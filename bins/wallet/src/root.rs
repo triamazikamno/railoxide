@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -417,7 +418,7 @@ pub(crate) struct WalletRoot {
     waku_config: WakuMonitorConfig,
     waku_runtime: Option<WalletWakuRuntime>,
     waku_session_generation: u64,
-    waku_stopping_generation: Option<u64>,
+    waku_stopping_generation: Option<WakuStoppingState>,
     public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
     public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
@@ -512,7 +513,79 @@ pub(crate) struct WalletRoot {
 struct WalletWakuRuntime {
     client: Arc<WakuDeliveryClient>,
     worker_shutdown: watch::Sender<bool>,
+    completion: WakuWorkerCompletionToken,
     generation: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct WakuWorkerCompletionToken {
+    quiesced_rx: watch::Receiver<bool>,
+}
+
+impl WakuWorkerCompletionToken {
+    async fn wait(mut self) -> Result<(), String> {
+        loop {
+            if *self.quiesced_rx.borrow() {
+                return Ok(());
+            }
+            self.quiesced_rx
+                .changed()
+                .await
+                .map_err(|_| "Waku worker ended before quiescence was established".to_string())?;
+        }
+    }
+
+    #[cfg(test)]
+    fn closed_for_test() -> Self {
+        let (_quiesced_tx, quiesced_rx) = watch::channel(false);
+        Self { quiesced_rx }
+    }
+
+    #[cfg(test)]
+    fn channel_for_test() -> (Self, watch::Sender<bool>) {
+        let (quiesced_tx, quiesced_rx) = watch::channel(false);
+        (Self { quiesced_rx }, quiesced_tx)
+    }
+}
+
+struct WakuWorkerQuiescenceGuard {
+    quiesced_tx: watch::Sender<bool>,
+}
+
+impl WakuWorkerQuiescenceGuard {
+    const fn new(quiesced_tx: watch::Sender<bool>) -> Self {
+        Self { quiesced_tx }
+    }
+}
+
+impl Drop for WakuWorkerQuiescenceGuard {
+    fn drop(&mut self) {
+        let _ = self.quiesced_tx.send(true);
+    }
+}
+
+async fn run_waku_worker_task(
+    worker: impl Future<Output = eyre::Result<()>>,
+    quiescence_guard: WakuWorkerQuiescenceGuard,
+) -> eyre::Result<()> {
+    let result = worker.await;
+    drop(quiescence_guard);
+    result
+}
+
+struct WakuStoppingState {
+    generation: u64,
+    completion: WakuWorkerCompletionToken,
+}
+
+#[cfg(test)]
+impl WakuStoppingState {
+    fn for_test(generation: u64) -> Self {
+        Self {
+            generation,
+            completion: WakuWorkerCompletionToken::closed_for_test(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -533,9 +606,14 @@ fn should_start_waku_runtime(
     view_unlocked: bool,
     runtime_active: bool,
     runtime_stopping: bool,
+    lifecycle_shutdown_started: bool,
     network_mode: RelayNetworkMode,
 ) -> bool {
-    view_unlocked && !runtime_active && !runtime_stopping && network_mode != RelayNetworkMode::Proxy
+    view_unlocked
+        && !runtime_active
+        && !runtime_stopping
+        && !lifecycle_shutdown_started
+        && network_mode != RelayNetworkMode::Proxy
 }
 
 fn should_start_waku_for_delivery(
@@ -543,6 +621,7 @@ fn should_start_waku_for_delivery(
     view_unlocked: bool,
     runtime_active: bool,
     runtime_stopping: bool,
+    lifecycle_shutdown_started: bool,
     network_mode: RelayNetworkMode,
 ) -> bool {
     delivery_mode == DeliveryMode::PublicBroadcaster
@@ -550,6 +629,7 @@ fn should_start_waku_for_delivery(
             view_unlocked,
             runtime_active,
             runtime_stopping,
+            lifecycle_shutdown_started,
             network_mode,
         )
 }
@@ -573,38 +653,50 @@ fn refresh_active_waku(runtime: Option<&WalletWakuRuntime>) -> bool {
     runtime.is_some_and(|runtime| runtime.client.refresh_network_session())
 }
 
+fn take_waku_runtime_for_stop(
+    runtime: &mut Option<WalletWakuRuntime>,
+) -> Option<WakuStoppingState> {
+    let runtime = runtime.take()?;
+    let _ = runtime.worker_shutdown.send(true);
+    Some(WakuStoppingState {
+        generation: runtime.generation,
+        completion: runtime.completion,
+    })
+}
+
+#[cfg(test)]
 fn stop_waku_runtime(
     runtime: &mut Option<WalletWakuRuntime>,
     monitor_state: &Shared,
     monitor_event_tx: &EventTx,
 ) -> bool {
-    let Some(runtime) = runtime.take() else {
-        return false;
-    };
-    let _ = runtime.worker_shutdown.send(true);
-    drop(runtime);
-    if let Some(rev) = monitor_state.write().clear() {
+    let stopped = take_waku_runtime_for_stop(runtime).is_some();
+    if stopped && let Some(rev) = monitor_state.write().clear() {
         publish_revision(monitor_event_tx, rev);
     }
-    true
+    stopped
 }
 
 fn complete_waku_worker_generation(
     active_generation: Option<u64>,
-    stopping_generation: &mut Option<u64>,
+    stopping_generation: &mut Option<WakuStoppingState>,
     generation: u64,
     completion: WakuWorkerCompletionKind,
     view_unlocked: bool,
+    lifecycle_shutdown_started: bool,
     monitor_state: &Shared,
     monitor_event_tx: &EventTx,
 ) -> WakuWorkerCompletionAction {
-    if *stopping_generation == Some(generation) {
+    if stopping_generation
+        .as_ref()
+        .is_some_and(|stopping| stopping.generation == generation)
+    {
         *stopping_generation = None;
-        if let Some(rev) = monitor_state.write().clear() {
+        if !lifecycle_shutdown_started && let Some(rev) = monitor_state.write().clear() {
             publish_revision(monitor_event_tx, rev);
         }
         return WakuWorkerCompletionAction::FinalizedStop {
-            restart: view_unlocked,
+            restart: view_unlocked && !lifecycle_shutdown_started,
         };
     }
 
@@ -657,6 +749,7 @@ impl WalletRoot {
             self.vault_view_unlock.is_some(),
             self.waku_runtime.is_some(),
             self.waku_stopping_generation.is_some(),
+            self.wallet_sync_lifecycle_shutdown_started,
             self.waku_config.network.mode,
         ) {
             self.ensure_waku_started(cx);
@@ -668,6 +761,7 @@ impl WalletRoot {
             self.vault_view_unlock.is_some(),
             self.waku_runtime.is_some(),
             self.waku_stopping_generation.is_some(),
+            self.wallet_sync_lifecycle_shutdown_started,
             self.waku_config.network.mode,
         );
         let client =
@@ -687,16 +781,30 @@ impl WalletRoot {
         self.waku_session_generation = self.waku_session_generation.wrapping_add(1);
         let generation = self.waku_session_generation;
         let (worker_shutdown, shutdown_rx) = watch::channel(false);
-        let worker = self.runtime.spawn(spawn_workers_until_shutdown(
-            self.waku_config.clone(),
-            Arc::clone(&client),
-            self.monitor_state.clone(),
-            self.monitor_event_tx.clone(),
-            shutdown_rx,
-        ));
+        let (quiesced_tx, quiesced_rx) = watch::channel(false);
+        let completion = WakuWorkerCompletionToken { quiesced_rx };
+        let config = self.waku_config.clone();
+        let worker_client = Arc::clone(&client);
+        let worker_monitor_state = self.monitor_state.clone();
+        let worker_event_tx = self.monitor_event_tx.clone();
+        let quiescence_guard = WakuWorkerQuiescenceGuard::new(quiesced_tx);
+        let worker = self.runtime.spawn(async move {
+            run_waku_worker_task(
+                spawn_workers_until_shutdown(
+                    config,
+                    worker_client,
+                    worker_monitor_state,
+                    worker_event_tx,
+                    shutdown_rx,
+                ),
+                quiescence_guard,
+            )
+            .await
+        });
         self.waku_runtime = Some(WalletWakuRuntime {
             client,
             worker_shutdown,
+            completion,
             generation,
         });
         self.network_status_error = None;
@@ -715,6 +823,7 @@ impl WalletRoot {
                     generation,
                     completion,
                     root.vault_view_unlock.is_some(),
+                    root.wallet_sync_lifecycle_shutdown_started,
                     &root.monitor_state,
                     &root.monitor_event_tx,
                 );
@@ -769,16 +878,26 @@ impl WalletRoot {
     }
 
     pub(super) fn stop_waku(&mut self) -> bool {
-        let generation = self.waku_runtime.as_ref().map(|runtime| runtime.generation);
-        let stopped = stop_waku_runtime(
-            &mut self.waku_runtime,
-            &self.monitor_state,
-            &self.monitor_event_tx,
-        );
+        let stopping = take_waku_runtime_for_stop(&mut self.waku_runtime);
+        let stopped = stopping.is_some();
         if stopped {
-            self.waku_stopping_generation = generation;
+            self.waku_stopping_generation = stopping;
+            if !self.wallet_sync_lifecycle_shutdown_started
+                && let Some(rev) = self.monitor_state.write().clear()
+            {
+                publish_revision(&self.monitor_event_tx, rev);
+            }
         }
         stopped
+    }
+
+    pub(super) fn stop_waku_for_root_replacement(&mut self) -> Option<WakuWorkerCompletionToken> {
+        if let Some(stopping) = take_waku_runtime_for_stop(&mut self.waku_runtime) {
+            self.waku_stopping_generation = Some(stopping);
+        }
+        self.waku_stopping_generation
+            .as_ref()
+            .map(|stopping| stopping.completion.clone())
     }
 
     const fn is_prover_cache_building(&self) -> bool {

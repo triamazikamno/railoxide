@@ -4,7 +4,7 @@ use gpui::{Context, WeakEntity};
 use tokio::runtime::Handle;
 use wallet_ops::vault::DesktopVaultStore;
 
-use super::{WalletRoot, chain_load::WalletSyncLifecycleCleanupWaitGroup};
+use super::{WalletRoot, chain_load::WalletRootReplacementCleanup};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::root) enum WalletMaintenanceReset {
@@ -91,7 +91,7 @@ pub(in crate::root) struct WalletMaintenanceController {
     runtime: Handle,
     state: WalletMaintenanceStateMachine,
     active_root: Option<WeakEntity<WalletRoot>>,
-    root_replacement_cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
+    root_replacement_cleanup: Option<WalletRootReplacementCleanup>,
 }
 
 impl WalletMaintenanceController {
@@ -126,7 +126,7 @@ impl WalletMaintenanceController {
 
     pub(in crate::root) fn set_root_replacement_cleanup(
         &mut self,
-        cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
+        cleanup: Option<WalletRootReplacementCleanup>,
     ) {
         self.root_replacement_cleanup = cleanup;
     }
@@ -135,7 +135,7 @@ impl WalletMaintenanceController {
         if self
             .root_replacement_cleanup
             .as_ref()
-            .is_some_and(WalletSyncLifecycleCleanupWaitGroup::is_finished)
+            .is_some_and(WalletRootReplacementCleanup::is_finished)
         {
             self.root_replacement_cleanup = None;
         }

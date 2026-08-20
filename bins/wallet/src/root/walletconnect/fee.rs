@@ -58,7 +58,7 @@ pub(super) const fn walletconnect_request_fee_eligible(
     )
 }
 
-pub(super) fn validate_walletconnect_reviewed_fee_pairing(
+pub(super) const fn validate_walletconnect_reviewed_fee_pairing(
     request: &WalletConnectParsedRequest,
     reviewed_fee: Option<&WalletConnectReviewedFeeProjection>,
 ) -> Result<(), &'static str> {

@@ -2054,7 +2054,7 @@ mod tests {
         assert_eq!(missing.primary_type, "Message");
     }
 
-    fn permit_typed_data(token: Address, owner: Address, spender: Address, value: Value) -> Value {
+    fn permit_typed_data(token: Address, owner: Address, spender: Address, value: &Value) -> Value {
         json!({
             "types": {
                 "EIP712Domain": [
@@ -2099,7 +2099,7 @@ mod tests {
         let request = request_with(
             WalletConnectParsedRequest::EthSignTypedDataV4 {
                 account,
-                typed_data: permit_typed_data(token, account, spender, json!("1000000")),
+                typed_data: permit_typed_data(token, account, spender, &json!("1000000")),
                 domain_chain_id: Some(U256::from(1)),
             },
             None,
@@ -2158,7 +2158,7 @@ mod tests {
                     token,
                     foreign_owner,
                     spender,
-                    json!(U256::MAX.to_string()),
+                    &json!(U256::MAX.to_string()),
                 ),
                 domain_chain_id: Some(U256::from(1)),
             },

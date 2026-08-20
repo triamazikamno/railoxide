@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use broadcaster_monitor::{EventTx, Shared, publish_revision};
 use gpui::{
     AnyElement, Context, ParentElement, SharedString, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
@@ -20,6 +21,7 @@ use wallet_ops::{
     vault::WalletSource,
 };
 
+use super::WakuWorkerCompletionToken;
 use super::utxo::should_focus_utxo_table;
 use super::{
     BroadcasterActivityTab, InitialCatchUpFingerprint, InitialSyncObservation, WalletRoot,
@@ -199,6 +201,11 @@ pub(super) struct WalletSyncLifecycleCleanupTask {
 #[derive(Clone)]
 pub(super) struct WalletSyncLifecycleCleanupWaitGroup {
     tasks: Vec<WalletSyncLifecycleCleanupTask>,
+}
+
+#[derive(Clone)]
+pub(super) struct WalletRootReplacementCleanup {
+    completed_rx: watch::Receiver<Option<Result<WalletSyncLifecycleCleanupReport, String>>>,
 }
 
 pub(super) struct WalletPublicSyncCacheResetContext {
@@ -530,6 +537,15 @@ impl WalletSyncLifecycleCleanupTask {
         Self { completed_rx }
     }
 
+    #[cfg(test)]
+    pub(super) fn channel_for_test() -> (
+        Self,
+        watch::Sender<Option<WalletSyncLifecycleCleanupReport>>,
+    ) {
+        let (completed_tx, completed_rx) = watch::channel(None);
+        (Self { completed_rx }, completed_tx)
+    }
+
     pub(super) fn is_finished(&self) -> bool {
         self.completed_rx.borrow().is_some() || self.completed_rx.has_changed().is_err()
     }
@@ -565,18 +581,13 @@ impl WalletSyncLifecycleCleanupWaitGroup {
         self.wait().await
     }
 
-    pub(super) async fn shutdown_for_root_replacement(
-        self,
-    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
-        self.wait().await
-    }
-
     pub(super) async fn shutdown_for_wallet_replacement(
         self,
     ) -> Result<WalletSyncLifecycleCleanupReport, String> {
         self.wait().await
     }
 
+    #[cfg(test)]
     pub(super) fn is_finished(&self) -> bool {
         self.tasks
             .iter()
@@ -592,6 +603,64 @@ impl WalletSyncLifecycleCleanupWaitGroup {
             combined.shut_down_session_store |= report.shut_down_session_store;
         }
         Ok(combined)
+    }
+}
+
+impl WalletRootReplacementCleanup {
+    pub(super) fn spawn(
+        runtime: &Handle,
+        sync_cleanup: WalletSyncLifecycleCleanupWaitGroup,
+        waku_completion: Option<WakuWorkerCompletionToken>,
+        monitor_state: Shared,
+        monitor_event_tx: EventTx,
+    ) -> Self {
+        let (completed_tx, completed_rx) = watch::channel(None);
+        runtime.spawn(async move {
+            let (sync_result, waku_result) = tokio::join!(
+                sync_cleanup.wait(),
+                async {
+                    match waku_completion {
+                        Some(completion) => completion.wait().await,
+                        None => Ok(()),
+                    }
+                },
+            );
+
+            if let Some(rev) = monitor_state.write().clear() {
+                publish_revision(&monitor_event_tx, rev);
+            }
+
+            let result = match (sync_result, waku_result) {
+                (Ok(report), Ok(())) => Ok(report),
+                (Err(sync_error), Ok(())) => Err(format!(
+                    "wallet sync cleanup failed during root replacement: {sync_error}"
+                )),
+                (Ok(_), Err(waku_error)) => Err(format!(
+                    "Waku worker cleanup failed during root replacement: {waku_error}"
+                )),
+                (Err(sync_error), Err(waku_error)) => Err(format!(
+                    "wallet sync cleanup failed during root replacement: {sync_error}; Waku worker cleanup failed during root replacement: {waku_error}"
+                )),
+            };
+            let _ = completed_tx.send(Some(result));
+        });
+        Self { completed_rx }
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.completed_rx.borrow().is_some() || self.completed_rx.has_changed().is_err()
+    }
+
+    pub(super) async fn wait(mut self) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        loop {
+            if let Some(result) = self.completed_rx.borrow().clone() {
+                return result;
+            }
+            self.completed_rx
+                .changed()
+                .await
+                .map_err(|_| "root replacement cleanup ended before completion".to_string())?;
+        }
     }
 }
 
@@ -1507,21 +1576,30 @@ impl WalletRoot {
         self.wallet_sync_cleanup_wait_group()
     }
 
-    pub(super) fn begin_root_replacement_sync_shutdown(
+    pub(super) fn begin_root_replacement_shutdown(
         &mut self,
         cx: &mut Context<'_, Self>,
-    ) -> (WalletSyncLifecycleCleanupWaitGroup, HttpContext) {
+    ) -> (WalletRootReplacementCleanup, HttpContext) {
         self.advance_active_wallet_generation();
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
         self.invalidate_pending_profile_open_tokens();
         self.revealed_passphrase_context_id = None;
-        let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.wallet_sync_lifecycle_shutdown_started = true;
+        let waku_completion = self.stop_waku_for_root_replacement();
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
         let outgoing_http = self.http.clone();
         self.reset_wallet_scoped_state(cx);
         self.start_wallet_sync_cleanup(cleanup);
-        (self.wallet_sync_cleanup_wait_group(), outgoing_http)
+        let sync_cleanup = self.wallet_sync_cleanup_wait_group();
+        let root_replacement_cleanup = WalletRootReplacementCleanup::spawn(
+            &self.runtime,
+            sync_cleanup,
+            waku_completion,
+            self.monitor_state.clone(),
+            self.monitor_event_tx.clone(),
+        );
+        (root_replacement_cleanup, outgoing_http)
     }
 
     fn start_wallet_sync_cleanup(

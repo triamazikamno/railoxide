@@ -34,7 +34,7 @@ use wallet_ops::{
     vault::DesktopVaultStore,
 };
 
-use super::chain_load::WalletSyncLifecycleCleanupWaitGroup;
+use super::chain_load::WalletRootReplacementCleanup;
 use super::settings::{
     StartupSettingsSummary, WalletSettingsEditor, settings_dialog_dimensions,
     startup_settings_action_state,
@@ -220,7 +220,7 @@ impl WalletStartupRoot {
         generation: u64,
         event_tx: EventTx,
         network_context: StartupNetworkContext,
-        cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
+        cleanup: Option<WalletRootReplacementCleanup>,
         progress_tx: watch::Sender<WalletNetworkProgress>,
         mut progress_rx: watch::Receiver<WalletNetworkProgress>,
         vault_store: Arc<DesktopVaultStore>,
@@ -249,10 +249,7 @@ impl WalletStartupRoot {
         let chain_ids = self.chain_ids.clone();
         let startup = self.runtime.spawn(async move {
             if let Some(cleanup) = cleanup {
-                cleanup
-                    .shutdown_for_root_replacement()
-                    .await
-                    .map_err(|error| eyre::eyre!(error))?;
+                cleanup.wait().await.map_err(|error| eyre::eyre!(error))?;
             }
             build_wallet_startup(
                 options,
@@ -493,7 +490,7 @@ impl WalletStartupRoot {
         let replacement = self
             .wallet_root
             .as_ref()
-            .map(|root| root.update(cx, super::WalletRoot::begin_root_replacement_sync_shutdown));
+            .map(|root| root.update(cx, super::WalletRoot::begin_root_replacement_shutdown));
         let (cleanup, outgoing_http) =
             replacement.map_or((None, None), |(cleanup, http)| (Some(cleanup), Some(http)));
         let active_http = match outgoing_http {
@@ -553,7 +550,9 @@ impl WalletStartupRoot {
         self.tor_reset_error = None;
         self.tor_bootstrap_recovery_available = false;
         self.progress = WalletNetworkProgress::initial();
-        if let Some(rev) = self.monitor_state.write().clear() {
+        if cleanup.is_none()
+            && let Some(rev) = self.monitor_state.write().clear()
+        {
             publish_revision(&self.event_tx, rev);
         }
         let (progress_tx, progress_rx) = watch::channel(self.progress.clone());
