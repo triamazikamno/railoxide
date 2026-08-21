@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use local_db::{DbConfig, DbStore};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::{
     AUTO_LOCK_TIMEOUT_PRESETS_SECS, DEFAULT_AUTO_LOCK_TIMEOUT_SECS,
@@ -1720,6 +1721,132 @@ fn price_anchor_validation_covers_oracle_and_product_metadata() {
             .iter()
             .any(|message| message.contains("oracle_decimals"))
     );
+}
+
+#[test]
+fn uniswap_v3_twap_settings_round_trip_and_validate_boundaries() {
+    let anchor = super::PriceAnchorSettings::UniswapV3Twap {
+        pool_address: "0x0000000000000000000000000000000000000400".to_string(),
+        base_token_address: "0x0000000000000000000000000000000000000401".to_string(),
+        quote_token_address: "0x0000000000000000000000000000000000000402".to_string(),
+        base_token_decimals: 18,
+        window_seconds: 1_800,
+    };
+    let wire = serde_json::to_value(&anchor).expect("serialize TWAP settings");
+    assert_eq!(wire["type"], json!("uniswap-v3-twap"));
+    assert!(wire.get("chain_id").is_none());
+    assert_eq!(
+        wire["pool_address"],
+        json!("0x0000000000000000000000000000000000000400")
+    );
+    assert_eq!(
+        serde_json::from_value::<super::PriceAnchorSettings>(wire).expect("deserialize"),
+        anchor
+    );
+
+    let mut settings = WalletSettings::default();
+    settings
+        .tokens
+        .price_anchors
+        .push(super::TokenPriceAnchorOverride {
+            key: super::TokenKey {
+                chain_id: 1,
+                token_address: "0x0000000000000000000000000000000000000002".to_string(),
+            },
+            price_anchor: anchor.clone(),
+        });
+    settings.validate().expect("supported TWAP accepted");
+    let mut invalid = anchor;
+    let super::PriceAnchorSettings::UniswapV3Twap {
+        pool_address,
+        base_token_address,
+        quote_token_address,
+        base_token_decimals,
+        window_seconds,
+    } = &mut invalid
+    else {
+        unreachable!();
+    };
+    *pool_address = "not-an-address".to_string();
+    *base_token_address = "not-an-address".to_string();
+    *quote_token_address = "not-an-address".to_string();
+    *base_token_decimals = 37;
+    *window_seconds = 0;
+    settings.tokens.price_anchors[0].price_anchor = invalid;
+    let error = settings.validate().expect_err("invalid TWAP rejected");
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("pool_address"))
+    );
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("base_token_address"))
+    );
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("quote_token_address"))
+    );
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("base_token_decimals"))
+    );
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("window_seconds"))
+    );
+}
+
+#[test]
+fn legacy_anchor_settings_remain_compatible_and_rail_twap_override_resets() {
+    let legacy = vec![
+        json!({"type":"fixed", "rate":"1000000000000000000"}),
+        json!({"type":"oracle", "chain_id":1, "oracle_address":"0x0000000000000000000000000000000000000003", "token_decimals":18, "oracle_decimals":8, "is_inversed":false}),
+        json!({"type":"product", "components":[{"type":"fixed", "rate":"2"}], "scale_decimals":18}),
+        json!({"type":"uniswap-v3-twap", "chain_id":999, "pool_address":"0x0000000000000000000000000000000000000400", "base_token_address":"0x0000000000000000000000000000000000000401", "quote_token_address":"0x0000000000000000000000000000000000000402", "base_token_decimals":18, "window_seconds":1800}),
+    ];
+    for value in legacy {
+        serde_json::from_value::<super::PriceAnchorSettings>(value).expect("legacy anchor");
+    }
+    let rail = super::TokenKey {
+        chain_id: 1,
+        token_address: "0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D".to_string(),
+    };
+    let mut settings = WalletSettings::default();
+    settings
+        .tokens
+        .price_anchors
+        .push(super::TokenPriceAnchorOverride {
+            key: rail.clone(),
+            price_anchor: super::PriceAnchorSettings::Fixed {
+                rate: "7".to_string(),
+            },
+        });
+    let registry = build_effective_token_registry(&settings).expect("override registry");
+    assert!(
+        matches!(registry.tokens.get(&(1, rail.token_address.to_ascii_lowercase())).and_then(|token| token.price_anchor.as_ref()), Some(super::PriceAnchorSettings::Fixed { rate }) if rate == "7")
+    );
+    settings.tokens.price_anchors.clear();
+    let registry = build_effective_token_registry(&settings).expect("reset registry");
+    assert!(matches!(
+        registry
+            .tokens
+            .get(&(1, rail.token_address.to_ascii_lowercase()))
+            .and_then(|token| token.price_anchor.as_ref()),
+        Some(super::PriceAnchorSettings::UniswapV3Twap {
+            window_seconds: 1_800,
+            ..
+        })
+    ));
 }
 
 #[test]

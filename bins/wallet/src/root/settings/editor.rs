@@ -1541,6 +1541,21 @@ impl WalletSettingsEditor {
                     cx,
                 )
             }),
+            twap_pool_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_pool_address.clone())
+            }),
+            twap_base_token_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_base_token_address.clone())
+            }),
+            twap_quote_token_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_quote_token_address.clone())
+            }),
+            twap_base_token_decimals: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_base_token_decimals.clone())
+            }),
+            twap_window_seconds: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_window_seconds.clone())
+            }),
             product_scale_decimals: cx.new(|cx| {
                 InputState::new(window, cx).default_value(values.product_scale_decimals.clone())
             }),
@@ -1551,7 +1566,7 @@ impl WalletSettingsEditor {
                 .map(|component| {
                     Self::product_anchor_component_dialog_inputs(
                         component,
-                        chain_items.clone(),
+                        &chain_items,
                         window,
                         cx,
                     )
@@ -1632,14 +1647,14 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn product_anchor_component_dialog_inputs(
         values: &PriceAnchorComponentDialogValues,
-        chain_items: Vec<ChainSelectItem>,
+        chain_items: &[ChainSelectItem],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> ProductAnchorComponentDialogInputs {
         let component_type_items = product_component_type_select_items();
         let selected_component_type_index =
             price_anchor_type_select_index(&component_type_items, values.anchor_type);
-        let selected_oracle_chain_index = chain_select_index(&chain_items, values.oracle_chain_id);
+        let selected_oracle_chain_index = chain_select_index(chain_items, values.oracle_chain_id);
         ProductAnchorComponentDialogInputs {
             anchor_type: cx.new(|cx| {
                 SelectState::new(
@@ -1653,8 +1668,14 @@ impl WalletSettingsEditor {
                 .new(|cx| InputState::new(window, cx).default_value(values.anchor_type)),
             fixed_rate: cx
                 .new(|cx| InputState::new(window, cx).default_value(values.fixed_rate.clone())),
-            oracle_chain_id: cx
-                .new(|cx| SelectState::new(chain_items, selected_oracle_chain_index, window, cx)),
+            oracle_chain_id: cx.new(|cx| {
+                SelectState::new(
+                    chain_items.to_vec(),
+                    selected_oracle_chain_index,
+                    window,
+                    cx,
+                )
+            }),
             oracle_address: cx
                 .new(|cx| InputState::new(window, cx).default_value(values.oracle_address.clone())),
             oracle_token_decimals: cx.new(|cx| {
@@ -1670,6 +1691,21 @@ impl WalletSettingsEditor {
                     window,
                     cx,
                 )
+            }),
+            twap_pool_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_pool_address.clone())
+            }),
+            twap_base_token_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_base_token_address.clone())
+            }),
+            twap_quote_token_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_quote_token_address.clone())
+            }),
+            twap_base_token_decimals: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_base_token_decimals.clone())
+            }),
+            twap_window_seconds: cx.new(|cx| {
+                InputState::new(window, cx).default_value(values.twap_window_seconds.clone())
             }),
         }
     }

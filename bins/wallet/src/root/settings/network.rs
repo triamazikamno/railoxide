@@ -477,10 +477,12 @@ pub(in crate::root) fn parse_price_anchor_type(value: &str) -> Result<&'static s
         Ok("fixed")
     } else if value.eq_ignore_ascii_case("oracle") {
         Ok("oracle")
+    } else if value.eq_ignore_ascii_case("uniswap-v3-twap") || value.eq_ignore_ascii_case("twap") {
+        Ok("uniswap-v3-twap")
     } else if value.eq_ignore_ascii_case("product") {
         Ok("product")
     } else {
-        Err("Anchor type must be fixed, oracle, or product".to_string())
+        Err("Anchor type must be fixed, oracle, or product (or uniswap-v3-twap)".to_string())
     }
 }
 
@@ -492,8 +494,10 @@ pub(in crate::root) fn parse_product_component_anchor_type(
         Ok("fixed")
     } else if value.eq_ignore_ascii_case("oracle") {
         Ok("oracle")
+    } else if value.eq_ignore_ascii_case("uniswap-v3-twap") || value.eq_ignore_ascii_case("twap") {
+        Ok("uniswap-v3-twap")
     } else {
-        Err("Product component type must be fixed or oracle".to_string())
+        Err("Product component type must be fixed, oracle, or uniswap-v3-twap".to_string())
     }
 }
 
@@ -505,6 +509,13 @@ pub(in crate::root) fn default_price_anchor_for_type(value: &str) -> PriceAnchor
             token_decimals: 18,
             oracle_decimals: 8,
             is_inversed: false,
+        },
+        "uniswap-v3-twap" => PriceAnchorSettings::UniswapV3Twap {
+            pool_address: Address::ZERO.to_string(),
+            base_token_address: Address::ZERO.to_string(),
+            quote_token_address: Address::ZERO.to_string(),
+            base_token_decimals: 18,
+            window_seconds: 1_800,
         },
         "product" => PriceAnchorSettings::Product {
             components: default_product_anchor_components(),

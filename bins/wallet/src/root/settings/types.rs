@@ -414,6 +414,11 @@ pub(in crate::root) struct PriceAnchorDialogInputs {
     pub(in crate::root) oracle_token_decimals: Entity<InputState>,
     pub(in crate::root) oracle_decimals: Entity<InputState>,
     pub(in crate::root) oracle_is_inversed: Entity<SelectState<Vec<BoolSelectItem>>>,
+    pub(in crate::root) twap_pool_address: Entity<InputState>,
+    pub(in crate::root) twap_base_token_address: Entity<InputState>,
+    pub(in crate::root) twap_quote_token_address: Entity<InputState>,
+    pub(in crate::root) twap_base_token_decimals: Entity<InputState>,
+    pub(in crate::root) twap_window_seconds: Entity<InputState>,
     pub(in crate::root) product_scale_decimals: Entity<InputState>,
     pub(in crate::root) product_components: Vec<ProductAnchorComponentDialogInputs>,
 }
@@ -428,6 +433,11 @@ pub(in crate::root) struct ProductAnchorComponentDialogInputs {
     pub(in crate::root) oracle_token_decimals: Entity<InputState>,
     pub(in crate::root) oracle_decimals: Entity<InputState>,
     pub(in crate::root) oracle_is_inversed: Entity<SelectState<Vec<BoolSelectItem>>>,
+    pub(in crate::root) twap_pool_address: Entity<InputState>,
+    pub(in crate::root) twap_base_token_address: Entity<InputState>,
+    pub(in crate::root) twap_quote_token_address: Entity<InputState>,
+    pub(in crate::root) twap_base_token_decimals: Entity<InputState>,
+    pub(in crate::root) twap_window_seconds: Entity<InputState>,
 }
 
 #[derive(Clone, Copy)]
@@ -477,6 +487,11 @@ pub(in crate::root) struct PriceAnchorDialogValues {
     pub(in crate::root) oracle_token_decimals: String,
     pub(in crate::root) oracle_decimals: String,
     pub(in crate::root) oracle_is_inversed: bool,
+    pub(in crate::root) twap_pool_address: String,
+    pub(in crate::root) twap_base_token_address: String,
+    pub(in crate::root) twap_quote_token_address: String,
+    pub(in crate::root) twap_base_token_decimals: String,
+    pub(in crate::root) twap_window_seconds: String,
     pub(in crate::root) product_scale_decimals: String,
     pub(in crate::root) product_components: Vec<PriceAnchorComponentDialogValues>,
 }
@@ -490,4 +505,9 @@ pub(in crate::root) struct PriceAnchorComponentDialogValues {
     pub(in crate::root) oracle_token_decimals: String,
     pub(in crate::root) oracle_decimals: String,
     pub(in crate::root) oracle_is_inversed: bool,
+    pub(in crate::root) twap_pool_address: String,
+    pub(in crate::root) twap_base_token_address: String,
+    pub(in crate::root) twap_quote_token_address: String,
+    pub(in crate::root) twap_base_token_decimals: String,
+    pub(in crate::root) twap_window_seconds: String,
 }

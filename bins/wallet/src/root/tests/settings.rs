@@ -6,6 +6,7 @@ use crate::root::maintenance::{
 use crate::root::settings::{
     add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
     indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
+    price_anchor_component_dialog_values_from_anchor, price_anchor_dialog_values_from_override,
     remove_indexed_artifact_gateway_url, set_indexed_artifact_gateway_url,
     should_show_indexed_artifact_custom_settings,
 };
@@ -1212,6 +1213,11 @@ fn price_anchor_add_dialog_values_create_override_without_mutating_settings() {
         oracle_token_decimals: "6".to_string(),
         oracle_decimals: "8".to_string(),
         oracle_is_inversed: true,
+        twap_pool_address: Address::ZERO.to_string(),
+        twap_base_token_address: Address::ZERO.to_string(),
+        twap_quote_token_address: Address::ZERO.to_string(),
+        twap_base_token_decimals: "18".to_string(),
+        twap_window_seconds: "1800".to_string(),
         product_scale_decimals: "18".to_string(),
         product_components: test_product_anchor_components(),
     })
@@ -1237,7 +1243,51 @@ fn price_anchor_add_dialog_values_create_override_without_mutating_settings() {
 }
 
 #[test]
+fn price_anchor_twap_dialog_round_trip_preserves_all_fields() {
+    let twap = PriceAnchorSettings::UniswapV3Twap {
+        pool_address: "0x0000000000000000000000000000000000000400".to_string(),
+        base_token_address: "0x0000000000000000000000000000000000000401".to_string(),
+        quote_token_address: "0x0000000000000000000000000000000000000402".to_string(),
+        base_token_decimals: 8,
+        window_seconds: 777,
+    };
+    let override_settings = TokenPriceAnchorOverride {
+        key: TokenKey {
+            chain_id: 1,
+            token_address: "0x0000000000000000000000000000000000000002".to_string(),
+        },
+        price_anchor: twap.clone(),
+    };
+    let values = price_anchor_dialog_values_from_override(&override_settings);
+    assert_eq!(values.anchor_type, "uniswap-v3-twap");
+    assert_eq!(
+        values.twap_pool_address,
+        "0x0000000000000000000000000000000000000400"
+    );
+    assert_eq!(
+        values.twap_base_token_address,
+        "0x0000000000000000000000000000000000000401"
+    );
+    assert_eq!(
+        values.twap_quote_token_address,
+        "0x0000000000000000000000000000000000000402"
+    );
+    assert_eq!(values.twap_base_token_decimals, "8");
+    assert_eq!(values.twap_window_seconds, "777");
+    let round_trip = price_anchor_override_from_dialog_values(&values).expect("TWAP round trip");
+    assert_eq!(round_trip.price_anchor, twap);
+}
+
+#[test]
 fn price_anchor_add_dialog_values_create_product_override() {
+    let twap_component = PriceAnchorSettings::UniswapV3Twap {
+        pool_address: "0x0000000000000000000000000000000000000400".to_string(),
+        base_token_address: "0x0000000000000000000000000000000000000401".to_string(),
+        quote_token_address: "0x0000000000000000000000000000000000000402".to_string(),
+        base_token_decimals: 6,
+        window_seconds: 900,
+    };
+    let twap_component_values = price_anchor_component_dialog_values_from_anchor(&twap_component);
     let anchor = price_anchor_override_from_dialog_values(&PriceAnchorDialogValues {
         chain_id: 1,
         token_address: "0x0000000000000000000000000000000000000002".to_string(),
@@ -1248,6 +1298,11 @@ fn price_anchor_add_dialog_values_create_product_override() {
         oracle_token_decimals: "18".to_string(),
         oracle_decimals: "8".to_string(),
         oracle_is_inversed: false,
+        twap_pool_address: Address::ZERO.to_string(),
+        twap_base_token_address: Address::ZERO.to_string(),
+        twap_quote_token_address: Address::ZERO.to_string(),
+        twap_base_token_decimals: "18".to_string(),
+        twap_window_seconds: "1800".to_string(),
         product_scale_decimals: "12".to_string(),
         product_components: vec![
             PriceAnchorComponentDialogValues {
@@ -1258,16 +1313,13 @@ fn price_anchor_add_dialog_values_create_product_override() {
                 oracle_token_decimals: "18".to_string(),
                 oracle_decimals: "8".to_string(),
                 oracle_is_inversed: false,
+                twap_pool_address: Address::ZERO.to_string(),
+                twap_base_token_address: Address::ZERO.to_string(),
+                twap_quote_token_address: Address::ZERO.to_string(),
+                twap_base_token_decimals: "18".to_string(),
+                twap_window_seconds: "1800".to_string(),
             },
-            PriceAnchorComponentDialogValues {
-                anchor_type: "oracle",
-                fixed_rate: "1000000000000000000".to_string(),
-                oracle_chain_id: 42161,
-                oracle_address: "0x0000000000000000000000000000000000000005".to_string(),
-                oracle_token_decimals: "18".to_string(),
-                oracle_decimals: "8".to_string(),
-                oracle_is_inversed: true,
-            },
+            twap_component_values,
         ],
     })
     .expect("valid product price anchor dialog values");
@@ -1286,13 +1338,19 @@ fn price_anchor_add_dialog_values_create_product_override() {
                     is_inversed: false,
                     ..
                 },
-                PriceAnchorSettings::Oracle {
-                    chain_id: 42161,
-                    oracle_decimals: 8,
-                    is_inversed: true,
-                    ..
+                PriceAnchorSettings::UniswapV3Twap {
+                    pool_address,
+                    base_token_address,
+                    quote_token_address,
+                    base_token_decimals: 6,
+                    window_seconds: 900,
                 },
             ]
+            if pool_address == "0x0000000000000000000000000000000000000400"
+                && base_token_address
+                    == "0x0000000000000000000000000000000000000401"
+                && quote_token_address
+                    == "0x0000000000000000000000000000000000000402"
         )
     ));
 }
@@ -1309,6 +1367,11 @@ fn price_anchor_add_dialog_values_reject_invalid_anchor_type() {
         oracle_token_decimals: "18".to_string(),
         oracle_decimals: "8".to_string(),
         oracle_is_inversed: false,
+        twap_pool_address: Address::ZERO.to_string(),
+        twap_base_token_address: Address::ZERO.to_string(),
+        twap_quote_token_address: Address::ZERO.to_string(),
+        twap_base_token_decimals: "18".to_string(),
+        twap_window_seconds: "1800".to_string(),
         product_scale_decimals: "18".to_string(),
         product_components: test_product_anchor_components(),
     })
@@ -1327,6 +1390,11 @@ fn test_product_anchor_components() -> Vec<PriceAnchorComponentDialogValues> {
             oracle_token_decimals: "18".to_string(),
             oracle_decimals: "8".to_string(),
             oracle_is_inversed: false,
+            twap_pool_address: Address::ZERO.to_string(),
+            twap_base_token_address: Address::ZERO.to_string(),
+            twap_quote_token_address: Address::ZERO.to_string(),
+            twap_base_token_decimals: "18".to_string(),
+            twap_window_seconds: "1800".to_string(),
         },
         PriceAnchorComponentDialogValues {
             anchor_type: "oracle",
@@ -1336,6 +1404,11 @@ fn test_product_anchor_components() -> Vec<PriceAnchorComponentDialogValues> {
             oracle_token_decimals: "18".to_string(),
             oracle_decimals: "8".to_string(),
             oracle_is_inversed: true,
+            twap_pool_address: Address::ZERO.to_string(),
+            twap_base_token_address: Address::ZERO.to_string(),
+            twap_quote_token_address: Address::ZERO.to_string(),
+            twap_base_token_decimals: "18".to_string(),
+            twap_window_seconds: "1800".to_string(),
         },
     ]
 }

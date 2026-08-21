@@ -57,6 +57,13 @@ pub enum TokenAnchorSource {
         oracle_decimals: u8,
         is_inversed: bool,
     },
+    UniswapV3Twap {
+        pool: Address,
+        base_token: Address,
+        quote_token: Address,
+        base_token_decimals: u8,
+        window_seconds: u32,
+    },
     Product {
         sources: &'static [Self],
         scale_decimals: u8,
@@ -159,6 +166,13 @@ const ARB_ETH_USD_6_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::C
     oracle_decimals: 8,
     is_inversed: false,
 }];
+const RAIL_ETH_TWAP_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::UniswapV3Twap {
+    pool: address!("0x2837809FD68e4a4104af76bbec5b622b6146B2cb"),
+    base_token: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+    quote_token: address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"),
+    base_token_decimals: 18,
+    window_seconds: 1_800,
+}];
 
 #[rustfmt::skip]
 const NATIVE_USD_ANCHORS: &[(u64, &[TokenAnchorSource])] = &[
@@ -178,7 +192,7 @@ const TOKENS: &[(u64, Address, &str, u8, &[TokenAnchorSource])] = &[
     (1, address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), "WBTC", 8, BTC_ETH_8_ANCHOR),
     (1, address!("0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"), "EURC", 6, NO_ANCHORS),
     (1, address!("0x6f40d4a6237c257fff2db00fa0510deeecd303eb"), "FLUID", 18, NO_ANCHORS),
-    (1, address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"), "RAIL", 18, NO_ANCHORS),
+    (1, address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"), "RAIL", 18, RAIL_ETH_TWAP_ANCHOR),
     (1, address!("0x03ab458634910aad20ef5f1c8ee96f1d6ac54919"), "RAI", 18, NO_ANCHORS),
     (1, address!("0x853d955aCEf822Db058eb8505911ED77F175b99e"), "FRAX", 18, ETH_USD_18_ANCHOR),
     (1, address!("0x956f47f50a910163d8bf957cf5846d573e7f87ca"), "FEI", 18, ETH_USD_18_ANCHOR),
@@ -705,13 +719,22 @@ mod tests {
     }
 
     #[test]
-    fn lookup_tokens_without_anchor_keep_empty_source_list() {
+    fn lookup_rail_exposes_builtin_uniswap_v3_twap_source() {
         let addr = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
         let info = lookup_token(1, &addr).expect("RAIL on Ethereum should be known");
 
         assert_eq!(info.symbol, "RAIL");
         assert_eq!(info.decimals, 18);
-        assert!(info.anchor_sources.is_empty());
+        assert_eq!(
+            info.anchor_sources,
+            &[TokenAnchorSource::UniswapV3Twap {
+                pool: address!("0x2837809FD68e4a4104af76bbec5b622b6146B2cb"),
+                base_token: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+                quote_token: addr,
+                base_token_decimals: 18,
+                window_seconds: 1_800,
+            }]
+        );
     }
 
     #[test]

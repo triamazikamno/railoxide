@@ -177,6 +177,34 @@ pub(in crate::root) fn render_price_anchor_dialog_content(
                     content_width,
                 ));
         }
+        "uniswap-v3-twap" => {
+            content = content
+                .child(settings_dialog_field(
+                    "Pool address",
+                    &inputs.twap_pool_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Base-token address",
+                    &inputs.twap_base_token_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Quote-token address",
+                    &inputs.twap_quote_token_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Base-token decimals",
+                    &inputs.twap_base_token_decimals,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Window seconds",
+                    &inputs.twap_window_seconds,
+                    false,
+                ));
+        }
         "product" => {
             content = content.child(settings_dialog_field(
                 "Scale decimals",
@@ -254,6 +282,34 @@ pub(in crate::root) fn render_price_anchor_product_component_dialog_content(
                     "Inverse oracle",
                     &component.oracle_is_inversed,
                     content_width,
+                ));
+        }
+        "uniswap-v3-twap" => {
+            content = content
+                .child(settings_dialog_field(
+                    "Pool address",
+                    &component.twap_pool_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Base-token address",
+                    &component.twap_base_token_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Quote-token address",
+                    &component.twap_quote_token_address,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Base-token decimals",
+                    &component.twap_base_token_decimals,
+                    false,
+                ))
+                .child(settings_dialog_field(
+                    "Window seconds",
+                    &component.twap_window_seconds,
+                    false,
                 ));
         }
         _ => {
@@ -414,6 +470,7 @@ pub(in crate::root) fn render_price_anchor_entry_summary(
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(price_anchor_summary(
                     &entry.price_anchor,
+                    entry.key.chain_id,
                 ))),
         );
     if entry.token_symbol.is_some() {
@@ -462,11 +519,15 @@ pub(in crate::root) const fn price_anchor_type_display(
     match anchor {
         PriceAnchorSettings::Fixed { .. } => "Fixed",
         PriceAnchorSettings::Oracle { .. } => "Oracle",
+        PriceAnchorSettings::UniswapV3Twap { .. } => "Uniswap V3 TWAP",
         PriceAnchorSettings::Product { .. } => "Product",
     }
 }
 
-pub(in crate::root) fn price_anchor_summary(anchor: &PriceAnchorSettings) -> String {
+pub(in crate::root) fn price_anchor_summary(
+    anchor: &PriceAnchorSettings,
+    owner_chain_id: u64,
+) -> String {
     match anchor {
         PriceAnchorSettings::Fixed { rate } => format!("Fixed rate {rate}"),
         PriceAnchorSettings::Oracle {
@@ -490,6 +551,22 @@ pub(in crate::root) fn price_anchor_summary(anchor: &PriceAnchorSettings) -> Str
         } => format!(
             "Product of {} components, scale {scale_decimals} decimals",
             components.len()
+        ),
+        PriceAnchorSettings::UniswapV3Twap {
+            pool_address,
+            base_token_address,
+            quote_token_address,
+            base_token_decimals,
+            window_seconds,
+        } => format!(
+            "TWAP on {}: {} / {}, pool {}, {} decimals, {} seconds",
+            chain_name(owner_chain_id)
+                .map_or_else(|| owner_chain_id.to_string(), ToString::to_string),
+            short_token_address(base_token_address),
+            short_token_address(quote_token_address),
+            short_token_address(pool_address),
+            base_token_decimals,
+            window_seconds,
         ),
     }
 }
@@ -597,6 +674,10 @@ pub(in crate::root) fn price_anchor_type_select_items() -> Vec<PriceAnchorTypeSe
             label: "Oracle",
         },
         PriceAnchorTypeSelectItem {
+            value: "uniswap-v3-twap",
+            label: "Uniswap V3 TWAP",
+        },
+        PriceAnchorTypeSelectItem {
             value: "product",
             label: "Product",
         },
@@ -612,6 +693,10 @@ pub(in crate::root) fn product_component_type_select_items() -> Vec<PriceAnchorT
         PriceAnchorTypeSelectItem {
             value: "oracle",
             label: "Oracle",
+        },
+        PriceAnchorTypeSelectItem {
+            value: "uniswap-v3-twap",
+            label: "Uniswap V3 TWAP",
         },
     ]
 }

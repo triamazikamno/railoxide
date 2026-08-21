@@ -364,6 +364,19 @@ fn price_anchor_from_static_source(
             oracle_decimals: *oracle_decimals,
             is_inversed: *is_inversed,
         }),
+        TokenAnchorSource::UniswapV3Twap {
+            pool,
+            base_token,
+            quote_token,
+            base_token_decimals,
+            window_seconds,
+        } => Some(PriceAnchorSettings::UniswapV3Twap {
+            pool_address: pool.to_string(),
+            base_token_address: base_token.to_string(),
+            quote_token_address: quote_token.to_string(),
+            base_token_decimals: *base_token_decimals,
+            window_seconds: *window_seconds,
+        }),
         TokenAnchorSource::Product {
             sources,
             scale_decimals,

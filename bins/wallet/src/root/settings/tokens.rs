@@ -171,6 +171,11 @@ pub(in crate::root) fn default_price_anchor_dialog_values() -> PriceAnchorDialog
         oracle_token_decimals: "18".to_string(),
         oracle_decimals: "8".to_string(),
         oracle_is_inversed: false,
+        twap_pool_address: Address::ZERO.to_string(),
+        twap_base_token_address: Address::ZERO.to_string(),
+        twap_quote_token_address: Address::ZERO.to_string(),
+        twap_base_token_decimals: "18".to_string(),
+        twap_window_seconds: "1800".to_string(),
         product_scale_decimals: "18".to_string(),
         product_components: default_price_anchor_component_dialog_values(),
     }
@@ -208,6 +213,24 @@ pub(in crate::root) fn price_anchor_dialog_values_from_override(
             values.oracle_token_decimals = token_decimals.to_string();
             values.oracle_decimals = oracle_decimals.to_string();
             values.oracle_is_inversed = *is_inversed;
+        }
+        PriceAnchorSettings::UniswapV3Twap {
+            pool_address,
+            base_token_address,
+            quote_token_address,
+            base_token_decimals,
+            window_seconds,
+        } => {
+            values.anchor_type = "uniswap-v3-twap";
+            values.twap_pool_address.clone_from(pool_address);
+            values
+                .twap_base_token_address
+                .clone_from(base_token_address);
+            values
+                .twap_quote_token_address
+                .clone_from(quote_token_address);
+            values.twap_base_token_decimals = base_token_decimals.to_string();
+            values.twap_window_seconds = window_seconds.to_string();
         }
         PriceAnchorSettings::Product {
             components,
@@ -265,6 +288,27 @@ pub(in crate::root) fn price_anchor_component_dialog_values_from_anchor(
             oracle_token_decimals: token_decimals.to_string(),
             oracle_decimals: oracle_decimals.to_string(),
             oracle_is_inversed: *is_inversed,
+            ..default_price_anchor_component_dialog_value()
+        },
+        PriceAnchorSettings::UniswapV3Twap {
+            pool_address,
+            base_token_address,
+            quote_token_address,
+            base_token_decimals,
+            window_seconds,
+        } => PriceAnchorComponentDialogValues {
+            anchor_type: "uniswap-v3-twap",
+            fixed_rate: "1000000000000000000".to_string(),
+            oracle_chain_id: railgun_ui::DEFAULT_CHAINS[0],
+            oracle_address: Address::ZERO.to_string(),
+            oracle_token_decimals: "18".to_string(),
+            oracle_decimals: "8".to_string(),
+            oracle_is_inversed: false,
+            twap_pool_address: pool_address.clone(),
+            twap_base_token_address: base_token_address.clone(),
+            twap_quote_token_address: quote_token_address.clone(),
+            twap_base_token_decimals: base_token_decimals.to_string(),
+            twap_window_seconds: window_seconds.to_string(),
         },
         PriceAnchorSettings::Product { .. } => default_price_anchor_component_dialog_value(),
     }
@@ -280,6 +324,11 @@ pub(in crate::root) fn default_price_anchor_component_dialog_value()
         oracle_token_decimals: "18".to_string(),
         oracle_decimals: "8".to_string(),
         oracle_is_inversed: false,
+        twap_pool_address: Address::ZERO.to_string(),
+        twap_base_token_address: Address::ZERO.to_string(),
+        twap_quote_token_address: Address::ZERO.to_string(),
+        twap_base_token_decimals: "18".to_string(),
+        twap_window_seconds: "1800".to_string(),
     }
 }
 
@@ -436,6 +485,31 @@ pub(in crate::root) fn price_anchor_override_from_dialog_inputs(
             .to_string(),
         oracle_decimals: inputs.oracle_decimals.read(cx).value().trim().to_string(),
         oracle_is_inversed,
+        twap_pool_address: inputs.twap_pool_address.read(cx).value().trim().to_string(),
+        twap_base_token_address: inputs
+            .twap_base_token_address
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_quote_token_address: inputs
+            .twap_quote_token_address
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_base_token_decimals: inputs
+            .twap_base_token_decimals
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_window_seconds: inputs
+            .twap_window_seconds
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
         product_scale_decimals: inputs
             .product_scale_decimals
             .read(cx)
@@ -482,6 +556,31 @@ pub(in crate::root) fn price_anchor_component_dialog_values(
             .to_string(),
         oracle_decimals: inputs.oracle_decimals.read(cx).value().trim().to_string(),
         oracle_is_inversed,
+        twap_pool_address: inputs.twap_pool_address.read(cx).value().trim().to_string(),
+        twap_base_token_address: inputs
+            .twap_base_token_address
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_quote_token_address: inputs
+            .twap_quote_token_address
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_base_token_decimals: inputs
+            .twap_base_token_decimals
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
+        twap_window_seconds: inputs
+            .twap_window_seconds
+            .read(cx)
+            .value()
+            .trim()
+            .to_string(),
     })
 }
 
@@ -503,6 +602,20 @@ pub(in crate::root) fn price_anchor_override_from_dialog_values(
             )?,
             oracle_decimals: parse_price_anchor_u8("Oracle decimals", &values.oracle_decimals)?,
             is_inversed: values.oracle_is_inversed,
+        },
+        "uniswap-v3-twap" => PriceAnchorSettings::UniswapV3Twap {
+            pool_address: values.twap_pool_address.trim().to_string(),
+            base_token_address: values.twap_base_token_address.trim().to_string(),
+            quote_token_address: values.twap_quote_token_address.trim().to_string(),
+            base_token_decimals: parse_price_anchor_u8(
+                "TWAP base-token decimals",
+                &values.twap_base_token_decimals,
+            )?,
+            window_seconds: values
+                .twap_window_seconds
+                .trim()
+                .parse::<u32>()
+                .map_err(|error| format!("Invalid TWAP window seconds: {error}"))?,
         },
         "product" => PriceAnchorSettings::Product {
             components: product_components_from_dialog_values(&values.product_components)?,
@@ -555,6 +668,20 @@ pub(in crate::root) fn price_anchor_component_from_dialog_values(
                 &values.oracle_decimals,
             )?,
             is_inversed: values.oracle_is_inversed,
+        }),
+        "uniswap-v3-twap" => Ok(PriceAnchorSettings::UniswapV3Twap {
+            pool_address: values.twap_pool_address.trim().to_string(),
+            base_token_address: values.twap_base_token_address.trim().to_string(),
+            quote_token_address: values.twap_quote_token_address.trim().to_string(),
+            base_token_decimals: parse_price_anchor_u8(
+                "TWAP base-token decimals",
+                &values.twap_base_token_decimals,
+            )?,
+            window_seconds: values
+                .twap_window_seconds
+                .trim()
+                .parse::<u32>()
+                .map_err(|error| format!("Invalid TWAP window seconds: {error}"))?,
         }),
         _ => Ok(PriceAnchorSettings::Fixed {
             rate: values.fixed_rate.trim().to_string(),

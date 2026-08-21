@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr};
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use railgun_ui::{
     NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, lookup_token,
     native_usd_anchor_entries, native_usd_micro_value, token_anchor_entries, token_usd_micro_value,
@@ -25,6 +26,8 @@ use tokio::time::{Instant, sleep_until, timeout};
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings};
 use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
 
+mod uniswap_v3_twap;
+
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
 const BPS_DENOMINATOR: U256 = alloy::uint!(10_000_U256);
 const TOKEN_ANCHOR_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
@@ -36,6 +39,11 @@ const TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 sol! {
     interface AggregatorInterface {
         function latestAnswer() external view returns (int256);
+    }
+    interface UniswapV3PoolInterface {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function observe(uint32[] secondsAgos) external view returns (int56[] tickCumulatives, uint160[] secondsPerLiquidityCumulativeX128s);
     }
 }
 
@@ -161,10 +169,47 @@ enum RuntimeTokenAnchorSource {
         oracle_decimals: u8,
         is_inversed: bool,
     },
+    UniswapV3Twap {
+        pool: Address,
+        base_token: Address,
+        quote_token: Address,
+        base_token_decimals: u8,
+        window_seconds: u32,
+    },
     Product {
         sources: Vec<Self>,
         scale_decimals: u8,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolKey {
+    chain_id: u64,
+    pool: Address,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ObservationKey {
+    chain_id: u64,
+    pool: Address,
+    window_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PoolMetadata {
+    token0: Address,
+    token1: Address,
+}
+
+#[derive(Debug, Clone)]
+struct TwapObservation {
+    tick_cumulatives: Vec<i128>,
+}
+
+#[derive(Debug, Default)]
+struct TwapFetchedInputs {
+    metadata: BTreeMap<PoolKey, PoolMetadata>,
+    observations: BTreeMap<ObservationKey, TwapObservation>,
 }
 
 impl TokenAnchorKey {
@@ -373,57 +418,55 @@ pub async fn refresh_token_anchor_rates(
         chain_count = chain_ids.len(),
         "token anchor refresh started"
     );
-    let mut entries_by_chain: BTreeMap<u64, Vec<RuntimeTokenAnchorInfo>> = BTreeMap::new();
-    for entry in token_anchor_entries_for_chains(chain_ids, token_registry) {
-        entries_by_chain
-            .entry(entry.chain_id)
-            .or_default()
-            .push(entry);
-    }
-    let mut native_entries_by_chain: BTreeMap<u64, Vec<RuntimeNativeUsdAnchorInfo>> =
-        BTreeMap::new();
-    for entry in native_usd_anchor_entries_for_chains(chain_ids) {
-        native_entries_by_chain
-            .entry(entry.chain_id)
-            .or_default()
-            .push(entry);
-    }
-
-    let refresh_chain_ids = entries_by_chain
-        .keys()
-        .chain(native_entries_by_chain.keys())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut refreshes = Vec::with_capacity(refresh_chain_ids.len());
-    for chain_id in refresh_chain_ids {
-        let entries = entries_by_chain.remove(&chain_id).unwrap_or_default();
-        let native_entries = native_entries_by_chain
-            .remove(&chain_id)
-            .unwrap_or_default();
-        refreshes.push(async move {
-            if timeout(
-                TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT,
-                refresh_token_anchor_rates_for_chain(
-                    cache,
-                    chain_id,
-                    &entries,
-                    &native_entries,
-                    effective_chains,
-                    http,
-                ),
-            )
-            .await
-            .is_err()
-            {
-                tracing::warn!(
-                    chain_id,
-                    timeout_secs = TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT.as_secs(),
-                    "token anchor chain refresh timed out"
-                );
-            }
-        });
-    }
-    join_all(refreshes).await;
+    let entries = token_anchor_entries_for_chains(chain_ids, token_registry);
+    let native_entries = native_usd_anchor_entries_for_chains(chain_ids);
+    let oracle_addresses_by_chain =
+        oracle_addresses_for_token_and_native_entries(&entries, &native_entries);
+    let (pool_keys, observation_keys) = twap_keys_for_entries(&entries, &native_entries);
+    refresh_token_anchor_rates_with_fetch(
+        cache,
+        &entries,
+        &native_entries,
+        oracle_addresses_by_chain,
+        pool_keys,
+        observation_keys,
+        TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT,
+        |plan| {
+            Box::pin(async move {
+                match plan {
+                    AnchorSourcePlan::Chainlink {
+                        chain_id,
+                        addresses,
+                    } => AnchorSourceResult::Chainlink {
+                        chain_id,
+                        result: fetch_oracle_answers_for_chain(
+                            chain_id,
+                            &addresses,
+                            effective_chains,
+                            http,
+                        )
+                        .await,
+                    },
+                    AnchorSourcePlan::Twap {
+                        chain_id,
+                        pools,
+                        observations,
+                    } => AnchorSourceResult::Twap {
+                        chain_id,
+                        result: fetch_twap_inputs_for_chain(
+                            chain_id,
+                            &pools,
+                            &observations,
+                            effective_chains,
+                            http,
+                        )
+                        .await,
+                    },
+                }
+            })
+        },
+    )
+    .await;
     let missing_native_usd_rates = chain_ids
         .iter()
         .filter(|chain_id| cache.cached_native_usd_rate(**chain_id).is_none())
@@ -436,67 +479,127 @@ pub async fn refresh_token_anchor_rates(
     cache.notify_refreshed();
 }
 
-async fn refresh_token_anchor_rates_for_chain(
-    cache: &TokenAnchorRateCache,
-    chain_id: u64,
-    entries: &[RuntimeTokenAnchorInfo],
-    native_entries: &[RuntimeNativeUsdAnchorInfo],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
-    http: &HttpContext,
-) {
-    let oracle_addresses_by_chain =
-        oracle_addresses_for_token_and_native_entries(entries, native_entries);
-    refresh_token_anchor_rates_for_chain_with_fetch(
-        cache,
-        chain_id,
-        entries,
-        native_entries,
-        oracle_addresses_by_chain,
-        move |oracle_chain_id, oracle_addresses| async move {
-            fetch_oracle_answers_for_chain(
-                oracle_chain_id,
-                &oracle_addresses,
-                effective_chains,
-                http,
-            )
-            .await
-        },
-    )
-    .await;
+enum AnchorSourcePlan {
+    Chainlink {
+        chain_id: u64,
+        addresses: Vec<Address>,
+    },
+    Twap {
+        chain_id: u64,
+        pools: Vec<PoolKey>,
+        observations: Vec<ObservationKey>,
+    },
 }
 
-async fn refresh_token_anchor_rates_for_chain_with_fetch<F, Fut>(
+enum AnchorSourceResult {
+    Chainlink {
+        chain_id: u64,
+        result: Result<BTreeMap<Address, U256>>,
+    },
+    Twap {
+        chain_id: u64,
+        result: Result<TwapFetchedInputs>,
+    },
+}
+
+type AnchorSourceFuture<'a> = Pin<Box<dyn Future<Output = AnchorSourceResult> + Send + 'a>>;
+
+async fn refresh_token_anchor_rates_with_fetch<'a, F>(
     cache: &TokenAnchorRateCache,
-    chain_id: u64,
     entries: &[RuntimeTokenAnchorInfo],
     native_entries: &[RuntimeNativeUsdAnchorInfo],
     oracle_addresses_by_chain: BTreeMap<u64, Vec<Address>>,
-    mut fetch_oracle_answers: F,
+    pool_keys: BTreeSet<PoolKey>,
+    observation_keys: BTreeSet<ObservationKey>,
+    deadline: Duration,
+    mut fetch: F,
 ) where
-    F: FnMut(u64, Vec<Address>) -> Fut,
-    Fut: Future<Output = Result<BTreeMap<Address, U256>>>,
+    F: FnMut(AnchorSourcePlan) -> AnchorSourceFuture<'a>,
 {
     let mut oracle_answers = BTreeMap::new();
-    for (oracle_chain_id, oracle_addresses) in oracle_addresses_by_chain {
-        match fetch_oracle_answers(oracle_chain_id, oracle_addresses).await {
-            Ok(answers) => {
-                for (oracle_address, answer) in answers {
-                    oracle_answers.insert((oracle_chain_id, oracle_address), answer);
-                }
-                store_anchor_rates_from_entries(cache, entries, &oracle_answers);
-                store_native_usd_rates_from_entries(cache, native_entries, &oracle_answers);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    chain_id,
-                    oracle_chain_id,
-                    "failed to refresh token anchor oracles"
-                );
-            }
-        }
+    let mut twap_inputs = TwapFetchedInputs::default();
+    store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
+    store_native_usd_rates_from_entries_with_inputs(
+        cache,
+        native_entries,
+        &oracle_answers,
+        &twap_inputs,
+    );
+
+    let mut pending = FuturesUnordered::new();
+    for (chain_id, addresses) in oracle_addresses_by_chain {
+        pending.push(fetch(AnchorSourcePlan::Chainlink {
+            chain_id,
+            addresses,
+        }));
     }
-    store_anchor_rates_from_entries(cache, entries, &oracle_answers);
-    store_native_usd_rates_from_entries(cache, native_entries, &oracle_answers);
+    let mut twap_chains = BTreeSet::new();
+    twap_chains.extend(pool_keys.iter().map(|key| key.chain_id));
+    twap_chains.extend(observation_keys.iter().map(|key| key.chain_id));
+    for chain_id in twap_chains {
+        pending.push(fetch(AnchorSourcePlan::Twap {
+            chain_id,
+            pools: pool_keys
+                .iter()
+                .copied()
+                .filter(|key| key.chain_id == chain_id)
+                .collect(),
+            observations: observation_keys
+                .iter()
+                .copied()
+                .filter(|key| key.chain_id == chain_id)
+                .collect(),
+        }));
+    }
+
+    let deadline = Instant::now() + deadline;
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, pending.next()).await {
+        match result {
+            AnchorSourceResult::Chainlink { chain_id, result } => match result {
+                Ok(answers) => {
+                    oracle_answers.extend(
+                        answers
+                            .into_iter()
+                            .map(|(address, answer)| ((chain_id, address), answer)),
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        source_kind = "chainlink",
+                        chain_id,
+                        "anchor source fetch failed"
+                    );
+                }
+            },
+            AnchorSourceResult::Twap { chain_id, result } => match result {
+                Ok(inputs) => {
+                    twap_inputs.metadata.extend(inputs.metadata);
+                    twap_inputs.observations.extend(inputs.observations);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        source_kind = "uniswap_v3_twap",
+                        chain_id,
+                        "anchor source fetch failed"
+                    );
+                }
+            },
+        }
+        store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
+        store_native_usd_rates_from_entries_with_inputs(
+            cache,
+            native_entries,
+            &oracle_answers,
+            &twap_inputs,
+        );
+    }
+    store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
+    store_native_usd_rates_from_entries_with_inputs(
+        cache,
+        native_entries,
+        &oracle_answers,
+        &twap_inputs,
+    );
 }
 
 async fn fetch_oracle_answers_for_chain(
@@ -705,6 +808,19 @@ fn static_anchor_source_to_runtime(
             oracle_decimals: *oracle_decimals,
             is_inversed: *is_inversed,
         },
+        TokenAnchorSource::UniswapV3Twap {
+            pool,
+            base_token,
+            quote_token,
+            base_token_decimals,
+            window_seconds,
+        } => RuntimeTokenAnchorSource::UniswapV3Twap {
+            pool: *pool,
+            base_token: *base_token,
+            quote_token: *quote_token,
+            base_token_decimals: *base_token_decimals,
+            window_seconds: *window_seconds,
+        },
         TokenAnchorSource::Product {
             sources,
             scale_decimals,
@@ -743,6 +859,19 @@ fn price_anchor_to_runtime_source(
             token_decimals: *token_decimals,
             oracle_decimals: *oracle_decimals,
             is_inversed: *is_inversed,
+        }),
+        PriceAnchorSettings::UniswapV3Twap {
+            pool_address,
+            base_token_address,
+            quote_token_address,
+            base_token_decimals,
+            window_seconds,
+        } => Some(RuntimeTokenAnchorSource::UniswapV3Twap {
+            pool: Address::from_str(pool_address).ok()?,
+            base_token: Address::from_str(base_token_address).ok()?,
+            quote_token: Address::from_str(quote_token_address).ok()?,
+            base_token_decimals: *base_token_decimals,
+            window_seconds: *window_seconds,
         }),
         PriceAnchorSettings::Product {
             components,
@@ -797,7 +926,8 @@ fn collect_oracle_addresses_from_source(
     addresses: &mut BTreeMap<u64, BTreeSet<Address>>,
 ) {
     match source {
-        RuntimeTokenAnchorSource::Fixed { .. } => {}
+        RuntimeTokenAnchorSource::Fixed { .. } | RuntimeTokenAnchorSource::UniswapV3Twap { .. } => {
+        }
         RuntimeTokenAnchorSource::ChainlinkOracle { chain_id, addr, .. } => {
             addresses.entry(*chain_id).or_default().insert(*addr);
         }
@@ -809,47 +939,283 @@ fn collect_oracle_addresses_from_source(
     }
 }
 
-fn store_anchor_rates_from_entries(
+fn collect_twap_keys_from_source(
+    owner_chain_id: u64,
+    source: &RuntimeTokenAnchorSource,
+    pools: &mut BTreeSet<PoolKey>,
+    observations: &mut BTreeSet<ObservationKey>,
+) {
+    match source {
+        RuntimeTokenAnchorSource::UniswapV3Twap {
+            pool,
+            window_seconds,
+            ..
+        } => {
+            pools.insert(PoolKey {
+                chain_id: owner_chain_id,
+                pool: *pool,
+            });
+            observations.insert(ObservationKey {
+                chain_id: owner_chain_id,
+                pool: *pool,
+                window_seconds: *window_seconds,
+            });
+        }
+        RuntimeTokenAnchorSource::Product { sources, .. } => {
+            for source in sources {
+                collect_twap_keys_from_source(owner_chain_id, source, pools, observations);
+            }
+        }
+        RuntimeTokenAnchorSource::Fixed { .. }
+        | RuntimeTokenAnchorSource::ChainlinkOracle { .. } => {}
+    }
+}
+
+fn twap_keys_for_entries(
+    entries: &[RuntimeTokenAnchorInfo],
+    native_entries: &[RuntimeNativeUsdAnchorInfo],
+) -> (BTreeSet<PoolKey>, BTreeSet<ObservationKey>) {
+    let mut pools = BTreeSet::new();
+    let mut observations = BTreeSet::new();
+    for entry in entries {
+        for source in &entry.anchor_sources {
+            collect_twap_keys_from_source(entry.chain_id, source, &mut pools, &mut observations);
+        }
+    }
+    for entry in native_entries {
+        for source in &entry.anchor_sources {
+            collect_twap_keys_from_source(entry.chain_id, source, &mut pools, &mut observations);
+        }
+    }
+    (pools, observations)
+}
+
+async fn fetch_twap_inputs_for_chain(
+    chain_id: u64,
+    pools: &[PoolKey],
+    observations: &[ObservationKey],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    http: &HttpContext,
+) -> Result<TwapFetchedInputs> {
+    fetch_twap_inputs_for_chain_with_timeout(
+        chain_id,
+        pools,
+        observations,
+        effective_chains,
+        http,
+        TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_twap_inputs_for_chain_with_timeout(
+    chain_id: u64,
+    pools: &[PoolKey],
+    observations: &[ObservationKey],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    http: &HttpContext,
+    request_timeout: Duration,
+) -> Result<TwapFetchedInputs> {
+    if pools.is_empty() && observations.is_empty() {
+        return Ok(TwapFetchedInputs::default());
+    }
+    let (query_rpc_pool, multicall_addr) = provider_for_chain(chain_id, effective_chains, http)?;
+    let mut last_error = None;
+    let mut selected = None;
+    for provider_handle in query_rpc_pool.available_providers() {
+        let mut metadata_call = provider_handle
+            .provider
+            .multicall()
+            .dynamic::<UniswapV3PoolInterface::token0Call>()
+            .address(multicall_addr);
+        for pool in pools {
+            metadata_call = metadata_call.add_call_dynamic(CallItem::new(
+                pool.pool,
+                UniswapV3PoolInterface::token0Call {}.abi_encode().into(),
+            ));
+            metadata_call = metadata_call.add_call_dynamic(CallItem::new(
+                pool.pool,
+                UniswapV3PoolInterface::token1Call {}.abi_encode().into(),
+            ));
+        }
+        let mut observation_call = provider_handle
+            .provider
+            .multicall()
+            .dynamic::<UniswapV3PoolInterface::observeCall>()
+            .address(multicall_addr);
+        for observation in observations {
+            observation_call = observation_call.add_call_dynamic(CallItem::new(
+                observation.pool,
+                UniswapV3PoolInterface::observeCall {
+                    secondsAgos: vec![observation.window_seconds, 0],
+                }
+                .abi_encode()
+                .into(),
+            ));
+        }
+        let calls = async {
+            let metadata = metadata_call
+                .try_aggregate(false)
+                .await
+                .map_err(|error| eyre::eyre!("metadata batch: {error}"))?;
+            let observations = observation_call
+                .try_aggregate(false)
+                .await
+                .map_err(|error| eyre::eyre!("observation batch: {error}"))?;
+            Ok::<_, eyre::Report>((metadata, observations))
+        };
+        match timeout(request_timeout, calls).await {
+            Ok(Ok(values)) => {
+                selected = Some(values);
+                break;
+            }
+            Ok(Err(error)) => {
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre::eyre!("uniswap v3 multicall failed: {error}"));
+            }
+            Err(_) => {
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre::eyre!("uniswap v3 multicall timed out"));
+            }
+        }
+    }
+    let (metadata_results, observation_results) = selected.ok_or_else(|| {
+        last_error
+            .unwrap_or_else(|| eyre::eyre!("no healthy query RPC available for chain {chain_id}"))
+    })?;
+    let mut fetched = TwapFetchedInputs::default();
+    for (pair, key) in metadata_results.chunks_exact(2).zip(pools.iter().copied()) {
+        let (Ok(token0), Ok(token1)) = (pair[0].clone(), pair[1].clone()) else {
+            continue;
+        };
+        fetched
+            .metadata
+            .insert(key, PoolMetadata { token0, token1 });
+    }
+    for (result, key) in observation_results
+        .into_iter()
+        .zip(observations.iter().copied())
+    {
+        let Ok(decoded) = result else { continue };
+        if decoded.tickCumulatives.len() == 2 {
+            let Ok(tick_cumulatives) = decoded
+                .tickCumulatives
+                .into_iter()
+                .map(i128::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+            else {
+                continue;
+            };
+            fetched
+                .observations
+                .insert(key, TwapObservation { tick_cumulatives });
+        }
+    }
+    Ok(fetched)
+}
+
+fn store_anchor_rates_from_entries_with_inputs(
     cache: &TokenAnchorRateCache,
     entries: &[RuntimeTokenAnchorInfo],
     oracle_answers: &BTreeMap<(u64, Address), U256>,
+    twap_inputs: &TwapFetchedInputs,
 ) {
     for entry in entries {
-        let rates = anchor_rates_from_sources(&entry.anchor_sources, oracle_answers);
+        let rates = anchor_rates_from_sources_with_inputs(
+            entry.chain_id,
+            &entry.anchor_sources,
+            oracle_answers,
+            twap_inputs,
+        );
         if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
             cache.store_rate(entry.chain_id, entry.token, rate);
         }
     }
 }
 
-fn store_native_usd_rates_from_entries(
+fn store_native_usd_rates_from_entries_with_inputs(
     cache: &TokenAnchorRateCache,
     entries: &[RuntimeNativeUsdAnchorInfo],
     oracle_answers: &BTreeMap<(u64, Address), U256>,
+    twap_inputs: &TwapFetchedInputs,
 ) {
     for entry in entries {
-        let rates = anchor_rates_from_sources(&entry.anchor_sources, oracle_answers);
+        let rates = anchor_rates_from_sources_with_inputs(
+            entry.chain_id,
+            &entry.anchor_sources,
+            oracle_answers,
+            twap_inputs,
+        );
         if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
             cache.store_native_usd_rate(entry.chain_id, rate);
         }
     }
 }
 
-fn anchor_rates_from_sources(
+fn anchor_rates_from_sources_with_inputs(
+    owner_chain_id: u64,
     sources: &[RuntimeTokenAnchorSource],
     oracle_answers: &BTreeMap<(u64, Address), U256>,
+    twap_inputs: &TwapFetchedInputs,
 ) -> Vec<U256> {
     sources
         .iter()
-        .filter_map(|source| anchor_rate_from_source(source, oracle_answers))
+        .filter_map(|source| {
+            anchor_rate_from_source_with_inputs(owner_chain_id, source, oracle_answers, twap_inputs)
+        })
         .collect()
 }
 
-fn anchor_rate_from_source(
+fn anchor_rate_from_source_with_inputs(
+    owner_chain_id: u64,
     source: &RuntimeTokenAnchorSource,
     oracle_answers: &BTreeMap<(u64, Address), U256>,
+    twap_inputs: &TwapFetchedInputs,
 ) -> Option<U256> {
     match source {
+        RuntimeTokenAnchorSource::UniswapV3Twap {
+            pool,
+            base_token,
+            quote_token,
+            base_token_decimals,
+            window_seconds,
+        } => {
+            let pool_key = PoolKey {
+                chain_id: owner_chain_id,
+                pool: *pool,
+            };
+            let metadata = twap_inputs.metadata.get(&pool_key)?;
+            let base_is_token0 =
+                if metadata.token0 == *base_token && metadata.token1 == *quote_token {
+                    true
+                } else if metadata.token0 == *quote_token && metadata.token1 == *base_token {
+                    false
+                } else {
+                    return None;
+                };
+            let observation_key = ObservationKey {
+                chain_id: owner_chain_id,
+                pool: *pool,
+                window_seconds: *window_seconds,
+            };
+            let observation = twap_inputs.observations.get(&observation_key)?;
+            uniswap_v3_twap::quote_from_observation(
+                &observation.tick_cumulatives,
+                *window_seconds,
+                base_is_token0,
+                *base_token_decimals,
+            )
+        }
+        RuntimeTokenAnchorSource::Product {
+            sources,
+            scale_decimals,
+        } => product_anchor_rate_with_inputs(
+            owner_chain_id,
+            sources,
+            *scale_decimals,
+            oracle_answers,
+            twap_inputs,
+        ),
         RuntimeTokenAnchorSource::Fixed {
             token_fee_per_unit_gas,
         } => non_zero_rate(*token_fee_per_unit_gas),
@@ -862,22 +1228,20 @@ fn anchor_rate_from_source(
         } => oracle_answers.get(&(*chain_id, *addr)).and_then(|price| {
             oracle_answer_to_anchor_rate(*price, *token_decimals, *oracle_decimals, *is_inversed)
         }),
-        RuntimeTokenAnchorSource::Product {
-            sources,
-            scale_decimals,
-        } => product_anchor_rate(sources, *scale_decimals, oracle_answers),
     }
 }
 
-fn product_anchor_rate(
+fn product_anchor_rate_with_inputs(
+    owner_chain_id: u64,
     sources: &[RuntimeTokenAnchorSource],
     scale_decimals: u8,
     oracle_answers: &BTreeMap<(u64, Address), U256>,
+    twap_inputs: &TwapFetchedInputs,
 ) -> Option<U256> {
     let scale = checked_pow10(scale_decimals)?;
-    let mut rates = sources
-        .iter()
-        .map(|source| anchor_rate_from_source(source, oracle_answers));
+    let mut rates = sources.iter().map(|source| {
+        anchor_rate_from_source_with_inputs(owner_chain_id, source, oracle_answers, twap_inputs)
+    });
     let mut product = rates.next()??;
     for rate in rates {
         product = product.checked_mul(rate?)?.checked_div(scale)?;
@@ -901,7 +1265,9 @@ pub fn fixed_token_anchor_rate(chain_id: u64, token: Address) -> Option<U256> {
             TokenAnchorSource::Fixed {
                 token_fee_per_unit_gas,
             } => Some(*token_fee_per_unit_gas),
-            TokenAnchorSource::ChainlinkOracle { .. } | TokenAnchorSource::Product { .. } => None,
+            TokenAnchorSource::ChainlinkOracle { .. }
+            | TokenAnchorSource::UniswapV3Twap { .. }
+            | TokenAnchorSource::Product { .. } => None,
         })
 }
 
@@ -998,9 +1364,18 @@ fn non_zero_rate(rate: U256) -> Option<U256> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::{Arc as SharedArc, Mutex, mpsc};
+    use std::thread;
+
     use alloy::primitives::address;
+    use alloy::primitives::aliases::I56;
+    use alloy::primitives::{Bytes, U160};
     use alloy::uint;
     use railgun_ui::WRAPPED_NATIVE_FEE_RATE;
+    use serde_json::{Value, json};
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
 
@@ -1034,6 +1409,179 @@ mod tests {
         sources: ARB_PER_ETH_PRODUCT_SOURCES,
         scale_decimals: 18,
     }];
+
+    const TWAP_POOL: Address = address!("0x0000000000000000000000000000000000000400");
+    const TWAP_BASE: Address = address!("0x0000000000000000000000000000000000000401");
+    const TWAP_QUOTE: Address = address!("0x0000000000000000000000000000000000000402");
+
+    fn twap_source(window_seconds: u32) -> RuntimeTokenAnchorSource {
+        RuntimeTokenAnchorSource::UniswapV3Twap {
+            pool: TWAP_POOL,
+            base_token: TWAP_BASE,
+            quote_token: TWAP_QUOTE,
+            base_token_decimals: 18,
+            window_seconds,
+        }
+    }
+
+    fn spawn_twap_rpc_fixture(
+        multicall: Address,
+        base: Address,
+        quote: Address,
+        expected_window_seconds: u32,
+        request_count: usize,
+        fail_second: bool,
+    ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TWAP RPC fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept fixture request");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut buffer).expect("read fixture headers");
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = index + 4;
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().expect("content length"))
+                            })
+                            .expect("content length");
+                        break (end, length);
+                    }
+                };
+                while bytes.len() < header_end + content_length {
+                    let read = stream.read(&mut buffer).expect("read fixture body");
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let request: Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .expect("fixture JSON");
+                request_tx
+                    .send(request.clone())
+                    .expect("record fixture request");
+                let params = request["params"][0].clone();
+                assert_eq!(
+                    params["to"]
+                        .as_str()
+                        .and_then(|value| value.parse::<Address>().ok()),
+                    Some(multicall)
+                );
+                let call_data = params
+                    .get("input")
+                    .or_else(|| params.get("data"))
+                    .and_then(Value::as_str)
+                    .expect("eth_call calldata missing input/data");
+                let mut metadata = false;
+                let mut observation = false;
+                let call_bytes = call_data
+                    .parse::<alloy::primitives::Bytes>()
+                    .expect("call bytes");
+                let decoded =
+                    alloy::providers::bindings::IMulticall3::tryAggregateCall::abi_decode(
+                        &call_bytes,
+                    )
+                    .expect("tryAggregate calldata");
+                let call_count = decoded.calls.len();
+                for call in decoded.calls {
+                    if call
+                        .callData
+                        .starts_with(&UniswapV3PoolInterface::token0Call::SELECTOR)
+                        || call
+                            .callData
+                            .starts_with(&UniswapV3PoolInterface::token1Call::SELECTOR)
+                    {
+                        metadata = true;
+                    }
+                    if call
+                        .callData
+                        .starts_with(&UniswapV3PoolInterface::observeCall::SELECTOR)
+                    {
+                        observation = true;
+                        let decoded =
+                            UniswapV3PoolInterface::observeCall::abi_decode(&call.callData)
+                                .expect("observe calldata");
+                        assert_eq!(decoded.secondsAgos, vec![expected_window_seconds, 0]);
+                    }
+                }
+                assert_ne!(metadata, observation, "exactly two homogeneous batches");
+                let returns = if metadata {
+                    (0..call_count)
+                        .map(|index| {
+                            let success = !(fail_second && index >= 2);
+                            let return_data = if !success {
+                                Bytes::new()
+                            } else if index % 2 == 0 {
+                                UniswapV3PoolInterface::token0Call::abi_encode_returns(&base).into()
+                            } else {
+                                UniswapV3PoolInterface::token1Call::abi_encode_returns(&quote)
+                                    .into()
+                            };
+                            alloy::providers::bindings::IMulticall3::Result {
+                                success,
+                                returnData: return_data,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    type ObserveReturn = <UniswapV3PoolInterface::observeCall as SolCall>::Return;
+                    let decoded = ObserveReturn {
+                        tickCumulatives: vec![I56::ZERO, I56::ZERO],
+                        secondsPerLiquidityCumulativeX128s: vec![U160::ZERO, U160::ZERO],
+                    };
+                    (0..call_count)
+                        .map(|index| alloy::providers::bindings::IMulticall3::Result {
+                            success: !(fail_second && index >= 1),
+                            returnData: if fail_second && index >= 1 {
+                                Bytes::new()
+                            } else {
+                                UniswapV3PoolInterface::observeCall::abi_encode_returns(&decoded)
+                                    .into()
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let response =
+                    alloy::providers::bindings::IMulticall3::tryAggregateCall::abi_encode_returns(
+                        &returns,
+                    );
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": format!("0x{}", alloy::hex::encode(response)),
+                });
+                let body = serde_json::to_string(&body).expect("fixture response");
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write fixture response");
+            }
+        });
+        (url, request_rx, task)
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter(SharedArc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn runtime_sources(sources: &[TokenAnchorSource]) -> Vec<RuntimeTokenAnchorSource> {
         sources
@@ -1112,12 +1660,74 @@ mod tests {
         };
         cache.store_rate(1, token, uint!(123_U256));
 
-        store_anchor_rates_from_entries(&cache, &[entry], &BTreeMap::new());
+        store_anchor_rates_from_entries_with_inputs(
+            &cache,
+            &[entry],
+            &BTreeMap::new(),
+            &TwapFetchedInputs::default(),
+        );
 
         assert_eq!(cache.cached_rate(1, token), Some(uint!(123_U256)));
         assert_eq!(
             cache.cached_rate(1, address!("0x0000000000000000000000000000000000000002")),
             None
+        );
+        let twap_token = address!("0x0000000000000000000000000000000000000003");
+        let twap_entry = RuntimeTokenAnchorInfo {
+            chain_id: 1,
+            token: twap_token,
+            anchor_sources: vec![twap_source(1_800)],
+        };
+
+        store_anchor_rates_from_entries_with_inputs(
+            &cache,
+            std::slice::from_ref(&twap_entry),
+            &BTreeMap::new(),
+            &TwapFetchedInputs::default(),
+        );
+        assert_eq!(cache.cached_rate(1, twap_token), None);
+
+        let mut usable_inputs = TwapFetchedInputs::default();
+        usable_inputs.metadata.insert(
+            PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            },
+            PoolMetadata {
+                token0: TWAP_BASE,
+                token1: TWAP_QUOTE,
+            },
+        );
+        usable_inputs.observations.insert(
+            ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            },
+            TwapObservation {
+                tick_cumulatives: vec![0, 0],
+            },
+        );
+        store_anchor_rates_from_entries_with_inputs(
+            &cache,
+            std::slice::from_ref(&twap_entry),
+            &BTreeMap::new(),
+            &usable_inputs,
+        );
+        assert_eq!(
+            cache.cached_rate(1, twap_token),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+
+        store_anchor_rates_from_entries_with_inputs(
+            &cache,
+            std::slice::from_ref(&twap_entry),
+            &BTreeMap::new(),
+            &TwapFetchedInputs::default(),
+        );
+        assert_eq!(
+            cache.cached_rate(1, twap_token),
+            Some(uint!(1_000_000_000_000_000_000_U256))
         );
     }
 
@@ -1206,6 +1816,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn twap_multicall_timeout_bounds_unresponsive_provider() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind unresponsive RPC listener");
+        let rpc_url = format!(
+            "http://{}",
+            listener.local_addr().expect("RPC listener address")
+        );
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&1)
+            .expect("Ethereum config")
+            .rpc_endpoints = vec![rpc_url];
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+        let error = fetch_twap_inputs_for_chain_with_timeout(
+            1,
+            &[PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            }],
+            &[ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            }],
+            &effective_chains,
+            &http,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("unresponsive TWAP RPC must time out");
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn twap_fetch_decodes_two_typed_batches_and_routes_non_ethereum_chain() {
+        let multicall = address!("0x0000000000000000000000000000000000000600");
+        let (rpc_url, requests, server) =
+            spawn_twap_rpc_fixture(multicall, TWAP_BASE, TWAP_QUOTE, 1_800, 2, false);
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .rpc_endpoints = vec![rpc_url];
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .multicall_contract = multicall.to_string();
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+        let pool_key = PoolKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+        };
+        let observation_key = ObservationKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+            window_seconds: 1_800,
+        };
+        let inputs = fetch_twap_inputs_for_chain_with_timeout(
+            42161,
+            &[pool_key],
+            &[observation_key],
+            &effective_chains,
+            &http,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("typed TWAP batches");
+        assert_eq!(
+            inputs
+                .metadata
+                .get(&pool_key)
+                .map(|metadata| metadata.token0),
+            Some(TWAP_BASE)
+        );
+        assert_eq!(
+            inputs
+                .metadata
+                .get(&pool_key)
+                .map(|metadata| metadata.token1),
+            Some(TWAP_QUOTE)
+        );
+        assert_eq!(
+            inputs
+                .observations
+                .get(&observation_key)
+                .map(|observation| observation.tick_cumulatives.as_slice()),
+            Some([0_i128, 0_i128].as_slice())
+        );
+        for label in ["metadata request", "observation request"] {
+            assert_eq!(
+                requests.recv().expect(label)["params"][0]["to"]
+                    .as_str()
+                    .and_then(|value| value.parse::<Address>().ok()),
+                Some(multicall)
+            );
+        }
+        server.join().expect("fixture server");
+    }
+
+    #[tokio::test]
+    async fn twap_fetch_isolates_individual_pool_and_observation_reverts() {
+        let multicall = address!("0x0000000000000000000000000000000000000601");
+        let (rpc_url, _requests, server) =
+            spawn_twap_rpc_fixture(multicall, TWAP_BASE, TWAP_QUOTE, 1_800, 2, true);
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .rpc_endpoints = vec![rpc_url];
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .multicall_contract = multicall.to_string();
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+        let first_pool = PoolKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+        };
+        let second_pool = PoolKey {
+            chain_id: 42161,
+            pool: address!("0x0000000000000000000000000000000000000403"),
+        };
+        let first_observation = ObservationKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+            window_seconds: 1_800,
+        };
+        let second_observation = ObservationKey {
+            chain_id: 42161,
+            pool: second_pool.pool,
+            window_seconds: 1_800,
+        };
+        let inputs = fetch_twap_inputs_for_chain_with_timeout(
+            42161,
+            &[first_pool, second_pool],
+            &[first_observation, second_observation],
+            &effective_chains,
+            &http,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("partial TWAP batches");
+        assert!(inputs.metadata.contains_key(&first_pool));
+        assert!(!inputs.metadata.contains_key(&second_pool));
+        assert!(inputs.observations.contains_key(&first_observation));
+        assert!(!inputs.observations.contains_key(&second_observation));
+        server.join().expect("fixture server");
+    }
+
+    #[tokio::test]
+    async fn twap_fetch_marks_failed_provider_and_fails_over_deterministically() {
+        let multicall = address!("0x0000000000000000000000000000000000000602");
+        let dead_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("dead provider");
+        let dead_url = format!(
+            "http://{}",
+            dead_listener.local_addr().expect("dead address")
+        );
+        drop(dead_listener);
+        let (healthy_url, requests, server) =
+            spawn_twap_rpc_fixture(multicall, TWAP_BASE, TWAP_QUOTE, 1_800, 2, false);
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .rpc_endpoints = vec![dead_url, healthy_url];
+        effective_chains
+            .get_mut(&42161)
+            .expect("Arbitrum config")
+            .multicall_contract = multicall.to_string();
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+        let pool_key = PoolKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+        };
+        let observation_key = ObservationKey {
+            chain_id: 42161,
+            pool: TWAP_POOL,
+            window_seconds: 1_800,
+        };
+        let inputs = fetch_twap_inputs_for_chain_with_timeout(
+            42161,
+            &[pool_key],
+            &[observation_key],
+            &effective_chains,
+            &http,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("healthy failover result");
+        assert!(inputs.metadata.contains_key(&pool_key));
+        assert!(inputs.observations.contains_key(&observation_key));
+        assert!(requests.recv().is_ok());
+        assert!(requests.recv().is_ok());
+        server.join().expect("fixture server");
+    }
+
+    #[tokio::test]
     async fn successful_oracle_chain_rates_survive_later_source_timeout() {
         let cache = TokenAnchorRateCache::new();
         let token = address!("0x0000000000000000000000000000000000000001");
@@ -1244,28 +2087,44 @@ mod tests {
         let oracle_addresses_by_chain =
             oracle_addresses_for_token_and_native_entries(&entries, &native_entries);
 
-        let refresh = refresh_token_anchor_rates_for_chain_with_fetch(
+        let refresh = refresh_token_anchor_rates_with_fetch(
             &cache,
-            42,
             &entries,
             &native_entries,
             oracle_addresses_by_chain,
-            move |oracle_chain_id, oracle_addresses| async move {
-                if oracle_chain_id == 1 {
-                    assert_eq!(oracle_addresses, vec![successful_oracle]);
-                    Ok(BTreeMap::from([(
-                        successful_oracle,
-                        uint!(3_000_00000000_U256),
-                    )]))
-                } else {
-                    assert_eq!(oracle_chain_id, 2);
-                    assert_eq!(oracle_addresses, vec![pending_oracle]);
-                    std::future::pending().await
-                }
+            BTreeSet::new(),
+            BTreeSet::new(),
+            Duration::from_millis(25),
+            move |plan| {
+                Box::pin(async move {
+                    let AnchorSourcePlan::Chainlink {
+                        chain_id,
+                        addresses,
+                    } = plan
+                    else {
+                        unreachable!("oracle-only test plan")
+                    };
+                    if chain_id == 1 {
+                        assert_eq!(addresses, vec![successful_oracle]);
+                        AnchorSourceResult::Chainlink {
+                            chain_id,
+                            result: Ok(BTreeMap::from([(
+                                successful_oracle,
+                                uint!(3_000_00000000_U256),
+                            )])),
+                        }
+                    } else {
+                        assert_eq!(chain_id, 2);
+                        assert_eq!(addresses, vec![pending_oracle]);
+                        std::future::pending::<AnchorSourceResult>().await
+                    }
+                })
             },
         );
 
-        assert!(timeout(Duration::from_millis(25), refresh).await.is_err());
+        timeout(Duration::from_millis(250), refresh)
+            .await
+            .expect("refresh respects internal deadline");
         assert_eq!(
             cache.cached_rate(42, token),
             Some(uint!(3_000_000_000_U256))
@@ -1275,6 +2134,78 @@ mod tests {
             Some(uint!(3_000_000_000_U256))
         );
         assert_eq!(cache.cached_rate(42, pending_token), None);
+    }
+
+    #[tokio::test]
+    async fn anchor_source_fetch_warnings_redact_opaque_errors() {
+        let logs = SharedArc::new(Mutex::new(Vec::new()));
+        let writer_logs = SharedArc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || SharedLogWriter(SharedArc::clone(&writer_logs)))
+            .finish();
+        let cache = TokenAnchorRateCache::new();
+        let chainlink_sentinel = "https://chainlink-user:chainlink-secret@rpc.invalid";
+        let twap_sentinel = "https://twap-user:twap-secret@rpc.invalid";
+        let chainlink_chain_id = 101;
+        let twap_source_chain = 202;
+        let chainlink_address = address!("0x0000000000000000000000000000000000000500");
+        let pool = PoolKey {
+            chain_id: twap_source_chain,
+            pool: address!("0x0000000000000000000000000000000000000501"),
+        };
+        let observation = ObservationKey {
+            chain_id: twap_source_chain,
+            pool: pool.pool,
+            window_seconds: 1_800,
+        };
+
+        async {
+            refresh_token_anchor_rates_with_fetch(
+                &cache,
+                &[],
+                &[],
+                BTreeMap::from([(chainlink_chain_id, vec![chainlink_address])]),
+                BTreeSet::from([pool]),
+                BTreeSet::from([observation]),
+                Duration::from_secs(1),
+                move |plan| {
+                    Box::pin(async move {
+                        match plan {
+                            AnchorSourcePlan::Chainlink { chain_id, .. } => {
+                                assert_eq!(chain_id, chainlink_chain_id);
+                                AnchorSourceResult::Chainlink {
+                                    chain_id,
+                                    result: Err(eyre::eyre!(
+                                        "provider failed at {chainlink_sentinel}"
+                                    )),
+                                }
+                            }
+                            AnchorSourcePlan::Twap { chain_id, .. } => {
+                                assert_eq!(chain_id, twap_source_chain);
+                                AnchorSourceResult::Twap {
+                                    chain_id,
+                                    result: Err(eyre::eyre!("provider failed at {twap_sentinel}")),
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+            .await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let output = String::from_utf8(logs.lock().expect("log buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("anchor source fetch failed"));
+        assert!(output.contains("source_kind=\"chainlink\""));
+        assert!(output.contains("source_kind=\"uniswap_v3_twap\""));
+        assert!(output.contains("chain_id=101"));
+        assert!(output.contains("chain_id=202"));
+        assert!(!output.contains(chainlink_sentinel));
+        assert!(!output.contains(twap_sentinel));
     }
 
     #[test]
@@ -1290,7 +2221,12 @@ mod tests {
             uint!(3_000_00000000_U256),
         );
 
-        store_native_usd_rates_from_entries(&cache, &[entry], &answers);
+        store_native_usd_rates_from_entries_with_inputs(
+            &cache,
+            &[entry],
+            &answers,
+            &TwapFetchedInputs::default(),
+        );
 
         assert_eq!(
             cache.cached_native_usd_rate(1),
@@ -1345,6 +2281,240 @@ mod tests {
     }
 
     #[test]
+    fn twap_planning_deduplicates_pool_and_observation_keys() {
+        let source = twap_source(1_800);
+        let different_window = twap_source(900);
+        let entries = [
+            RuntimeTokenAnchorInfo {
+                chain_id: 1,
+                token: TWAP_QUOTE,
+                anchor_sources: vec![source.clone(), source.clone(), different_window],
+            },
+            RuntimeTokenAnchorInfo {
+                chain_id: 1,
+                token: TWAP_BASE,
+                anchor_sources: vec![RuntimeTokenAnchorSource::Product {
+                    sources: vec![source.clone(), source],
+                    scale_decimals: 18,
+                }],
+            },
+            RuntimeTokenAnchorInfo {
+                chain_id: 2,
+                token: address!("0x0000000000000000000000000000000000000004"),
+                anchor_sources: vec![twap_source(1_800)],
+            },
+        ];
+        let (pools, observations) = twap_keys_for_entries(&entries, &[]);
+        assert_eq!(pools.len(), 2);
+        assert_eq!(observations.len(), 3);
+        assert!(observations.contains(&ObservationKey {
+            chain_id: 1,
+            pool: TWAP_POOL,
+            window_seconds: 1_800,
+        }));
+        assert!(observations.contains(&ObservationKey {
+            chain_id: 1,
+            pool: TWAP_POOL,
+            window_seconds: 900,
+        }));
+        assert!(pools.contains(&PoolKey {
+            chain_id: 2,
+            pool: TWAP_POOL,
+        }));
+    }
+
+    #[tokio::test]
+    async fn scheduler_reuses_one_source_fetch_for_different_targets_on_one_chain() {
+        let direct_token = address!("0x0000000000000000000000000000000000000410");
+        let product_token = address!("0x0000000000000000000000000000000000000411");
+        let direct_entry = RuntimeTokenAnchorInfo {
+            chain_id: 10,
+            token: direct_token,
+            anchor_sources: vec![twap_source(1_800)],
+        };
+        let product_entry = RuntimeTokenAnchorInfo {
+            chain_id: 10,
+            token: product_token,
+            anchor_sources: vec![RuntimeTokenAnchorSource::Product {
+                sources: vec![
+                    twap_source(1_800),
+                    RuntimeTokenAnchorSource::Fixed {
+                        token_fee_per_unit_gas: uint!(1_000_000_000_000_000_000_U256),
+                    },
+                ],
+                scale_decimals: 18,
+            }],
+        };
+        let entries = [direct_entry, product_entry];
+        let (pool_keys, observation_keys) = twap_keys_for_entries(&entries, &[]);
+        let cache = TokenAnchorRateCache::new();
+        let mut fetch_count = 0;
+        refresh_token_anchor_rates_with_fetch(
+            &cache,
+            &entries,
+            &[],
+            BTreeMap::new(),
+            pool_keys,
+            observation_keys,
+            Duration::from_secs(1),
+            |plan| {
+                let AnchorSourcePlan::Twap {
+                    chain_id,
+                    pools,
+                    observations,
+                } = plan
+                else {
+                    unreachable!("TWAP-only scheduler test plan")
+                };
+                fetch_count += 1;
+                Box::pin(async move {
+                    let mut inputs = TwapFetchedInputs::default();
+                    inputs.metadata.insert(
+                        PoolKey {
+                            chain_id,
+                            pool: TWAP_POOL,
+                        },
+                        PoolMetadata {
+                            token0: TWAP_BASE,
+                            token1: TWAP_QUOTE,
+                        },
+                    );
+                    inputs.observations.insert(
+                        ObservationKey {
+                            chain_id,
+                            pool: TWAP_POOL,
+                            window_seconds: observations[0].window_seconds,
+                        },
+                        TwapObservation {
+                            tick_cumulatives: vec![0, 0],
+                        },
+                    );
+                    assert_eq!(pools.len(), 1);
+                    AnchorSourceResult::Twap {
+                        chain_id,
+                        result: Ok(inputs),
+                    }
+                })
+            },
+        )
+        .await;
+        assert_eq!(fetch_count, 1);
+        assert_eq!(
+            cache.cached_rate(10, direct_token),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+        assert_eq!(
+            cache.cached_rate(10, product_token),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+    }
+
+    #[test]
+    fn twap_observation_abi_preserves_signed_i56_cumulatives() {
+        type ObserveReturn = <UniswapV3PoolInterface::observeCall as SolCall>::Return;
+        let returns = ObserveReturn {
+            tickCumulatives: vec![
+                I56::try_from(-123_i128).expect("negative tick cumulative fits I56"),
+                I56::try_from(456_i128).expect("positive tick cumulative fits I56"),
+            ],
+            secondsPerLiquidityCumulativeX128s: vec![U160::ZERO, U160::ZERO],
+        };
+        let decoded = UniswapV3PoolInterface::observeCall::abi_decode_returns(
+            &UniswapV3PoolInterface::observeCall::abi_encode_returns(&returns),
+        )
+        .expect("decode signed observation");
+        let converted = decoded
+            .tickCumulatives
+            .into_iter()
+            .map(i128::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("I56 values fit in i128");
+        assert_eq!(converted, vec![-123, 456]);
+    }
+
+    #[test]
+    fn twap_evaluation_checks_orientation_pair_and_observation_shape() {
+        let mut inputs = TwapFetchedInputs::default();
+        inputs.metadata.insert(
+            PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            },
+            PoolMetadata {
+                token0: TWAP_QUOTE,
+                token1: TWAP_BASE,
+            },
+        );
+        inputs.observations.insert(
+            ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            },
+            TwapObservation {
+                tick_cumulatives: vec![0, 1_800],
+            },
+        );
+        let source = twap_source(1_800);
+        assert!(matches!(
+            anchor_rate_from_source_with_inputs(1, &source, &BTreeMap::new(), &inputs),
+            Some(rate) if rate > U256::ZERO && rate < uint!(1_000_000_000_000_000_000_U256)
+        ));
+        inputs.metadata.insert(
+            PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            },
+            PoolMetadata {
+                token0: TWAP_QUOTE,
+                token1: address!("0x0000000000000000000000000000000000000403"),
+            },
+        );
+        assert_eq!(
+            anchor_rate_from_source_with_inputs(1, &source, &BTreeMap::new(), &inputs),
+            None
+        );
+        inputs.metadata.insert(
+            PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            },
+            PoolMetadata {
+                token0: TWAP_BASE,
+                token1: TWAP_QUOTE,
+            },
+        );
+        inputs.observations.insert(
+            ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            },
+            TwapObservation {
+                tick_cumulatives: vec![0, 1_800],
+            },
+        );
+        assert!(matches!(
+            anchor_rate_from_source_with_inputs(1, &source, &BTreeMap::new(), &inputs),
+            Some(rate) if rate > uint!(1_000_000_000_000_000_000_U256)
+        ));
+        inputs.observations.insert(
+            ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            },
+            TwapObservation {
+                tick_cumulatives: vec![0],
+            },
+        );
+        assert_eq!(
+            anchor_rate_from_source_with_inputs(1, &source, &BTreeMap::new(), &inputs),
+            None
+        );
+    }
+
+    #[test]
     fn token_anchor_entries_apply_effective_registry_overrides() {
         let mut settings = crate::settings::WalletSettings::default();
         let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
@@ -1394,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_rates_from_sources_reuses_oracle_answer() {
+    fn anchor_rates_from_sources_with_inputs_reuses_oracle_answer() {
         let mut answers = BTreeMap::new();
         answers.insert(
             (1, address!("0x0000000000000000000000000000000000000100")),
@@ -1402,17 +2572,27 @@ mod tests {
         );
 
         assert_eq!(
-            anchor_rates_from_sources(&runtime_sources(SHARED_ORACLE_SOURCE_6), &answers),
+            anchor_rates_from_sources_with_inputs(
+                1,
+                &runtime_sources(SHARED_ORACLE_SOURCE_6),
+                &answers,
+                &TwapFetchedInputs::default(),
+            ),
             vec![uint!(3_000_000_000_U256)]
         );
         assert_eq!(
-            anchor_rates_from_sources(&runtime_sources(SHARED_ORACLE_SOURCE_18), &answers),
+            anchor_rates_from_sources_with_inputs(
+                1,
+                &runtime_sources(SHARED_ORACLE_SOURCE_18),
+                &answers,
+                &TwapFetchedInputs::default(),
+            ),
             vec![uint!(3_000_000_000_000_000_000_000_U256)]
         );
     }
 
     #[test]
-    fn anchor_rates_from_sources_composes_arb_per_eth_anchor() {
+    fn anchor_rates_from_sources_with_inputs_composes_arb_per_eth_anchor() {
         let mut answers = BTreeMap::new();
         answers.insert(
             (1, address!("0x0000000000000000000000000000000000000200")),
@@ -1424,13 +2604,18 @@ mod tests {
         );
 
         assert_eq!(
-            anchor_rates_from_sources(&runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE), &answers),
+            anchor_rates_from_sources_with_inputs(
+                1,
+                &runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE),
+                &answers,
+                &TwapFetchedInputs::default(),
+            ),
             vec![uint!(4_285_714_285_714_285_713_000_U256)]
         );
     }
 
     #[test]
-    fn anchor_rates_from_sources_discards_composite_with_missing_component() {
+    fn anchor_rates_from_sources_with_inputs_discards_composite_with_missing_component() {
         let mut answers = BTreeMap::new();
         answers.insert(
             (1, address!("0x0000000000000000000000000000000000000200")),
@@ -1438,9 +2623,159 @@ mod tests {
         );
 
         assert!(
-            anchor_rates_from_sources(&runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE), &answers)
-                .is_empty()
+            anchor_rates_from_sources_with_inputs(
+                1,
+                &runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE),
+                &answers,
+                &TwapFetchedInputs::default(),
+            )
+            .is_empty()
         );
+    }
+
+    #[test]
+    fn mixed_chainlink_and_twap_sources_isolate_failures() {
+        let twap = twap_source(1_800);
+        let mut inputs = TwapFetchedInputs::default();
+        inputs.metadata.insert(
+            PoolKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+            },
+            PoolMetadata {
+                token0: TWAP_BASE,
+                token1: TWAP_QUOTE,
+            },
+        );
+        inputs.observations.insert(
+            ObservationKey {
+                chain_id: 1,
+                pool: TWAP_POOL,
+                window_seconds: 1_800,
+            },
+            TwapObservation {
+                tick_cumulatives: vec![0, 0],
+            },
+        );
+        let oracle = RuntimeTokenAnchorSource::ChainlinkOracle {
+            chain_id: 1,
+            addr: address!("0x0000000000000000000000000000000000000500"),
+            token_decimals: 18,
+            oracle_decimals: 18,
+            is_inversed: false,
+        };
+        let sources = vec![oracle, twap.clone()];
+        let rates = anchor_rates_from_sources_with_inputs(1, &sources, &BTreeMap::new(), &inputs);
+        assert_eq!(rates, vec![uint!(1_000_000_000_000_000_000_U256)]);
+        let product = RuntimeTokenAnchorSource::Product {
+            sources: vec![
+                twap,
+                RuntimeTokenAnchorSource::ChainlinkOracle {
+                    chain_id: 1,
+                    addr: address!("0x0000000000000000000000000000000000000501"),
+                    token_decimals: 18,
+                    oracle_decimals: 18,
+                    is_inversed: false,
+                },
+            ],
+            scale_decimals: 18,
+        };
+        assert_eq!(
+            anchor_rate_from_source_with_inputs(1, &product, &BTreeMap::new(), &inputs),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn built_in_rail_twap_rate_reaches_cache_consumers() {
+        let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+        let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let multicall = address!("0x0000000000000000000000000000000000000603");
+        let (rpc_url, _requests, server) =
+            spawn_twap_rpc_fixture(multicall, weth, rail, 1_800, 2, false);
+        let settings = crate::settings::WalletSettings::default();
+        let registry = crate::settings::build_effective_token_registry(&settings)
+            .expect("built-in token registry");
+        let entry = token_anchor_entries_for_chains(&[1], &registry)
+            .into_iter()
+            .find(|entry| entry.token == rail)
+            .expect("built-in RAIL entry");
+        assert!(entry.anchor_sources.iter().any(|source| matches!(
+            source,
+            RuntimeTokenAnchorSource::UniswapV3Twap {
+                window_seconds: 1_800,
+                ..
+            }
+        )));
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&1)
+            .expect("Ethereum config")
+            .rpc_endpoints = vec![rpc_url];
+        effective_chains
+            .get_mut(&1)
+            .expect("Ethereum config")
+            .multicall_contract = multicall.to_string();
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+        let cache = TokenAnchorRateCache::new();
+        let (pool_keys, observation_keys) =
+            twap_keys_for_entries(std::slice::from_ref(&entry), &[]);
+        refresh_token_anchor_rates_with_fetch(
+            &cache,
+            std::slice::from_ref(&entry),
+            &[],
+            BTreeMap::new(),
+            pool_keys,
+            observation_keys,
+            TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT,
+            |plan| {
+                Box::pin(async {
+                    let AnchorSourcePlan::Twap {
+                        chain_id,
+                        pools,
+                        observations,
+                    } = plan
+                    else {
+                        unreachable!("TWAP-only test plan")
+                    };
+                    AnchorSourceResult::Twap {
+                        chain_id,
+                        result: fetch_twap_inputs_for_chain(
+                            chain_id,
+                            &pools,
+                            &observations,
+                            &effective_chains,
+                            &http,
+                        )
+                        .await,
+                    }
+                })
+            },
+        )
+        .await;
+        server.join().expect("fixture server");
+        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+        assert_eq!(
+            cache.cached_rate(1, rail),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+        assert!(
+            cache
+                .cached_token_usd_micro_value(1, rail, U256::from(1))
+                .is_some()
+        );
+        assert!(!matches!(
+            BroadcasterFeePolicy::default().classify_fee(U256::from(1), cache.cached_rate(1, rail)),
+            BroadcasterFeePolicyStatus::UnknownAnchor
+        ));
     }
 
     #[test]

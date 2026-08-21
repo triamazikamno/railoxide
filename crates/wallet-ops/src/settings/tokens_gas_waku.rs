@@ -156,6 +156,13 @@ pub enum PriceAnchorSettings {
         oracle_decimals: u8,
         is_inversed: bool,
     },
+    UniswapV3Twap {
+        pool_address: String,
+        base_token_address: String,
+        quote_token_address: String,
+        base_token_decimals: u8,
+        window_seconds: u32,
+    },
     Product {
         components: Vec<Self>,
         scale_decimals: u8,
@@ -194,6 +201,31 @@ impl PriceAnchorSettings {
                 }
                 if *oracle_decimals > 36 {
                     errors.push(format!("{field}.oracle_decimals must be at most 36"));
+                }
+            }
+            Self::UniswapV3Twap {
+                pool_address,
+                base_token_address,
+                quote_token_address,
+                base_token_decimals,
+                window_seconds,
+            } => {
+                validate_address(&format!("{field}.pool_address"), pool_address, errors);
+                validate_address(
+                    &format!("{field}.base_token_address"),
+                    base_token_address,
+                    errors,
+                );
+                validate_address(
+                    &format!("{field}.quote_token_address"),
+                    quote_token_address,
+                    errors,
+                );
+                if *base_token_decimals > 36 {
+                    errors.push(format!("{field}.base_token_decimals must be at most 36"));
+                }
+                if *window_seconds == 0 {
+                    errors.push(format!("{field}.window_seconds must be greater than 0"));
                 }
             }
             Self::Product {

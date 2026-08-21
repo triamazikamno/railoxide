@@ -15186,6 +15186,7 @@ dependencies = [
  "tokio",
  "tor-rtcompat",
  "tracing",
+ "tracing-subscriber",
  "trezor-client",
  "url",
  "waku",
