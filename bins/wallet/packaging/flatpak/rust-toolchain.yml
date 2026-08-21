@@ -1,0 +1,21 @@
+name: rust-toolchain
+buildsystem: simple
+build-commands:
+  - rust-toolchain/install.sh --prefix=/app/lib/railoxide-rust --disable-ldconfig --without=rust-docs --without=rust-docs-json-preview
+sources:
+  - type: archive
+    only-arches:
+      - x86_64
+    url: https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
+    sha256: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
+    dest: rust-toolchain
+    strip-components: 1
+  - type: archive
+    only-arches:
+      - aarch64
+    url: https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz
+    sha256: 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+    dest: rust-toolchain
+    strip-components: 1
+cleanup:
+  - /lib/railoxide-rust

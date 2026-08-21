@@ -204,6 +204,12 @@ EOF
   exit 0
 fi
 [[ -z "$generator_metadata_path" ]] || die "--generator-metadata requires --generate-sources"
+rust_toolchain_source="$packaging_dir/rust-toolchain.yml"
+if [[ -n "$cargo_sources" ]]; then
+  rust_toolchain_source="$(dirname -- "$cargo_sources")/rust-toolchain.yml"
+  [[ -f "$rust_toolchain_source" && -r "$rust_toolchain_source" ]] \
+    || die "Cargo source sibling rust-toolchain.yml must be a readable regular file: $rust_toolchain_source"
+fi
 
 require_command flatpak
 require_command flatpak-builder
@@ -261,6 +267,7 @@ mkdir -p -- "$repo_dir" "$build_dir" "$state_dir"
 temporary_dir="$(mktemp -d "$repo_root/.railoxide-flatpak-build.XXXXXXXX")"
 generated_cargo_sources="$temporary_dir/cargo-sources.json"
 generated_manifest="$temporary_dir/manifest.yml"
+rust_toolchain_manifest="$temporary_dir/rust-toolchain.yml"
 source_archive="$temporary_dir/source.tar"
 trap 'rm -rf -- "$temporary_dir"' EXIT
 
@@ -300,6 +307,8 @@ source = source.replace("@SOURCE_DATE_EPOCH@", sys.argv[8])
 source = source.replace("@GIT_SHORT_HASH@", sys.argv[9])
 Path(sys.argv[2]).write_text(source, encoding="utf-8")
 PY
+
+cp -- "$rust_toolchain_source" "$rust_toolchain_manifest"
 
 builder_args=(
   --arch="$arch"

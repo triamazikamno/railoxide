@@ -5,8 +5,6 @@ app_id="io.github.triamazikamno.RailOxide"
 repository_url="https://triamazikamno.github.io/railoxide/flatpak/repo/"
 runtime_repository="https://dl.flathub.org/repo/flathub.flatpakrepo"
 builder_image_digest="sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff"
-rust_aarch64_commit="2687c4277fcc861b72fe6deda54a765cc1ef7939ac1214d37430f886a5768497"
-rust_x86_64_commit="385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
@@ -116,6 +114,9 @@ done
 [[ -n "$input_dir" ]] || die "--input-dir is required"
 [[ -n "$output_dir" ]] || die "--output-dir is required"
 [[ -n "$cargo_sources" && -f "$cargo_sources" ]] || die "--cargo-sources must name an existing file"
+rust_toolchain_source="$(dirname -- "$cargo_sources")/rust-toolchain.yml"
+[[ -f "$rust_toolchain_source" && -r "$rust_toolchain_source" ]] \
+  || die "Cargo source sibling rust-toolchain.yml must be a readable regular file: $rust_toolchain_source"
 [[ -n "$generator_metadata" && -f "$generator_metadata" ]] || die "--generator-metadata must name an existing file"
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || die "--source-commit must be a full lowercase Git SHA"
 [[ -n "$gpg_key_id" ]] || die "--gpg-key-id is required"
@@ -210,6 +211,8 @@ for arch in "${arches[@]}"; do
 done
 
 cp -- "$cargo_sources" "$provenance_dir/cargo-sources.json"
+cp -- "$rust_toolchain_source" "$provenance_dir/rust-toolchain.yml"
+rust_toolchain_manifest_sha256="$(sha256sum "$provenance_dir/rust-toolchain.yml" | awk '{print $1}')"
 printf '%s\n' "$source_commit" >"$provenance_dir/SOURCE-COMMIT"
 generator_commit="$(sed -n 's/^flatpak_cargo_generator_commit=//p' "$generator_metadata")"
 generator_sha256="$(sed -n 's/^flatpak_cargo_generator_sha256=//p' "$generator_metadata")"
@@ -218,8 +221,7 @@ generator_sha256="$(sed -n 's/^flatpak_cargo_generator_sha256=//p' "$generator_m
 cat >"$provenance_dir/BUILD-INPUTS" <<EOF
 source_commit=$source_commit
 builder_image_digest=$builder_image_digest
-rust_extension_aarch64_commit=$rust_aarch64_commit
-rust_extension_x86_64_commit=$rust_x86_64_commit
+rust_toolchain_manifest_sha256=$rust_toolchain_manifest_sha256
 flatpak_cargo_generator_commit=$generator_commit
 flatpak_cargo_generator_sha256=$generator_sha256
 EOF

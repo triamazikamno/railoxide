@@ -46,10 +46,14 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Generate Cargo sources
-        run: >-
-          scripts/build-wallet-flatpak
-          --generate-sources out/flatpak/generated/cargo-sources.json
-          --generator-metadata out/flatpak/generated/generator-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-wallet-flatpak \
+            --generate-sources out/flatpak/generated/cargo-sources.json \
+            --generator-metadata out/flatpak/generated/generator-metadata
+          cp -- bins/wallet/packaging/flatpak/rust-toolchain.yml \
+            out/flatpak/generated/rust-toolchain.yml
 
       - name: Upload Cargo sources
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -66,10 +70,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            rust_commit: 385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            rust_commit: 2687c4277fcc861b72fe6deda54a765cc1ef7939ac1214d37430f886a5768497
     runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff
@@ -88,15 +90,6 @@ jobs:
         with:
           name: flatpak-cargo-sources
           path: out/flatpak/generated
-
-      - name: Install Rust SDK extension
-        shell: bash
-        run: |
-          set -euo pipefail
-          extension=org.freedesktop.Sdk.Extension.rust-stable//25.08
-          flatpak install --system --noninteractive --assumeyes --arch="${{ matrix.arch }}" flathub "$extension"
-          flatpak update --system --noninteractive --assumeyes --arch="${{ matrix.arch }}" --commit="${{ matrix.rust_commit }}" "$extension"
-          [[ "$(flatpak info --system --arch="${{ matrix.arch }}" --show-commit "$extension")" == "${{ matrix.rust_commit }}" ]]
 
       - name: Build hardware variant
         run: >-
@@ -125,6 +118,8 @@ jobs:
           flatpak install --user --noninteractive --assumeyes "out/flatpak/RailOxide-no-hardware-${{ matrix.arch }}.flatpak"
           flatpak run --user "$app_id//stable" --help
           flatpak run --user "$app_id//stable-no-hardware" --help
+          flatpak run --user --command=sh "$app_id//stable" -c 'test ! -e /app/lib/railoxide-rust'
+          flatpak run --user --command=sh "$app_id//stable-no-hardware" -c 'test ! -e /app/lib/railoxide-rust'
 
           hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable")"
           no_hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable-no-hardware")"

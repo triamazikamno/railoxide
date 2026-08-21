@@ -2,8 +2,6 @@ id: io.github.triamazikamno.RailOxide
 runtime: org.freedesktop.Platform
 runtime-version: "25.08"
 sdk: org.freedesktop.Sdk
-sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
 command: io.github.triamazikamno.RailOxide
 default-branch: stable
 collection-id: io.github.triamazikamno.RailOxide
@@ -17,10 +15,11 @@ finish-args:
   - --socket=fallback-x11
   - --require-version=1.16.0
 modules:
+  - rust-toolchain.yml
   - name: railoxide
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin
+      prepend-path: /app/lib/railoxide-rust/bin
       env:
         CARGO_HOME: /run/build/railoxide/cargo
         CARGO_NET_OFFLINE: "true"
