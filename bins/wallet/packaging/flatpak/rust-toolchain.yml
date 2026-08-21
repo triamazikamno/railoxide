@@ -1,5 +1,8 @@
 name: rust-toolchain
 buildsystem: simple
+build-options:
+  strip: false
+  no-debuginfo: true
 build-commands:
   - rust-toolchain/install.sh --prefix=/app/lib/railoxide-rust --disable-ldconfig --without=rust-docs --without=rust-docs-json-preview
 sources:
