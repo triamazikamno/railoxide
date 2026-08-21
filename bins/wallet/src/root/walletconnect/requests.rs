@@ -35,6 +35,7 @@ pub(super) async fn approve_walletconnect_request_task(
     let response_request = request.clone();
     let authorization = async move {
         let mut submitted_tx_hash = None;
+        let request_method = request.parsed.method();
         let result = match request.parsed.clone() {
             WalletConnectParsedRequest::PersonalSign { message, .. } => {
                 walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
@@ -51,19 +52,23 @@ pub(super) async fn approve_walletconnect_request_task(
                 .await
                 .map(Value::String)
             }
-            WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
-                walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
-                    view_session,
-                    vault_store,
-                    vault_password,
-                    protected_software_seed_session,
-                    trezor_app_passphrase,
-                    trezor_pin_matrix_provider,
-                    public_account_uuid: request.session.selected_public_account_uuid.clone(),
-                    typed_data,
-                    hash_fallback_confirmed,
-                    event_tx,
-                })
+            WalletConnectParsedRequest::EthSignTypedData { typed_data, .. }
+            | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
+                walletconnect_sign_typed_data(
+                    WalletConnectTypedDataSignRequest {
+                        view_session,
+                        vault_store,
+                        vault_password,
+                        protected_software_seed_session,
+                        trezor_app_passphrase,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid: request.session.selected_public_account_uuid.clone(),
+                        typed_data,
+                        hash_fallback_confirmed,
+                        event_tx,
+                    },
+                    request_method,
+                )
                 .await
                 .map(Value::String)
             }
@@ -354,7 +359,11 @@ pub(super) fn walletconnect_request_approval_error_kind(
     } else if is_walletconnect_authorization_error(error) {
         WalletConnectRequestErrorKind::Unauthorized
     } else if request.account_source == PublicAccountSource::HardwareDerived
-        && request.item.method == WalletConnectSupportedMethod::EthSignTypedDataV4
+        && matches!(
+            request.item.method,
+            WalletConnectSupportedMethod::EthSignTypedData
+                | WalletConnectSupportedMethod::EthSignTypedDataV4
+        )
     {
         WalletConnectRequestErrorKind::UnsupportedMethod
     } else {
@@ -556,7 +565,8 @@ pub(super) const fn hardware_walletconnect_notice(
     method: WalletConnectSupportedMethod,
 ) -> &'static str {
     match method {
-        WalletConnectSupportedMethod::EthSignTypedDataV4 => {
+        WalletConnectSupportedMethod::EthSignTypedData
+        | WalletConnectSupportedMethod::EthSignTypedDataV4 => {
             "Confirm this EIP-712 typed-data request on the connected hardware wallet."
         }
         WalletConnectSupportedMethod::PersonalSign

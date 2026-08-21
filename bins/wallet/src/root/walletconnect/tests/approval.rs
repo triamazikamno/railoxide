@@ -14,6 +14,11 @@ fn hardware_typed_data_error_maps_to_unsupported_method() {
         walletconnect_request_approval_error_kind(&request, &error),
         WalletConnectRequestErrorKind::UnsupportedMethod
     );
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedData;
+    assert_eq!(
+        walletconnect_request_approval_error_kind(&request, &error),
+        WalletConnectRequestErrorKind::UnsupportedMethod
+    );
 }
 
 #[test]

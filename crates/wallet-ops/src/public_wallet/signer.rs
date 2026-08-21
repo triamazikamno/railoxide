@@ -206,7 +206,7 @@ impl HardwarePublicEvmSigner {
         loop {
             if !mode.is_supported() {
                 return Err(eyre!(
-                    "WalletConnect eth_signTypedData_v4 is unsupported for this hardware Public account session"
+                    "WalletConnect EIP-712 typed-data signing is unsupported for this hardware Public account session"
                 ));
             }
             if mode.requires_hash_fallback_warning() && !hash_fallback_confirmed {
@@ -395,7 +395,7 @@ async fn sign_hardware_public_typed_data(
                         | HardwareTypedDataSigningMode::Unsupported,
                     )) => {
                         return Err(eyre!(
-                            "WalletConnect eth_signTypedData_v4 cannot downgrade Ledger clear signing to a safe fallback"
+                            "WalletConnect EIP-712 typed-data signing cannot downgrade Ledger clear signing to a safe fallback"
                         ));
                     }
                     Err(error) => return Err(error).wrap_err("sign public typed data on Ledger"),
@@ -406,7 +406,7 @@ async fn sign_hardware_public_typed_data(
                     .wrap_err("sign public typed-data hashes on Ledger")?,
                 HardwareTypedDataSigningMode::Unsupported => {
                     return Err(eyre!(
-                        "WalletConnect eth_signTypedData_v4 is unsupported for this Ledger session"
+                        "WalletConnect EIP-712 typed-data signing is unsupported for this Ledger session"
                     ));
                 }
             };
@@ -448,7 +448,7 @@ async fn sign_hardware_public_typed_data(
                     .wrap_err("sign public typed-data hashes on Trezor")?,
                 HardwareTypedDataSigningMode::Unsupported => {
                     return Err(eyre!(
-                        "WalletConnect eth_signTypedData_v4 is unsupported for this Trezor session"
+                        "WalletConnect EIP-712 typed-data signing is unsupported for this Trezor session"
                     ));
                 }
             };

@@ -14,6 +14,7 @@ pub enum WalletConnectSupportedMethod {
     EthRequestAccounts,
     PersonalSign,
     EthSendTransaction,
+    EthSignTypedData,
     EthSignTypedDataV4,
     WalletSwitchEthereumChain,
 }
@@ -26,6 +27,7 @@ impl WalletConnectSupportedMethod {
             Self::EthRequestAccounts => "eth_requestAccounts",
             Self::PersonalSign => "personal_sign",
             Self::EthSendTransaction => "eth_sendTransaction",
+            Self::EthSignTypedData => "eth_signTypedData",
             Self::EthSignTypedDataV4 => "eth_signTypedData_v4",
             Self::WalletSwitchEthereumChain => "wallet_switchEthereumChain",
         }
@@ -41,6 +43,7 @@ impl FromStr for WalletConnectSupportedMethod {
             "eth_requestAccounts" => Ok(Self::EthRequestAccounts),
             "personal_sign" => Ok(Self::PersonalSign),
             "eth_sendTransaction" => Ok(Self::EthSendTransaction),
+            "eth_signTypedData" => Ok(Self::EthSignTypedData),
             "eth_signTypedData_v4" => Ok(Self::EthSignTypedDataV4),
             "wallet_switchEthereumChain" => Ok(Self::WalletSwitchEthereumChain),
             method => Err(WalletConnectError::UnsupportedMethod(method.to_owned())),

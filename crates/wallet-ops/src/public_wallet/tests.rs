@@ -18,7 +18,6 @@ use zeroize::Zeroizing;
 
 use super::types::PlannedPublicBalanceCall;
 use super::*;
-use crate::WalletConnectDecodedCallKind;
 use crate::hardware::{
     ConfirmedHardwarePublicAccount, HardwareDerivationDescriptor, HardwareDeviceKind,
     HardwareOperationOutput, HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode,
@@ -38,6 +37,7 @@ use crate::vault::{
     bip39_seed_from_mnemonic,
 };
 use crate::{GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, WalletNetworkMode};
+use crate::{WalletConnectDecodedCallKind, WalletConnectSupportedMethod};
 
 const TEST_PASSWORD: &str = "correct horse battery staple";
 const TEST_MNEMONIC: &str =
@@ -651,6 +651,62 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
 
     assert!(signature.starts_with("0x"));
     assert_eq!(signature.len(), 132);
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn walletconnect_typed_data_signing_error_preserves_method_label() {
+    let (root_dir, db, store, view_session) = public_action_request_parts();
+    let account = store
+        .import_public_account(
+            TEST_PASSWORD,
+            &view_session,
+            TEST_IMPORTED_PRIVATE_KEY,
+            Some("WalletConnect typed data diagnostics"),
+            false,
+        )
+        .expect("import public account");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+
+    for method in [
+        WalletConnectSupportedMethod::EthSignTypedData,
+        WalletConnectSupportedMethod::EthSignTypedDataV4,
+    ] {
+        let error = runtime
+            .block_on(walletconnect_sign_typed_data(
+                WalletConnectTypedDataSignRequest {
+                    view_session: Arc::clone(&view_session),
+                    vault_store: Arc::clone(&store),
+                    vault_password: Zeroizing::new("wrong password".to_owned()),
+                    protected_software_seed_session: None,
+                    trezor_app_passphrase: None,
+                    trezor_pin_matrix_provider: None,
+                    public_account_uuid: account.public_account_uuid.clone(),
+                    typed_data: serde_json::json!({}),
+                    hash_fallback_confirmed: false,
+                    event_tx: None,
+                },
+                method,
+            ))
+            .expect_err("typed-data signing should fail with the wrong password");
+        let message = error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(message.contains(method.as_str()));
+        if method == WalletConnectSupportedMethod::EthSignTypedData {
+            assert!(!message.contains(WalletConnectSupportedMethod::EthSignTypedDataV4.as_str()));
+        } else {
+            assert!(message.contains(WalletConnectSupportedMethod::EthSignTypedDataV4.as_str()));
+        }
+    }
 
     drop(store);
     drop(db);

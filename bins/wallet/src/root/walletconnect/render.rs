@@ -180,6 +180,7 @@ pub(super) fn walletconnect_approval_progress_steps(
             WalletConnectApprovalProgressStep::RespondToDapp,
         ],
         WalletConnectParsedRequest::PersonalSign { .. }
+        | WalletConnectParsedRequest::EthSignTypedData { .. }
         | WalletConnectParsedRequest::EthSignTypedDataV4 { .. } => vec![
             WalletConnectApprovalProgressStep::ApproveOnDevice,
             WalletConnectApprovalProgressStep::RespondToDapp,

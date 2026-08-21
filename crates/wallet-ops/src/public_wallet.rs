@@ -61,7 +61,8 @@ pub use types::{
 };
 pub use walletconnect::{
     submit_walletconnect_send_transaction, walletconnect_probe_hardware_typed_data_signing_mode,
-    walletconnect_sign_personal_message, walletconnect_sign_typed_data_v4,
+    walletconnect_sign_personal_message, walletconnect_sign_typed_data,
+    walletconnect_sign_typed_data_v4,
 };
 
 #[cfg(test)]

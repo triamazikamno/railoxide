@@ -182,7 +182,8 @@ pub use public_wallet::{
     submit_walletconnect_send_transaction, validate_walletconnect_reviewed_transaction,
     walletconnect_hardware_typed_data_hash_fallback_confirmation_session,
     walletconnect_probe_hardware_typed_data_signing_mode, walletconnect_sign_personal_message,
-    walletconnect_sign_typed_data_v4, walletconnect_transaction_payload_fingerprint,
+    walletconnect_sign_typed_data, walletconnect_sign_typed_data_v4,
+    walletconnect_transaction_payload_fingerprint,
 };
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 pub use sponsored_bundle::*;

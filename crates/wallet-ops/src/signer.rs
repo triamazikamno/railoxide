@@ -38,7 +38,7 @@ impl SoftwareEvmSigner {
     pub(crate) fn sign_typed_data_v4(&self, typed_data: &TypedData) -> Result<Signature> {
         self.signer
             .sign_dynamic_typed_data_sync(typed_data)
-            .wrap_err("software eth_signTypedData_v4")
+            .wrap_err("software EIP-712 typed-data signing")
     }
 }
 

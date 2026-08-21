@@ -223,7 +223,11 @@ fn hardware_account_rejects_required_typed_data_namespace() {
     let mut required = BTreeMap::new();
     required.insert(
         "eip155".to_owned(),
-        namespace(&["eip155:1"], &["eth_signTypedData_v4"], &[]),
+        namespace(
+            &["eip155:1"],
+            &["eth_signTypedData", "eth_signTypedData_v4"],
+            &[],
+        ),
     );
 
     assert!(matches!(
@@ -244,7 +248,11 @@ fn hardware_account_accepts_required_typed_data_namespace_with_capability() {
     let mut required = BTreeMap::new();
     required.insert(
         "eip155".to_owned(),
-        namespace(&["eip155:1"], &["eth_signTypedData_v4"], &[]),
+        namespace(
+            &["eip155:1"],
+            &["eth_signTypedData", "eth_signTypedData_v4"],
+            &[],
+        ),
     );
 
     let negotiated = negotiate_walletconnect_namespaces_with_account_support(
@@ -260,7 +268,10 @@ fn hardware_account_accepts_required_typed_data_namespace_with_capability() {
         .get("eip155")
         .expect("approved namespace");
 
-    assert_eq!(approved.methods, vec!["eth_signTypedData_v4"]);
+    assert_eq!(
+        approved.methods,
+        vec!["eth_signTypedData", "eth_signTypedData_v4"]
+    );
 }
 
 #[test]
@@ -273,7 +284,7 @@ fn hardware_account_auto_includes_optional_typed_data_with_capability() {
     let mut optional = BTreeMap::new();
     optional.insert(
         "eip155:1".to_owned(),
-        namespace(&[], &["eth_signTypedData_v4"], &[]),
+        namespace(&[], &["eth_signTypedData", "eth_signTypedData_v4"], &[]),
     );
 
     let negotiated = negotiate_walletconnect_namespaces_with_account_support(
@@ -289,7 +300,10 @@ fn hardware_account_auto_includes_optional_typed_data_with_capability() {
         .get("eip155:1")
         .expect("approved optional namespace");
 
-    assert_eq!(optional.methods, vec!["eth_signTypedData_v4"]);
+    assert_eq!(
+        optional.methods,
+        vec!["eth_signTypedData", "eth_signTypedData_v4"]
+    );
     assert!(negotiated.excluded_optional.is_empty());
 }
 
@@ -303,7 +317,7 @@ fn hardware_account_omits_optional_typed_data_without_capability() {
     let mut optional = BTreeMap::new();
     optional.insert(
         "eip155:1".to_owned(),
-        namespace(&[], &["eth_signTypedData_v4"], &[]),
+        namespace(&[], &["eth_signTypedData", "eth_signTypedData_v4"], &[]),
     );
 
     let negotiated = negotiate_walletconnect_namespaces_with_account_support(
@@ -319,8 +333,14 @@ fn hardware_account_omits_optional_typed_data_without_capability() {
         namespace
             .methods
             .iter()
-            .all(|method| method != "eth_signTypedData_v4")
+            .all(|method| method != "eth_signTypedData" && method != "eth_signTypedData_v4")
     }));
+    assert!(
+        negotiated
+            .excluded_optional
+            .iter()
+            .any(|item| item.item == "eth_signTypedData")
+    );
     assert!(
         negotiated
             .excluded_optional
@@ -339,7 +359,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
     let mut proposal = test_proposal(required);
     proposal.optional_namespaces.insert(
         "eip155:1".to_owned(),
-        namespace(&[], &["eth_signTypedData_v4"], &[]),
+        namespace(&[], &["eth_signTypedData", "eth_signTypedData_v4"], &[]),
     );
     let relay_identity = WalletConnectRelayIdentity {
         signing_key: [8u8; 32],
@@ -350,7 +370,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
     let resolution = WalletConnectSessionAccountResolution::Usable(account.clone());
     let request = parse_walletconnect_session_request(
         31,
-        "eth_signTypedData_v4",
+        "eth_signTypedData",
         &json!([account.address.to_string(), typed_data_payload(&json!(1))]),
     )
     .expect("typed-data request");
@@ -375,7 +395,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
                 namespace
                     .methods
                     .iter()
-                    .all(|method| method != "eth_signTypedData_v4")
+                    .all(|method| method != "eth_signTypedData" && method != "eth_signTypedData_v4")
             })
     );
     assert!(matches!(
@@ -390,7 +410,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
             Some(NOW + 300),
             NOW,
         ),
-        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4"
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData"
     ));
 
     let included = approve_walletconnect_session_with_account_support(
@@ -415,7 +435,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
                 namespace
                     .methods
                     .iter()
-                    .any(|method| method == "eth_signTypedData_v4")
+                    .any(|method| method == "eth_signTypedData" || method == "eth_signTypedData_v4")
             })
     );
     let validation = validate_walletconnect_session_request_with_account_support(
@@ -445,7 +465,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
             Some(NOW + 300),
             NOW,
         ),
-        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4"
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData"
     ));
 }
 
@@ -455,6 +475,7 @@ fn default_build_hardware_account_rejects_required_signing_namespaces() {
     for method in [
         "personal_sign",
         "eth_sendTransaction",
+        "eth_signTypedData",
         "eth_signTypedData_v4",
     ] {
         let mut required = BTreeMap::new();
@@ -493,6 +514,7 @@ fn default_build_hardware_account_excludes_optional_signing_methods() {
             &[
                 "personal_sign",
                 "eth_sendTransaction",
+                "eth_signTypedData",
                 "eth_signTypedData_v4",
             ],
             &[],
@@ -512,6 +534,7 @@ fn default_build_hardware_account_excludes_optional_signing_methods() {
         namespace.methods.iter().all(|method| {
             method != "personal_sign"
                 && method != "eth_sendTransaction"
+                && method != "eth_signTypedData"
                 && method != "eth_signTypedData_v4"
         })
     }));

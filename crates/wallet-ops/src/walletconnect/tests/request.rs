@@ -44,6 +44,127 @@ fn parses_supported_requests_and_rejects_unsafe_methods() {
 }
 
 #[test]
+fn parses_unsuffixed_typed_data_with_exact_identity_and_rejects_v3() {
+    let account = address!("2222222222222222222222222222222222222222");
+    let payload = typed_data_payload(&json!(1));
+
+    let object_request = parse_walletconnect_session_request(
+        4,
+        "eth_signTypedData",
+        &json!([account.to_string(), payload]),
+    )
+    .expect("unsuffixed object typed-data request");
+    assert!(matches!(
+        &object_request,
+        WalletConnectParsedRequest::EthSignTypedData {
+            account: request_account,
+            domain_chain_id: Some(chain_id),
+            ..
+        } if *request_account == account && *chain_id == U256::from(1)
+    ));
+    assert_eq!(object_request.method().as_str(), "eth_signTypedData");
+
+    let json_request = parse_walletconnect_session_request(
+        5,
+        "eth_signTypedData",
+        &json!([account.to_string(), payload.to_string()]),
+    )
+    .expect("unsuffixed JSON-text typed-data request");
+    assert!(matches!(
+        json_request,
+        WalletConnectParsedRequest::EthSignTypedData { .. }
+    ));
+
+    assert!(matches!(
+        parse_walletconnect_session_request(6, "eth_signTypedData_v3", &json!([])),
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v3"
+    ));
+}
+
+#[test]
+fn unsuffixed_typed_data_requires_its_own_active_session_permission() {
+    let (session, account) = approved_request_session(&["eth_signTypedData_v4"]);
+    let request = parse_walletconnect_session_request(
+        7,
+        "eth_signTypedData",
+        &json!([account.address.to_string(), typed_data_payload(&json!(1))]),
+    )
+    .expect("unsuffixed typed-data request");
+    let resolution = WalletConnectSessionAccountResolution::Usable(account);
+
+    assert!(matches!(
+        validate_walletconnect_session_request(
+            &session,
+            &resolution,
+            &session.session_topic,
+            7,
+            "eip155:1",
+            request,
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData"
+    ));
+}
+
+#[test]
+fn unsuffixed_typed_data_rejects_malformed_account_and_chain_inputs() {
+    let account = address!("2222222222222222222222222222222222222222");
+    assert!(matches!(
+        parse_walletconnect_session_request(8, "eth_signTypedData", &json!({})),
+        Err(WalletConnectError::MalformedParams(message))
+            if message == "eth_signTypedData params must be an array"
+    ));
+
+    let (session, selected_account) = approved_request_session(&["eth_signTypedData"]);
+    let resolution = WalletConnectSessionAccountResolution::Usable(selected_account.clone());
+    let foreign_request = parse_walletconnect_session_request(
+        9,
+        "eth_signTypedData",
+        &json!([account.to_string(), typed_data_payload(&json!(1))]),
+    )
+    .expect("foreign-account typed-data request");
+    assert!(matches!(
+        validate_walletconnect_session_request(
+            &session,
+            &resolution,
+            &session.session_topic,
+            9,
+            "eip155:1",
+            foreign_request,
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::Relay(message))
+            if message.contains("does not match selected Public account")
+    ));
+
+    let mismatched_chain_request = parse_walletconnect_session_request(
+        10,
+        "eth_signTypedData",
+        &json!([
+            selected_account.address.to_string(),
+            typed_data_payload(&json!(2))
+        ]),
+    )
+    .expect("chain-mismatched typed-data request");
+    assert!(matches!(
+        validate_walletconnect_session_request(
+            &session,
+            &resolution,
+            &session.session_topic,
+            10,
+            "eip155:1",
+            mismatched_chain_request,
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::Relay(message))
+            if message.contains("typed-data domain.chainId")
+    ));
+}
+
+#[test]
 fn rejects_malformed_personal_sign_hex_before_approval() {
     let account = address!("1111111111111111111111111111111111111111");
 

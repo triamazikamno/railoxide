@@ -80,6 +80,11 @@ pub enum WalletConnectParsedRequest {
     EthSendTransaction {
         transaction: WalletConnectEvmTransaction,
     },
+    EthSignTypedData {
+        account: Address,
+        typed_data: Value,
+        domain_chain_id: Option<U256>,
+    },
     EthSignTypedDataV4 {
         account: Address,
         typed_data: Value,
@@ -98,6 +103,7 @@ impl WalletConnectParsedRequest {
             Self::EthRequestAccounts => WalletConnectSupportedMethod::EthRequestAccounts,
             Self::PersonalSign { .. } => WalletConnectSupportedMethod::PersonalSign,
             Self::EthSendTransaction { .. } => WalletConnectSupportedMethod::EthSendTransaction,
+            Self::EthSignTypedData { .. } => WalletConnectSupportedMethod::EthSignTypedData,
             Self::EthSignTypedDataV4 { .. } => WalletConnectSupportedMethod::EthSignTypedDataV4,
             Self::WalletSwitchEthereumChain { .. } => {
                 WalletConnectSupportedMethod::WalletSwitchEthereumChain
@@ -111,6 +117,7 @@ impl WalletConnectParsedRequest {
             self,
             Self::PersonalSign { .. }
                 | Self::EthSendTransaction { .. }
+                | Self::EthSignTypedData { .. }
                 | Self::EthSignTypedDataV4 { .. }
         )
     }
@@ -262,9 +269,15 @@ pub fn parse_walletconnect_session_request(
         "eth_requestAccounts" => Ok(WalletConnectParsedRequest::EthRequestAccounts),
         "personal_sign" => parse_personal_sign(params),
         "eth_sendTransaction" => parse_send_transaction(params),
-        "eth_signTypedData_v4" => parse_typed_data(params),
+        "eth_signTypedData" => {
+            parse_typed_data(WalletConnectSupportedMethod::EthSignTypedData, params)
+        }
+        "eth_signTypedData_v4" => {
+            parse_typed_data(WalletConnectSupportedMethod::EthSignTypedDataV4, params)
+        }
         "wallet_switchEthereumChain" => parse_switch_chain(params),
         "eth_sign"
+        | "eth_signTypedData_v3"
         | "eth_signTransaction"
         | "eth_sendRawTransaction"
         | "wallet_addEthereumChain" => {
@@ -389,7 +402,10 @@ pub fn validate_walletconnect_session_request_with_account_support(
                 ));
             }
         }
-        WalletConnectParsedRequest::EthSignTypedDataV4 {
+        WalletConnectParsedRequest::EthSignTypedData {
+            domain_chain_id, ..
+        }
+        | WalletConnectParsedRequest::EthSignTypedDataV4 {
             domain_chain_id, ..
         } => {
             if domain_chain_id.is_some_and(|embedded| embedded != U256::from(request_chain_id)) {
@@ -452,7 +468,8 @@ const fn walletconnect_approved_request_method_supported_for_account_support(
             selected_account_support.hardware_typed_data_capability_known,
         ),
         (
-            WalletConnectSupportedMethod::EthSignTypedDataV4,
+            WalletConnectSupportedMethod::EthSignTypedData
+                | WalletConnectSupportedMethod::EthSignTypedDataV4,
             crate::vault::PublicAccountSource::HardwareDerived,
             false,
         )
@@ -575,19 +592,23 @@ fn parse_send_transaction(params: &Value) -> Result<WalletConnectParsedRequest> 
     Ok(WalletConnectParsedRequest::EthSendTransaction { transaction })
 }
 
-fn parse_typed_data(params: &Value) -> Result<WalletConnectParsedRequest> {
+fn parse_typed_data(
+    method: WalletConnectSupportedMethod,
+    params: &Value,
+) -> Result<WalletConnectParsedRequest> {
+    let method_name = method.as_str();
     let values = params
         .as_array()
-        .ok_or_else(|| malformed_params("eth_signTypedData_v4 params must be an array"))?;
+        .ok_or_else(|| malformed_params(format!("{method_name} params must be an array")))?;
     let account = parse_address_value(values.first())
-        .ok_or_else(|| malformed_params("typed-data account is required"))?;
+        .ok_or_else(|| malformed_params(format!("{method_name} account is required")))?;
     let typed_data = values
         .get(1)
         .cloned()
-        .ok_or_else(|| malformed_params("typed-data payload is required"))?;
+        .ok_or_else(|| malformed_params(format!("{method_name} payload is required")))?;
     let typed_data = if let Some(encoded) = typed_data.as_str() {
         serde_json::from_str(encoded).map_err(|error| {
-            malformed_params(format!("typed-data payload must be JSON: {error}"))
+            malformed_params(format!("{method_name} payload must be JSON: {error}"))
         })?
     } else {
         typed_data
@@ -596,16 +617,34 @@ fn parse_typed_data(params: &Value) -> Result<WalletConnectParsedRequest> {
         .get("domain")
         .and_then(|domain| domain.get("chainId"))
         .map(|value| {
-            parse_u256_value(value)
-                .ok_or_else(|| malformed_params("typed-data domain.chainId must be a chain ID"))
+            parse_u256_value(value).ok_or_else(|| {
+                malformed_params(format!("{method_name} domain.chainId must be a chain ID"))
+            })
         })
         .transpose()?;
-    validate_typed_data_payload(&typed_data)?;
-    Ok(WalletConnectParsedRequest::EthSignTypedDataV4 {
-        account,
-        typed_data,
-        domain_chain_id,
-    })
+    validate_typed_data_payload(method_name, &typed_data)?;
+    let request = match method {
+        WalletConnectSupportedMethod::EthSignTypedData => {
+            WalletConnectParsedRequest::EthSignTypedData {
+                account,
+                typed_data,
+                domain_chain_id,
+            }
+        }
+        WalletConnectSupportedMethod::EthSignTypedDataV4 => {
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
+                account,
+                typed_data,
+                domain_chain_id,
+            }
+        }
+        _ => {
+            return Err(WalletConnectError::UnsupportedMethod(
+                method_name.to_owned(),
+            ));
+        }
+    };
+    Ok(request)
 }
 
 fn parse_switch_chain(params: &Value) -> Result<WalletConnectParsedRequest> {
@@ -621,6 +660,7 @@ fn parse_switch_chain(params: &Value) -> Result<WalletConnectParsedRequest> {
 const fn request_account(request: &WalletConnectParsedRequest) -> Option<Address> {
     match request {
         WalletConnectParsedRequest::PersonalSign { account, .. }
+        | WalletConnectParsedRequest::EthSignTypedData { account, .. }
         | WalletConnectParsedRequest::EthSignTypedDataV4 { account, .. } => Some(*account),
         WalletConnectParsedRequest::EthSendTransaction { transaction } => Some(transaction.from),
         WalletConnectParsedRequest::EthAccounts
@@ -636,7 +676,8 @@ fn request_raw_details(request: &WalletConnectParsedRequest) -> Value {
             "account": account.to_string(),
         }),
         WalletConnectParsedRequest::EthSendTransaction { transaction } => transaction.raw.clone(),
-        WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => typed_data.clone(),
+        WalletConnectParsedRequest::EthSignTypedData { typed_data, .. }
+        | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => typed_data.clone(),
         WalletConnectParsedRequest::EthAccounts
         | WalletConnectParsedRequest::EthRequestAccounts
         | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. } => Value::Null,
@@ -767,12 +808,12 @@ fn parse_optional_transaction_type(value: &Value) -> Result<Option<u8>> {
         .transpose()
 }
 
-fn validate_typed_data_payload(value: &Value) -> Result<()> {
+fn validate_typed_data_payload(method: &str, value: &Value) -> Result<()> {
     let typed_data: TypedData = serde_json::from_value(value.clone()).map_err(|error| {
-        malformed_params(format!("typed-data payload is invalid EIP-712: {error}"))
+        malformed_params(format!("{method} payload is invalid EIP-712: {error}"))
     })?;
     typed_data.coerce().map_err(|error| {
-        malformed_params(format!("typed-data payload is invalid EIP-712: {error}"))
+        malformed_params(format!("{method} payload is invalid EIP-712: {error}"))
     })?;
     Ok(())
 }

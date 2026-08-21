@@ -19,6 +19,7 @@ use super::types::{
 };
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::hardware_typed_data::HardwareEip712Model;
+use crate::walletconnect::WalletConnectSupportedMethod;
 use crate::{HttpContext, query_rpc_pool_with_http_client, report_chain_string};
 
 pub async fn walletconnect_sign_personal_message(
@@ -63,9 +64,20 @@ pub async fn walletconnect_sign_personal_message(
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
 }
 
-pub async fn walletconnect_sign_typed_data_v4(
+pub async fn walletconnect_sign_typed_data(
     request: WalletConnectTypedDataSignRequest,
+    method: WalletConnectSupportedMethod,
 ) -> Result<String> {
+    let operation = match method {
+        WalletConnectSupportedMethod::EthSignTypedData
+        | WalletConnectSupportedMethod::EthSignTypedDataV4 => method.as_str(),
+        _ => {
+            return Err(eyre!(
+                "WalletConnect {} is not a typed-data signing method",
+                method.as_str()
+            ));
+        }
+    };
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
@@ -74,25 +86,32 @@ pub async fn walletconnect_sign_typed_data_v4(
         request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
-    )?;
+    )
+    .wrap_err_with(|| format!("WalletConnect {operation}"))?;
     let typed_data = HardwareEip712Model::from_walletconnect_typed_data_json(request.typed_data)
-        .wrap_err("WalletConnect typed-data payload")?;
+        .wrap_err("WalletConnect typed-data payload")
+        .wrap_err_with(|| format!("WalletConnect {operation}"))?;
     let event_tx = request.event_tx.as_ref();
     let requires_device_approval = signer.requires_device_approval();
-    let hardware_typed_data_mode = signer.typed_data_signing_mode().await?;
+    let hardware_typed_data_mode = signer
+        .typed_data_signing_mode()
+        .await
+        .wrap_err_with(|| format!("WalletConnect {operation}"))?;
     if let Some(mode) = hardware_typed_data_mode {
         if !mode.is_supported() {
             return Err(eyre!(
-                "WalletConnect eth_signTypedData_v4 is unsupported for this hardware Public account session"
+                "WalletConnect {operation} is unsupported for this hardware Public account session"
             ));
         }
         if mode.requires_hash_fallback_warning() && !request.hash_fallback_confirmed {
             return Err(
                 WalletConnectHardwareTypedDataHashFallbackConfirmationRequired::new(
-                    signer.refreshed_hardware_session()?,
+                    signer
+                        .refreshed_hardware_session()
+                        .wrap_err_with(|| format!("WalletConnect {operation}"))?,
                 ),
             )
-            .wrap_err("WalletConnect eth_signTypedData_v4");
+            .wrap_err_with(|| format!("WalletConnect {operation}"));
         }
     }
     if requires_device_approval {
@@ -117,6 +136,7 @@ pub async fn walletconnect_sign_typed_data_v4(
             signature
         }
         Err(error) => {
+            let error = error.wrap_err(format!("WalletConnect {operation}"));
             let confirmation_required =
                 is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(&error);
             if confirmation_required {
@@ -128,10 +148,16 @@ pub async fn walletconnect_sign_typed_data_v4(
                     PublicActionSessionEvent::HardwareApprovalFailed { message },
                 );
             }
-            return Err(error).wrap_err("WalletConnect eth_signTypedData_v4");
+            return Err(error);
         }
     };
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
+}
+
+pub async fn walletconnect_sign_typed_data_v4(
+    request: WalletConnectTypedDataSignRequest,
+) -> Result<String> {
+    walletconnect_sign_typed_data(request, WalletConnectSupportedMethod::EthSignTypedDataV4).await
 }
 
 pub async fn walletconnect_probe_hardware_typed_data_signing_mode(

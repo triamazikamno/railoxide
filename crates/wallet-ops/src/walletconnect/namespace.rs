@@ -333,7 +333,10 @@ const fn walletconnect_method_supported_for_hardware_account(
     typed_data_signing_mode: HardwareTypedDataSigningMode,
 ) -> bool {
     match method {
-        WalletConnectSupportedMethod::EthSignTypedDataV4 => typed_data_signing_mode.is_supported(),
+        WalletConnectSupportedMethod::EthSignTypedData
+        | WalletConnectSupportedMethod::EthSignTypedDataV4 => {
+            typed_data_signing_mode.is_supported()
+        }
         #[cfg(not(feature = "hardware"))]
         WalletConnectSupportedMethod::PersonalSign
         | WalletConnectSupportedMethod::EthSendTransaction => false,
@@ -351,7 +354,11 @@ fn unsupported_method_reason(
     selected_account_support: WalletConnectNamespaceAccountSupport,
 ) -> String {
     if selected_account_support.account_source == PublicAccountSource::HardwareDerived
-        && method == WalletConnectSupportedMethod::EthSignTypedDataV4
+        && matches!(
+            method,
+            WalletConnectSupportedMethod::EthSignTypedData
+                | WalletConnectSupportedMethod::EthSignTypedDataV4
+        )
         && !selected_account_support
             .hardware_typed_data_signing_mode
             .is_supported()

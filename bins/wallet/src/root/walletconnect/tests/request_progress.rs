@@ -111,6 +111,25 @@ fn walletconnect_typed_data_hardware_progress_starts_at_device_approval() {
     );
     assert_eq!(progress.steps[0].status, PublicActionStepStatus::Pending);
     assert_eq!(progress.steps[1].status, PublicActionStepStatus::NotStarted);
+
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedData;
+    request.parsed = WalletConnectParsedRequest::EthSignTypedData {
+        account: request.item.account,
+        typed_data: json!({}),
+        domain_chain_id: Some(U256::from(1_u64)),
+    };
+    let unsuffixed_progress = WalletConnectApprovalProgress::new(5, &request);
+    assert_eq!(
+        unsuffixed_progress
+            .steps
+            .iter()
+            .map(|step| step.step)
+            .collect::<Vec<_>>(),
+        vec![
+            WalletConnectApprovalProgressStep::ApproveOnDevice,
+            WalletConnectApprovalProgressStep::RespondToDapp,
+        ]
+    );
 }
 
 #[test]
@@ -129,6 +148,13 @@ fn walletconnect_hash_fallback_warning_uses_explicit_continue_label() {
         walletconnect_request_approve_label(false, true, false, false),
         "Approve on device"
     );
+    assert!(
+        walletconnect_request_uses_hardware_typed_data_hash_fallback(
+            &request,
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        )
+    );
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedData;
     assert!(
         walletconnect_request_uses_hardware_typed_data_hash_fallback(
             &request,

@@ -1199,6 +1199,7 @@ pub(super) fn process_walletconnect_session_request_message(
         }
         WalletConnectParsedRequest::PersonalSign { .. }
         | WalletConnectParsedRequest::EthSendTransaction { .. }
+        | WalletConnectParsedRequest::EthSignTypedData { .. }
         | WalletConnectParsedRequest::EthSignTypedDataV4 { .. } => Value::Null,
     };
     tracing::debug!(

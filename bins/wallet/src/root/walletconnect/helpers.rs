@@ -93,10 +93,10 @@ pub(super) fn walletconnect_proposal_requests_required_typed_data(
     proposal: &WalletConnectSessionProposal,
 ) -> bool {
     proposal.required_namespaces.values().any(|namespace| {
-        namespace
-            .methods
-            .iter()
-            .any(|method| method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str())
+        namespace.methods.iter().any(|method| {
+            method == WalletConnectSupportedMethod::EthSignTypedData.as_str()
+                || method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str()
+        })
     })
 }
 
@@ -105,10 +105,10 @@ pub(super) fn walletconnect_proposal_requests_optional_typed_data(
     proposal: &WalletConnectSessionProposal,
 ) -> bool {
     proposal.optional_namespaces.values().any(|namespace| {
-        namespace
-            .methods
-            .iter()
-            .any(|method| method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str())
+        namespace.methods.iter().any(|method| {
+            method == WalletConnectSupportedMethod::EthSignTypedData.as_str()
+                || method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str()
+        })
     })
 }
 

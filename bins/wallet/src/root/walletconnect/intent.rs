@@ -424,7 +424,8 @@ pub(super) fn build_walletconnect_intent<'a>(
                 context.public_address_book,
             ));
         }
-        WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
+        WalletConnectParsedRequest::EthSignTypedData { typed_data, .. }
+        | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
             let summary = typed_data_summary(typed_data);
             hero_summary = WalletConnectHeroSummary::TypedData(summary);
             if let Some(permit) = parse_eip2612_permit(typed_data, selected_account) {
