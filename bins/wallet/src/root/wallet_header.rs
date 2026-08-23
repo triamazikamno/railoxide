@@ -391,7 +391,7 @@ impl WalletRoot {
         )
     }
 
-    fn render_chain_selector(&self) -> impl IntoElement {
+    pub(super) fn render_chain_selector(&self) -> impl IntoElement {
         div().h(px(24.0)).w(px(130.0)).flex().items_center().child(
             Select::new(&self.chain_select)
                 .appearance(false)

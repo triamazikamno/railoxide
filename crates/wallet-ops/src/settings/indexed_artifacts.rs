@@ -11,6 +11,7 @@ pub const OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x053fc2967addee3cec8d637f6de25401a170faaf16e42585952cb1c50abd85fe";
 pub const OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME: &str =
     "k51qzi5uqu5dgbarnyr67fxkcmuyb5aumtsi2p86acs8fxpg3q3r0947ne9726";
+/// Frozen released-settings compatibility data; runtime defaults use the POI gateway list.
 pub const OFFICIAL_INDEXED_ARTIFACT_GATEWAYS: &[&str] = &[
     "https://ipfs.io",
     "https://dweb.link",
@@ -35,6 +36,8 @@ pub struct IndexedArtifactSettings {
     pub source_mode: IndexedArtifactSourceModeSetting,
     pub publisher_pubkey: Option<String>,
     pub manifest_source: Option<IndexedArtifactManifestSourceSetting>,
+    /// Frozen legacy gateway list retained for released-settings compatibility.
+    /// Do not extend this field; runtime indexed-artifact requests use `poi.artifact.gateway_urls`.
     pub gateway_urls: Vec<String>,
     pub max_manifest_age_secs: Option<u64>,
     pub concurrency: Option<usize>,
@@ -84,15 +87,22 @@ impl IndexedArtifactSettings {
         }
     }
 
-    pub(super) fn source_config(&self) -> Option<IndexedArtifactSourceConfig> {
+    pub(super) fn source_config(
+        &self,
+        gateway_urls: &[String],
+    ) -> Option<IndexedArtifactSourceConfig> {
         match self.source_mode {
             IndexedArtifactSourceModeSetting::Disabled => None,
-            IndexedArtifactSourceModeSetting::Official => Some(Self::official_source_config()),
-            IndexedArtifactSourceModeSetting::Custom => Some(self.custom_source_config()),
+            IndexedArtifactSourceModeSetting::Official => {
+                Some(Self::official_source_config(gateway_urls))
+            }
+            IndexedArtifactSourceModeSetting::Custom => {
+                Some(self.custom_source_config(gateway_urls))
+            }
         }
     }
 
-    fn official_source_config() -> IndexedArtifactSourceConfig {
+    fn official_source_config(gateway_urls: &[String]) -> IndexedArtifactSourceConfig {
         IndexedArtifactSourceConfig {
             trusted_publisher_pubkey: parse_fixed_hex_32(
                 OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
@@ -101,11 +111,9 @@ impl IndexedArtifactSettings {
             manifest_source: IndexedArtifactManifestSource::IpnsName(
                 OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_string(),
             ),
-            gateway_urls: OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+            gateway_urls: gateway_urls
                 .iter()
-                .map(|gateway| {
-                    Url::parse(gateway).expect("official indexed artifact gateway URL is valid")
-                })
+                .map(|gateway| Url::parse(gateway).expect("validated indexed artifact gateway URL"))
                 .collect(),
             max_manifest_age: None,
             concurrency: DEFAULT_INDEXED_ARTIFACT_CONCURRENCY,
@@ -113,7 +121,7 @@ impl IndexedArtifactSettings {
         }
     }
 
-    fn custom_source_config(&self) -> IndexedArtifactSourceConfig {
+    fn custom_source_config(&self, gateway_urls: &[String]) -> IndexedArtifactSourceConfig {
         IndexedArtifactSourceConfig {
             trusted_publisher_pubkey: parse_fixed_hex_32(
                 self.publisher_pubkey
@@ -126,8 +134,7 @@ impl IndexedArtifactSettings {
                 .as_ref()
                 .expect("validated indexed artifact manifest source")
                 .to_runtime(),
-            gateway_urls: self
-                .gateway_urls
+            gateway_urls: gateway_urls
                 .iter()
                 .map(|gateway| Url::parse(gateway).expect("validated indexed artifact gateway URL"))
                 .collect(),
@@ -185,19 +192,6 @@ impl IndexedArtifactSettings {
         match &self.manifest_source {
             Some(source) => source.validate("indexed_artifacts.manifest_source", errors),
             None => errors.push("indexed_artifacts.manifest_source is required".to_string()),
-        }
-        if self.gateway_urls.is_empty() {
-            errors.push(
-                "indexed_artifacts.gateway_urls must contain at least one gateway".to_string(),
-            );
-        }
-        for (index, gateway) in self.gateway_urls.iter().enumerate() {
-            validate_url_scheme(
-                &format!("indexed_artifacts.gateway_urls[{index}]"),
-                gateway,
-                &["http", "https"],
-                errors,
-            );
         }
     }
 }

@@ -43,8 +43,11 @@ impl PoiSettings {
     }
 
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
+        self.artifact.validate_gateway_urls(errors);
         match self.read_source {
-            PoiReadSourceSetting::IndexedArtifacts => self.artifact.validate_required(errors),
+            PoiReadSourceSetting::IndexedArtifacts => {
+                self.artifact.validate_required_source(errors);
+            }
             PoiReadSourceSetting::PoiProxy => {}
         }
         self.proxy.validate(errors);
@@ -115,7 +118,7 @@ impl PoiArtifactSettings {
         }
     }
 
-    pub(super) fn validate_required(&self, errors: &mut Vec<String>) {
+    pub(super) fn validate_required_source(&self, errors: &mut Vec<String>) {
         if self.publisher_pubkey.trim().is_empty() {
             errors.push("poi.artifact.publisher_pubkey is required".to_string());
         } else if parse_fixed_hex_32(&self.publisher_pubkey).is_err() {
@@ -136,6 +139,16 @@ impl PoiArtifactSettings {
                 errors.push("poi.artifact.manifest_source must use an IPNS name".to_string());
             }
         }
+        validate_optional_range(
+            "poi.artifact.max_manifest_age_secs",
+            self.max_manifest_age_secs,
+            1,
+            MAX_INTERVAL_SECS * 365,
+            errors,
+        );
+    }
+
+    pub(super) fn validate_gateway_urls(&self, errors: &mut Vec<String>) {
         if self.gateway_urls.is_empty() {
             errors.push("poi.artifact.gateway_urls must contain at least one gateway".to_string());
         }
@@ -147,13 +160,6 @@ impl PoiArtifactSettings {
                 errors,
             );
         }
-        validate_optional_range(
-            "poi.artifact.max_manifest_age_secs",
-            self.max_manifest_age_secs,
-            1,
-            MAX_INTERVAL_SECS * 365,
-            errors,
-        );
     }
 }
 

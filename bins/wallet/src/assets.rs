@@ -28,6 +28,7 @@ const QR_CODE_ICON_PATH: &str = "railgun/icons/qr-code.svg";
 const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
 const CLOCK_ICON_PATH: &str = "railgun/icons/clock.svg";
 const BOOK_USER_ICON_PATH: &str = "railgun/icons/book-user.svg";
+const LANDMARK_ICON_PATH: &str = "railgun/icons/landmark.svg";
 const SAVE_ICON_PATH: &str = "railgun/icons/save.svg";
 pub(crate) const IMPORT_ICON_PATH: &str = "railgun/icons/import.svg";
 pub(crate) const LIST_ICON_PATH: &str = "railgun/icons/list.svg";
@@ -68,6 +69,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     TRASH_2_ICON_PATH,
     CLOCK_ICON_PATH,
     BOOK_USER_ICON_PATH,
+    LANDMARK_ICON_PATH,
     SAVE_ICON_PATH,
     IMPORT_ICON_PATH,
     LIST_ICON_PATH,
@@ -109,6 +111,7 @@ const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
 const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/book-user.svg");
+const LANDMARK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/landmark.svg");
 const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
 const LIST_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/list.svg");
@@ -356,6 +359,7 @@ pub(crate) enum RailgunSidebarIcon {
     Wallet,
     Broadcaster,
     BookUser,
+    Landmark,
     Logs,
 }
 
@@ -365,6 +369,7 @@ impl IconNamed for RailgunSidebarIcon {
             Self::Wallet => WALLET_ICON_PATH,
             Self::Broadcaster => BROADCASTER_ICON_PATH,
             Self::BookUser => BOOK_USER_ICON_PATH,
+            Self::Landmark => LANDMARK_ICON_PATH,
             Self::Logs => LOGS_ICON_PATH,
         }
         .into()
@@ -427,6 +432,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         TRASH_2_ICON_PATH => Some(TRASH_2_ICON_BYTES),
         CLOCK_ICON_PATH => Some(CLOCK_ICON_BYTES),
         BOOK_USER_ICON_PATH => Some(BOOK_USER_ICON_BYTES),
+        LANDMARK_ICON_PATH => Some(LANDMARK_ICON_BYTES),
         SAVE_ICON_PATH => Some(SAVE_ICON_BYTES),
         IMPORT_ICON_PATH => Some(IMPORT_ICON_BYTES),
         LIST_ICON_PATH => Some(LIST_ICON_BYTES),
@@ -481,6 +487,12 @@ mod tests {
             assets
                 .load("railgun/icons/book-user.svg")
                 .expect("load book user icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/landmark.svg")
+                .expect("load landmark icon")
                 .is_some()
         );
         assert!(

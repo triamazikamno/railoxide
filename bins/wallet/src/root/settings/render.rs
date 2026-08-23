@@ -297,9 +297,6 @@ impl Render for WalletSettingsEditor {
             chain_group = chain_group.item(Self::chain_enabled_item(editor.clone(), chain_id));
         }
 
-        let indexed_gateway_kind = SettingsUrlListKind::IndexedArtifactGateway;
-        let indexed_gateway_endpoints = indexed_gateway_kind.endpoints(&self.draft);
-        let indexed_gateway_editor = editor.clone();
         let indexed_artifact_status = format!(
             "Current index source priority order: {}",
             indexed_artifact_source_status_message(&self.draft)
@@ -342,12 +339,6 @@ impl Render for WalletSettingsEditor {
                             });
                         })
                     }),
-                ))
-                .item(Self::settings_url_list_item(
-                    "Indexed artifact gateway URLs",
-                    indexed_gateway_editor,
-                    indexed_gateway_kind,
-                    indexed_gateway_endpoints,
                 ));
         }
 

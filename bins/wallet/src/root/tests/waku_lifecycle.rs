@@ -9,6 +9,7 @@ use super::super::chain_load::{
 use super::super::private_broadcaster::{
     cancel_private_broadcaster_progress, cancel_public_broadcaster_tasks,
 };
+use super::super::proposals::ProposalCleanup;
 use super::*;
 
 #[test]
@@ -220,6 +221,7 @@ async fn root_replacement_barrier_waits_for_both_workers_before_clearing_monitor
         &tokio::runtime::Handle::current(),
         sync_cleanup,
         Some(waku_completion),
+        ProposalCleanup::empty(),
         monitor_state.clone(),
         event_tx,
     );
@@ -295,6 +297,7 @@ async fn worker_error_epilogue_publishes_quiescence_and_preserves_error() {
         &tokio::runtime::Handle::current(),
         sync_cleanup,
         Some(waku_completion),
+        ProposalCleanup::empty(),
         monitor_state.clone(),
         event_tx,
     );
@@ -338,6 +341,7 @@ async fn panicking_worker_releases_waku_quiescence_and_clears_monitor() {
         &tokio::runtime::Handle::current(),
         sync_cleanup,
         Some(waku_completion),
+        ProposalCleanup::empty(),
         monitor_state.clone(),
         event_tx,
     );
@@ -396,6 +400,7 @@ async fn root_replacement_barrier_rejects_closed_waku_quiescence_latch() {
         &tokio::runtime::Handle::current(),
         sync_cleanup,
         Some(waku_completion),
+        ProposalCleanup::empty(),
         monitor_state.clone(),
         event_tx,
     );
@@ -429,6 +434,7 @@ async fn root_replacement_barrier_preserves_sync_cleanup_failure_after_waku_quie
         &tokio::runtime::Handle::current(),
         sync_cleanup,
         Some(waku_completion),
+        ProposalCleanup::empty(),
         monitor_state.clone(),
         event_tx,
     );

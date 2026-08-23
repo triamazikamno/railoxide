@@ -347,35 +347,6 @@ pub(in crate::root) fn remove_poi_gateway_url(settings: &mut WalletSettings, ind
     }
 }
 
-pub(in crate::root) fn set_indexed_artifact_gateway_url(
-    settings: &mut WalletSettings,
-    index: usize,
-    value: &str,
-) {
-    if let Some(gateway) = settings.indexed_artifacts.gateway_urls.get_mut(index) {
-        *gateway = value.trim().to_string();
-    }
-}
-
-pub(in crate::root) fn add_indexed_artifact_gateway_url(
-    settings: &mut WalletSettings,
-    value: &str,
-) {
-    settings
-        .indexed_artifacts
-        .gateway_urls
-        .push(value.trim().to_string());
-}
-
-pub(in crate::root) fn remove_indexed_artifact_gateway_url(
-    settings: &mut WalletSettings,
-    index: usize,
-) {
-    if index < settings.indexed_artifacts.gateway_urls.len() {
-        settings.indexed_artifacts.gateway_urls.remove(index);
-    }
-}
-
 pub(in crate::root) const fn indexed_artifact_source_mode_value(
     mode: IndexedArtifactSourceModeSetting,
 ) -> &'static str {

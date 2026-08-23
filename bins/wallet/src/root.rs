@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
 use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
-#[cfg(feature = "hardware")]
-use gpui::FocusHandle;
-use gpui::{AppContext, Context, Entity, Focusable, Pixels, SharedString, Window, px};
+use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
     IndexPath, WindowExt,
     input::{InputEvent, InputState},
@@ -56,6 +54,7 @@ mod platform_attention;
 mod private_action;
 mod private_assets;
 mod private_broadcaster;
+mod proposals;
 mod public_account;
 mod public_action;
 mod public_balances;
@@ -105,6 +104,7 @@ use private_action::{
     UnshieldAssetKey, UnshieldFormState,
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
+use proposals::ProposalsState;
 use public_account::{HardwarePublicAccountDerivationStatus, PublicAccountFormState};
 use public_action::{PublicActionMode, PublicSendKind};
 use public_balances::{
@@ -462,6 +462,8 @@ pub(crate) struct WalletRoot {
     import_mnemonic_input: Entity<InputState>,
     public_accounts: Vec<PublicAccountMetadata>,
     address_book: AddressBookState,
+    proposals: ProposalsState,
+    proposal_detail_focus: FocusHandle,
     private_address_book: Vec<PrivateAddressBookEntry>,
     public_address_book: Vec<PublicAddressBookEntry>,
     broadcaster_preferences: BroadcasterPreferences,
@@ -1407,6 +1409,8 @@ impl WalletRoot {
             import_mnemonic_input,
             public_accounts: Vec::new(),
             address_book,
+            proposals: ProposalsState::new(initial_chain_id),
+            proposal_detail_focus: cx.focus_handle(),
             private_address_book: Vec::new(),
             public_address_book: Vec::new(),
             broadcaster_preferences: BroadcasterPreferences::default(),

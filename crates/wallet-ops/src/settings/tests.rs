@@ -46,10 +46,48 @@ fn legacy_official_settings() -> WalletSettings {
 }
 
 fn put_unmigrated_settings(store: &DbStore, settings: &WalletSettings) {
-    let payload = encode_wallet_settings(settings).expect("encode unmigrated settings");
+    let payload = released_v4_settings_payload(settings);
     store
         .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
         .expect("store unmigrated settings");
+}
+
+#[derive(Debug, Serialize)]
+struct ReleasedV4WalletSettingsWire {
+    version: u32,
+    network: super::NetworkSettings,
+    privacy: super::PrivacySettings,
+    chains: super::ChainSettings,
+    indexed_artifacts: super::IndexedArtifactSettings,
+    poi: super::PoiSettings,
+    broadcaster: super::PublicBroadcasterSettings,
+    tokens: super::TokenSettings,
+    gas: super::GasSettings,
+    runtime: super::RuntimeSettings,
+    waku: super::WakuSettings,
+    walletconnect: super::WalletConnectSettings,
+}
+
+fn released_settings_payload(settings: &WalletSettings, version: u32) -> Vec<u8> {
+    rmp_serde::to_vec_named(&ReleasedV4WalletSettingsWire {
+        version,
+        network: settings.network.clone(),
+        privacy: settings.privacy.clone(),
+        chains: settings.chains.clone(),
+        indexed_artifacts: settings.indexed_artifacts.clone(),
+        poi: settings.poi.clone(),
+        broadcaster: settings.broadcaster.clone(),
+        tokens: settings.tokens.clone(),
+        gas: settings.gas.clone(),
+        runtime: settings.runtime.clone(),
+        waku: settings.waku.clone(),
+        walletconnect: settings.walletconnect.clone(),
+    })
+    .expect("encode released v4 settings")
+}
+
+fn released_v4_settings_payload(settings: &WalletSettings) -> Vec<u8> {
+    released_settings_payload(settings, 4)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -367,6 +405,291 @@ fn official_identity_migration_preserves_user_preferences() {
         settings.poi.artifact.max_manifest_age_secs
     );
     assert_eq!(migrated.poi.proxy, settings.poi.proxy);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_5_previous_poi_defaults_migrate_to_pinata_and_persist() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.gateway_urls = vec![
+        "https://dweb.link".to_string(),
+        "https://ipfs.filebase.io".to_string(),
+        "https://ipfs.io".to_string(),
+    ];
+    let released_payload = released_settings_payload(&settings, 5);
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store released v5 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate released v5 settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        migrated.poi.artifact.gateway_urls,
+        OFFICIAL_POI_ARTIFACT_GATEWAYS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    let persisted = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read migrated settings")
+        .expect("migrated settings record");
+    assert_eq!(
+        decode_wallet_settings(&persisted).expect("decode migrated settings"),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_5_customized_poi_gateways_are_preserved() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.gateway_urls = vec![
+        "https://custom-second.example".to_string(),
+        "https://custom-first.example/path".to_string(),
+    ];
+    let released_payload = released_settings_payload(&settings, 5);
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store released v5 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate released v5 settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        migrated.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    let persisted = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read migrated settings")
+        .expect("migrated settings record");
+    assert_eq!(
+        decode_wallet_settings(&persisted).expect("decode migrated settings"),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_5_current_poi_default_is_not_overwritten_by_legacy_gateways() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.gateway_urls = OFFICIAL_POI_ARTIFACT_GATEWAYS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    settings.indexed_artifacts.gateway_urls = vec![
+        "https://legacy-first.example/path".to_string(),
+        "http://legacy-second.example".to_string(),
+    ];
+    let released_payload = released_settings_payload(&settings, 5);
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store released v5 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate released v5 settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        migrated.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        migrated.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+
+    let persisted = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read migrated settings")
+        .expect("migrated settings record");
+    let decoded = decode_wallet_settings(&persisted).expect("decode migrated settings");
+    assert_eq!(
+        decoded.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        decoded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn legacy_indexed_gateways_promote_into_default_poi_gateways_and_persist() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.gateway_urls = vec![
+        "https://dweb.link".to_string(),
+        "https://ipfs.filebase.io".to_string(),
+        "https://ipfs.io".to_string(),
+    ];
+    settings.indexed_artifacts.gateway_urls = vec![
+        "https://legacy-first.example".to_string(),
+        "http://legacy-second.example/path".to_string(),
+    ];
+    put_unmigrated_settings(&store, &settings);
+
+    let migrated = load_wallet_settings(&store).expect("load and migrate settings");
+    assert_eq!(
+        migrated.poi.artifact.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+    assert_eq!(
+        migrated.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+    let persisted = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read migrated settings")
+        .expect("migrated settings record");
+    assert_eq!(
+        decode_wallet_settings(&persisted).expect("decode migrated settings"),
+        migrated
+    );
+
+    let mut reset = migrated;
+    reset.poi.artifact.gateway_urls = OFFICIAL_POI_ARTIFACT_GATEWAYS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    save_wallet_settings(&store, &reset).expect("save reset gateways");
+    let reloaded = load_wallet_settings(&store).expect("reload reset gateways");
+    assert_eq!(
+        reloaded.poi.artifact.gateway_urls,
+        reset.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        reloaded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn customized_poi_gateways_win_over_legacy_indexed_gateways() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.gateway_urls = vec!["https://custom-poi.example".to_string()];
+    settings.indexed_artifacts.gateway_urls = vec!["https://legacy-indexed.example".to_string()];
+    put_unmigrated_settings(&store, &settings);
+
+    let loaded = load_wallet_settings(&store).expect("load customized settings");
+    assert_eq!(
+        loaded.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        loaded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn invalid_legacy_indexed_gateways_are_not_promoted() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.gateway_urls = vec!["ftp://legacy-indexed.example".to_string()];
+    put_unmigrated_settings(&store, &settings);
+
+    let loaded = load_wallet_settings(&store).expect("load settings");
+    assert_eq!(
+        loaded.poi.artifact.gateway_urls,
+        OFFICIAL_POI_ARTIFACT_GATEWAYS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        loaded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn released_indexed_gateway_field_roundtrips_without_runtime_use() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.gateway_urls = vec!["https://legacy-indexed.example".to_string()];
+
+    let encoded = encode_wallet_settings(&settings).expect("encode settings");
+    let decoded = decode_wallet_settings(&encoded).expect("decode settings");
+    assert_eq!(
+        decoded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+}
+
+#[test]
+fn current_settings_do_not_promote_legacy_indexed_gateways() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.gateway_urls = vec!["https://legacy-indexed.example".to_string()];
+    let payload = encode_wallet_settings(&settings).expect("encode current settings");
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .expect("store current settings");
+
+    let loaded = load_wallet_settings(&store).expect("load current settings");
+    assert_eq!(
+        loaded.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        loaded.indexed_artifacts.gateway_urls,
+        settings.indexed_artifacts.gateway_urls
+    );
+    assert_eq!(
+        store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .expect("read current settings")
+            .expect("current settings record"),
+        payload
+    );
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -1105,8 +1428,15 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
     ));
     assert_eq!(
-        source.gateway_urls.len(),
-        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS.len()
+        source
+            .gateway_urls
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect::<Vec<_>>(),
+        OFFICIAL_POI_ARTIFACT_GATEWAYS
+            .iter()
+            .map(|gateway| format!("{gateway}/"))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1264,7 +1594,7 @@ fn indexed_artifact_official_source_ignores_stored_custom_fields() {
             .iter()
             .map(|url| url.as_str().to_string())
             .collect::<Vec<_>>(),
-        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+        OFFICIAL_POI_ARTIFACT_GATEWAYS
             .iter()
             .map(|gateway| format!("{gateway}/"))
             .collect::<Vec<_>>()
@@ -1285,7 +1615,8 @@ fn indexed_artifact_custom_source_builds_effective_config() {
     settings.indexed_artifacts.manifest_source = Some(IndexedArtifactManifestSourceSetting::Url(
         "https://artifacts.example/manifest.json".to_string(),
     ));
-    settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+    settings.indexed_artifacts.gateway_urls = vec!["https://legacy-gateway.example".to_string()];
+    settings.poi.artifact.gateway_urls = vec!["https://canonical-gateway.example".to_string()];
     settings.indexed_artifacts.concurrency = Some(5);
     settings.indexed_artifacts.max_in_flight_bytes = Some(8 * 1024 * 1024);
     settings.indexed_artifacts.max_manifest_age_secs = Some(3_600);
@@ -1310,7 +1641,10 @@ fn indexed_artifact_custom_source_builds_effective_config() {
         super::IndexedArtifactManifestSource::Url(url)
             if url.as_str() == "https://artifacts.example/manifest.json"
     ));
-    assert_eq!(source.gateway_urls[0].as_str(), "https://gateway.example/");
+    assert_eq!(
+        source.gateway_urls[0].as_str(),
+        "https://canonical-gateway.example/"
+    );
     assert_eq!(source.concurrency, 5);
     assert_eq!(source.max_in_flight_bytes, 8 * 1024 * 1024);
     assert_eq!(
@@ -1328,7 +1662,7 @@ fn indexed_artifact_ipns_source_is_trimmed_in_effective_config() {
         Some(IndexedArtifactManifestSourceSetting::IpnsName(format!(
             "  {OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME}  "
         )));
-    settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+    settings.indexed_artifacts.gateway_urls = vec!["ftp://legacy-gateway.example".to_string()];
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let source = configs
@@ -1395,7 +1729,7 @@ fn indexed_artifact_custom_source_validation_rejects_missing_source() {
             .any(|message| message.contains("indexed_artifacts.manifest_source"))
     );
     assert!(
-        err.messages
+        !err.messages
             .iter()
             .any(|message| message.contains("indexed_artifacts.gateway_urls"))
     );
@@ -1958,6 +2292,24 @@ fn explicit_poi_proxy_mode_remains_selectable_without_artifact_fallback() {
             reqwest::Url::parse("https://explicit-poi-proxy.example/rpc")
                 .expect("explicit proxy URL")
         )
+    );
+}
+
+#[test]
+fn poi_proxy_mode_still_validates_canonical_artifact_gateways() {
+    let mut settings = WalletSettings::default();
+    settings.poi.read_source = PoiReadSourceSetting::PoiProxy;
+    settings.poi.artifact.gateway_urls = vec!["ftp://invalid-gateway.example".to_string()];
+
+    let err = settings
+        .validate()
+        .expect_err("invalid canonical gateway should be rejected");
+    assert_eq!(
+        err.messages
+            .iter()
+            .filter(|message| message.contains("poi.artifact.gateway_urls"))
+            .count(),
+        1
     );
 }
 

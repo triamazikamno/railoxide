@@ -22,6 +22,7 @@ use wallet_ops::{
 };
 
 use super::WakuWorkerCompletionToken;
+use super::proposals::ProposalCleanup;
 use super::utxo::should_focus_utxo_table;
 use super::{
     BroadcasterActivityTab, InitialCatchUpFingerprint, InitialSyncObservation, WalletRoot,
@@ -611,12 +612,13 @@ impl WalletRootReplacementCleanup {
         runtime: &Handle,
         sync_cleanup: WalletSyncLifecycleCleanupWaitGroup,
         waku_completion: Option<WakuWorkerCompletionToken>,
+        proposal_cleanup: ProposalCleanup,
         monitor_state: Shared,
         monitor_event_tx: EventTx,
     ) -> Self {
         let (completed_tx, completed_rx) = watch::channel(None);
         runtime.spawn(async move {
-            let (sync_result, waku_result) = tokio::join!(
+            let (sync_result, waku_result, proposal_result) = tokio::join!(
                 sync_cleanup.wait(),
                 async {
                     match waku_completion {
@@ -624,22 +626,35 @@ impl WalletRootReplacementCleanup {
                         None => Ok(()),
                     }
                 },
+                proposal_cleanup.shutdown(),
             );
 
             if let Some(rev) = monitor_state.write().clear() {
                 publish_revision(&monitor_event_tx, rev);
             }
 
-            let result = match (sync_result, waku_result) {
-                (Ok(report), Ok(())) => Ok(report),
-                (Err(sync_error), Ok(())) => Err(format!(
+            let result = match (sync_result, waku_result, proposal_result) {
+                (Ok(report), Ok(()), Ok(())) => Ok(report),
+                (Err(sync_error), Ok(()), Ok(())) => Err(format!(
                     "wallet sync cleanup failed during root replacement: {sync_error}"
                 )),
-                (Ok(_), Err(waku_error)) => Err(format!(
+                (Ok(_), Err(waku_error), Ok(())) => Err(format!(
                     "Waku worker cleanup failed during root replacement: {waku_error}"
                 )),
-                (Err(sync_error), Err(waku_error)) => Err(format!(
+                (Ok(_), Ok(()), Err(proposal_error)) => Err(format!(
+                    "Proposal worker cleanup failed during root replacement: {proposal_error}"
+                )),
+                (Err(sync_error), Err(waku_error), Ok(())) => Err(format!(
                     "wallet sync cleanup failed during root replacement: {sync_error}; Waku worker cleanup failed during root replacement: {waku_error}"
+                )),
+                (Err(sync_error), Ok(()), Err(proposal_error)) => Err(format!(
+                    "wallet sync cleanup failed during root replacement: {sync_error}; Proposal worker cleanup failed during root replacement: {proposal_error}"
+                )),
+                (Ok(_), Err(waku_error), Err(proposal_error)) => Err(format!(
+                    "Waku worker cleanup failed during root replacement: {waku_error}; Proposal worker cleanup failed during root replacement: {proposal_error}"
+                )),
+                (Err(sync_error), Err(waku_error), Err(proposal_error)) => Err(format!(
+                    "wallet sync cleanup failed during root replacement: {sync_error}; Waku worker cleanup failed during root replacement: {waku_error}; Proposal worker cleanup failed during root replacement: {proposal_error}"
                 )),
             };
             let _ = completed_tx.send(Some(result));
@@ -1587,6 +1602,7 @@ impl WalletRoot {
         self.revealed_passphrase_context_id = None;
         self.wallet_sync_lifecycle_shutdown_started = true;
         let waku_completion = self.stop_waku_for_root_replacement();
+        let proposal_cleanup = self.proposals.take_cleanup();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         let outgoing_http = self.http.clone();
         self.reset_wallet_scoped_state(cx);
@@ -1596,6 +1612,7 @@ impl WalletRoot {
             &self.runtime,
             sync_cleanup,
             waku_completion,
+            proposal_cleanup,
             self.monitor_state.clone(),
             self.monitor_event_tx.clone(),
         );
@@ -2664,6 +2681,7 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        self.invalidate_proposals_chain(chain_id);
         self.ui_state.last_chain_id = Some(chain_id);
         self.save_ui_state();
         self.sync_broadcaster_monitor_chain_filter(chain_id, window, cx);
@@ -2687,6 +2705,9 @@ impl WalletRoot {
         }
         if self.view_session.is_some() {
             self.ensure_chain_load(chain_id, cx);
+        }
+        if self.active_activity == super::sidebar::Activity::Proposals {
+            self.start_proposals_refresh(false, cx);
         }
         cx.notify();
     }

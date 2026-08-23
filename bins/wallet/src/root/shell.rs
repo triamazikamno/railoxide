@@ -347,7 +347,7 @@ impl Render for WalletRoot {
                     .h_full()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
-                    .child(self.render_workspace(root, window)),
+                    .child(self.render_workspace(root, window, cx)),
             )
     }
 }
@@ -645,8 +645,15 @@ pub(super) fn wallet_build_label() -> SharedString {
 }
 
 impl WalletRoot {
-    pub(super) fn render_workspace(&self, root: Entity<Self>, window: &Window) -> impl IntoElement {
+    pub(super) fn render_workspace(
+        &mut self,
+        root: Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> impl IntoElement {
+        let active_content = self.render_active_content(&root, window, cx);
         if self.logs_open {
+            let logs_content = self.render_logs_drawer(root);
             div().size_full().min_w(px(0.0)).min_h(px(0.0)).child(
                 v_resizable("wallet-logs-drawer")
                     .with_state(&self.drawer_split)
@@ -656,7 +663,7 @@ impl WalletRoot {
                                 .size_full()
                                 .min_w(px(0.0))
                                 .min_h(px(0.0))
-                                .child(self.render_active_content(&root, window)),
+                                .child(active_content),
                         ),
                     )
                     .child(
@@ -668,7 +675,7 @@ impl WalletRoot {
                                     .size_full()
                                     .min_w(px(0.0))
                                     .min_h(px(0.0))
-                                    .child(self.render_logs_drawer(root)),
+                                    .child(logs_content),
                             ),
                     ),
             )
@@ -677,15 +684,23 @@ impl WalletRoot {
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
-                .child(self.render_active_content(&root, window))
+                .child(active_content)
         }
     }
 
-    fn render_active_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
+    fn render_active_content(
+        &mut self,
+        root: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> gpui::AnyElement {
         match self.active_activity {
             Activity::Wallet => self.render_wallet_view(root, window).into_any_element(),
             Activity::Broadcaster => self.render_broadcaster_view(root).into_any_element(),
             Activity::AddressBook => self.render_address_book_view(root),
+            Activity::Proposals => self
+                .render_proposals_view(root, window, cx)
+                .into_any_element(),
             Activity::Settings => self.render_settings_view().into_any_element(),
         }
     }

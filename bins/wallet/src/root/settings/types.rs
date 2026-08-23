@@ -133,7 +133,6 @@ pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables Wak
 pub(in crate::root) enum SettingsUrlListKind {
     ChainRpc { chain_id: u64, chain_label: String },
     SponsoredRelay { chain_id: u64, chain_label: String },
-    IndexedArtifactGateway,
     PoiGateway,
     WakuDnsEnrTree,
     WakuDohFallback,
@@ -146,7 +145,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { .. } => {
                 "No sponsored relays configured. Sponsored self-broadcast is disabled."
             }
-            Self::IndexedArtifactGateway => "No indexed artifact gateways configured.",
             Self::PoiGateway => "No artifact gateways configured.",
             Self::WakuDnsEnrTree => "No DNS ENR trees configured. DNS bootstrap is disabled.",
             Self::WakuDohFallback => "No DoH fallback endpoints configured.",
@@ -159,10 +157,9 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { .. } => {
                 "Enter a compatible HTTP(S) pending-block eth_sendBundle relay."
             }
-            Self::IndexedArtifactGateway => {
-                "Enter an HTTP(S) gateway URL for chain-indexed artifact reads."
+            Self::PoiGateway => {
+                "Enter an HTTP(S) gateway URL for POI, indexed artifact, and governance document reads."
             }
-            Self::PoiGateway => "Enter an HTTP(S) gateway URL for indexed POI artifact reads.",
             Self::WakuDnsEnrTree => "Enter an enrtree:// DNS discovery tree URL.",
             Self::WakuDohFallback => "Enter an HTTP(S) DNS-over-HTTPS fallback endpoint.",
         }
@@ -173,9 +170,6 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => format!("wallet-settings-rpc-add-{chain_id}"),
             Self::SponsoredRelay { chain_id, .. } => {
                 format!("wallet-settings-sponsored-relay-add-{chain_id}")
-            }
-            Self::IndexedArtifactGateway => {
-                "wallet-settings-indexed-artifact-gateway-add".to_string()
             }
             Self::PoiGateway => "wallet-settings-poi-gateway-add".to_string(),
             Self::WakuDnsEnrTree => "wallet-settings-waku-dns-enr-tree-add".to_string(),
@@ -191,9 +185,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 format!("wallet-settings-sponsored-relay-row-{chain_id}-{index}")
             }
-            Self::IndexedArtifactGateway => {
-                format!("wallet-settings-indexed-artifact-gateway-row-{index}")
-            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-row-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-row-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-row-{index}"),
@@ -208,9 +199,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 format!("wallet-settings-sponsored-relay-edit-{chain_id}-{index}")
             }
-            Self::IndexedArtifactGateway => {
-                format!("wallet-settings-indexed-artifact-gateway-edit-{index}")
-            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-edit-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-edit-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-edit-{index}"),
@@ -224,9 +212,6 @@ impl SettingsUrlListKind {
             }
             Self::SponsoredRelay { chain_id, .. } => {
                 format!("wallet-settings-sponsored-relay-remove-{chain_id}-{index}")
-            }
-            Self::IndexedArtifactGateway => {
-                format!("wallet-settings-indexed-artifact-gateway-remove-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-remove-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-remove-{index}"),
@@ -248,13 +233,6 @@ impl SettingsUrlListKind {
                     format!("Edit {chain_label} sponsored relay")
                 } else {
                     format!("Add {chain_label} sponsored relay")
-                }
-            }
-            Self::IndexedArtifactGateway => {
-                if is_edit {
-                    "Edit indexed artifact gateway".to_string()
-                } else {
-                    "Add indexed artifact gateway".to_string()
                 }
             }
             Self::PoiGateway => {
@@ -287,7 +265,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 display_sponsored_bundle_relays(settings, *chain_id)
             }
-            Self::IndexedArtifactGateway => settings.indexed_artifacts.gateway_urls.clone(),
             Self::PoiGateway => settings.poi.artifact.gateway_urls.clone(),
             Self::WakuDnsEnrTree => display_waku_dns_enr_trees(settings),
             Self::WakuDohFallback => display_waku_doh_fallback_endpoints(settings),
@@ -307,9 +284,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 set_sponsored_bundle_relay(settings, *chain_id, index, value);
             }
-            Self::IndexedArtifactGateway => {
-                set_indexed_artifact_gateway_url(settings, index, value);
-            }
             Self::PoiGateway => set_poi_gateway_url(settings, index, value),
             Self::WakuDnsEnrTree => set_waku_dns_enr_tree(settings, index, value),
             Self::WakuDohFallback => set_waku_doh_fallback_endpoint(settings, index, value),
@@ -322,7 +296,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 add_sponsored_bundle_relay(settings, *chain_id, value);
             }
-            Self::IndexedArtifactGateway => add_indexed_artifact_gateway_url(settings, value),
             Self::PoiGateway => add_poi_gateway_url(settings, value),
             Self::WakuDnsEnrTree => add_waku_dns_enr_tree(settings, value),
             Self::WakuDohFallback => add_waku_doh_fallback_endpoint(settings, value),
@@ -337,7 +310,6 @@ impl SettingsUrlListKind {
             Self::SponsoredRelay { chain_id, .. } => {
                 remove_sponsored_bundle_relay(settings, *chain_id, index);
             }
-            Self::IndexedArtifactGateway => remove_indexed_artifact_gateway_url(settings, index),
             Self::PoiGateway => remove_poi_gateway_url(settings, index),
             Self::WakuDnsEnrTree => remove_waku_dns_enr_tree(settings, index),
             Self::WakuDohFallback => remove_waku_doh_fallback_endpoint(settings, index),

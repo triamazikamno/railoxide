@@ -119,7 +119,7 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.secondary_active = rgb(SURFACE_ELEVATED_ALT);
     colors.secondary_foreground = rgb(TEXT);
     colors.secondary_hover = rgb(SURFACE_HOVER);
-    colors.selection = rgb(SELECTED_SURFACE);
+    colors.selection = rgb(SELECTED_SURFACE).alpha(0.45);
     colors.sidebar = rgb(SURFACE);
     colors.sidebar_accent = rgb(SURFACE_HOVER);
     colors.sidebar_accent_foreground = rgb(TEXT);

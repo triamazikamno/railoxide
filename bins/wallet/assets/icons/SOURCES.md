@@ -15,6 +15,7 @@
 - `arrow-down-to-line.svg`: Lucide `arrow-down-to-line`, ISC License, https://lucide.dev/icons/arrow-down-to-line
 - `list.svg`: Lucide `list`, ISC License, https://lucide.dev/icons/list
 - `group.svg`: Lucide `group`, ISC License, https://lucide.dev/icons/group
+- `landmark.svg`: Lucide `landmark`, ISC License, https://lucide.dev/icons/landmark
 - `walletconnect.svg`: WalletConnect official blue default icon from `WalletConnect/walletconnect-assets`, MIT License, https://github.com/WalletConnect/walletconnect-assets/blob/master/Icon/Blue%20(Default)/Icon.svg. Used only to identify WalletConnect support; do not recolor, rotate, deform, or add shadows.
 - `telegram.svg`: Simple Icons `telegram`, CC0-1.0, https://simpleicons.org/icons/telegram and https://cdn.jsdelivr.net/npm/simple-icons@16.22.0/icons/telegram.svg. Used only to identify the RailOxide Telegram link.
 - `trezor-symbol-white-rgb.svg`: Trezor official white symbol for screens, https://satoshilabs.visualbook.pro/content/2_trezor/1_logos/2_symbol/trezor-symbol-white-rgb.svg. Brand guidance: https://satoshilabs.visualbook.pro/trezor/logos/symbol. Render at minimum 22px height; do not recolor, rotate, deform, or add shadows.

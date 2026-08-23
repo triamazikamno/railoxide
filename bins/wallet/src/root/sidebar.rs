@@ -39,15 +39,17 @@ pub(super) enum Activity {
     Wallet,
     Broadcaster,
     AddressBook,
+    Proposals,
     Settings,
 }
 
 #[cfg(test)]
-pub(super) const fn sidebar_primary_activity_order() -> [Activity; 4] {
+pub(super) const fn sidebar_primary_activity_order() -> [Activity; 5] {
     [
         Activity::Wallet,
         Activity::Broadcaster,
         Activity::AddressBook,
+        Activity::Proposals,
         Activity::Settings,
     ]
 }
@@ -62,6 +64,7 @@ impl WalletRoot {
         let wallet_root = root.clone();
         let broadcaster_root = root.clone();
         let address_book_root = root.clone();
+        let proposals_root = root.clone();
         let settings_root = root.clone();
         let logs_root = root.clone();
         let network_root = root.clone();
@@ -149,6 +152,17 @@ impl WalletRoot {
                                     root.clear_settings_transient_status(cx);
                                     root.active_activity = Activity::AddressBook;
                                     cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        SidebarMenuItem::new("Governance")
+                            .icon(Icon::new(RailgunSidebarIcon::Landmark).size_5())
+                            .active(self.active_activity == Activity::Proposals)
+                            .on_click(move |_event, _window, cx| {
+                                proposals_root.update(cx, |root, cx| {
+                                    root.clear_settings_transient_status(cx);
+                                    root.open_proposals(cx);
                                 });
                             }),
                     )

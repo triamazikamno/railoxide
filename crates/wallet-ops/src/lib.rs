@@ -97,6 +97,8 @@ mod amounts;
 mod anchors;
 mod block_observer;
 mod desktop;
+mod governance;
+mod governance_documents;
 pub mod hardware;
 mod hardware_typed_data;
 mod http;
@@ -123,6 +125,14 @@ pub use anchors::{
     spawn_token_anchor_refresh_worker,
 };
 pub use desktop::*;
+pub use governance::{
+    GovernanceContractRules, GovernanceContractSummary, GovernanceContractVersion,
+    GovernanceMajorityResult, GovernanceOverview, GovernanceProposal, GovernanceProposalAction,
+    GovernanceProposalDeadlines, GovernanceProposalStage, GovernanceProposalStatus,
+    GovernanceQuorumBasis, derive_governance_proposal_stage, derive_governance_proposal_status,
+    fetch_governance_chain_time, fetch_governance_overview, fetch_governance_page,
+};
+pub use governance_documents::{GovernanceDocument, resolve_governance_document};
 pub use http::{
     HttpContext, TorBridgeActivitySnapshot, TorRuntimeHealth, WalletNetworkConfig,
     WalletNetworkHealth, WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode,

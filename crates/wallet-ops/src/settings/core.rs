@@ -6,7 +6,7 @@ use super::{
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 4;
+pub const WALLET_SETTINGS_VERSION: u32 = 6;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 2;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
@@ -19,6 +19,7 @@ pub const OFFICIAL_POI_ARTIFACT_GATEWAYS: &[&str] = &[
     "https://dweb.link",
     "https://ipfs.filebase.io",
     "https://ipfs.io",
+    "https://gateway.pinata.cloud",
 ];
 pub const DEFAULT_WAKU_CLUSTER_ID: u32 = 5;
 pub const DEFAULT_WAKU_SHARD_ID: u32 = 1;

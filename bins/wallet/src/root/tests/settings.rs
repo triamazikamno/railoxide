@@ -4,11 +4,9 @@ use crate::root::maintenance::{
     public_sync_reset_restart_is_safe,
 };
 use crate::root::settings::{
-    add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
-    indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
-    price_anchor_component_dialog_values_from_anchor, price_anchor_dialog_values_from_override,
-    remove_indexed_artifact_gateway_url, set_indexed_artifact_gateway_url,
-    should_show_indexed_artifact_custom_settings,
+    apply_indexed_artifact_source_mode, indexed_artifact_source_mode_value,
+    indexed_artifact_source_status_message, price_anchor_component_dialog_values_from_anchor,
+    price_anchor_dialog_values_from_override, should_show_indexed_artifact_custom_settings,
 };
 use crate::root::startup::tor_bootstrap_recovery_is_current;
 use wallet_ops::WalletNetworkProgressStage;
@@ -226,13 +224,14 @@ fn wallet_app_options_preserve_cli_db_path() {
 }
 
 #[test]
-fn settings_sidebar_order_places_address_book_before_settings() {
+fn primary_sidebar_order_places_proposals_before_settings() {
     assert_eq!(
         sidebar_primary_activity_order(),
         [
             Activity::Wallet,
             Activity::Broadcaster,
             Activity::AddressBook,
+            Activity::Proposals,
             Activity::Settings
         ]
     );
@@ -764,33 +763,6 @@ fn poi_gateway_settings_mutations_update_direct_list() {
             "https://edited-gateway.example".to_string(),
             "https://added-gateway.example".to_string(),
         ]
-    );
-}
-
-#[test]
-fn indexed_artifact_gateway_settings_mutations_do_not_touch_poi_gateways() {
-    let mut settings = WalletSettings::default();
-    settings.indexed_artifacts.gateway_urls = vec![
-        "https://indexed-one.example".to_string(),
-        "https://indexed-two.example".to_string(),
-    ];
-    settings.poi.artifact.gateway_urls = vec!["https://poi.example".to_string()];
-
-    set_indexed_artifact_gateway_url(&mut settings, 0, " https://indexed-edited.example ");
-    add_indexed_artifact_gateway_url(&mut settings, " https://indexed-added.example ");
-    remove_indexed_artifact_gateway_url(&mut settings, 1);
-    remove_indexed_artifact_gateway_url(&mut settings, 10);
-
-    assert_eq!(
-        settings.indexed_artifacts.gateway_urls,
-        vec![
-            "https://indexed-edited.example".to_string(),
-            "https://indexed-added.example".to_string(),
-        ]
-    );
-    assert_eq!(
-        settings.poi.artifact.gateway_urls,
-        vec!["https://poi.example".to_string()]
     );
 }
 

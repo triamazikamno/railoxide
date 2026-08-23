@@ -62,7 +62,9 @@ pub fn build_effective_chain_configs(
             override_settings.map_or(&deployment_default, |settings| &settings.deployment);
         let gas_default = ChainGasSettings::default();
         let gas = override_settings.map_or(&gas_default, |settings| &settings.gas);
-        let indexed_artifact_source = settings.indexed_artifacts.source_config();
+        let indexed_artifact_source = settings
+            .indexed_artifacts
+            .source_config(&settings.poi.artifact.gateway_urls);
         configs.insert(
             *chain_id,
             EffectiveChainConfig {
