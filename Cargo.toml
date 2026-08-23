@@ -63,15 +63,15 @@ arti-client = "0.43"
 tor-rtcompat = "0.43"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
-waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "98ca2a5f13a8a83c8205b095cb459eeea100fcaf" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c13f3723032659152445976b0bab6c795e46058d" }
 
 [profile.release]
 opt-level = 3
