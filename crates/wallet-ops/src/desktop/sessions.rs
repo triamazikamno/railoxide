@@ -159,6 +159,7 @@ impl WalletSessionStore {
         http: &HttpContext,
         wait_until_ready: bool,
     ) -> Result<WalletSession> {
+        self.sync_manager.set_gateway_pool(http.gateway_pool());
         let wallet_id = request.view_session.wallet_id().to_owned();
         let mut active_scope = self.active_wallet_scope.lock().await;
         if active_scope.requires_replacement(request.wallet_scope_generation, &wallet_id)? {

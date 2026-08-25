@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tor_rtcompat::PreferredRuntime;
+use trustless_artifacts::GatewayPool;
 
 const ARTI_DIR: &str = "arti";
 const ARTI_STATE_DIR: &str = "state";
@@ -619,9 +620,10 @@ pub struct HttpContext {
     pub client: reqwest::Client,
     /// Async HTTP client for bounded EVM JSON-RPC requests.
     pub rpc_client: reqwest::Client,
-    /// Proxy URL for components that build their own client, such as the
-    /// blocking artifact downloader. In Tor mode this is the internal SOCKS
-    /// bridge URL, not a user-supplied external proxy.
+    gateway_pool: GatewayPool,
+    /// Proxy URL retained for components that need an endpoint value. In Tor
+    /// mode this is the internal SOCKS bridge URL, not a user-supplied
+    /// external proxy.
     pub proxy_url: Option<Url>,
     pub user_proxy_url: Option<Url>,
     mode: WalletNetworkMode,
@@ -791,7 +793,14 @@ impl HttpContext {
             .socks_bridge
             .as_ref()
             .ok_or_else(|| eyre!("new Tor session requires the internal SOCKS bridge"))?;
-        socks_bridge.new_isolated_session()
+        let generation = socks_bridge.new_isolated_session()?;
+        self.gateway_pool.reset();
+        Ok(generation)
+    }
+
+    #[must_use]
+    pub fn gateway_pool(&self) -> GatewayPool {
+        self.gateway_pool.clone()
     }
 
     #[must_use]
@@ -821,6 +830,7 @@ impl HttpContext {
         Self {
             client: reqwest::Client::new(),
             rpc_client: reqwest::Client::new(),
+            gateway_pool: GatewayPool::new(),
             proxy_url: None,
             user_proxy_url: None,
             mode: WalletNetworkMode::Direct,
@@ -840,6 +850,7 @@ impl HttpContext {
         Self {
             client: reqwest::Client::new(),
             rpc_client,
+            gateway_pool: GatewayPool::new(),
             proxy_url: None,
             user_proxy_url: None,
             mode,
@@ -1196,6 +1207,7 @@ fn build_reqwest_context(
     Ok(HttpContext {
         client,
         rpc_client,
+        gateway_pool: GatewayPool::new(),
         proxy_url,
         user_proxy_url,
         mode,

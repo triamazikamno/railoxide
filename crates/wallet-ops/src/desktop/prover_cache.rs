@@ -113,7 +113,7 @@ pub async fn build_cache_with_context_and_progress_with_session(
     session: ProverCacheBuildSession,
     mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
 ) -> Result<ProverCacheBuildReport> {
-    let source = artifact_source(http, db.as_ref());
+    let source = artifact_source(http, db.as_ref())?;
     let db_path = db.root_dir().to_path_buf();
     tracing::info!(
         db_path = %db_path.display(),
@@ -121,14 +121,11 @@ pub async fn build_cache_with_context_and_progress_with_session(
         artifact_dir = %source.out_dir.display(),
         "starting wallet cache build"
     );
-    let report = tokio::task::spawn_blocking(move || {
-        build_prover_cache_with_progress(&source, Some(db.as_ref()), |progress| {
-            session.publish(progress.clone());
-            on_progress(progress);
-        })
+    let report = build_prover_cache_with_progress(&source, Some(Arc::clone(&db)), |progress| {
+        session.publish(progress.clone());
+        on_progress(progress);
     })
-    .await
-    .wrap_err("join prover cache build task")??;
+    .await?;
     tracing::info!(
         railgun_variants = report.railgun_variants,
         poi_variants = report.poi_variants,

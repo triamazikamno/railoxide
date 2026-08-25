@@ -112,6 +112,7 @@ impl PoiArtifactSettings {
                     SensitiveUrl::from(Url::parse(gateway).expect("validated POI gateway URL"))
                 })
                 .collect(),
+            gateway_pool: None,
             max_manifest_age: self
                 .max_manifest_age_secs
                 .map(std::time::Duration::from_secs),

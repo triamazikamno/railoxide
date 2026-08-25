@@ -5,6 +5,8 @@ use super::{
     WalletConnectSettings, WalletNetworkMode, fmt,
 };
 
+pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
+
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 6;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
@@ -15,12 +17,6 @@ pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
     "k51qzi5uqu5di629evs7ynhsqiy4uit6qt70tx62roace2ij6jc83uo9jseqit";
 pub const OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
     "k51qzi5uqu5dkrtrukbpsi4pbdfphcrceqgujgft1fxaa4lfgrdp46f4mk7qdq";
-pub const OFFICIAL_POI_ARTIFACT_GATEWAYS: &[&str] = &[
-    "https://dweb.link",
-    "https://ipfs.filebase.io",
-    "https://ipfs.io",
-    "https://gateway.pinata.cloud",
-];
 pub const DEFAULT_WAKU_CLUSTER_ID: u32 = 5;
 pub const DEFAULT_WAKU_SHARD_ID: u32 = 1;
 pub const DEFAULT_WAKU_MAX_PEERS: usize = 10;

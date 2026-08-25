@@ -64,6 +64,7 @@ protobuf = { workspace = true, optional = true }
 railgun-wallet = { workspace = true }
 railgun-ui = { path = "../railgun-ui" }
 sync-service = { workspace = true }
+trustless-artifacts = { workspace = true }
 waku = { workspace = true }
 waku-relay = { workspace = true }
 

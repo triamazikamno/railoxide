@@ -534,7 +534,7 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         .wrap_err("create encrypted wallet cache")?,
     );
     let scan_keys = view_session.scan_keys();
-    let prover_artifact_source = artifact_source(http, db.as_ref());
+    let prover_artifact_source = artifact_source(http, db.as_ref())?;
     let poi_recovery_prover = ProverService::new_with_db(&prover_artifact_source, &db);
     let wallet_cfg = WalletConfig {
         chain: chain_key,
@@ -688,6 +688,7 @@ pub(crate) fn chain_config(
                     }
                 },
                 gateway_urls: source.gateway_urls.clone(),
+                gateway_pool: Some(http.gateway_pool()),
                 max_manifest_age: source.max_manifest_age,
                 concurrency: source.concurrency,
                 max_in_flight_bytes: source.max_in_flight_bytes,
@@ -710,16 +711,20 @@ pub(super) const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'
     }
 }
 
-pub(super) fn artifact_source(http: &HttpContext, db: &DbStore) -> ArtifactSource {
-    artifact_source_with_proxy(http.proxy_url.as_ref(), db)
-}
-
-fn artifact_source_with_proxy(proxy_url: Option<&Url>, db: &DbStore) -> ArtifactSource {
-    let source = ArtifactSource::default().with_cache_dir(db.blob_dir().join("artifacts"));
-    match proxy_url {
-        Some(url) => source.with_proxy(url.clone()),
-        None => source,
-    }
+pub(super) fn artifact_source(http: &HttpContext, db: &DbStore) -> Result<ArtifactSource> {
+    let settings = settings::load_wallet_settings(db).wrap_err("load wallet settings")?;
+    let gateways = settings
+        .poi
+        .artifact
+        .gateway_urls
+        .iter()
+        .map(|gateway| Url::parse(gateway).wrap_err("parse artifact gateway URL"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArtifactSource::default()
+        .with_gateways(gateways)
+        .with_gateway_pool(http.gateway_pool())
+        .with_client(http.client.clone())
+        .with_cache_dir(db.blob_dir().join("artifacts")))
 }
 
 pub(super) async fn buffered_gas_price_with_policy(
@@ -828,10 +833,23 @@ mod tests {
             root_dir: root_dir.clone(),
         })
         .expect("open test db");
+        let mut settings = settings::WalletSettings::default();
+        settings.poi.artifact.gateway_urls = vec!["https://gateway.example".to_string()];
+        settings::save_wallet_settings(&db, &settings).expect("save wallet settings");
 
-        let source = artifact_source_with_proxy(None, &db);
+        let http = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(build_wallet_network_context(WalletNetworkConfig {
+                network_mode: Some(WalletNetworkMode::Direct),
+                proxy: None,
+                data_dir: &root_dir,
+            }))
+            .expect("http context");
+        let source = artifact_source(&http, &db).expect("artifact source");
 
         assert_eq!(source.out_dir, db.blob_dir().join("artifacts"));
+        assert_eq!(source.gateways[0].as_str(), "https://gateway.example/");
+        assert!(source.client.is_some());
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 

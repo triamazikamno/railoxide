@@ -72,11 +72,17 @@ pub async fn resolve_governance_document(
         return GovernanceDocument::unavailable();
     }
 
-    let bytes =
-        match sync_service::fetch_verified_cid(&http.client, &gateways, &normalized_cid).await {
-            Ok(bytes) if (bytes.len() as u64) <= MAX_PROPOSAL_DOCUMENT_BYTES => bytes,
-            _ => return GovernanceDocument::unavailable(),
-        };
+    let bytes = match sync_service::fetch_verified_cid_with_pool(
+        &http.client,
+        &gateways,
+        &normalized_cid,
+        http.gateway_pool(),
+    )
+    .await
+    {
+        Ok(bytes) if (bytes.len() as u64) <= MAX_PROPOSAL_DOCUMENT_BYTES => bytes,
+        _ => return GovernanceDocument::unavailable(),
+    };
     let _ = db.replace_blob_file_atomic(PROPOSAL_DOCUMENT_BLOB_KIND, &normalized_cid, &bytes);
 
     parse_document(&bytes)

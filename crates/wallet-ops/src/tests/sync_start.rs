@@ -461,6 +461,7 @@ fn chain_config_threads_indexed_artifact_source() {
         .indexed_artifact_source
         .as_ref()
         .expect("indexed artifact source");
+    let gateway_pool = http.gateway_pool();
 
     assert_eq!(
         source.trusted_publisher_pubkey,
@@ -475,6 +476,7 @@ fn chain_config_threads_indexed_artifact_source() {
     assert_eq!(source.max_manifest_age, Some(Duration::from_mins(10)));
     assert_eq!(source.concurrency, 5);
     assert_eq!(source.max_in_flight_bytes, 8 * 1024 * 1024);
+    assert_eq!(source.gateway_pool.as_ref(), Some(&gateway_pool));
 
     drop(http);
     let _ = fs::remove_dir_all(root_dir);
