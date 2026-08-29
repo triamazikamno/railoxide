@@ -37,19 +37,27 @@ struct GovernanceDocumentWire {
     description: String,
 }
 
-/// Resolve a proposal document from its CID, using the configured gateways and wallet HTTP
-/// context. Invalid input, unavailable gateways, cache read failures, fetch failures, and
-/// malformed documents all degrade to an unavailable placeholder so on-chain proposal data
+/// Resolve a proposal document from its CID or inline text, using the configured gateways and
+/// wallet HTTP context. Empty input, unavailable gateways, cache read failures, fetch failures,
+/// and malformed documents all degrade to an unavailable placeholder so on-chain proposal data
 /// remains usable. Cache persistence is best effort after a verified fetch.
 pub async fn resolve_governance_document(
     db: &DbStore,
     http: &HttpContext,
-    cid: &str,
+    proposal_document: &str,
     gateway_urls: &[String],
 ) -> GovernanceDocument {
-    let normalized_cid = match Cid::from_str(cid.trim()) {
-        Ok(cid) => cid.to_string(),
-        Err(_) => return GovernanceDocument::unavailable(),
+    let trimmed_proposal_document = proposal_document.trim();
+    let normalized_cid = match Cid::from_str(trimmed_proposal_document) {
+        Ok(parsed_cid) => parsed_cid.to_string(),
+        Err(_) if trimmed_proposal_document.is_empty() => return GovernanceDocument::unavailable(),
+        Err(_) => {
+            return GovernanceDocument {
+                title: String::new(),
+                description: proposal_document.to_string(),
+                available: true,
+            };
+        }
     };
     let Ok(identity) =
         CanonicalBlobMetaIdentity::from_leaf(PROPOSAL_DOCUMENT_BLOB_KIND, &normalized_cid)
@@ -258,16 +266,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_cid_returns_placeholder() {
+    async fn inline_proposal_text_is_available_with_exact_source() {
         let root = temp_db_root();
         let db = DbStore::open(DbConfig {
             root_dir: root.clone(),
         })
         .expect("open db");
         let http = build_http_client(None).expect("http context");
-        let result = resolve_governance_document(&db, &http, "not a cid", &[]).await;
-        assert!(!result.available);
-        assert_eq!(result.title, "Document unavailable");
+        let source = "# Proposal\n\nThis is **inline** text.\n\n- First\n- Second\n";
+        assert_eq!(
+            resolve_governance_document(&db, &http, source, &[]).await,
+            GovernanceDocument {
+                title: String::new(),
+                description: source.to_string(),
+                available: true,
+            }
+        );
+        drop(db);
+        fs::remove_dir_all(root).expect("remove test db");
+    }
+
+    #[tokio::test]
+    async fn empty_proposal_document_returns_placeholder() {
+        let root = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root.clone(),
+        })
+        .expect("open db");
+        let http = build_http_client(None).expect("http context");
+        let result = resolve_governance_document(&db, &http, " \n\t ", &[]).await;
+        assert_eq!(result, GovernanceDocument::unavailable());
         drop(db);
         fs::remove_dir_all(root).expect("remove test db");
     }

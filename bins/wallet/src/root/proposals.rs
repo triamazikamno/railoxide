@@ -1446,7 +1446,11 @@ impl WalletRoot {
         let status = proposal.status(chain_time);
         let title = proposal.document().map(|document| {
             if document.available {
-                ProposalRowTitle::Available(document.title.clone())
+                ProposalRowTitle::Available(if document.title.is_empty() {
+                    format!("Proposal #{}", proposal.proposal.index)
+                } else {
+                    document.title.clone()
+                })
             } else {
                 ProposalRowTitle::Unavailable
             }
