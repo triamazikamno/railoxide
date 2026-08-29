@@ -379,7 +379,7 @@ impl WalletRoot {
             }))
     }
 
-    fn render_wallet_selector(&self) -> impl IntoElement {
+    pub(super) fn render_wallet_selector(&self) -> impl IntoElement {
         div().h(px(24.0)).w(px(180.0)).flex().items_center().child(
             Select::new(&self.wallet_select)
                 .appearance(false)

@@ -1098,6 +1098,10 @@ fn ui_state_roundtrip_through_local_db() {
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
         last_wallet_kind: RememberedWalletKind::SoftwareProfile,
+        governance_participants: std::collections::BTreeMap::from([(
+            "wallet-123".to_owned(),
+            vec!["account-1".to_owned(), "account-2".to_owned()],
+        )]),
     };
 
     save_wallet_ui_state(&store, &state).expect("save UI state");
@@ -1110,6 +1114,10 @@ fn ui_state_roundtrip_through_local_db() {
             last_wallet_id: Some("wallet-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::SoftwareProfile,
+            governance_participants: std::collections::BTreeMap::from([(
+                "wallet-123".to_owned(),
+                vec!["account-1".to_owned(), "account-2".to_owned()],
+            )]),
         }
     );
 
@@ -1120,6 +1128,7 @@ fn ui_state_roundtrip_through_local_db() {
             last_wallet_id: Some("hardware-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::HardwareWallet,
+            governance_participants: std::collections::BTreeMap::new(),
         },
     )
     .expect("save hardware UI state");
@@ -1130,6 +1139,7 @@ fn ui_state_roundtrip_through_local_db() {
             last_wallet_id: Some("hardware-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::HardwareWallet,
+            governance_participants: std::collections::BTreeMap::new(),
         }
     );
 
@@ -1138,7 +1148,7 @@ fn ui_state_roundtrip_through_local_db() {
 }
 
 #[test]
-fn released_v1_ui_state_migrates_to_unknown_kind_and_persists_v2() {
+fn released_v1_ui_state_migrates_to_unknown_kind_and_persists_v3() {
     #[derive(Serialize)]
     struct ReleasedV1WalletUiState {
         version: u32,
@@ -1166,6 +1176,7 @@ fn released_v1_ui_state_migrates_to_unknown_kind_and_persists_v2() {
     assert_eq!(loaded.last_wallet_id.as_deref(), Some("legacy-wallet"));
     assert_eq!(loaded.last_chain_id, Some(56));
     assert_eq!(loaded.last_wallet_kind, RememberedWalletKind::Unknown);
+    assert!(loaded.governance_participants.is_empty());
     let persisted = store
         .get_app_settings_record(WALLET_UI_STATE_KEY)
         .expect("load migrated UI state")
@@ -1180,6 +1191,33 @@ fn released_v1_ui_state_migrates_to_unknown_kind_and_persists_v2() {
 }
 
 #[test]
+fn released_v2_ui_state_migrates_to_v3_with_empty_participants() {
+    #[derive(Serialize)]
+    struct ReleasedV2WalletUiState {
+        version: u32,
+        last_wallet_id: Option<String>,
+        last_chain_id: Option<u64>,
+        last_wallet_kind: RememberedWalletKind,
+    }
+
+    let payload = rmp_serde::to_vec_named(&ReleasedV2WalletUiState {
+        version: 2,
+        last_wallet_id: Some("v2-wallet".to_owned()),
+        last_chain_id: Some(1),
+        last_wallet_kind: RememberedWalletKind::HardwareWallet,
+    })
+    .expect("encode released v2 UI state");
+    let loaded = decode_wallet_ui_state(&payload).expect("migrate released v2 UI state");
+    assert_eq!(loaded.version, WALLET_UI_STATE_VERSION);
+    assert_eq!(loaded.last_wallet_id.as_deref(), Some("v2-wallet"));
+    assert_eq!(
+        loaded.last_wallet_kind,
+        RememberedWalletKind::HardwareWallet
+    );
+    assert!(loaded.governance_participants.is_empty());
+}
+
+#[test]
 fn unsupported_future_ui_state_version_falls_back_to_empty() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -1191,6 +1229,7 @@ fn unsupported_future_ui_state_version_falls_back_to_empty() {
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
         last_wallet_kind: RememberedWalletKind::Unknown,
+        governance_participants: std::collections::BTreeMap::new(),
     };
     let data = rmp_serde::to_vec_named(&state).expect("encode future UI state");
     store

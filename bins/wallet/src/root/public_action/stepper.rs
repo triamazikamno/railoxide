@@ -86,6 +86,11 @@ pub(in crate::root) fn render_public_action_step(
         );
     }
     body = body.children(
+        step.interval
+            .as_ref()
+            .map(render_public_action_step_interval),
+    );
+    body = body.children(
         step.tx_hash
             .as_ref()
             .map(|tx_hash| render_public_action_step_hash(step.step, tx_hash.as_ref())),
@@ -110,6 +115,14 @@ pub(in crate::root) fn render_public_action_step(
         color,
         px(32.0),
         None,
+    )
+}
+
+fn render_public_action_step_interval(interval: &PublicActionStepInterval) -> gpui::Div {
+    div().flex().items_center().gap_1().child(
+        app_muted_text(format!("Interval {}–{}", interval.start, interval.end))
+            .font_family(APP_MONO_FONT_FAMILY)
+            .line_height(gpui::relative(1.0)),
     )
 }
 

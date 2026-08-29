@@ -46,10 +46,13 @@ mod broadcaster_view;
 mod chain_load;
 mod dialogs;
 mod gas_fee;
+mod governance;
+mod governance_action;
 mod key_export;
 mod maintenance;
 mod manage_wallets;
 mod network;
+mod participant;
 mod platform_attention;
 mod private_action;
 mod private_assets;
@@ -95,6 +98,7 @@ use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
 };
 use gas_fee::Eip1559GasFeeEditorState;
+use governance::GovernanceState;
 use key_export::KeyExportState;
 use maintenance::WalletMaintenanceController;
 use manage_wallets::ManageWalletsState;
@@ -106,7 +110,7 @@ use private_action::{
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
 use public_account::{HardwarePublicAccountDerivationStatus, PublicAccountFormState};
-use public_action::{PublicActionMode, PublicSendKind};
+use public_action::{PublicActionMode, PublicActionProgressLifecycle, PublicSendKind};
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
     public_balance_amount_label,
@@ -229,8 +233,8 @@ use public_action::{
     public_action_error_copy_value, public_action_error_details, public_action_error_summary,
     public_action_max_amount_after_reserve, public_action_progress_footer_action,
     public_action_progress_steps, public_action_step_color, public_action_step_detail,
-    public_action_step_is_final_handoff, public_action_step_uses_stop_marker,
-    public_action_uses_railway_authorization_ceiling,
+    public_action_step_is_final_handoff, public_action_step_is_final_handoff_for_steps,
+    public_action_step_uses_stop_marker, public_action_uses_railway_authorization_ceiling,
 };
 #[cfg(test)]
 use public_balances::{
@@ -462,6 +466,7 @@ pub(crate) struct WalletRoot {
     import_mnemonic_input: Entity<InputState>,
     public_accounts: Vec<PublicAccountMetadata>,
     address_book: AddressBookState,
+    governance: GovernanceState,
     proposals: ProposalsState,
     proposal_detail_focus: FocusHandle,
     private_address_book: Vec<PrivateAddressBookEntry>,
@@ -1138,6 +1143,10 @@ impl WalletRoot {
                 .placeholder("paste recovery phrase")
         });
         let public_account_search_input = new_text_input(window, cx, "search accounts");
+        let governance_participant_search_input =
+            new_text_input(window, cx, "search participating accounts");
+        let governance_proposal_action_amount_input = new_text_input(window, cx, "amount");
+        let governance_staking_delegate_input = new_text_input(window, cx, "delegate address");
         let address_book_search_input = new_text_input(window, cx, "search saved recipients");
         let favorite_broadcaster_input =
             new_text_input(window, cx, "favorite broadcaster 0zk address");
@@ -1182,6 +1191,7 @@ impl WalletRoot {
             selected_asset: None,
             mimic_railway_shield: mimic_railway_shields_by_default,
             action_mode: PublicActionMode::Shield,
+            action_progress_mode: PublicActionMode::Shield,
             public_send_kind: PublicSendKind::Transfer,
             advanced_send_estimate: None,
             advanced_send_estimate_invalidated: false,
@@ -1192,10 +1202,12 @@ impl WalletRoot {
             advanced_send_data_error: None,
             action_generation: 0,
             action_progress: Vec::new(),
+            action_progress_lifecycle: PublicActionProgressLifecycle::Clear,
             action_fee_authorization_review: None,
             expanded_action_error_steps: BTreeSet::new(),
             action_progress_dialog_open: false,
             action_requires_device_approval: false,
+            action_progress_title_override: None,
             action_progress_asset_label: Arc::from(""),
             action_progress_icon_path: None,
             action_task_abort_handle: None,
@@ -1409,6 +1421,11 @@ impl WalletRoot {
             import_mnemonic_input,
             public_accounts: Vec::new(),
             address_book,
+            governance: GovernanceState::new(
+                governance_participant_search_input,
+                governance_proposal_action_amount_input,
+                governance_staking_delegate_input,
+            ),
             proposals: ProposalsState::new(initial_chain_id),
             proposal_detail_focus: cx.focus_handle(),
             private_address_book: Vec::new(),
@@ -1481,6 +1498,24 @@ impl WalletRoot {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value().trim().to_ascii_lowercase();
                     this.public_form.search_query = Arc::from(query);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &root.governance.participant_search_input,
+            |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &root.governance.proposal_action_amount_input,
+            |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
             },

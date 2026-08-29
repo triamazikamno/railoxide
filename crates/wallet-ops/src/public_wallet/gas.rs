@@ -1098,11 +1098,22 @@ pub(super) const fn public_action_tip_fallback(chain_id: u64) -> SelfBroadcastTi
 
 const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
     match step {
-        PublicActionProgressStep::ShieldKey => 0,
         PublicActionProgressStep::Send => PUBLIC_NATIVE_SEND_GAS_UNITS,
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
         PublicActionProgressStep::Shield => PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS,
+        PublicActionProgressStep::ShieldKey
+        | PublicActionProgressStep::Sponsor
+        | PublicActionProgressStep::Unsponsor
+        | PublicActionProgressStep::CallVote
+        | PublicActionProgressStep::Vote
+        | PublicActionProgressStep::GovernanceApprove
+        | PublicActionProgressStep::Stake
+        | PublicActionProgressStep::Delegate
+        | PublicActionProgressStep::Undelegate
+        | PublicActionProgressStep::Unlock
+        | PublicActionProgressStep::PrincipalClaim
+        | PublicActionProgressStep::RewardClaim(_) => 0,
     }
 }
 

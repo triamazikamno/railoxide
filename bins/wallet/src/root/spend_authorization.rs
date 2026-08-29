@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +42,7 @@ use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
 
+use super::governance_action::GovernanceSpendDraft;
 use super::private_action::UnshieldAssetKey;
 use super::public_action::{PublicSendDraft, PublicShieldDraft};
 use super::vault::hardware_device_label;
@@ -163,6 +166,7 @@ pub(super) enum SpendAuthorizationIntent {
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend(Box<PublicSendDraft>),
     PublicShield(Box<PublicShieldDraft>),
+    Governance(Box<GovernanceSpendDraft>),
     WalletConnectRequest {
         request_key: String,
         review_token: u64,
@@ -615,6 +619,8 @@ impl SpendAuthorizationDialogContent {
 impl gpui::Render for SpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let cancel_root = self.root.clone();
+        let cancel_intent = self.intent.clone();
         let payload_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
@@ -674,6 +680,9 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         app_button("wallet-spend-auth-cancel", "Cancel")
                             .flex_none()
                             .on_click(move |_event, window, cx| {
+                                cancel_root.update(cx, |root, cx| {
+                                    root.cancel_governance_authorization(&cancel_intent, cx);
+                                });
                                 window.close_dialog(cx);
                             }),
                     )
@@ -1074,10 +1083,12 @@ impl WalletRoot {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
+        let content_root = root.clone();
+        let content_intent = intent.clone();
         let content = cx.new(|cx| {
             SpendAuthorizationDialogContent::new(
-                root,
-                intent,
+                content_root,
+                content_intent,
                 summary,
                 initial_lifetime,
                 window,
@@ -1091,10 +1102,17 @@ impl WalletRoot {
         let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_root = root.clone();
+            let close_intent = intent.clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(dialog_title.clone()))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.cancel_governance_authorization(&close_intent, cx);
+                    });
+                })
                 .child(scrollable_dialog_content(
                     content_max_height,
                     div().w(content_width).child(content.clone()),
@@ -1121,9 +1139,11 @@ impl WalletRoot {
             .payload
             .clone()
             .map(|payload| cx.new(|_cx| SpendAuthorizationPayloadDisclosure::new(payload)));
+        let handed_off = Rc::new(Cell::new(false));
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let submit_root = root.clone();
+            let close_intent = intent.clone();
             let show_trezor_app_passphrase = root
                 .read(cx)
                 .current_session_needs_trezor_app_passphrase();
@@ -1135,15 +1155,23 @@ impl WalletRoot {
                 .title(app_strong_text("Authorize hardware public action"))
                 .button_props(DialogButtonProps::default().ok_text("Approve on device"))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
-                .on_close(move |_event, window, cx| {
-                    close_root.update(cx, |root, cx| {
-                        root.clear_trezor_app_passphrase_input(window, cx);
-                    });
+                .on_close({
+                    let handed_off = handed_off.clone();
+                    move |_event, window, cx| {
+                        close_root.update(cx, |root, cx| {
+                            root.clear_trezor_app_passphrase_input(window, cx);
+                            if !handed_off.get() {
+                                root.cancel_governance_authorization(&close_intent, cx);
+                            }
+                        });
+                    }
                 })
                 .on_ok({
                     let intent = intent.clone();
+                    let handed_off = handed_off.clone();
                     move |_event, window, cx| {
                         let intent = intent.clone();
+                        handed_off.set(true);
                         submit_root.update(cx, |root, cx| {
                             root.continue_authorized_spend(
                                 intent,
@@ -1539,6 +1567,16 @@ impl WalletRoot {
                     return;
                 };
                 self.submit_public_shield_authorized(*draft, password, session, window, cx);
+            }
+            SpendAuthorizationIntent::Governance(draft) => {
+                let Ok((password, session)) = authorization.public_signing_parts() else {
+                    self.set_vault_error(
+                        "Governance Public-account authorization could not be retained safely",
+                        cx,
+                    );
+                    return;
+                };
+                self.revalidate_governance_authorized(&draft, password, session, window, cx);
             }
             SpendAuthorizationIntent::WalletConnectRequest {
                 request_key,

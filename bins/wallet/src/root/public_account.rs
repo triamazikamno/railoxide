@@ -68,6 +68,7 @@ pub(super) use qr::{public_address_qr_payload, render_public_address_qr_dialog_c
 pub(super) use types::PublicAccountFormState;
 
 use super::dialogs::PublicAccountDialogKind;
+use super::participant::{remove_global_participant, remove_scoped_participant};
 use super::public_action::{PublicActionMode, PublicSendKind};
 use super::public_balances::{
     public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
@@ -975,10 +976,28 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
+        let account_is_global = account.is_global();
+        let owning_wallet_uuid = view_session.wallet_id().to_owned();
         match store
             .delete_imported_public_account(view_session.as_ref(), &account.public_account_uuid)
         {
             Ok(_) => {
+                let participation_changed = if account_is_global {
+                    remove_global_participant(
+                        &mut self.ui_state.governance_participants,
+                        &account.public_account_uuid,
+                    )
+                } else {
+                    remove_scoped_participant(
+                        &mut self.ui_state.governance_participants,
+                        &owning_wallet_uuid,
+                        &account.public_account_uuid,
+                    )
+                };
+                if participation_changed {
+                    self.save_ui_state();
+                    self.invalidate_governance_context();
+                }
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
                     self.public_form.selected_account_uuid = None;
                 }

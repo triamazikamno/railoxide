@@ -116,7 +116,7 @@ pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
 mod tests {
     use gpui::{
         AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Keystroke,
-        ParentElement as _, Render, TestAppContext, Window, div,
+        ParentElement as _, Render, TestAppContext, Window, WindowOptions, div,
     };
 
     use super::*;
@@ -170,7 +170,7 @@ mod tests {
             install_wallet_action_bindings(app);
         });
         let window = cx.update(|app| {
-            app.open_window(Default::default(), |_, cx| {
+            app.open_window(WindowOptions::default(), |_, cx| {
                 cx.new(|cx| TrezorPassphraseTabProbe {
                     input_focus: cx.focus_handle(),
                     cycle_count: 0,

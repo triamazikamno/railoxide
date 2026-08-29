@@ -98,7 +98,10 @@ mod anchors;
 mod block_observer;
 mod desktop;
 mod governance;
+mod governance_actions;
 mod governance_documents;
+mod governance_staking_actions;
+mod governor_rewards;
 pub mod hardware;
 mod hardware_typed_data;
 mod http;
@@ -109,6 +112,7 @@ mod public_wallet;
 mod signer;
 mod sponsored_bundle;
 mod sponsorship;
+mod staking;
 mod utxos;
 pub mod walletconnect;
 
@@ -126,13 +130,56 @@ pub use anchors::{
 };
 pub use desktop::*;
 pub use governance::{
-    GovernanceContractRules, GovernanceContractSummary, GovernanceContractVersion,
-    GovernanceMajorityResult, GovernanceOverview, GovernanceProposal, GovernanceProposalAction,
-    GovernanceProposalDeadlines, GovernanceProposalStage, GovernanceProposalStatus,
-    GovernanceQuorumBasis, derive_governance_proposal_stage, derive_governance_proposal_status,
+    GOVERNANCE_SPONSOR_LOCKOUT_TIME_SECONDS, GovernanceAccountSnapshot, GovernanceCallError,
+    GovernanceCapacity, GovernanceCapacityError, GovernanceContractRules,
+    GovernanceContractSummary, GovernanceContractVersion, GovernanceGuardError,
+    GovernanceLastSponsored, GovernanceMajorityResult, GovernanceOverview, GovernanceParticipation,
+    GovernanceParticipationError, GovernanceParticipationRow, GovernanceProposal,
+    GovernanceProposalAction, GovernanceProposalDeadlines, GovernanceProposalStage,
+    GovernanceProposalStatus, GovernanceQuorumBasis, GovernanceTransactionCall,
+    build_call_vote_call, build_nay_vote_call, build_sponsor_call, build_unsponsor_call,
+    build_vote_call, build_yay_vote_call, calculate_governance_capacity,
+    derive_governance_proposal_stage, derive_governance_proposal_status,
     fetch_governance_chain_time, fetch_governance_overview, fetch_governance_page,
+    fetch_governance_participation, guard_call_vote, guard_nay_vote, guard_sponsor,
+    guard_unsponsor, guard_yay_vote,
+};
+pub use governance_actions::{
+    GovernanceActionContext, GovernanceActionError, GovernanceActionIntent, GovernanceActionReview,
+    GovernanceContractKind, GovernancePreflight, GovernanceProgress, GovernanceProgressStatus,
+    GovernanceProgressStep, GovernanceResolvedAction, GovernanceSubmissionRequest,
+    GovernanceWorkflow, GovernanceWorkflowRequest, GovernanceWorkflowResult,
+    estimate_governance_action, governance_estimate_request, simulate_governance_action,
+    submit_governance_action_with_progress, submit_governance_workflow_with_progress,
+    validate_governance_authorization, validate_governance_submission,
+    validate_governance_workflow,
 };
 pub use governance_documents::{GovernanceDocument, resolve_governance_document};
+pub use governance_staking_actions::{
+    DelegationEvidence, DelegationImpact, DelegationPlan, GovernancePlanningError,
+    PrincipalClaimPlan, RewardClaimConfirmedStep, RewardClaimPlan, RewardClaimProgress,
+    RewardClaimStepPlan, StakeObservedState, StakePlan, UndelegateFirstPlan, UnlockIntent,
+    UnlockPlan, configured_reward_token, confirm_reward_claim_batch_step,
+    confirm_reward_claim_step, continue_stake_after_approval, continue_unlock_after_undelegation,
+    delegation_evidence_fingerprint, next_reward_claim_batch_step, next_reward_claim_step,
+    plan_active_reward_claim, plan_delegate, plan_principal_claim, plan_reward_claim,
+    plan_reward_claim_batch, plan_stake, plan_undelegate, plan_unlock, principal_claim_fingerprint,
+    rebuild_reward_claim_batch_continuation, rebuild_reward_claim_continuation,
+    reward_batch_evidence_fingerprint, reward_batch_plan_fingerprint, reward_evidence_fingerprint,
+    reward_plan_fingerprint, stake_position_fingerprint, validate_reward_token_order,
+};
+pub use governor_rewards::{
+    GovernorRewardsIntervalMetadata, RewardBatchAuthorizationState, RewardBatchEvidence,
+    RewardBatchIntervalAmount, RewardBatchIntervalSubtotal, RewardClaimStep, RewardEvidence,
+    RewardEvidenceResult, RewardIntervalAmount, RewardIntervalSubtotal, decode_claimed_flag,
+    fetch_interval_metadata, fetch_latest_block_gas_limit, fetch_reward_batch_authorization_state,
+    fetch_reward_batch_claimed_intervals, fetch_reward_batch_evidence,
+    fetch_reward_batch_interval_amounts, fetch_reward_evidence, fetch_reward_evidence_multi,
+    fetch_reward_interval_amounts, plan_reward_claim_batch_steps, plan_reward_claim_steps,
+    reward_batch_authorization_state_match, reward_batch_claimed_intervals_match,
+    reward_batch_positive_split_boundary, reward_evidence, reward_positive_split_boundary,
+    validate_reward_batch_authorization_state, validate_reward_batch_claimed_intervals,
+};
 pub use http::{
     HttpContext, TorBridgeActivitySnapshot, TorRuntimeHealth, WalletNetworkConfig,
     WalletNetworkHealth, WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode,
@@ -198,6 +245,15 @@ pub use public_wallet::{
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 pub use sponsored_bundle::*;
 pub use sponsorship::*;
+pub use staking::{
+    AccountSnapshot, AccountSnapshotsResult, AccountStakeResult, DEFAULT_MULTICALL_CHUNK_SIZE,
+    DeploymentValidationError, MulticallChunkSize, StakePosition, StakeState,
+    StakingDeploymentValidationError, StakingGlobalMetrics, chunk_indices, classify_stake_state,
+    decode_stake_position, fetch_account_snapshots, fetch_account_snapshots_multi,
+    fetch_account_stakes, fetch_governance_token_balance_allowance, fetch_staking_global_metrics,
+    reward_staking_interval, snapshot_hint, validate_deployment, validate_deployment_relationships,
+    validate_governance_deployment,
+};
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,

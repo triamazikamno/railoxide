@@ -13,6 +13,17 @@ pub(in crate::root) const fn public_action_step_label(
         PublicActionProgressStep::Wrap => "Wrap",
         PublicActionProgressStep::Approve => "Approve",
         PublicActionProgressStep::Shield => "Shield",
+        PublicActionProgressStep::Sponsor => "Sponsor proposal",
+        PublicActionProgressStep::Unsponsor => "Unsponsor proposal",
+        PublicActionProgressStep::CallVote => "Call vote",
+        PublicActionProgressStep::Vote => "Vote",
+        PublicActionProgressStep::GovernanceApprove => "Approve governance token",
+        PublicActionProgressStep::Stake => "Stake",
+        PublicActionProgressStep::Delegate => "Delegate",
+        PublicActionProgressStep::Undelegate => "Undelegate",
+        PublicActionProgressStep::Unlock => "Unlock",
+        PublicActionProgressStep::PrincipalClaim => "Claim principal",
+        PublicActionProgressStep::RewardClaim(_) => "Claim rewards",
     }
 }
 
@@ -37,6 +48,19 @@ pub(in crate::root) const fn public_action_step_detail_for_context(
             PublicActionProgressStep::Wrap => "Waiting to wrap the native token.",
             PublicActionProgressStep::Approve => "Waiting to approve the shield contract.",
             PublicActionProgressStep::Shield => "Waiting to shield into the Private wallet.",
+            PublicActionProgressStep::Sponsor => "Waiting to sponsor the proposal.",
+            PublicActionProgressStep::Unsponsor => "Waiting to unsponsor the proposal.",
+            PublicActionProgressStep::CallVote => "Waiting to call the vote.",
+            PublicActionProgressStep::Vote => "Waiting to submit the vote.",
+            PublicActionProgressStep::GovernanceApprove => {
+                "Waiting to approve the governance token allowance."
+            }
+            PublicActionProgressStep::Stake => "Waiting to stake governance tokens.",
+            PublicActionProgressStep::Delegate => "Waiting to delegate the stake.",
+            PublicActionProgressStep::Undelegate => "Waiting to undelegate the stake.",
+            PublicActionProgressStep::Unlock => "Waiting to unlock the stake.",
+            PublicActionProgressStep::PrincipalClaim => "Waiting to claim the staked principal.",
+            PublicActionProgressStep::RewardClaim(_) => "Waiting to claim rewards.",
         },
         PublicActionStepStatus::Pending => match (step, requires_device_approval, tx_submitted) {
             (PublicActionProgressStep::ShieldKey, _, _) => {
@@ -77,6 +101,39 @@ pub(in crate::root) fn public_action_error_summary(
             PublicActionProgressStep::Shield => {
                 "Shield transaction signing was cancelled on the hardware wallet.".to_string()
             }
+            PublicActionProgressStep::Sponsor => {
+                "Sponsorship signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Unsponsor => {
+                "Unsponsorship signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::CallVote => {
+                "Call-vote signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Vote => {
+                "Vote signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::GovernanceApprove => {
+                "Governance approval signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Stake => {
+                "Stake signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Delegate => {
+                "Delegation signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Undelegate => {
+                "Undelegation signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::Unlock => {
+                "Unlock signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::PrincipalClaim => {
+                "Principal claim signing was cancelled on the hardware wallet.".to_string()
+            }
+            PublicActionProgressStep::RewardClaim(_) => {
+                "Reward claim signing was cancelled on the hardware wallet.".to_string()
+            }
         };
     }
     if details.contains("estimate gas") {
@@ -98,6 +155,49 @@ pub(in crate::root) fn public_action_error_summary(
                 "Could not estimate gas for shielding. Try again or check the RPC/network."
                     .to_string()
             }
+            PublicActionProgressStep::Sponsor => {
+                "Could not estimate gas for sponsorship. Check proposal state and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::Unsponsor => {
+                "Could not estimate gas for unsponsorship. Check proposal state and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::CallVote => {
+                "Could not estimate gas for calling the vote. Check proposal state and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::Vote => {
+                "Could not estimate gas for voting. Check voting power and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::GovernanceApprove => {
+                "Could not estimate gas for governance approval. Check token balance and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::Stake => {
+                "Could not estimate gas for staking. Check token balance and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::Delegate => {
+                "Could not estimate gas for delegation. Check stake and gas balance.".to_string()
+            }
+            PublicActionProgressStep::Undelegate => {
+                "Could not estimate gas for undelegation. Check stake and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::Unlock => {
+                "Could not estimate gas for unlocking. Check stake state and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::PrincipalClaim => {
+                "Could not estimate gas for claiming principal. Check stake state and gas balance."
+                    .to_string()
+            }
+            PublicActionProgressStep::RewardClaim(_) => {
+                "Could not estimate gas for claiming rewards. Check reward state and gas balance."
+                    .to_string()
+            }
         };
     }
     if details.contains("revert") {
@@ -109,6 +209,23 @@ pub(in crate::root) fn public_action_error_summary(
             PublicActionProgressStep::Wrap => format!("Wrapping {asset_label} reverted on-chain."),
             PublicActionProgressStep::Approve => "Approval reverted on-chain.".to_string(),
             PublicActionProgressStep::Shield => "Shielding reverted on-chain.".to_string(),
+            PublicActionProgressStep::Sponsor => "Sponsorship reverted on-chain.".to_string(),
+            PublicActionProgressStep::Unsponsor => "Unsponsorship reverted on-chain.".to_string(),
+            PublicActionProgressStep::CallVote => "Calling the vote reverted on-chain.".to_string(),
+            PublicActionProgressStep::Vote => "Voting reverted on-chain.".to_string(),
+            PublicActionProgressStep::GovernanceApprove => {
+                "Governance approval reverted on-chain.".to_string()
+            }
+            PublicActionProgressStep::Stake => "Staking reverted on-chain.".to_string(),
+            PublicActionProgressStep::Delegate => "Delegation reverted on-chain.".to_string(),
+            PublicActionProgressStep::Undelegate => "Undelegation reverted on-chain.".to_string(),
+            PublicActionProgressStep::Unlock => "Unlocking reverted on-chain.".to_string(),
+            PublicActionProgressStep::PrincipalClaim => {
+                "Principal claim reverted on-chain.".to_string()
+            }
+            PublicActionProgressStep::RewardClaim(_) => {
+                "Reward claim reverted on-chain.".to_string()
+            }
         };
     }
     match step {
@@ -127,6 +244,40 @@ pub(in crate::root) fn public_action_error_summary(
         PublicActionProgressStep::Shield => {
             "Could not shield into the Private wallet. Try again or check the RPC/network."
                 .to_string()
+        }
+        PublicActionProgressStep::Sponsor => {
+            "Could not sponsor the proposal. Check proposal state, voting power, and gas balance."
+                .to_string()
+        }
+        PublicActionProgressStep::Unsponsor => {
+            "Could not unsponsor the proposal. Check proposal state and gas balance.".to_string()
+        }
+        PublicActionProgressStep::CallVote => {
+            "Could not call the vote. Check proposal state and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Vote => {
+            "Could not submit the vote. Check voting power and gas balance.".to_string()
+        }
+        PublicActionProgressStep::GovernanceApprove => {
+            "Could not approve governance tokens. Check token balance and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Stake => {
+            "Could not stake governance tokens. Check token balance and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Delegate => {
+            "Could not delegate the stake. Check stake and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Undelegate => {
+            "Could not undelegate the stake. Check stake and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Unlock => {
+            "Could not unlock the stake. Check stake state and gas balance.".to_string()
+        }
+        PublicActionProgressStep::PrincipalClaim => {
+            "Could not claim staked principal. Check stake state and gas balance.".to_string()
+        }
+        PublicActionProgressStep::RewardClaim(_) => {
+            "Could not claim rewards. Try again or check the RPC/network.".to_string()
         }
     }
 }
@@ -160,13 +311,24 @@ pub(in crate::root) fn public_action_error_copy_value(
     value
 }
 
-pub(in crate::root) const fn public_action_step_id(step: PublicActionProgressStep) -> &'static str {
+pub(in crate::root) fn public_action_step_id(step: PublicActionProgressStep) -> String {
     match step {
-        PublicActionProgressStep::ShieldKey => "shield-key",
-        PublicActionProgressStep::Send => "send",
-        PublicActionProgressStep::Wrap => "wrap",
-        PublicActionProgressStep::Approve => "approve",
-        PublicActionProgressStep::Shield => "shield",
+        PublicActionProgressStep::ShieldKey => "shield-key".to_string(),
+        PublicActionProgressStep::Send => "send".to_string(),
+        PublicActionProgressStep::Wrap => "wrap".to_string(),
+        PublicActionProgressStep::Approve => "approve".to_string(),
+        PublicActionProgressStep::Shield => "shield".to_string(),
+        PublicActionProgressStep::Sponsor => "sponsor".to_string(),
+        PublicActionProgressStep::Unsponsor => "unsponsor".to_string(),
+        PublicActionProgressStep::CallVote => "call-vote".to_string(),
+        PublicActionProgressStep::Vote => "vote".to_string(),
+        PublicActionProgressStep::GovernanceApprove => "governance-approve".to_string(),
+        PublicActionProgressStep::Stake => "stake".to_string(),
+        PublicActionProgressStep::Delegate => "delegate".to_string(),
+        PublicActionProgressStep::Undelegate => "undelegate".to_string(),
+        PublicActionProgressStep::Unlock => "unlock".to_string(),
+        PublicActionProgressStep::PrincipalClaim => "principal-claim".to_string(),
+        PublicActionProgressStep::RewardClaim(index) => format!("reward-claim-{index}"),
     }
 }
 

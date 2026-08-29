@@ -27,8 +27,8 @@ use super::vault::{
 use super::{
     APP_TEXT_SIZE, ConfirmationDialogProps, WalletRoot,
     chain_load::WalletSyncLifecycleCleanupWaitGroup, confirmation_dialog,
-    dialog_content_max_height, dialog_max_height, scrollable_dialog_content,
-    secondary_dialog_content_width,
+    dialog_content_max_height, dialog_max_height, participant::remove_private_wallet_participants,
+    scrollable_dialog_content, secondary_dialog_content_width,
 };
 
 #[derive(Default)]
@@ -558,7 +558,12 @@ impl WalletRoot {
                 if whole_profile {
                     store
                         .delete_software_profile_with_view_unlock(view.as_ref(), &wallet_id_string)
-                        .map(|_| ())
+                        .map(|wallets| {
+                            wallets
+                                .into_iter()
+                                .map(|wallet| wallet.wallet_uuid)
+                                .collect()
+                        })
                 } else {
                     match target_session.as_deref() {
                         Some(session) => {
@@ -568,7 +573,7 @@ impl WalletRoot {
                             store.delete_wallet_with_view_unlock(view.as_ref(), &wallet_id_string)
                         }
                     }
-                    .map(|_| ())
+                    .map(|wallet| vec![wallet.wallet_uuid])
                 }
             })
             .await
@@ -579,7 +584,8 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.manage_wallets.deleting_wallet_id = None;
-                let deletion_succeeded = matches!(&result, Ok(Ok(())));
+                let deletion_succeeded =
+                    matches!(&result, Ok(Ok(wallet_ids)) if !wallet_ids.is_empty());
                 if restart_selected_wallet_sync_after_deletion(
                     deleting_selected_wallet,
                     deletion_succeeded,
@@ -587,7 +593,18 @@ impl WalletRoot {
                     root.restart_selected_wallet_sync_after_failed_deletion(window, cx);
                 }
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(deleted_wallet_ids)) => {
+                        let mut participation_changed = false;
+                        for wallet_id in &deleted_wallet_ids {
+                            participation_changed |= remove_private_wallet_participants(
+                                &mut root.ui_state.governance_participants,
+                                wallet_id,
+                            );
+                        }
+                        if participation_changed {
+                            root.save_ui_state();
+                            root.invalidate_governance_context();
+                        }
                         root.manage_wallets.pending_delete_wallet_id = None;
                         root.manage_wallets.clear_hardware_delete_unlock_intent();
                         root.manage_wallets.error = None;

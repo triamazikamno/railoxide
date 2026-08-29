@@ -5,7 +5,7 @@ use crate::root::private_broadcaster::{
 };
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
-    public_action_error_retry_kind, public_action_step_detail_for_context,
+    public_action_error_retry_kind, public_action_step_detail_for_context, public_action_step_id,
 };
 use wallet_ops::{DesktopSelfBroadcastResult, SelfBroadcastAttemptInfo, TxReceiptOutput};
 
@@ -370,12 +370,47 @@ fn stopped_progress_status_uses_danger_stop_marker_and_copy() {
 }
 
 #[test]
+fn semantic_public_action_step_ids_are_unique_and_indexed() {
+    let steps = [
+        PublicActionProgressStep::ShieldKey,
+        PublicActionProgressStep::Send,
+        PublicActionProgressStep::Wrap,
+        PublicActionProgressStep::Approve,
+        PublicActionProgressStep::Shield,
+        PublicActionProgressStep::Sponsor,
+        PublicActionProgressStep::Unsponsor,
+        PublicActionProgressStep::CallVote,
+        PublicActionProgressStep::Vote,
+        PublicActionProgressStep::GovernanceApprove,
+        PublicActionProgressStep::Stake,
+        PublicActionProgressStep::Delegate,
+        PublicActionProgressStep::Undelegate,
+        PublicActionProgressStep::Unlock,
+        PublicActionProgressStep::PrincipalClaim,
+        PublicActionProgressStep::RewardClaim(0),
+        PublicActionProgressStep::RewardClaim(1),
+    ];
+    let ids = steps
+        .into_iter()
+        .map(public_action_step_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        ids.len()
+    );
+    assert!(ids[15].ends_with("-0"));
+    assert!(ids[16].ends_with("-1"));
+}
+
+#[test]
 fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() {
     let gas_error = PublicActionStepState {
         step: PublicActionProgressStep::Wrap,
         status: PublicActionStepStatus::Error,
         tx_hash: None,
         message: Some(Arc::from("public-shield-wrap: estimate gas failed")),
+        interval: None,
     };
     let signing_cancel = PublicActionStepState {
         step: PublicActionProgressStep::Wrap,
@@ -384,6 +419,7 @@ fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() 
         message: Some(Arc::from(
             "public-shield-wrap: hardware sign: Failure_ActionCancelled",
         )),
+        interval: None,
     };
     let balance_error = PublicActionStepState {
         message: Some(Arc::from("insufficient native balance for public action")),
@@ -419,6 +455,7 @@ fn public_action_discard_attempt_only_shows_for_active_failed_steps() {
         status: PublicActionStepStatus::Error,
         tx_hash: None,
         message: Some(Arc::from("cancelled")),
+        interval: None,
     };
     let pending = PublicActionStepState {
         status: PublicActionStepStatus::Pending,
@@ -437,6 +474,7 @@ fn progress_dialog_close_behavior_distinguishes_success_from_failure_and_stop() 
         status: PublicActionStepStatus::Done,
         tx_hash: Some(Arc::from("0xabc")),
         message: None,
+        interval: None,
     }];
     let failed_steps = vec![PublicActionStepState {
         status: PublicActionStepStatus::Error,
@@ -461,6 +499,34 @@ fn progress_dialog_close_behavior_distinguishes_success_from_failure_and_stop() 
 }
 
 #[test]
+fn replaced_reward_progress_remains_reopenable_but_clear_resets_lifecycle() {
+    let history = vec![PublicActionStepState {
+        step: PublicActionProgressStep::RewardClaim(0),
+        status: PublicActionStepStatus::Done,
+        tx_hash: Some(Arc::from("0xconfirmed")),
+        message: None,
+        interval: None,
+    }];
+    assert_eq!(
+        public_action_progress_handoff_lifecycle(true),
+        Some(PublicActionProgressLifecycle::DialogReplacedWhileConfirmedHistoryRemains),
+    );
+    assert_eq!(public_action_progress_handoff_lifecycle(false), None,);
+    assert_eq!(
+        public_action_closed_status_step(
+            &history,
+            PublicActionProgressLifecycle::DialogReplacedWhileConfirmedHistoryRemains,
+        )
+        .map(|step| step.step),
+        Some(PublicActionProgressStep::RewardClaim(0)),
+    );
+    assert!(
+        public_action_closed_status_step(&history, PublicActionProgressLifecycle::Active,)
+            .is_none()
+    );
+}
+
+#[test]
 fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started() {
     let mut steps = vec![
         PublicActionStepState {
@@ -468,18 +534,21 @@ fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started()
             status: PublicActionStepStatus::Error,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Approve,
             status: PublicActionStepStatus::Pending,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
     assert!(mark_public_action_active_step_stopped(&mut steps));
@@ -491,12 +560,14 @@ fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started()
             status: PublicActionStepStatus::Error,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
     assert!(mark_public_action_active_step_stopped(&mut steps));
@@ -508,12 +579,14 @@ fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started()
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
     assert!(mark_public_action_active_step_stopped(&mut steps));
@@ -533,6 +606,7 @@ fn public_send_stop_footer_follows_send_handoff_boundary() {
         status: PublicActionStepStatus::Pending,
         tx_hash: None,
         message: None,
+        interval: None,
     }];
 
     assert_eq!(
@@ -561,12 +635,14 @@ fn erc20_public_shield_stop_footer_allows_approval_until_final_shield() {
             status: PublicActionStepStatus::Pending,
             tx_hash: Some(Arc::from("0xapprove")),
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
 
@@ -586,6 +662,76 @@ fn erc20_public_shield_stop_footer_allows_approval_until_final_shield() {
         public_action_progress_footer_action(false, &prerequisite_attempt_steps),
         ProgressFooterAction::Close,
     );
+}
+
+#[test]
+fn governance_handoff_uses_the_initialized_step_topology() {
+    let stake_workflow = [
+        PublicActionStepState {
+            step: PublicActionProgressStep::GovernanceApprove,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: None,
+            message: None,
+            interval: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Stake,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+            interval: None,
+        },
+    ];
+    assert!(!public_action_step_is_final_handoff_for_steps(
+        PublicActionMode::Send,
+        PublicActionProgressStep::GovernanceApprove,
+        &stake_workflow,
+    ));
+    assert!(public_action_step_is_final_handoff_for_steps(
+        PublicActionMode::Send,
+        PublicActionProgressStep::Stake,
+        &stake_workflow,
+    ));
+
+    let undelegate_workflow = [
+        PublicActionStepState {
+            step: PublicActionProgressStep::Undelegate,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: None,
+            message: None,
+            interval: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Unlock,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+            interval: None,
+        },
+    ];
+    assert!(!public_action_step_is_final_handoff_for_steps(
+        PublicActionMode::Send,
+        PublicActionProgressStep::Undelegate,
+        &undelegate_workflow,
+    ));
+    assert!(public_action_step_is_final_handoff_for_steps(
+        PublicActionMode::Send,
+        PublicActionProgressStep::Unlock,
+        &undelegate_workflow,
+    ));
+
+    let standalone_undelegate = [PublicActionStepState {
+        step: PublicActionProgressStep::Undelegate,
+        status: PublicActionStepStatus::Pending,
+        tx_hash: None,
+        message: None,
+        interval: None,
+    }];
+    assert!(public_action_step_is_final_handoff_for_steps(
+        PublicActionMode::Send,
+        PublicActionProgressStep::Undelegate,
+        &standalone_undelegate,
+    ));
 }
 
 #[test]

@@ -1541,18 +1541,21 @@ fn public_action_closed_active_step_uses_pending_step() {
             status: PublicActionStepStatus::Error,
             tx_hash: None,
             message: Some(Arc::from("wrap failed")),
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Approve,
             status: PublicActionStepStatus::Pending,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
 
@@ -1560,6 +1563,7 @@ fn public_action_closed_active_step_uses_pending_step() {
         public_action_closed_active_step(&steps).map(|step| step.step),
         Some(PublicActionProgressStep::Approve),
     );
+    assert!(steps.iter().all(|step| step.interval.is_none()));
 }
 
 #[test]
@@ -1570,18 +1574,21 @@ fn public_action_closed_active_step_uses_error_without_pending() {
             status: PublicActionStepStatus::Done,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Approve,
             status: PublicActionStepStatus::Error,
             tx_hash: None,
             message: Some(Arc::from("approve failed")),
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Shield,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
 
@@ -1599,12 +1606,14 @@ fn public_action_closed_active_step_ignores_inactive_steps() {
             status: PublicActionStepStatus::Done,
             tx_hash: None,
             message: None,
+            interval: None,
         },
         PublicActionStepState {
             step: PublicActionProgressStep::Approve,
             status: PublicActionStepStatus::NotStarted,
             tx_hash: None,
             message: None,
+            interval: None,
         },
     ];
 

@@ -33,6 +33,8 @@ const SAVE_ICON_PATH: &str = "railgun/icons/save.svg";
 pub(crate) const IMPORT_ICON_PATH: &str = "railgun/icons/import.svg";
 pub(crate) const LIST_ICON_PATH: &str = "railgun/icons/list.svg";
 pub(crate) const GROUP_ICON_PATH: &str = "railgun/icons/group.svg";
+pub(crate) const USERS_ICON_PATH: &str = "railgun/icons/users.svg";
+pub(crate) const PIGGY_BANK_ICON_PATH: &str = "railgun/icons/piggy-bank.svg";
 pub(crate) const CHEVRONS_DOWN_ICON_PATH: &str = "railgun/icons/chevrons-down.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
@@ -74,6 +76,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     IMPORT_ICON_PATH,
     LIST_ICON_PATH,
     GROUP_ICON_PATH,
+    USERS_ICON_PATH,
+    PIGGY_BANK_ICON_PATH,
     CHEVRONS_DOWN_ICON_PATH,
     KEY_ROUND_ICON_PATH,
     WRENCH_ICON_PATH,
@@ -116,6 +120,8 @@ const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
 const LIST_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/list.svg");
 const GROUP_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/group.svg");
+const USERS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/users.svg");
+const PIGGY_BANK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/piggy-bank.svg");
 const CHEVRONS_DOWN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/chevrons-down.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
 const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
@@ -437,6 +443,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         IMPORT_ICON_PATH => Some(IMPORT_ICON_BYTES),
         LIST_ICON_PATH => Some(LIST_ICON_BYTES),
         GROUP_ICON_PATH => Some(GROUP_ICON_BYTES),
+        USERS_ICON_PATH => Some(USERS_ICON_BYTES),
+        PIGGY_BANK_ICON_PATH => Some(PIGGY_BANK_ICON_BYTES),
         CHEVRONS_DOWN_ICON_PATH => Some(CHEVRONS_DOWN_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
         WRENCH_ICON_PATH => Some(WRENCH_ICON_BYTES),
@@ -541,6 +549,18 @@ mod tests {
             assets
                 .load("railgun/icons/group.svg")
                 .expect("load group icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/users.svg")
+                .expect("load users icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/piggy-bank.svg")
+                .expect("load piggy bank icon")
                 .is_some()
         );
         assert!(

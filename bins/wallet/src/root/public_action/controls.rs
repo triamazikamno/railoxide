@@ -332,6 +332,7 @@ fn public_action_muted_fee_row(label: &'static str, value: String) -> gpui::Div 
 pub(in crate::root) fn render_public_action_active_status_notice(
     root: Entity<WalletRoot>,
     mode: PublicActionMode,
+    title_override: Option<&str>,
     step: &PublicActionStepState,
     requires_device_approval: bool,
     command_available: bool,
@@ -340,14 +341,21 @@ pub(in crate::root) fn render_public_action_active_status_notice(
     let discard_available = public_action_discard_attempt_available(command_available, step);
     let view_root = root.clone();
     let discard_root = root;
-    let title = match (mode, step.status) {
-        (PublicActionMode::Shield, PublicActionStepStatus::Error) => {
-            "Public shield needs attention"
+    let title = title_override.map_or_else(
+        || match mode {
+            PublicActionMode::Shield => "Public shield".to_owned(),
+            PublicActionMode::Send => "Public send".to_owned(),
+        },
+        str::to_owned,
+    );
+    let title = format!(
+        "{title} {}",
+        if step.status == PublicActionStepStatus::Error {
+            "needs attention"
+        } else {
+            "in progress"
         }
-        (PublicActionMode::Send, PublicActionStepStatus::Error) => "Public send needs attention",
-        (PublicActionMode::Shield, _) => "Public shield in progress",
-        (PublicActionMode::Send, _) => "Public send in progress",
-    };
+    );
     let detail = format!(
         "{}: {}",
         public_action_step_label(step.step),
@@ -459,6 +467,17 @@ pub(in crate::root) fn public_action_closed_active_step(
                 .iter()
                 .find(|step| step.status == PublicActionStepStatus::Error)
         })
+}
+
+pub(in crate::root) fn public_action_closed_status_step(
+    steps: &[PublicActionStepState],
+    lifecycle: PublicActionProgressLifecycle,
+) -> Option<&PublicActionStepState> {
+    public_action_closed_active_step(steps).or_else(|| {
+        (lifecycle == PublicActionProgressLifecycle::DialogReplacedWhileConfirmedHistoryRemains)
+            .then(|| steps.last())
+            .flatten()
+    })
 }
 
 pub(in crate::root) const fn public_action_mode_verb(mode: PublicActionMode) -> &'static str {

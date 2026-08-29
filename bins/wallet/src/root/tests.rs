@@ -17,8 +17,9 @@ use super::private_broadcaster::{
     self_broadcast_composite_output_rows, self_broadcast_step_retry_kind,
 };
 use super::public_action::{
-    ProgressDialogCloseBehavior, progress_dialog_close_behavior, public_action_asset_label,
-    public_action_max_label, public_action_progress_is_successful,
+    ProgressDialogCloseBehavior, PublicActionProgressLifecycle, progress_dialog_close_behavior,
+    public_action_asset_label, public_action_closed_status_step, public_action_max_label,
+    public_action_progress_handoff_lifecycle, public_action_progress_is_successful,
 };
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::shell::balance_sync_issue_detail;

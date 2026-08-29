@@ -104,6 +104,7 @@ impl WalletRoot {
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
+                                    root.invalidate_governance_context();
                                     root.active_activity = Activity::Wallet;
                                     if root.active_wallet_tab == WalletTab::Public {
                                         root.focus_public_account_search_on_render = true;
@@ -133,6 +134,7 @@ impl WalletRoot {
                             .on_click(move |_event, window, cx| {
                                 broadcaster_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
+                                    root.invalidate_governance_context();
                                     root.sync_broadcaster_monitor_chain_filter(
                                         root.selected_chain,
                                         window,
@@ -150,6 +152,7 @@ impl WalletRoot {
                             .on_click(move |_event, _window, cx| {
                                 address_book_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
+                                    root.invalidate_governance_context();
                                     root.active_activity = Activity::AddressBook;
                                     cx.notify();
                                 });
@@ -173,6 +176,7 @@ impl WalletRoot {
                             .on_click(move |_event, _window, cx| {
                                 settings_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
+                                    root.invalidate_governance_context();
                                     root.active_activity = Activity::Settings;
                                     cx.notify();
                                 });

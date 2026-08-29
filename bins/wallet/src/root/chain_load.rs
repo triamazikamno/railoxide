@@ -1484,6 +1484,8 @@ impl WalletRoot {
     }
 
     pub(super) fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
+        self.invalidate_governance_context();
+        self.invalidate_proposals_chain(self.selected_chain);
         self.clear_protected_software_seed_session(cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -2682,6 +2684,7 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
         self.invalidate_proposals_chain(chain_id);
+        self.invalidate_governance_context();
         self.ui_state.last_chain_id = Some(chain_id);
         self.save_ui_state();
         self.sync_broadcaster_monitor_chain_filter(chain_id, window, cx);
@@ -2707,7 +2710,12 @@ impl WalletRoot {
             self.ensure_chain_load(chain_id, cx);
         }
         if self.active_activity == super::sidebar::Activity::Proposals {
-            self.start_proposals_refresh(false, cx);
+            match self.governance.tab {
+                super::governance::GovernanceTab::Proposals => {
+                    self.start_proposals_refresh(false, cx);
+                }
+                super::governance::GovernanceTab::Staking => self.start_staking_refresh(cx),
+            }
         }
         cx.notify();
     }

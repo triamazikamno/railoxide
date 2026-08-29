@@ -10,6 +10,7 @@ mod tests;
 mod types;
 mod walletconnect;
 
+pub(crate) use actions::submit_public_action_step_with_signer;
 pub use actions::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,

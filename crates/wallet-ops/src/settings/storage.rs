@@ -180,6 +180,12 @@ fn decode_wallet_ui_state_with_migration(
         1 => {
             state.version = WALLET_UI_STATE_VERSION;
             state.last_wallet_kind = RememberedWalletKind::default();
+            state.governance_participants.clear();
+            true
+        }
+        2 => {
+            state.version = WALLET_UI_STATE_VERSION;
+            state.governance_participants.clear();
             true
         }
         version => {

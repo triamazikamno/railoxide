@@ -699,7 +699,7 @@ impl WalletRoot {
             Activity::Broadcaster => self.render_broadcaster_view(root).into_any_element(),
             Activity::AddressBook => self.render_address_book_view(root),
             Activity::Proposals => self
-                .render_proposals_view(root, window, cx)
+                .render_governance_workspace(root, window, cx)
                 .into_any_element(),
             Activity::Settings => self.render_settings_view().into_any_element(),
         }

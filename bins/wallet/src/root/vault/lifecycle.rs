@@ -758,6 +758,16 @@ impl WalletRoot {
         self.reload_address_books(cx);
         self.reload_broadcaster_preferences(cx);
         self.reload_public_accounts(window, cx);
+        if self.active_activity == super::super::sidebar::Activity::Proposals {
+            match self.governance.tab {
+                super::super::governance::GovernanceTab::Proposals => {
+                    self.start_proposals_refresh(false, cx);
+                }
+                super::super::governance::GovernanceTab::Staking => {
+                    self.start_staking_refresh(cx);
+                }
+            }
+        }
         self.setup_password = None;
         self.generated_seed = None;
         #[cfg(feature = "hardware")]
@@ -1131,6 +1141,8 @@ impl WalletRoot {
             return;
         }
         self.shutdown_wallet_session_store();
+        self.invalidate_governance_context();
+        self.invalidate_proposals_chain(self.selected_chain);
         self.clear_private_broadcaster_progress_state();
         self.stop_waku();
         window.close_all_dialogs(cx);

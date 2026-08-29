@@ -6,29 +6,33 @@ use std::time::{Duration, Instant};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, px, rgb,
+    Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Sizable,
+    Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
     button::ButtonVariants,
     collapsible::Collapsible,
-    divider::Divider,
     list::{List, ListDelegate, ListItem, ListState},
+    progress::Progress,
     scroll::ScrollableElement,
     skeleton::Skeleton,
+    spinner::Spinner,
     tab::{Tab, TabBar},
     text::TextView,
     tooltip::Tooltip,
 };
 use markdown::{ParseOptions, mdast::Node, to_mdast};
+use railgun_ui::short_address;
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
+use ui::controls::{
+    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+};
 use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
@@ -40,15 +44,17 @@ use wallet_ops::{
     vault::DesktopVaultStore,
 };
 
+use super::governance_action::{
+    ProposalActionKind, ProposalParticipationRow, proposal_participation_key,
+    validate_proposal_action,
+};
 use super::spend_authorization::spend_authorization_recipient_display;
-use super::tokens::format_native_token_amount_for_display;
-use super::{WalletRoot, app_refresh_button, app_status_tag, format_report_chain};
-use crate::assets::RailgunSidebarIcon;
+use super::tokens::{format_native_token_amount_for_display, format_send_amount_input};
+use super::{WalletRoot, app_status_tag, format_report_chain};
 
 pub(super) const PROPOSALS_PAGE_SIZE: usize = 5;
 const DOCUMENT_RESOLUTION_CONCURRENCY: usize = 4;
 const CONTENT_WIDTH: gpui::Pixels = px(1080.0);
-const GOVERNANCE_HEADER_HEIGHT: gpui::Pixels = px(52.0);
 const MAX_MDAST_NODES: usize = 4_096;
 const MAX_RENDER_COMPLEXITY: usize = 256;
 const MAX_PREPARED_SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -276,7 +282,7 @@ impl ListDelegate for ProposalListDelegate {
             return;
         };
         root.update(cx, |root, cx| {
-            root.select_proposal(page, identity, window, cx);
+            root.select_proposal(page, &identity, window, cx);
         });
     }
 }
@@ -286,6 +292,7 @@ pub(super) struct ProposalSelection {
     page: usize,
     identity: ProposalIdentity,
     tab: ProposalDetailTab,
+    participation_expanded: bool,
 }
 
 struct ProposalTaskTracker {
@@ -454,6 +461,13 @@ impl ProposalsState {
     }
     fn rows(&self, page: usize) -> Option<&[ResolvedProposal]> {
         self.pages.get(&page).map(|p| p.rows.as_slice())
+    }
+
+    pub(super) fn selected_proposal(&self) -> Option<&GovernanceProposal> {
+        let selection = self.selected.as_ref()?;
+        self.rows(selection.page)
+            .and_then(|rows| rows.iter().find(|row| row.identity() == selection.identity))
+            .map(|row| &row.proposal)
     }
 
     fn chain_time(&self) -> U256 {
@@ -630,14 +644,112 @@ struct InitialLoad {
 }
 
 impl WalletRoot {
+    pub(super) fn render_proposal_action_dialog_content(
+        &self,
+        root: Entity<Self>,
+        content_width: gpui::Pixels,
+        cx: &App,
+    ) -> gpui::Div {
+        let proposal = self.proposals.selected.as_ref().and_then(|selection| {
+            self.proposals
+                .rows(selection.page)
+                .and_then(|rows| rows.iter().find(|row| row.identity() == selection.identity))
+        });
+        let Some(proposal) = proposal else {
+            let close_root = root;
+            return div()
+                .w(content_width)
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(Alert::error(
+                    "governance-action-stale-selection",
+                    "The selected proposal is no longer available. Refresh before reviewing this action.",
+                ))
+                .child(
+                    div().flex().justify_end().child(
+                        app_button_base("governance-action-stale-cancel")
+                            .ghost()
+                            .small()
+                            .child("Cancel")
+                            .on_click(move |_event, window, cx| {
+                                close_root.update(cx, Self::close_proposal_action);
+                                window.close_dialog(cx);
+                            }),
+                    ),
+                );
+        };
+        let token = railgun_ui::governance_contracts(self.selected_chain)
+            .map_or(Address::ZERO, |contracts| contracts.governance_token);
+        let decimals = self
+            .effective_token_registry
+            .get(self.selected_chain, &token)
+            .map(|info| info.decimals);
+        render_proposal_action_form(
+            &root,
+            self,
+            proposal,
+            decimals,
+            content_width,
+            self.proposals.chain_time(),
+            cx,
+        )
+            .unwrap_or_else(|| {
+                let close_root = root;
+                div()
+                    .w(content_width)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(Alert::error(
+                        "governance-action-stale-context",
+                        "This proposal action is no longer valid for the current account or chain context. Refresh before trying again.",
+                    ))
+                    .child(
+                        div().flex().justify_end().child(
+                            app_button_base("governance-action-stale-context-cancel")
+                                .ghost()
+                                .small()
+                                .child("Cancel")
+                                .on_click(move |_event, window, cx| {
+                                    close_root.update(cx, Self::close_proposal_action);
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                    )
+            })
+    }
+
     pub(super) fn open_proposals(&mut self, cx: &mut Context<'_, Self>) {
         self.active_activity = super::sidebar::Activity::Proposals;
+        self.clean_governance_participants();
         self.proposals.focus_list_on_render = true;
         if self.proposals.chain_time_anchor.is_some() {
             self.start_proposals_time_tick(cx);
         }
-        if !self.proposals.checked && !self.proposals.loading {
+        if self.governance.tab == super::governance::GovernanceTab::Proposals
+            && !self.proposals.checked
+            && !self.proposals.loading
+        {
             self.start_proposals_refresh(false, cx);
+        } else if self.governance.tab == super::governance::GovernanceTab::Staking
+            && matches!(
+                self.governance.staking.status,
+                super::governance::StakingRefreshStatus::Idle
+            )
+        {
+            self.start_staking_refresh(cx);
+        } else if self.governance.tab == super::governance::GovernanceTab::Proposals {
+            let selected = self.proposals.selected.as_ref().and_then(|selection| {
+                self.proposals.rows(selection.page).and_then(|rows| {
+                    rows.iter()
+                        .find(|row| row.identity() == selection.identity)
+                        .map(|row| row.proposal.clone())
+                })
+            });
+            if let Some(proposal) = selected.as_ref() {
+                self.start_proposal_participation(proposal, cx);
+            }
         }
         cx.notify();
     }
@@ -733,6 +845,17 @@ impl WalletRoot {
                         root.proposals.total_pages = load.total_pages;
                         root.proposals
                             .replace_refreshed_page(requested_page, load.page, load.rows);
+                        let selected_proposal =
+                            root.proposals.selected.as_ref().and_then(|selection| {
+                                root.proposals.rows(selection.page).and_then(|rows| {
+                                    rows.iter()
+                                        .find(|row| row.identity() == selection.identity)
+                                        .map(|row| row.proposal.clone())
+                                })
+                            });
+                        if let Some(proposal) = selected_proposal.as_ref() {
+                            root.start_proposal_participation(proposal, cx);
+                        }
                         if root.proposals.overview.is_some() {
                             root.start_proposals_time_tick(cx);
                             root.resume_active_proposals_page(load.page, cx);
@@ -766,6 +889,7 @@ impl WalletRoot {
         }
         self.proposals.current_page = page;
         self.proposals.selected = None;
+        self.close_proposal_action(cx);
         self.proposals.expanded_calldata.clear();
         self.proposals.focus_list_on_render = true;
         if self.proposals.rows(page).is_none() {
@@ -778,14 +902,14 @@ impl WalletRoot {
     pub(super) fn select_proposal(
         &mut self,
         page: usize,
-        identity: ProposalIdentity,
+        identity: &ProposalIdentity,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let table_count =
             self.proposals
                 .rows(page)
-                .and_then(|rows| rows.iter().find(|row| row.identity() == identity))
+                .and_then(|rows| rows.iter().find(|row| row.identity().eq(identity)))
                 .and_then(ResolvedProposal::presentation)
                 .and_then(|presentation| match presentation {
                     ProposalPresentation::Prepared(prepared) => Some(prepared.table_count),
@@ -794,20 +918,30 @@ impl WalletRoot {
                 });
         if let Some(table_count) = table_count {
             self.proposals
-                .ensure_table_scroll_handles(&identity, table_count);
+                .ensure_table_scroll_handles(identity, table_count);
         }
         self.proposals.expanded_calldata.clear();
         self.proposals.selected = Some(ProposalSelection {
             page,
-            identity,
+            identity: identity.clone(),
             tab: ProposalDetailTab::default(),
+            participation_expanded: false,
         });
         self.proposals.detail_scroll_handle = ScrollHandle::new();
+        let selected_proposal = self.proposals.rows(page).and_then(|rows| {
+            rows.iter()
+                .find(|row| row.identity().eq(identity))
+                .map(|row| row.proposal.clone())
+        });
+        if let Some(proposal) = selected_proposal.as_ref() {
+            self.start_proposal_participation(proposal, cx);
+        }
         self.proposal_detail_focus.focus(window);
         cx.notify();
     }
     pub(super) fn clear_selected_proposal(&mut self, cx: &mut Context<'_, Self>) {
         self.proposals.selected = None;
+        self.close_proposal_action(cx);
         self.proposals.expanded_calldata.clear();
         self.proposals.focus_list_on_render = true;
         cx.notify();
@@ -815,6 +949,12 @@ impl WalletRoot {
     fn select_proposal_detail_tab(&mut self, tab: ProposalDetailTab, cx: &mut Context<'_, Self>) {
         if let Some(selection) = self.proposals.selected.as_mut() {
             selection.tab = tab;
+            cx.notify();
+        }
+    }
+    fn toggle_proposal_participation(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(selection) = self.proposals.selected.as_mut() {
+            selection.participation_expanded = !selection.participation_expanded;
             cx.notify();
         }
     }
@@ -919,6 +1059,17 @@ impl WalletRoot {
                         }
                         if !prefetch && page == root.proposals.current_page {
                             root.proposals.error = None;
+                            let selected_proposal =
+                                root.proposals.selected.as_ref().and_then(|selection| {
+                                    root.proposals.rows(selection.page).and_then(|rows| {
+                                        rows.iter()
+                                            .find(|row| row.identity() == selection.identity)
+                                            .map(|row| row.proposal.clone())
+                                    })
+                                });
+                            if let Some(proposal) = selected_proposal.as_ref() {
+                                root.start_proposal_participation(proposal, cx);
+                            }
                         }
                     }
                     Err(error) => {
@@ -933,6 +1084,19 @@ impl WalletRoot {
             });
         })
         .detach();
+    }
+
+    pub(super) fn refresh_selected_proposal_page(&mut self, cx: &mut Context<'_, Self>) {
+        let page = self
+            .proposals
+            .selected
+            .as_ref()
+            .map_or(self.proposals.current_page, |selection| selection.page);
+        self.proposals.pages.remove(&page);
+        self.proposals.proposal_lists.remove(&page);
+        self.proposals.loading_pages.remove(&page);
+        self.request_proposals_page(page, false, cx);
+        cx.notify();
     }
     fn resume_active_proposals_page(&mut self, page: usize, cx: &Context<'_, Self>) {
         self.start_proposals_hydration(page, false, cx);
@@ -1089,7 +1253,6 @@ impl WalletRoot {
                 });
                 cx.stop_propagation();
             })
-            .child(self.render_proposals_header(root))
             .child(
                 div()
                     .flex_1()
@@ -1274,49 +1437,6 @@ impl WalletRoot {
         };
         content = content.child(body);
         content.into_any_element()
-    }
-    fn render_proposals_header(&self, root: &Entity<Self>) -> gpui::Div {
-        let refresh_root = root.clone();
-        let state = &self.proposals;
-        div()
-            .h(GOVERNANCE_HEADER_HEIGHT)
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px(px(14.0))
-            .bg(rgb(theme::SURFACE))
-            .border_b_1()
-            .border_color(rgb(theme::BORDER))
-            .child(
-                Icon::new(RailgunSidebarIcon::Landmark)
-                    .size_5()
-                    .text_color(rgb(theme::PRIMARY)),
-            )
-            .child(
-                app_strong_text("Governance")
-                    .text_size(px(20.0))
-                    .font_weight(FontWeight::SEMIBOLD),
-            )
-            .child(div().flex_1())
-            .child(app_refresh_button(
-                "wallet-proposals-refresh",
-                "Refresh governance proposals",
-                state.refreshing,
-                true,
-                move |_window, cx| {
-                    refresh_root.update(cx, |root, cx| {
-                        root.start_proposals_refresh(true, cx);
-                    });
-                },
-            ))
-            .child(
-                Divider::vertical()
-                    .h(px(18.0))
-                    .mx(px(2.0))
-                    .color(rgb(theme::BORDER)),
-            )
-            .child(self.render_chain_selector())
     }
     fn render_proposal_row(
         proposal: &ResolvedProposal,
@@ -1517,6 +1637,12 @@ impl WalletRoot {
                                     ),
                             ),
                     )
+                    .child(render_proposal_participation_card(
+                        root,
+                        self,
+                        proposal,
+                        status.stage,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1795,7 +1921,7 @@ fn rules_for(
             .clone(),
     })
 }
-const fn proposal_stage_label(stage: GovernanceProposalStage) -> &'static str {
+pub(super) const fn proposal_stage_label(stage: GovernanceProposalStage) -> &'static str {
     match stage {
         GovernanceProposalStage::AwaitingSponsorship => "Awaiting sponsorship",
         GovernanceProposalStage::ReadyToCallVote => "Ready to call vote",
@@ -1882,7 +2008,7 @@ fn proposal_row_group(identity: &ProposalIdentity) -> SharedString {
 fn format_deadline(deadline: &U256) -> String {
     format_datetime_short(deadline)
 }
-fn format_date_short(timestamp: &U256) -> String {
+pub(super) fn format_date_short(timestamp: &U256) -> String {
     format_timestamp_with_pattern(timestamp, "%d %b %Y")
 }
 fn format_datetime_short(timestamp: &U256) -> String {
@@ -1898,7 +2024,7 @@ fn format_timestamp_with_pattern(timestamp: &U256, pattern: &str) -> String {
     utc.with_timezone(&Local).format(pattern).to_string()
 }
 
-fn format_compact_rail_amount(amount: U256) -> String {
+pub(super) fn format_compact_rail_amount(amount: U256) -> String {
     let scale = U256::from(10).pow(U256::from(18));
     let whole = amount / scale;
     if whole < U256::from(1_000) {
@@ -1919,9 +2045,32 @@ fn format_compact_rail_amount(amount: U256) -> String {
     let decimal = (whole % 1_000_000_000) / 10_000_000;
     compact_suffix_two_decimals(integer, decimal, 'B')
 }
-fn format_compact_rail_amount_with_unit(amount: U256) -> String {
+pub(super) fn format_compact_rail_amount_with_unit(amount: U256) -> String {
     format!("{} RAIL", format_compact_rail_amount(amount))
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProposalCapacityKind {
+    Sponsorship,
+    Voting,
+}
+
+const fn proposal_capacity_kind(stage: GovernanceProposalStage) -> ProposalCapacityKind {
+    match stage {
+        GovernanceProposalStage::AwaitingSponsorship
+        | GovernanceProposalStage::ReadyToCallVote
+        | GovernanceProposalStage::SponsorshipExpired
+        | GovernanceProposalStage::VoteCallExpired => ProposalCapacityKind::Sponsorship,
+        GovernanceProposalStage::VotingDelay
+        | GovernanceProposalStage::VotingOpen
+        | GovernanceProposalStage::NayOnlyVoting
+        | GovernanceProposalStage::Failed
+        | GovernanceProposalStage::PassedAwaitingExecution
+        | GovernanceProposalStage::PassedExecutable
+        | GovernanceProposalStage::ExecutionExpired
+        | GovernanceProposalStage::Executed => ProposalCapacityKind::Voting,
+    }
+}
+
 fn compact_suffix(integer: u128, decimal: u128, suffix: char) -> String {
     if decimal == 0 {
         format!("{integer}{suffix}")
@@ -1946,6 +2095,67 @@ fn per_mille(numerator: U256, denominator: U256) -> u16 {
     let denominator = u128::try_from(denominator).unwrap_or(u128::MAX);
     u16::try_from((numerator.saturating_mul(1_000) / denominator).min(1_000)).unwrap_or(1_000)
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProposalCapacitySummaryState {
+    Empty,
+    Loading,
+    Unavailable,
+    Full,
+    Partial,
+    Exhausted,
+}
+
+fn proposal_capacity_summary_state(
+    available: Option<U256>,
+    maximum: Option<U256>,
+    loading_count: usize,
+    unavailable_count: usize,
+    participant_count: usize,
+) -> ProposalCapacitySummaryState {
+    if participant_count == 0 {
+        return ProposalCapacitySummaryState::Empty;
+    }
+    if unavailable_count > 0 {
+        return ProposalCapacitySummaryState::Unavailable;
+    }
+    if loading_count > 0 || available.is_none() || maximum.is_none() {
+        return ProposalCapacitySummaryState::Loading;
+    }
+    let (Some(available), Some(maximum)) = (available, maximum) else {
+        return ProposalCapacitySummaryState::Loading;
+    };
+    match (available, maximum) {
+        (available, maximum) if available == maximum => ProposalCapacitySummaryState::Full,
+        (available, maximum) if available.is_zero() && !maximum.is_zero() => {
+            ProposalCapacitySummaryState::Exhausted
+        }
+        _ => ProposalCapacitySummaryState::Partial,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProposalClosedHistoryKind {
+    Sponsorship,
+    Voting,
+}
+
+const fn proposal_closed_history_kind(
+    stage: GovernanceProposalStage,
+) -> Option<ProposalClosedHistoryKind> {
+    match stage {
+        GovernanceProposalStage::SponsorshipExpired | GovernanceProposalStage::VoteCallExpired => {
+            Some(ProposalClosedHistoryKind::Sponsorship)
+        }
+        GovernanceProposalStage::Failed
+        | GovernanceProposalStage::PassedAwaitingExecution
+        | GovernanceProposalStage::PassedExecutable
+        | GovernanceProposalStage::ExecutionExpired
+        | GovernanceProposalStage::Executed => Some(ProposalClosedHistoryKind::Voting),
+        _ => None,
+    }
+}
+
 fn vote_split(yay: U256, nay: U256) -> Option<u16> {
     let total = yay.checked_add(nay)?;
     if total.is_zero() {
@@ -2191,6 +2401,1091 @@ fn proposal_detail_title(proposal: &ResolvedProposal) -> gpui::Div {
         Some(_) => app_strong_text(format!("Proposal #{}", proposal.proposal.index))
             .text_size(px(22.0))
             .font_weight(FontWeight::SEMIBOLD),
+    }
+}
+
+fn render_proposal_participation_card(
+    root: &Entity<WalletRoot>,
+    wallet: &WalletRoot,
+    proposal: &ResolvedProposal,
+    stage: GovernanceProposalStage,
+) -> gpui::Div {
+    let history_kind = proposal_closed_history_kind(stage);
+    let actionable = matches!(
+        stage,
+        GovernanceProposalStage::AwaitingSponsorship
+            | GovernanceProposalStage::ReadyToCallVote
+            | GovernanceProposalStage::VotingOpen
+            | GovernanceProposalStage::NayOnlyVoting
+    );
+    let key_matches = wallet
+        .governance
+        .proposal_participation
+        .key
+        .as_ref()
+        .is_some_and(|key| {
+            key.index == proposal.proposal.index
+                && key.contract == proposal.proposal.contract_address
+                && key.version == proposal.proposal.contract_version
+        });
+    let capacity_kind = proposal_capacity_kind(stage);
+    let power_phrase = match capacity_kind {
+        ProposalCapacityKind::Sponsorship => "sponsorship",
+        ProposalCapacityKind::Voting => "voting",
+    };
+    let expanded = wallet.proposals.selected.as_ref().is_some_and(|selection| {
+        selection.identity == proposal.identity() && selection.participation_expanded
+    });
+    let participants = wallet.governance_participants();
+    let total_accounts = participants.len();
+    let mut aggregate_available = Some(U256::ZERO);
+    let mut aggregate_maximum = Some(U256::ZERO);
+    let mut aggregate_valid = key_matches || participants.is_empty();
+    let mut total_used_accounts = 0usize;
+    let mut inactive_count = 0usize;
+    let mut loading_count = 0usize;
+    let mut unavailable_count = 0usize;
+    let mut closed_sponsored = Some(U256::ZERO);
+    let mut closed_voted = Some(U256::ZERO);
+    for account in &participants {
+        let row = wallet
+            .governance
+            .proposal_participation
+            .rows
+            .get(&account.address);
+        if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
+            inactive_count += 1;
+        }
+        if !key_matches {
+            continue;
+        }
+        match row {
+            Some(ProposalParticipationRow::Loading) | None => loading_count += 1,
+            Some(ProposalParticipationRow::Unavailable(_)) => unavailable_count += 1,
+            Some(ProposalParticipationRow::Ready(participation)) => {
+                let participation_matches = participation.proposal_version
+                    == proposal.proposal.contract_version
+                    && participation.proposal_id == proposal.proposal.index
+                    && participation.voting_contract == proposal.proposal.contract_address;
+                if !participation_matches {
+                    unavailable_count += 1;
+                    continue;
+                }
+                if let Some(kind) = history_kind {
+                    let sponsored = closed_sponsored
+                        .and_then(|total| total.checked_add(participation.sponsored));
+                    let voted =
+                        closed_voted.and_then(|total| total.checked_add(participation.voted));
+                    if sponsored.is_none() || voted.is_none() {
+                        if aggregate_valid {
+                            unavailable_count += 1;
+                        }
+                        aggregate_valid = false;
+                    }
+                    closed_sponsored = sponsored;
+                    closed_voted = voted;
+                    if matches!(kind, ProposalClosedHistoryKind::Voting) {
+                        if !participation.voted.is_zero() {
+                            total_used_accounts += 1;
+                        }
+                    } else if !participation.sponsored.is_zero() {
+                        total_used_accounts += 1;
+                    }
+                    continue;
+                }
+                let sponsor_capacity = participation.sponsorship_capacity();
+                let voting_capacity = participation.voting_capacity();
+                let capacity = match capacity_kind {
+                    ProposalCapacityKind::Sponsorship => &sponsor_capacity,
+                    ProposalCapacityKind::Voting => &voting_capacity,
+                };
+                let Ok(capacity) = capacity else {
+                    unavailable_count += 1;
+                    aggregate_valid = false;
+                    continue;
+                };
+                let Some((available, maximum)) = capacity.remaining.zip(capacity.snapshot_power)
+                else {
+                    unavailable_count += 1;
+                    aggregate_valid = false;
+                    continue;
+                };
+                aggregate_available =
+                    aggregate_available.and_then(|total| total.checked_add(available));
+                aggregate_maximum = aggregate_maximum.and_then(|total| total.checked_add(maximum));
+                if aggregate_available.is_none() || aggregate_maximum.is_none() {
+                    if aggregate_valid {
+                        unavailable_count += 1;
+                    }
+                    aggregate_valid = false;
+                }
+                if !capacity.allocated.is_zero() {
+                    total_used_accounts += 1;
+                }
+            }
+        }
+    }
+    if !key_matches && total_accounts > 0 {
+        loading_count = total_accounts;
+    }
+    let mut details = div().w_full().flex().flex_col().mt(px(8.0));
+    if participants.is_empty() {
+        details = details.child(
+            app_muted_text("Enroll a Public account to view voting power and allocations.")
+                .mb(px(8.0)),
+        );
+    }
+    for account in &participants {
+        let row = wallet
+            .governance
+            .proposal_participation
+            .rows
+            .get(&account.address);
+        let label =
+            super::public_account::public_account_display_label(account).unwrap_or_else(|| {
+                super::spend_authorization::spend_authorization_recipient_display(&format!(
+                    "{:#x}",
+                    account.address
+                ))
+            });
+        let mut row_card = div()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .gap_3()
+            .py(px(9.0))
+            .px(px(2.0))
+            .border_t_1()
+            .border_color(rgb(theme::BORDER_SUBTLE));
+        let mut account_column = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(250.0))
+            .flex_none()
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(app_strong_text(label))
+                    .child(
+                        app_muted_text(
+                            super::spend_authorization::spend_authorization_recipient_display(
+                                &format!("{:#x}", account.address),
+                            ),
+                        )
+                        .font_family(APP_MONO_FONT_FAMILY)
+                        .text_size(px(11.0))
+                        .truncate(),
+                    ),
+            );
+        if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
+            account_column = account_column.child(
+                app_muted_text("Inactive account")
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme::WARNING)),
+            );
+        }
+        row_card = row_card.child(account_column);
+        let mut capacity_column = div().flex().flex_col().gap_1().flex_1().min_w(px(220.0));
+        let mut actions = div().flex().flex_wrap().gap_2().flex_none();
+        match row {
+            Some(ProposalParticipationRow::Ready(participation)) => {
+                let participation_matches = participation.proposal_version
+                    == proposal.proposal.contract_version
+                    && participation.proposal_id == proposal.proposal.index
+                    && participation.voting_contract == proposal.proposal.contract_address;
+                if participation_matches {
+                    if let Some(history_kind) = history_kind {
+                        let allocation = match history_kind {
+                            ProposalClosedHistoryKind::Sponsorship => {
+                                if participation.sponsored.is_zero() {
+                                    "No sponsorship allocated".to_owned()
+                                } else {
+                                    format!(
+                                        "{} sponsored",
+                                        format_compact_rail_amount_with_unit(
+                                            participation.sponsored
+                                        )
+                                    )
+                                }
+                            }
+                            ProposalClosedHistoryKind::Voting => {
+                                if participation.voted.is_zero()
+                                    && participation.sponsored.is_zero()
+                                {
+                                    "No allocation".to_owned()
+                                } else if participation.voted.is_zero() {
+                                    format!(
+                                        "{} sponsored",
+                                        format_compact_rail_amount_with_unit(
+                                            participation.sponsored
+                                        )
+                                    )
+                                } else if participation.sponsored.is_zero() {
+                                    format!(
+                                        "{} voted",
+                                        format_compact_rail_amount_with_unit(participation.voted)
+                                    )
+                                } else {
+                                    format!(
+                                        "{} voted · {} sponsored",
+                                        format_compact_rail_amount_with_unit(participation.voted),
+                                        format_compact_rail_amount_with_unit(
+                                            participation.sponsored
+                                        )
+                                    )
+                                }
+                            }
+                        };
+                        capacity_column =
+                            capacity_column.child(app_text(allocation).text_size(px(12.0)));
+                    } else {
+                        let capacity_result = match capacity_kind {
+                            ProposalCapacityKind::Sponsorship => {
+                                participation.sponsorship_capacity()
+                            }
+                            ProposalCapacityKind::Voting => participation.voting_capacity(),
+                        };
+                        match capacity_result {
+                            Ok(capacity) => {
+                                let remaining = capacity.remaining.unwrap_or_default();
+                                let snapshot = capacity.snapshot_power.unwrap_or_default();
+                                let kind = match capacity_kind {
+                                    ProposalCapacityKind::Sponsorship => "sponsor",
+                                    ProposalCapacityKind::Voting => "vote",
+                                };
+                                if capacity.allocated.is_zero() {
+                                    capacity_column = capacity_column.child(
+                                        app_text(format!(
+                                            "{} available to {kind}",
+                                            format_compact_rail_amount_with_unit(snapshot)
+                                        ))
+                                        .text_size(px(12.0)),
+                                    );
+                                } else {
+                                    capacity_column = capacity_column.child(
+                                        app_text(format!(
+                                            "{} of {} RAIL",
+                                            format_compact_rail_amount(remaining),
+                                            format_compact_rail_amount(snapshot)
+                                        ))
+                                        .text_size(px(12.0)),
+                                    );
+                                    capacity_column = capacity_column.child(
+                                        app_muted_text(format!(
+                                            "available · {} {}",
+                                            format_compact_rail_amount_with_unit(
+                                                capacity.allocated
+                                            ),
+                                            if capacity_kind == ProposalCapacityKind::Sponsorship {
+                                                "sponsored"
+                                            } else {
+                                                "voted"
+                                            }
+                                        ))
+                                        .text_size(px(11.0)),
+                                    );
+                                    capacity_column = capacity_column.child(
+                                        Progress::new().w_full().max_w(px(340.0)).value(
+                                            f32::from(per_mille(remaining, snapshot)) / 10.0,
+                                        ),
+                                    );
+                                    if remaining.is_zero() {
+                                        capacity_column = capacity_column.child(
+                                            app_muted_text(format!(
+                                                "All {power_phrase} power used for this proposal"
+                                            ))
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(theme::WARNING)),
+                                        );
+                                    }
+                                }
+                                if capacity_kind == ProposalCapacityKind::Voting
+                                    && !participation.sponsored.is_zero()
+                                {
+                                    capacity_column = capacity_column.child(
+                                        app_muted_text(format!(
+                                            "Sponsored {} earlier in this proposal",
+                                            format_compact_rail_amount_with_unit(
+                                                participation.sponsored
+                                            )
+                                        ))
+                                        .text_size(px(11.0)),
+                                    );
+                                }
+                                let active_snapshot = match capacity_kind {
+                                    ProposalCapacityKind::Sponsorship => {
+                                        participation.sponsorship_snapshot.voting_power
+                                    }
+                                    ProposalCapacityKind::Voting => {
+                                        participation.voting_snapshot.voting_power
+                                    }
+                                };
+                                if participation.current_voting_power != active_snapshot {
+                                    capacity_column = capacity_column.child(
+                                        app_muted_text(format!(
+                                            "Live received power {} (snapshot {})",
+                                            format_compact_rail_amount_with_unit(
+                                                participation.current_voting_power
+                                            ),
+                                            format_compact_rail_amount_with_unit(active_snapshot)
+                                        ))
+                                        .text_size(px(11.0)),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                capacity_column = capacity_column.child(
+                                    Alert::error(
+                                        SharedString::from(format!(
+                                            "governance-capacity-error-{}",
+                                            account.address
+                                        )),
+                                        format!("Capacity unavailable: {error}"),
+                                    )
+                                    .small(),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    capacity_column = capacity_column.child(app_muted_text("Participation data does not match this proposal; actions are unavailable.").text_size(px(11.0)));
+                }
+                if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
+                    capacity_column = capacity_column.child(
+                        app_muted_text(
+                            "Inactive account, shown for information; actions disabled.",
+                        )
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme::WARNING)),
+                    );
+                }
+                let sponsor_remaining = participation
+                    .sponsorship_capacity()
+                    .ok()
+                    .and_then(|capacity| capacity.remaining);
+                let voting_remaining = participation
+                    .voting_capacity()
+                    .ok()
+                    .and_then(|capacity| capacity.remaining);
+                if key_matches
+                    && participation_matches
+                    && actionable
+                    && account.status == wallet_ops::vault::PublicAccountStatus::Active
+                {
+                    let actor = account.address;
+                    let open = |kind: ProposalActionKind, root: &Entity<WalletRoot>| {
+                        let root = root.clone();
+                        let mut button = app_button_base(SharedString::from(format!(
+                            "governance-proposal-action-{kind:?}-{actor}"
+                        )))
+                        .child(match kind {
+                            ProposalActionKind::Sponsor => "Sponsor",
+                            ProposalActionKind::Unsponsor => "Unsponsor",
+                            ProposalActionKind::CallVote => "Call vote",
+                            ProposalActionKind::Yay => "Yay",
+                            ProposalActionKind::Nay => "Nay",
+                        });
+                        button = match kind {
+                            ProposalActionKind::Yay => {
+                                button.small().primary().icon(IconName::ThumbsUp)
+                            }
+                            ProposalActionKind::Nay => {
+                                button.small().warning().icon(IconName::ThumbsDown)
+                            }
+                            ProposalActionKind::Sponsor
+                            | ProposalActionKind::Unsponsor
+                            | ProposalActionKind::CallVote => button.outline().small(),
+                        };
+                        button.on_click(move |_event, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.open_proposal_action(actor, kind, window, cx);
+                            });
+                        })
+                    };
+                    match stage {
+                        GovernanceProposalStage::AwaitingSponsorship => {
+                            if sponsor_remaining.is_some_and(|remaining| !remaining.is_zero()) {
+                                actions = actions.child(open(ProposalActionKind::Sponsor, root));
+                            }
+                            if !participation.sponsored.is_zero() {
+                                actions = actions.child(open(ProposalActionKind::Unsponsor, root));
+                            }
+                        }
+                        GovernanceProposalStage::ReadyToCallVote => {
+                            if sponsor_remaining.is_some_and(|remaining| !remaining.is_zero()) {
+                                actions = actions.child(open(ProposalActionKind::Sponsor, root));
+                            }
+                            if !participation.sponsored.is_zero() {
+                                actions = actions.child(open(ProposalActionKind::Unsponsor, root));
+                            }
+                            actions = actions.child(open(ProposalActionKind::CallVote, root));
+                        }
+                        GovernanceProposalStage::VotingOpen => {
+                            if voting_remaining.is_some_and(|remaining| !remaining.is_zero()) {
+                                actions = actions
+                                    .child(open(ProposalActionKind::Yay, root))
+                                    .child(open(ProposalActionKind::Nay, root));
+                            }
+                        }
+                        GovernanceProposalStage::NayOnlyVoting
+                            if voting_remaining.is_some_and(|remaining| !remaining.is_zero()) =>
+                        {
+                            actions = actions.child(open(ProposalActionKind::Nay, root));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(ProposalParticipationRow::Unavailable(error)) => {
+                capacity_column = capacity_column
+                    .child(
+                        Alert::error(
+                            SharedString::from(format!(
+                                "governance-participation-error-{}",
+                                account.address
+                            )),
+                            error.to_string(),
+                        )
+                        .small(),
+                    )
+                    .child(
+                        app_muted_text("Actions unavailable until this account refreshes.")
+                            .text_size(px(11.0)),
+                    );
+            }
+            Some(ProposalParticipationRow::Loading) | None => {
+                capacity_column = capacity_column
+                    .child(app_muted_text("Loading account participation…").text_size(px(11.0)));
+            }
+        }
+        row_card = row_card.child(capacity_column).child(actions);
+        details = details.child(row_card);
+    }
+    if !key_matches {
+        details = details.child(
+            app_muted_text("Refreshing participation for this proposal…")
+                .text_size(px(11.0))
+                .mt(px(8.0)),
+        );
+    }
+    let summary_state = if !key_matches && total_accounts > 0 {
+        ProposalCapacitySummaryState::Loading
+    } else if !aggregate_valid {
+        ProposalCapacitySummaryState::Unavailable
+    } else {
+        proposal_capacity_summary_state(
+            aggregate_available,
+            aggregate_maximum,
+            loading_count,
+            unavailable_count,
+            total_accounts,
+        )
+    };
+    let (kind_phrase, action_word) = match capacity_kind {
+        ProposalCapacityKind::Sponsorship => ("sponsor", "sponsored"),
+        ProposalCapacityKind::Voting => ("vote", "voted"),
+    };
+    let account_word = if total_accounts == 1 {
+        "account"
+    } else {
+        "accounts"
+    };
+    let mut summary = div().w_full().flex().flex_col().gap_2();
+    match (summary_state, history_kind) {
+        (ProposalCapacitySummaryState::Empty, _) => {
+            summary = summary.child(
+                app_muted_text(
+                    "No participating accounts enrolled · enroll an account to view governance power",
+                )
+                .text_size(px(12.0)),
+            );
+        }
+        (ProposalCapacitySummaryState::Loading, _) => {
+            summary = summary.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .py(px(6.0))
+                    .child(Spinner::new().small())
+                    .child(app_muted_text("Loading account participation…").text_size(px(12.0))),
+            );
+        }
+        (ProposalCapacitySummaryState::Unavailable, _) => {
+            let unavailable_word = if unavailable_count == 1 {
+                "account unavailable"
+            } else {
+                "accounts unavailable"
+            };
+            let inactive_suffix = if inactive_count == 0 {
+                String::new()
+            } else {
+                format!(" · {inactive_count} inactive")
+            };
+            summary = summary.child(div().w_full().flex().items_baseline().flex_wrap().gap_2().child(app_text("—").text_size(px(16.0)).text_color(rgb(theme::DANGER))).child(app_muted_text("available power unknown").text_size(px(12.0))).child(div().ml_auto().child(app_text(format!("{unavailable_count} {unavailable_word} · expand for details{inactive_suffix}")).text_size(px(12.0)).text_color(rgb(theme::DANGER)))));
+        }
+        (
+            ProposalCapacitySummaryState::Full
+            | ProposalCapacitySummaryState::Partial
+            | ProposalCapacitySummaryState::Exhausted,
+            Some(history),
+        ) => {
+            let sponsored = closed_sponsored.unwrap_or_default();
+            let voted = closed_voted.unwrap_or_default();
+            let (history_text, history_amount) = match history {
+                ProposalClosedHistoryKind::Sponsorship => {
+                    ("Sponsorship closed · your accounts allocated", sponsored)
+                }
+                ProposalClosedHistoryKind::Voting => {
+                    ("Voting closed · your accounts allocated", voted)
+                }
+            };
+            let right = if total_accounts == 0 {
+                "0 accounts · enroll an account to view history".to_owned()
+            } else if inactive_count > 0 {
+                format!(
+                    "{total_accounts} {account_word} · {total_used_accounts} {action_word} · {inactive_count} inactive"
+                )
+            } else {
+                format!("{total_accounts} {account_word} · {total_used_accounts} {action_word}")
+            };
+            summary = summary.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_baseline()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(app_muted_text(history_text).text_size(px(12.0)).mr(px(8.0)))
+                    .child(
+                        app_text(format_compact_rail_amount_with_unit(history_amount))
+                            .text_size(px(16.0))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .child(app_muted_text(right).text_size(px(12.0))),
+                    ),
+            );
+        }
+        (state, None) => {
+            let available = aggregate_available.unwrap_or_default();
+            let maximum = aggregate_maximum.unwrap_or_default();
+            let amount = if state == ProposalCapacitySummaryState::Full {
+                format_compact_rail_amount_with_unit(available)
+            } else {
+                format!(
+                    "{} of {} RAIL",
+                    format_compact_rail_amount(available),
+                    format_compact_rail_amount(maximum)
+                )
+            };
+            let right = if total_accounts == 0 {
+                "0 accounts · enroll an account to participate".to_owned()
+            } else if state == ProposalCapacitySummaryState::Exhausted {
+                if inactive_count > 0 {
+                    format!(
+                        "{total_accounts} {account_word} · all {power_phrase} power is used · {inactive_count} inactive"
+                    )
+                } else {
+                    format!("{total_accounts} {account_word} · all {power_phrase} power is used")
+                }
+            } else if total_used_accounts == 0 {
+                if inactive_count > 0 {
+                    format!(
+                        "{total_accounts} {account_word} · none {action_word} yet · {inactive_count} inactive"
+                    )
+                } else {
+                    format!("{total_accounts} {account_word} · none {action_word} yet")
+                }
+            } else {
+                if inactive_count > 0 {
+                    format!(
+                        "{total_accounts} {account_word} · {total_used_accounts} {action_word} · {inactive_count} inactive"
+                    )
+                } else {
+                    format!("{total_accounts} {account_word} · {total_used_accounts} {action_word}")
+                }
+            };
+            let amount_text = app_text(amount)
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD);
+            let amount_text = if state == ProposalCapacitySummaryState::Exhausted {
+                amount_text.text_color(rgb(theme::WARNING))
+            } else {
+                amount_text
+            };
+            summary = summary.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_baseline()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(amount_text)
+                    .child(
+                        app_muted_text(format!("available to {kind_phrase}"))
+                            .text_size(px(12.0))
+                            .ml(px(8.0)),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .child(app_muted_text(right).text_size(px(12.0))),
+                    ),
+            );
+            if matches!(
+                state,
+                ProposalCapacitySummaryState::Partial | ProposalCapacitySummaryState::Exhausted
+            ) {
+                summary = summary.child(
+                    Progress::new()
+                        .w_full()
+                        .value(f32::from(per_mille(available, maximum)) / 10.0),
+                );
+            }
+        }
+    }
+    let toggle_root = root.clone();
+    let toggle_id = SharedString::from(format!(
+        "wallet-proposal-participation-toggle-{}-{}-{}",
+        proposal_version_label(proposal.proposal.contract_version),
+        proposal.proposal.contract_address,
+        proposal.proposal.index,
+    ));
+    let card = proposal_card("Participation").child(
+        Collapsible::new()
+            .open(expanded)
+            .w_full()
+            .child(summary)
+            .content(details),
+    );
+    div().relative().w_full().pb(px(10.0)).child(card).child(
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(0.0))
+            .flex()
+            .justify_center()
+            .child(
+                app_button_base(toggle_id)
+                    .outline()
+                    .bg(rgb(theme::SURFACE))
+                    .xsmall()
+                    .rounded_full()
+                    .icon(if expanded {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .tooltip(if expanded {
+                        "Hide participation details"
+                    } else {
+                        "Show participation details"
+                    })
+                    .on_click(move |_event, _window, cx| {
+                        toggle_root.update(cx, |root, cx| {
+                            root.toggle_proposal_participation(cx);
+                        });
+                    }),
+            ),
+    )
+}
+
+pub(super) const fn proposal_action_title(kind: ProposalActionKind) -> &'static str {
+    match kind {
+        ProposalActionKind::Sponsor => "Sponsor proposal",
+        ProposalActionKind::Unsponsor => "Withdraw sponsorship",
+        ProposalActionKind::CallVote => "Call vote",
+        ProposalActionKind::Yay => "Vote Yay",
+        ProposalActionKind::Nay => "Vote Nay",
+    }
+}
+
+fn render_proposal_action_form(
+    root: &Entity<WalletRoot>,
+    wallet: &WalletRoot,
+    proposal: &ResolvedProposal,
+    decimals: Option<u8>,
+    content_width: gpui::Pixels,
+    chain_time: U256,
+    cx: &App,
+) -> Option<gpui::Div> {
+    let displayed_key =
+        proposal_participation_key(&proposal.proposal, wallet.governance_context_key());
+    if !wallet.proposal_participation_key_matches(&proposal.proposal, &displayed_key) {
+        return None;
+    }
+    let Some(super::governance::GovernanceActionSelection::Proposal(selection)) =
+        wallet.governance.action_flow.selection.as_ref()
+    else {
+        return None;
+    };
+    let Some(ProposalParticipationRow::Ready(participation)) = wallet
+        .governance
+        .proposal_participation
+        .rows
+        .get(&selection.actor)
+    else {
+        return Some(
+            app_muted_text(
+                "Selected account participation is unavailable; refresh before authorizing.",
+            )
+            .text_size(px(11.0)),
+        );
+    };
+    let participation = participation.as_ref();
+    if participation.proposal_version != proposal.proposal.contract_version
+        || participation.proposal_id != proposal.proposal.index
+        || participation.voting_contract != proposal.proposal.contract_address
+    {
+        return None;
+    }
+    let amount_input = &wallet.governance.proposal_action_amount_input;
+    let raw_amount = amount_input.read(cx).value();
+    let raw_amount_present = !raw_amount.trim().is_empty();
+    let parsed_amount = wallet_ops::parse_send_amount(raw_amount.as_ref(), decimals);
+    let amount = parsed_amount
+        .as_ref()
+        .ok()
+        .filter(|amount| !amount.is_zero())
+        .copied();
+    let (maximum, capacity_label) = match selection.kind {
+        ProposalActionKind::Sponsor => (
+            participation
+                .sponsorship_capacity()
+                .ok()
+                .and_then(|capacity| capacity.remaining),
+            "available to sponsor",
+        ),
+        ProposalActionKind::Unsponsor => (Some(participation.sponsored), "sponsored"),
+        ProposalActionKind::Yay | ProposalActionKind::Nay => (
+            participation
+                .voting_capacity()
+                .ok()
+                .and_then(|capacity| capacity.remaining),
+            "available voting power",
+        ),
+        ProposalActionKind::CallVote => (None, ""),
+    };
+    let sponsor_lockout_until = matches!(selection.kind, ProposalActionKind::Sponsor)
+        .then(|| {
+            (participation.last_sponsored.proposal_id != proposal.proposal.index)
+                .then_some(participation.last_sponsored.last_sponsor_time)
+                .and_then(|last| {
+                    last.checked_add(U256::from(
+                        wallet_ops::GOVERNANCE_SPONSOR_LOCKOUT_TIME_SECONDS,
+                    ))
+                })
+        })
+        .flatten()
+        .filter(|until| chain_time <= *until);
+    let capacity_text = maximum.map(|maximum| {
+        format!(
+            "{} RAIL {}",
+            format_compact_rail_amount(maximum),
+            capacity_label,
+        )
+    });
+    let validation = if sponsor_lockout_until.is_some() {
+        Some("This account is temporarily locked from sponsoring another proposal.".to_owned())
+    } else if raw_amount_present {
+        validate_proposal_action(
+            &proposal.proposal,
+            &proposal.rules,
+            chain_time,
+            participation,
+            selection.kind,
+            amount,
+        )
+        .err()
+        .map(|error| humanize_proposal_action_error(error, selection.kind, maximum))
+    } else {
+        None
+    };
+    let parse_error = raw_amount_present
+        .then_some(parsed_amount.as_ref().err())
+        .flatten()
+        .map(|error| format!("Enter a valid RAIL amount ({error})"));
+    let validation = parse_error.or(validation);
+    let ready = if matches!(selection.kind, ProposalActionKind::CallVote) {
+        true
+    } else {
+        amount.is_some() && validation.is_none() && sponsor_lockout_until.is_none()
+    };
+    let proposal_for_review = proposal.proposal.clone();
+    let selection = *selection;
+    let action_pending = wallet.governance.action_flow.pending;
+    let close_root = root.clone();
+    let max_root = root.clone();
+    let review_root = root.clone();
+    let max_input = amount_input.clone();
+    let max_value = maximum.map(|maximum| format_send_amount_input(maximum, decimals));
+    let action_label = "Prepare authorization";
+    let display_label = public_account_display_label_for_proposal_actor(wallet, selection.actor);
+    let mut content = div()
+        .w(content_width)
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            app_muted_text(format!(
+                "Proposal #{} · {}",
+                proposal.proposal.index,
+                proposal
+                    .document()
+                    .filter(|document| document.available && !document.title.is_empty())
+                    .map_or("Governance proposal", |document| document.title.as_str()),
+            ))
+            .text_size(px(12.0))
+            .truncate(),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .min_w(px(0.0))
+                        .child(
+                            app_strong_text(display_label)
+                                .text_size(px(12.0))
+                                .line_height(px(16.0)),
+                        )
+                        .child(
+                            app_muted_text(short_address(&selection.actor))
+                                .font_family(APP_MONO_FONT_FAMILY)
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .truncate(),
+                        ),
+                )
+                .when_some(capacity_text, |this, text| {
+                    this.child(
+                        app_muted_text(text)
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .ml_auto()
+                            .truncate(),
+                    )
+                }),
+        );
+    if !matches!(selection.kind, ProposalActionKind::CallVote) {
+        content =
+            content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(app_muted_text("Amount").text_size(px(12.0)))
+                            .when_some(maximum, |this, maximum| {
+                                this.child(
+                                    app_button_base("governance-action-max")
+                                        .link()
+                                        .xsmall()
+                                        .compact()
+                                        .disabled(sponsor_lockout_until.is_some())
+                                        .child(format!(
+                                            "Max: {} RAIL",
+                                            format_send_amount_input(maximum, decimals)
+                                        ))
+                                        .on_click(move |_event, window, cx| {
+                                            if let Some(value) = &max_value {
+                                                max_input.update(cx, |input, cx| {
+                                                    input.set_value(value.clone(), window, cx);
+                                                    cx.notify();
+                                                });
+                                            }
+                                            max_root.update(cx, |_, cx| cx.notify());
+                                        }),
+                                )
+                            }),
+                    )
+                    .child(
+                        app_input(amount_input)
+                            .small()
+                            .disabled(sponsor_lockout_until.is_some())
+                            .suffix(app_muted_text("RAIL").text_size(px(11.0))),
+                    )
+                    .children(validation.clone().map(|error| {
+                        app_muted_text(error)
+                            .text_color(rgb(theme::DANGER))
+                            .text_size(px(11.0))
+                    }))
+                    .children(
+                        (validation.is_none()
+                            && amount.is_some()
+                            && matches!(selection.kind, ProposalActionKind::Unsponsor))
+                        .then(|| {
+                            app_muted_text("Returns to this account's available sponsorship power")
+                                .text_size(px(11.0))
+                        }),
+                    )
+                    .children(
+                        (validation.is_none()
+                            && amount.is_some()
+                            && !matches!(selection.kind, ProposalActionKind::Unsponsor))
+                        .then(|| {
+                            let remaining = maximum.and_then(|maximum| {
+                                amount.and_then(|amount| maximum.checked_sub(amount))
+                            });
+                            remaining.map(|remaining| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        app_muted_text(format!(
+                                            "{} RAIL will remain available",
+                                            format_compact_rail_amount(remaining)
+                                        ))
+                                        .text_size(px(11.0)),
+                                    )
+                                    .child(Progress::new().w_full().value(
+                                        maximum.filter(|maximum| !maximum.is_zero()).map_or(
+                                            0.0,
+                                            |maximum| {
+                                                f32::from(per_mille(remaining, maximum)) / 10.0
+                                            },
+                                        ),
+                                    ))
+                            })
+                        })
+                        .flatten(),
+                    ),
+            );
+    }
+    if matches!(selection.kind, ProposalActionKind::Sponsor) {
+        if let Some(unlock) = sponsor_lockout_until {
+            content = content.child(
+                Alert::warning(
+                    "governance-action-sponsor-lockout",
+                    format!(
+                        "Sponsoring another proposal is locked until {}.",
+                        format_datetime_short(&unlock)
+                    ),
+                )
+                .small(),
+            );
+        }
+        content = content.child(app_muted_text(
+            "Sponsorship can be withdrawn before the vote is called. Sponsoring starts a 7-day lockout on other proposals with this account.",
+        ).text_size(px(11.0)));
+    }
+    if matches!(selection.kind, ProposalActionKind::Unsponsor) {
+        let after = proposal
+            .proposal
+            .sponsorship
+            .checked_sub(amount.unwrap_or_default());
+        if after.is_some_and(|after| after < proposal.rules.sponsor_threshold) {
+            content = content.child(
+                Alert::warning(
+                    "governance-action-unsponsor-warning",
+                    "This withdrawal lowers proposal sponsorship below the threshold required to call a vote.",
+                )
+                .small(),
+            );
+        }
+    }
+    let action_error = wallet
+        .governance
+        .action_flow
+        .error
+        .as_ref()
+        .map(|error| Alert::error("governance-action-error", error.to_string()).small());
+    content = content.children(action_error).child(
+        div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                app_button_base("governance-action-cancel")
+                    .ghost()
+                    .small()
+                    .child("Cancel")
+                    .on_click(move |_event, window, cx| {
+                        close_root.update(cx, WalletRoot::close_proposal_action);
+                        window.close_dialog(cx);
+                    }),
+            )
+            .child(
+                app_button_base("governance-action-review")
+                    .primary()
+                    .small()
+                    .loading(action_pending)
+                    .disabled(!ready || action_pending)
+                    .child(if action_pending {
+                        "Preparing authorization…"
+                    } else {
+                        action_label
+                    })
+                    .on_click(move |_event, window, cx| {
+                        review_root.update(cx, |root, cx| {
+                            root.review_proposal_action(
+                                &proposal_for_review,
+                                selection,
+                                amount,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            ),
+    );
+    Some(content)
+}
+
+fn public_account_display_label_for_proposal_actor(wallet: &WalletRoot, actor: Address) -> String {
+    wallet
+        .governance_participants()
+        .into_iter()
+        .find(|account| account.address == actor)
+        .and_then(|account| super::public_account::public_account_display_label(&account))
+        .unwrap_or_else(|| "Public account".to_owned())
+}
+
+fn humanize_proposal_action_error(
+    error: String,
+    kind: ProposalActionKind,
+    maximum: Option<U256>,
+) -> String {
+    let amount_limit =
+        maximum.map(|maximum| format!(" ({})", format_compact_rail_amount_with_unit(maximum)));
+    let limit = amount_limit.as_deref().unwrap_or("");
+    match kind {
+        ProposalActionKind::Sponsor if error.contains("sponsorship capacity") => {
+            format!("Exceeds this account's available sponsorship power{limit}")
+        }
+        ProposalActionKind::Unsponsor if error.contains("sponsored") => {
+            format!("Exceeds this account's sponsored amount{limit}")
+        }
+        ProposalActionKind::Yay | ProposalActionKind::Nay
+            if error.contains("voting capacity") || error.contains("snapshot") =>
+        {
+            format!("Exceeds this account's available voting power{limit}")
+        }
+        _ => error,
     }
 }
 
@@ -4090,12 +5385,14 @@ mod tests {
     use super::{
         CONTENT_WIDTH, DocumentCompletion, MAX_MDAST_NODES, MAX_PREPARED_SOURCE_BYTES,
         MAX_TABLE_RENDER_WIDTH_PX, PreparationBudget, ProposalActionIdentity, ProposalBlock,
+        ProposalCapacityKind, ProposalCapacitySummaryState, ProposalClosedHistoryKind,
         ProposalDetailTab, ProposalDocumentState, ProposalPreparationFailure, ProposalPresentation,
         ProposalSelection, ProposalsPage, ProposalsState, ResolvedProposal, TABLE_COLUMN_CHROME_PX,
         TABLE_OUTER_BORDER_PX, TimelineDeadline, action_calldata_hex, compact_calldata_display,
         ensure_mdast_node_limit, format_compact_rail_amount, format_compact_rail_amount_with_unit,
         inert_raw_fallback_source, list_voting_deadline, next_proposal_page, parse_proposal_blocks,
         prepare_proposal_presentation, prepared_markdown_source_len, proposal_action_id,
+        proposal_capacity_kind, proposal_capacity_summary_state, proposal_closed_history_kind,
         proposal_table_scroll_key, send_document_completions, table_fingerprint,
         timeline_deadline_completed, vote_split,
     };
@@ -4136,6 +5433,167 @@ mod tests {
             },
             document,
         }
+    }
+
+    #[test]
+    fn participation_capacity_follows_proposal_stage() {
+        let cases = [
+            (
+                GovernanceProposalStage::AwaitingSponsorship,
+                ProposalCapacityKind::Sponsorship,
+            ),
+            (
+                GovernanceProposalStage::ReadyToCallVote,
+                ProposalCapacityKind::Sponsorship,
+            ),
+            (
+                GovernanceProposalStage::SponsorshipExpired,
+                ProposalCapacityKind::Sponsorship,
+            ),
+            (
+                GovernanceProposalStage::VoteCallExpired,
+                ProposalCapacityKind::Sponsorship,
+            ),
+            (
+                GovernanceProposalStage::VotingDelay,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::VotingOpen,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::NayOnlyVoting,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::Failed,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::PassedAwaitingExecution,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::PassedExecutable,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::ExecutionExpired,
+                ProposalCapacityKind::Voting,
+            ),
+            (
+                GovernanceProposalStage::Executed,
+                ProposalCapacityKind::Voting,
+            ),
+        ];
+        for (stage, expected) in cases {
+            assert_eq!(proposal_capacity_kind(stage), expected);
+        }
+    }
+
+    #[test]
+    fn participation_summary_state_classifies_capacity_and_failures() {
+        let cases = [
+            (
+                Some(U256::from(3)),
+                Some(U256::from(3)),
+                0,
+                0,
+                1,
+                ProposalCapacitySummaryState::Full,
+            ),
+            (
+                Some(U256::ZERO),
+                Some(U256::ZERO),
+                0,
+                0,
+                1,
+                ProposalCapacitySummaryState::Full,
+            ),
+            (
+                Some(U256::ZERO),
+                Some(U256::from(3)),
+                0,
+                0,
+                1,
+                ProposalCapacitySummaryState::Exhausted,
+            ),
+            (
+                Some(U256::from(1)),
+                Some(U256::from(3)),
+                0,
+                0,
+                1,
+                ProposalCapacitySummaryState::Partial,
+            ),
+            (None, None, 1, 0, 1, ProposalCapacitySummaryState::Loading),
+            (
+                Some(U256::from(1)),
+                None,
+                0,
+                1,
+                1,
+                ProposalCapacitySummaryState::Unavailable,
+            ),
+            (
+                None,
+                None,
+                1,
+                1,
+                1,
+                ProposalCapacitySummaryState::Unavailable,
+            ),
+            (
+                Some(U256::ZERO),
+                Some(U256::ZERO),
+                0,
+                0,
+                0,
+                ProposalCapacitySummaryState::Empty,
+            ),
+        ];
+        for (available, maximum, loading, unavailable, participants, expected) in cases {
+            assert_eq!(
+                proposal_capacity_summary_state(
+                    available,
+                    maximum,
+                    loading,
+                    unavailable,
+                    participants,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn participation_history_maps_only_terminal_stages() {
+        for stage in [
+            GovernanceProposalStage::SponsorshipExpired,
+            GovernanceProposalStage::VoteCallExpired,
+        ] {
+            assert_eq!(
+                proposal_closed_history_kind(stage),
+                Some(ProposalClosedHistoryKind::Sponsorship)
+            );
+        }
+        for stage in [
+            GovernanceProposalStage::Failed,
+            GovernanceProposalStage::PassedAwaitingExecution,
+            GovernanceProposalStage::PassedExecutable,
+            GovernanceProposalStage::ExecutionExpired,
+            GovernanceProposalStage::Executed,
+        ] {
+            assert_eq!(
+                proposal_closed_history_kind(stage),
+                Some(ProposalClosedHistoryKind::Voting)
+            );
+        }
+        assert_eq!(
+            proposal_closed_history_kind(GovernanceProposalStage::VotingDelay),
+            None
+        );
     }
 
     fn resolved_document() -> ProposalDocumentState {
@@ -4984,6 +6442,7 @@ mod tests {
             page: 1,
             identity,
             tab: ProposalDetailTab::Actions,
+            participation_expanded: false,
         });
 
         let old_generation = state.generation;
@@ -5125,21 +6584,36 @@ mod tests {
             page: 3,
             identity: selected_identity.clone(),
             tab: ProposalDetailTab::Actions,
+            participation_expanded: false,
         });
+        let expanded_identity = ProposalActionIdentity {
+            proposal: selected_identity.clone(),
+            ordinal: 0,
+        };
+        state.expanded_calldata.insert(expanded_identity.clone());
+        let detail_offset = gpui::point(gpui::px(9.0), gpui::px(-21.0));
+        state.detail_scroll_handle.set_offset(detail_offset);
 
         state.prepare_manual_refresh();
         assert!(state.pages[&3].rows[0].document().is_some());
         assert!(state.pages[&3].rows[1].has_pending_document());
 
-        state.replace_refreshed_page(
-            3,
-            2,
+        state.replace_refreshed_page(3, 2, {
+            let mut selected_refreshed = test_proposal(10, ProposalDocumentState::Pending);
+            selected_refreshed
+                .proposal
+                .actions
+                .push(GovernanceProposalAction {
+                    call_contract: Address::ZERO,
+                    calldata: alloy::primitives::Bytes::from(vec![1]),
+                    value: U256::ZERO,
+                });
             vec![
-                test_proposal(10, ProposalDocumentState::Pending),
+                selected_refreshed,
                 test_proposal(11, ProposalDocumentState::Pending),
                 test_proposal(12, ProposalDocumentState::Pending),
-            ],
-        );
+            ]
+        });
 
         assert_eq!(state.current_page, 2);
         assert_eq!(state.pages.len(), 1);
@@ -5156,6 +6630,12 @@ mod tests {
             state.selected.as_ref().map(|selected| selected.page),
             Some(2)
         );
+        assert_eq!(
+            state.selected.as_ref().map(|selected| selected.tab),
+            Some(ProposalDetailTab::Actions)
+        );
+        assert_eq!(state.detail_scroll_handle.offset(), detail_offset);
+        assert!(state.expanded_calldata.contains(&expanded_identity));
         assert_eq!(
             state.pages[&2].rows[0]
                 .document()

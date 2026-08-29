@@ -14,11 +14,13 @@ use super::submission::{
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
-    PublicActionGasFeeMode, PublicActionProgressStatus, PublicActionProgressStep,
-    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionStepFeePolicy, PublicAssetId,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest, PublicShieldTransactionProfile,
-    PublicTransactionIntent,
+    PublicActionCommandReceiver, PublicActionGasFeeMode, PublicActionGasFeeSelection,
+    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
+    PublicActionSessionEvent, PublicActionSessionEventSender, PublicActionStepFeePolicy,
+    PublicAdvancedTransactionAuthorization, PublicAssetId, PublicSendRequest, PublicSendResult,
+    PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent,
 };
+use crate::settings::EffectiveChainConfig;
 use crate::{HttpContext, ShieldSendOutput, query_rpc_pool_with_http_client, report_chain_string};
 
 pub async fn submit_public_send(
@@ -34,7 +36,6 @@ pub async fn submit_public_send_with_progress(
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_public_transaction_intent(&request.intent)?;
-    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
@@ -44,45 +45,106 @@ pub async fn submit_public_send_with_progress(
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;
-    let from_address = signer.address();
-    let authorized_gas_limit = public_send_authorized_gas_limit(
+    let mut command_rx = request.command_rx;
+    let tx = submit_public_action_step_with_signer(
+        PublicActionProgressStep::Send,
+        "public-send",
+        "public send transaction",
         request.chain_id,
-        from_address,
+        request.effective_chain.as_ref(),
         &request.intent,
+        &signer,
         request.advanced_authorization,
+        false,
         request.gas_fee,
+        &mut command_rx,
+        request.event_tx.as_ref(),
+        http,
+        &mut progress,
+    )
+    .await?;
+    Ok(PublicSendResult { tx })
+}
+
+/// Submit one public action with an already-derived signer.  Governance workflows use this
+/// narrow entry point to keep one signer session and command channel across ordered calls while
+/// allowing every call to run the normal RPC nonce, gas, signing, and confirmation machinery.
+pub(crate) async fn submit_public_action_step_with_signer(
+    step: PublicActionProgressStep,
+    operation_label: &str,
+    revert_subject: &str,
+    chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+    intent: &PublicTransactionIntent,
+    signer: &super::signer::VaultedPublicSigner,
+    advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
+    dynamic_gas_preflight: bool,
+    gas_fee: PublicActionGasFeeSelection,
+    command_rx: &mut Option<PublicActionCommandReceiver>,
+    event_tx: Option<&PublicActionSessionEventSender>,
+    http: &HttpContext,
+    progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
+) -> Result<crate::TxReceiptOutput> {
+    validate_public_transaction_intent(intent)?;
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let from_address = signer.address();
+    let authorized_gas_limit = public_action_authorized_gas_limit(
+        chain_id,
+        from_address,
+        intent,
+        advanced_authorization,
+        dynamic_gas_preflight,
+        gas_fee,
     )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let tx_req = public_send_transaction_request(request.chain_id, from_address, &request.intent)?;
-    let mut command_rx = request.command_rx;
+    let tx_req = public_send_transaction_request(chain_id, from_address, intent)?;
     let tx = submit_public_action_step_session(
-        PublicActionProgressStep::Send,
+        step,
         tx_req,
         PublicShieldTransactionProfile::Railoxide,
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(PublicAssetId::Native),
-        &signer,
-        "public-send",
-        query_rpc_pool.clone(),
+        signer,
+        operation_label,
+        query_rpc_pool,
         chain.finality_depth,
         http.network_mode(),
-        request.chain_id,
+        chain_id,
         from_address,
         &chain.gas,
         authorized_gas_limit,
         None,
-        request.gas_fee,
+        gas_fee,
         PublicActionStepFeePolicy::Custom,
         None,
-        &mut command_rx,
-        request.event_tx.as_ref(),
-        &mut progress,
+        command_rx,
+        event_tx,
+        progress,
     )
     .await?
     .receipt;
     if !tx.status {
-        return Err(eyre!("public send transaction reverted ({})", tx.tx_hash));
+        return Err(eyre!("{revert_subject} reverted ({})", tx.tx_hash));
     }
-    Ok(PublicSendResult { tx })
+    Ok(tx)
+}
+
+fn public_action_authorized_gas_limit(
+    chain_id: u64,
+    from: Address,
+    intent: &PublicTransactionIntent,
+    authorization: Option<PublicAdvancedTransactionAuthorization>,
+    dynamic_gas_preflight: bool,
+    gas_fee: PublicActionGasFeeSelection,
+) -> Result<Option<u64>> {
+    if dynamic_gas_preflight {
+        if !matches!(intent, PublicTransactionIntent::Raw { .. }) || authorization.is_some() {
+            return Err(eyre!(
+                "dynamic public action gas preflight is restricted to an unauthorised raw workflow step"
+            ));
+        }
+        return Ok(None);
+    }
+    public_send_authorized_gas_limit(chain_id, from, intent, authorization, gas_fee)
 }
 
 pub(super) fn public_send_authorized_gas_limit(
@@ -543,5 +605,40 @@ pub(super) fn validate_public_transaction_intent(intent: &PublicTransactionInten
             Err(eyre!("contract call must include native value or data"))
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_gas_preflight_is_workflow_only() {
+        let intent = PublicTransactionIntent::Raw {
+            to: Some(Address::ZERO),
+            value: U256::ZERO,
+            data: Bytes::from(vec![1_u8]),
+        };
+        let fee = PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        };
+        assert!(
+            public_action_authorized_gas_limit(1, Address::ZERO, &intent, None, false, fee)
+                .is_err()
+        );
+        assert_eq!(
+            public_action_authorized_gas_limit(1, Address::ZERO, &intent, None, true, fee).unwrap(),
+            None
+        );
+        let transfer = PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Native,
+            amount: U256::from(1_u8),
+            recipient: Address::ZERO,
+        };
+        assert!(
+            public_action_authorized_gas_limit(1, Address::ZERO, &transfer, None, true, fee)
+                .is_err()
+        );
     }
 }

@@ -457,12 +457,36 @@ pub(in crate::root) enum PublicActionStepStatus {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum PublicActionProgressLifecycle {
+    Clear,
+    Active,
+    DialogReplacedWhileConfirmedHistoryRemains,
+}
+
+pub(in crate::root) const fn public_action_progress_handoff_lifecycle(
+    confirmed_history_remains: bool,
+) -> Option<PublicActionProgressLifecycle> {
+    if confirmed_history_remains {
+        Some(PublicActionProgressLifecycle::DialogReplacedWhileConfirmedHistoryRemains)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) struct PublicActionStepInterval {
+    pub(in crate::root) start: U256,
+    pub(in crate::root) end: U256,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::root) struct PublicActionStepState {
     pub(in crate::root) step: PublicActionProgressStep,
     pub(in crate::root) status: PublicActionStepStatus,
     pub(in crate::root) tx_hash: Option<Arc<str>>,
     pub(in crate::root) message: Option<Arc<str>>,
+    pub(in crate::root) interval: Option<PublicActionStepInterval>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -531,10 +555,32 @@ pub(in crate::root) const fn public_action_step_is_final_handoff(
     mode: PublicActionMode,
     step: PublicActionProgressStep,
 ) -> bool {
-    match mode {
+    matches!(
+        step,
+        PublicActionProgressStep::Sponsor
+            | PublicActionProgressStep::Unsponsor
+            | PublicActionProgressStep::CallVote
+            | PublicActionProgressStep::Vote
+            | PublicActionProgressStep::Stake
+            | PublicActionProgressStep::Delegate
+            | PublicActionProgressStep::Unlock
+            | PublicActionProgressStep::PrincipalClaim
+            | PublicActionProgressStep::RewardClaim(_)
+    ) || match mode {
         PublicActionMode::Shield => matches!(step, PublicActionProgressStep::Shield),
         PublicActionMode::Send => matches!(step, PublicActionProgressStep::Send),
     }
+}
+
+pub(in crate::root) fn public_action_step_is_final_handoff_for_steps(
+    mode: PublicActionMode,
+    step: PublicActionProgressStep,
+    steps: &[PublicActionStepState],
+) -> bool {
+    steps.last().map_or_else(
+        || public_action_step_is_final_handoff(mode, step),
+        |last| last.step == step,
+    )
 }
 
 pub(in crate::root) const fn public_action_accepts_update(

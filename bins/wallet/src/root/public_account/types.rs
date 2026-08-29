@@ -12,7 +12,8 @@ use wallet_ops::{
 use crate::assets::WalletIconSource;
 use crate::root::gas_fee::Eip1559GasFeeEditorState;
 use crate::root::public_action::{
-    PublicActionFeeAuthorizationReview, PublicActionMode, PublicActionStepState, PublicSendKind,
+    PublicActionFeeAuthorizationReview, PublicActionMode, PublicActionProgressLifecycle,
+    PublicActionStepState, PublicSendKind,
 };
 
 use super::hardware::HardwarePublicAccountDerivationStatus;
@@ -41,6 +42,7 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) selected_asset: Option<PublicAssetId>,
     pub(in crate::root) mimic_railway_shield: bool,
     pub(in crate::root) action_mode: PublicActionMode,
+    pub(in crate::root) action_progress_mode: PublicActionMode,
     pub(in crate::root) public_send_kind: PublicSendKind,
     pub(in crate::root) advanced_send_estimate: Option<PublicAdvancedTransactionEstimate>,
     pub(in crate::root) advanced_send_estimate_invalidated: bool,
@@ -51,10 +53,12 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) advanced_send_data_error: Option<Arc<str>>,
     pub(in crate::root) action_generation: u64,
     pub(in crate::root) action_progress: Vec<PublicActionStepState>,
+    pub(in crate::root) action_progress_lifecycle: PublicActionProgressLifecycle,
     pub(in crate::root) action_fee_authorization_review: Option<PublicActionFeeAuthorizationReview>,
     pub(in crate::root) expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
     pub(in crate::root) action_progress_dialog_open: bool,
     pub(in crate::root) action_requires_device_approval: bool,
+    pub(in crate::root) action_progress_title_override: Option<Arc<str>>,
     pub(in crate::root) action_progress_asset_label: Arc<str>,
     pub(in crate::root) action_progress_icon_path: Option<WalletIconSource>,
     pub(in crate::root) action_task_abort_handle: Option<tokio::task::AbortHandle>,

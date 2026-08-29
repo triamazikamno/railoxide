@@ -4,13 +4,14 @@ use super::{
     RuntimeSettings, SensitiveUrl, Serialize, TokenSettings, Url, WakuSettings,
     WalletConnectSettings, WalletNetworkMode, fmt,
 };
+use std::collections::BTreeMap;
 
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 6;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
-pub const WALLET_UI_STATE_VERSION: u32 = 2;
+pub const WALLET_UI_STATE_VERSION: u32 = 3;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
@@ -115,6 +116,8 @@ pub struct WalletUiState {
     pub last_wallet_id: Option<String>,
     pub last_chain_id: Option<u64>,
     pub last_wallet_kind: RememberedWalletKind,
+    #[serde(default)]
+    pub governance_participants: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for WalletUiState {
@@ -124,6 +127,7 @@ impl Default for WalletUiState {
             last_wallet_id: None,
             last_chain_id: None,
             last_wallet_kind: RememberedWalletKind::Unknown,
+            governance_participants: BTreeMap::new(),
         }
     }
 }

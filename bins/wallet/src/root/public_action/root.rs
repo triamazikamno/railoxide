@@ -496,12 +496,15 @@ impl WalletRoot {
         }
 
         if !self.public_form.action_progress_dialog_open
-            && let Some(active_step) =
-                public_action_closed_active_step(&self.public_form.action_progress)
+            && let Some(active_step) = public_action_closed_status_step(
+                &self.public_form.action_progress,
+                self.public_form.action_progress_lifecycle,
+            )
         {
             content = content.child(render_public_action_active_status_notice(
                 progress_root,
-                mode,
+                self.public_form.action_progress_mode,
+                self.public_form.action_progress_title_override.as_deref(),
                 active_step,
                 self.public_form.action_requires_device_approval,
                 self.public_form.action_command_tx.is_some(),
@@ -765,6 +768,7 @@ impl WalletRoot {
         }
         self.drop_trezor_pin_matrix_prompt();
         self.public_form.action_progress.clear();
+        self.public_form.action_progress_lifecycle = PublicActionProgressLifecycle::Clear;
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.action_progress_dialog_open = false;
         self.public_form.action_requires_device_approval = false;
@@ -779,6 +783,20 @@ impl WalletRoot {
         self.public_form.action_fees_authorized = false;
         self.public_form.action_action_error = None;
         self.public_form.action_contract_address = None;
+        self.public_form.action_progress_mode = PublicActionMode::Shield;
+        self.public_form.action_progress_title_override = None;
+    }
+
+    pub(in crate::root) const fn replace_public_action_dialog_for_confirmed_history(
+        &mut self,
+        confirmed_history_remains: bool,
+    ) {
+        let Some(lifecycle) = public_action_progress_handoff_lifecycle(confirmed_history_remains)
+        else {
+            return;
+        };
+        self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_progress_lifecycle = lifecycle;
     }
 
     pub(in crate::root) fn set_public_action_gas_fee_mode(
@@ -953,8 +971,67 @@ impl WalletRoot {
         initial_gas_fee: Option<(u128, u128)>,
         fees_authorized: bool,
     ) -> u64 {
+        let steps = public_action_progress_steps_for_source(mode, asset, public_account_source);
+        self.start_public_action_progress_with_steps(
+            mode,
+            steps,
+            asset_label,
+            icon_path,
+            public_account_source,
+            command_tx,
+            initial_gas_fee,
+            fees_authorized,
+        )
+    }
+
+    pub(in crate::root) fn start_public_action_progress_with_steps(
+        &mut self,
+        mode: PublicActionMode,
+        steps: Vec<PublicActionProgressStep>,
+        asset_label: String,
+        icon_path: Option<WalletIconSource>,
+        public_account_source: PublicAccountSource,
+        command_tx: Option<PublicActionCommandSender>,
+        initial_gas_fee: Option<(u128, u128)>,
+        fees_authorized: bool,
+    ) -> u64 {
+        let states = steps
+            .into_iter()
+            .map(|step| PublicActionStepState {
+                step,
+                status: PublicActionStepStatus::NotStarted,
+                tx_hash: None,
+                message: None,
+                interval: None,
+            })
+            .collect();
+        self.start_public_action_progress_with_states(
+            mode,
+            states,
+            asset_label,
+            icon_path,
+            public_account_source,
+            command_tx,
+            initial_gas_fee,
+            fees_authorized,
+        )
+    }
+
+    pub(in crate::root) fn start_public_action_progress_with_states(
+        &mut self,
+        mode: PublicActionMode,
+        mut states: Vec<PublicActionStepState>,
+        asset_label: String,
+        icon_path: Option<WalletIconSource>,
+        public_account_source: PublicAccountSource,
+        command_tx: Option<PublicActionCommandSender>,
+        initial_gas_fee: Option<(u128, u128)>,
+        fees_authorized: bool,
+    ) -> u64 {
         self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
+        self.public_form.action_progress_mode = mode;
         let generation = self.public_form.action_generation;
+        self.public_form.action_progress_lifecycle = PublicActionProgressLifecycle::Active;
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.action_progress_asset_label = Arc::from(asset_label);
         self.public_form.action_progress_icon_path = icon_path;
@@ -971,19 +1048,15 @@ impl WalletRoot {
         self.public_form.action_fees_authorized = fees_authorized;
         self.public_form.action_action_error = None;
         self.public_form.action_contract_address = None;
-        self.public_form.action_progress =
-            public_action_progress_steps_for_source(mode, asset, public_account_source)
-                .into_iter()
-                .map(|step| PublicActionStepState {
-                    step,
-                    status: PublicActionStepStatus::NotStarted,
-                    tx_hash: None,
-                    message: None,
-                })
-                .collect();
-        if let Some(first) = self.public_form.action_progress.first_mut() {
+        self.public_form.action_progress_title_override = None;
+        if states
+            .iter()
+            .all(|step| step.status == PublicActionStepStatus::NotStarted)
+            && let Some(first) = states.first_mut()
+        {
             first.status = PublicActionStepStatus::Pending;
         }
+        self.public_form.action_progress = states;
         generation
     }
 
@@ -1147,12 +1220,20 @@ impl WalletRoot {
                 }
             }
             PublicActionSessionEvent::AttemptHandoff { step } => {
-                if public_action_step_is_final_handoff(self.public_form.action_mode, step) {
+                if public_action_step_is_final_handoff_for_steps(
+                    self.public_form.action_progress_mode,
+                    step,
+                    &self.public_form.action_progress,
+                ) {
                     self.public_form.action_stop_available = false;
                 }
             }
             PublicActionSessionEvent::AttemptSubmitted { step, attempt } => {
-                if public_action_step_is_final_handoff(self.public_form.action_mode, step) {
+                if public_action_step_is_final_handoff_for_steps(
+                    self.public_form.action_progress_mode,
+                    step,
+                    &self.public_form.action_progress,
+                ) {
                     self.public_form.action_stop_available = false;
                 }
                 self.public_form.action_current_gas_fee =
@@ -1210,10 +1291,19 @@ impl WalletRoot {
             return;
         }
         self.public_form.action_progress_dialog_open = true;
+        self.public_form.action_progress_lifecycle = PublicActionProgressLifecycle::Active;
         let generation = self.public_form.action_generation;
-        let mode = self.public_form.action_mode;
+        let mode = self.public_form.action_progress_mode;
         let asset_label = Arc::clone(&self.public_form.action_progress_asset_label);
         let icon_path = self.public_form.action_progress_icon_path.clone();
+        let title = self
+            .public_form
+            .action_progress_title_override
+            .clone()
+            .map_or_else(
+                || format!("{} {}", public_action_mode_verb(mode), asset_label.as_ref()),
+                |title| title.to_string(),
+            );
         let root = cx.entity();
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
@@ -1226,10 +1316,7 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(public_action_title_row(
-                    format!("{} {}", public_action_mode_verb(mode), asset_label.as_ref()),
-                    icon_path.clone(),
-                ))
+                .title(public_action_title_row(title.clone(), icon_path.clone()))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         if root.public_form.action_generation == generation {
@@ -1273,7 +1360,7 @@ impl WalletRoot {
         self.public_form.action_fee_authorization_review = None;
         self.public_form.action_stop_available = false;
         self.public_form.action_stopped = true;
-        match self.public_form.action_mode {
+        match self.public_form.action_progress_mode {
             PublicActionMode::Shield => self.public_form.shielding = false,
             PublicActionMode::Send => self.public_form.sending = false,
         }
@@ -1286,7 +1373,7 @@ impl WalletRoot {
             return;
         }
         self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
-        match self.public_form.action_mode {
+        match self.public_form.action_progress_mode {
             PublicActionMode::Shield => self.public_form.shielding = false,
             PublicActionMode::Send => self.public_form.sending = false,
         }
@@ -1309,6 +1396,13 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
         close_top_dialog: bool,
     ) {
+        if self.public_form.action_progress_lifecycle
+            == PublicActionProgressLifecycle::DialogReplacedWhileConfirmedHistoryRemains
+        {
+            self.clear_trezor_pin_matrix_prompt(cx);
+            self.public_form.action_progress_dialog_open = false;
+            return;
+        }
         match progress_dialog_close_behavior(
             public_action_progress_is_successful(&self.public_form.action_progress),
             self.public_form.action_stopped,

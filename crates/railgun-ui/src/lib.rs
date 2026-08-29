@@ -3,7 +3,7 @@ pub mod governance;
 pub mod tokens;
 
 pub use chains::{DEFAULT_CHAINS, chain_icon_asset_path, chain_icon_path, chain_name};
-pub use governance::{GovernanceContracts, governance_contracts};
+pub use governance::{GovernanceContracts, GovernanceRewardToken, governance_contracts};
 pub use tokens::{
     KnownTokenInfo, NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, TokenInfo,
     WRAPPED_NATIVE_FEE_RATE, format_broadcaster_address_label, format_scaled_amount,
