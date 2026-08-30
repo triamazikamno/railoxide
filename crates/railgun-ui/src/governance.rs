@@ -5,6 +5,7 @@ use alloy::primitives::{Address, address};
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceContracts {
     pub governance_token: Address,
+    pub delegator: Address,
     pub voting: Address,
     pub voting_legacy: Option<Address>,
     pub staking: Address,
@@ -67,6 +68,7 @@ const POLYGON_REWARD_TOKENS: &[GovernanceRewardToken] = &[
 const GOVERNANCE_CONTRACTS: &[(u64, GovernanceContracts)] = &[
     (1, GovernanceContracts {
         governance_token: address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"),
+        delegator: address!("0xB6d513f6222Ee92Fff975E901bd792E2513fB53B"),
         voting: address!("0xc480F68A3dcC3EdD82134FAB45C14A0FcF1dA3CC"),
         voting_legacy: Some(address!("0xfc4B580C9bda2EEf4E94D9Fb4bcB1F7a61660cf9")),
         staking: address!("0xee6a649aa3766bd117e12c161726b693a1b2ee20"),
@@ -75,6 +77,7 @@ const GOVERNANCE_CONTRACTS: &[(u64, GovernanceContracts)] = &[
     }),
     (56, GovernanceContracts {
         governance_token: address!("0x3F847b01d4d498a293e3197B186356039eCd737F"),
+        delegator: address!("0x4A7532f58259524251D7df1052762dc23c98Bae7"),
         voting: address!("0xc3f2C8F9d5F0705De706b1302B7a039e1e11aC88"),
         voting_legacy: Some(address!("0x569C15b356D3bA9c9f407945b12C867f7C3608C9")),
         staking: address!("0x753f0F9BA003DDA95eb9284533Cf5B0F19e441dc"),
@@ -83,6 +86,7 @@ const GOVERNANCE_CONTRACTS: &[(u64, GovernanceContracts)] = &[
     }),
     (137, GovernanceContracts {
         governance_token: address!("0x92A9C92C215092720C731c96D4Ff508c831a714f"),
+        delegator: address!("0x5f67441090FbDf57F1D9f28dd65a29b0bB3E83a7"),
         voting: address!("0xc3f2C8F9d5F0705De706b1302B7a039e1e11aC88"),
         voting_legacy: None,
         staking: address!("0x9AC2bA4bf7FaCB0bbB33447e5fF8f8D63B71dDC1"),
@@ -99,6 +103,22 @@ pub fn governance_contracts(chain_id: u64) -> Option<GovernanceContracts> {
         .map(|(_, contracts)| *contracts)
 }
 
+#[rustfmt::skip]
+const GOVERNANCE_TREASURIES: &[(u64, Address)] = &[
+    (1, address!("0xE8A8B458BcD1Ececc6b6b58F80929b29cCecFF40")),
+    (56, address!("0xdca05161eE5b5FA6DF170191c88857E70FFB4094")),
+    (137, address!("0xdca05161eE5b5FA6DF170191c88857E70FFB4094")),
+    (42161, address!("0x3B374464a714525498e445ba050B91571937bFc8")),
+];
+
+#[must_use]
+pub fn governance_treasury(chain_id: u64) -> Option<Address> {
+    GOVERNANCE_TREASURIES
+        .iter()
+        .find(|(deployed_chain_id, _)| *deployed_chain_id == chain_id)
+        .map(|(_, address)| *address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +131,7 @@ mod tests {
         for &(chain_id, contracts) in GOVERNANCE_CONTRACTS {
             assert!(chain_ids.insert(chain_id), "duplicate chain ID: {chain_id}");
             assert_ne!(contracts.governance_token, Address::ZERO);
+            assert_ne!(contracts.delegator, Address::ZERO);
             assert_ne!(contracts.voting, Address::ZERO);
             assert_ne!(contracts.staking, Address::ZERO);
             assert_ne!(contracts.governor_rewards, Address::ZERO);
@@ -133,6 +154,7 @@ mod tests {
         fn assert_entry(
             chain_id: u64,
             governance_token: Address,
+            delegator: Address,
             voting: Address,
             voting_legacy: Option<Address>,
             staking: Address,
@@ -141,6 +163,7 @@ mod tests {
         ) {
             let contracts = governance_contracts(chain_id).expect("supported deployment");
             assert_eq!(contracts.governance_token, governance_token);
+            assert_eq!(contracts.delegator, delegator);
             assert_eq!(contracts.voting, voting);
             assert_eq!(contracts.voting_legacy, voting_legacy);
             assert_eq!(contracts.staking, staking);
@@ -158,6 +181,7 @@ mod tests {
         assert_entry(
             1,
             address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"),
+            address!("0xB6d513f6222Ee92Fff975E901bd792E2513fB53B"),
             address!("0xc480F68A3dcC3EdD82134FAB45C14A0FcF1dA3CC"),
             Some(address!("0xfc4B580C9bda2EEf4E94D9Fb4bcB1F7a61660cf9")),
             address!("0xee6a649aa3766bd117e12c161726b693a1b2ee20"),
@@ -180,6 +204,7 @@ mod tests {
         assert_entry(
             56,
             address!("0x3F847b01d4d498a293e3197B186356039eCd737F"),
+            address!("0x4A7532f58259524251D7df1052762dc23c98Bae7"),
             address!("0xc3f2C8F9d5F0705De706b1302B7a039e1e11aC88"),
             Some(address!("0x569C15b356D3bA9c9f407945b12C867f7C3608C9")),
             address!("0x753f0F9BA003DDA95eb9284533Cf5B0F19e441dc"),
@@ -202,6 +227,7 @@ mod tests {
         assert_entry(
             137,
             address!("0x92A9C92C215092720C731c96D4Ff508c831a714f"),
+            address!("0x5f67441090FbDf57F1D9f28dd65a29b0bB3E83a7"),
             address!("0xc3f2C8F9d5F0705De706b1302B7a039e1e11aC88"),
             None,
             address!("0x9AC2bA4bf7FaCB0bbB33447e5fF8f8D63B71dDC1"),
@@ -221,5 +247,26 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    #[test]
+    fn action_contracts_are_registered_per_chain() {
+        assert_eq!(
+            governance_treasury(1),
+            Some(address!("0xE8A8B458BcD1Ececc6b6b58F80929b29cCecFF40"))
+        );
+        assert_eq!(
+            governance_treasury(56),
+            Some(address!("0xdca05161eE5b5FA6DF170191c88857E70FFB4094"))
+        );
+        assert_eq!(
+            governance_treasury(137),
+            Some(address!("0xdca05161eE5b5FA6DF170191c88857E70FFB4094"))
+        );
+        assert_eq!(
+            governance_treasury(42161),
+            Some(address!("0x3B374464a714525498e445ba050B91571937bFc8"))
+        );
+        assert_eq!(governance_treasury(u64::MAX), None);
     }
 }

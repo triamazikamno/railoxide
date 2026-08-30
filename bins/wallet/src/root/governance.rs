@@ -2069,7 +2069,7 @@ impl WalletRoot {
         vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
         recipe: GovernanceDraftRecipe,
         confirmed_hash: Option<B256>,
-        #[cfg(feature = "hardware")] window: &mut Window,
+        #[cfg(feature = "hardware")] window: &Window,
         #[cfg(not(feature = "hardware"))] window: &Window,
         cx: &mut Context<'_, Self>,
     ) {

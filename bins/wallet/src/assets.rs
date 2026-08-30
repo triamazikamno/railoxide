@@ -40,6 +40,7 @@ const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
 const FILE_PEN_LINE_ICON_PATH: &str = "railgun/icons/file-pen-line.svg";
 const FOLDER_COG_ICON_PATH: &str = "railgun/icons/folder-cog.svg";
+const SPARKLES_ICON_PATH: &str = "railgun/icons/sparkles.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
 const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
@@ -83,6 +84,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     WRENCH_ICON_PATH,
     FILE_PEN_LINE_ICON_PATH,
     FOLDER_COG_ICON_PATH,
+    SPARKLES_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
     TOR_STATUS_ICON_PATH,
@@ -127,6 +129,7 @@ const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.sv
 const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
 const FILE_PEN_LINE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/file-pen-line.svg");
 const FOLDER_COG_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/folder-cog.svg");
+const SPARKLES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/sparkles.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
 const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.svg");
@@ -316,6 +319,7 @@ pub(crate) enum RailgunActionIcon {
     Wrench,
     FilePenLine,
     FolderCog,
+    Sparkles,
 }
 
 impl IconNamed for RailgunActionIcon {
@@ -337,6 +341,7 @@ impl IconNamed for RailgunActionIcon {
             Self::Wrench => WRENCH_ICON_PATH,
             Self::FilePenLine => FILE_PEN_LINE_ICON_PATH,
             Self::FolderCog => FOLDER_COG_ICON_PATH,
+            Self::Sparkles => SPARKLES_ICON_PATH,
         }
         .into()
     }
@@ -450,6 +455,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         WRENCH_ICON_PATH => Some(WRENCH_ICON_BYTES),
         FILE_PEN_LINE_ICON_PATH => Some(FILE_PEN_LINE_ICON_BYTES),
         FOLDER_COG_ICON_PATH => Some(FOLDER_COG_ICON_BYTES),
+        SPARKLES_ICON_PATH => Some(SPARKLES_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
         TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),

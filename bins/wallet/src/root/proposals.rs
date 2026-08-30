@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, FixedBytes, U256};
+use alloy::sol;
+use alloy::sol_types::SolCall;
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, prelude::FluentBuilder as _, px, rgb,
+    Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
@@ -37,11 +39,11 @@ use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     GovernanceContractRules, GovernanceDocument, GovernanceOverview, GovernanceProposal,
-    GovernanceProposalStage, GovernanceProposalStatus, HttpContext,
+    GovernanceProposalStage, GovernanceProposalStatus, HttpContext, TokenAnchorRateCache,
     derive_governance_proposal_status, fetch_governance_chain_time, fetch_governance_overview,
     fetch_governance_page, resolve_governance_document,
     settings::{EffectiveChainConfig, load_wallet_settings},
-    vault::DesktopVaultStore,
+    vault::{DesktopVaultStore, PublicAccountMetadata, PublicAddressBookEntry},
 };
 
 use super::governance_action::{
@@ -49,8 +51,12 @@ use super::governance_action::{
     validate_proposal_action,
 };
 use super::spend_authorization::spend_authorization_recipient_display;
-use super::tokens::{format_native_token_amount_for_display, format_send_amount_input};
+use super::tokens::{
+    format_native_token_amount_for_display, format_send_amount_input,
+    format_token_amount_for_display, native_wrapped_output_labels, token_display_metadata,
+};
 use super::{WalletRoot, app_status_tag, format_report_chain};
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 pub(super) const PROPOSALS_PAGE_SIZE: usize = 5;
 const DOCUMENT_RESOLUTION_CONCURRENCY: usize = 4;
@@ -64,6 +70,361 @@ const TABLE_COLUMN_CHROME_PX: usize = 17;
 const TABLE_OUTER_BORDER_PX: usize = 2;
 const MIN_TABLE_RENDER_WIDTH_PX: usize = 1;
 const MAX_TABLE_RENDER_WIDTH_PX: usize = 4_096;
+
+sol! {
+    interface ProposalErc20 {
+        function transfer(address recipient, uint256 amount) external;
+        function transferFrom(address from, address to, uint256 amount) external;
+        function approve(address spender, uint256 amount) external;
+    }
+
+    interface ProposalTreasury {
+        function transferERC20(address token, address to, uint256 amount) external;
+        function transferETH(address to, uint256 amount) external;
+        function initializeTreasury(address owner) external;
+        function grantRole(bytes32 role, address account) external;
+        function revokeRole(bytes32 role, address account) external;
+        function renounceRole(bytes32 role, address account) external;
+    }
+
+    interface ProposalOpStackSender {
+        function readyTask(uint256 taskId) external;
+        function setExecutorL2(address executor) external;
+    }
+
+    interface ProposalOwnable {
+        function transferOwnership(address newOwner) external;
+        function renounceOwnership() external;
+    }
+
+    interface ProposalWrappedNative {
+        function deposit() external;
+        function withdraw(uint256 amount) external;
+    }
+
+    interface ProposalProxyAdmin {
+        function upgrade(address proxy, address implementation) external;
+        function pause(address proxy) external;
+        function transferProxyOwnership(address proxy, address newOwner) external;
+    }
+
+    interface ProposalRailgun {
+        function changeFee(uint120 shieldFee, uint120 unshieldFee, uint256 nftFee) external;
+    }
+
+    interface ProposalGovernanceToken {
+        function governanceMint(address account, uint256 amount) external;
+    }
+
+    interface ProposalGovernorRewards {
+        function setIntervalBP(uint256 newIntervalBP) external;
+        function addTokens(address[] tokens) external;
+    }
+
+    interface ProposalDelegator {
+        function setPermission(
+            address caller,
+            address contractAddress,
+            bytes4 selector,
+            bool permission
+        ) external;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DecodedProposalAction {
+    Erc20Transfer {
+        recipient: Address,
+        amount: U256,
+    },
+    Erc20TransferFrom {
+        from: Address,
+        to: Address,
+        amount: U256,
+    },
+    Erc20Approve {
+        spender: Address,
+        amount: U256,
+    },
+    TreasuryTransferErc20 {
+        token: Address,
+        to: Address,
+        amount: U256,
+    },
+    TreasuryTransferEth {
+        to: Address,
+        amount: U256,
+    },
+    TreasuryInitialize {
+        owner: Address,
+    },
+    TreasuryGrantRole {
+        role: B256,
+        account: Address,
+    },
+    TreasuryRevokeRole {
+        role: B256,
+        account: Address,
+    },
+    TreasuryRenounceRole {
+        role: B256,
+        account: Address,
+    },
+    OpStackReadyTask {
+        task_id: U256,
+    },
+    OpStackSetExecutorL2 {
+        executor: Address,
+    },
+    TransferOwnership {
+        new_owner: Address,
+    },
+    WrappedDeposit,
+    WrappedWithdraw {
+        amount: U256,
+    },
+    ProxyUpgrade {
+        proxy: Address,
+        implementation: Address,
+    },
+    ProxyPause {
+        proxy: Address,
+    },
+    ProxyTransferOwnership {
+        proxy: Address,
+        new_owner: Address,
+    },
+    ChangeFee {
+        shield_fee: U256,
+        unshield_fee: U256,
+        nft_fee: U256,
+    },
+    GovernanceMint {
+        account: Address,
+        amount: U256,
+    },
+    SetIntervalBP {
+        new_interval_bp: U256,
+    },
+    AddTokens {
+        tokens: Vec<Address>,
+    },
+    DelegatorSetPermission {
+        caller: Address,
+        contract_address: Address,
+        selector: FixedBytes<4>,
+        permission: bool,
+    },
+}
+
+impl DecodedProposalAction {
+    const fn method_name(&self) -> &'static str {
+        match self {
+            Self::Erc20Transfer { .. } => "transfer",
+            Self::Erc20TransferFrom { .. } => "transferFrom",
+            Self::Erc20Approve { .. } => "approve",
+            Self::TreasuryTransferErc20 { .. } => "transferERC20",
+            Self::TreasuryTransferEth { .. } => "transferETH",
+            Self::TreasuryInitialize { .. } => "initializeTreasury",
+            Self::TreasuryGrantRole { .. } => "grantRole",
+            Self::TreasuryRevokeRole { .. } => "revokeRole",
+            Self::TreasuryRenounceRole { .. } => "renounceRole",
+            Self::OpStackReadyTask { .. } => "readyTask",
+            Self::OpStackSetExecutorL2 { .. } => "setExecutorL2",
+            Self::TransferOwnership { .. } => "transferOwnership",
+            Self::WrappedDeposit => "deposit",
+            Self::WrappedWithdraw { .. } => "withdraw",
+            Self::ProxyUpgrade { .. } => "upgrade",
+            Self::ProxyPause { .. } => "pause",
+            Self::ProxyTransferOwnership { .. } => "transferProxyOwnership",
+            Self::ChangeFee { .. } => "changeFee",
+            Self::GovernanceMint { .. } => "governanceMint",
+            Self::SetIntervalBP { .. } => "setIntervalBP",
+            Self::AddTokens { .. } => "addTokens",
+            Self::DelegatorSetPermission { .. } => "setPermission",
+        }
+    }
+
+    const fn contract_family_label(&self) -> Option<&'static str> {
+        match self {
+            Self::OpStackReadyTask { .. } | Self::OpStackSetExecutorL2 { .. } => {
+                Some("OpStack sender")
+            }
+            Self::ProxyUpgrade { .. }
+            | Self::ProxyPause { .. }
+            | Self::ProxyTransferOwnership { .. } => Some("Proxy admin"),
+            _ => None,
+        }
+    }
+}
+
+fn decode_exact_call<C: SolCall>(calldata: &[u8]) -> Option<C> {
+    let call = C::abi_decode_validate(calldata).ok()?;
+    (call.abi_encode().as_slice() == calldata).then_some(call)
+}
+
+fn decode_proposal_action(
+    chain_id: u64,
+    target: Address,
+    calldata: &[u8],
+    wrapped_native_token: Option<Address>,
+    railgun_contract: Option<Address>,
+) -> Option<DecodedProposalAction> {
+    if railgun_ui::governance_treasury(chain_id).is_some_and(|treasury| treasury == target) {
+        if let Some(call) = decode_exact_call::<ProposalTreasury::transferERC20Call>(calldata) {
+            return Some(DecodedProposalAction::TreasuryTransferErc20 {
+                token: call.token,
+                to: call.to,
+                amount: call.amount,
+            });
+        }
+        if let Some(call) = decode_exact_call::<ProposalTreasury::transferETHCall>(calldata) {
+            return Some(DecodedProposalAction::TreasuryTransferEth {
+                to: call.to,
+                amount: call.amount,
+            });
+        }
+        if let Some(call) = decode_exact_call::<ProposalTreasury::initializeTreasuryCall>(calldata)
+        {
+            return Some(DecodedProposalAction::TreasuryInitialize { owner: call.owner });
+        }
+        if let Some(call) = decode_exact_call::<ProposalTreasury::grantRoleCall>(calldata) {
+            return Some(DecodedProposalAction::TreasuryGrantRole {
+                role: call.role,
+                account: call.account,
+            });
+        }
+        if let Some(call) = decode_exact_call::<ProposalTreasury::revokeRoleCall>(calldata) {
+            return Some(DecodedProposalAction::TreasuryRevokeRole {
+                role: call.role,
+                account: call.account,
+            });
+        }
+        if let Some(call) = decode_exact_call::<ProposalTreasury::renounceRoleCall>(calldata) {
+            return Some(DecodedProposalAction::TreasuryRenounceRole {
+                role: call.role,
+                account: call.account,
+            });
+        }
+    }
+
+    if let Some(call) = decode_exact_call::<ProposalOpStackSender::readyTaskCall>(calldata) {
+        return Some(DecodedProposalAction::OpStackReadyTask {
+            task_id: call.taskId,
+        });
+    }
+    if let Some(call) = decode_exact_call::<ProposalOpStackSender::setExecutorL2Call>(calldata) {
+        return Some(DecodedProposalAction::OpStackSetExecutorL2 {
+            executor: call.executor,
+        });
+    }
+
+    if let Some(call) = decode_exact_call::<ProposalOwnable::transferOwnershipCall>(calldata) {
+        return Some(DecodedProposalAction::TransferOwnership {
+            new_owner: call.newOwner,
+        });
+    }
+
+    if let Some(call) = decode_exact_call::<ProposalProxyAdmin::upgradeCall>(calldata) {
+        return Some(DecodedProposalAction::ProxyUpgrade {
+            proxy: call.proxy,
+            implementation: call.implementation,
+        });
+    }
+    if let Some(call) = decode_exact_call::<ProposalProxyAdmin::pauseCall>(calldata) {
+        return Some(DecodedProposalAction::ProxyPause { proxy: call.proxy });
+    }
+    if let Some(call) =
+        decode_exact_call::<ProposalProxyAdmin::transferProxyOwnershipCall>(calldata)
+    {
+        return Some(DecodedProposalAction::ProxyTransferOwnership {
+            proxy: call.proxy,
+            new_owner: call.newOwner,
+        });
+    }
+
+    if railgun_contract.is_some_and(|railgun| railgun == target)
+        && let Some(call) = decode_exact_call::<ProposalRailgun::changeFeeCall>(calldata)
+    {
+        return Some(DecodedProposalAction::ChangeFee {
+            shield_fee: U256::from(call.shieldFee),
+            unshield_fee: U256::from(call.unshieldFee),
+            nft_fee: call.nftFee,
+        });
+    }
+
+    if railgun_ui::governance_contracts(chain_id)
+        .is_some_and(|contracts| contracts.governance_token == target)
+        && let Some(call) =
+            decode_exact_call::<ProposalGovernanceToken::governanceMintCall>(calldata)
+    {
+        return Some(DecodedProposalAction::GovernanceMint {
+            account: call.account,
+            amount: call.amount,
+        });
+    }
+
+    if railgun_ui::governance_contracts(chain_id)
+        .is_some_and(|contracts| contracts.governor_rewards == target)
+        && let Some(call) =
+            decode_exact_call::<ProposalGovernorRewards::setIntervalBPCall>(calldata)
+    {
+        return Some(DecodedProposalAction::SetIntervalBP {
+            new_interval_bp: call.newIntervalBP,
+        });
+    }
+    if railgun_ui::governance_contracts(chain_id)
+        .is_some_and(|contracts| contracts.governor_rewards == target)
+        && let Some(call) = decode_exact_call::<ProposalGovernorRewards::addTokensCall>(calldata)
+    {
+        return Some(DecodedProposalAction::AddTokens {
+            tokens: call.tokens,
+        });
+    }
+
+    if railgun_ui::governance_contracts(chain_id)
+        .is_some_and(|contracts| contracts.delegator == target)
+        && let Some(call) = decode_exact_call::<ProposalDelegator::setPermissionCall>(calldata)
+    {
+        return Some(DecodedProposalAction::DelegatorSetPermission {
+            caller: call.caller,
+            contract_address: call.contractAddress,
+            selector: call.selector,
+            permission: call.permission,
+        });
+    }
+
+    if wrapped_native_token.is_some_and(|wrapped| wrapped == target) {
+        if decode_exact_call::<ProposalWrappedNative::depositCall>(calldata).is_some() {
+            return Some(DecodedProposalAction::WrappedDeposit);
+        }
+        if let Some(call) = decode_exact_call::<ProposalWrappedNative::withdrawCall>(calldata) {
+            return Some(DecodedProposalAction::WrappedWithdraw {
+                amount: call.amount,
+            });
+        }
+    }
+
+    if let Some(call) = decode_exact_call::<ProposalErc20::transferCall>(calldata) {
+        return Some(DecodedProposalAction::Erc20Transfer {
+            recipient: call.recipient,
+            amount: call.amount,
+        });
+    }
+    if let Some(call) = decode_exact_call::<ProposalErc20::transferFromCall>(calldata) {
+        return Some(DecodedProposalAction::Erc20TransferFrom {
+            from: call.from,
+            to: call.to,
+            amount: call.amount,
+        });
+    }
+    decode_exact_call::<ProposalErc20::approveCall>(calldata).map(|call| {
+        DecodedProposalAction::Erc20Approve {
+            spender: call.spender,
+            amount: call.amount,
+        }
+    })
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct ProposalIdentity {
@@ -1478,9 +1839,9 @@ impl WalletRoot {
                     .gap_2()
                     .child(
                         app_muted_text(format!("#{}", proposal.proposal.index))
-                            .font_family(APP_MONO_FONT_FAMILY)
                             .text_color(rgb(theme::TEXT_SUBTLE))
-                            .text_size(px(12.0)),
+                            .text_size(px(15.0))
+                            .line_height(px(18.0)),
                     )
                     .child(proposal_row_title(title))
                     .child(div().ml_auto().child(app_status_tag(
@@ -1679,6 +2040,14 @@ impl WalletRoot {
                                             proposal,
                                             self.proposals.chain_id,
                                             &self.proposals.expanded_calldata,
+                                            &self.public_broadcaster_anchor_cache,
+                                            &self.effective_token_registry,
+                                            self.effective_chain_configs
+                                                .get(&self.proposals.chain_id),
+                                            &self.public_accounts,
+                                            self.view_session
+                                                .as_ref()
+                                                .map(|_| self.public_address_book.as_slice()),
                                         )
                                         .into_any_element(),
                                     }),
@@ -2199,6 +2568,7 @@ fn proposal_row_title(title: Option<ProposalRowTitle>) -> gpui::Div {
             .flex_1()
             .min_w(px(0.0))
             .text_size(px(15.0))
+            .line_height(px(18.0))
             .font_weight(FontWeight::SEMIBOLD)
             .truncate(),
         Some(ProposalRowTitle::Available(_) | ProposalRowTitle::Unavailable) => {
@@ -4696,11 +5066,852 @@ fn proposal_action_id(
     ))
 }
 
+fn proposal_known_address_label(
+    chain_id: u64,
+    address: Address,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+) -> Option<String> {
+    if let Some(metadata) = token_display_metadata(Some(token_registry), chain_id, &address) {
+        return Some(metadata.symbol);
+    }
+    if let Some(contracts) = railgun_ui::governance_contracts(chain_id) {
+        if address == contracts.governance_token {
+            return Some("Governance token".to_owned());
+        }
+        if address == contracts.delegator {
+            return Some("Delegator".to_owned());
+        }
+        if address == contracts.voting {
+            return Some("Voting".to_owned());
+        }
+        if contracts.voting_legacy == Some(address) {
+            return Some("Legacy voting".to_owned());
+        }
+        if address == contracts.staking {
+            return Some("Staking".to_owned());
+        }
+        if address == contracts.governor_rewards {
+            return Some("Governor rewards".to_owned());
+        }
+        if let Some(reward) = contracts
+            .reward_tokens
+            .iter()
+            .find(|reward| reward.token == address)
+        {
+            return Some(reward.symbol.to_owned());
+        }
+    }
+    if railgun_ui::governance_treasury(chain_id) == Some(address) {
+        return Some("Treasury".to_owned());
+    }
+    let effective_chain = effective_chain?;
+    let configured = [
+        ("RAILGUN", effective_chain.railgun_contract.as_str()),
+        ("Relay Adapt", effective_chain.relay_adapt_contract.as_str()),
+        (
+            "Relay Adapt 7702",
+            effective_chain.relay_adapt_7702_contract.as_str(),
+        ),
+        ("Multicall", effective_chain.multicall_contract.as_str()),
+    ];
+    configured
+        .into_iter()
+        .find_map(|(label, raw)| {
+            (raw.parse::<Address>().ok() == Some(address)).then_some(label.to_owned())
+        })
+        .or_else(|| {
+            effective_chain
+                .wrapped_native_token
+                .as_deref()
+                .and_then(|raw| raw.parse::<Address>().ok())
+                .filter(|wrapped| *wrapped == address)
+                .map(|_| "Wrapped native token".to_owned())
+        })
+        .or_else(|| {
+            effective_chain
+                .coinbase_payer
+                .filter(|payer| *payer == address)
+                .map(|_| "Coinbase payer".to_owned())
+        })
+}
+
+fn proposal_action_target_label(
+    chain_id: u64,
+    target: Address,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+    decoded: Option<&DecodedProposalAction>,
+) -> Option<String> {
+    proposal_known_address_label(chain_id, target, token_registry, effective_chain).or_else(|| {
+        decoded
+            .and_then(DecodedProposalAction::contract_family_label)
+            .map(str::to_owned)
+    })
+}
+
+fn proposal_role_label(role: B256) -> String {
+    if role == B256::ZERO {
+        "DEFAULT_ADMIN_ROLE".to_owned()
+    } else if role == alloy::primitives::keccak256(b"TRANSFER_ROLE") {
+        "TRANSFER_ROLE".to_owned()
+    } else {
+        role.to_string()
+    }
+}
+
+fn proposal_basis_points_label(basis_points: U256) -> String {
+    let whole_percent = basis_points / U256::from(100);
+    let fractional_percent = (basis_points % U256::from(100)).to::<u8>();
+    format!("{whole_percent}.{fractional_percent:02}% ({basis_points} bp)")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProposalDecodedHero {
+    rounded: String,
+    icon: Option<WalletIconSource>,
+    context: Option<String>,
+    amount_copy_value: Option<String>,
+    context_copy_value: Option<String>,
+    monospace: bool,
+    danger: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProposalDecodedDetail {
+    Party {
+        role: String,
+        address: Address,
+        copy_value: String,
+        badge: Option<String>,
+    },
+    Connector,
+    Value {
+        role: String,
+        value: String,
+        copy_value: Option<String>,
+        monospace: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProposalDecodedPreview {
+    verb: String,
+    hero: Option<ProposalDecodedHero>,
+    details: Vec<ProposalDecodedDetail>,
+    unlimited_warning: Option<String>,
+}
+
+fn proposal_party_badge_label(
+    chain_id: u64,
+    address: Address,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+    public_accounts: &[PublicAccountMetadata],
+    public_address_book: Option<&[PublicAddressBookEntry]>,
+) -> Option<String> {
+    proposal_known_address_label(chain_id, address, token_registry, effective_chain)
+        .or_else(|| {
+            public_accounts
+                .iter()
+                .find(|account| account.address == address)
+                .map(|account| {
+                    account
+                        .label
+                        .as_deref()
+                        .filter(|label| !label.trim().is_empty())
+                        .map_or_else(
+                            || "Your account".to_owned(),
+                            |label| format!("Your account · {label}"),
+                        )
+                })
+        })
+        .or_else(|| {
+            public_address_book
+                .and_then(|entries| entries.iter().find(|entry| entry.address == address))
+                .map(|entry| entry.label.clone())
+        })
+}
+
+fn proposal_party_detail_with_context(
+    role: &str,
+    chain_id: u64,
+    address: Address,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+    public_accounts: &[PublicAccountMetadata],
+    public_address_book: Option<&[PublicAddressBookEntry]>,
+) -> ProposalDecodedDetail {
+    ProposalDecodedDetail::Party {
+        role: role.to_owned(),
+        address,
+        copy_value: address.to_checksum(None),
+        badge: proposal_party_badge_label(
+            chain_id,
+            address,
+            token_registry,
+            effective_chain,
+            public_accounts,
+            public_address_book,
+        ),
+    }
+}
+
+fn proposal_address_badge(label: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+        .px(px(5.0))
+        .py(px(2.0))
+        .text_size(px(10.0))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .whitespace_normal()
+        .child(label.into())
+}
+
+fn proposal_delegator_selector_label(selector: FixedBytes<4>) -> String {
+    let raw = format!("0x{}", alloy::hex::encode(selector.as_slice()));
+    if selector == FixedBytes::from([0; 4]) {
+        format!("Any function · {raw}")
+    } else if selector == FixedBytes::from([0x2e, 0xc0, 0xf3, 0x59]) {
+        format!("setVerificationKey · {raw}")
+    } else {
+        raw
+    }
+}
+
+fn proposal_decoded_preview(
+    decoded: &DecodedProposalAction,
+    target: Address,
+    action_value: U256,
+    chain_id: u64,
+    anchor_rates: &TokenAnchorRateCache,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+    public_accounts: &[PublicAccountMetadata],
+    public_address_book: Option<&[PublicAddressBookEntry]>,
+) -> ProposalDecodedPreview {
+    let party = |role: &str, address: Address| {
+        proposal_party_detail_with_context(
+            role,
+            chain_id,
+            address,
+            token_registry,
+            effective_chain,
+            public_accounts,
+            public_address_book,
+        )
+    };
+    let combine_context = |usd_context: Option<String>, semantic_context: Option<String>| match (
+        usd_context,
+        semantic_context,
+    ) {
+        (Some(usd), Some(context)) => Some(format!("{usd} · {context}")),
+        (Some(usd), None) | (None, Some(usd)) => Some(usd),
+        (None, None) => None,
+    };
+    let token_hero = |token: Address, amount: U256, context: Option<String>| {
+        if let Some(metadata) = token_display_metadata(Some(token_registry), chain_id, &token) {
+            let usd_context = anchor_rates
+                .cached_token_usd_micro_value(chain_id, token, amount)
+                .and_then(|usd| {
+                    railgun_ui::non_redundant_usd_micro_value(amount, metadata.decimals, usd)
+                })
+                .map(|usd| format!("≈ {}", railgun_ui::format_usd_micro_value(usd)));
+            ProposalDecodedHero {
+                rounded: format_token_amount_for_display(
+                    chain_id,
+                    token,
+                    amount,
+                    Some(token_registry),
+                ),
+                icon: metadata.icon_path,
+                context: combine_context(usd_context, context),
+                amount_copy_value: None,
+                context_copy_value: None,
+                monospace: false,
+                danger: false,
+            }
+        } else {
+            ProposalDecodedHero {
+                rounded: format!("{amount} raw token units"),
+                icon: None,
+                context: Some(format!(
+                    "Token not in registry · {}",
+                    railgun_ui::short_address(&token)
+                )),
+                amount_copy_value: Some(amount.to_string()),
+                context_copy_value: Some(token.to_checksum(None)),
+                monospace: true,
+                danger: false,
+            }
+        }
+    };
+    let native_hero = |amount: U256, context: Option<String>| {
+        let usd_context = anchor_rates
+            .cached_native_usd_micro_value(chain_id, amount)
+            .map(|usd| format!("≈ {}", railgun_ui::format_usd_micro_value(usd)));
+        ProposalDecodedHero {
+            rounded: format_native_token_amount_for_display(chain_id, amount),
+            icon: railgun_ui::chain_icon_asset_path(chain_id).map(WalletIconSource::embedded),
+            context: combine_context(usd_context, context),
+            amount_copy_value: None,
+            context_copy_value: None,
+            monospace: false,
+            danger: false,
+        }
+    };
+    match decoded {
+        DecodedProposalAction::Erc20Transfer { recipient, amount } => ProposalDecodedPreview {
+            verb: "Send".to_owned(),
+            hero: Some(token_hero(target, *amount, None)),
+            details: vec![party("TO", *recipient)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::Erc20TransferFrom { from, to, amount } => ProposalDecodedPreview {
+            verb: "Send".to_owned(),
+            hero: Some(token_hero(target, *amount, None)),
+            details: vec![
+                party("FROM", *from),
+                ProposalDecodedDetail::Connector,
+                party("TO", *to),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::Erc20Approve { spender, amount } => {
+            let unlimited = *amount == U256::MAX;
+            let mut hero = token_hero(target, *amount, Some("allowance".to_owned()));
+            if unlimited {
+                hero.rounded = token_display_metadata(Some(token_registry), chain_id, &target)
+                    .map_or_else(
+                        || "Unlimited raw token units".to_owned(),
+                        |metadata| format!("Unlimited {}", metadata.symbol),
+                    );
+                hero.danger = true;
+            }
+            ProposalDecodedPreview {
+                verb: "Allow spending".to_owned(),
+                hero: Some(hero),
+                details: vec![party("SPENDER", *spender)],
+                unlimited_warning: unlimited.then(|| {
+                    format!(
+                        "Unlimited allowance: {} can keep spending this token until the allowance is revoked.",
+                        spender.to_checksum(None)
+                    )
+                }),
+            }
+        }
+        DecodedProposalAction::TreasuryTransferErc20 { token, to, amount } => {
+            ProposalDecodedPreview {
+                verb: "Send from treasury".to_owned(),
+                hero: Some(token_hero(*token, *amount, None)),
+                details: vec![
+                    party("FROM", target),
+                    ProposalDecodedDetail::Connector,
+                    party("TO", *to),
+                ],
+                unlimited_warning: None,
+            }
+        }
+        DecodedProposalAction::TreasuryTransferEth { to, amount } => ProposalDecodedPreview {
+            verb: "Send from treasury".to_owned(),
+            hero: Some(native_hero(*amount, None)),
+            details: vec![
+                party("FROM", target),
+                ProposalDecodedDetail::Connector,
+                party("TO", *to),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::TreasuryInitialize { owner } => ProposalDecodedPreview {
+            verb: "Initialize treasury".to_owned(),
+            hero: None,
+            details: vec![party("OWNER", *owner)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::TreasuryGrantRole { role, account } => ProposalDecodedPreview {
+            verb: "Grant role".to_owned(),
+            hero: None,
+            details: vec![
+                ProposalDecodedDetail::Value {
+                    role: "ROLE".to_owned(),
+                    value: proposal_role_label(*role),
+                    copy_value: None,
+                    monospace: true,
+                },
+                party("ACCOUNT", *account),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::TreasuryRevokeRole { role, account } => ProposalDecodedPreview {
+            verb: "Revoke role".to_owned(),
+            hero: None,
+            details: vec![
+                ProposalDecodedDetail::Value {
+                    role: "ROLE".to_owned(),
+                    value: proposal_role_label(*role),
+                    copy_value: None,
+                    monospace: true,
+                },
+                party("ACCOUNT", *account),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::TreasuryRenounceRole { role, account } => ProposalDecodedPreview {
+            verb: "Renounce role".to_owned(),
+            hero: None,
+            details: vec![
+                ProposalDecodedDetail::Value {
+                    role: "ROLE".to_owned(),
+                    value: proposal_role_label(*role),
+                    copy_value: None,
+                    monospace: true,
+                },
+                party("ACCOUNT", *account),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::OpStackReadyTask { task_id } => ProposalDecodedPreview {
+            verb: "Ready task".to_owned(),
+            hero: None,
+            details: vec![ProposalDecodedDetail::Value {
+                role: "TASK ID".to_owned(),
+                value: task_id.to_string(),
+                copy_value: None,
+                monospace: true,
+            }],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::OpStackSetExecutorL2 { executor } => ProposalDecodedPreview {
+            verb: "Set executor".to_owned(),
+            hero: None,
+            details: vec![party("EXECUTOR", *executor)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::TransferOwnership { new_owner } => ProposalDecodedPreview {
+            verb: "Transfer ownership".to_owned(),
+            hero: None,
+            details: vec![party("NEW OWNER", *new_owner)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::WrappedDeposit => ProposalDecodedPreview {
+            verb: "Wrap".to_owned(),
+            hero: Some(native_hero(
+                action_value,
+                native_wrapped_output_labels(chain_id)
+                    .map(|(_, wrapped)| format!("wrapped into {wrapped}")),
+            )),
+            details: Vec::new(),
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::WrappedWithdraw { amount } => ProposalDecodedPreview {
+            verb: "Unwrap".to_owned(),
+            hero: Some(token_hero(
+                target,
+                *amount,
+                native_wrapped_output_labels(chain_id)
+                    .map(|(native, _)| format!("unwrapped into {native}")),
+            )),
+            details: Vec::new(),
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::ProxyUpgrade {
+            proxy,
+            implementation,
+        } => ProposalDecodedPreview {
+            verb: "Upgrade proxy".to_owned(),
+            hero: None,
+            details: vec![
+                party("PROXY", *proxy),
+                party("IMPLEMENTATION", *implementation),
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::ProxyPause { proxy } => ProposalDecodedPreview {
+            verb: "Pause proxy".to_owned(),
+            hero: None,
+            details: vec![party("PROXY", *proxy)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::ProxyTransferOwnership { proxy, new_owner } => {
+            ProposalDecodedPreview {
+                verb: "Transfer proxy ownership".to_owned(),
+                hero: None,
+                details: vec![party("PROXY", *proxy), party("NEW OWNER", *new_owner)],
+                unlimited_warning: None,
+            }
+        }
+        DecodedProposalAction::ChangeFee {
+            shield_fee,
+            unshield_fee,
+            nft_fee,
+        } => ProposalDecodedPreview {
+            verb: "Change protocol fees".to_owned(),
+            hero: None,
+            details: vec![
+                ProposalDecodedDetail::Value {
+                    role: "SHIELD FEE".to_owned(),
+                    value: proposal_basis_points_label(*shield_fee),
+                    copy_value: Some(shield_fee.to_string()),
+                    monospace: false,
+                },
+                ProposalDecodedDetail::Value {
+                    role: "UNSHIELD FEE".to_owned(),
+                    value: proposal_basis_points_label(*unshield_fee),
+                    copy_value: Some(unshield_fee.to_string()),
+                    monospace: false,
+                },
+                ProposalDecodedDetail::Value {
+                    role: "NFT FEE".to_owned(),
+                    value: format!(
+                        "{} ({} wei)",
+                        format_native_token_amount_for_display(chain_id, *nft_fee),
+                        nft_fee
+                    ),
+                    copy_value: Some(nft_fee.to_string()),
+                    monospace: false,
+                },
+            ],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::GovernanceMint { account, amount } => ProposalDecodedPreview {
+            verb: "Mint governance tokens".to_owned(),
+            hero: Some(token_hero(target, *amount, None)),
+            details: vec![party("TO", *account)],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::SetIntervalBP { new_interval_bp } => ProposalDecodedPreview {
+            verb: "Set reward interval rate".to_owned(),
+            hero: None,
+            details: vec![ProposalDecodedDetail::Value {
+                role: "RATE".to_owned(),
+                value: proposal_basis_points_label(*new_interval_bp),
+                copy_value: Some(new_interval_bp.to_string()),
+                monospace: false,
+            }],
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::AddTokens { tokens } => ProposalDecodedPreview {
+            verb: "Add reward tokens".to_owned(),
+            hero: None,
+            details: tokens.iter().map(|token| party("TOKEN", *token)).collect(),
+            unlimited_warning: None,
+        },
+        DecodedProposalAction::DelegatorSetPermission {
+            caller,
+            contract_address,
+            selector,
+            permission,
+        } => ProposalDecodedPreview {
+            verb: if *permission {
+                "Grant call permission".to_owned()
+            } else {
+                "Revoke call permission".to_owned()
+            },
+            hero: None,
+            details: vec![
+                party("CALLER", *caller),
+                if *contract_address == Address::ZERO {
+                    ProposalDecodedDetail::Value {
+                        role: "CONTRACT".to_owned(),
+                        value: format!("Any contract · {}", short_address(contract_address)),
+                        copy_value: Some(contract_address.to_checksum(None)),
+                        monospace: false,
+                    }
+                } else {
+                    party("CONTRACT", *contract_address)
+                },
+                ProposalDecodedDetail::Value {
+                    role: "FUNCTION".to_owned(),
+                    value: proposal_delegator_selector_label(*selector),
+                    copy_value: Some(format!("0x{}", alloy::hex::encode(selector.as_slice()))),
+                    monospace: true,
+                },
+            ],
+            unlimited_warning: None,
+        },
+    }
+}
+
+fn render_proposal_decoded_preview(
+    preview: &ProposalDecodedPreview,
+    identity: &ProposalIdentity,
+    ordinal: usize,
+) -> gpui::Div {
+    let mut inset = div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_sm()
+        .bg(rgb(theme::SURFACE))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    app_strong_text(preview.verb.clone())
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(div().flex_1().min_w(px(0.0)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Icon::new(RailgunActionIcon::Sparkles)
+                                .with_size(px(13.0))
+                                .text_color(rgb(theme::PRIMARY)),
+                        )
+                        .child(app_muted_text("DECODED").text_size(px(10.0))),
+                ),
+        );
+
+    if let Some(hero) = &preview.hero {
+        let mut amount = app_strong_text(hero.rounded.clone()).text_size(px(17.0));
+        if hero.monospace {
+            amount = amount.font_family(APP_MONO_FONT_FAMILY);
+        }
+        if hero.danger {
+            amount = amount.text_color(rgb(theme::DANGER));
+        }
+        let mut amount_group = div()
+            .min_w(px(0.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(amount.whitespace_normal());
+        if let Some(copy_value) = &hero.amount_copy_value {
+            amount_group = amount_group.child(
+                div()
+                    .id(proposal_action_id(
+                        identity,
+                        ordinal,
+                        "decoded-hero-raw-amount",
+                        "action",
+                    ))
+                    .flex_none()
+                    .tooltip(|window, cx| Tooltip::new("Copy raw amount").build(window, cx))
+                    .child(clipboard_with_toast(
+                        proposal_action_id(
+                            identity,
+                            ordinal,
+                            "decoded-hero-raw-amount",
+                            "clipboard",
+                        ),
+                        copy_value.clone(),
+                    )),
+            );
+        }
+        let mut body = div()
+            .min_w(px(0.0))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(amount_group);
+        if let Some(context) = &hero.context {
+            let mut context_group = div()
+                .min_w(px(0.0))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .child(app_muted_text(context.clone()).text_size(px(11.0)));
+            if let Some(copy_value) = &hero.context_copy_value {
+                context_group = context_group.child(
+                    div()
+                        .id(proposal_action_id(
+                            identity,
+                            ordinal,
+                            "decoded-hero-token-address",
+                            "action",
+                        ))
+                        .flex_none()
+                        .tooltip(|window, cx| Tooltip::new("Copy token address").build(window, cx))
+                        .child(clipboard_with_toast(
+                            proposal_action_id(
+                                identity,
+                                ordinal,
+                                "decoded-hero-token-address",
+                                "clipboard",
+                            ),
+                            copy_value.clone(),
+                        )),
+                );
+            }
+            body = body.child(context_group);
+        }
+        let mut hero_row = div().w_full().min_w(px(0.0)).flex().items_center().gap_3();
+        if let Some(icon) = hero.icon.clone() {
+            hero_row = hero_row.child(img(icon).size(px(30.0)).rounded_full().flex_none());
+        }
+        inset = inset.child(hero_row.child(body));
+    }
+
+    inset = inset.children(
+        preview
+            .details
+            .iter()
+            .enumerate()
+            .map(|(detail_index, detail)| match detail {
+                ProposalDecodedDetail::Connector => {
+                    div().w_full().min_w(px(0.0)).flex().pl(px(66.0)).child(
+                        Icon::new(IconName::ArrowDown)
+                            .with_size(px(13.0))
+                            .text_color(rgb(theme::TEXT_SUBTLE)),
+                    )
+                }
+                ProposalDecodedDetail::Party {
+                    role,
+                    address,
+                    copy_value,
+                    badge,
+                } => {
+                    let role_address_line = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            app_muted_text(role.clone())
+                                .w(px(58.0))
+                                .flex_none()
+                                .font_family(APP_MONO_FONT_FAMILY)
+                                .text_size(px(12.0))
+                                .line_height(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(theme::TEXT_SUBTLE)),
+                        )
+                        .child(
+                            app_text(railgun_ui::short_address(address))
+                                .font_family(APP_MONO_FONT_FAMILY)
+                                .font_weight(FontWeight::NORMAL)
+                                .text_size(px(12.0))
+                                .line_height(px(12.0)),
+                        );
+                    let copy_control = div()
+                        .id(proposal_action_id(
+                            identity,
+                            ordinal,
+                            &format!("decoded-party-{detail_index}"),
+                            "action",
+                        ))
+                        .flex_none()
+                        .tooltip({
+                            let tooltip = format!("Copy {role}");
+                            move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)
+                        })
+                        .child(clipboard_with_toast(
+                            proposal_action_id(
+                                identity,
+                                ordinal,
+                                &format!("decoded-party-{detail_index}"),
+                                "clipboard",
+                            ),
+                            copy_value.clone(),
+                        ));
+                    let party_line = div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .child(role_address_line)
+                        .child(copy_control);
+                    let mut row = div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(party_line);
+                    if let Some(badge) = badge {
+                        row = row.child(proposal_address_badge(badge.clone()));
+                    }
+                    row
+                }
+                ProposalDecodedDetail::Value {
+                    role,
+                    value,
+                    copy_value,
+                    monospace,
+                } => {
+                    let mut rendered_value = app_text(value.clone())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .whitespace_normal();
+                    if *monospace {
+                        rendered_value = rendered_value.font_family(APP_MONO_FONT_FAMILY);
+                    }
+                    let mut row = div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            app_muted_text(role.clone())
+                                .w(px(58.0))
+                                .flex_none()
+                                .font_family(APP_MONO_FONT_FAMILY)
+                                .text_size(px(12.0))
+                                .line_height(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(theme::TEXT_SUBTLE)),
+                        )
+                        .child(rendered_value);
+                    if let Some(copy_value) = copy_value {
+                        row = row.child(clipboard_with_toast(
+                            proposal_action_id(
+                                identity,
+                                ordinal,
+                                &format!("decoded-value-{detail_index}"),
+                                "clipboard",
+                            ),
+                            copy_value.clone(),
+                        ));
+                    }
+                    row
+                }
+            }),
+    );
+    if let Some(warning) = &preview.unlimited_warning {
+        inset = inset.child(
+            Alert::error(
+                proposal_action_id(identity, ordinal, "decoded-unlimited", "alert"),
+                warning.clone(),
+            )
+            .small(),
+        );
+    }
+    inset
+}
+
 fn render_proposal_actions_card(
     root: &Entity<WalletRoot>,
     proposal: &ResolvedProposal,
     chain_id: u64,
     expanded_calldata: &BTreeSet<ProposalActionIdentity>,
+    anchor_rates: &TokenAnchorRateCache,
+    token_registry: &wallet_ops::settings::EffectiveTokenRegistry,
+    effective_chain: Option<&EffectiveChainConfig>,
+    public_accounts: &[PublicAccountMetadata],
+    public_address_book: Option<&[PublicAddressBookEntry]>,
 ) -> impl IntoElement {
     let identity = proposal.identity();
     let mut card = div()
@@ -4732,6 +5943,25 @@ fn render_proposal_actions_card(
         let expanded = expanded_calldata.contains(&action_identity);
         let compact_calldata = compact_calldata_display(&calldata);
         let address = action.call_contract.to_checksum(None);
+        let wrapped_native_token = effective_chain
+            .and_then(|chain| chain.wrapped_native_token.as_deref())
+            .and_then(|address| address.parse::<Address>().ok());
+        let railgun_contract =
+            effective_chain.and_then(|chain| chain.railgun_contract.parse::<Address>().ok());
+        let decoded = decode_proposal_action(
+            chain_id,
+            action.call_contract,
+            &action.calldata,
+            wrapped_native_token,
+            railgun_contract,
+        );
+        let target_label = proposal_action_target_label(
+            chain_id,
+            action.call_contract,
+            token_registry,
+            effective_chain,
+            decoded.as_ref(),
+        );
         let value = action.value;
         let address_copy_id = proposal_action_id(&identity, ordinal, "address", "clipboard");
         let calldata_copy_id = proposal_action_id(&identity, ordinal, "calldata", "clipboard");
@@ -4752,31 +5982,69 @@ fn render_proposal_actions_card(
             .bg(rgb(theme::SURFACE_ELEVATED))
             .border_1()
             .border_color(rgb(theme::BORDER_SUBTLE))
-            .child(app_strong_text(format!("Action {}", ordinal + 1)).text_size(px(13.0)))
-            .child(app_muted_text("Target").text_size(px(11.0)))
             .child(
-                div()
+                app_strong_text(match decoded.as_ref() {
+                    Some(decoded) => format!("Action {} · {}", ordinal + 1, decoded.method_name()),
+                    None => format!("Action {}", ordinal + 1),
+                })
+                .text_size(px(13.0)),
+            )
+            .child(app_muted_text("Target").text_size(px(11.0)))
+            .child({
+                let mut target_row = div()
                     .w_full()
                     .min_w(px(0.0))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
-                        app_text(address.clone())
-                            .flex_none()
-                            .font_family(APP_MONO_FONT_FAMILY)
-                            .text_size(px(12.0))
-                            .whitespace_nowrap(),
-                    )
-                    .child(
                         div()
-                            .id(proposal_action_id(&identity, ordinal, "address", "action"))
-                            .flex_none()
-                            .tooltip(|window, cx| Tooltip::new("Copy target").build(window, cx))
-                            .child(clipboard_with_toast(address_copy_id, address.clone())),
-                    ),
-            )
-            .child(app_muted_text("Calldata").text_size(px(11.0)))
+                            .max_w_full()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                app_text(address.clone())
+                                    .max_w_full()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(px(12.0)),
+                            )
+                            .child(
+                                div()
+                                    .id(proposal_action_id(&identity, ordinal, "address", "action"))
+                                    .flex_none()
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Copy target").build(window, cx)
+                                    })
+                                    .child(clipboard_with_toast(address_copy_id, address.clone())),
+                            ),
+                    );
+                if let Some(label) = target_label {
+                    target_row = target_row.child(proposal_address_badge(label));
+                }
+                target_row
+            })
+            .children(decoded.as_ref().map(|decoded| {
+                let preview = proposal_decoded_preview(
+                    decoded,
+                    action.call_contract,
+                    value,
+                    chain_id,
+                    anchor_rates,
+                    token_registry,
+                    effective_chain,
+                    public_accounts,
+                    public_address_book,
+                );
+                render_proposal_decoded_preview(&preview, &identity, ordinal)
+            }))
+            .child(app_muted_text("Raw calldata").text_size(px(11.0)))
             .child(
                 Collapsible::new()
                     .open(expanded)
@@ -5232,19 +6500,20 @@ fn timeline_deadline_completed(
     }
 }
 
+fn timeline_sponsorship_completed(called: bool, chain_time: U256, deadline: U256) -> bool {
+    called || timeline_deadline_completed(TimelineDeadline::SponsorshipClose, chain_time, deadline)
+}
+
 fn render_timeline_card(proposal: &ResolvedProposal, chain_time: U256) -> gpui::Div {
     let status = proposal.status(chain_time);
+    let called = !proposal.proposal.vote_call_time.is_zero();
     let sponsorship = if status.stage == GovernanceProposalStage::SponsorshipExpired {
         (
             Some(IconName::CircleX),
             format!("Expired {}", format_deadline(&status.deadlines.sponsorship)),
             theme::TEXT_MUTED,
         )
-    } else if timeline_deadline_completed(
-        TimelineDeadline::SponsorshipClose,
-        chain_time,
-        status.deadlines.sponsorship,
-    ) {
+    } else if timeline_sponsorship_completed(called, chain_time, status.deadlines.sponsorship) {
         (
             Some(IconName::CircleCheck),
             format_deadline(&status.deadlines.sponsorship),
@@ -5257,7 +6526,6 @@ fn render_timeline_card(proposal: &ResolvedProposal, chain_time: U256) -> gpui::
             theme::TEXT_MUTED,
         )
     };
-    let called = !proposal.proposal.vote_call_time.is_zero();
     let mut steps = div().flex().flex_col();
     steps = steps.child(timeline_step(
         Some(IconName::CircleCheck),
@@ -5377,34 +6645,42 @@ fn render_details_card(proposal: &ResolvedProposal) -> gpui::Div {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Instant;
 
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, B256, FixedBytes, U256, address};
+    use alloy::sol_types::SolCall;
     use markdown::{ParseOptions, mdast::Node, to_mdast};
 
     use super::{
-        CONTENT_WIDTH, DocumentCompletion, MAX_MDAST_NODES, MAX_PREPARED_SOURCE_BYTES,
-        MAX_TABLE_RENDER_WIDTH_PX, PreparationBudget, ProposalActionIdentity, ProposalBlock,
-        ProposalCapacityKind, ProposalCapacitySummaryState, ProposalClosedHistoryKind,
-        ProposalDetailTab, ProposalDocumentState, ProposalPreparationFailure, ProposalPresentation,
-        ProposalSelection, ProposalsPage, ProposalsState, ResolvedProposal, TABLE_COLUMN_CHROME_PX,
-        TABLE_OUTER_BORDER_PX, TimelineDeadline, action_calldata_hex, compact_calldata_display,
-        ensure_mdast_node_limit, format_compact_rail_amount, format_compact_rail_amount_with_unit,
+        CONTENT_WIDTH, DecodedProposalAction, DocumentCompletion, MAX_MDAST_NODES,
+        MAX_PREPARED_SOURCE_BYTES, MAX_TABLE_RENDER_WIDTH_PX, PreparationBudget,
+        ProposalActionIdentity, ProposalBlock, ProposalCapacityKind, ProposalCapacitySummaryState,
+        ProposalClosedHistoryKind, ProposalDecodedDetail, ProposalDelegator, ProposalDetailTab,
+        ProposalDocumentState, ProposalErc20, ProposalGovernanceToken, ProposalGovernorRewards,
+        ProposalOpStackSender, ProposalOwnable, ProposalPreparationFailure, ProposalPresentation,
+        ProposalProxyAdmin, ProposalRailgun, ProposalSelection, ProposalTreasury,
+        ProposalWrappedNative, ProposalsPage, ProposalsState, ResolvedProposal,
+        TABLE_COLUMN_CHROME_PX, TABLE_OUTER_BORDER_PX, TimelineDeadline, action_calldata_hex,
+        compact_calldata_display, decode_proposal_action, ensure_mdast_node_limit,
+        format_compact_rail_amount, format_compact_rail_amount_with_unit,
         inert_raw_fallback_source, list_voting_deadline, next_proposal_page, parse_proposal_blocks,
         prepare_proposal_presentation, prepared_markdown_source_len, proposal_action_id,
-        proposal_capacity_kind, proposal_capacity_summary_state, proposal_closed_history_kind,
+        proposal_action_target_label, proposal_capacity_kind, proposal_capacity_summary_state,
+        proposal_closed_history_kind, proposal_decoded_preview, proposal_role_label,
         proposal_table_scroll_key, send_document_completions, table_fingerprint,
-        timeline_deadline_completed, vote_split,
+        timeline_deadline_completed, timeline_sponsorship_completed, vote_split,
     };
     use ui::theme::APP_TEXT_SIZE;
     use wallet_ops::{
         GovernanceContractRules, GovernanceContractSummary, GovernanceContractVersion,
         GovernanceDocument, GovernanceOverview, GovernanceProposal, GovernanceProposalAction,
         GovernanceProposalDeadlines, GovernanceProposalStage, GovernanceProposalStatus,
+        TokenAnchorRateCache,
     };
 
     fn test_proposal(index: u64, document: ProposalDocumentState) -> ResolvedProposal {
@@ -6176,6 +7452,1362 @@ mod tests {
     }
 
     #[test]
+    fn proposal_decodes_generic_erc20_calls_to_semantic_fields() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let from = address!("0x3333333333333333333333333333333333333333");
+        let amount = U256::from(42);
+        assert_eq!(
+            decode_proposal_action(
+                1,
+                target,
+                &ProposalErc20::transferCall { recipient, amount }.abi_encode(),
+                None,
+                None,
+            ),
+            Some(DecodedProposalAction::Erc20Transfer { recipient, amount })
+        );
+        assert_eq!(
+            decode_proposal_action(
+                1,
+                target,
+                &ProposalErc20::transferFromCall {
+                    from,
+                    to: recipient,
+                    amount,
+                }
+                .abi_encode(),
+                None,
+                None,
+            ),
+            Some(DecodedProposalAction::Erc20TransferFrom {
+                from,
+                to: recipient,
+                amount,
+            })
+        );
+        let spender = address!("0x4444444444444444444444444444444444444444");
+        assert_eq!(
+            decode_proposal_action(
+                1,
+                target,
+                &ProposalErc20::approveCall { spender, amount }.abi_encode(),
+                None,
+                None,
+            ),
+            Some(DecodedProposalAction::Erc20Approve { spender, amount })
+        );
+    }
+
+    #[test]
+    fn proposal_decodes_common_governance_calls_with_target_guards() {
+        let arbitrary_target = address!("0x1111111111111111111111111111111111111111");
+        let proxy = address!("0x2222222222222222222222222222222222222222");
+        let implementation = address!("0x3333333333333333333333333333333333333333");
+        let account = address!("0x4444444444444444444444444444444444444444");
+        let upgrade = ProposalProxyAdmin::upgradeCall {
+            proxy,
+            implementation,
+        }
+        .abi_encode();
+        let upgrade_decoded = DecodedProposalAction::ProxyUpgrade {
+            proxy,
+            implementation,
+        };
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &upgrade, None, None),
+            Some(upgrade_decoded.clone())
+        );
+        let empty_registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        assert_eq!(
+            proposal_action_target_label(
+                1,
+                arbitrary_target,
+                &empty_registry,
+                None,
+                Some(&upgrade_decoded),
+            ),
+            Some("Proxy admin".to_owned())
+        );
+
+        let pause = ProposalProxyAdmin::pauseCall { proxy }.abi_encode();
+        assert_eq!(&pause[..4], &[0x76, 0xa6, 0x7a, 0x51]);
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &pause, None, None),
+            Some(DecodedProposalAction::ProxyPause { proxy })
+        );
+        let proxy_owner = ProposalProxyAdmin::transferProxyOwnershipCall {
+            proxy,
+            newOwner: account,
+        }
+        .abi_encode();
+        assert_eq!(&proxy_owner[..4], &[0x00, 0x36, 0x1d, 0x55]);
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &proxy_owner, None, None),
+            Some(DecodedProposalAction::ProxyTransferOwnership {
+                proxy,
+                new_owner: account,
+            })
+        );
+
+        let railgun = address!("0x5555555555555555555555555555555555555555");
+        let change_fee = ProposalRailgun::changeFeeCall {
+            shieldFee: alloy::primitives::Uint::<120, 2>::from_limbs([10, 0]),
+            unshieldFee: alloy::primitives::Uint::<120, 2>::from_limbs([10, 0]),
+            nftFee: U256::ZERO,
+        }
+        .abi_encode();
+        assert_eq!(&change_fee[..4], &[0xcc, 0x1f, 0x73, 0xfd]);
+        assert_eq!(
+            decode_proposal_action(1, railgun, &change_fee, None, Some(railgun)),
+            Some(DecodedProposalAction::ChangeFee {
+                shield_fee: U256::from(10),
+                unshield_fee: U256::from(10),
+                nft_fee: U256::ZERO,
+            })
+        );
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &change_fee, None, Some(railgun)),
+            None
+        );
+        let mut trailing_change_fee = change_fee;
+        trailing_change_fee.push(0);
+        assert_eq!(
+            decode_proposal_action(1, railgun, &trailing_change_fee, None, Some(railgun)),
+            None
+        );
+
+        let contracts = railgun_ui::governance_contracts(1).expect("Ethereum governance");
+        let mint = ProposalGovernanceToken::governanceMintCall {
+            account,
+            amount: U256::from(42),
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_proposal_action(1, contracts.governance_token, &mint, None, None),
+            Some(DecodedProposalAction::GovernanceMint {
+                account,
+                amount: U256::from(42),
+            })
+        );
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &mint, None, None),
+            None
+        );
+
+        let interval = ProposalGovernorRewards::setIntervalBPCall {
+            newIntervalBP: U256::from(420),
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_proposal_action(1, contracts.governor_rewards, &interval, None, None),
+            Some(DecodedProposalAction::SetIntervalBP {
+                new_interval_bp: U256::from(420),
+            })
+        );
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &interval, None, None),
+            None
+        );
+
+        let usdt = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let add_tokens = ProposalGovernorRewards::addTokensCall {
+            tokens: vec![usdt, usdc],
+        }
+        .abi_encode();
+        assert_eq!(&add_tokens[..4], [0x4a, 0xe0, 0x5c, 0x7d]);
+        assert_eq!(
+            decode_proposal_action(1, contracts.governor_rewards, &add_tokens, None, None),
+            Some(DecodedProposalAction::AddTokens {
+                tokens: vec![usdt, usdc],
+            })
+        );
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &add_tokens, None, None),
+            None
+        );
+        let mut malformed_offset = add_tokens.clone();
+        malformed_offset[4..36].fill(0);
+        assert_eq!(
+            decode_proposal_action(1, contracts.governor_rewards, &malformed_offset, None, None),
+            None
+        );
+        let mut trailing_tokens = add_tokens;
+        trailing_tokens.push(0);
+        assert_eq!(
+            decode_proposal_action(1, contracts.governor_rewards, &trailing_tokens, None, None),
+            None
+        );
+
+        let caller = address!("0x64DA0892E8E24fECa6Eb5E3D8cbf2D9b6Fbe7598");
+        let contract_address = address!("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9");
+        let selector = FixedBytes::from([0x2e, 0xc0, 0xf3, 0x59]);
+        let permission = ProposalDelegator::setPermissionCall {
+            caller,
+            contractAddress: contract_address,
+            selector,
+            permission: true,
+        }
+        .abi_encode();
+        assert_eq!(&permission[..4], [0xe6, 0x46, 0x24, 0xfa]);
+        let permission_decoded = DecodedProposalAction::DelegatorSetPermission {
+            caller,
+            contract_address,
+            selector,
+            permission: true,
+        };
+        assert_eq!(
+            decode_proposal_action(1, contracts.delegator, &permission, None, None),
+            Some(permission_decoded)
+        );
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &permission, None, None),
+            None
+        );
+
+        let mut malformed_bool = permission.clone();
+        malformed_bool[131] = 2;
+        assert_eq!(
+            decode_proposal_action(1, contracts.delegator, &malformed_bool, None, None),
+            None
+        );
+        let mut malformed_address = permission.clone();
+        malformed_address[4] = 1;
+        assert_eq!(
+            decode_proposal_action(1, contracts.delegator, &malformed_address, None, None),
+            None
+        );
+        let mut malformed_padding = permission.clone();
+        malformed_padding[72] = 1;
+        assert_eq!(
+            decode_proposal_action(1, contracts.delegator, &malformed_padding, None, None),
+            None
+        );
+        let mut trailing_permission = permission.clone();
+        trailing_permission.push(0);
+        assert_eq!(
+            decode_proposal_action(1, contracts.delegator, &trailing_permission, None, None),
+            None
+        );
+        assert_eq!(
+            decode_proposal_action(
+                1,
+                contracts.delegator,
+                &permission[..permission.len() - 1],
+                None,
+                None
+            ),
+            None
+        );
+
+        let mut trailing = upgrade;
+        trailing.push(0);
+        assert_eq!(
+            decode_proposal_action(1, arbitrary_target, &trailing, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn common_governance_decoded_previews_show_parties_tokens_and_rates() {
+        let proxy = address!("0x2222222222222222222222222222222222222222");
+        let implementation = address!("0x3333333333333333333333333333333333333333");
+        let account = address!("0x4444444444444444444444444444444444444444");
+        let token = railgun_ui::governance_contracts(1)
+            .expect("Ethereum governance")
+            .governance_token;
+        let usdt = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::from([
+                (
+                    (1, token.to_string().to_ascii_lowercase()),
+                    wallet_ops::settings::EffectiveTokenInfo {
+                        chain_id: 1,
+                        token_address: token.to_string(),
+                        symbol: "RAIL".to_owned(),
+                        decimals: 18,
+                        icon_path: None,
+                        price_anchor: None,
+                        built_in: false,
+                    },
+                ),
+                (
+                    (1, usdt.to_string().to_ascii_lowercase()),
+                    wallet_ops::settings::EffectiveTokenInfo {
+                        chain_id: 1,
+                        token_address: usdt.to_string(),
+                        symbol: "USDT".to_owned(),
+                        decimals: 6,
+                        icon_path: None,
+                        price_anchor: None,
+                        built_in: false,
+                    },
+                ),
+                (
+                    (1, usdc.to_string().to_ascii_lowercase()),
+                    wallet_ops::settings::EffectiveTokenInfo {
+                        chain_id: 1,
+                        token_address: usdc.to_string(),
+                        symbol: "USDC".to_owned(),
+                        decimals: 6,
+                        icon_path: None,
+                        price_anchor: None,
+                        built_in: false,
+                    },
+                ),
+            ]),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let upgrade = proposal_decoded_preview(
+            &DecodedProposalAction::ProxyUpgrade {
+                proxy,
+                implementation,
+            },
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(upgrade.verb, "Upgrade proxy");
+        assert!(matches!(
+            upgrade.details.as_slice(),
+            [
+                ProposalDecodedDetail::Party { role: proxy_role, address: proxy_address, .. },
+                ProposalDecodedDetail::Party {
+                    role: implementation_role,
+                    address: implementation_address,
+                    ..
+                },
+            ] if proxy_role == "PROXY"
+                && *proxy_address == proxy
+                && implementation_role == "IMPLEMENTATION"
+                && *implementation_address == implementation
+        ));
+
+        let ownership = proposal_decoded_preview(
+            &DecodedProposalAction::TransferOwnership { new_owner: account },
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(ownership.verb, "Transfer ownership");
+        assert!(ownership.hero.is_none());
+        assert!(matches!(
+            &ownership.details[0],
+            ProposalDecodedDetail::Party { role, address, .. }
+                if role == "NEW OWNER" && *address == account
+        ));
+
+        let pause = proposal_decoded_preview(
+            &DecodedProposalAction::ProxyPause { proxy },
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(pause.verb, "Pause proxy");
+        assert!(matches!(
+            &pause.details[0],
+            ProposalDecodedDetail::Party { role, address, .. }
+                if role == "PROXY" && *address == proxy
+        ));
+
+        let proxy_ownership = proposal_decoded_preview(
+            &DecodedProposalAction::ProxyTransferOwnership {
+                proxy,
+                new_owner: account,
+            },
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(proxy_ownership.verb, "Transfer proxy ownership");
+        assert!(matches!(
+            proxy_ownership.details.as_slice(),
+            [
+                ProposalDecodedDetail::Party { role: proxy_role, address: proxy_address, .. },
+                ProposalDecodedDetail::Party { role: owner_role, address: owner_address, .. },
+            ] if proxy_role == "PROXY"
+                && *proxy_address == proxy
+                && owner_role == "NEW OWNER"
+                && *owner_address == account
+        ));
+
+        let fees = proposal_decoded_preview(
+            &DecodedProposalAction::ChangeFee {
+                shield_fee: U256::from(10),
+                unshield_fee: U256::from(10),
+                nft_fee: U256::ZERO,
+            },
+            address!("0x5555555555555555555555555555555555555555"),
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(fees.verb, "Change protocol fees");
+        assert!(fees.hero.is_none());
+        assert!(matches!(
+            fees.details.as_slice(),
+            [
+                ProposalDecodedDetail::Value { role: shield_role, value: shield_value, copy_value: Some(shield_copy), .. },
+                ProposalDecodedDetail::Value { role: unshield_role, value: unshield_value, copy_value: Some(unshield_copy), .. },
+                ProposalDecodedDetail::Value { role: nft_role, value: nft_value, copy_value: Some(nft_copy), .. },
+            ] if shield_role == "SHIELD FEE"
+                && shield_value == "0.10% (10 bp)"
+                && shield_copy == "10"
+                && unshield_role == "UNSHIELD FEE"
+                && unshield_value == "0.10% (10 bp)"
+                && unshield_copy == "10"
+                && nft_role == "NFT FEE"
+                && nft_value == "0 ETH (0 wei)"
+                && nft_copy == "0"
+        ));
+
+        let mint = proposal_decoded_preview(
+            &DecodedProposalAction::GovernanceMint {
+                account,
+                amount: U256::from(10_000_000_000_000_000_000_000_u128),
+            },
+            token,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(mint.verb, "Mint governance tokens");
+        assert_eq!(
+            mint.hero.as_ref().map(|hero| hero.rounded.as_str()),
+            Some("10000 RAIL")
+        );
+        assert!(matches!(
+            &mint.details[0],
+            ProposalDecodedDetail::Party { role, address, .. }
+                if role == "TO" && *address == account
+        ));
+
+        let interval = proposal_decoded_preview(
+            &DecodedProposalAction::SetIntervalBP {
+                new_interval_bp: U256::from(420),
+            },
+            Address::ZERO,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(interval.verb, "Set reward interval rate");
+        assert!(matches!(
+            &interval.details[0],
+            ProposalDecodedDetail::Value {
+                role,
+                value,
+                copy_value: Some(copy_value),
+                monospace,
+            } if role == "RATE"
+                && value == "4.20% (420 bp)"
+                && copy_value == "420"
+                && !monospace
+        ));
+
+        let add_tokens = proposal_decoded_preview(
+            &DecodedProposalAction::AddTokens {
+                tokens: vec![usdt, usdc],
+            },
+            railgun_ui::governance_contracts(1)
+                .expect("Ethereum governance")
+                .governor_rewards,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(add_tokens.verb, "Add reward tokens");
+        assert!(add_tokens.hero.is_none());
+        assert!(matches!(
+            add_tokens.details.as_slice(),
+            [
+                ProposalDecodedDetail::Party {
+                    role: first_role,
+                    address: first_address,
+                    badge: Some(first_badge),
+                    ..
+                },
+                ProposalDecodedDetail::Party {
+                    role: second_role,
+                    address: second_address,
+                    badge: Some(second_badge),
+                    ..
+                },
+            ] if first_role == "TOKEN"
+                && *first_address == usdt
+                && first_badge == "USDT"
+                && second_role == "TOKEN"
+                && *second_address == usdc
+                && second_badge == "USDC"
+        ));
+
+        let caller = address!("0x64DA0892E8E24fECa6Eb5E3D8cbf2D9b6Fbe7598");
+        let contract_address = address!("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9");
+        let known_selector = FixedBytes::from([0x2e, 0xc0, 0xf3, 0x59]);
+        let grant = proposal_decoded_preview(
+            &DecodedProposalAction::DelegatorSetPermission {
+                caller,
+                contract_address,
+                selector: known_selector,
+                permission: true,
+            },
+            railgun_ui::governance_contracts(1)
+                .expect("Ethereum governance")
+                .delegator,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(grant.verb, "Grant call permission");
+        assert!(grant.hero.is_none());
+        assert!(matches!(
+            grant.details.as_slice(),
+            [
+                ProposalDecodedDetail::Party { role: caller_role, address: caller_value, .. },
+                ProposalDecodedDetail::Party {
+                    role: contract_role,
+                    address: contract_value,
+                    ..
+                },
+                ProposalDecodedDetail::Value {
+                    role: function_role,
+                    value,
+                    copy_value: Some(copy_value),
+                    monospace,
+                },
+            ] if caller_role == "CALLER"
+                && *caller_value == caller
+                && contract_role == "CONTRACT"
+                && *contract_value == contract_address
+                && function_role == "FUNCTION"
+                && value == "setVerificationKey · 0x2ec0f359"
+                && copy_value == "0x2ec0f359"
+                && *monospace
+        ));
+
+        let unknown_selector = FixedBytes::from([0xaa, 0xbb, 0xcc, 0xdd]);
+        let revoke = proposal_decoded_preview(
+            &DecodedProposalAction::DelegatorSetPermission {
+                caller,
+                contract_address,
+                selector: unknown_selector,
+                permission: false,
+            },
+            Address::ZERO,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(revoke.verb, "Revoke call permission");
+        assert!(matches!(
+            &revoke.details[2],
+            ProposalDecodedDetail::Value {
+                role,
+                value,
+                copy_value: Some(copy_value),
+                ..
+            } if role == "FUNCTION" && value == "0xaabbccdd" && copy_value == "0xaabbccdd"
+        ));
+    }
+
+    #[test]
+    fn delegator_wildcard_preview_details_preserve_specific_counterpart() {
+        let caller = address!("0x64DA0892E8E24fECa6Eb5E3D8cbf2D9b6Fbe7598");
+        let contract = address!("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9");
+        let known_selector = FixedBytes::from([0x2e, 0xc0, 0xf3, 0x59]);
+        let zero_selector = FixedBytes::from([0; 4]);
+        let zero_copy = Address::ZERO.to_checksum(None);
+        let contract_copy = contract.to_checksum(None);
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let cases = [
+            (
+                "zero contract only",
+                Address::ZERO,
+                known_selector,
+                true,
+                "Any contract · 0x0000…0000",
+                zero_copy.as_str(),
+                "setVerificationKey · 0x2ec0f359",
+                "0x2ec0f359",
+            ),
+            (
+                "zero selector only",
+                contract,
+                zero_selector,
+                false,
+                "",
+                contract_copy.as_str(),
+                "Any function · 0x00000000",
+                "0x00000000",
+            ),
+            (
+                "both zero",
+                Address::ZERO,
+                zero_selector,
+                true,
+                "Any contract · 0x0000…0000",
+                zero_copy.as_str(),
+                "Any function · 0x00000000",
+                "0x00000000",
+            ),
+        ];
+
+        for (
+            label,
+            contract_address,
+            selector,
+            wildcard_contract,
+            expected_contract_value,
+            expected_contract_copy,
+            expected_function_value,
+            expected_function_copy,
+        ) in cases
+        {
+            let preview = proposal_decoded_preview(
+                &DecodedProposalAction::DelegatorSetPermission {
+                    caller,
+                    contract_address,
+                    selector,
+                    permission: true,
+                },
+                Address::ZERO,
+                U256::ZERO,
+                1,
+                &anchor_rates,
+                &registry,
+                None,
+                &[],
+                None,
+            );
+            assert!(
+                matches!(
+                    &preview.details[0],
+                    ProposalDecodedDetail::Party {
+                        role,
+                        address,
+                        copy_value,
+                        ..
+                    } if role == "CALLER"
+                        && *address == caller
+                        && copy_value == caller.to_checksum(None).as_str()
+                ),
+                "{label}: caller detail"
+            );
+
+            match (&preview.details[1], wildcard_contract) {
+                (
+                    ProposalDecodedDetail::Value {
+                        role,
+                        value,
+                        copy_value: Some(copy_value),
+                        monospace,
+                    },
+                    true,
+                ) if role == "CONTRACT"
+                    && value == expected_contract_value
+                    && copy_value == expected_contract_copy
+                    && !monospace => {}
+                (
+                    ProposalDecodedDetail::Party {
+                        role,
+                        address,
+                        copy_value,
+                        ..
+                    },
+                    false,
+                ) if role == "CONTRACT"
+                    && *address == contract
+                    && copy_value == expected_contract_copy => {}
+                _ => panic!("{label}: unexpected contract detail"),
+            }
+
+            assert!(
+                matches!(
+                    &preview.details[2],
+                    ProposalDecodedDetail::Value {
+                        role,
+                        value,
+                        copy_value: Some(copy_value),
+                        monospace,
+                    } if role == "FUNCTION"
+                        && value == expected_function_value
+                        && copy_value == expected_function_copy
+                        && *monospace
+                ),
+                "{label}: function detail"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_decoded_preview_uses_typed_token_and_party_presentation() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::from([(
+                (1, target.to_string().to_ascii_lowercase()),
+                wallet_ops::settings::EffectiveTokenInfo {
+                    chain_id: 1,
+                    token_address: target.to_string(),
+                    symbol: "TEST".to_owned(),
+                    decimals: 6,
+                    icon_path: None,
+                    price_anchor: None,
+                    built_in: false,
+                },
+            )]),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let transfer = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Transfer {
+                recipient,
+                amount: U256::from(15_109_211_424_u64),
+            },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            Some(&[]),
+        );
+        let hero = transfer.hero.as_ref().expect("known token hero");
+        assert_eq!(hero.rounded, "15109 TEST");
+        assert!(hero.icon.is_none(), "custom icon-less symbols have no slot");
+        assert!(hero.amount_copy_value.is_none());
+        assert!(hero.context_copy_value.is_none());
+        assert_eq!(transfer.details.len(), 1);
+        assert!(matches!(
+            &transfer.details[0],
+            ProposalDecodedDetail::Party { role, address, badge, .. }
+                if role == "TO" && *address == recipient && badge.is_none()
+        ));
+
+        let unknown_token = address!("0x9999999999999999999999999999999999999999");
+        let unknown = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Transfer {
+                recipient,
+                amount: U256::from(42),
+            },
+            unknown_token,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        let unknown_hero = unknown.hero.as_ref().expect("unknown token hero");
+        assert!(unknown_hero.icon.is_none());
+        assert_eq!(unknown_hero.rounded, "42 raw token units");
+        assert_eq!(unknown_hero.amount_copy_value.as_deref(), Some("42"));
+        let unknown_token_short = railgun_ui::short_address(&unknown_token);
+        assert!(
+            unknown_hero
+                .context
+                .as_deref()
+                .is_some_and(|context| context.contains(unknown_token_short.as_str()))
+        );
+        let unknown_token_checksum = unknown_token.to_checksum(None);
+        assert_eq!(
+            unknown_hero.context_copy_value.as_deref(),
+            Some(unknown_token_checksum.as_str())
+        );
+    }
+
+    #[test]
+    fn proposal_decoded_preview_adds_only_nonredundant_cached_usd_context() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::from([(
+                (1, target.to_string().to_ascii_lowercase()),
+                wallet_ops::settings::EffectiveTokenInfo {
+                    chain_id: 1,
+                    token_address: target.to_string(),
+                    symbol: "WBTC".to_owned(),
+                    decimals: 8,
+                    icon_path: None,
+                    price_anchor: None,
+                    built_in: false,
+                },
+            )]),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        anchor_rates.store_rate(1, target, U256::from(100_000_000_u64));
+        anchor_rates.store_native_usd_rate(1, U256::from(13_194_600_000_u64));
+        let priced = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Transfer {
+                recipient,
+                amount: U256::from(100_000_000_u64),
+            },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(
+            priced
+                .hero
+                .as_ref()
+                .and_then(|hero| hero.context.as_deref()),
+            Some("≈ $13,194.60")
+        );
+
+        let stable_target = address!("0x3333333333333333333333333333333333333333");
+        let stable_registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::from([(
+                (1, stable_target.to_string().to_ascii_lowercase()),
+                wallet_ops::settings::EffectiveTokenInfo {
+                    chain_id: 1,
+                    token_address: stable_target.to_string(),
+                    symbol: "USDC".to_owned(),
+                    decimals: 6,
+                    icon_path: None,
+                    price_anchor: None,
+                    built_in: false,
+                },
+            )]),
+        };
+        let stable_rates = TokenAnchorRateCache::new();
+        stable_rates.store_rate(1, stable_target, U256::from(1_000_000_000_u64));
+        stable_rates.store_native_usd_rate(1, U256::from(1_000_000_000_u64));
+        let stable = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Transfer {
+                recipient,
+                amount: U256::from(10_000_000_u64),
+            },
+            stable_target,
+            U256::ZERO,
+            1,
+            &stable_rates,
+            &stable_registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(
+            stable
+                .hero
+                .as_ref()
+                .is_some_and(|hero| hero.context.is_none())
+        );
+
+        let missing_rates = TokenAnchorRateCache::new();
+        let missing = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Transfer {
+                recipient,
+                amount: U256::from(100_000_000_u64),
+            },
+            target,
+            U256::ZERO,
+            1,
+            &missing_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(
+            missing
+                .hero
+                .as_ref()
+                .is_some_and(|hero| hero.context.is_none())
+        );
+    }
+
+    #[test]
+    fn proposal_decoded_preview_preserves_direction_treasury_badges_and_approval_warning() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let from = address!("0x3333333333333333333333333333333333333333");
+        let spender = address!("0x52908400098527886e0f7030069857d2e4169ee7");
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::from([(
+                (1, target.to_string().to_ascii_lowercase()),
+                wallet_ops::settings::EffectiveTokenInfo {
+                    chain_id: 1,
+                    token_address: target.to_string(),
+                    symbol: "TEST".to_owned(),
+                    decimals: 2,
+                    icon_path: None,
+                    price_anchor: None,
+                    built_in: false,
+                },
+            )]),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let transfer_from = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20TransferFrom {
+                from,
+                to: recipient,
+                amount: U256::from(1),
+            },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(matches!(
+            transfer_from.details.as_slice(),
+            [
+                ProposalDecodedDetail::Party { role: from_role, address: from_address, .. },
+                ProposalDecodedDetail::Connector,
+                ProposalDecodedDetail::Party { role: to_role, address: to_address, .. },
+            ] if from_role == "FROM" && *from_address == from && to_role == "TO" && *to_address == recipient
+        ));
+
+        let treasury = railgun_ui::governance_treasury(1).expect("ethereum treasury metadata");
+        let treasury_transfer = proposal_decoded_preview(
+            &DecodedProposalAction::TreasuryTransferErc20 {
+                token: target,
+                to: recipient,
+                amount: U256::from(1),
+            },
+            treasury,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(matches!(
+            &treasury_transfer.details[0],
+            ProposalDecodedDetail::Party { role, address, badge: Some(badge), .. }
+                if role == "FROM" && *address == treasury && badge == "Treasury"
+        ));
+
+        let bounded = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Approve {
+                spender,
+                amount: U256::from(1),
+            },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(bounded.unlimited_warning.is_none());
+        assert!(!bounded.hero.as_ref().expect("approval hero").danger);
+
+        let unlimited = proposal_decoded_preview(
+            &DecodedProposalAction::Erc20Approve {
+                spender,
+                amount: U256::MAX,
+            },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        let unlimited_hero = unlimited.hero.as_ref().expect("approval hero");
+        assert_eq!(unlimited_hero.rounded, "Unlimited TEST");
+        assert!(unlimited_hero.danger);
+        let expected_warning = format!(
+            "Unlimited allowance: {} can keep spending this token until the allowance is revoked.",
+            spender.to_checksum(None)
+        );
+        assert_eq!(
+            unlimited.unlimited_warning.as_deref(),
+            Some(expected_warning.as_str())
+        );
+        assert!(matches!(
+            &unlimited.details[0],
+            ProposalDecodedDetail::Party { role, address, .. }
+                if role == "SPENDER" && *address == spender
+        ));
+    }
+
+    #[test]
+    fn proposal_decoded_preview_covers_wrapping_and_role_shells() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let account = address!("0x2222222222222222222222222222222222222222");
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let wrapped = proposal_decoded_preview(
+            &DecodedProposalAction::WrappedDeposit,
+            target,
+            U256::from(1_000_000_000_000_000_000_u128),
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        let wrapped_hero = wrapped.hero.as_ref().expect("wrap hero");
+        assert_eq!(wrapped.verb, "Wrap");
+        assert_eq!(wrapped_hero.rounded, "1 ETH");
+        assert_eq!(wrapped_hero.context.as_deref(), Some("wrapped into WETH"));
+
+        let role = B256::repeat_byte(7);
+        let role_preview = proposal_decoded_preview(
+            &DecodedProposalAction::TreasuryGrantRole { role, account },
+            target,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(role_preview.details.len(), 2);
+        assert!(matches!(
+            &role_preview.details[0],
+            ProposalDecodedDetail::Value { role: label, value, .. }
+                if label == "ROLE" && value == &proposal_role_label(role)
+        ));
+        assert!(matches!(
+            &role_preview.details[1],
+            ProposalDecodedDetail::Party { role, address, .. }
+                if role == "ACCOUNT" && *address == account
+        ));
+    }
+
+    #[test]
+    fn proposal_decoded_preview_retains_exact_address_copy_fidelity() {
+        let first = address!("0x123400000000000000000000000000000000abcd");
+        let second = address!("0x123411111111111111111111111111111111abcd");
+        assert_eq!(
+            railgun_ui::short_address(&first),
+            railgun_ui::short_address(&second)
+        );
+        let registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let anchor_rates = TokenAnchorRateCache::new();
+        let preview = proposal_decoded_preview(
+            &DecodedProposalAction::TreasuryInitialize { owner: first },
+            Address::ZERO,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(matches!(
+            &preview.details[0],
+            ProposalDecodedDetail::Party { address, copy_value, .. }
+                if *address == first && copy_value == &first.to_checksum(None)
+        ));
+        let other = proposal_decoded_preview(
+            &DecodedProposalAction::TreasuryInitialize { owner: second },
+            Address::ZERO,
+            U256::ZERO,
+            1,
+            &anchor_rates,
+            &registry,
+            None,
+            &[],
+            None,
+        );
+        assert!(matches!(
+            &other.details[0],
+            ProposalDecodedDetail::Party { address, copy_value, .. }
+                if *address == second && copy_value == &second.to_checksum(None)
+        ));
+    }
+
+    #[test]
+    fn proposal_decodes_all_treasury_writes_only_at_known_target() {
+        let treasury = railgun_ui::governance_treasury(1).expect("ethereum treasury metadata");
+        let other = address!("0x1111111111111111111111111111111111111111");
+        let token = address!("0x2222222222222222222222222222222222222222");
+        let account = address!("0x3333333333333333333333333333333333333333");
+        let role = B256::repeat_byte(7);
+        let calls = [
+            (
+                ProposalTreasury::transferERC20Call {
+                    token,
+                    to: account,
+                    amount: U256::from(1),
+                }
+                .abi_encode(),
+                DecodedProposalAction::TreasuryTransferErc20 {
+                    token,
+                    to: account,
+                    amount: U256::from(1),
+                },
+            ),
+            (
+                ProposalTreasury::transferETHCall {
+                    to: account,
+                    amount: U256::from(2),
+                }
+                .abi_encode(),
+                DecodedProposalAction::TreasuryTransferEth {
+                    to: account,
+                    amount: U256::from(2),
+                },
+            ),
+            (
+                ProposalTreasury::initializeTreasuryCall { owner: account }.abi_encode(),
+                DecodedProposalAction::TreasuryInitialize { owner: account },
+            ),
+            (
+                ProposalTreasury::grantRoleCall { role, account }.abi_encode(),
+                DecodedProposalAction::TreasuryGrantRole { role, account },
+            ),
+            (
+                ProposalTreasury::revokeRoleCall { role, account }.abi_encode(),
+                DecodedProposalAction::TreasuryRevokeRole { role, account },
+            ),
+            (
+                ProposalTreasury::renounceRoleCall { role, account }.abi_encode(),
+                DecodedProposalAction::TreasuryRenounceRole { role, account },
+            ),
+        ];
+        let arbitrum_treasury =
+            railgun_ui::governance_treasury(42161).expect("arbitrum treasury metadata");
+        assert_eq!(
+            decode_proposal_action(42161, arbitrum_treasury, &calls[0].0, None, None),
+            Some(calls[0].1.clone())
+        );
+        for (calldata, expected) in calls {
+            assert_eq!(
+                decode_proposal_action(1, treasury, &calldata, None, None),
+                Some(expected)
+            );
+            assert_eq!(
+                decode_proposal_action(1, other, &calldata, None, None),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_role_labels_cover_known_treasury_roles() {
+        assert_eq!(proposal_role_label(B256::ZERO), "DEFAULT_ADMIN_ROLE");
+        assert_eq!(
+            proposal_role_label(alloy::primitives::keccak256(b"TRANSFER_ROLE")),
+            "TRANSFER_ROLE"
+        );
+        let unknown = B256::repeat_byte(7);
+        assert_eq!(proposal_role_label(unknown), unknown.to_string());
+    }
+
+    #[test]
+    fn proposal_decodes_sender_writes_at_any_target_and_labels_decoded_actions() {
+        let first_target = address!("0x1111111111111111111111111111111111111111");
+        let second_target = address!("0x2222222222222222222222222222222222222222");
+        let executor = address!("0x3333333333333333333333333333333333333333");
+        let empty_registry = wallet_ops::settings::EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let ready_task = ProposalOpStackSender::readyTaskCall {
+            taskId: U256::from(1),
+        }
+        .abi_encode();
+        let ready_task_decoded = DecodedProposalAction::OpStackReadyTask {
+            task_id: U256::from(1),
+        };
+        assert_eq!(
+            decode_proposal_action(1, first_target, &ready_task, None, None),
+            Some(ready_task_decoded.clone())
+        );
+        assert_eq!(
+            proposal_action_target_label(
+                1,
+                first_target,
+                &empty_registry,
+                None,
+                Some(&ready_task_decoded),
+            ),
+            Some("OpStack sender".to_owned())
+        );
+
+        let treasury = railgun_ui::governance_treasury(1).expect("mainnet treasury metadata");
+        assert_eq!(
+            proposal_action_target_label(
+                1,
+                treasury,
+                &empty_registry,
+                None,
+                Some(&ready_task_decoded),
+            ),
+            Some("Treasury".to_owned())
+        );
+
+        let delegator = railgun_ui::governance_contracts(1)
+            .expect("mainnet governance metadata")
+            .delegator;
+        assert_eq!(
+            proposal_action_target_label(
+                1,
+                delegator,
+                &empty_registry,
+                None,
+                Some(&ready_task_decoded),
+            ),
+            Some("Delegator".to_owned())
+        );
+
+        let set_executor = ProposalOpStackSender::setExecutorL2Call { executor }.abi_encode();
+        let set_executor_decoded = DecodedProposalAction::OpStackSetExecutorL2 { executor };
+        assert_eq!(
+            decode_proposal_action(42161, second_target, &set_executor, None, None),
+            Some(set_executor_decoded.clone())
+        );
+        assert_eq!(
+            proposal_action_target_label(
+                42161,
+                second_target,
+                &empty_registry,
+                None,
+                Some(&set_executor_decoded),
+            ),
+            Some("OpStack sender".to_owned())
+        );
+
+        let transfer_ownership =
+            ProposalOwnable::transferOwnershipCall { newOwner: executor }.abi_encode();
+        assert_eq!(&transfer_ownership[..4], &[0xf2, 0xfd, 0xe3, 0x8b]);
+        assert_eq!(
+            decode_proposal_action(1, first_target, &transfer_ownership, None, None),
+            Some(DecodedProposalAction::TransferOwnership {
+                new_owner: executor
+            })
+        );
+        assert_eq!(
+            proposal_action_target_label(
+                1,
+                first_target,
+                &empty_registry,
+                None,
+                Some(&DecodedProposalAction::TransferOwnership {
+                    new_owner: executor
+                }),
+            ),
+            None
+        );
+        let renounce_ownership = ProposalOwnable::renounceOwnershipCall {}.abi_encode();
+        assert_eq!(
+            decode_proposal_action(42161, second_target, &renounce_ownership, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn proposal_decodes_wrapped_native_calls_only_at_configured_target() {
+        let wrapped = address!("0x1111111111111111111111111111111111111111");
+        let other = address!("0x2222222222222222222222222222222222222222");
+        let deposit = ProposalWrappedNative::depositCall {}.abi_encode();
+        assert_eq!(
+            decode_proposal_action(1, wrapped, &deposit, Some(wrapped), None),
+            Some(DecodedProposalAction::WrappedDeposit)
+        );
+        assert_eq!(
+            decode_proposal_action(1, other, &deposit, Some(wrapped), None),
+            None
+        );
+        let amount = U256::from(9);
+        let withdraw = ProposalWrappedNative::withdrawCall { amount }.abi_encode();
+        assert_eq!(
+            decode_proposal_action(1, wrapped, &withdraw, Some(wrapped), None),
+            Some(DecodedProposalAction::WrappedWithdraw { amount })
+        );
+    }
+
+    #[test]
+    fn proposal_keeps_unknown_malformed_and_trailing_calls_undecoded() {
+        let target = address!("0x1111111111111111111111111111111111111111");
+        let mut trailing = ProposalErc20::transferCall {
+            recipient: target,
+            amount: U256::from(1),
+        }
+        .abi_encode();
+        trailing.push(0);
+        assert_eq!(
+            decode_proposal_action(1, target, &trailing, None, None),
+            None
+        );
+        assert_eq!(
+            decode_proposal_action(1, target, &[0xa9, 0x05], None, None),
+            None
+        );
+        assert_eq!(
+            decode_proposal_action(1, target, &[0xff; 36], None, None),
+            None
+        );
+    }
+
+    #[test]
     fn action_control_ids_are_unique_per_proposal_ordinal_and_control() {
         let identity = test_proposal(7, resolved_document()).identity();
         let first = proposal_action_id(&identity, 0, "calldata", "clipboard");
@@ -6348,6 +8980,22 @@ mod tests {
 
     #[test]
     fn timeline_deadline_boundaries_match_protocol_semantics() {
+        assert!(timeline_sponsorship_completed(
+            true,
+            U256::from(9),
+            U256::from(10)
+        ));
+        assert!(!timeline_sponsorship_completed(
+            false,
+            U256::from(9),
+            U256::from(10)
+        ));
+        assert!(timeline_sponsorship_completed(
+            false,
+            U256::from(10),
+            U256::from(10)
+        ));
+
         for milestone in [
             TimelineDeadline::SponsorshipClose,
             TimelineDeadline::YayVotingEnd,
