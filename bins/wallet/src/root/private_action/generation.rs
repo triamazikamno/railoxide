@@ -1697,6 +1697,7 @@ impl WalletRoot {
                     root.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 }
                 if refresh_public_balances {
+                    root.http.rpc_broker().invalidate_block(chain_id);
                     root.schedule_public_balance_refresh(cx);
                 }
                 if let Some(result) = progress_result {

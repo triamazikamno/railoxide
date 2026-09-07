@@ -137,6 +137,7 @@ dependencies = [
  "alloy-eips",
  "alloy-ens",
  "alloy-genesis",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-provider",
  "alloy-rpc-client",

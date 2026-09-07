@@ -1589,9 +1589,10 @@ pub(super) fn effective_desktop_chain_config(
     effective_chain: Option<&settings::EffectiveChainConfig>,
 ) -> Result<EffectiveDesktopChainConfig> {
     let defaults = chain_defaults_for_chain(chain_id)?;
+    let rpc_route = settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let Some(effective_chain) = effective_chain else {
         return Ok(EffectiveDesktopChainConfig {
-            rpc_urls: defaults.rpc_urls,
+            rpc_urls: rpc_route.endpoint_urls(),
             railgun_contract: defaults.contract,
             relay_adapt_contract: defaults.relay_adapt_contract,
             wrapped_native_token: wrapped_native_token_for_chain(chain_id),
@@ -1603,13 +1604,7 @@ pub(super) fn effective_desktop_chain_config(
             },
         });
     };
-    if effective_chain.chain_id != chain_id {
-        return Err(eyre!(
-            "effective chain config is for chain {}, not {chain_id}",
-            effective_chain.chain_id
-        ));
-    }
-    let rpc_urls = parse_effective_rpc_urls(chain_id, &effective_chain.rpc_endpoints)?;
+    let rpc_urls = rpc_route.endpoint_urls();
     let railgun_contract =
         parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
     let relay_adapt_contract = parse_effective_address(
@@ -1632,27 +1627,11 @@ pub(super) fn effective_desktop_chain_config(
     })
 }
 
-pub(crate) fn parse_effective_rpc_urls(
-    chain_id: u64,
-    rpc_endpoints: &[String],
-) -> Result<Vec<Url>> {
-    if rpc_endpoints.is_empty() {
-        return Err(eyre!("effective chain {chain_id} has no RPC endpoints"));
-    }
-    rpc_endpoints
-        .iter()
-        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse RPC URL {url}")))
-        .collect()
-}
-
 pub(crate) fn effective_rpc_urls_for_chain(
-    defaults: &ChainConfigDefaults,
+    chain_id: u64,
     effective_chain: Option<&settings::EffectiveChainConfig>,
 ) -> Result<Vec<Url>> {
-    effective_chain.map_or_else(
-        || Ok(defaults.rpc_urls.clone()),
-        |chain| parse_effective_rpc_urls(defaults.chain_id, &chain.rpc_endpoints),
-    )
+    Ok(settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)?.endpoint_urls())
 }
 
 pub(crate) fn query_rpc_pool_with_http_client(

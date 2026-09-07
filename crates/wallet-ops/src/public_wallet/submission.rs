@@ -20,7 +20,7 @@ use super::types::{
 use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
-    SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
+    HttpContext, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
     self_broadcast_replacement_bumped_fee, self_broadcast_send_raw_transaction_to_rpc_pool,
 };
 
@@ -110,7 +110,7 @@ pub(super) async fn submit_public_action_step_session(
     label: &str,
     query_rpc_pool: Arc<QueryRpcPool>,
     finality_depth: u64,
-    network_mode: crate::WalletNetworkMode,
+    http: &HttpContext,
     chain_id: u64,
     from_address: Address,
     gas: &EffectiveChainGasSettings,
@@ -141,7 +141,7 @@ pub(super) async fn submit_public_action_step_session(
 
         let preflight = match public_action_preflight_from_rpc_pool(
             query_rpc_pool.as_ref(),
-            network_mode,
+            http.network_mode(),
             chain_id,
             from_address,
             base_tx_req.clone(),
@@ -216,8 +216,15 @@ pub(super) async fn submit_public_action_step_session(
         nonce = Some(preflight.nonce);
 
         if observer.is_none() {
-            observer =
-                Some(BlockObserver::establish(Arc::clone(&query_rpc_pool), finality_depth).await?);
+            observer = Some(
+                BlockObserver::establish(
+                    Arc::clone(&query_rpc_pool),
+                    finality_depth,
+                    http.rpc_broker(),
+                    chain_id,
+                )
+                .await?,
+            );
         }
 
         emit_public_action_event(event_tx, PublicActionSessionEvent::AttemptHandoff { step });
@@ -225,7 +232,7 @@ pub(super) async fn submit_public_action_step_session(
             step,
             preflight,
             query_rpc_pool.as_ref(),
-            network_mode,
+            http.network_mode(),
             signer,
             label,
             event_tx,
@@ -314,7 +321,7 @@ pub(super) async fn submit_public_action_step_session(
                             .map_or(0, |attempt| attempt.info.gas_limit);
                         let replacement = match public_action_preflight_from_rpc_pool(
                             query_rpc_pool.as_ref(),
-                            network_mode,
+                            http.network_mode(),
                             chain_id,
                             from_address,
                             base_tx_req.clone(),
@@ -350,7 +357,7 @@ pub(super) async fn submit_public_action_step_session(
                             step,
                             replacement,
                             query_rpc_pool.as_ref(),
-                            network_mode,
+                            http.network_mode(),
                             signer,
                             label,
                             event_tx,

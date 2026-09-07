@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::num::NonZeroUsize;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,20 +9,21 @@ use alloy::consensus::BlockHeader as _;
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::BlockResponse as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::bindings::IMulticall3;
-use alloy::providers::{CallItem, Provider};
+use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use railgun_ui::governance_contracts;
-use sync_service::ChainConfigDefaults;
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::settings::EffectiveChainConfig;
+use crate::rpc_broker::total_failure;
+use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{MulticallChunkSize, fetch_account_snapshots_multi, snapshot_hint};
-use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
+use crate::{
+    HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client,
+};
 
 const GOVERNANCE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -671,14 +671,10 @@ pub async fn fetch_governance_participation(
         return Ok(rows.into_iter().flatten().collect());
     }
 
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let accounts_per_batch = (MulticallChunkSize::default().get() / 6).max(1);
     let mut values = Vec::new();
     for prepared_batch in prepared.chunks(accounts_per_batch) {
-        let expected_batch = prepared_batch
-            .len()
-            .checked_mul(6)
-            .ok_or_else(|| eyre!("governance participation result count overflows"))?;
         let calls = prepared_batch
             .iter()
             .flat_map(|&(_, account, sponsor_hint, voting_hint)| {
@@ -736,26 +732,10 @@ pub async fn fetch_governance_participation(
                 ]
             })
             .collect();
-        let batch_values = fetch_governance_multicall_raw(&pool, multicall_address, calls).await?;
-        if batch_values.len() != expected_batch {
-            return Err(eyre!(
-                "governance participation multicall returned {}, expected {}",
-                batch_values.len(),
-                expected_batch
-            ));
-        }
+        let batch_values =
+            fetch_governance_multicall_raw(&chain_route, http, calls, "governance participation")
+                .await?;
         values.extend(batch_values);
-    }
-    let expected = prepared
-        .len()
-        .checked_mul(6)
-        .ok_or_else(|| eyre!("governance participation result count overflows"))?;
-    if values.len() != expected {
-        return Err(eyre!(
-            "governance participation multicall returned {}, expected {}",
-            values.len(),
-            expected
-        ));
     }
     for (position, &(_row_index, account, sponsor_hint, voting_hint)) in prepared.iter().enumerate()
     {
@@ -781,7 +761,7 @@ fn decode_governance_participation(
     account: Address,
     sponsor_hint: U256,
     voting_hint: U256,
-    values: &[IMulticall3::Result],
+    values: &[std::result::Result<Bytes, RpcBrokerError>],
 ) -> std::result::Result<GovernanceParticipation, GovernanceParticipationError> {
     if values.len() != 6 {
         return Err(GovernanceParticipationError::Decode {
@@ -790,15 +770,12 @@ fn decode_governance_participation(
         });
     }
     let value = |index: usize, field: &'static str| {
-        let result = &values[index];
-        if result.success {
-            Ok(&result.returnData)
-        } else {
-            Err(GovernanceParticipationError::Read {
+        values[index]
+            .as_ref()
+            .map_err(|error| GovernanceParticipationError::Read {
                 field,
-                reason: "multicall target returned failure".into(),
+                reason: error.to_string(),
             })
-        }
     };
     let current_voting_power =
         <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_decode_validate(
@@ -885,48 +862,30 @@ fn decode_governance_participation(
     })
 }
 
+/// Submits one broker batch and returns the per-call results in input order.
+///
+/// A member revert is reported to the caller as `Err(RpcBrokerError::InnerRevert(_))` so it can be
+/// distinguished from a transport or JSON-RPC failure; only a whole-batch failure is an outer
+/// error.
 async fn fetch_governance_multicall_raw(
-    pool: &QueryRpcPool,
-    multicall_address: Address,
+    chain_route: &crate::RpcChainRoute,
+    http: &HttpContext,
     calls: Vec<(Address, Bytes)>,
-) -> Result<Vec<IMulticall3::Result>> {
-    let mut last_error = None;
-    for _ in 0..pool.len() {
-        let Some(handle) = pool.random_provider() else {
-            break;
-        };
-        let mut multicall = handle
-            .provider
-            .multicall()
-            .dynamic::<GovernanceStaking::votingPowerCall>()
-            .address(multicall_address);
-        for (target, call) in calls.iter().cloned() {
-            multicall = multicall.add_call_dynamic(CallItem::new(target, call));
-        }
-        let request = multicall.to_try_aggregate_request(false);
-        match timeout(GOVERNANCE_RPC_TIMEOUT, handle.provider.call(request)).await {
-            Ok(Ok(output)) => {
-                match IMulticall3::tryAggregateCall::abi_decode_returns_validate(&output) {
-                    Ok(values) => return Ok(values),
-                    Err(error) => {
-                        pool.mark_bad_provider(&handle);
-                        last_error = Some(eyre!(
-                            "governance participation response decoding failed: {error}"
-                        ));
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("governance participation multicall failed: {error}"));
-            }
-            Err(_) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("governance participation multicall timed out"));
-            }
-        }
+    caller: &'static str,
+) -> Result<Vec<std::result::Result<Bytes, RpcBrokerError>>> {
+    let results = http
+        .rpc_broker()
+        .submit_eth_calls(
+            RpcRoute::from(chain_route.clone()),
+            calls,
+            WalletRpcOrigin::Governance.into(),
+        )
+        .await
+        .map_err(|error| eyre!("{caller} multicall failed: {error}"))?;
+    if let Some(error) = total_failure(&results) {
+        return Err(eyre!("{caller} multicall failed: {error}"));
     }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
+    Ok(results)
 }
 
 /// Derive a proposal's complete lifecycle status from immutable on-chain fields, deployed rules,
@@ -1080,12 +1039,12 @@ pub async fn fetch_governance_overview(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let (query_rpc_pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let mut targets = vec![(GovernanceContractVersion::V2, contracts.voting)];
     if let Some(address) = contracts.voting_legacy {
         targets.push((GovernanceContractVersion::V1, address));
     }
-    let summaries = fetch_contract_summaries(&query_rpc_pool, multicall_address, &targets).await?;
+    let summaries = fetch_contract_summaries(&chain_route, http, &targets).await?;
     let v2 = summaries[0].clone();
     let v1 = summaries.get(1).cloned();
     Ok(Some(GovernanceOverview { chain_id, v2, v1 }))
@@ -1193,9 +1152,8 @@ pub async fn fetch_governance_page(
         return Ok(Vec::new());
     }
 
-    let (query_rpc_pool, multicall_address) =
-        provider_for_chain(overview.chain_id, effective_chain, http)?;
-    let proposals = fetch_proposal_calls(&query_rpc_pool, multicall_address, &planned).await?;
+    let chain_route = resolve_effective_chain_rpc_route(overview.chain_id, effective_chain)?;
+    let proposals = fetch_proposal_calls(&chain_route, http, &planned).await?;
     for proposal in &proposals {
         let rules = match proposal.contract_version {
             GovernanceContractVersion::V2 => &overview.v2.rules,
@@ -1222,38 +1180,23 @@ fn provider_for_chain(
     chain_id: u64,
     effective_chain: Option<&EffectiveChainConfig>,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, Address)> {
-    let defaults = ChainConfigDefaults::for_chain(chain_id)
-        .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
-    let rpc_urls = effective_rpc_urls_for_chain(&defaults, effective_chain)?;
-    let multicall_address = effective_chain
-        .map(|chain| Address::from_str(&chain.multicall_contract))
-        .transpose()
-        .wrap_err("parse effective multicall contract")?
-        .unwrap_or(defaults.multicall_contract);
+) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     Ok((
-        query_rpc_pool_with_http_client(rpc_urls, http),
-        multicall_address,
+        query_rpc_pool_with_http_client(chain_route.endpoint_urls(), http),
+        chain_route,
     ))
 }
 
 async fn fetch_contract_summaries(
-    query_rpc_pool: &QueryRpcPool,
-    multicall_address: Address,
+    chain_route: &crate::RpcChainRoute,
+    http: &HttpContext,
     targets: &[(GovernanceContractVersion, Address)],
 ) -> Result<Vec<GovernanceContractSummary>> {
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        let mut multicall = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<GovernanceVoting::proposalsLengthCall>()
-            .address(multicall_address);
-        for &(_, voting_address) in targets {
-            for call in [
+    let calls = targets
+        .iter()
+        .flat_map(|&(_, voting_address)| {
+            [
                 GovernanceVoting::proposalsLengthCall {}.abi_encode(),
                 GovernanceVoting::PROPOSAL_SPONSOR_THRESHOLDCall {}.abi_encode(),
                 GovernanceVoting::QUORUMCall {}.abi_encode(),
@@ -1263,296 +1206,175 @@ async fn fetch_contract_summaries(
                 GovernanceVoting::VOTING_NAY_END_OFFSETCall {}.abi_encode(),
                 GovernanceVoting::EXECUTION_START_OFFSETCall {}.abi_encode(),
                 GovernanceVoting::EXECUTION_END_OFFSETCall {}.abi_encode(),
-            ] {
-                multicall = multicall.add_call_dynamic(CallItem::new(voting_address, call.into()));
-            }
-        }
-        let request = multicall.to_try_aggregate_request(false);
-        match timeout(
-            GOVERNANCE_RPC_TIMEOUT,
-            provider_handle.provider.call(request),
-        )
-        .await
-        {
-            Ok(Ok(output)) => {
-                let values =
-                    match IMulticall3::tryAggregateCall::abi_decode_returns_validate(&output) {
-                        Ok(values) => values,
-                        Err(error) => {
-                            query_rpc_pool.mark_bad_provider(&provider_handle);
-                            last_error = Some(eyre!(
-                                "governance metadata response decoding failed: {error}"
-                            ));
-                            continue;
-                        }
-                    };
-                let expected = targets.len() * 9;
-                if values.len() != expected {
-                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                    last_error = Some(eyre!(
-                        "governance metadata multicall returned {}, expected {}",
-                        values.len(),
-                        expected
+            ]
+            .into_iter()
+            .map(move |call| (voting_address, call.into()))
+        })
+        .collect();
+    let values =
+        fetch_governance_multicall_raw(chain_route, http, calls, "governance overview").await?;
+    let mut summaries = Vec::with_capacity(targets.len());
+    for (target_index, &(version, address)) in targets.iter().enumerate() {
+        let fields = &values[target_index * 9..target_index * 9 + 9];
+        let mut decoded = Vec::with_capacity(9);
+        for (field_index, field) in fields.iter().enumerate() {
+            let Ok(return_data) = field else {
+                return Err(eyre!(
+                    "governance {version:?} metadata call {field_index} failed"
+                ));
+            };
+            match <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_decode_validate(return_data) {
+                Ok(value) => decoded.push(value),
+                Err(error) => {
+                    return Err(eyre!(
+                        "governance {version:?} metadata call {field_index} ABI decode failed: {error}"
                     ));
-                    continue;
                 }
-                let mut summaries = Vec::with_capacity(targets.len());
-                let mut failed = None;
-                for (target_index, &(version, address)) in targets.iter().enumerate() {
-                    let fields = &values[target_index * 9..target_index * 9 + 9];
-                    let mut decoded = Vec::with_capacity(9);
-                    for (field_index, field) in fields.iter().enumerate() {
-                        if !field.success {
-                            failed = Some(eyre!(
-                                "governance {version:?} metadata call {field_index} failed"
-                            ));
-                            break;
-                        }
-                        match <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_decode_validate(&field.returnData) {
-                            Ok(value) => decoded.push(value),
-                            Err(error) => {
-                                failed = Some(eyre!(
-                                    "governance {version:?} metadata call {field_index} ABI decode failed: {error}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    if failed.is_some() {
-                        break;
-                    }
-                    let rules = GovernanceContractRules {
-                        sponsor_threshold: decoded[1],
-                        quorum: decoded[2],
-                        sponsor_window: decoded[3],
-                        voting_start_offset: decoded[4],
-                        voting_yay_end_offset: decoded[5],
-                        voting_nay_end_offset: decoded[6],
-                        execution_start_offset: decoded[7],
-                        execution_end_offset: decoded[8],
-                    };
-                    if let Err(error) = rules.validate() {
-                        failed = Some(error);
-                        break;
-                    }
-                    summaries.push(GovernanceContractSummary {
-                        version,
-                        address,
-                        proposal_count: decoded[0],
-                        rules,
-                    });
-                }
-                if let Some(error) = failed {
-                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                    last_error = Some(error);
-                    continue;
-                }
-                return Ok(summaries);
-            }
-            Ok(Err(error)) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("governance metadata multicall failed: {error}"));
-            }
-            Err(_) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("governance metadata multicall timed out"));
             }
         }
+        let rules = GovernanceContractRules {
+            sponsor_threshold: decoded[1],
+            quorum: decoded[2],
+            sponsor_window: decoded[3],
+            voting_start_offset: decoded[4],
+            voting_yay_end_offset: decoded[5],
+            voting_nay_end_offset: decoded[6],
+            execution_start_offset: decoded[7],
+            execution_end_offset: decoded[8],
+        };
+        rules.validate()?;
+        summaries.push(GovernanceContractSummary {
+            version,
+            address,
+            proposal_count: decoded[0],
+            rules,
+        });
     }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
+    Ok(summaries)
 }
 
 async fn fetch_proposal_calls(
-    query_rpc_pool: &QueryRpcPool,
-    multicall_address: Address,
+    chain_route: &crate::RpcChainRoute,
+    http: &HttpContext,
     planned: &[(GovernanceContractVersion, Address, U256)],
 ) -> Result<Vec<GovernanceProposal>> {
-    let expected_results = planned
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| eyre!("governance proposal/action result count overflows"))?;
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
+    let calls = planned
+        .iter()
+        .flat_map(|(_, address, index)| {
+            [
+                (
+                    *address,
+                    GovernanceVoting::proposalsCall { index: *index }
+                        .abi_encode()
+                        .into(),
+                ),
+                (
+                    *address,
+                    GovernanceVoting::getActionsCall { id: *index }
+                        .abi_encode()
+                        .into(),
+                ),
+            ]
+        })
+        .collect();
+    let values =
+        fetch_governance_multicall_raw(chain_route, http, calls, "governance proposal").await?;
+    let mut proposals = Vec::with_capacity(planned.len());
+    for (position, (version, address, index)) in planned.iter().enumerate() {
+        let proposal_result = &values[position * 2];
+        let action_result = &values[position * 2 + 1];
+        let Ok(proposal_return_data) = proposal_result else {
+            return Err(eyre!(
+                "governance {version:?} proposal call failed at index {index}"
+            ));
         };
-        let mut multicall = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<GovernanceVoting::proposalsCall>()
-            .address(multicall_address);
-        for (_, address, index) in planned {
-            multicall = multicall.add_call_dynamic(CallItem::new(
-                *address,
-                GovernanceVoting::proposalsCall { index: *index }
-                    .abi_encode()
-                    .into(),
-            ));
-            multicall = multicall.add_call_dynamic(CallItem::new(
-                *address,
-                GovernanceVoting::getActionsCall { id: *index }
-                    .abi_encode()
-                    .into(),
-            ));
+        let proposal = match version {
+            GovernanceContractVersion::V2 => {
+                GovernanceVotingV2::proposalsCall::abi_decode_returns_validate(proposal_return_data)
+                    .map(|proposal| GovernanceProposal {
+                        contract_version: *version,
+                        index: *index,
+                        contract_address: *address,
+                        proposer: proposal.proposer,
+                        proposal_document: proposal.proposalDocument,
+                        publish_time: proposal.publishTime,
+                        vote_call_time: proposal.voteCallTime,
+                        sponsorship: proposal.sponsorship,
+                        executed: proposal.executed,
+                        yay_votes: proposal.yayVotes,
+                        nay_votes: proposal.nayVotes,
+                        sponsor_snapshot_interval: proposal.sponsorInterval,
+                        voting_snapshot_interval: proposal.votingInterval,
+                        actions: Vec::new(),
+                    })
+                    .map_err(|_| eyre!("ABI decoding failed"))
+            }
+            GovernanceContractVersion::V1 => {
+                GovernanceVoting::proposalsCall::abi_decode_returns_validate(proposal_return_data)
+                    .map(|proposal| GovernanceProposal {
+                        contract_version: *version,
+                        index: *index,
+                        contract_address: *address,
+                        proposer: proposal.proposer,
+                        proposal_document: proposal.proposalDocument,
+                        publish_time: proposal.publishTime,
+                        vote_call_time: proposal.voteCallTime,
+                        sponsorship: proposal.sponsorship,
+                        executed: proposal.executed,
+                        yay_votes: proposal.yayVotes,
+                        nay_votes: proposal.nayVotes,
+                        sponsor_snapshot_interval: proposal.sponsorInterval,
+                        voting_snapshot_interval: proposal.votingInterval,
+                        actions: Vec::new(),
+                    })
+                    .map_err(|_| eyre!("ABI decoding failed"))
+            }
         }
-        let request = multicall.to_try_aggregate_request(false);
-        match timeout(
-            GOVERNANCE_RPC_TIMEOUT,
-            provider_handle.provider.call(request),
+        .map_err(|_| {
+            eyre!("governance {version:?} proposal return decoding failed at index {index}")
+        })?;
+        let Ok(action_return_data) = action_result else {
+            return Err(eyre!(
+                "governance {version:?} getActions call failed at index {index}"
+            ));
+        };
+        let actions = GovernanceVoting::getActionsCall::abi_decode_returns_validate(
+            action_return_data,
         )
-        .await
-        {
-            Ok(Ok(output)) => {
-                let Ok(values) =
-                    IMulticall3::tryAggregateCall::abi_decode_returns_validate(&output)
-                else {
-                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                    last_error = Some(eyre!(
-                        "governance proposal multicall response decoding failed"
-                    ));
-                    continue;
-                };
-                if values.len() != expected_results {
-                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                    last_error = Some(eyre!(
-                        "governance proposal/action multicall returned {} results, expected {}",
-                        values.len(),
-                        expected_results
-                    ));
-                    continue;
-                }
-                let mut proposals = Vec::with_capacity(planned.len());
-                for (position, (version, address, index)) in planned.iter().enumerate() {
-                    let proposal_result = &values[position * 2];
-                    let action_result = &values[position * 2 + 1];
-                    if !proposal_result.success {
-                        query_rpc_pool.mark_bad_provider(&provider_handle);
-                        last_error = Some(eyre!(
-                            "governance {version:?} proposal call failed at index {index}"
-                        ));
-                        proposals.clear();
-                        break;
-                    }
-                    let proposal = match version {
-                        GovernanceContractVersion::V2 => {
-                            GovernanceVotingV2::proposalsCall::abi_decode_returns_validate(
-                                &proposal_result.returnData,
-                            )
-                            .map(|proposal| GovernanceProposal {
-                                contract_version: *version,
-                                index: *index,
-                                contract_address: *address,
-                                proposer: proposal.proposer,
-                                proposal_document: proposal.proposalDocument,
-                                publish_time: proposal.publishTime,
-                                vote_call_time: proposal.voteCallTime,
-                                sponsorship: proposal.sponsorship,
-                                executed: proposal.executed,
-                                yay_votes: proposal.yayVotes,
-                                nay_votes: proposal.nayVotes,
-                                sponsor_snapshot_interval: proposal.sponsorInterval,
-                                voting_snapshot_interval: proposal.votingInterval,
-                                actions: Vec::new(),
-                            })
-                            .map_err(|_| eyre!("ABI decoding failed"))
-                        }
-                        GovernanceContractVersion::V1 => {
-                            GovernanceVoting::proposalsCall::abi_decode_returns_validate(
-                                &proposal_result.returnData,
-                            )
-                            .map(|proposal| GovernanceProposal {
-                                contract_version: *version,
-                                index: *index,
-                                contract_address: *address,
-                                proposer: proposal.proposer,
-                                proposal_document: proposal.proposalDocument,
-                                publish_time: proposal.publishTime,
-                                vote_call_time: proposal.voteCallTime,
-                                sponsorship: proposal.sponsorship,
-                                executed: proposal.executed,
-                                yay_votes: proposal.yayVotes,
-                                nay_votes: proposal.nayVotes,
-                                sponsor_snapshot_interval: proposal.sponsorInterval,
-                                voting_snapshot_interval: proposal.votingInterval,
-                                actions: Vec::new(),
-                            })
-                            .map_err(|_| eyre!("ABI decoding failed"))
-                        }
-                    };
-                    let Ok(proposal) = proposal else {
-                        query_rpc_pool.mark_bad_provider(&provider_handle);
-                        last_error = Some(eyre!(
-                            "governance {version:?} proposal return decoding failed at index {index}"
-                        ));
-                        proposals.clear();
-                        break;
-                    };
-                    if !action_result.success {
-                        query_rpc_pool.mark_bad_provider(&provider_handle);
-                        last_error = Some(eyre!(
-                            "governance {version:?} getActions call failed at index {index}"
-                        ));
-                        proposals.clear();
-                        break;
-                    }
-                    let actions =
-                        match GovernanceVoting::getActionsCall::abi_decode_returns_validate(
-                            &action_result.returnData,
-                        ) {
-                            Ok(actions) => actions
-                                .into_iter()
-                                .map(
-                                    |(call_contract, calldata, value)| GovernanceProposalAction {
-                                        call_contract,
-                                        calldata,
-                                        value,
-                                    },
-                                )
-                                .collect(),
-                            Err(error) => {
-                                query_rpc_pool.mark_bad_provider(&provider_handle);
-                                last_error = Some(eyre!(
-                                    "governance {version:?} getActions return decoding failed at index {index}: {error}"
-                                ));
-                                proposals.clear();
-                                break;
-                            }
-                        };
-                    let proposal = GovernanceProposal {
-                        actions,
-                        ..proposal
-                    };
-                    proposals.push(proposal);
-                }
-                if proposals.len() == planned.len() {
-                    return Ok(proposals);
-                }
-            }
-            Ok(Err(error)) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("governance proposal multicall failed: {error}"));
-            }
-            Err(_) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!(
-                    "governance proposal multicall timed out after {} milliseconds",
-                    GOVERNANCE_RPC_TIMEOUT.as_millis()
-                ));
-            }
-        }
+        .map_err(|error| {
+            eyre!(
+                "governance {version:?} getActions return decoding failed at index {index}: {error}"
+            )
+        })?
+        .into_iter()
+        .map(
+            |(call_contract, calldata, value)| GovernanceProposalAction {
+                call_contract,
+                calldata,
+                value,
+            },
+        )
+        .collect();
+        proposals.push(GovernanceProposal {
+            actions,
+            ..proposal
+        });
     }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
+    Ok(proposals)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{RpcChainRoute, RpcRevert};
+
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
     use std::sync::mpsc;
     use std::thread;
 
     use alloy::primitives::address;
-    use alloy::providers::Failure;
+    use alloy::providers::bindings::IMulticall3;
+    use reqwest::Url;
     use serde_json::{Value, json};
 
     use super::*;
@@ -1567,9 +1389,15 @@ mod tests {
 
     struct ParticipationFixture {
         url: String,
-        calls: mpsc::Receiver<Vec<usize>>,
+        calls: mpsc::Receiver<ParticipationObservation>,
         shutdown: mpsc::Sender<()>,
         task: thread::JoinHandle<()>,
+    }
+
+    struct ParticipationObservation {
+        aggregate_call_counts: Vec<usize>,
+        individual_request_count: usize,
+        later_high_level_chunks: usize,
     }
 
     #[derive(Clone, Copy)]
@@ -1621,9 +1449,11 @@ mod tests {
         let (calls_tx, calls_rx) = mpsc::channel();
         let task = thread::spawn(move || {
             let mut page_calls = Vec::new();
-            for _ in 0..2 {
+            let mut application_calls = 0;
+            while application_calls < 2 {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let request = read_request(&mut stream);
+                application_calls += 1;
                 let call_data = request["params"][0]
                     .get("input")
                     .or_else(|| request["params"][0].get("data"))
@@ -1845,10 +1675,7 @@ mod tests {
         let (calls_tx, calls_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let task = thread::spawn(move || {
-            let serve = |mut stream: std::net::TcpStream,
-                         expected_calls: usize,
-                         returned_results: usize|
-             -> usize {
+            let serve = |mut stream: std::net::TcpStream, request_number: usize| {
                 let request = read_request(&mut stream);
                 let call_data = request["params"][0]
                     .get("input")
@@ -1857,16 +1684,37 @@ mod tests {
                     .expect("eth_call data")
                     .parse::<alloy::primitives::Bytes>()
                     .expect("call bytes");
-                let decoded = IMulticall3::tryAggregateCall::abi_decode(&call_data)
-                    .expect("tryAggregate calldata");
-                assert_eq!(decoded.calls.len(), expected_calls);
+                let Ok(decoded) = IMulticall3::tryAggregateCall::abi_decode(&call_data) else {
+                    let body = serde_json::to_string(&json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32099, "message": "individual recovery failure"}
+                    }))
+                    .expect("serialize individual recovery response");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write individual recovery response");
+                    return None;
+                };
+                let call_count = decoded.calls.len();
                 let target = request["params"][0]["to"]
                     .as_str()
                     .expect("multicall target")
                     .parse::<Address>()
                     .expect("multicall address");
                 assert_eq!(target, MULTICALL);
-                let returns = if returned_results == expected_calls {
+                let later_high_level_chunk = decoded.calls.iter().any(|call| {
+                    GovernanceStaking::votingPowerCall::abi_decode(&call.callData)
+                        .is_ok_and(|decoded| decoded.owner == Address::from([11_u8; 20]))
+                });
+                if request_number >= 2 {
+                    let body = serde_json::to_string(&json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32099, "message": "reduction failure"}
+                    }))
+                    .expect("serialize reduction response");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write reduction response");
+                    return Some((call_count, later_high_level_chunk));
+                }
+                let returned_results = if request_number == 1 { 54 } else { call_count };
+                let returns = if returned_results == call_count {
                     (0..returned_results)
                         .map(|_| IMulticall3::Result {
                             success: true,
@@ -1880,7 +1728,12 @@ mod tests {
                 } else {
                     let templates = encoded_participation_values();
                     (0..returned_results)
-                        .map(|index| templates[index % templates.len()].clone())
+                        .map(|index| IMulticall3::Result {
+                            success: true,
+                            returnData: templates[index % templates.len()]
+                                .clone()
+                                .expect("participation template"),
+                        })
                         .collect()
                 };
                 let response_data = IMulticall3::tryAggregateCall::abi_encode_returns(&returns);
@@ -1896,26 +1749,32 @@ mod tests {
                     body.len()
                 )
                 .expect("write fixture response");
-                expected_calls
+                Some((call_count, later_high_level_chunk))
             };
-
-            let mut call_counts = Vec::new();
-            let (stream, _) = listener.accept().expect("accept snapshot request");
-            call_counts.push(serve(stream, 11, 11));
-            let (stream, _) = listener.accept().expect("accept participation request");
-            call_counts.push(serve(stream, 60, 54));
 
             listener
                 .set_nonblocking(true)
                 .expect("set fixture listener nonblocking");
+            let mut aggregate_call_counts = Vec::new();
+            let mut individual_request_count = 0;
+            let mut later_high_level_chunks = 0;
+            let mut request_number = 0;
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     break;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        call_counts.push(serve(stream, 6, 12));
-                        break;
+                        if let Some((count, later_high_level_chunk)) = serve(stream, request_number)
+                        {
+                            request_number += 1;
+                            aggregate_call_counts.push(count);
+                            if later_high_level_chunk {
+                                later_high_level_chunks += 1;
+                            }
+                        } else {
+                            individual_request_count += 1;
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         match shutdown_rx.recv_timeout(Duration::from_millis(10)) {
@@ -1926,7 +1785,13 @@ mod tests {
                     Err(error) => panic!("accept fixture request: {error}"),
                 }
             }
-            calls_tx.send(call_counts).expect("send fixture calls");
+            calls_tx
+                .send(ParticipationObservation {
+                    aggregate_call_counts,
+                    individual_request_count,
+                    later_high_level_chunks,
+                })
+                .expect("send fixture calls");
         });
         ParticipationFixture {
             url,
@@ -1949,8 +1814,8 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
-        effective_chain.rpc_endpoints = vec![url];
-        effective_chain.multicall_contract = MULTICALL.to_string();
+        effective_chain.rpc_route =
+            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
 
         let overview = fetch_governance_overview(1, Some(effective_chain), &http)
@@ -2029,8 +1894,8 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
-        effective_chain.rpc_endpoints = vec![url];
-        effective_chain.multicall_contract = MULTICALL.to_string();
+        effective_chain.rpc_route =
+            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
 
         let overview = fetch_governance_overview(1, Some(effective_chain), &http)
@@ -2070,8 +1935,8 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
-        effective_chain.rpc_endpoints = vec![url];
-        effective_chain.multicall_contract = MULTICALL.to_string();
+        effective_chain.rpc_route =
+            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
         let overview = fetch_governance_overview(1, Some(effective_chain), &http)
             .await
@@ -2094,11 +1959,12 @@ mod tests {
     #[tokio::test]
     async fn page_rejects_failed_malformed_and_wrong_count_actions() {
         let failed = action_fault_page_error(ActionFault::Failed).await;
-        assert!(failed.contains("getActions call failed at index"));
+        assert!(failed.contains("governance V2 getActions call failed at index"));
         let malformed = action_fault_page_error(ActionFault::Malformed).await;
-        assert!(malformed.contains("getActions return decoding failed at index"));
+        assert!(malformed.contains("governance V2 getActions return decoding failed at index"));
         let wrong_count = action_fault_page_error(ActionFault::WrongCount).await;
-        assert!(wrong_count.contains("returned 5 results, expected 6"));
+        assert!(wrong_count.contains("governance proposal multicall failed"));
+        assert!(wrong_count.contains("invalid RPC response"));
     }
 
     fn stage_test_proposal() -> GovernanceProposal {
@@ -2312,8 +2178,8 @@ mod tests {
         }
     }
 
-    fn encoded_participation_values() -> Vec<IMulticall3::Result> {
-        let encoded: Vec<std::result::Result<Bytes, Failure>> = vec![
+    fn encoded_participation_values() -> Vec<std::result::Result<Bytes, RpcBrokerError>> {
+        vec![
             Ok(
                 <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
                     &U256::from(40),
@@ -2357,14 +2223,7 @@ mod tests {
                 },
             )
             .into()),
-        ];
-        encoded
-            .into_iter()
-            .map(|result| IMulticall3::Result {
-                success: result.is_ok(),
-                returnData: result.unwrap_or_default(),
-            })
-            .collect()
+        ]
     }
 
     #[tokio::test]
@@ -2374,8 +2233,8 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
-        effective_chain.rpc_endpoints = vec![fixture.url.clone()];
-        effective_chain.multicall_contract = MULTICALL.to_string();
+        effective_chain.rpc_route = RpcChainRoute::new(1, vec![Url::parse(&fixture.url).unwrap()])
+            .with_multicall(MULTICALL);
         let accounts: Vec<_> = (1_u8..=11)
             .map(|marker| Address::from([marker; 20]))
             .collect();
@@ -2389,11 +2248,19 @@ mod tests {
         )
         .await
         .expect_err("short participation batch should be rejected");
-        assert!(error.to_string().contains("returned 54, expected 60"));
+        let error = error.to_string();
+        assert!(error.contains("governance participation multicall failed"));
+        assert!(error.contains(&RpcBrokerError::InvalidResponse.to_string()));
 
         fixture.shutdown.send(()).expect("stop fixture");
-        let call_counts = fixture.calls.recv().expect("fixture calls");
-        assert_eq!(call_counts, vec![11, 60]);
+        let ParticipationObservation {
+            aggregate_call_counts,
+            individual_request_count,
+            later_high_level_chunks,
+        } = fixture.calls.recv().expect("fixture calls");
+        assert_eq!(aggregate_call_counts, [11, 60]);
+        assert_eq!(individual_request_count, 0);
+        assert_eq!(later_high_level_chunks, 0);
         fixture.task.join().expect("fixture task");
     }
 
@@ -2427,20 +2294,24 @@ mod tests {
         let proposal = participation_proposal(GovernanceContractVersion::V2);
         let account = Address::from([3_u8; 20]);
         let mut values = encoded_participation_values();
-        values[1].returnData = GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
-            &GovernanceStaking::accountSnapshotAtReturn {
-                interval: U256::from(10),
-                votingPower: U256::from(17),
-            },
-        )
-        .into();
-        values[2].returnData = GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
-            &GovernanceStaking::accountSnapshotAtReturn {
-                interval: U256::from(12),
-                votingPower: U256::from(24),
-            },
-        )
-        .into();
+        values[1] = Ok(
+            GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                &GovernanceStaking::accountSnapshotAtReturn {
+                    interval: U256::from(10),
+                    votingPower: U256::from(17),
+                },
+            )
+            .into(),
+        );
+        values[2] = Ok(
+            GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                &GovernanceStaking::accountSnapshotAtReturn {
+                    interval: U256::from(12),
+                    votingPower: U256::from(24),
+                },
+            )
+            .into(),
+        );
         let row = decode_governance_participation(
             &proposal,
             proposal.contract_address,
@@ -2463,13 +2334,15 @@ mod tests {
         assert_eq!(row.voting_snapshot.voting_power, U256::from(24));
         assert_eq!(row.voting_snapshot.hint, U256::from(5));
 
-        values[1].returnData = GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
-            &GovernanceStaking::accountSnapshotAtReturn {
-                interval: U256::from(7),
-                votingPower: U256::from(17),
-            },
-        )
-        .into();
+        values[1] = Ok(
+            GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                &GovernanceStaking::accountSnapshotAtReturn {
+                    interval: U256::from(7),
+                    votingPower: U256::from(17),
+                },
+            )
+            .into(),
+        );
         let error = decode_governance_participation(
             &proposal,
             proposal.contract_address,
@@ -2490,7 +2363,9 @@ mod tests {
         let proposal = participation_proposal(GovernanceContractVersion::V2);
         let account = Address::from([3_u8; 20]);
         let mut values = encoded_participation_values();
-        values[4].success = false;
+        values[4] = Err(RpcBrokerError::InnerRevert(RpcRevert::from_multicall(
+            Bytes::new(),
+        )));
         let error = decode_governance_participation(
             &proposal,
             proposal.contract_address,

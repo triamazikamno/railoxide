@@ -469,7 +469,7 @@ pub async fn quote_public_action_gas_fee_bundle_with_profile(
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
         &query_rpc_pool,
         http.network_mode(),
@@ -490,7 +490,7 @@ pub async fn estimate_public_advanced_transaction(
         ));
     }
     let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let quote = public_action_gas_fee_quote_from_rpc_pool(
         &query_rpc_pool,
         http.network_mode(),
@@ -554,7 +554,7 @@ async fn estimate_public_advanced_transaction_with_fee_core(
 {
     let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())
         .map_err(|_| unavailable_simulation_error("RPC providers are unavailable."))?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let mut tx_req =
         public_send_transaction_request(request.chain_id, request.from, &request.intent)
             .map_err(|error| unavailable_simulation_error(&error.to_string()))?
@@ -853,7 +853,7 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
     authorization_ceiling: Option<PublicActionGasFeeSelection>,
 ) -> Result<U256> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let quote_bundle = public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
         &query_rpc_pool,
         http.network_mode(),

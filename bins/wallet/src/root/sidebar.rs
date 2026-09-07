@@ -43,17 +43,6 @@ pub(super) enum Activity {
     Settings,
 }
 
-#[cfg(test)]
-pub(super) const fn sidebar_primary_activity_order() -> [Activity; 5] {
-    [
-        Activity::Wallet,
-        Activity::Broadcaster,
-        Activity::AddressBook,
-        Activity::Proposals,
-        Activity::Settings,
-    ]
-}
-
 impl WalletRoot {
     pub(super) fn render_sidebar(
         &self,

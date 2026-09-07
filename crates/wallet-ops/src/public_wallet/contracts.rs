@@ -17,8 +17,4 @@ sol! {
         function allowance(address owner, address spender) external view returns (uint256);
         function transfer(address recipient, uint256 amount) external returns (bool);
     }
-
-    interface Multicall3Balance {
-        function getEthBalance(address addr) external view returns (uint256);
-    }
 }

@@ -2,22 +2,21 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::SystemTime;
 
-use alloy::primitives::{Address, U256};
-use alloy::providers::{CallItem, Provider};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
 use eyre::{Result, eyre};
-use railgun_ui::{chain_name, known_tokens_for_chain};
+use railgun_ui::known_tokens_for_chain;
 
-use super::contracts::{Multicall3Balance, PublicErc20};
+use super::contracts::PublicErc20;
 use super::runtime::public_chain_runtime_config;
 use super::types::{
     PlannedPublicBalanceCall, PublicAccountBalance, PublicAssetId, PublicBalanceAmount,
     PublicBalanceAsset, PublicBalanceEntry, PublicBalanceSnapshot,
 };
-use crate::http::redact_url_for_display;
+use crate::rpc_broker::total_failure;
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry};
 use crate::vault::PublicAccountMetadata;
-use crate::{HttpContext, query_rpc_pool_with_http_client};
+use crate::{HttpContext, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
 
 const PUBLIC_BALANCE_REFRESH_INTERVAL_SECS: u64 = 60;
 
@@ -70,7 +69,6 @@ pub(super) fn public_balance_assets_for_chain_with_registry(
 
 pub(super) fn plan_public_balance_calls(
     chain_id: u64,
-    multicall_addr: Address,
     accounts: &[PublicAccountMetadata],
     token_registry: Option<&EffectiveTokenRegistry>,
 ) -> Vec<PlannedPublicBalanceCall> {
@@ -78,28 +76,21 @@ pub(super) fn plan_public_balance_calls(
     let mut calls = Vec::with_capacity(accounts.len().saturating_mul(assets.len()));
     for account in accounts {
         for asset in &assets {
-            let (target, data) = match asset.id {
-                PublicAssetId::Native => (
-                    multicall_addr,
-                    Multicall3Balance::getEthBalanceCall {
-                        addr: account.address,
-                    }
-                    .abi_encode(),
-                ),
-                PublicAssetId::Erc20(token) => (
+            let read = match asset.id {
+                PublicAssetId::Native => RpcRead::get_balance(account.address),
+                PublicAssetId::Erc20(token) => RpcRead::eth_call(
                     token,
                     PublicErc20::balanceOfCall {
                         account: account.address,
                     }
-                    .abi_encode(),
+                    .abi_encode()
+                    .into(),
                 ),
             };
             calls.push(PlannedPublicBalanceCall {
                 public_account_uuid: account.public_account_uuid.clone(),
-                account: account.address,
                 asset: asset.clone(),
-                target,
-                data,
+                read,
             });
         }
     }
@@ -114,64 +105,53 @@ pub async fn refresh_public_balances(
     http: &HttpContext,
 ) -> Result<PublicBalanceSnapshot> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let chain_label =
-        chain_name(chain_id).map_or_else(|| format!("chain {chain_id}"), str::to_string);
-    let multicall_contract = chain.multicall_contract;
-    let planned_calls =
-        plan_public_balance_calls(chain_id, multicall_contract, accounts, token_registry);
+    let planned_calls = plan_public_balance_calls(chain_id, accounts, token_registry);
     if planned_calls.is_empty() {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
 
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let mut last_error = None;
-    let mut results = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        let mut multicall = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<PublicErc20::balanceOfCall>()
-            .address(multicall_contract);
-        for call in &planned_calls {
-            multicall =
-                multicall.add_call_dynamic(CallItem::new(call.target, call.data.clone().into()));
-        }
-
-        match multicall.try_aggregate(false).await {
-            Ok(values) => {
-                results = Some(values);
-                break;
-            }
-            Err(error) => {
-                let rpc = redact_url_for_display(&provider_handle.url);
-                tracing::warn!(%error, %rpc, "refresh public balances multicall failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("{error}"));
-            }
-        }
-    }
-    let results = results.ok_or_else(|| {
-        let account_suffix = if accounts.len() == 1 { "" } else { "s" };
-        let call_suffix = if planned_calls.len() == 1 { "" } else { "s" };
-        let detail = last_error.map_or_else(
-            || "no healthy query RPC available".to_string(),
-            |error| error.to_string(),
+    let route = RpcRoute::from(chain.rpc_route);
+    let reads = planned_calls.iter().map(|call| call.read.clone()).collect();
+    let results = http
+        .rpc_broker()
+        .submit(RpcSubmission::new(
+            route,
+            reads,
+            WalletRpcOrigin::PublicWallet.into(),
+        ))
+        .await
+        .map_err(|error| eyre!("RPC broker balance submission failed: {error}"))?;
+    if let Some(error) = total_failure(&results) {
+        tracing::warn!(
+            chain_id,
+            account_count = accounts.len(),
+            member_count = results.len(),
+            failure_class = ?error.failure_class(),
+            "public balance RPC request failed for all members"
         );
-        eyre!(
-            "could not refresh public balances on {chain_label}: Multicall3 request to configured RPCs ({multicall_contract:#x}) failed for {} account{account_suffix} and {} balance call{call_suffix}: {detail}",
-            accounts.len(),
-            planned_calls.len(),
-        )
-    })?;
+        return Err(eyre!(
+            "public balance RPC request failed for all members: {error}"
+        ));
+    }
+    tracing::debug!(
+        chain_id,
+        account_count = accounts.len(),
+        member_count = results.len(),
+        "public balance RPC refresh completed"
+    );
     Ok(public_balance_snapshot_from_results(
         chain_id,
         accounts,
         &planned_calls,
-        results.into_iter().map(std::result::Result::ok).collect(),
+        results
+            .into_iter()
+            .map(|result| result.as_ref().ok().and_then(decode_public_balance))
+            .collect(),
     ))
+}
+
+fn decode_public_balance(bytes: &Bytes) -> Option<U256> {
+    PublicErc20::balanceOfCall::abi_decode_returns_validate(bytes).ok()
 }
 
 pub(super) fn public_balance_snapshot_from_results(

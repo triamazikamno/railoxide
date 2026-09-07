@@ -355,7 +355,7 @@ pub struct WakuDirectPeerSetting {
 pub struct EffectiveChainConfig {
     pub chain_id: u64,
     pub enabled: bool,
-    pub rpc_endpoints: Vec<String>,
+    pub rpc_route: crate::RpcChainRoute,
     pub sponsored_bundle_relays: Vec<SensitiveUrl>,
     pub archive_rpc_url: Option<String>,
     pub quick_sync_enabled: bool,
@@ -371,7 +371,6 @@ pub struct EffectiveChainConfig {
     pub relay_adapt_contract: String,
     pub relay_adapt_7702_contract: String,
     pub wrapped_native_token: Option<String>,
-    pub multicall_contract: String,
     pub coinbase_payer: Option<Address>,
     pub finality_depth: u64,
     pub block_time: Duration,

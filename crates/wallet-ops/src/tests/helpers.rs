@@ -44,7 +44,7 @@ pub(super) use crate::{
     DesktopNativeTopUpPlan, DesktopWalletChainStart, DesktopWalletSyncStartPolicy, FeeHandlingMode,
     ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
     PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
-    RAILGUN_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
+    RAILGUN_PROTOCOL_FEE_BPS, RpcChainRoute, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
     SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput, UtxoPpoiState,
     WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome,
     apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
@@ -141,7 +141,14 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
     crate::settings::EffectiveChainConfig {
         chain_id,
         enabled: true,
-        rpc_endpoints,
+        rpc_route: RpcChainRoute::new(
+            chain_id,
+            rpc_endpoints
+                .into_iter()
+                .map(|endpoint| reqwest::Url::parse(&endpoint).expect("RPC URL"))
+                .collect(),
+        )
+        .with_multicall(defaults.multicall_contract),
         sponsored_bundle_relays: crate::settings::default_sponsored_bundle_relays(chain_id),
         archive_rpc_url: None,
         quick_sync_enabled: true,
@@ -161,7 +168,6 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: wrapped_native_token_for_chain(chain_id)
             .map(|token| token.to_string()),
-        multicall_contract: defaults.multicall_contract.to_string(),
         coinbase_payer: crate::settings::default_coinbase_payer(chain_id),
         finality_depth: defaults.finality_depth,
         block_time: defaults.block_time,

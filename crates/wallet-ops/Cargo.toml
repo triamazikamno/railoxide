@@ -18,7 +18,7 @@ name = "hardware_derivation_probe"
 required-features = ["hardware"]
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers"] }
+alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers", "json-rpc"] }
 alloy-signer = { workspace = true }
 arti-client = { workspace = true, features = ["onion-service-client"] }
 argon2 = { workspace = true }

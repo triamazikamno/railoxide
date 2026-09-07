@@ -1,6 +1,5 @@
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider as _;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
@@ -21,7 +20,10 @@ use super::types::{
     PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent,
 };
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, ShieldSendOutput, query_rpc_pool_with_http_client, report_chain_string};
+use crate::{
+    HttpContext, RpcChainRoute, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
+    query_rpc_pool_with_http_client, report_chain_string,
+};
 
 pub async fn submit_public_send(
     request: PublicSendRequest,
@@ -96,7 +98,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         dynamic_gas_preflight,
         gas_fee,
     )?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let tx_req = public_send_transaction_request(chain_id, from_address, intent)?;
     let tx = submit_public_action_step_session(
         step,
@@ -107,7 +109,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         operation_label,
         query_rpc_pool,
         chain.finality_depth,
-        http.network_mode(),
+        http,
         chain_id,
         from_address,
         &chain.gas,
@@ -296,7 +298,7 @@ pub async fn submit_public_shield_with_progress(
     .wrap_err("build public shield calldata")?;
 
     let from_address = signer.address();
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
 
     let approval_required = if request.asset == PublicAssetId::Native {
         false
@@ -310,7 +312,8 @@ pub async fn submit_public_shield_with_progress(
             None,
         ));
         match query_erc20_allowance(
-            &query_rpc_pool,
+            &chain.rpc_route,
+            http,
             request.asset,
             from_address,
             chain.railgun_contract,
@@ -371,7 +374,7 @@ pub async fn submit_public_shield_with_progress(
             "public-shield-approve",
             query_rpc_pool.clone(),
             chain.finality_depth,
-            http.network_mode(),
+            http,
             request.chain_id,
             from_address,
             &chain.gas,
@@ -430,7 +433,7 @@ pub async fn submit_public_shield_with_progress(
         "public-shield",
         query_rpc_pool,
         chain.finality_depth,
-        http.network_mode(),
+        http,
         request.chain_id,
         from_address,
         &chain.gas,
@@ -480,8 +483,9 @@ pub(super) fn public_shield_approval_required(
     }
 }
 
-async fn query_erc20_allowance(
-    query_rpc_pool: &broadcaster_core::query_rpc_pool::QueryRpcPool,
+pub(super) async fn query_erc20_allowance(
+    chain_route: &RpcChainRoute,
+    http: &HttpContext,
     asset: PublicAssetId,
     owner: Address,
     spender: Address,
@@ -489,27 +493,27 @@ async fn query_erc20_allowance(
     let PublicAssetId::Erc20(token) = asset else {
         return Err(eyre!("native shield has no ERC-20 allowance"));
     };
-    let call = TransactionRequest::default()
-        .with_to(token)
-        .with_input(PublicErc20::allowanceCall { owner, spender }.abi_encode());
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        match provider_handle.provider.call(call.clone()).await {
-            Ok(output) => {
-                return PublicErc20::allowanceCall::abi_decode_returns_validate(&output)
-                    .wrap_err("decode public shield ERC-20 allowance");
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.map_or_else(
-        || eyre!("no healthy query RPC available"),
-        |error| eyre!(error),
-    ))
-    .wrap_err("query public shield ERC-20 allowance")
+    let results = http
+        .rpc_broker()
+        .submit_eth_calls(
+            RpcRoute::from(chain_route.clone()),
+            vec![(
+                token,
+                PublicErc20::allowanceCall { owner, spender }
+                    .abi_encode()
+                    .into(),
+            )],
+            WalletRpcOrigin::PublicWallet.into(),
+        )
+        .await
+        .wrap_err("query public shield ERC-20 allowance")?;
+    let output = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("missing public shield ERC-20 allowance result"))?
+        .wrap_err("query public shield ERC-20 allowance")?;
+    PublicErc20::allowanceCall::abi_decode_returns_validate(&output)
+        .wrap_err("decode public shield ERC-20 allowance")
 }
 
 pub(super) fn public_native_shield_transaction_request(

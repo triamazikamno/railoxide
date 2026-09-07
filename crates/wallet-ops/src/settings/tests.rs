@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use alloy::primitives::Address;
 use local_db::{DbConfig, DbStore};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -19,8 +22,10 @@ use super::{
     WakuDirectPeerSetting, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
     decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
-    save_wallet_settings, save_wallet_ui_state, should_show_chain_deployment_metadata_settings,
+    resolve_effective_chain_rpc_route, save_wallet_settings, save_wallet_ui_state,
+    should_show_chain_deployment_metadata_settings,
 };
+use crate::RpcChainRoute;
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
 use sync_service::ChainConfigDefaults;
 
@@ -1418,16 +1423,14 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     let ethereum = configs.get(&1).expect("ethereum config");
     let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
 
+    for (map_chain_id, config) in &configs {
+        assert_eq!(*map_chain_id, config.chain_id);
+        assert_eq!(config.chain_id, config.rpc_route.chain_id());
+    }
+
     assert!(ethereum.enabled);
-    assert_eq!(
-        ethereum.rpc_endpoints,
-        defaults
-            .rpc_urls
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    );
-    assert!(ethereum.rpc_endpoints.len() > 1);
+    assert_eq!(ethereum.rpc_route.endpoint_urls(), defaults.rpc_urls,);
+    assert!(ethereum.rpc_route.endpoints().len() > 1);
     assert_eq!(ethereum.finality_depth, defaults.finality_depth);
     assert!(ethereum.has_sponsorship_prerequisites());
     for chain_id in [56, 137, 42161] {
@@ -1446,8 +1449,8 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
         defaults.quick_sync_endpoint.map(|url| url.to_string())
     );
     assert_eq!(
-        ethereum.multicall_contract,
-        defaults.multicall_contract.to_string()
+        ethereum.rpc_route.multicall(),
+        Some(defaults.multicall_contract)
     );
     assert_eq!(
         ethereum.indexed_artifact_source_mode,
@@ -1477,6 +1480,37 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             .map(|gateway| format!("{gateway}/"))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn effective_chain_rpc_route_validates_chain_identities() {
+    let settings = WalletSettings::default();
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let ethereum = configs.get(&1).expect("ethereum config");
+
+    assert_eq!(
+        resolve_effective_chain_rpc_route(1, None).expect("default route"),
+        ethereum.rpc_route
+    );
+    assert_eq!(
+        resolve_effective_chain_rpc_route(1, Some(ethereum)).expect("effective route"),
+        ethereum.rpc_route
+    );
+    assert!(resolve_effective_chain_rpc_route(9_999, Some(ethereum)).is_err());
+
+    let mut outer_mismatch = ethereum.clone();
+    outer_mismatch.chain_id = 56;
+    assert!(resolve_effective_chain_rpc_route(1, Some(&outer_mismatch)).is_err());
+
+    let mut embedded_mismatch = ethereum.clone();
+    embedded_mismatch.rpc_route = RpcChainRoute::new(56, ethereum.rpc_route.endpoint_urls());
+    assert!(resolve_effective_chain_rpc_route(1, Some(&embedded_mismatch)).is_err());
+
+    let mut no_endpoints = ethereum.clone();
+    no_endpoints.rpc_route = RpcChainRoute::new(1, Vec::<Url>::new());
+    let error = resolve_effective_chain_rpc_route(1, Some(&no_endpoints))
+        .expect_err("empty endpoint list is rejected");
+    assert!(error.to_string().contains("has no RPC endpoints"));
 }
 
 #[test]
@@ -1811,8 +1845,11 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
     let ethereum = configs.get(&1).expect("ethereum config");
 
     assert_eq!(
-        ethereum.rpc_endpoints,
-        vec!["https://rpc-a.example", "https://rpc-b.example"]
+        ethereum.rpc_route.endpoint_urls(),
+        vec![
+            Url::parse("https://rpc-a.example").unwrap(),
+            Url::parse("https://rpc-b.example").unwrap(),
+        ]
     );
     assert_eq!(
         ethereum.quick_sync_endpoint.as_deref(),
@@ -1828,8 +1865,8 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
         Some("https://archive.example")
     );
     assert_eq!(
-        ethereum.multicall_contract,
-        "0x0000000000000000000000000000000000000001"
+        ethereum.rpc_route.multicall(),
+        Some(Address::from_str("0x0000000000000000000000000000000000000001").unwrap())
     );
     assert_eq!(ethereum.gas.gas_limit_buffer, 250_000);
 }

@@ -36,7 +36,10 @@ use crate::vault::{
     SoftwareSeedSessionBinding, TrezorPassphraseMode, VaultError, VaultSessionId, WalletSource,
     bip39_seed_from_mnemonic,
 };
-use crate::{GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, WalletNetworkMode};
+use crate::{
+    GAS_LIMIT_BUFFER, HttpContext, RpcChainRoute, RpcRead, RpcRoute, RpcSubmission,
+    SelfBroadcastTipFallback, WalletNetworkMode, WalletRpcOrigin,
+};
 use crate::{WalletConnectDecodedCallKind, WalletConnectSupportedMethod};
 
 const TEST_PASSWORD: &str = "correct horse battery staple";
@@ -234,6 +237,10 @@ async fn handle_mock_rpc_connection(
             },
             "eth_getTransactionCount" => json!("0x7"),
             "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+            "eth_call" => json!(format!(
+                "0x{}",
+                alloy::hex::encode(U256::from(0x1234).to_be_bytes::<32>())
+            )),
             _ => json!("0x1"),
         };
         if method == "eth_estimateGas"
@@ -253,12 +260,13 @@ async fn handle_mock_rpc_connection(
     stream.write_all(&response).await
 }
 
-fn effective_chain_for_rpc(rpc_url: String, gas_limit_buffer: u64) -> EffectiveChainConfig {
+fn effective_chain_for_rpc(rpc_url: &str, gas_limit_buffer: u64) -> EffectiveChainConfig {
     let defaults = chain_defaults_for_public_chain(1).expect("Ethereum defaults");
     EffectiveChainConfig {
         chain_id: 1,
         enabled: true,
-        rpc_endpoints: vec![rpc_url],
+        rpc_route: RpcChainRoute::new(1, vec![Url::parse(rpc_url).expect("RPC URL")])
+            .with_multicall(defaults.multicall_contract),
         sponsored_bundle_relays: Vec::new(),
         archive_rpc_url: None,
         quick_sync_enabled: false,
@@ -274,7 +282,6 @@ fn effective_chain_for_rpc(rpc_url: String, gas_limit_buffer: u64) -> EffectiveC
         relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: None,
-        multicall_contract: defaults.multicall_contract.to_string(),
         coinbase_payer: None,
         finality_depth: defaults.finality_depth,
         block_time: defaults.block_time,
@@ -457,19 +464,68 @@ fn balance_plan_batches_native_and_known_tokens_per_account() {
         status: PublicAccountStatus::Active,
         display_order: 0,
     };
-    let multicall = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
-    let calls = plan_public_balance_calls(1, multicall, &[account], None);
+    let calls = plan_public_balance_calls(1, std::slice::from_ref(&account), None);
 
-    assert_eq!(calls.first().expect("native call").target, multicall);
+    let native = calls.first().expect("native call");
+    assert_eq!(native.asset.id, PublicAssetId::Native);
+    assert_eq!(native.read, RpcRead::get_balance(account.address));
+    let token = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let erc20 = calls
+        .iter()
+        .find(|call| call.asset.id == PublicAssetId::Erc20(token))
+        .expect("known token call");
     assert_eq!(
-        calls.first().expect("native call").asset.id,
-        PublicAssetId::Native
+        erc20.read,
+        RpcRead::eth_call(
+            token,
+            PublicErc20::balanceOfCall {
+                account: account.address,
+            }
+            .abi_encode()
+            .into(),
+        )
     );
+}
+
+#[tokio::test]
+async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
+    let accounts = (1_u8..=3)
+        .map(|index| PublicAccountMetadata {
+            public_account_uuid: format!("public-{index}"),
+            address: alloy::primitives::Address::from([index; 20]),
+            label: None,
+            source: PublicAccountSource::Derived,
+            scope: PublicAccountScope::PrivateWallet {
+                wallet_uuid: "wallet-1".to_string(),
+            },
+            derivation_index: Some(u32::from(index)),
+            hardware_descriptor: None,
+            status: PublicAccountStatus::Active,
+            display_order: u32::from(index),
+        })
+        .collect::<Vec<_>>();
+    let planned = plan_public_balance_calls(1, &accounts, None);
     assert!(
-        calls
-            .iter()
-            .any(|call| matches!(call.asset.id, PublicAssetId::Erc20(_)))
+        planned.len() > 64,
+        "a three-account chain 1 refresh must exceed the dapp read cap, planned {}",
+        planned.len()
     );
+
+    let (broker, _executions) = crate::rpc_broker::tests::spawn_counting_test_broker();
+    let route = RpcRoute::from(RpcChainRoute::new(
+        1,
+        vec![Url::parse("https://balances.invalid").expect("route URL")],
+    ));
+    let results = broker
+        .submit(RpcSubmission::new(
+            route,
+            planned.iter().map(|call| call.read.clone()).collect(),
+            WalletRpcOrigin::PublicWallet.into(),
+        ))
+        .await
+        .expect("wallet balance submission is admitted");
+    assert_eq!(results.len(), planned.len());
+    assert!(results.iter().all(std::result::Result::is_ok));
 }
 
 #[test]
@@ -922,25 +978,24 @@ fn balance_snapshot_preserves_partial_success() {
     let planned = vec![
         PlannedPublicBalanceCall {
             public_account_uuid: account.public_account_uuid.clone(),
-            account: account.address,
             asset: PublicBalanceAsset {
                 id: PublicAssetId::Native,
                 symbol: "ETH".to_string(),
                 decimals: 18,
             },
-            target: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-            data: Vec::new(),
+            read: RpcRead::get_balance(account.address),
         },
         PlannedPublicBalanceCall {
             public_account_uuid: account.public_account_uuid.clone(),
-            account: account.address,
             asset: PublicBalanceAsset {
                 id: PublicAssetId::Erc20(address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
                 symbol: "WETH".to_string(),
                 decimals: 18,
             },
-            target: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-            data: Vec::new(),
+            read: RpcRead::eth_call(
+                address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+                Bytes::new(),
+            ),
         },
     ];
 
@@ -1314,9 +1369,66 @@ fn walletconnect_custom_fee_resolves_without_an_automatic_quote() {
 }
 
 #[tokio::test]
+async fn public_shield_allowance_uses_shared_rpc_client_and_decodes_result() {
+    let server = MockRpcServer::spawn(false, 50_000).await;
+    let chain_route = RpcChainRoute::new(1, vec![Url::parse(&server.url).expect("mock RPC URL")]);
+    let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
+    let token = address!("1111111111111111111111111111111111111111");
+    let owner = address!("2222222222222222222222222222222222222222");
+    let spender = address!("3333333333333333333333333333333333333333");
+
+    let allowance = super::actions::query_erc20_allowance(
+        &chain_route,
+        &http,
+        PublicAssetId::Erc20(token),
+        owner,
+        spender,
+    )
+    .await
+    .expect("query allowance through broker");
+    assert_eq!(allowance, U256::from(0x1234));
+
+    let calls = server.calls();
+    let allowance_calls = rpc_calls_for(&calls, "eth_call");
+    assert_eq!(allowance_calls.len(), 1);
+    let call = allowance_calls[0];
+    assert_eq!(call.route.as_deref(), Some("tor"));
+    let transaction: TransactionRequest =
+        serde_json::from_value(call.params[0].clone()).expect("allowance transaction");
+    assert_eq!(transaction.to, Some(TxKind::Call(token)));
+    let calldata = transaction.input.input().expect("allowance calldata");
+    let decoded = PublicErc20::allowanceCall::abi_decode(calldata).expect("decode allowance call");
+    assert_eq!(decoded.owner, owner);
+    assert_eq!(decoded.spender, spender);
+}
+
+#[tokio::test]
+async fn public_shield_allowance_propagates_rpc_member_error() {
+    let server = MockRpcServer::spawn(true, 50_000).await;
+    let chain_route = RpcChainRoute::new(1, vec![Url::parse(&server.url).expect("mock RPC URL")]);
+    let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
+    let error = super::actions::query_erc20_allowance(
+        &chain_route,
+        &http,
+        PublicAssetId::Erc20(address!("1111111111111111111111111111111111111111")),
+        address!("2222222222222222222222222222222222222222"),
+        address!("3333333333333333333333333333333333333333"),
+    )
+    .await
+    .expect_err("failed allowance read must not produce an approval decision");
+
+    assert_eq!(error.to_string(), "query public shield ERC-20 allowance");
+    assert!(matches!(
+        error.downcast_ref::<crate::RpcBrokerError>(),
+        Some(crate::RpcBrokerError::Remote(_))
+    ));
+    assert!(!rpc_calls_for(&server.calls(), "eth_call").is_empty());
+}
+
+#[tokio::test]
 async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_context() {
     let server = MockRpcServer::spawn(false, 50_000).await;
-    let chain = effective_chain_for_rpc(server.url.clone(), 12_345);
+    let chain = effective_chain_for_rpc(&server.url, 12_345);
 
     for (mode, route) in [
         (WalletNetworkMode::Tor, "tor"),
@@ -1417,7 +1529,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     );
 
     let simulation_server = MockRpcServer::spawn(false, 42_000).await;
-    let simulation_chain = effective_chain_for_rpc(simulation_server.url.clone(), 8_000);
+    let simulation_chain = effective_chain_for_rpc(&simulation_server.url, 8_000);
     let simulation_http = http_context_for_route(WalletNetworkMode::Direct, "direct");
     let simulation_request = PublicAdvancedTransactionEstimateRequest {
         chain_id: 1,
@@ -1462,7 +1574,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         (WalletNetworkMode::Proxy, "proxy"),
     ] {
         let failed_server = MockRpcServer::spawn(true, 50_000).await;
-        let failed_chain = effective_chain_for_rpc(failed_server.url.clone(), 0);
+        let failed_chain = effective_chain_for_rpc(&failed_server.url, 0);
         let failed_http = http_context_for_route(mode, route);
         let _ = quote_public_action_gas_fee(1, Some(&failed_chain), &failed_http).await;
         let failed_calls = failed_server.calls();
@@ -1490,12 +1602,18 @@ async fn advanced_simulation_uses_each_provider_once_and_selects_revert_pluralit
     let unavailable_server = MockRpcServer::spawn(true, 50_000).await;
     let from = address!("0x1111111111111111111111111111111111111111");
     let to = address!("0x2222222222222222222222222222222222222222");
-    let mut chain = effective_chain_for_rpc(revert_servers[0].url.clone(), 8_000);
-    chain.rpc_endpoints = revert_servers
-        .iter()
-        .map(|server| server.url.clone())
-        .chain(std::iter::once(unavailable_server.url.clone()))
-        .collect();
+    let mut chain = effective_chain_for_rpc(&revert_servers[0].url, 8_000);
+    chain.rpc_route = RpcChainRoute::new(
+        1,
+        revert_servers
+            .iter()
+            .map(|server| Url::parse(&server.url).expect("RPC URL"))
+            .chain(std::iter::once(
+                Url::parse(&unavailable_server.url).expect("RPC URL"),
+            ))
+            .collect(),
+    )
+    .with_multicall(chain.rpc_route.multicall().expect("multicall"));
     let request = PublicAdvancedTransactionEstimateRequest {
         chain_id: 1,
         effective_chain: Some(chain),
@@ -1861,7 +1979,8 @@ fn effective_public_chain_config_uses_settings_overrides() {
     let effective = EffectiveChainConfig {
         chain_id: 1,
         enabled: true,
-        rpc_endpoints: vec!["https://rpc.example".to_string()],
+        rpc_route: RpcChainRoute::new(1, vec![Url::parse("https://rpc.example").expect("RPC URL")])
+            .with_multicall(address!("0x0000000000000000000000000000000000000003")),
         sponsored_bundle_relays: Vec::new(),
         archive_rpc_url: None,
         quick_sync_enabled: true,
@@ -1877,7 +1996,6 @@ fn effective_public_chain_config_uses_settings_overrides() {
         relay_adapt_contract: "0x0000000000000000000000000000000000000004".to_string(),
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: Some("0x0000000000000000000000000000000000000002".to_string()),
-        multicall_contract: "0x0000000000000000000000000000000000000003".to_string(),
         coinbase_payer: None,
         finality_depth: defaults.finality_depth,
         block_time: defaults.block_time,
@@ -1892,8 +2010,11 @@ fn effective_public_chain_config_uses_settings_overrides() {
 
     let config = public_chain_runtime_config(1, Some(&effective)).expect("effective config");
 
-    assert_eq!(config.rpc_urls.len(), 1);
-    assert_eq!(config.rpc_urls[0].as_str(), "https://rpc.example/");
+    assert_eq!(config.rpc_route.endpoint_urls().len(), 1);
+    assert_eq!(
+        config.rpc_route.endpoint_urls()[0].as_str(),
+        "https://rpc.example/"
+    );
     assert_eq!(
         config.railgun_contract,
         address!("0x0000000000000000000000000000000000000001")
@@ -1907,8 +2028,8 @@ fn effective_public_chain_config_uses_settings_overrides() {
         Some(address!("0x0000000000000000000000000000000000000002"))
     );
     assert_eq!(
-        config.multicall_contract,
-        address!("0x0000000000000000000000000000000000000003")
+        config.rpc_route.multicall(),
+        Some(address!("0x0000000000000000000000000000000000000003"))
     );
     assert_eq!(config.gas.gas_limit_buffer, 42);
 }
@@ -1919,7 +2040,8 @@ fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
     let effective = EffectiveChainConfig {
         chain_id: 1,
         enabled: false,
-        rpc_endpoints: vec!["https://rpc.example".to_string()],
+        rpc_route: RpcChainRoute::new(1, vec![Url::parse("https://rpc.example").expect("RPC URL")])
+            .with_multicall(defaults.multicall_contract),
         sponsored_bundle_relays: Vec::new(),
         archive_rpc_url: None,
         quick_sync_enabled: true,
@@ -1935,7 +2057,6 @@ fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
         relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: None,
-        multicall_contract: defaults.multicall_contract.to_string(),
         coinbase_payer: None,
         finality_depth: defaults.finality_depth,
         block_time: defaults.block_time,
@@ -1960,8 +2081,8 @@ fn effective_public_chain_config_uses_default_rpc_fallbacks() {
     let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
     let config = public_chain_runtime_config(1, None).expect("default config");
 
-    assert_eq!(config.rpc_urls, defaults.rpc_urls);
-    assert!(config.rpc_urls.len() > 1);
+    assert_eq!(config.rpc_route.endpoint_urls(), defaults.rpc_urls);
+    assert!(config.rpc_route.endpoint_urls().len() > 1);
 }
 
 #[test]
@@ -2324,7 +2445,7 @@ fn public_actions_reject_zero_amount_before_signing() {
         .build()
         .expect("build runtime");
     let (root_dir, db, store, view_session) = public_action_request_parts();
-    let http = HttpContext::direct_for_tests();
+    let http = runtime.block_on(async { HttpContext::direct_for_tests() });
     let recipient = address!("0x2222222222222222222222222222222222222222");
 
     let send_result = runtime.block_on(submit_public_send(

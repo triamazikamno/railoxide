@@ -6,6 +6,8 @@ use super::{
     TokenKey, TokenPriceAnchorOverride, Url, WakuDirectPeerSetting, WalletSettings,
     WalletSettingsValidationError,
 };
+use crate::RpcChainRoute;
+use eyre::{Result as EyreResult, eyre};
 
 pub const ETHEREUM_SPONSORED_BUNDLE_RELAYS: &[&str] =
     &["https://rpc.titanbuilder.xyz", "https://rpc.quasar.win"];
@@ -30,7 +32,7 @@ pub fn build_effective_chain_configs(
         };
         let override_settings = settings.chains.per_chain.get(chain_id);
         let enabled = override_settings.is_none_or(|settings| settings.enabled);
-        let rpc_endpoints = override_settings
+        let rpc_endpoint_values = override_settings
             .filter(|settings| !settings.rpc_endpoints.is_empty())
             .map_or_else(
                 || defaults.rpc_urls.iter().map(ToString::to_string).collect(),
@@ -62,6 +64,22 @@ pub fn build_effective_chain_configs(
             override_settings.map_or(&deployment_default, |settings| &settings.deployment);
         let gas_default = ChainGasSettings::default();
         let gas = override_settings.map_or(&gas_default, |settings| &settings.gas);
+        let multicall_contract = contracts
+            .multicall_contract
+            .clone()
+            .unwrap_or_else(|| defaults.multicall_contract.to_string());
+        let rpc_route = RpcChainRoute::new(
+            *chain_id,
+            rpc_endpoint_values
+                .iter()
+                .map(|endpoint| {
+                    SensitiveUrl::from(Url::parse(endpoint).expect("validated RPC endpoint URL"))
+                })
+                .collect(),
+        )
+        .with_multicall(
+            Address::from_str(&multicall_contract).expect("validated multicall address"),
+        );
         let indexed_artifact_source = settings
             .indexed_artifacts
             .source_config(&settings.poi.artifact.gateway_urls);
@@ -70,7 +88,7 @@ pub fn build_effective_chain_configs(
             EffectiveChainConfig {
                 chain_id: *chain_id,
                 enabled,
-                rpc_endpoints,
+                rpc_route,
                 sponsored_bundle_relays,
                 archive_rpc_url: deployment.archive_rpc_url.clone(),
                 quick_sync_enabled: quick_sync.enabled,
@@ -114,10 +132,6 @@ pub fn build_effective_chain_configs(
                     crate::amounts::wrapped_native_token_for_chain(*chain_id)
                         .map(|token| token.to_string())
                 }),
-                multicall_contract: contracts
-                    .multicall_contract
-                    .clone()
-                    .unwrap_or_else(|| defaults.multicall_contract.to_string()),
                 coinbase_payer: contracts
                     .coinbase_payer
                     .as_deref()
@@ -151,6 +165,49 @@ pub fn build_effective_chain_configs(
 pub fn default_chain_rpc_endpoints(chain_id: u64) -> Option<Vec<String>> {
     ChainConfigDefaults::for_chain(chain_id)
         .map(|defaults| defaults.rpc_urls.iter().map(ToString::to_string).collect())
+}
+
+/// Return the built-in immutable RPC route for a supported chain.
+#[must_use]
+pub fn default_chain_rpc_route(chain_id: u64) -> Option<RpcChainRoute> {
+    let defaults = ChainConfigDefaults::for_chain(chain_id)?;
+    Some(
+        RpcChainRoute::new(chain_id, defaults.rpc_urls).with_multicall(defaults.multicall_contract),
+    )
+}
+
+/// Resolve and validate the RPC route for a requested chain.
+pub(crate) fn resolve_effective_chain_rpc_route(
+    requested_chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+) -> EyreResult<RpcChainRoute> {
+    let defaults = ChainConfigDefaults::for_chain(requested_chain_id)
+        .ok_or_else(|| eyre!("unsupported chain id {requested_chain_id}"))?;
+    let route = match effective_chain {
+        None => RpcChainRoute::new(requested_chain_id, defaults.rpc_urls)
+            .with_multicall(defaults.multicall_contract),
+        Some(effective_chain) => {
+            if effective_chain.chain_id != requested_chain_id {
+                return Err(eyre!(
+                    "effective chain config is for chain {}, not {requested_chain_id}",
+                    effective_chain.chain_id
+                ));
+            }
+            if effective_chain.rpc_route.chain_id() != requested_chain_id {
+                return Err(eyre!(
+                    "effective RPC route is for chain {}, not {requested_chain_id}",
+                    effective_chain.rpc_route.chain_id()
+                ));
+            }
+            effective_chain.rpc_route.clone()
+        }
+    };
+    if route.endpoints().is_empty() {
+        return Err(eyre!(
+            "effective chain {requested_chain_id} has no RPC endpoints"
+        ));
+    }
+    Ok(route)
 }
 
 #[must_use]

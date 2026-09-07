@@ -203,7 +203,7 @@ pub async fn submit_walletconnect_send_transaction(
         request.trezor_pin_matrix_provider,
     )?;
     let from_address = signer.address();
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let tx_req =
         sanitize_walletconnect_transaction_request(request.tx_req, request.chain_id, from_address);
     let operation_gas_limit = request

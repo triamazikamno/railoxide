@@ -354,10 +354,14 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
     let effective = crate::settings::EffectiveChainConfig {
         chain_id: 1,
         enabled: true,
-        rpc_endpoints: vec![
-            "https://rpc-a.example".to_string(),
-            "https://rpc-b.example".to_string(),
-        ],
+        rpc_route: RpcChainRoute::new(
+            1,
+            vec![
+                reqwest::Url::parse("https://rpc-a.example").unwrap(),
+                reqwest::Url::parse("https://rpc-b.example").unwrap(),
+            ],
+        )
+        .with_multicall(defaults.multicall_contract),
         sponsored_bundle_relays: crate::settings::default_sponsored_bundle_relays(1),
         archive_rpc_url: Some("https://archive.example".to_string()),
         quick_sync_enabled: false,
@@ -373,7 +377,6 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
         relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: wrapped_native_token_for_chain(1).map(|token| token.to_string()),
-        multicall_contract: defaults.multicall_contract.to_string(),
         coinbase_payer: crate::settings::default_coinbase_payer(1),
         finality_depth: 99,
         block_time: Duration::from_secs(7),

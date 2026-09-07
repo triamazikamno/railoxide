@@ -272,8 +272,6 @@ use settings::{
     startup_settings_action_state,
 };
 #[cfg(test)]
-use sidebar::sidebar_primary_activity_order;
-#[cfg(test)]
 use spend_authorization::{
     SpendAuthorizationSummary, is_spend_authorization_failure_error,
     remembered_spend_authorization_valid_for_test, spend_authorization_can_use_cached_password,

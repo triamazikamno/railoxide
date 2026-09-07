@@ -124,7 +124,13 @@ pub(super) async fn submit_self_broadcast_plan(
 
         if observer.is_none() {
             observer = Some(
-                BlockObserver::establish(Arc::clone(&query_rpc_pool), chain.finality_depth).await?,
+                BlockObserver::establish(
+                    Arc::clone(&query_rpc_pool),
+                    chain.finality_depth,
+                    http.rpc_broker(),
+                    chain_id,
+                )
+                .await?,
             );
         }
 
@@ -1376,8 +1382,11 @@ pub async fn run_sponsored_self_broadcast_session(
         ));
     }
 
-    let rpc_urls =
-        parse_effective_rpc_urls(request.chain_id, &request.effective_chain.rpc_endpoints)?;
+    let rpc_urls = settings::resolve_effective_chain_rpc_route(
+        request.chain_id,
+        Some(&request.effective_chain),
+    )?
+    .endpoint_urls();
     let query_rpc_pool = query_rpc_pool_with_http_client(rpc_urls, http);
     let tx_hash = keccak256(&request.signed_raw_transaction);
     let signed_raw_transaction = Zeroizing::new(hex::encode_prefixed(
@@ -1388,6 +1397,7 @@ pub async fn run_sponsored_self_broadcast_session(
         relays: &request.effective_chain.sponsored_bundle_relays,
         query_rpc_pool,
         finality_depth: request.effective_chain.finality_depth,
+        chain_id: request.chain_id,
         tx_hash,
         observer: tokio::sync::Mutex::new(None),
         session: &request.session,
@@ -1603,6 +1613,7 @@ struct LiveSponsoredSelfBroadcastBackend<'a> {
     relays: &'a [SensitiveUrl],
     query_rpc_pool: Arc<QueryRpcPool>,
     finality_depth: u64,
+    chain_id: u64,
     tx_hash: FixedBytes<32>,
     observer: tokio::sync::Mutex<Option<BlockObserver>>,
     session: &'a WalletSession,
@@ -1614,9 +1625,13 @@ impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
     async fn establish_observation(&self) -> Result<()> {
         let mut observer = self.observer.lock().await;
         if observer.is_none() {
-            let mut created =
-                BlockObserver::establish(Arc::clone(&self.query_rpc_pool), self.finality_depth)
-                    .await?;
+            let mut created = BlockObserver::establish(
+                Arc::clone(&self.query_rpc_pool),
+                self.finality_depth,
+                self.http.rpc_broker(),
+                self.chain_id,
+            )
+            .await?;
             created.register(self.tx_hash, 0);
             *observer = Some(created);
         }

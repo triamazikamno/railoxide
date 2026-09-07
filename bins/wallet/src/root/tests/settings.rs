@@ -224,20 +224,6 @@ fn wallet_app_options_preserve_cli_db_path() {
 }
 
 #[test]
-fn primary_sidebar_order_places_proposals_before_settings() {
-    assert_eq!(
-        sidebar_primary_activity_order(),
-        [
-            Activity::Wallet,
-            Activity::Broadcaster,
-            Activity::AddressBook,
-            Activity::Proposals,
-            Activity::Settings
-        ]
-    );
-}
-
-#[test]
 fn locked_vault_screen_exposes_pre_unlock_settings_action() {
     assert!(should_show_pre_unlock_settings_action(
         &VaultState::CreateVault

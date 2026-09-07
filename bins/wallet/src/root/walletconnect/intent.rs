@@ -1336,6 +1336,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::time::Duration;
+    use wallet_ops::RpcChainRoute;
     use wallet_ops::settings::{
         EffectiveChainGasSettings, EffectiveTokenInfo, IndexedArtifactSourceModeSetting,
     };
@@ -1636,7 +1637,7 @@ mod tests {
         EffectiveChainConfig {
             chain_id: 1,
             enabled: true,
-            rpc_endpoints: Vec::new(),
+            rpc_route: RpcChainRoute::new(1, Vec::<reqwest::Url>::new()),
             sponsored_bundle_relays: Vec::new(),
             archive_rpc_url: None,
             quick_sync_enabled: false,
@@ -1652,7 +1653,6 @@ mod tests {
             relay_adapt_contract: String::new(),
             relay_adapt_7702_contract: String::new(),
             wrapped_native_token: wrapped_native_token.map(ToOwned::to_owned),
-            multicall_contract: String::new(),
             coinbase_payer: None,
             finality_depth: 0,
             block_time: Duration::ZERO,

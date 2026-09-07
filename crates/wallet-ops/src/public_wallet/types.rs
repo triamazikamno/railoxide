@@ -9,6 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::RpcRead;
 use crate::TxReceiptOutput;
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::settings::EffectiveChainConfig;
@@ -209,10 +210,8 @@ pub struct PublicBalanceSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedPublicBalanceCall {
     pub(crate) public_account_uuid: String,
-    pub(crate) account: Address,
     pub(crate) asset: PublicBalanceAsset,
-    pub(crate) target: Address,
-    pub(crate) data: Vec<u8>,
+    pub(crate) read: RpcRead,
 }
 
 #[derive(Default)]

@@ -612,7 +612,7 @@ pub(crate) fn chain_config(
     progress_tx: Option<SyncProgressSender>,
 ) -> Result<ChainConfig> {
     let rpc_urls = if effective_chain.is_some() {
-        effective_rpc_urls_for_chain(defaults, effective_chain)?
+        effective_rpc_urls_for_chain(defaults.chain_id, effective_chain)?
     } else if let Some(rpc_url) = rpc_url_override {
         vec![rpc_url]
     } else {

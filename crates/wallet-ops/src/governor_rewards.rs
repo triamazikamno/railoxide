@@ -1,28 +1,26 @@
 //! `GovernorRewards` read models and checked reward-claim planning.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::consensus::BlockHeader as _;
 use alloy::network::BlockResponse as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::{CallItem, Failure, Provider};
+use alloy::providers::Provider;
 use alloy::rpc::types::BlockNumberOrTag;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use railgun_ui::governance_contracts;
-use sync_service::ChainConfigDefaults;
 use tokio::time::timeout;
 
-use crate::settings::EffectiveChainConfig;
+use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{
     AccountSnapshot, MulticallChunkSize, chunk_indices, reward_staking_interval, snapshot_hint,
 };
-use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
+use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -520,7 +518,8 @@ pub async fn fetch_interval_metadata(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let mut calls = vec![
         GovernorRewards::STAKING_DISTRIBUTION_INTERVAL_MULTIPLIERCall {}
             .abi_encode()
@@ -538,18 +537,17 @@ pub async fn fetch_interval_metadata(
             .abi_encode()
             .into()
     }));
-    let values = multicall_values::<GovernorRewards::STAKING_DISTRIBUTION_INTERVAL_MULTIPLIERCall>(
-        &pool,
-        multicall_address,
-        contracts.governor_rewards,
-        calls,
-    )
-    .await?;
-    if values.len() != 4 + tokens.len() {
-        return Err(eyre!(
-            "GovernorRewards metadata returned wrong result count"
-        ));
-    }
+    let values = http
+        .rpc_broker()
+        .submit_calls_decoded_as::<GovernorRewards::STAKING_DISTRIBUTION_INTERVAL_MULTIPLIERCall>(
+            route.clone(),
+            calls
+                .into_iter()
+                .map(|calldata| (contracts.governor_rewards, calldata))
+                .collect(),
+            WalletRpcOrigin::GovernorRewards.into(),
+        )
+        .await?;
     let mut values = values.into_iter();
     let multiplier = values
         .next()
@@ -638,7 +636,8 @@ pub async fn fetch_reward_evidence_multi(
             })
             .collect());
     };
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let mut claimed: Vec<Option<Vec<Option<bool>>>> = Vec::with_capacity(tokens.len());
     let mut errors: Vec<Option<String>> = vec![None; tokens.len()];
     let mut calls = Vec::new();
@@ -659,27 +658,31 @@ pub async fn fetch_reward_evidence_multi(
         }
     }
     for chunk in calls.chunks(chunk_size.get()) {
-        let encoded = chunk
+        let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
             .map(|&(_, token, interval)| {
-                GovernorRewards::getClaimedCall {
-                    account,
-                    token,
-                    interval: U256::from(interval),
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::getClaimedCall {
+                        account,
+                        token,
+                        interval: U256::from(interval),
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        match multicall_values::<GovernorRewards::getClaimedCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            encoded,
-        )
-        .await
+        match http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::getClaimedCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await
         {
-            Ok(values) if values.len() == chunk.len() => {
+            Ok(values) => {
                 for (&(token_index, _, interval), value) in chunk.iter().zip(values) {
                     match value {
                         Ok(flag) => {
@@ -701,17 +704,6 @@ pub async fn fetch_reward_evidence_multi(
                                 Some(format!("claimed flag call failed: {error:?}"));
                         }
                         Err(_) => {}
-                    }
-                }
-            }
-            Ok(values) => {
-                for &(token_index, _, _) in chunk {
-                    if errors[token_index].is_none() {
-                        errors[token_index] = Some(format!(
-                            "claimed flags returned {}, expected {}",
-                            values.len(),
-                            chunk.len()
-                        ));
                     }
                 }
             }
@@ -766,31 +758,32 @@ pub async fn fetch_reward_evidence_multi(
         }
     }
     if !calculator_calls.is_empty() {
-        let encoded = calculator_calls
+        let calldata: Vec<(Address, Bytes)> = calculator_calls
             .iter()
             .map(|(_, evidence)| {
-                GovernorRewards::calculateRewardsCall {
-                    tokens: vec![evidence.token],
-                    account,
-                    startingInterval: evidence.starting_interval,
-                    endingInterval: evidence.ending_interval,
-                    hints: evidence.hints.clone(),
-                    ignoreClaimed: true,
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::calculateRewardsCall {
+                        tokens: vec![evidence.token],
+                        account,
+                        startingInterval: evidence.starting_interval,
+                        endingInterval: evidence.ending_interval,
+                        hints: evidence.hints.clone(),
+                        ignoreClaimed: true,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        let values = multicall_values::<GovernorRewards::calculateRewardsCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            encoded,
-        )
-        .await?;
-        if values.len() != calculator_calls.len() {
-            return Err(eyre!("reward calculator returned wrong result count"));
-        }
+        let values = http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await?;
         for ((token_index, mut value), result) in calculator_calls.into_iter().zip(values) {
             match result {
                 Ok(amounts) if amounts.len() == 1 => {
@@ -866,7 +859,8 @@ pub async fn fetch_reward_batch_evidence(
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| eyre!("reward interval range exceeds platform limits"))?;
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let mut claimed = vec![vec![None; count]; tokens.len()];
     let calls = tokens
         .iter()
@@ -876,28 +870,29 @@ pub async fn fetch_reward_batch_evidence(
         })
         .collect::<Vec<_>>();
     for chunk in calls.chunks(chunk_size.get()) {
-        let encoded = chunk
+        let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
             .map(|&(_, token, interval)| {
-                GovernorRewards::getClaimedCall {
-                    account,
-                    token,
-                    interval: U256::from(interval),
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::getClaimedCall {
+                        account,
+                        token,
+                        interval: U256::from(interval),
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        let values = multicall_values::<GovernorRewards::getClaimedCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            encoded,
-        )
-        .await?;
-        if values.len() != chunk.len() {
-            return Err(eyre!("claimed flags returned wrong result count"));
-        }
+        let values = http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::getClaimedCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await?;
         for (&(token_index, _, interval), value) in chunk.iter().zip(values) {
             claimed[token_index][interval] =
                 Some(value.map_err(|error| eyre!("claimed flag call failed: {error:?}"))?);
@@ -940,24 +935,26 @@ pub async fn fetch_reward_batch_evidence(
         .iter()
         .map(|&interval| snapshot_hint(snapshots, interval))
         .collect::<Result<Vec<_>>>()?;
-    let values = multicall_values::<GovernorRewards::calculateRewardsCall>(
-        &pool,
-        multicall_address,
-        contracts.governor_rewards,
-        vec![
-            GovernorRewards::calculateRewardsCall {
-                tokens: tokens.to_vec(),
-                account,
-                startingInterval: starting_interval,
-                endingInterval: ending_interval,
-                hints: hints.clone(),
-                ignoreClaimed: true,
-            }
-            .abi_encode()
-            .into(),
-        ],
-    )
-    .await?;
+    let values = http
+        .rpc_broker()
+        .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
+            route.clone(),
+            vec![(
+                contracts.governor_rewards,
+                GovernorRewards::calculateRewardsCall {
+                    tokens: tokens.to_vec(),
+                    account,
+                    startingInterval: starting_interval,
+                    endingInterval: ending_interval,
+                    hints: hints.clone(),
+                    ignoreClaimed: true,
+                }
+                .abi_encode()
+                .into(),
+            )],
+            WalletRpcOrigin::GovernorRewards.into(),
+        )
+        .await?;
     let Some(result) = values.into_iter().next() else {
         return Err(eyre!("reward calculator returned no result"));
     };
@@ -1019,7 +1016,8 @@ pub async fn fetch_reward_batch_claimed_intervals(
             .ok_or_else(|| eyre!("reward interval range is invalid"))?,
     )
     .map_err(|_| eyre!("reward interval range exceeds platform limits"))?;
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let mut claimed = vec![vec![None; count]; evidence.reward_tokens.len()];
     let calls = evidence
         .reward_tokens
@@ -1030,28 +1028,29 @@ pub async fn fetch_reward_batch_claimed_intervals(
         })
         .collect::<Vec<_>>();
     for chunk in calls.chunks(chunk_size.get()) {
-        let encoded = chunk
+        let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
             .map(|&(_, token, offset)| {
-                GovernorRewards::getClaimedCall {
-                    account,
-                    token,
-                    interval: evidence.starting_interval + U256::from(offset),
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::getClaimedCall {
+                        account,
+                        token,
+                        interval: evidence.starting_interval + U256::from(offset),
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        let values = multicall_values::<GovernorRewards::getClaimedCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            encoded,
-        )
-        .await?;
-        if values.len() != chunk.len() {
-            return Err(eyre!("claimed flags returned wrong result count"));
-        }
+        let values = http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::getClaimedCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await?;
         for (&(token_index, _, offset), value) in chunk.iter().zip(values) {
             claimed[token_index][offset] =
                 Some(value.map_err(|error| eyre!("claimed flag call failed: {error:?}"))?);
@@ -1109,31 +1108,29 @@ pub async fn fetch_reward_batch_authorization_state(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
-    let values = multicall_values::<GovernorRewards::calculateRewardsCall>(
-        &pool,
-        multicall_address,
-        contracts.governor_rewards,
-        vec![
-            GovernorRewards::calculateRewardsCall {
-                tokens: evidence.reward_tokens.clone(),
-                account,
-                startingInterval: evidence.starting_interval,
-                endingInterval: evidence.ending_interval,
-                hints: evidence.hints.clone(),
-                ignoreClaimed: true,
-            }
-            .abi_encode()
-            .into(),
-        ],
-    )
-    .await?;
-    if values.len() != 1 {
-        return Err(eyre!("reward calculator returned wrong result count"));
-    }
-    let Some(result) = values.into_iter().next() else {
-        return Err(eyre!("reward calculator returned no result"));
-    };
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
+    let values = http
+        .rpc_broker()
+        .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
+            route.clone(),
+            vec![(
+                contracts.governor_rewards,
+                GovernorRewards::calculateRewardsCall {
+                    tokens: evidence.reward_tokens.clone(),
+                    account,
+                    startingInterval: evidence.starting_interval,
+                    endingInterval: evidence.ending_interval,
+                    hints: evidence.hints.clone(),
+                    ignoreClaimed: true,
+                }
+                .abi_encode()
+                .into(),
+            )],
+            WalletRpcOrigin::GovernorRewards.into(),
+        )
+        .await?;
+    let result = values[0].clone();
     let amounts = result.map_err(|error| eyre!("reward calculator call failed: {error:?}"))?;
     if amounts.len() != evidence.reward_tokens.len() {
         return Err(eyre!(
@@ -1206,7 +1203,8 @@ pub async fn fetch_reward_interval_amounts(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let count = usize::try_from(evidence.ending_interval - evidence.starting_interval)
         .ok()
         .and_then(|value| value.checked_add(1))
@@ -1216,31 +1214,32 @@ pub async fn fetch_reward_interval_amounts(
     }
     let mut amounts = Vec::with_capacity(count);
     for chunk in chunk_indices(count, chunk_size) {
-        let calls = chunk
+        let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
             .map(|&offset| {
-                GovernorRewards::calculateRewardsCall {
-                    tokens: vec![evidence.token],
-                    account,
-                    startingInterval: evidence.starting_interval + U256::from(offset),
-                    endingInterval: evidence.starting_interval + U256::from(offset),
-                    hints: vec![evidence.hints[offset]],
-                    ignoreClaimed: true,
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::calculateRewardsCall {
+                        tokens: vec![evidence.token],
+                        account,
+                        startingInterval: evidence.starting_interval + U256::from(offset),
+                        endingInterval: evidence.starting_interval + U256::from(offset),
+                        hints: vec![evidence.hints[offset]],
+                        ignoreClaimed: true,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        let values = multicall_values::<GovernorRewards::calculateRewardsCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            calls,
-        )
-        .await?;
-        if values.len() != chunk.len() {
-            return Err(eyre!("reward calculator returned wrong result count"));
-        }
+        let values = http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await?;
         for (offset, value) in chunk.iter().zip(values) {
             let result =
                 value.map_err(|error| eyre!("reward calculator call failed: {error:?}"))?;
@@ -1299,34 +1298,36 @@ pub async fn fetch_reward_batch_interval_amounts(
     if evidence.hints.len() != count {
         return Err(eyre!("reward evidence hints do not match interval range"));
     }
-    let (pool, multicall_address) = provider_for_chain(chain_id, effective_chain, http)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = RpcRoute::from(chain_route);
     let mut amounts = Vec::with_capacity(count);
     for chunk in chunk_indices(count, chunk_size) {
-        let calls = chunk
+        let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
             .map(|&offset| {
-                GovernorRewards::calculateRewardsCall {
-                    tokens: evidence.reward_tokens.clone(),
-                    account,
-                    startingInterval: evidence.starting_interval + U256::from(offset),
-                    endingInterval: evidence.starting_interval + U256::from(offset),
-                    hints: vec![evidence.hints[offset]],
-                    ignoreClaimed: true,
-                }
-                .abi_encode()
-                .into()
+                (
+                    contracts.governor_rewards,
+                    GovernorRewards::calculateRewardsCall {
+                        tokens: evidence.reward_tokens.clone(),
+                        account,
+                        startingInterval: evidence.starting_interval + U256::from(offset),
+                        endingInterval: evidence.starting_interval + U256::from(offset),
+                        hints: vec![evidence.hints[offset]],
+                        ignoreClaimed: true,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
             })
             .collect();
-        let values = multicall_values::<GovernorRewards::calculateRewardsCall>(
-            &pool,
-            multicall_address,
-            contracts.governor_rewards,
-            calls,
-        )
-        .await?;
-        if values.len() != chunk.len() {
-            return Err(eyre!("reward calculator returned wrong result count"));
-        }
+        let values = http
+            .rpc_broker()
+            .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
+                route.clone(),
+                calldata,
+                WalletRpcOrigin::GovernorRewards.into(),
+            )
+            .await?;
         for (offset, value) in chunk.iter().zip(values) {
             let result =
                 value.map_err(|error| eyre!("reward calculator call failed: {error:?}"))?;
@@ -1342,55 +1343,15 @@ pub async fn fetch_reward_batch_interval_amounts(
     Ok(amounts)
 }
 
-async fn multicall_values<C: SolCall + 'static>(
-    pool: &QueryRpcPool,
-    multicall_address: Address,
-    target: Address,
-    calls: Vec<Bytes>,
-) -> Result<Vec<std::result::Result<C::Return, Failure>>> {
-    let mut last_error = None;
-    for _ in 0..pool.len() {
-        let Some(handle) = pool.random_provider() else {
-            break;
-        };
-        let mut multicall = handle
-            .provider
-            .multicall()
-            .dynamic::<C>()
-            .address(multicall_address);
-        for call in calls.iter().cloned() {
-            multicall = multicall.add_call_dynamic(CallItem::new(target, call));
-        }
-        match timeout(RPC_TIMEOUT, multicall.try_aggregate(false)).await {
-            Ok(Ok(values)) => return Ok(values),
-            Ok(Err(error)) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("multicall failed: {error}"));
-            }
-            Err(_) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("multicall timed out"));
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
-}
-
 fn provider_for_chain(
     chain_id: u64,
     effective_chain: Option<&EffectiveChainConfig>,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, Address)> {
-    let defaults = ChainConfigDefaults::for_chain(chain_id)
-        .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
-    let rpc_urls = effective_rpc_urls_for_chain(&defaults, effective_chain)?;
-    let multicall_address = effective_chain
-        .map(|chain| Address::from_str(&chain.multicall_contract))
-        .transpose()?
-        .unwrap_or(defaults.multicall_contract);
+) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     Ok((
-        query_rpc_pool_with_http_client(rpc_urls, http),
-        multicall_address,
+        query_rpc_pool_with_http_client(chain_route.endpoint_urls(), http),
+        chain_route,
     ))
 }
 

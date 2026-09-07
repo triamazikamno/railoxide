@@ -23,6 +23,8 @@ use tokio::task::JoinHandle;
 use tor_rtcompat::PreferredRuntime;
 use trustless_artifacts::GatewayPool;
 
+use crate::rpc_broker::RpcBroker;
+
 const ARTI_DIR: &str = "arti";
 const ARTI_STATE_DIR: &str = "state";
 const ARTI_CACHE_DIR: &str = "cache";
@@ -618,8 +620,9 @@ fn median_duration(values: &[Duration]) -> Option<Duration> {
 pub struct HttpContext {
     /// Async HTTP client for non-chain HTTP traffic.
     pub client: reqwest::Client,
-    /// Async HTTP client for bounded EVM JSON-RPC requests.
+    /// Shared EVM JSON-RPC client used by the RPC broker and pool-backed workflows.
     pub rpc_client: reqwest::Client,
+    broker: Arc<RpcBroker>,
     gateway_pool: GatewayPool,
     /// Proxy URL retained for components that need an endpoint value. In Tor
     /// mode this is the internal SOCKS bridge URL, not a user-supplied
@@ -635,6 +638,12 @@ pub struct HttpContext {
 }
 
 impl HttpContext {
+    /// Return the broker for submitted `eth_call` and `eth_getBalance` reads.
+    #[must_use]
+    pub fn rpc_broker(&self) -> Arc<RpcBroker> {
+        self.broker.clone()
+    }
+
     #[must_use]
     pub const fn network_mode(&self) -> WalletNetworkMode {
         self.mode
@@ -827,9 +836,12 @@ impl HttpContext {
 
     #[cfg(test)]
     pub(crate) fn direct_for_tests() -> Self {
+        let rpc_client = reqwest::Client::new();
         Self {
             client: reqwest::Client::new(),
-            rpc_client: reqwest::Client::new(),
+            rpc_client: rpc_client.clone(),
+            broker: RpcBroker::spawn(rpc_client)
+                .expect("HttpContext test constructor requires an active Tokio runtime"),
             gateway_pool: GatewayPool::new(),
             proxy_url: None,
             user_proxy_url: None,
@@ -847,9 +859,12 @@ impl HttpContext {
         rpc_client: reqwest::Client,
         mode: WalletNetworkMode,
     ) -> Self {
+        let broker = RpcBroker::spawn(rpc_client.clone())
+            .expect("HttpContext test constructor requires an active Tokio runtime");
         Self {
             client: reqwest::Client::new(),
             rpc_client,
+            broker,
             gateway_pool: GatewayPool::new(),
             proxy_url: None,
             user_proxy_url: None,
@@ -1204,9 +1219,11 @@ fn build_reqwest_context(
         .timeout(rpc_request_timeout(mode))
         .build()
         .wrap_err("build RPC HTTP client")?;
+    let broker = RpcBroker::spawn(rpc_client.clone()).wrap_err("start RPC broker")?;
     Ok(HttpContext {
         client,
         rpc_client,
+        broker,
         gateway_pool: GatewayPool::new(),
         proxy_url,
         user_proxy_url,
@@ -1726,8 +1743,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn direct_network_health_is_ready() {
+    #[tokio::test]
+    async fn direct_network_health_is_ready() {
         let health = HttpContext::direct_for_tests().network_health();
         assert_eq!(health.mode, WalletNetworkMode::Direct);
         assert_eq!(health.state, WalletNetworkHealthState::Ready);
@@ -2063,8 +2080,8 @@ mod tests {
         assert_eq!(report.recent_successful_sample_count, 9);
     }
 
-    #[test]
-    fn proxy_network_health_is_ready() {
+    #[tokio::test]
+    async fn proxy_network_health_is_ready() {
         let proxy = proxy_url();
         let context = build_reqwest_context(
             WalletNetworkMode::Proxy,
@@ -2094,8 +2111,8 @@ mod tests {
         assert!(!redacted.contains("fragment"));
     }
 
-    #[test]
-    fn proxy_network_health_redacts_configured_proxy_url() {
+    #[tokio::test]
+    async fn proxy_network_health_redacts_configured_proxy_url() {
         let proxy = sensitive_proxy_url();
         let context = build_reqwest_context(
             WalletNetworkMode::Proxy,
@@ -2117,8 +2134,8 @@ mod tests {
         assert!(!detail.contains("fragment"));
     }
 
-    #[test]
-    fn tor_network_health_without_client_is_degraded() {
+    #[tokio::test]
+    async fn tor_network_health_without_client_is_degraded() {
         let context = build_reqwest_context(
             WalletNetworkMode::Tor,
             Some(proxy_url()),
@@ -2136,16 +2153,16 @@ mod tests {
         assert!(health.detail.contains("unavailable"));
     }
 
-    #[test]
-    fn start_new_tor_session_requires_tor_mode() {
+    #[tokio::test]
+    async fn start_new_tor_session_requires_tor_mode() {
         let error = HttpContext::direct_for_tests()
             .start_new_tor_session()
             .expect_err("direct mode cannot start Tor sessions");
         assert!(error.to_string().contains("only available in Tor mode"));
     }
 
-    #[test]
-    fn start_new_tor_session_requires_internal_socks_bridge() {
+    #[tokio::test]
+    async fn start_new_tor_session_requires_internal_socks_bridge() {
         let context = build_reqwest_context(
             WalletNetworkMode::Tor,
             Some(proxy_url()),

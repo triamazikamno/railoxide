@@ -9,7 +9,7 @@ use alloy::providers::Provider as _;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
 
-use crate::TxReceiptOutput;
+use crate::{RpcBroker, TxReceiptOutput};
 
 const MAX_BLOCKS_PER_POLL: u64 = 8;
 
@@ -56,12 +56,16 @@ pub(crate) struct BlockObserver {
     history: VecDeque<BlockIdentity>,
     unsupported_receipts: HashSet<usize>,
     active_provider: Option<usize>,
+    rpc_broker: Arc<RpcBroker>,
+    chain_id: u64,
 }
 
 impl BlockObserver {
     pub(crate) async fn establish(
         query_rpc_pool: Arc<QueryRpcPool>,
         finality_depth: u64,
+        rpc_broker: Arc<RpcBroker>,
+        chain_id: u64,
     ) -> Result<Self> {
         let mut observer = Self {
             query_rpc_pool,
@@ -71,6 +75,8 @@ impl BlockObserver {
             history: VecDeque::new(),
             unsupported_receipts: HashSet::new(),
             active_provider: None,
+            rpc_broker,
+            chain_id,
         };
         observer.establish_baseline().await?;
         Ok(observer)
@@ -102,6 +108,13 @@ impl BlockObserver {
             match self.poll_provider(&provider).await {
                 Ok(observation) => {
                     self.active_provider = Some(provider.index);
+                    // Inclusion invalidates rather than notifies: an equal head does not evict,
+                    // and this endpoint may lead the one that served a cached latest read.
+                    if observation.receipt.is_some() {
+                        self.rpc_broker.invalidate_block(self.chain_id);
+                    } else if let Some((_, head)) = observation.head {
+                        self.rpc_broker.notify_block(self.chain_id, head);
+                    }
                     return Ok(observation);
                 }
                 Err(ProviderPollFailure::Lagging) => lagging = true,
@@ -436,6 +449,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::rpc_broker::tests::spawn_counting_test_broker;
+    use crate::{RpcChainRoute, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
+    use alloy::primitives::Bytes;
     use reqwest::Url;
     use serde_json::{Value, json};
 
@@ -445,6 +461,11 @@ mod tests {
             Duration::ZERO,
             reqwest::Client::new(),
         ))
+    }
+
+    fn test_broker() -> Arc<RpcBroker> {
+        RpcBroker::spawn(reqwest::Client::new())
+            .expect("test broker requires an active Tokio runtime")
     }
 
     fn spawn_rpc_script<F>(
@@ -627,7 +648,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 3);
@@ -641,6 +662,67 @@ mod tests {
         let requests = request_rx.try_iter().collect::<Vec<_>>();
         assert_eq!(requests[0]["method"], "eth_blockNumber");
         assert_no_exact_hash_methods(&requests);
+    }
+
+    #[tokio::test]
+    async fn observer_receipt_forces_next_latest_read_past_the_cache() {
+        let tx_hash = B256::from([0x11; 32]);
+        let block_hash = B256::from([0x22; 32]);
+        let parent_hash = B256::from([0x01; 32]);
+        let head_calls = Arc::new(AtomicUsize::new(0));
+        let (url, _request_rx, task) =
+            spawn_rpc_script(4, move |request| match request["method"].as_str() {
+                Some("eth_blockNumber") => Ok(quantity(
+                    if head_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        1
+                    } else {
+                        2
+                    },
+                )),
+                Some("eth_getBlockByNumber") => {
+                    Ok(block(2, block_hash, parent_hash, &[json!(tx_hash)]))
+                }
+                Some("eth_getBlockReceipts") => Ok(json!([receipt(tx_hash, 2, block_hash, 1)])),
+                method => panic!("unexpected RPC method {method:?}"),
+            });
+
+        let (broker, executions) = spawn_counting_test_broker();
+        broker.notify_block(1, 10);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let route = RpcRoute::from(RpcChainRoute::new(
+            1,
+            vec![Url::parse("https://cache.invalid").unwrap()],
+        ));
+        let read = RpcRead::eth_call(Address::from([4_u8; 20]), Bytes::from_static(b"read"));
+        let make_submission = || {
+            RpcSubmission::new(
+                route.clone(),
+                vec![read.clone()],
+                WalletRpcOrigin::PublicWallet.into(),
+            )
+        };
+        assert_eq!(
+            broker.submit(make_submission()).await.unwrap()[0],
+            Ok(Bytes::from_static(b"cached"))
+        );
+        assert_eq!(
+            broker.submit(make_submission()).await.unwrap()[0],
+            Ok(Bytes::from_static(b"cached"))
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        let pool = test_pool(url);
+        let mut observer = BlockObserver::establish(pool, 2, Arc::clone(&broker), 1)
+            .await
+            .expect("establish observer baseline");
+        observer.register(tx_hash, 0);
+        let observation = observer.poll().await.expect("observe containing block");
+        assert!(observation.receipt.is_some());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(broker.submit(make_submission()).await.unwrap()[0].is_ok());
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        task.join().expect("RPC fixture task");
     }
 
     #[tokio::test]
@@ -681,7 +763,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(original, 0);
@@ -732,7 +814,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0x33; 32]), 0);
@@ -775,7 +857,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -814,7 +896,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -863,7 +945,7 @@ mod tests {
         url.set_query(Some("rpc-query-sentinel"));
         url.set_fragment(Some("rpc-fragment-sentinel"));
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -898,7 +980,7 @@ mod tests {
             ))
         });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xcc; 32]), 0);
@@ -920,7 +1002,7 @@ mod tests {
             Duration::ZERO,
             reqwest::Client::new(),
         ));
-        let observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("fail over to healthy baseline provider");
         drop(observer);
@@ -974,7 +1056,7 @@ mod tests {
             Duration::from_mins(1),
             reqwest::Client::new(),
         ));
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1029,7 +1111,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 3)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 3, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xdd; 32]), 0);
@@ -1084,7 +1166,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1)
+        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xee; 32]), 0);

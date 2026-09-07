@@ -6,25 +6,26 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
-use alloy::providers::{CallItem, Provider};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use railgun_ui::{
     NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, lookup_token,
     native_usd_anchor_entries, native_usd_micro_value, token_anchor_entries, token_usd_micro_value,
 };
-use sync_service::ChainConfigDefaults;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until};
 
-use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings};
-use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
+use crate::rpc_broker::total_failure;
+use crate::settings::{
+    EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings,
+    resolve_effective_chain_rpc_route,
+};
+use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
 
 mod uniswap_v3_twap;
 
@@ -625,55 +626,27 @@ async fn fetch_oracle_answers_for_chain_with_timeout(
     http: &HttpContext,
     request_timeout: Duration,
 ) -> Result<BTreeMap<Address, U256>> {
-    let (query_rpc_pool, multicall_addr) = provider_for_chain(chain_id, effective_chains, http)?;
-    let mut last_error = None;
-    let mut results = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        let mut multicall = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<AggregatorInterface::latestAnswerCall>()
-            .address(multicall_addr);
-        for oracle_address in oracle_addresses {
-            multicall = multicall.add_call_dynamic(CallItem::new(
-                *oracle_address,
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chains.get(&chain_id))?;
+    let route = RpcRoute::from(chain_route)
+        .with_request_timeout(request_timeout)
+        .with_attempt_timeout(Duration::from_secs(5));
+    let calls = oracle_addresses
+        .iter()
+        .map(|&oracle_address| {
+            (
+                oracle_address,
                 AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
-            ));
-        }
-
-        match timeout(request_timeout, multicall.try_aggregate(false)).await {
-            Ok(Ok(values)) => {
-                results = Some(values);
-                break;
-            }
-            Ok(Err(_)) => {
-                tracing::warn!(chain_id, "multicall anchor oracle answers failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre::eyre!("anchor oracle RPC request failed"));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    chain_id,
-                    timeout_millis = request_timeout.as_millis(),
-                    "multicall anchor oracle answers timed out"
-                );
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre::eyre!(
-                    "anchor oracle multicall timed out after {} milliseconds",
-                    request_timeout.as_millis()
-                ));
-            }
-        }
-    }
-    let results = results.ok_or_else(|| {
-        last_error.map_or_else(
-            || eyre::eyre!("no healthy query RPC available for chain {chain_id}"),
-            |error| error.wrap_err("multicall anchor oracle answers"),
-        )
-    })?;
+            )
+        })
+        .collect();
+    let results = rpc_broker_values::<AggregatorInterface::latestAnswerCall>(
+        http,
+        &route,
+        calls,
+        "anchors::chainlink_oracle",
+    )
+    .await
+    .wrap_err("multicall anchor oracle answers")?;
     let mut answers = BTreeMap::new();
     for (oracle_address, result) in oracle_addresses.iter().copied().zip(results) {
         match result {
@@ -692,27 +665,6 @@ async fn fetch_oracle_answers_for_chain_with_timeout(
         }
     }
     Ok(answers)
-}
-
-fn provider_for_chain(
-    chain_id: u64,
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
-    http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, Address)> {
-    let defaults = ChainConfigDefaults::for_chain(chain_id)
-        .ok_or_else(|| eyre::eyre!("unsupported chain id {chain_id}"))?;
-    let effective_chain = effective_chains.get(&chain_id);
-    let rpc_urls = effective_rpc_urls_for_chain(&defaults, effective_chain)?;
-    let multicall_contract = if let Some(effective_chain) = effective_chain {
-        Address::from_str(&effective_chain.multicall_contract)
-            .wrap_err("parse effective multicall contract")?
-    } else {
-        defaults.multicall_contract
-    };
-    Ok((
-        query_rpc_pool_with_http_client(rpc_urls, http),
-        multicall_contract,
-    ))
 }
 
 fn token_anchor_entries_for_chains(
@@ -1019,70 +971,52 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
     if pools.is_empty() && observations.is_empty() {
         return Ok(TwapFetchedInputs::default());
     }
-    let (query_rpc_pool, multicall_addr) = provider_for_chain(chain_id, effective_chains, http)?;
-    let mut last_error = None;
-    let mut selected = None;
-    for provider_handle in query_rpc_pool.available_providers() {
-        let mut metadata_call = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<UniswapV3PoolInterface::token0Call>()
-            .address(multicall_addr);
-        for pool in pools {
-            metadata_call = metadata_call.add_call_dynamic(CallItem::new(
-                pool.pool,
-                UniswapV3PoolInterface::token0Call {}.abi_encode().into(),
-            ));
-            metadata_call = metadata_call.add_call_dynamic(CallItem::new(
-                pool.pool,
-                UniswapV3PoolInterface::token1Call {}.abi_encode().into(),
-            ));
-        }
-        let mut observation_call = provider_handle
-            .provider
-            .multicall()
-            .dynamic::<UniswapV3PoolInterface::observeCall>()
-            .address(multicall_addr);
-        for observation in observations {
-            observation_call = observation_call.add_call_dynamic(CallItem::new(
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chains.get(&chain_id))?;
+    let route = RpcRoute::from(chain_route)
+        .with_request_timeout(request_timeout)
+        .with_attempt_timeout(Duration::from_secs(5));
+    let metadata_calls = pools
+        .iter()
+        .flat_map(|pool| {
+            [
+                (
+                    pool.pool,
+                    UniswapV3PoolInterface::token0Call {}.abi_encode().into(),
+                ),
+                (
+                    pool.pool,
+                    UniswapV3PoolInterface::token1Call {}.abi_encode().into(),
+                ),
+            ]
+        })
+        .collect();
+    let observation_calls = observations
+        .iter()
+        .map(|observation| {
+            (
                 observation.pool,
                 UniswapV3PoolInterface::observeCall {
                     secondsAgos: vec![observation.window_seconds, 0],
                 }
                 .abi_encode()
                 .into(),
-            ));
-        }
-        let calls = async {
-            let metadata = metadata_call
-                .try_aggregate(false)
-                .await
-                .map_err(|error| eyre::eyre!("metadata batch: {error}"))?;
-            let observations = observation_call
-                .try_aggregate(false)
-                .await
-                .map_err(|error| eyre::eyre!("observation batch: {error}"))?;
-            Ok::<_, eyre::Report>((metadata, observations))
-        };
-        match timeout(request_timeout, calls).await {
-            Ok(Ok(values)) => {
-                selected = Some(values);
-                break;
-            }
-            Ok(Err(error)) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre::eyre!("uniswap v3 multicall failed: {error}"));
-            }
-            Err(_) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre::eyre!("uniswap v3 multicall timed out"));
-            }
-        }
-    }
-    let (metadata_results, observation_results) = selected.ok_or_else(|| {
-        last_error
-            .unwrap_or_else(|| eyre::eyre!("no healthy query RPC available for chain {chain_id}"))
-    })?;
+            )
+        })
+        .collect();
+    let metadata_results = rpc_broker_values::<UniswapV3PoolInterface::token0Call>(
+        http,
+        &route,
+        metadata_calls,
+        "anchors::uniswap_v3_twap.metadata",
+    )
+    .await?;
+    let observation_results = rpc_broker_values::<UniswapV3PoolInterface::observeCall>(
+        http,
+        &route,
+        observation_calls,
+        "anchors::uniswap_v3_twap.observations",
+    )
+    .await?;
     let mut fetched = TwapFetchedInputs::default();
     for (pair, key) in metadata_results.chunks_exact(2).zip(pools.iter().copied()) {
         let (Ok(token0), Ok(token1)) = (pair[0].clone(), pair[1].clone()) else {
@@ -1112,6 +1046,22 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
         }
     }
     Ok(fetched)
+}
+
+async fn rpc_broker_values<C: SolCall + 'static>(
+    http: &HttpContext,
+    route: &RpcRoute,
+    calls: Vec<(Address, Bytes)>,
+    caller: &'static str,
+) -> Result<Vec<std::result::Result<C::Return, RpcBrokerError>>> {
+    let results = http
+        .rpc_broker()
+        .submit_calls_decoded_as::<C>(route.clone(), calls, WalletRpcOrigin::Anchors.into())
+        .await?;
+    if let Some(error) = total_failure(&results) {
+        return Err(eyre::eyre!("{caller} RPC request failed: {error}"));
+    }
+    Ok(results)
 }
 
 fn store_anchor_rates_from_entries_with_inputs(
@@ -1364,6 +1314,8 @@ fn non_zero_rate(rate: U256) -> Option<U256> {
 
 #[cfg(test)]
 mod tests {
+    use crate::RpcChainRoute;
+
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
     use std::sync::{Arc as SharedArc, Mutex, mpsc};
@@ -1375,6 +1327,7 @@ mod tests {
     use alloy::uint;
     use railgun_ui::WRAPPED_NATIVE_FEE_RATE;
     use serde_json::{Value, json};
+    use tokio::time::timeout;
     use tracing::instrument::WithSubscriber;
 
     use super::*;
@@ -1436,7 +1389,8 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().expect("fixture address"));
         let (request_tx, request_rx) = mpsc::channel();
         let task = thread::spawn(move || {
-            for _ in 0..request_count {
+            let mut application_calls = 0;
+            while application_calls < request_count {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let mut bytes = Vec::new();
                 let mut buffer = [0_u8; 4096];
@@ -1466,6 +1420,7 @@ mod tests {
                 let request: Value =
                     serde_json::from_slice(&bytes[header_end..header_end + content_length])
                         .expect("fixture JSON");
+                application_calls += 1;
                 request_tx
                     .send(request.clone())
                     .expect("record fixture request");
@@ -1789,10 +1744,16 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
+        let multicall = effective_chains
+            .get(&1)
+            .and_then(|chain| chain.rpc_route.multicall())
+            .expect("multicall");
         effective_chains
             .get_mut(&1)
             .expect("Ethereum config")
-            .rpc_endpoints = vec![rpc_url];
+            .rpc_route =
+            RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
+                .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -1812,7 +1773,7 @@ mod tests {
         .await
         .expect_err("unresponsive oracle RPC must time out");
 
-        assert!(format!("{error:#}").contains("timed out after 25 milliseconds"));
+        assert!(format!("{error:#}").contains("timed out"));
     }
 
     #[tokio::test]
@@ -1826,10 +1787,16 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
+        let multicall = effective_chains
+            .get(&1)
+            .and_then(|chain| chain.rpc_route.multicall())
+            .expect("multicall");
         effective_chains
             .get_mut(&1)
             .expect("Ethereum config")
-            .rpc_endpoints = vec![rpc_url];
+            .rpc_route =
+            RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
+                .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -1869,11 +1836,9 @@ mod tests {
         effective_chains
             .get_mut(&42161)
             .expect("Arbitrum config")
-            .rpc_endpoints = vec![rpc_url];
-        effective_chains
-            .get_mut(&42161)
-            .expect("Arbitrum config")
-            .multicall_contract = multicall.to_string();
+            .rpc_route =
+            RpcChainRoute::new(42161, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
+                .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -1944,11 +1909,9 @@ mod tests {
         effective_chains
             .get_mut(&42161)
             .expect("Arbitrum config")
-            .rpc_endpoints = vec![rpc_url];
-        effective_chains
-            .get_mut(&42161)
-            .expect("Arbitrum config")
-            .multicall_contract = multicall.to_string();
+            .rpc_route =
+            RpcChainRoute::new(42161, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
+                .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -2009,11 +1972,14 @@ mod tests {
         effective_chains
             .get_mut(&42161)
             .expect("Arbitrum config")
-            .rpc_endpoints = vec![dead_url, healthy_url];
-        effective_chains
-            .get_mut(&42161)
-            .expect("Arbitrum config")
-            .multicall_contract = multicall.to_string();
+            .rpc_route = RpcChainRoute::new(
+            42161,
+            vec![
+                reqwest::Url::parse(&dead_url).expect("RPC URL"),
+                reqwest::Url::parse(&healthy_url).expect("RPC URL"),
+            ],
+        )
+        .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -2712,11 +2678,9 @@ mod tests {
         effective_chains
             .get_mut(&1)
             .expect("Ethereum config")
-            .rpc_endpoints = vec![rpc_url];
-        effective_chains
-            .get_mut(&1)
-            .expect("Ethereum config")
-            .multicall_contract = multicall.to_string();
+            .rpc_route =
+            RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
+                .with_multicall(multicall);
         let data_dir = std::env::temp_dir();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),

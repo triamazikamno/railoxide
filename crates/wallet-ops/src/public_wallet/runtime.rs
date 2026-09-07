@@ -2,13 +2,14 @@ use std::str::FromStr;
 
 use alloy::primitives::Address;
 use eyre::{Result, WrapErr, eyre};
-use reqwest::Url;
 use sync_service::ChainConfigDefaults;
 
 use super::types::PublicAssetId;
 use crate::amounts::wrapped_native_token_for_chain;
-use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings};
-use crate::{GAS_LIMIT_BUFFER, chain_defaults_for_chain, effective_rpc_urls_for_chain};
+use crate::settings::{
+    EffectiveChainConfig, EffectiveChainGasSettings, resolve_effective_chain_rpc_route,
+};
+use crate::{GAS_LIMIT_BUFFER, RpcChainRoute, chain_defaults_for_chain};
 
 pub(super) fn public_shield_token(
     asset: PublicAssetId,
@@ -23,11 +24,10 @@ pub(super) fn public_shield_token(
 }
 
 pub(super) struct PublicChainRuntimeConfig {
-    pub(super) rpc_urls: Vec<Url>,
+    pub(super) rpc_route: RpcChainRoute,
     pub(super) railgun_contract: Address,
     pub(super) relay_adapt_contract: Address,
     pub(super) wrapped_native_token: Option<Address>,
-    pub(super) multicall_contract: Address,
     pub(super) finality_depth: u64,
     pub(super) gas: EffectiveChainGasSettings,
 }
@@ -37,13 +37,13 @@ pub(super) fn public_chain_runtime_config(
     effective_chain: Option<&EffectiveChainConfig>,
 ) -> Result<PublicChainRuntimeConfig> {
     let defaults = chain_defaults_for_public_chain(chain_id)?;
+    let rpc_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let Some(effective_chain) = effective_chain else {
         return Ok(PublicChainRuntimeConfig {
-            rpc_urls: defaults.rpc_urls,
+            rpc_route,
             railgun_contract: defaults.contract,
             relay_adapt_contract: defaults.relay_adapt_contract,
             wrapped_native_token: wrapped_native_token_for_chain(chain_id),
-            multicall_contract: defaults.multicall_contract,
             finality_depth: defaults.finality_depth,
             gas: EffectiveChainGasSettings {
                 gas_limit_buffer: GAS_LIMIT_BUFFER,
@@ -52,16 +52,9 @@ pub(super) fn public_chain_runtime_config(
             },
         });
     };
-    if effective_chain.chain_id != chain_id {
-        return Err(eyre!(
-            "effective chain config is for chain {}, not {chain_id}",
-            effective_chain.chain_id
-        ));
-    }
     if !effective_chain.enabled {
         return Err(eyre!("chain {chain_id} is disabled in wallet settings"));
     }
-    let rpc_urls = effective_rpc_urls_for_chain(&defaults, Some(effective_chain))?;
     let railgun_contract =
         parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
     let relay_adapt_contract = parse_effective_address(
@@ -74,14 +67,11 @@ pub(super) fn public_chain_runtime_config(
         .map(|value| parse_effective_address("wrapped native token", value))
         .transpose()?
         .or_else(|| wrapped_native_token_for_chain(chain_id));
-    let multicall_contract =
-        parse_effective_address("multicall contract", &effective_chain.multicall_contract)?;
     Ok(PublicChainRuntimeConfig {
-        rpc_urls,
+        rpc_route,
         railgun_contract,
         relay_adapt_contract,
         wrapped_native_token,
-        multicall_contract,
         finality_depth: effective_chain.finality_depth,
         gas: effective_chain.gas.clone(),
     })

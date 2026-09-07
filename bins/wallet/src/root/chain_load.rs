@@ -1721,6 +1721,25 @@ impl WalletRoot {
         )
     }
 
+    /// Drops the broker's cached head for `chain_id`, but only while this observer is still the
+    /// wallet's current one, so a superseded observer cannot invalidate a live chain's cache.
+    fn invalidate_block_for_current_observer(
+        &self,
+        wallet_id: &str,
+        active_wallet_generation: u64,
+        chain_id: u64,
+        observer_token: &InstalledObserverToken,
+    ) {
+        if self.is_current_installed_observer(
+            wallet_id,
+            active_wallet_generation,
+            chain_id,
+            observer_token,
+        ) {
+            self.http.rpc_broker().invalidate_block(chain_id);
+        }
+    }
+
     fn transition_current_installed_observer_to_error(
         &mut self,
         wallet_id: &str,
@@ -1765,6 +1784,7 @@ impl WalletRoot {
             observer_token,
             message,
         )?;
+        self.http.rpc_broker().invalidate_block(chain_id);
         let state = self.chain_states.remove(&chain_id)?;
         let (session, previous_ppoi_workflow_status) = match state {
             ChainUtxoState::Syncing {
@@ -2101,6 +2121,7 @@ impl WalletRoot {
                         if !is_current {
                             return;
                         }
+                        root.http.rpc_broker().invalidate_block(chain_id);
                         let message = format_report_chain(&error);
                         tracing::error!(
                             chain_id,
@@ -2144,6 +2165,7 @@ impl WalletRoot {
                         if !is_current {
                             return;
                         }
+                        root.http.rpc_broker().invalidate_block(chain_id);
                         root.chain_states.insert(
                             chain_id,
                             ChainUtxoState::Error {
@@ -2268,7 +2290,16 @@ impl WalletRoot {
                     | ChainUtxoState::Ready { .. }
                     | ChainUtxoState::Error { .. } => None,
                 };
+                // A session can install with a head already observed, and the
+                // sync-tip stream only reports later transitions. Seed the broker
+                // here so its block epoch is established before the first read.
+                let installed_head_block = state.sync_tip().and_then(|tip| tip.head_block);
                 root.chain_states.insert(chain_id, state);
+                if let Some(installed_head_block) = installed_head_block {
+                    root.http
+                        .rpc_broker()
+                        .notify_block(chain_id, installed_head_block);
+                }
                 if let Some(fingerprint) = initial_sync_fingerprint {
                     root.handle_initial_sync_observation(
                         active_wallet_generation,
@@ -2284,6 +2315,7 @@ impl WalletRoot {
                     );
                 }
                 if initially_failed {
+                    root.http.rpc_broker().invalidate_block(chain_id);
                     root.handle_initial_sync_observation(
                         active_wallet_generation,
                         chain_id,
@@ -2319,6 +2351,14 @@ impl WalletRoot {
                 return;
             }
             if initial_observation.readiness == WalletReadiness::Shutdown {
+                let _ = this.update(cx, |root, _cx| {
+                    root.invalidate_block_for_current_observer(
+                        result_wallet_id.as_ref(),
+                        active_wallet_generation,
+                        chain_id,
+                        &observer_token,
+                    );
+                });
                 return;
             }
 
@@ -2326,6 +2366,14 @@ impl WalletRoot {
                 tokio::select! {
                     changed = observer_cancel_rx.changed() => {
                         if changed.is_err() || *observer_cancel_rx.borrow() {
+                            let _ = this.update(cx, |root, _cx| {
+                                root.invalidate_block_for_current_observer(
+                                    result_wallet_id.as_ref(),
+                                    active_wallet_generation,
+                                    chain_id,
+                                    &observer_token,
+                                );
+                            });
                             if let Err(error) = session.stop().await {
                                 tracing::warn!(
                                     chain_id,
@@ -2542,6 +2590,14 @@ impl WalletRoot {
                         }
                     } => {
                         if !retain_auxiliary_stream(&mut sync_tip_rx, &changed) {
+                            let _ = this.update(cx, |root, _cx| {
+                                root.invalidate_block_for_current_observer(
+                                    result_wallet_id.as_ref(),
+                                    active_wallet_generation,
+                                    chain_id,
+                                    &observer_token,
+                                );
+                            });
                             continue;
                         }
                         let sync_tip = *sync_tip_rx
@@ -2556,6 +2612,17 @@ impl WalletRoot {
                                 &observer_token,
                             ) {
                                 return false;
+                            }
+                            let has_installed_chain_state = root
+                                .chain_states
+                                .get(&chain_id)
+                                .is_some_and(|state| {
+                                    matches!(state, ChainUtxoState::Syncing { .. } | ChainUtxoState::Ready { .. })
+                                });
+                            if has_installed_chain_state
+                                && let Some(new_head_block) = sync_tip.head_block
+                            {
+                                root.http.rpc_broker().notify_block(chain_id, new_head_block);
                             }
                             let Some(state) = root.chain_states.get_mut(&chain_id) else {
                                 return false;

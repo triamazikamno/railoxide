@@ -109,6 +109,7 @@ mod native_topup;
 mod poi_contexts;
 mod protocol_fee;
 mod public_wallet;
+mod rpc_broker;
 mod signer;
 mod sponsored_bundle;
 mod sponsorship;
@@ -243,6 +244,11 @@ pub use public_wallet::{
     walletconnect_transaction_payload_fingerprint,
 };
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
+pub use rpc_broker::{
+    FailureClass, RpcBroker, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute, RpcOrigin,
+    RpcOriginError, RpcRead, RpcReadValidationError, RpcRemoteError, RpcRevert, RpcRoute,
+    RpcSubmission, WalletRpcOrigin,
+};
 pub use sponsored_bundle::*;
 pub use sponsorship::*;
 pub use staking::{

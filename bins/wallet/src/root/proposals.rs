@@ -5106,6 +5106,10 @@ fn proposal_known_address_label(
         return Some("Treasury".to_owned());
     }
     let effective_chain = effective_chain?;
+    let multicall = effective_chain
+        .rpc_route
+        .multicall()
+        .map(|address| address.to_string());
     let configured = [
         ("RAILGUN", effective_chain.railgun_contract.as_str()),
         ("Relay Adapt", effective_chain.relay_adapt_contract.as_str()),
@@ -5113,7 +5117,7 @@ fn proposal_known_address_label(
             "Relay Adapt 7702",
             effective_chain.relay_adapt_7702_contract.as_str(),
         ),
-        ("Multicall", effective_chain.multicall_contract.as_str()),
+        ("Multicall", multicall.as_deref().unwrap_or_default()),
     ];
     configured
         .into_iter()
