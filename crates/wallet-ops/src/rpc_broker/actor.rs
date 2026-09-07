@@ -1,4 +1,5 @@
 use super::cache::ReadCache;
+use super::model::RpcResult;
 use super::model::{
     JsonRpcFailurePolicy, RpcBrokerError, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
 };
@@ -6,7 +7,6 @@ use super::profile::EndpointProfile;
 use super::resolution::{ActiveWork, ReadReply, WaiterPolicy, WaiterState, WorkItem, WorkKey};
 use super::scheduler::{ExecutionJob, ReadyScheduler, RouteLoad};
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::Bytes;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ pub(super) enum EndpointHealthOutcome {
 }
 
 impl EndpointHealthOutcome {
-    pub(super) fn for_result(result: &Result<Bytes, RpcBrokerError>) -> Self {
+    pub(super) fn for_result<T>(result: &Result<T, RpcBrokerError>) -> Self {
         match result {
             Ok(_) | Err(RpcBrokerError::InnerRevert(_)) => Self::Healthy,
             Err(
@@ -60,7 +60,7 @@ impl EndpointHealthOutcome {
         }
     }
 
-    pub(super) fn for_results(results: &[Result<Bytes, RpcBrokerError>]) -> Self {
+    pub(super) fn for_results<T>(results: &[Result<T, RpcBrokerError>]) -> Self {
         results.iter().fold(Self::Healthy, |outcome, result| {
             outcome.combine(Self::for_result(result))
         })
@@ -88,7 +88,7 @@ impl RequestEvent {
 }
 
 pub(super) struct JobOutput {
-    pub(super) completions: Vec<(WorkKey, Result<Bytes, RpcBrokerError>)>,
+    pub(super) completions: Vec<(WorkKey, Result<RpcResult, RpcBrokerError>)>,
     pub(super) requests: Vec<RequestEvent>,
 }
 
@@ -311,12 +311,17 @@ impl Actor {
         origin: RpcOrigin,
         current_batch: &mut Vec<WorkItem>,
     ) {
-        let latest_epoch = matches!(read.block_id(), BlockId::Number(BlockNumberOrTag::Latest))
-            .then(|| self.cache.reconcile_latest_cache_epoch(route.chain_id()))
-            .flatten();
+        let latest_epoch = matches!(
+            read.reuse_block_id(),
+            Some(BlockId::Number(BlockNumberOrTag::Latest))
+        )
+        .then(|| self.cache.reconcile_latest_cache_epoch(route.chain_id()))
+        .flatten();
         let is_dedupable = read.is_dedupable()
-            && (!matches!(read.block_id(), BlockId::Number(BlockNumberOrTag::Latest))
-                || latest_epoch.is_some());
+            && (!matches!(
+                read.reuse_block_id(),
+                Some(BlockId::Number(BlockNumberOrTag::Latest))
+            ) || latest_epoch.is_some());
         let key = WorkKey {
             identity: read.identity_for_route(&route),
             route: route.chain_route().clone(),
@@ -329,12 +334,12 @@ impl Actor {
             },
             latest_epoch,
         };
-        let expected_epoch = match read.block_id() {
-            BlockId::Number(BlockNumberOrTag::Latest) => {
+        let expected_epoch = match read.reuse_block_id() {
+            Some(BlockId::Number(BlockNumberOrTag::Latest)) => {
                 latest_epoch.map(|epoch| epoch.block_number)
             }
-            BlockId::Number(BlockNumberOrTag::Number(number)) => Some(number),
-            BlockId::Hash(hash) if hash.require_canonical != Some(true) => Some(0),
+            Some(BlockId::Number(BlockNumberOrTag::Number(number))) => Some(number),
+            Some(BlockId::Hash(hash)) if hash.require_canonical != Some(true) => Some(0),
             _ => None,
         };
         if read.is_cacheable()
@@ -577,24 +582,21 @@ impl Actor {
                 let read = active.read;
                 if read.is_cacheable() && result.is_ok() {
                     let chain_id = key.identity.chain_id();
-                    let observed = match read.block_id() {
-                        BlockId::Number(BlockNumberOrTag::Latest) => self
+                    let observed = match read.reuse_block_id() {
+                        Some(BlockId::Number(BlockNumberOrTag::Latest)) => self
                             .cache
                             .reconcile_latest_cache_epoch(chain_id)
                             .map(|epoch| epoch.block_number),
-                        BlockId::Number(BlockNumberOrTag::Number(number)) => Some(number),
-                        BlockId::Hash(_) => Some(0),
-                        BlockId::Number(
-                            BlockNumberOrTag::Earliest
-                            | BlockNumberOrTag::Pending
-                            | BlockNumberOrTag::Safe
-                            | BlockNumberOrTag::Finalized,
-                        ) => None,
+                        Some(BlockId::Number(BlockNumberOrTag::Number(number))) => Some(number),
+                        Some(BlockId::Hash(_)) => Some(0),
+                        _ => None,
                     };
                     let latest_still_current =
                         self.cache.latest_is_current(chain_id, key.latest_epoch);
-                    if !matches!(read.block_id(), BlockId::Number(BlockNumberOrTag::Latest))
-                        || latest_still_current
+                    if !matches!(
+                        read.reuse_block_id(),
+                        Some(BlockId::Number(BlockNumberOrTag::Latest))
+                    ) || latest_still_current
                     {
                         self.cache
                             .insert(key.identity.clone(), observed, result.clone());

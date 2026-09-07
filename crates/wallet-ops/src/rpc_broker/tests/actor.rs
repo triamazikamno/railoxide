@@ -71,7 +71,7 @@ async fn actor_keeps_collection_window_across_later_arrival_and_deadline_wake() 
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -129,7 +129,10 @@ async fn actor_keeps_collection_window_across_later_arrival_and_deadline_wake() 
     }
     time::advance(Duration::from_secs(8)).await;
     let second_result = second.await.unwrap().expect("later submission");
-    assert_eq!(second_result, vec![Ok(Bytes::from_static(b"second"))]);
+    assert_eq!(
+        second_result,
+        vec![Ok(data_result(Bytes::from_static(b"second")))]
+    );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     drop(broker);
 }
@@ -146,7 +149,7 @@ async fn duplicate_waiters_share_one_execution_and_keep_independent_deadlines() 
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -162,7 +165,7 @@ async fn duplicate_waiters_share_one_execution_and_keep_independent_deadlines() 
                     route,
                     vec![
                         RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"shared"))
-                            .with_block(BlockNumberOrTag::Number(1)),
+                            .with_test_block(BlockNumberOrTag::Number(1)),
                     ],
                     test_origin(),
                 ))
@@ -182,7 +185,7 @@ async fn duplicate_waiters_share_one_execution_and_keep_independent_deadlines() 
     }
     assert_eq!(
         late.await.unwrap().expect("later waiter"),
-        vec![Ok(Bytes::from_static(b"shared"))]
+        vec![Ok(data_result(Bytes::from_static(b"shared")))]
     );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     drop(broker);
@@ -209,7 +212,7 @@ async fn duplicate_reads_share_one_request_under_the_strictest_attempt_cap() {
                     route,
                     vec![
                         RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"capped"))
-                            .with_block(BlockNumberOrTag::Number(4)),
+                            .with_test_block(BlockNumberOrTag::Number(4)),
                     ],
                     test_origin(),
                 ))
@@ -270,7 +273,7 @@ async fn aggregated_reads_keep_distinct_policies_and_per_member_deadlines() {
                             {
                                 Err(RpcBrokerError::TimeoutBeforeDispatch)
                             } else {
-                                Ok(read_calldata(&item.read))
+                                Ok(data_result(read_calldata(&item.read)))
                             };
                             (item.key, value)
                         })
@@ -313,7 +316,7 @@ async fn aggregated_reads_keep_distinct_policies_and_per_member_deadlines() {
     }
     assert_eq!(
         lenient_result.expect("lenient member"),
-        vec![Ok(Bytes::from_static(b"lenient"))]
+        vec![Ok(data_result(Bytes::from_static(b"lenient")))]
     );
     assert_eq!(
         observed
@@ -337,7 +340,7 @@ async fn a_queued_read_keeps_its_own_deadline_when_the_running_read_expires() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -384,7 +387,7 @@ async fn a_queued_read_keeps_its_own_deadline_when_the_running_read_expires() {
     }
     assert_eq!(
         queued.await.unwrap().expect("queued waiter"),
-        vec![Ok(Bytes::from_static(b"queued"))]
+        vec![Ok(data_result(Bytes::from_static(b"queued")))]
     );
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     drop(broker);
@@ -492,11 +495,17 @@ async fn callers_keep_their_ordered_results_when_collected_together() {
     let (first, second) = tokio::join!(broker.submit(first), broker.submit(second));
     assert_eq!(
         first.unwrap(),
-        vec![Ok(Bytes::from_static(&[1])), Ok(Bytes::from_static(&[2]))]
+        vec![
+            Ok(data_result(Bytes::from_static(&[1]))),
+            Ok(data_result(Bytes::from_static(&[2])))
+        ]
     );
     assert_eq!(
         second.unwrap(),
-        vec![Ok(Bytes::from_static(&[3])), Ok(Bytes::from_static(&[4]))]
+        vec![
+            Ok(data_result(Bytes::from_static(&[3]))),
+            Ok(data_result(Bytes::from_static(&[4])))
+        ]
     );
     drop(broker);
 }
@@ -512,7 +521,7 @@ async fn route_threshold_flushes_before_admitting_the_next_read() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -632,7 +641,7 @@ async fn individual_ready_work_is_bounded_by_top_level_concurrency() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -678,7 +687,7 @@ async fn aggregate_completion_is_delivered_while_individual_job_is_blocked() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -730,7 +739,10 @@ async fn aggregate_completion_is_delivered_while_individual_job_is_blocked() {
         .expect("aggregate completion must not wait for the blocked individual job")
         .unwrap()
         .expect("aggregate submission");
-    assert_eq!(delivered, vec![Ok(Bytes::from_static(b"aggregate"))]);
+    assert_eq!(
+        delivered,
+        vec![Ok(data_result(Bytes::from_static(b"aggregate")))]
+    );
     gate.add_permits(1);
     assert!(individual.await.unwrap().is_ok());
     drop(broker);
@@ -751,7 +763,7 @@ async fn queued_duplicate_reads_expire_without_dispatch() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -768,7 +780,7 @@ async fn queued_duplicate_reads_expire_without_dispatch() {
                     route,
                     vec![
                         RpcRead::eth_call(Address::ZERO, Bytes::from_static(calldata))
-                            .with_block(BlockNumberOrTag::Number(1)),
+                            .with_test_block(BlockNumberOrTag::Number(1)),
                     ],
                     origin,
                 ))
@@ -938,7 +950,7 @@ async fn unknown_block_latest_reads_do_not_deduplicate_in_flight() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -979,7 +991,7 @@ async fn eth_call_and_balance_reads_do_not_share_cache_or_dedup_identity() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -1076,7 +1088,7 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
     let admission = Arc::new(Semaphore::new(4));
     let read = |index| {
         RpcRead::eth_call(Address::from([index; 20]), Bytes::new())
-            .with_block(BlockNumberOrTag::Number(1))
+            .with_test_block(BlockNumberOrTag::Number(1))
     };
     let now = Instant::now();
     let mut results = Vec::new();
@@ -1177,12 +1189,12 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
         if shutdown {
             Err(RpcBrokerError::Shutdown)
         } else {
-            Ok(Bytes::from_static(b"ok"))
+            Ok(data_result(Bytes::from_static(b"ok")))
         }
     );
     assert_eq!(
         results.pop().unwrap().await.unwrap(),
-        Ok(Bytes::from_static(b"ok"))
+        Ok(data_result(Bytes::from_static(b"ok")))
     );
     drop(results);
     let mut expected = vec![vec![Address::from([2_u8; 20])]];
@@ -1212,7 +1224,7 @@ async fn shutdown_drains_an_accepted_execution() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -1298,7 +1310,7 @@ async fn shutdown_drains_an_accepted_execution() {
     release.notify_one();
     assert_eq!(
         started_result.await.expect("started reply"),
-        Ok(Bytes::from_static(&[15]))
+        Ok(data_result(Bytes::from_static(&[15])))
     );
     actor_task
         .await
@@ -1324,7 +1336,7 @@ async fn block_notification_flushes_pending_work_after_other_branch_wins() {
         .expect("block flush")
         .unwrap()
         .unwrap();
-    assert_eq!(result, vec![Ok(Bytes::from_static(&[8]))]);
+    assert_eq!(result, vec![Ok(data_result(Bytes::from_static(&[8])))]);
     drop(broker);
 }
 
@@ -1339,7 +1351,7 @@ async fn stale_head_notification_does_not_flush_pending_work() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -1384,7 +1396,7 @@ async fn stale_head_notification_does_not_flush_pending_work() {
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert_eq!(
         pending.await.unwrap().expect("pending submission"),
-        vec![Ok(Bytes::from_static(b"pending"))]
+        vec![Ok(data_result(Bytes::from_static(b"pending")))]
     );
     drop(broker);
 }
@@ -1406,7 +1418,7 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
                         endpoint,
                         health_outcome: EndpointHealthOutcome::Healthy,
                     });
-                    completions.push((item.key, Ok(Bytes::from_static(b"cached"))));
+                    completions.push((item.key, Ok(data_result(Bytes::from_static(b"cached")))));
                 }
                 JobOutput {
                     completions,
@@ -1426,7 +1438,7 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
     let make_submission = || RpcSubmission::new(route.clone(), vec![read.clone()], test_origin());
     assert_eq!(
         broker.submit(make_submission()).await.unwrap()[0],
-        Ok(Bytes::from_static(b"cached"))
+        Ok(data_result(Bytes::from_static(b"cached")))
     );
     // Session installation and the sync-tip stream both seed the epoch, so the
     // same head can be reported more than once and a stale head can still
@@ -1437,7 +1449,7 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
     time::sleep(Duration::from_millis(5)).await;
     assert_eq!(
         broker.submit(make_submission()).await.unwrap()[0],
-        Ok(Bytes::from_static(b"cached"))
+        Ok(data_result(Bytes::from_static(b"cached")))
     );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     broker.notify_block(1, 11);
@@ -1445,8 +1457,8 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
     assert!(broker.submit(make_submission()).await.unwrap()[0].is_ok());
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     let target = Address::from([5_u8; 20]);
-    let tagged =
-        RpcRead::eth_call(target, Bytes::from_static(b"tag")).with_block(BlockNumberOrTag::Safe);
+    let tagged = RpcRead::eth_call(target, Bytes::from_static(b"tag"))
+        .with_test_block(BlockNumberOrTag::Safe);
     assert!(!tagged.is_cacheable());
     drop(broker);
 }
@@ -1462,7 +1474,7 @@ async fn latest_cache_lease_and_invalidation_preserve_numbered_entries() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(Bytes::from_static(b"cached"))))
+                        .map(|item| (item.key, Ok(data_result(Bytes::from_static(b"cached")))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -1485,7 +1497,7 @@ async fn latest_cache_lease_and_invalidation_preserve_numbered_entries() {
     let latest = || RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"latest"));
     let numbered = || {
         let mut read = RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"numbered"));
-        read = read.with_block(BlockNumberOrTag::Number(7));
+        read = read.with_test_block(BlockNumberOrTag::Number(7));
         read
     };
     let origin = || test_origin();
@@ -1562,7 +1574,7 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
                     JobOutput {
                         completions: group
                             .into_iter()
-                            .map(|item| (item.key, Ok(value.clone())))
+                            .map(|item| (item.key, Ok(data_result(value.clone()))))
                             .collect(),
                         requests: Vec::new(),
                     }
@@ -1616,7 +1628,10 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
                             .expect("reconciling dispatch")
                             .send(Bytes::from_static(b"probe"))
                             .unwrap();
-                        assert_eq!(probe.await.unwrap(), vec![Ok(Bytes::from_static(b"probe"))]);
+                        assert_eq!(
+                            probe.await.unwrap(),
+                            vec![Ok(data_result(Bytes::from_static(b"probe")))]
+                        );
                     }
                 }
             }
@@ -1635,8 +1650,8 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
             let new_value = Bytes::from_static(b"new");
             if old_finishes_first {
                 old_release.send(old_value.clone()).unwrap();
-                assert_eq!(old.await.unwrap(), vec![Ok(old_value.clone())]);
-                assert_eq!(duplicate.await.unwrap(), vec![Ok(old_value)]);
+                assert_eq!(old.await.unwrap(), vec![Ok(data_result(old_value.clone()))]);
+                assert_eq!(duplicate.await.unwrap(), vec![Ok(data_result(old_value))]);
                 let later = submit(b"shared");
                 for _ in 0..8 {
                     tokio::task::yield_now().await;
@@ -1647,14 +1662,17 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
                 );
                 assert!(started_rx.try_recv().is_err());
                 new_release.send(new_value.clone()).unwrap();
-                assert_eq!(new.await.unwrap(), vec![Ok(new_value.clone())]);
-                assert_eq!(later.await.unwrap(), vec![Ok(new_value.clone())]);
+                assert_eq!(new.await.unwrap(), vec![Ok(data_result(new_value.clone()))]);
+                assert_eq!(
+                    later.await.unwrap(),
+                    vec![Ok(data_result(new_value.clone()))]
+                );
             } else {
                 new_release.send(new_value.clone()).unwrap();
-                assert_eq!(new.await.unwrap(), vec![Ok(new_value.clone())]);
+                assert_eq!(new.await.unwrap(), vec![Ok(data_result(new_value.clone()))]);
                 old_release.send(old_value.clone()).unwrap();
-                assert_eq!(old.await.unwrap(), vec![Ok(old_value.clone())]);
-                assert_eq!(duplicate.await.unwrap(), vec![Ok(old_value)]);
+                assert_eq!(old.await.unwrap(), vec![Ok(data_result(old_value.clone()))]);
+                assert_eq!(duplicate.await.unwrap(), vec![Ok(data_result(old_value))]);
             }
             let cached = submit(b"shared");
             for _ in 0..8 {
@@ -1664,7 +1682,7 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
                 cached.is_finished(),
                 "{boundary:?} must cache the new result"
             );
-            assert_eq!(cached.await.unwrap(), vec![Ok(new_value)]);
+            assert_eq!(cached.await.unwrap(), vec![Ok(data_result(new_value))]);
             assert!(started_rx.try_recv().is_err());
             drop(broker);
         }

@@ -1,6 +1,5 @@
-use super::model::{HEAD_FRESHNESS_LEASE, ReadIdentity, RpcBrokerError};
+use super::model::{HEAD_FRESHNESS_LEASE, ReadIdentity, RpcBrokerError, RpcResult};
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::Bytes;
 use std::collections::{HashMap, VecDeque};
 use tokio::time::Instant;
 
@@ -34,7 +33,7 @@ impl HeadObservation {
 /// Owns completed read results and the head observations used to validate latest reads.
 #[derive(Default)]
 pub(super) struct ReadCache {
-    pub(super) entries: HashMap<ReadIdentity, (Option<u64>, Result<Bytes, RpcBrokerError>)>,
+    pub(super) entries: HashMap<ReadIdentity, (Option<u64>, Result<RpcResult, RpcBrokerError>)>,
     order: VecDeque<ReadIdentity>,
     pub(super) current_blocks: HashMap<u64, HeadObservation>,
 }
@@ -44,7 +43,7 @@ impl ReadCache {
         &self,
         identity: &ReadIdentity,
         expected_epoch: Option<u64>,
-    ) -> Option<Result<Bytes, RpcBrokerError>> {
+    ) -> Option<Result<RpcResult, RpcBrokerError>> {
         self.entries
             .get(identity)
             .filter(|(observed, _)| *observed == expected_epoch)
@@ -134,11 +133,17 @@ impl ReadCache {
     pub(super) fn evict_latest(&mut self, chain_id: u64) {
         self.entries.retain(|identity, _| {
             identity.chain_id() != chain_id
-                || !matches!(identity.block(), BlockId::Number(BlockNumberOrTag::Latest))
+                || !matches!(
+                    identity.block(),
+                    Some(BlockId::Number(BlockNumberOrTag::Latest))
+                )
         });
         self.order.retain(|identity| {
             identity.chain_id() != chain_id
-                || !matches!(identity.block(), BlockId::Number(BlockNumberOrTag::Latest))
+                || !matches!(
+                    identity.block(),
+                    Some(BlockId::Number(BlockNumberOrTag::Latest))
+                )
         });
     }
 
@@ -146,7 +151,7 @@ impl ReadCache {
         &mut self,
         identity: ReadIdentity,
         observed: Option<u64>,
-        value: Result<Bytes, RpcBrokerError>,
+        value: Result<RpcResult, RpcBrokerError>,
     ) {
         self.order.retain(|existing| existing != &identity);
         self.entries.insert(identity.clone(), (observed, value));
@@ -173,6 +178,7 @@ impl ReadCache {
 mod tests {
     use super::super::model::{RpcChainRoute, RpcRead, RpcRoute};
     use super::*;
+    use crate::rpc_broker::tests::data_result;
     use alloy::primitives::{Address, Bytes};
     use url::Url;
 
@@ -182,7 +188,7 @@ mod tests {
             vec![Url::parse("https://cache.test").unwrap()],
         ));
         RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"cache"))
-            .with_block(block)
+            .with_test_block(block)
             .identity_for_route(&route)
     }
 
@@ -191,15 +197,19 @@ mod tests {
         let mut cache = ReadCache::default();
         let latest = identity(BlockId::Number(BlockNumberOrTag::Latest));
         let numbered = identity(BlockId::Number(BlockNumberOrTag::Number(7)));
-        cache.insert(latest.clone(), Some(7), Ok(Bytes::from_static(b"latest")));
+        cache.insert(
+            latest.clone(),
+            Some(7),
+            Ok(data_result(Bytes::from_static(b"latest"))),
+        );
         cache.insert(
             numbered.clone(),
             Some(7),
-            Ok(Bytes::from_static(b"numbered")),
+            Ok(data_result(Bytes::from_static(b"numbered"))),
         );
         assert_eq!(
             cache.lookup(&latest, Some(7)),
-            Some(Ok(Bytes::from_static(b"latest")))
+            Some(Ok(data_result(Bytes::from_static(b"latest"))))
         );
         assert_eq!(cache.lookup(&latest, Some(8)), None);
         cache.observe_head(1, 8, Instant::now());
@@ -216,7 +226,7 @@ mod tests {
             cache.insert(
                 numbered(block),
                 Some(block),
-                Ok(Bytes::from(block.to_be_bytes().to_vec())),
+                Ok(data_result(Bytes::from(block.to_be_bytes().to_vec()))),
             );
         }
         assert_eq!(cache.len(), READ_CACHE_ENTRY_LIMIT);
@@ -226,18 +236,22 @@ mod tests {
 
         // Re-inserting an existing key must move it to the back of the eviction order, so the
         // next admission evicts the entry behind it rather than the refreshed one.
-        cache.insert(numbered(1), Some(1), Ok(Bytes::from_static(b"refreshed")));
+        cache.insert(
+            numbered(1),
+            Some(1),
+            Ok(data_result(Bytes::from_static(b"refreshed"))),
+        );
         cache.insert(
             numbered(limit + 1),
             Some(limit + 1),
-            Ok(Bytes::from_static(b"newest")),
+            Ok(data_result(Bytes::from_static(b"newest"))),
         );
         assert_eq!(cache.len(), READ_CACHE_ENTRY_LIMIT);
         assert!(!cache.contains_key(&numbered(2)));
         assert!(cache.contains_key(&numbered(limit + 1)));
         assert_eq!(
             cache.lookup(&numbered(1), Some(1)),
-            Some(Ok(Bytes::from_static(b"refreshed")))
+            Some(Ok(data_result(Bytes::from_static(b"refreshed"))))
         );
     }
 }

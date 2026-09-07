@@ -1,12 +1,13 @@
 use super::actor::{EndpointHealthOutcome, JobOutput, RequestEvent};
 use super::model::{
-    FailureClass, MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT, RpcBrokerError, RpcOperation, RpcRead,
-    RpcRemoteError, RpcRevert, RpcRoute,
+    FailureClass, MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT, RpcBrokerError, RpcRead, RpcRemoteError,
+    RpcResult, RpcRevert, RpcRoute,
 };
+use super::operation::RpcOperation;
 use super::resolution::{WaiterSnapshot, WaiterState, WorkItem};
 use super::scheduler::ExecutionJob;
 use alloy::network::Ethereum;
-use alloy::primitives::{Bytes, TxKind, U256};
+use alloy::primitives::{Bytes, TxKind};
 use alloy::providers::EthCallParams;
 use alloy::providers::bindings::IMulticall3;
 use alloy::rpc::json_rpc::{ErrorPayload, Id, Request};
@@ -16,7 +17,7 @@ use alloy::sol_types::SolCall;
 use futures_util::future::BoxFuture;
 use poi::SensitiveUrl;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -216,13 +217,15 @@ async fn execute_aggregate_with_failover_attempt(
     }
 }
 
-/// Every failure class other than an inner revert is retried on the next endpoint; a revert is
-/// the target contract's answer and is identical everywhere.
+/// Reverts and the fixed local body cap are terminal. Other failures retain endpoint failover.
 pub(super) const fn should_failover_error(error: &RpcBrokerError) -> bool {
-    !matches!(error, RpcBrokerError::InnerRevert(_))
+    !matches!(
+        error,
+        RpcBrokerError::InnerRevert(_) | RpcBrokerError::ResponseTooLarge
+    )
 }
 
-const fn should_failover_aggregate_outcome(outcome: &AttemptOutcome<Bytes>) -> bool {
+const fn should_failover_aggregate_outcome(outcome: &AttemptOutcome<RpcResult>) -> bool {
     match outcome {
         // Member reverts arrive as `InnerRevert` under `requireSuccess=false`, never as
         // `Recoverable`, so a recoverable error that outlived reduction is an endpoint
@@ -234,7 +237,7 @@ const fn should_failover_aggregate_outcome(outcome: &AttemptOutcome<Bytes>) -> b
 }
 
 struct ReductionOutput {
-    values: Vec<AttemptOutcome<Bytes>>,
+    values: Vec<AttemptOutcome<RpcResult>>,
     attempts: Vec<PhysicalAttempt>,
 }
 struct PhysicalAttempt {
@@ -407,11 +410,13 @@ fn reduce_with_parent(
                 };
             }
             AttemptOutcome::Recoverable(error) => {
-                attempt.health_outcome = EndpointHealthOutcome::for_result(&Err(error.clone()));
+                attempt.health_outcome =
+                    EndpointHealthOutcome::for_result::<RpcResult>(&Err(error.clone()));
                 error
             }
             AttemptOutcome::CallerError(error) => {
-                attempt.health_outcome = EndpointHealthOutcome::for_result(&Err(error.clone()));
+                attempt.health_outcome =
+                    EndpointHealthOutcome::for_result::<RpcResult>(&Err(error.clone()));
                 for index in &actual {
                     values[*index] = AttemptOutcome::CallerError(error.clone());
                 }
@@ -510,10 +515,10 @@ fn reduce_with_parent(
 }
 
 fn replace_undispatched_with_parent_error(
-    values: Vec<AttemptOutcome<Bytes>>,
+    values: Vec<AttemptOutcome<RpcResult>>,
     indices: &[usize],
     parent_error: &RpcBrokerError,
-) -> Vec<AttemptOutcome<Bytes>> {
+) -> Vec<AttemptOutcome<RpcResult>> {
     let mut values = values;
     for index in indices.iter().copied() {
         if matches!(&values[index], AttemptOutcome::NotDispatched) {
@@ -525,7 +530,7 @@ fn replace_undispatched_with_parent_error(
 
 struct AggregateExecution {
     indices: Vec<usize>,
-    result: AttemptOutcome<Vec<Result<Bytes, RpcBrokerError>>>,
+    result: AttemptOutcome<Vec<Result<RpcResult, RpcBrokerError>>>,
 }
 
 async fn execute_aggregate(
@@ -589,7 +594,7 @@ async fn execute_aggregate(
         .map(|index| {
             let read = &context.members[*index].read;
             let (target, call_data) = match read.operation() {
-                RpcOperation::GetBalance { account } => (
+                RpcOperation::GetBalance { account, .. } => (
                     multicall,
                     Bytes::from(IMulticall3::getEthBalanceCall { addr: *account }.abi_encode()),
                 ),
@@ -601,6 +606,7 @@ async fn execute_aggregate(
                     let calldata = request.input.input().cloned().unwrap_or_default();
                     (target, calldata)
                 }
+                _ => unreachable!("only eligible calls and balances are aggregated"),
             };
             IMulticall3::Call {
                 target,
@@ -621,8 +627,12 @@ async fn execute_aggregate(
     let transaction = TransactionRequest::default()
         .to(multicall)
         .input(TransactionInput::new(input.into()));
-    let params = EthCallParams::<Ethereum>::new(transaction)
-        .with_block(context.members[first_index].read.block_id());
+    let params = EthCallParams::<Ethereum>::new(transaction).with_block(
+        context.members[first_index]
+            .read
+            .reuse_block_id()
+            .expect("aggregate member has a block"),
+    );
     let params = serde_json::to_value(params).expect("Alloy eth_call params serialize");
     let body = wire_request("eth_call", params);
     let value = execute_wire_request_with_permit(
@@ -641,23 +651,36 @@ async fn execute_aggregate(
             if decoded.len() != actual.len() {
                 return Err(RpcBrokerError::InvalidResponse);
             }
-            Ok(decoded
+            decoded
                 .into_iter()
-                .map(|result| {
+                .zip(&actual)
+                .map(|(result, index)| {
                     if result.success {
-                        Ok(result.returnData)
+                        context.members[*index]
+                            .read
+                            .result_from_abi(&result.returnData)
+                            .map(Ok)
                     } else {
-                        Err(RpcBrokerError::InnerRevert(RpcRevert::from_multicall(
+                        Ok(Err(RpcBrokerError::InnerRevert(RpcRevert::from_multicall(
                             result.returnData,
-                        )))
+                        ))))
                     }
                 })
-                .collect())
+                .collect::<Result<Vec<_>, RpcBrokerError>>()
         }) {
             Ok(values) => AttemptOutcome::Success(values),
             Err(error) => AttemptOutcome::from(Err(error)),
         },
         Err(error) => AttemptOutcome::from(Err(error)),
+    };
+    let result = if Instant::now() >= request_deadline
+        && !matches!(
+            result,
+            AttemptOutcome::CallerError(RpcBrokerError::ResponseTooLarge)
+        ) {
+        AttemptOutcome::CallerError(RpcBrokerError::Timeout)
+    } else {
+        result
     };
     AggregateExecution {
         indices: actual,
@@ -672,7 +695,7 @@ async fn execute_single_with_shared_waiters_attempt(
     endpoints: &[SensitiveUrl],
     waiters: Arc<WaiterState>,
     fallback_attempt_timeout: Duration,
-) -> (AttemptOutcome<Bytes>, Vec<(Url, EndpointHealthOutcome)>) {
+) -> (AttemptOutcome<RpcResult>, Vec<(Url, EndpointHealthOutcome)>) {
     let mut attempted = Vec::new();
     let mut result = AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint { chain_id });
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
@@ -721,7 +744,7 @@ async fn execute_single_shared_waiter_attempt(
     waiters: &WaiterState,
     fallback_attempt_timeout: Duration,
     reduction_attempt: Option<ReductionAttempt>,
-) -> AttemptOutcome<Bytes> {
+) -> AttemptOutcome<RpcResult> {
     let permit = loop {
         let snapshot = waiters.snapshot(Instant::now());
         if !snapshot.has_live {
@@ -753,23 +776,37 @@ async fn execute_single_shared_waiter_attempt(
     } else {
         snapshot.attempt_timeout
     };
+    let attempt_deadline = Instant::now() + attempt_timeout;
+    let request_deadline = snapshot
+        .deadline
+        .map_or(attempt_deadline, |deadline| deadline.min(attempt_deadline));
     let value = execute_wire_request_with_acquired_permit(
         client,
         endpoint,
         permit,
         body,
-        snapshot.deadline,
+        Some(request_deadline),
         reduction_attempt,
         attempt_timeout,
     )
     .await;
     let result =
         value.and_then(|value| AttemptOutcome::from(parse_rpc_result(&value, preserve_revert)));
-    result.and_then(|value| match decode_response_value(read, &value) {
-        Ok(value) => AttemptOutcome::Success(value),
-        Err(error) => AttemptOutcome::CallerError(error),
-    })
+    let result =
+        result.and_then(|value| AttemptOutcome::from(read.operation().validate_result(value)));
+    if Instant::now() >= request_deadline
+        && !matches!(
+            result,
+            AttemptOutcome::CallerError(RpcBrokerError::ResponseTooLarge)
+        )
+    {
+        AttemptOutcome::CallerError(RpcBrokerError::Timeout)
+    } else {
+        result
+    }
 }
+
+pub(super) const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 // RPC encoding and decoding
 fn wire_request(method: &str, params: Value) -> Request<Value> {
@@ -827,7 +864,7 @@ async fn execute_wire_request_with_permit(
     request_deadline: Instant,
 ) -> Result<Value, RpcBrokerError> {
     let request = async {
-        let response = client
+        let mut response = client
             .post(endpoint.clone())
             .json(&body)
             .send()
@@ -842,13 +879,29 @@ async fn execute_wire_request_with_permit(
         if !response.status().is_success() {
             return Err(RpcBrokerError::HttpStatus(response.status().as_u16()));
         }
-        response.json::<Value>().await.map_err(|error| {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             if error.is_timeout() {
                 RpcBrokerError::Timeout
             } else {
                 RpcBrokerError::InvalidResponse
             }
-        })
+        })? {
+            let size = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(RpcBrokerError::ResponseTooLarge)?;
+            if size > MAX_RESPONSE_BYTES {
+                return Err(RpcBrokerError::ResponseTooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value = serde_json::from_slice(&bytes).map_err(|_| RpcBrokerError::InvalidResponse);
+        if Instant::now() >= request_deadline {
+            Err(RpcBrokerError::Timeout)
+        } else {
+            value
+        }
     };
     time::timeout_at(request_deadline, request)
         .await
@@ -856,34 +909,13 @@ async fn execute_wire_request_with_permit(
 }
 
 pub(super) fn wire_request_for(read: &RpcRead) -> (&'static str, Value, bool) {
-    match read.operation() {
-        RpcOperation::EthCall {
-            request,
-            state_overrides,
-        } => {
-            let params = EthCallParams::<Ethereum>::new((**request).clone())
-                .with_block(read.block_id())
-                .with_overrides_opt(state_overrides.clone());
-            (
-                "eth_call",
-                serde_json::to_value(params).expect("Alloy eth_call params serialize"),
-                true,
-            )
-        }
-        RpcOperation::GetBalance { account } => (
-            "eth_getBalance",
-            json!([format!("{:#x}", account), read.block_id()]),
-            false,
-        ),
-    }
+    read.operation().wire()
 }
 /// The JSON-RPC response envelope, parsed once so the structured error payload (including its
 /// unknown fields) survives without a second deserialization of the same value.
 #[derive(Deserialize)]
 struct WireResponse {
     id: Id,
-    #[serde(default)]
-    result: Option<Value>,
     #[serde(default)]
     error: Option<WithOtherFields<ErrorPayload<Value>>>,
 }
@@ -916,7 +948,10 @@ pub(super) fn parse_rpc_result(
         }
         return Err(RpcBrokerError::Remote(remote));
     }
-    response.result.ok_or(RpcBrokerError::InvalidResponse)
+    value
+        .get("result")
+        .cloned()
+        .ok_or(RpcBrokerError::InvalidResponse)
 }
 pub(super) fn decode_hex_value(value: &Value) -> Result<Bytes, RpcBrokerError> {
     value
@@ -924,21 +959,6 @@ pub(super) fn decode_hex_value(value: &Value) -> Result<Bytes, RpcBrokerError> {
         .ok_or(RpcBrokerError::InvalidResponse)?
         .parse()
         .map_err(|_| RpcBrokerError::InvalidResponse)
-}
-
-pub(super) fn decode_response_value(
-    read: &RpcRead,
-    value: &Value,
-) -> Result<Bytes, RpcBrokerError> {
-    match read.operation() {
-        RpcOperation::EthCall { .. } => decode_hex_value(value),
-        RpcOperation::GetBalance { .. } => decode_balance_value(value),
-    }
-}
-
-fn decode_balance_value(value: &Value) -> Result<Bytes, RpcBrokerError> {
-    let balance = U256::deserialize(value).map_err(|_| RpcBrokerError::InvalidResponse)?;
-    Ok(Bytes::copy_from_slice(&balance.to_be_bytes::<32>()))
 }
 
 #[cfg(test)]

@@ -449,6 +449,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::rpc_broker::tests::data_result;
     use crate::rpc_broker::tests::spawn_counting_test_broker;
     use crate::{RpcChainRoute, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
     use alloy::primitives::Bytes;
@@ -703,11 +704,11 @@ mod tests {
         };
         assert_eq!(
             broker.submit(make_submission()).await.unwrap()[0],
-            Ok(Bytes::from_static(b"cached"))
+            Ok(data_result(Bytes::from_static(b"cached")))
         );
         assert_eq!(
             broker.submit(make_submission()).await.unwrap()[0],
-            Ok(Bytes::from_static(b"cached"))
+            Ok(data_result(Bytes::from_static(b"cached")))
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
 

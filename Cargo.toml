@@ -100,6 +100,9 @@ debug-assertions = true
 [profile.dev.package.gpui-component-assets]
 debug-assertions = true
 
+[profile.dev.package.alloy-eips]
+debug-assertions = true
+
 [profile.dev.package."*"]
 opt-level = 2
 debug = false

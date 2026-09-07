@@ -1,6 +1,6 @@
 use super::cache::LatestEpoch;
+use super::model::RpcResult;
 use super::model::{ReadIdentity, RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRead, RpcRoute};
-use alloy::primitives::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
@@ -12,13 +12,13 @@ use tokio::time::Instant;
 /// owner has been retired by the actor. This keeps caller cancellation from releasing work that
 /// remains registered in the broker.
 pub(super) struct ReadReply {
-    sender: oneshot::Sender<Result<Bytes, RpcBrokerError>>,
+    sender: oneshot::Sender<Result<RpcResult, RpcBrokerError>>,
     _permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl ReadReply {
     pub(super) const fn new(
-        sender: oneshot::Sender<Result<Bytes, RpcBrokerError>>,
+        sender: oneshot::Sender<Result<RpcResult, RpcBrokerError>>,
         permit: Arc<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
@@ -28,7 +28,7 @@ impl ReadReply {
     }
 
     /// Delivers the result to the caller. A dropped receiver is a cancelled caller, not an error.
-    pub(super) fn send(self, result: Result<Bytes, RpcBrokerError>) {
+    pub(super) fn send(self, result: Result<RpcResult, RpcBrokerError>) {
         let _ = self.sender.send(result);
     }
 }

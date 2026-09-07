@@ -16,7 +16,7 @@ use super::types::{
 use crate::rpc_broker::total_failure;
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry};
 use crate::vault::PublicAccountMetadata;
-use crate::{HttpContext, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
+use crate::{HttpContext, RpcRead, RpcResult, RpcRoute, RpcSubmission, WalletRpcOrigin};
 
 const PUBLIC_BALANCE_REFRESH_INTERVAL_SECS: u64 = 60;
 
@@ -145,13 +145,25 @@ pub async fn refresh_public_balances(
         &planned_calls,
         results
             .into_iter()
-            .map(|result| result.as_ref().ok().and_then(decode_public_balance))
+            .zip(&planned_calls)
+            .map(|(result, call)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| decode_public_balance(&call.asset.id, value))
+            })
             .collect(),
     ))
 }
 
-fn decode_public_balance(bytes: &Bytes) -> Option<U256> {
-    PublicErc20::balanceOfCall::abi_decode_returns_validate(bytes).ok()
+fn decode_public_balance(asset: &PublicAssetId, result: &RpcResult) -> Option<U256> {
+    match asset {
+        PublicAssetId::Native => serde_json::from_value(result.expose_value().clone()).ok(),
+        PublicAssetId::Erc20(_) => {
+            let bytes: Bytes = serde_json::from_value(result.expose_value().clone()).ok()?;
+            PublicErc20::balanceOfCall::abi_decode_returns_validate(&bytes).ok()
+        }
+    }
 }
 
 pub(super) fn public_balance_snapshot_from_results(

@@ -1,6 +1,6 @@
+use super::model::RpcResult;
 use super::model::{BlockKey, RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRoute, RpcSubmission};
 use super::resolution::{WorkItem, WorkKey};
-use alloy::primitives::Bytes;
 use std::collections::{HashMap, VecDeque};
 use tokio::time::Instant;
 
@@ -331,9 +331,12 @@ impl ReadyScheduler {
 
     pub(super) fn partition_and_admit(&mut self, work: Vec<WorkItem>) {
         let mut groups: Vec<Vec<WorkItem>> = Vec::new();
-        let mut group_indices: HashMap<(RpcChainRoute, BlockKey), usize> = HashMap::new();
+        let mut group_indices: HashMap<(RpcChainRoute, Option<BlockKey>), usize> = HashMap::new();
         for item in work {
-            let group_key = (item.key.route.clone(), BlockKey(item.read.block_id()));
+            let group_key = (
+                item.key.route.clone(),
+                item.read.reuse_block_id().map(BlockKey),
+            );
             let group_index = *group_indices.entry(group_key).or_insert_with(|| {
                 groups.push(Vec::new());
                 groups.len() - 1
@@ -347,7 +350,10 @@ impl ReadyScheduler {
         self.admit_chunks(chunks);
     }
 
-    pub(super) fn expire(&mut self, now: Instant) -> Vec<(WorkKey, Result<Bytes, RpcBrokerError>)> {
+    pub(super) fn expire(
+        &mut self,
+        now: Instant,
+    ) -> Vec<(WorkKey, Result<RpcResult, RpcBrokerError>)> {
         let mut expired = Vec::new();
         let ids = self.jobs.keys().copied().collect::<Vec<_>>();
         for ready_id in ids {
@@ -451,7 +457,7 @@ impl ReadyScheduler {
     pub(super) fn drain(
         &mut self,
         error: &RpcBrokerError,
-    ) -> Vec<(WorkKey, Result<Bytes, RpcBrokerError>)> {
+    ) -> Vec<(WorkKey, Result<RpcResult, RpcBrokerError>)> {
         let mut completions = Vec::new();
         for job in self.jobs.drain().map(|(_, job)| job) {
             completions.extend(job.into_iter().map(|item| (item.key, Err(error.clone()))));

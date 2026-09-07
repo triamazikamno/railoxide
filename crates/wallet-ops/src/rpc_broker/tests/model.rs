@@ -5,7 +5,6 @@ use alloy::rpc::types::eth::state::{AccountOverride, StateOverride};
 use alloy::rpc::types::eth::transaction::{
     AccessList, AccessListItem, TransactionInput, TransactionRequest,
 };
-use alloy::serde::WithOtherFields;
 
 fn admission_submission(reads: Vec<RpcRead>) -> RpcSubmission {
     RpcSubmission::new(test_route(), reads, test_origin())
@@ -692,7 +691,7 @@ fn identity_matches_equal_requests_and_includes_block_caller_and_gas() {
         first.identity_for_route(&route),
         gas.identity_for_route(&route)
     );
-    let block = first.clone().with_block(BlockNumberOrTag::Number(1));
+    let block = first.clone().with_test_block(BlockNumberOrTag::Number(1));
     assert_ne!(
         first.identity_for_route(&route),
         block.identity_for_route(&route)
@@ -821,7 +820,7 @@ fn explicit_gas_is_serialized_and_excluded_from_multicall() {
 }
 
 #[test]
-fn typed_eth_call_parser_rejects_unknown_and_conflicting_fields() {
+fn typed_eth_call_parser_preserves_unknown_fields_and_rejects_conflicting_input() {
     let route_chain_id = 1;
     let valid = serde_json::json!([
         {
@@ -847,11 +846,21 @@ fn typed_eth_call_parser_rejects_unknown_and_conflicting_fields() {
     assert_eq!(error.code(), -32602);
 
     let unknown = serde_json::json!([
-        { "to": format!("{:#x}", Address::ZERO), "proof": [] },
+        { "to": format!("{:#x}", Address::ZERO), "proof": {"nested": ["0x0001", null]}, "context": "chain-specific", "optional": null },
         "latest"
     ]);
-    let error = RpcRead::from_rpc_params(unknown, route_chain_id).unwrap_err();
-    assert_eq!(error.code(), -32602);
+    let read = RpcRead::from_rpc_params(unknown.clone(), route_chain_id).unwrap();
+    let (_, params, _) = wire_request_for(&read);
+    for field in ["proof", "context", "optional"] {
+        assert_eq!(params[0].get(field), unknown[0].get(field));
+    }
+    assert!(!read.is_dedupable());
+    assert!(!read.is_cacheable());
+    assert!(!read.is_multicall_eligible());
+    assert!(matches!(
+        read.identity_for_route(&test_route()),
+        ReadIdentity::Individual { .. }
+    ));
 }
 
 #[test]
@@ -931,20 +940,7 @@ fn typed_eth_call_accepts_contract_creation_but_keeps_it_individual() {
 }
 
 #[test]
-fn typed_eth_call_rejects_unsupported_fields_and_chain_mismatch() {
-    for transaction in [
-        serde_json::json!({ "maxFeePerBlobGas": "0x1" }),
-        serde_json::json!({ "blobVersionedHashes": [format!("{:#x}", alloy::primitives::B256::ZERO)] }),
-        serde_json::json!({ "blob": "0x0102" }),
-        serde_json::json!({ "blobs": [] }),
-        serde_json::json!({ "sidecar": {} }),
-        serde_json::json!({ "authorizationList": [] }),
-        serde_json::json!({ "proof": [] }),
-    ] {
-        let error = RpcRead::from_rpc_params(serde_json::json!([transaction, "latest"]), 1)
-            .expect_err("unsupported transaction field");
-        assert_eq!(error.code(), -32602);
-    }
+fn typed_eth_call_rejects_block_overrides_and_chain_mismatch() {
     let block_override = serde_json::json!([{}, "latest", { "timestamp": "0x1" }]);
     assert_eq!(
         RpcRead::from_rpc_params(block_override, 1)
@@ -989,8 +985,8 @@ fn typed_state_override_is_forwarded_and_never_cacheable_or_aggregateable() {
 #[test]
 fn block_hash_identity_and_wire_form_retain_require_canonical() {
     let hash = alloy::primitives::B256::from([7_u8; 32]);
-    let first = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_block((hash, Some(false)));
-    let second = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_block((hash, Some(true)));
+    let first = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_test_block((hash, Some(false)));
+    let second = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_test_block((hash, Some(true)));
     let route = test_route();
     assert_ne!(
         first.identity_for_route(&route),
@@ -1031,11 +1027,11 @@ fn complete_block_identifiers_are_forwarded_for_numbers_tags_hashes_and_balance(
         ),
     ];
     for (expected, block) in blocks {
-        let read = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_block(block);
-        assert_eq!(read.identity_for_route(&route).block(), block);
+        let read = RpcRead::eth_call(Address::ZERO, Bytes::new()).with_test_block(block);
+        assert_eq!(read.identity_for_route(&route).block(), Some(block));
         assert_eq!(wire_request_for(&read).1[1], expected);
-        let balance = RpcRead::get_balance(Address::ZERO).with_block(block);
-        assert_eq!(balance.identity_for_route(&route).block(), block);
+        let balance = RpcRead::get_balance(Address::ZERO).with_test_block(block);
+        assert_eq!(balance.identity_for_route(&route).block(), Some(block));
         assert_eq!(wire_request_for(&balance).1[1], expected);
     }
 }
@@ -1103,7 +1099,7 @@ fn endpoint_health_matrix_and_aggregate_precedence() {
         EndpointHealthOutcome::Neutral
     );
     assert_eq!(
-        EndpointHealthOutcome::for_results(&[
+        EndpointHealthOutcome::for_results::<Bytes>(&[
             Err(remote_error(-32000)),
             Err(RpcBrokerError::HttpStatus(429)),
         ]),

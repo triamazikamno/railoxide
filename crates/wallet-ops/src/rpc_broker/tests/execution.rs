@@ -5,14 +5,15 @@ use crate::rpc_broker::model::{
 };
 use crate::rpc_broker::resolution::{WaiterPolicy, WorkKey};
 use crate::rpc_broker::tests::{
-    RpcMockGate, RpcResponder, aggregate_response, read_calldata, remote_error, rpc_error,
-    rpc_read_from_request, rpc_result, spawn_gated_rpc_mock, spawn_rpc_mock, spawn_status_rpc_mock,
-    test_broker, test_broker_with_executor, test_origin, test_route,
+    RpcMockGate, RpcResponder, aggregate_response, data_result, read_calldata, remote_error,
+    rpc_error, rpc_read_from_request, rpc_result, spawn_gated_rpc_mock, spawn_rpc_mock,
+    spawn_status_rpc_mock, test_broker, test_broker_with_executor, test_origin, test_route,
 };
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, U256, hex};
 use alloy::rpc::types::eth::transaction::{TransactionInput, TransactionRequest};
 use alloy::sol_types::SolType;
+use serde_json::json;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -36,7 +37,7 @@ async fn execute_aggregate_with_failover(
 }
 
 struct AggregateFailoverOutput {
-    values: Vec<Result<Bytes, RpcBrokerError>>,
+    values: Vec<Result<RpcResult, RpcBrokerError>>,
     attempts: Vec<PhysicalAttempt>,
 }
 
@@ -49,7 +50,7 @@ async fn execute_single_with_shared_waiters(
     waiters: Arc<WaiterState>,
     fallback_attempt_timeout: Duration,
 ) -> (
-    Result<Bytes, RpcBrokerError>,
+    Result<RpcResult, RpcBrokerError>,
     Vec<(Url, EndpointHealthOutcome)>,
 ) {
     let (result, attempted) = execute_single_with_shared_waiters_attempt(
@@ -132,7 +133,7 @@ async fn execute_wire_request(
 
 #[tokio::test]
 async fn malformed_aggregate_response_strikes_without_reduction_and_can_fail_over() {
-    for malformed in ["hex", "abi", "count"] {
+    for malformed in ["hex", "abi", "count", "balance"] {
         let first_hits = Arc::new(AtomicUsize::new(0));
         let hits = first_hits.clone();
         let first_responder: RpcResponder = Arc::new(move |request| {
@@ -140,14 +141,28 @@ async fn malformed_aggregate_response_strikes_without_reduction_and_can_fail_ove
             match malformed {
                 "hex" => rpc_result(&request, &json!("0xzz")),
                 "abi" => rpc_result(&request, &json!("0x00")),
+                "balance" => aggregate_response(
+                    &request,
+                    vec![
+                        (true, Bytes::from_static(b"short")),
+                        (true, Bytes::from_static(b"second")),
+                    ],
+                ),
                 _ => aggregate_response(&request, Vec::new()),
             }
         });
-        let second_responder: RpcResponder = Arc::new(|request| {
+        let second_responder: RpcResponder = Arc::new(move |request| {
             aggregate_response(
                 &request,
                 vec![
-                    (true, Bytes::from_static(b"first")),
+                    (
+                        true,
+                        if malformed == "balance" {
+                            Bytes::copy_from_slice(&U256::from(42).to_be_bytes::<32>())
+                        } else {
+                            Bytes::from_static(b"first")
+                        },
+                    ),
                     (true, Bytes::from_static(b"second")),
                 ],
             )
@@ -168,7 +183,11 @@ async fn malformed_aggregate_response_strikes_without_reduction_and_can_fail_ove
             );
             let items = (1..=2)
                 .map(|index| {
-                    let read = RpcRead::eth_call(Address::from([index; 20]), Bytes::new());
+                    let read = if malformed == "balance" && index == 1 {
+                        RpcRead::get_balance(Address::ZERO)
+                    } else {
+                        RpcRead::eth_call(Address::from([index; 20]), Bytes::new())
+                    };
                     WorkItem {
                         key: WorkKey {
                             identity: read.identity_for_route(&route),
@@ -206,8 +225,12 @@ async fn malformed_aggregate_response_strikes_without_reduction_and_can_fail_ove
                 assert_eq!(
                     output.values,
                     vec![
-                        Ok(Bytes::from_static(b"first")),
-                        Ok(Bytes::from_static(b"second"))
+                        Ok(if malformed == "balance" {
+                            RpcResult::new(json!("0x2a"))
+                        } else {
+                            data_result(Bytes::from_static(b"first"))
+                        }),
+                        Ok(data_result(Bytes::from_static(b"second")))
                     ]
                 );
             } else {
@@ -253,12 +276,12 @@ async fn typed_submit_helper_decodes_members_and_preserves_errors() {
                 .map(|item| {
                     let marker = read_calldata(&item.read).first().copied();
                     let result = match marker {
-                        Some(1) => Ok(Bytes::from(
-                            <alloy::sol_types::sol_data::Uint<256> as SolType>::abi_encode(
-                                &U256::from(7),
-                            ),
-                        )),
-                        Some(2) => Ok(Bytes::from_static(&[1, 2, 3])),
+                        Some(1) => Ok(data_result(Bytes::from(<alloy::sol_types::sol_data::Uint<
+                            256,
+                        > as SolType>::abi_encode(
+                            &U256::from(7)
+                        )))),
+                        Some(2) => Ok(data_result(Bytes::from_static(&[1, 2, 3]))),
                         _ => Err(RpcBrokerError::Transport),
                     };
                     (item.key, result)
@@ -353,8 +376,8 @@ async fn production_path_reassembles_mixed_and_individual_reads() {
     assert_eq!(
         mixed_result,
         vec![
-            Ok(Bytes::from_static(&[0x11])),
-            Ok(Bytes::from_static(&[0x22]))
+            Ok(data_result(Bytes::from_static(&[0x11]))),
+            Ok(data_result(Bytes::from_static(&[0x22])))
         ]
     );
 
@@ -367,7 +390,10 @@ async fn production_path_reassembles_mixed_and_individual_reads() {
         test_origin(),
     );
     let individual_result = broker.submit(individual).await.unwrap();
-    assert_eq!(individual_result, vec![Ok(Bytes::from_static(&[0x22]))]);
+    assert_eq!(
+        individual_result,
+        vec![Ok(data_result(Bytes::from_static(&[0x22])))]
+    );
     drop(broker);
     server.abort();
 }
@@ -404,7 +430,7 @@ async fn production_path_isolates_inner_revert_payloads() {
         ))
         .await
         .unwrap();
-    assert_eq!(result[0], Ok(Bytes::from_static(&[0xaa])));
+    assert_eq!(result[0], Ok(data_result(Bytes::from_static(&[0xaa]))));
     assert!(matches!(
         &result[1],
         Err(RpcBrokerError::InnerRevert(revert))
@@ -464,7 +490,10 @@ async fn production_path_reduces_recoverable_aggregates_concurrently() {
     .await
     .expect("reduction request")
     .unwrap();
-    assert_eq!(result, vec![Ok(Bytes::from_static(&[0x42])); 4]);
+    assert_eq!(
+        result,
+        vec![Ok(data_result(Bytes::from_static(&[0x42]))); 4]
+    );
     let mut observed = sizes.lock().expect("sizes lock").clone();
     observed.sort_unstable();
     assert_eq!(observed, vec![1, 1, 1, 1, 2, 2, 4]);
@@ -540,7 +569,10 @@ async fn aggregate_attempt_timeout_fails_over_before_total_deadline() {
         .await
         .expect("attempt failover")
         .expect("aggregate task");
-    assert_eq!(output.values, vec![Ok(Bytes::from_static(b"second"))]);
+    assert_eq!(
+        output.values,
+        vec![Ok(data_result(Bytes::from_static(b"second")))]
+    );
     assert!(
         output
             .attempts
@@ -720,7 +752,7 @@ async fn late_waiter_extends_only_future_shared_failover_attempts() {
         .await
         .expect("shared failover should complete")
         .expect("shared failover task");
-    assert_eq!(result, Ok(Bytes::from_static(b"\x02")));
+    assert_eq!(result, Ok(data_result(Bytes::from_static(b"\x02"))));
     assert_eq!(second_calls.load(Ordering::SeqCst), 1);
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[1].0, second);
@@ -769,9 +801,10 @@ async fn shared_waiter_resnapshots_after_semaphore_wait() {
         deadline: Some(Instant::now() + Duration::from_secs(10)),
         attempt_timeout: Duration::from_secs(5),
     });
+    time::resume();
     semaphore.add_permits(1);
     let (result, attempts) = request.await.expect("shared semaphore request");
-    assert_eq!(result, Ok(Bytes::from_static(b"\x02")));
+    assert_eq!(result, Ok(data_result(Bytes::from_static(b"\x02"))));
     assert_eq!(attempts.len(), 1);
     server.abort();
 }
@@ -1104,7 +1137,9 @@ async fn singleton_reduction_retry_resnapshots_late_waiter() {
         .expect("singleton reduction");
     assert_eq!(
         output.values,
-        vec![AttemptOutcome::Success(Bytes::from_static(b"\x02"))]
+        vec![AttemptOutcome::Success(data_result(Bytes::from_static(
+            b"\x02"
+        )))]
     );
     assert_eq!(output.attempts.len(), 2);
     assert_eq!(output.attempts[0].indices, vec![0]);
@@ -1155,9 +1190,9 @@ async fn reduction_preserves_requested_cardinality() {
     assert_eq!(
         result,
         vec![
-            Ok(Bytes::from_static(b"\x01")),
-            Ok(Bytes::from_static(b"\x02")),
-            Ok(Bytes::from_static(b"\x03")),
+            Ok(data_result(Bytes::from_static(b"\x01"))),
+            Ok(data_result(Bytes::from_static(b"\x02"))),
+            Ok(data_result(Bytes::from_static(b"\x03"))),
         ]
     );
     server.abort();
@@ -1293,7 +1328,10 @@ async fn singleton_leaf_fails_over_after_individual_retry() {
         &[item],
     )
     .await;
-    assert_eq!(output.values, vec![Ok(Bytes::from_static(b"\x42"))]);
+    assert_eq!(
+        output.values,
+        vec![Ok(data_result(Bytes::from_static(b"\x42")))]
+    );
     assert_eq!(
         output
             .attempts
@@ -1352,7 +1390,10 @@ async fn individual_read_fails_over_on_recoverable_error() {
         endpoints,
     )
     .await;
-    assert_eq!(output.completions[0].1, Ok(Bytes::from_static(b"\x42")));
+    assert_eq!(
+        output.completions[0].1,
+        Ok(data_result(Bytes::from_static(b"\x42")))
+    );
     assert_eq!(output.requests.len(), 2);
     assert_eq!(output.requests[0].endpoint, first);
     assert_eq!(second_calls.load(Ordering::SeqCst), 1);
@@ -1686,21 +1727,25 @@ async fn aggregate_semaphore_wait_filters_expired_members_and_preserves_order() 
     });
     tokio::task::yield_now().await;
     time::advance(Duration::from_secs(2)).await;
+    time::resume();
     semaphore.add_permits(1);
-    let output = request.await.expect("aggregate execution");
+    let output = time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("aggregate completion")
+        .expect("aggregate execution");
     assert_eq!(observed_calls.lock().expect("calls lock").as_slice(), [1]);
     assert_eq!(output.attempts[0].indices, vec![1]);
     assert_eq!(
         output.values,
         vec![
             Err(RpcBrokerError::TimeoutBeforeDispatch),
-            Ok(Bytes::from_static(b"later")),
+            Ok(data_result(Bytes::from_static(b"later"))),
         ]
     );
     server.abort();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
     let multicall = Address::from([16_u8; 20]);
     let first_calls = Arc::new(Mutex::new(Vec::new()));
@@ -1805,7 +1850,12 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
         )
         .await
     });
-    first_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(5),
+        first_gate.request_started.notified(),
+    )
+    .await
+    .expect("request started");
 
     late_waiter.add(WaiterPolicy {
         deadline: Some(Instant::now() + Duration::from_secs(100)),
@@ -1825,17 +1875,23 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
         blocker_acquired_for_task.notify_one();
         blocker_release_for_task.notified().await;
     });
+    // Queue the blocker before the first HTTP attempt releases its permit.
+    tokio::task::yield_now().await;
     first_gate.release_response.notify_one();
-    time::advance(Duration::from_millis(10)).await;
-    tokio::task::yield_now().await;
-    blocker_acquired.notified().await;
+    time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+        .await
+        .expect("blocker acquired permit");
+    time::pause();
     time::advance(Duration::from_secs(2)).await;
-    tokio::task::yield_now().await;
+    time::resume();
     blocker_release.notify_one();
-    second_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(5),
+        second_gate.request_started.notified(),
+    )
+    .await
+    .expect("failover request started");
     second_gate.release_response.notify_one();
-    time::advance(Duration::from_millis(10)).await;
-    tokio::task::yield_now().await;
 
     let output = time::timeout(Duration::from_secs(5), request)
         .await
@@ -1854,7 +1910,10 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
     assert_eq!(output.attempts[1].indices, vec![1]);
     assert_eq!(
         output.values,
-        vec![Err(remote_error(-32005)), Ok(Bytes::from_static(b"late")),]
+        vec![
+            Err(remote_error(-32005)),
+            Ok(data_result(Bytes::from_static(b"late"))),
+        ]
     );
     blocker_release.notify_one();
     blocker.await.expect("blocker task");
@@ -1862,7 +1921,7 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
     second_server.abort();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reduction_drops_expired_child_but_preserves_parent_error() {
     let multicall = Address::from([17_u8; 20]);
     let observed_calls = Arc::new(Mutex::new(Vec::new()));
@@ -1944,7 +2003,12 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
         )
         .await
     });
-    first_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(5),
+        first_gate.request_started.notified(),
+    )
+    .await
+    .expect("request started");
 
     let blocker_acquired = Arc::new(tokio::sync::Notify::new());
     let blocker_release = Arc::new(tokio::sync::Notify::new());
@@ -1955,18 +2019,28 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
         blocker_acquired_for_task.notify_one();
         blocker_release_for_task.notified().await;
     });
-    first_gate.release_response.notify_one();
-    time::advance(Duration::from_millis(2)).await;
+    // Queue the blocker before the first HTTP attempt releases its permit.
     tokio::task::yield_now().await;
-    blocker_acquired.notified().await;
+    first_gate.release_response.notify_one();
+    time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+        .await
+        .expect("blocker acquired permit");
+    time::pause();
     time::advance(Duration::from_secs(2)).await;
+    time::resume();
     blocker_release.notify_one();
-    first_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(5),
+        first_gate.request_started.notified(),
+    )
+    .await
+    .expect("request started");
     first_gate.release_response.notify_one();
-    time::advance(Duration::from_millis(10)).await;
-    tokio::task::yield_now().await;
 
-    let output = request.await.expect("reduction execution");
+    let output = time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("reduction completion")
+        .expect("reduction execution");
     assert_eq!(
         observed_calls.lock().expect("calls lock").as_slice(),
         [2, 1]
@@ -1976,7 +2050,10 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
     assert_eq!(output.attempts[1].indices, vec![1]);
     assert_eq!(
         output.values,
-        vec![Err(remote_error(-32000)), Ok(Bytes::from_static(b"late")),]
+        vec![
+            Err(remote_error(-32000)),
+            Ok(data_result(Bytes::from_static(b"late"))),
+        ]
     );
     blocker.await.expect("blocker task");
     server.abort();
@@ -2006,9 +2083,7 @@ async fn ordinary_submission_emits_only_requested_rpc_method() {
         ))
         .await
         .unwrap();
-    let mut expected = [0_u8; 32];
-    expected[31] = 0x2a;
-    assert_eq!(result, vec![Ok(Bytes::copy_from_slice(&expected))]);
+    assert_eq!(result, vec![Ok(RpcResult::new(json!("0x2a")))]);
     drop(broker);
     assert_eq!(
         methods.lock().expect("method log lock").clone(),
@@ -2018,23 +2093,19 @@ async fn ordinary_submission_emits_only_requested_rpc_method() {
 }
 
 #[test]
-fn balance_quantity_decoding_pads_values_and_rejects_invalid_or_oversize_ones() {
-    assert_eq!(
-        decode_response_value(&RpcRead::get_balance(Address::ZERO), &json!("0x0")),
-        Ok(Bytes::copy_from_slice(&[0_u8; 32]))
-    );
-    let mut expected = [0_u8; 32];
-    expected[31] = 42;
-    assert_eq!(
-        decode_response_value(&RpcRead::get_balance(Address::ZERO), &json!("0x002a")),
-        Ok(Bytes::copy_from_slice(&expected))
-    );
+fn balance_quantity_validation_preserves_values_and_rejects_malformed_quantities() {
+    let read = RpcRead::get_balance(Address::ZERO);
+    for value in ["0x0", "0x2a", "0x002a", "42"] {
+        assert_eq!(
+            read.operation().validate_result(json!(value)),
+            Ok(RpcResult::new(json!(value)))
+        );
+    }
     let oversize = format!("0x{}", "a".repeat(65));
     for value in ["0x0g", oversize.as_str()] {
         assert_eq!(
-            decode_response_value(&RpcRead::get_balance(Address::ZERO), &json!(value)),
-            Err(RpcBrokerError::InvalidResponse),
-            "unexpectedly accepted malformed quantity"
+            read.operation().validate_result(json!(value)),
+            Err(RpcBrokerError::InvalidResponse)
         );
     }
 }
@@ -2092,7 +2163,7 @@ async fn endpoint_failover_retries_unrecoverable_failure_for_aggregate_reads() {
         ))
         .await
         .unwrap();
-    assert_eq!(result, vec![Ok(Bytes::from_static(b"\x42"))]);
+    assert_eq!(result, vec![Ok(data_result(Bytes::from_static(b"\x42")))]);
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
     assert_eq!(second_calls.load(Ordering::SeqCst), 1);
     drop(broker);

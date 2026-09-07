@@ -6,7 +6,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
 use alloy::network::TransactionBuilder as _;
-use alloy::primitives::{B256, Bytes, TxKind, U256, address};
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
 use alloy::sol_types::{Revert, SolCall, SolError};
 use alloy::uint;
@@ -526,6 +526,94 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
         .expect("wallet balance submission is admitted");
     assert_eq!(results.len(), planned.len());
     assert!(results.iter().all(std::result::Result::is_ok));
+}
+
+#[tokio::test]
+async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_accepting_short_abi() {
+    let account = PublicAccountMetadata {
+        public_account_uuid: "public-1".to_string(),
+        address: address!("1111111111111111111111111111111111111111"),
+        label: None,
+        source: PublicAccountSource::Derived,
+        scope: PublicAccountScope::PrivateWallet {
+            wallet_uuid: "wallet-1".to_string(),
+        },
+        derivation_index: Some(0),
+        hardware_descriptor: None,
+        status: PublicAccountStatus::Active,
+        display_order: 0,
+    };
+    let tokens = [
+        Address::from([1; 20]),
+        Address::from([2; 20]),
+        Address::from([3; 20]),
+    ];
+    let registry = crate::settings::EffectiveTokenRegistry {
+        tokens: tokens
+            .into_iter()
+            .map(|token| {
+                let address = token.to_string();
+                (
+                    (1, address.clone()),
+                    crate::settings::EffectiveTokenInfo {
+                        chain_id: 1,
+                        token_address: address,
+                        symbol: "TEST".to_string(),
+                        decimals: 18,
+                        icon_path: None,
+                        price_anchor: None,
+                        built_in: false,
+                    },
+                )
+            })
+            .collect(),
+    };
+    let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+        Arc::new(move |request| {
+            let result = if request["method"] == "eth_getBalance" {
+                json!("0x7")
+            } else {
+                let transaction: TransactionRequest = serde_json::from_value(request["params"][0].clone()).unwrap();
+                match transaction.to {
+                    Some(TxKind::Call(token)) if token == tokens[0] => json!(Bytes::copy_from_slice(&U256::from(9).to_be_bytes::<32>())),
+                    Some(TxKind::Call(token)) if token == tokens[1] => json!("0x09"),
+                    _ => return json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "unavailable"}}),
+                }
+            };
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        }),
+        Arc::default(),
+        Arc::default(),
+    ).await;
+    let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
+    chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+    let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
+    let snapshot = refresh_public_balances(1, &[account], Some(&chain), Some(&registry), &http)
+        .await
+        .unwrap();
+    let balances = &snapshot.accounts[0].balances;
+    let amount = |asset| {
+        &balances
+            .iter()
+            .find(|balance| balance.asset.id == asset)
+            .unwrap()
+            .amount
+    };
+    assert_eq!(
+        amount(PublicAssetId::Native),
+        &PublicBalanceAmount::Available(U256::from(7))
+    );
+    assert_eq!(
+        amount(PublicAssetId::Erc20(tokens[0])),
+        &PublicBalanceAmount::Available(U256::from(9))
+    );
+    for token in &tokens[1..] {
+        assert_eq!(
+            amount(PublicAssetId::Erc20(*token)),
+            &PublicBalanceAmount::Unavailable
+        );
+    }
+    server.abort();
 }
 
 #[test]

@@ -2,7 +2,7 @@ use super::actor::{Actor, BlockEvent, Command, JobExecutor};
 use super::execution::run_job;
 use super::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin,
-    RpcRead, RpcRoute, RpcSubmission,
+    RpcRead, RpcResult, RpcRoute, RpcSubmission,
 };
 use alloy::primitives::{Address, Bytes};
 use alloy::sol_types::SolCall;
@@ -16,7 +16,7 @@ use tokio::time::{self, Instant};
 const SUBMISSION_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(256).expect("submission capacity must be positive");
 
-/// Handle for submitted `eth_call` and `eth_getBalance` reads.
+/// Handle for the shared Ethereum read broker.
 #[derive(Clone)]
 pub struct RpcBroker {
     tx: mpsc::Sender<Command>,
@@ -111,7 +111,18 @@ impl RpcBroker {
             .into_iter()
             .map(|(target, calldata)| RpcRead::eth_call(target, calldata))
             .collect();
-        self.submit(RpcSubmission::new(route, reads, origin)).await
+        self.submit(RpcSubmission::new(route, reads, origin))
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|result| {
+                        result.and_then(|value| {
+                            super::execution::decode_hex_value(value.expose_value())
+                        })
+                    })
+                    .collect()
+            })
     }
 
     /// Submits pre-encoded calls in input order, with `C` selecting the response decoder; each
@@ -138,12 +149,15 @@ impl RpcBroker {
             })
     }
 
-    /// Submits reads in input order. The outer `Ok` always contains exactly one result per input read,
-    /// including member errors; missing delivery or a total deadline is an outer error.
+    /// Submits reads in input order, preserving each method's JSON result and member errors.
+    /// Missing delivery or a total deadline is an outer error. Successful HTTP bodies are capped
+    /// at 16 MiB; oversized responses fail without failover or a health penalty.
+    /// Exact transaction-hash reads require an authenticated, authorized upstream dapp consumer.
+    /// That consumer must resolve wallet-tracked hashes without forwarding them here.
     pub async fn submit(
         &self,
         submission: RpcSubmission,
-    ) -> Result<Vec<Result<Bytes, RpcBrokerError>>, RpcBrokerError> {
+    ) -> Result<Vec<Result<RpcResult, RpcBrokerError>>, RpcBrokerError> {
         submission.validate_admission()?;
         let read_count = submission.reads().len();
         if read_count == 0 {

@@ -246,8 +246,8 @@ pub use public_wallet::{
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 pub use rpc_broker::{
     FailureClass, RpcBroker, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute, RpcOrigin,
-    RpcOriginError, RpcRead, RpcReadValidationError, RpcRemoteError, RpcRevert, RpcRoute,
-    RpcSubmission, WalletRpcOrigin,
+    RpcOriginError, RpcRead, RpcReadValidationError, RpcRemoteError, RpcResult, RpcRevert,
+    RpcRoute, RpcSubmission, WalletRpcOrigin,
 };
 pub use sponsored_bundle::*;
 pub use sponsorship::*;

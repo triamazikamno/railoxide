@@ -2,6 +2,7 @@ use super::actor::{Actor, Command, EndpointHealthOutcome, JobExecutor, JobOutput
 use super::broker::{RpcBroker, default_executor};
 use super::execution::wire_request_for;
 use super::model::*;
+use super::operation::RpcOperation;
 use super::profile::*;
 use super::resolution;
 use super::resolution::{WaiterPolicy, WaiterSnapshot, WaiterState, WorkItem, WorkKey};
@@ -26,6 +27,10 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::{self, Instant};
 use url::Url;
 
+pub(crate) fn data_result(bytes: Bytes) -> RpcResult {
+    RpcResult::new(serde_json::to_value(bytes).expect("Bytes serialize"))
+}
+
 pub(super) fn test_route() -> RpcRoute {
     RpcRoute::from(RpcChainRoute::new(
         1,
@@ -47,7 +52,7 @@ fn test_route_with_multicall(address: Address) -> RpcRoute {
 pub(super) fn read_calldata(read: &RpcRead) -> Bytes {
     match read.operation() {
         RpcOperation::EthCall { request, .. } => request.input.input().cloned().unwrap_or_default(),
-        RpcOperation::GetBalance { .. } => Bytes::new(),
+        _ => Bytes::new(),
     }
 }
 
@@ -66,7 +71,7 @@ pub(super) fn test_executor() -> JobExecutor {
             JobOutput {
                 completions: group
                     .into_iter()
-                    .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                    .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                     .collect(),
                 requests: Vec::new(),
             }
@@ -118,7 +123,7 @@ pub(crate) fn spawn_counting_test_broker() -> (Arc<RpcBroker>, Arc<AtomicUsize>)
                         endpoint,
                         health_outcome: EndpointHealthOutcome::Healthy,
                     });
-                    completions.push((item.key, Ok(Bytes::from_static(b"cached"))));
+                    completions.push((item.key, Ok(data_result(Bytes::from_static(b"cached")))));
                 }
                 JobOutput {
                     completions,
@@ -165,7 +170,7 @@ pub(super) fn aggregate_response(request: &Value, results: Vec<(bool, Bytes)>) -
     rpc_result(request, &json!(format!("0x{}", hex::encode(encoded))))
 }
 
-pub(super) type RpcResponder = Arc<dyn Fn(Value) -> Value + Send + Sync>;
+pub(crate) type RpcResponder = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
 #[derive(Clone)]
 pub(super) struct RpcMockGate {
@@ -173,7 +178,7 @@ pub(super) struct RpcMockGate {
     pub(super) release_response: Arc<tokio::sync::Notify>,
 }
 
-pub(super) async fn spawn_rpc_mock(
+pub(crate) async fn spawn_rpc_mock(
     responder: RpcResponder,
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
@@ -310,5 +315,6 @@ async fn handle_rpc_mock(
 }
 
 mod actor;
+mod methods;
 mod model;
 mod profile;

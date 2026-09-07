@@ -4,7 +4,7 @@ use crate::rpc_broker::model::{
     DEFAULT_MAX_ESTIMATED_GAS, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin, RpcRead, RpcRoute,
     RpcSubmission,
 };
-use crate::rpc_broker::tests::{read_calldata, test_origin, test_route};
+use crate::rpc_broker::tests::{data_result, read_calldata, test_origin, test_route};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, Bytes};
 use futures_util::poll;
@@ -162,12 +162,12 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
     replies
         .next()
         .expect("last member reply")
-        .send(Ok(Bytes::from_static(b"last")));
+        .send(Ok(data_result(Bytes::from_static(b"last"))));
     assert_eq!(
         first.await.expect("first task").expect("first result"),
         vec![
             Err(RpcBrokerError::TimeoutBeforeDispatch),
-            Ok(Bytes::from_static(b"last")),
+            Ok(data_result(Bytes::from_static(b"last"))),
         ]
     );
 
@@ -176,11 +176,11 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
         .expect("second command should be released")
         .expect("second command");
     for reply in replies {
-        reply.send(Ok(Bytes::from_static(b"second")));
+        reply.send(Ok(data_result(Bytes::from_static(b"second"))));
     }
     assert_eq!(
         second.await.expect("second task").expect("second result"),
-        vec![Ok(Bytes::from_static(b"second")); 2]
+        vec![Ok(data_result(Bytes::from_static(b"second"))); 2]
     );
 
     let held = admission
@@ -283,7 +283,7 @@ async fn duplicate_callers_require_distinct_admission_credits() {
                 JobOutput {
                     completions: group
                         .into_iter()
-                        .map(|item| (item.key, Ok(read_calldata(&item.read))))
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
                         .collect(),
                     requests: Vec::new(),
                 }
@@ -301,7 +301,7 @@ async fn duplicate_callers_require_distinct_admission_credits() {
     let mut route = test_route().with_test_thresholds(1, DEFAULT_MAX_ESTIMATED_GAS);
     route.request_timeout = None;
     let read = RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"duplicate"))
-        .with_block(BlockNumberOrTag::Number(1));
+        .with_test_block(BlockNumberOrTag::Number(1));
     let origin = test_origin();
     let first = tokio::spawn({
         let broker = broker.clone();
@@ -336,7 +336,7 @@ async fn duplicate_callers_require_distinct_admission_credits() {
     assert_eq!(broker.admission.available_permits(), 0);
 
     let third_read = RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"third"))
-        .with_block(BlockNumberOrTag::Number(1));
+        .with_test_block(BlockNumberOrTag::Number(1));
     let third = broker.submit(RpcSubmission::new(
         route.clone(),
         vec![third_read],
@@ -350,11 +350,11 @@ async fn duplicate_callers_require_distinct_admission_credits() {
     release.notify_one();
     assert_eq!(
         second.await.expect("second result"),
-        vec![Ok(Bytes::from_static(b"duplicate"))]
+        vec![Ok(data_result(Bytes::from_static(b"duplicate")))]
     );
     assert_eq!(
         third.await.expect("third result"),
-        vec![Ok(Bytes::from_static(b"third"))]
+        vec![Ok(data_result(Bytes::from_static(b"third")))]
     );
     assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(broker.admission.available_permits(), 2);
@@ -363,7 +363,10 @@ async fn duplicate_callers_require_distinct_admission_credits() {
         .submit(RpcSubmission::new(route, vec![read], origin))
         .await
         .expect("cache hit");
-    assert_eq!(cached, vec![Ok(Bytes::from_static(b"duplicate"))]);
+    assert_eq!(
+        cached,
+        vec![Ok(data_result(Bytes::from_static(b"duplicate")))]
+    );
     assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(broker.admission.available_permits(), 2);
 }

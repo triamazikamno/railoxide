@@ -1,5 +1,7 @@
+use super::operation::{self, RpcOperation};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, Bytes, TxKind, U256};
+use alloy::rlp::Encodable;
 use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::eth::state::StateOverride;
 use alloy::rpc::types::eth::transaction::{TransactionInput, TransactionRequest};
@@ -58,30 +60,18 @@ pub(super) const MSG_SENDER_INDEPENDENT: &[[u8; 4]] = &[
     RpcBrokerViewCalls::latestAnswerCall::SELECTOR,
 ];
 
-/// The broker preserves this call context when choosing aggregation or individual dispatch.
+/// A validated read whose method and parameters are preserved during broker dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcRead {
-    block: BlockId,
     operation: RpcOperation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RpcOperation {
-    EthCall {
-        request: Arc<TransactionRequest>,
-        state_overrides: Option<StateOverride>,
-    },
-    GetBalance {
-        account: Address,
-    },
-}
-
-/// Validation failures for an RPC transaction object before it enters the broker.
+/// Validation failures for RPC read parameters before they enter the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RpcReadValidationError {
-    #[error("invalid eth_call parameters")]
+    #[error("invalid RPC read parameters")]
     InvalidParams,
-    #[error("eth_call chainId does not match the submission route")]
+    #[error("RPC read chainId does not match the submission route")]
     ChainIdMismatch,
 }
 
@@ -108,9 +98,9 @@ impl RpcRead {
             ..TransactionRequest::default()
         };
         Self {
-            block: BlockId::latest(),
             operation: RpcOperation::EthCall {
-                request: Arc::new(request),
+                block: BlockId::latest(),
+                request: Arc::new(WithOtherFields::new(request)),
                 state_overrides: None,
             },
         }
@@ -119,13 +109,20 @@ impl RpcRead {
     #[must_use]
     pub const fn get_balance(account: Address) -> Self {
         Self {
-            block: BlockId::latest(),
-            operation: RpcOperation::GetBalance { account },
+            operation: RpcOperation::GetBalance {
+                account,
+                block: BlockId::latest(),
+            },
         }
     }
     #[must_use]
-    pub(super) const fn block_id(&self) -> BlockId {
-        self.block
+    pub(super) const fn reuse_block_id(&self) -> Option<BlockId> {
+        match &self.operation {
+            RpcOperation::EthCall { block, .. } | RpcOperation::GetBalance { block, .. } => {
+                Some(*block)
+            }
+            _ => None,
+        }
     }
     /// Estimates gas for batching, using an explicit call limit when provided.
     #[must_use]
@@ -133,32 +130,32 @@ impl RpcRead {
         match &self.operation {
             RpcOperation::EthCall { request, .. } => request.gas.unwrap_or(DEFAULT_READ_GAS),
             RpcOperation::GetBalance { .. } => 30_000,
+            _ => DEFAULT_READ_GAS,
         }
     }
-    #[must_use]
-    pub fn with_block<B: Into<BlockId>>(mut self, block: B) -> Self {
-        self.block = block.into();
+    #[cfg(test)]
+    pub(super) fn with_test_block<B: Into<BlockId>>(mut self, block: B) -> Self {
+        match &mut self.operation {
+            RpcOperation::EthCall {
+                block: selector, ..
+            }
+            | RpcOperation::GetBalance {
+                block: selector, ..
+            } => *selector = block.into(),
+            _ => panic!("test block helper requires a call or balance"),
+        }
         self
     }
     /// Parses the transaction and optional state override using Alloy's RPC types.
     ///
     /// `route_chain_id` is passed separately because chain scope belongs to the submission
-    /// route, not to a read. Unknown transaction fields and unsupported typed fields are rejected
-    /// before a read can be queued.
+    /// route, not to a read. Transaction fields follow Alloy's parsing semantics.
     pub fn from_rpc(
         transaction: WithOtherFields<TransactionRequest>,
         block: BlockId,
         state_overrides: Option<StateOverride>,
         route_chain_id: u64,
     ) -> Result<Self, RpcReadValidationError> {
-        if !transaction.other.is_empty()
-            || transaction.max_fee_per_blob_gas.is_some()
-            || transaction.blob_versioned_hashes.is_some()
-            || transaction.sidecar.is_some()
-            || transaction.authorization_list.is_some()
-        {
-            return Err(RpcReadValidationError::InvalidParams);
-        }
         if transaction
             .chain_id
             .is_some_and(|chain| chain != route_chain_id)
@@ -170,9 +167,9 @@ impl RpcRead {
             .unique_input()
             .map_err(|_| RpcReadValidationError::InvalidParams)?;
         Ok(Self {
-            block,
             operation: RpcOperation::EthCall {
-                request: Arc::new(transaction.into_inner()),
+                block,
+                request: Arc::new(transaction),
                 state_overrides,
             },
         })
@@ -197,9 +194,7 @@ impl RpcRead {
         let block_value = params.next();
         let overrides_value = params.next();
         let block = match block_value {
-            Some(block) => {
-                serde_json::from_value(block).map_err(|_| RpcReadValidationError::InvalidParams)?
-            }
+            Some(block) => operation::typed(block)?,
             None => BlockId::latest(),
         };
         let overrides = overrides_value
@@ -211,33 +206,49 @@ impl RpcRead {
         Self::from_rpc(transaction, block, overrides, route_chain_id)
     }
 
+    /// Parses a method from the broker's finite read allowlist. The route chain is checked
+    /// here and again at submission. Parameters use Alloy's RPC types.
+    pub fn from_method_params(
+        method: &str,
+        params: Value,
+        route_chain_id: u64,
+    ) -> Result<Self, RpcReadValidationError> {
+        let Value::Array(params) = params else {
+            return Err(RpcReadValidationError::InvalidParams);
+        };
+        Ok(Self {
+            operation: RpcOperation::parse(method, params, route_chain_id)?,
+        })
+    }
+
+    pub(super) fn result_from_abi(&self, bytes: &Bytes) -> Result<RpcResult, RpcBrokerError> {
+        let value = match self.operation {
+            RpcOperation::EthCall { .. } => serde_json::json!(bytes),
+            RpcOperation::GetBalance { .. } if bytes.len() == 32 => {
+                serde_json::json!(U256::from_be_slice(bytes))
+            }
+            _ => return Err(RpcBrokerError::InvalidResponse),
+        };
+        Ok(RpcResult::new(value))
+    }
+
     pub(super) const fn operation(&self) -> &RpcOperation {
         &self.operation
     }
 
-    /// Returns the decoded, variable-length input represented by this read.
+    /// Returns decoded variable-length input plus compact JSON bytes for transaction extras.
     ///
     /// Fixed transaction fields and state-override account keys are deliberately excluded.
     fn decoded_input_size(&self) -> Option<usize> {
-        let RpcOperation::EthCall {
-            request,
-            state_overrides,
-        } = &self.operation
-        else {
-            return Some(0);
+        let (request, state_overrides) = match &self.operation {
+            RpcOperation::EthCall {
+                request,
+                state_overrides,
+                ..
+            } => (request, state_overrides),
+            operation => return operation.decoded_input_size(),
         };
-
-        let mut size = match request.input.unique_input() {
-            Ok(Some(input)) => input.len(),
-            Ok(None) => 0,
-            Err(_) => return None,
-        };
-        if let Some(access_list) = request.access_list.as_ref() {
-            for item in access_list.iter() {
-                size = size.checked_add(20)?;
-                size = size.checked_add(item.storage_keys.len().checked_mul(32)?)?;
-            }
-        }
+        let mut size = transaction_input_size(request)?;
         if let Some(state_overrides) = state_overrides {
             for account in state_overrides.values() {
                 if let Some(code) = account.code.as_ref() {
@@ -256,20 +267,28 @@ impl RpcRead {
     #[must_use]
     pub(super) fn identity_for_route(&self, route: &RpcRoute) -> ReadIdentity {
         match &self.operation {
-            RpcOperation::EthCall { request, .. } => ReadIdentity::EthCall {
+            RpcOperation::EthCall { request, block, .. } if request.other.is_empty() => {
+                ReadIdentity::EthCall {
+                    chain_id: route.chain_id(),
+                    block: *block,
+                    request: Arc::clone(request),
+                }
+            }
+            RpcOperation::GetBalance { account, block } => ReadIdentity::GetBalance {
                 chain_id: route.chain_id(),
-                block: self.block,
-                request: Arc::clone(request),
-            },
-            RpcOperation::GetBalance { account } => ReadIdentity::GetBalance {
-                chain_id: route.chain_id(),
-                block: self.block,
+                block: *block,
                 account: *account,
+            },
+            _ => ReadIdentity::Individual {
+                chain_id: route.chain_id(),
             },
         }
     }
     pub(super) fn is_cacheable(&self) -> bool {
-        let block_cacheable = match self.block_id() {
+        let Some(block) = self.reuse_block_id() else {
+            return false;
+        };
+        let block_cacheable = match block {
             BlockId::Number(BlockNumberOrTag::Latest | BlockNumberOrTag::Number(_)) => true,
             BlockId::Hash(hash) => hash.require_canonical != Some(true),
             BlockId::Number(
@@ -289,7 +308,10 @@ impl RpcRead {
                 RpcOperation::EthCall {
                     request,
                     state_overrides,
+                    ..
                 } if request.value.unwrap_or_default() == U256::ZERO && state_overrides.is_none()
+                    && !request.has_eip4844_fields() && request.authorization_list.is_none()
+                    && request.other.is_empty()
             )
     }
 
@@ -302,8 +324,10 @@ impl RpcRead {
             RpcOperation::EthCall {
                 request,
                 state_overrides,
+                ..
             } => {
                 if request.value.unwrap_or_default() != U256::ZERO
+                    || !request.other.is_empty()
                     || state_overrides.is_some()
                     || request.gas.is_some()
                     || request.gas_price.is_some()
@@ -313,6 +337,8 @@ impl RpcRead {
                     || request.access_list.is_some()
                     || request.max_fee_per_gas.is_some()
                     || request.max_priority_fee_per_gas.is_some()
+                    || request.has_eip4844_fields()
+                    || request.authorization_list.is_some()
                     || !matches!(request.to, Some(TxKind::Call(_)))
                 {
                     return false;
@@ -325,17 +351,107 @@ impl RpcRead {
                         .is_some_and(|selector| MSG_SENDER_INDEPENDENT.contains(selector))
                 })
             }
+            _ => false,
         }
+    }
+}
+
+pub(super) fn transaction_input_size(
+    request: &WithOtherFields<TransactionRequest>,
+) -> Option<usize> {
+    let mut size = match request.input.unique_input() {
+        Ok(Some(input)) => input.len(),
+        Ok(None) => 0,
+        Err(_) => return None,
+    };
+    if let Some(access_list) = request.access_list.as_ref() {
+        for item in access_list.iter() {
+            size = size.checked_add(20)?;
+            size = size.checked_add(item.storage_keys.len().checked_mul(32)?)?;
+        }
+    }
+    if let Some(hashes) = &request.blob_versioned_hashes {
+        size = size.checked_add(hashes.len().checked_mul(32)?)?;
+    }
+    if let Some(sidecar) = &request.sidecar {
+        size = size.checked_add(sidecar.size())?;
+    }
+    if let Some(authorizations) = &request.authorization_list {
+        for authorization in authorizations {
+            size = size.checked_add(authorization.length())?;
+        }
+    }
+    if !request.other.is_empty() {
+        let mut counter = InputSizeCounter(0);
+        serde_json::to_writer(&mut counter, &request.other).ok()?;
+        size = size.checked_add(counter.0)?;
+    }
+    Some(size)
+}
+
+/// Counts compact JSON bytes without allocating another copy of transaction extras.
+struct InputSizeCounter(usize);
+
+impl std::io::Write for InputSizeCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|size| *size <= MAX_READ_INPUT_BYTES)
+            .ok_or_else(|| std::io::Error::other("RPC input exceeds admission limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A method-preserving JSON result. Diagnostic formatting never exposes its payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RpcResult(Arc<Value>);
+
+impl RpcResult {
+    pub(super) fn new(value: Value) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Explicitly exposes the response payload to the caller. Do not log or persist it.
+    #[must_use]
+    pub fn expose_value(&self) -> &Value {
+        &self.0
+    }
+
+    /// Takes the response payload for delivery to the authorized caller.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl fmt::Debug for RpcResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RpcResult([REDACTED])")
+    }
+}
+
+impl fmt::Display for RpcResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
     }
 }
 
 /// Keys the broker's cache and in-flight deduplication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ReadIdentity {
+    // Individual work receives a unique WorkKey nonce and never enters the cache.
+    Individual {
+        chain_id: u64,
+    },
     EthCall {
         chain_id: u64,
         block: BlockId,
-        request: Arc<TransactionRequest>,
+        request: Arc<WithOtherFields<TransactionRequest>>,
     },
     GetBalance {
         chain_id: u64,
@@ -347,6 +463,10 @@ pub(super) enum ReadIdentity {
 impl Hash for ReadIdentity {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Self::Individual { chain_id } => {
+                2_u8.hash(state);
+                chain_id.hash(state);
+            }
             Self::EthCall {
                 chain_id,
                 block,
@@ -355,7 +475,8 @@ impl Hash for ReadIdentity {
                 0_u8.hash(state);
                 chain_id.hash(state);
                 BlockKey(*block).hash(state);
-                request.hash(state);
+                // Extra-bearing calls receive Individual identities and cannot be reused.
+                request.inner.hash(state);
             }
             Self::GetBalance {
                 chain_id,
@@ -394,12 +515,15 @@ impl Hash for BlockKey {
 impl ReadIdentity {
     pub(super) const fn chain_id(&self) -> u64 {
         match self {
-            Self::EthCall { chain_id, .. } | Self::GetBalance { chain_id, .. } => *chain_id,
+            Self::EthCall { chain_id, .. }
+            | Self::GetBalance { chain_id, .. }
+            | Self::Individual { chain_id } => *chain_id,
         }
     }
-    pub(super) const fn block(&self) -> BlockId {
+    pub(super) const fn block(&self) -> Option<BlockId> {
         match self {
-            Self::EthCall { block, .. } | Self::GetBalance { block, .. } => *block,
+            Self::EthCall { block, .. } | Self::GetBalance { block, .. } => Some(*block),
+            Self::Individual { .. } => None,
         }
     }
 }
@@ -656,6 +780,27 @@ impl RpcSubmission {
         }
         let mut total_size = 0_usize;
         for read in &self.reads {
+            let request = match read.operation() {
+                RpcOperation::EthCall { request, .. } | RpcOperation::EstimateGas(request, _) => {
+                    Some(request)
+                }
+                operation
+                    if operation.exact_transaction_hash()
+                        && matches!(self.origin.0, RpcOriginKind::Wallet(_)) =>
+                {
+                    return Err(RpcBrokerError::OriginRejected);
+                }
+                _ => None,
+            };
+            if request.is_some_and(|request| {
+                request
+                    .chain_id
+                    .is_some_and(|chain| chain != self.route.chain_id())
+            }) {
+                return Err(RpcBrokerError::InvalidRead(
+                    RpcReadValidationError::ChainIdMismatch,
+                ));
+            }
             let Some(read_size) = read.decoded_input_size() else {
                 return Err(RpcBrokerError::AdmissionRejected);
             };
@@ -685,6 +830,12 @@ pub enum RpcBrokerSpawnError {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RpcBrokerError {
+    #[error("RPC operation is not permitted for this origin")]
+    OriginRejected,
+    #[error("invalid RPC read: {0}")]
+    InvalidRead(RpcReadValidationError),
+    #[error("RPC response exceeds the local resource limit")]
+    ResponseTooLarge,
     #[error("RPC submission exceeds admission limits")]
     AdmissionRejected,
     #[error("RPC broker is shut down")]
