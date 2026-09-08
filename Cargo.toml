@@ -12,7 +12,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97.1"
 
 [workspace.dependencies]
 alloy = { version = "2", features = ["serde", "signer-mnemonic"] }

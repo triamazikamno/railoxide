@@ -20,19 +20,19 @@ clang --version
 
 `xcode-select -p` should report `/Library/Developer/CommandLineTools` or a full Xcode developer directory.
 
-## Install Rust 1.94
+## Install Rust 1.97.1
 
-If Rust 1.94+ is not installed, install it with `rustup`:
+If Rust 1.97.1+ is not installed, install it with `rustup`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain 1.94.1
+  sh -s -- -y --default-toolchain 1.97.1
 . "$HOME/.cargo/env"
 rustc --version
 cargo --version
 ```
 
-Both version commands should report `1.94.0` or higher.
+Both version commands should report `1.97.1` or higher.
 
 ## Clone the repository
 

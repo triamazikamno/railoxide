@@ -4,7 +4,7 @@ set -euo pipefail
 repo_url="https://github.com/triamazikamno/railoxide.git"
 repo_api_url="https://api.github.com/repos/triamazikamno/railoxide"
 branch="main"
-toolchain="1.94.1"
+toolchain="1.97.1"
 
 prefix="$HOME/.local"
 source_dir="$HOME/.local/src/railoxide"

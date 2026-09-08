@@ -1,6 +1,6 @@
 This guide builds the RailOxide desktop wallet binary from source on Ubuntu with Ledger and Trezor support enabled.
 
-The commands below were verified on Ubuntu 24.04.
+The commands below target Ubuntu 24.04.
 
 ## Install System Dependencies
 
@@ -38,19 +38,19 @@ sudo apt-get install -y \
 
 These packages cover the Rust native build chain, OpenSSL, GPUI's Linux desktop dependencies, and the USB libraries used by hardware-wallet support.
 
-## Install Rust 1.94
+## Install Rust 1.97.1
 
-If Rust 1.94+ is not installed, install it with `rustup`:
+If Rust 1.97.1+ is not installed, install it with `rustup`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain 1.94.0
+  sh -s -- -y --default-toolchain 1.97.1
 . "$HOME/.cargo/env"
 rustc --version
 cargo --version
 ```
 
-Both version commands should report `1.94.0` or higher.
+Both version commands should report `1.97.1` or higher.
 
 ## Clone The Repository
 

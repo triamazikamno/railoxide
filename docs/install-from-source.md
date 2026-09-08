@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 - Uses the latest published GitHub release by default, including pre-releases.
 - Clones or updates `https://github.com/triamazikamno/railoxide.git`.
 - Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
-- Installs Rust `1.94.1` through `rustup` if needed.
+- Installs Rust `1.97.1` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Prints the exact source commit before building.
 - Refuses to run as root on macOS/Linux.
