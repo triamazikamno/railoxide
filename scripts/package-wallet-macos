@@ -16,7 +16,7 @@ binary_dst="$macos_dir/$app_name"
 plist_src="$repo_root/bins/wallet/packaging/macos/Info.plist"
 icon_src="$repo_root/bins/wallet/packaging/icons/macos/RailOxide.icns"
 codesign_identity="${CODESIGN_IDENTITY:--}"
-cargo_features="${CARGO_FEATURES-hardware,gpui/runtime_shaders}"
+cargo_features="${CARGO_FEATURES-hardware}"
 cargo_bin="${CARGO_BIN:-cargo}"
 cargo_toolchain="${CARGO_TOOLCHAIN:-}"
 

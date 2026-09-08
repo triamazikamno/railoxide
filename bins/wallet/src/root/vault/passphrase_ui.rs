@@ -66,8 +66,11 @@ impl OpenPassphraseWalletAuthorizationUi {
         }
     }
 
-    fn focus_password(&self, window: &mut Window, cx: &Context<'_, Self>) {
-        self.password_input.read(cx).focus_handle(cx).focus(window);
+    fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.password_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -175,6 +178,7 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .child(div().w(content_width).child(content.clone()))
         });
         cx.defer_in(window, move |_root, window, cx| {
@@ -283,18 +287,22 @@ impl PassphraseOpenUi {
         }
     }
 
-    pub(in crate::root) fn focus_passphrase(&self, window: &mut Window, cx: &Context<'_, Self>) {
+    pub(in crate::root) fn focus_passphrase(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.passphrase_input
             .read(cx)
             .focus_handle(cx)
-            .focus(window);
+            .focus(window, cx);
     }
 
-    fn focus_confirmation(&self, window: &mut Window, cx: &Context<'_, Self>) {
+    fn focus_confirmation(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.confirmation_input
             .read(cx)
             .focus_handle(cx)
-            .focus(window);
+            .focus(window, cx);
     }
 
     fn clear_inputs(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -688,6 +696,7 @@ impl PassphraseOpenUi {
                             "pending-software-profile-create-new",
                             "Create new",
                             create_selected,
+                            active,
                             None,
                         )
                         .flex_1(),
@@ -697,6 +706,7 @@ impl PassphraseOpenUi {
                             "pending-software-profile-recover-existing",
                             "Recover existing",
                             recover_selected,
+                            active,
                             None,
                         )
                         .flex_1(),

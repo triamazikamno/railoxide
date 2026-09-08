@@ -37,10 +37,7 @@ use super::vault::{
     HardwareProfileStepState, HardwareProfileStepStatus,
 };
 use super::vault::{PendingSoftwareProfileOpenStage, hardware_device_label};
-use super::{
-    Activity, VaultState, WalletRoot, WalletSetupMode, labeled_field, rgb_with_alpha,
-    scrollable_dialog_content,
-};
+use super::{Activity, VaultState, WalletRoot, WalletSetupMode, labeled_field, rgb_with_alpha};
 #[cfg(feature = "hardware")]
 use crate::assets::RailgunActionIcon;
 use crate::assets::{
@@ -159,6 +156,7 @@ impl WalletRoot {
                 .outline()
                 .h(px(40.0))
                 .w(px(40.0))
+                .accessibility_label("Settings")
                 .tooltip("Settings")
                 .icon(IconName::Settings)
                 .on_click(move |_event, window, cx| {
@@ -204,7 +202,8 @@ impl WalletRoot {
                 .max_h(dialog_max_height)
                 .margin_top(px(16.0))
                 .title(app_strong_text("Settings"))
-                .child(scrollable_dialog_content(content_height, content))
+                .on_ok(|_, _, _| false)
+                .child(content)
         });
     }
 
@@ -304,7 +303,7 @@ impl WalletRoot {
                                 .text_color(rgb(theme::INFO)),
                         )
                         .child(
-                            UiProgress::new()
+                            UiProgress::new("create-vault-prover-cache-progress")
                                 .h(px(7.0))
                                 .value(f32::from(percent)),
                         ),
@@ -543,7 +542,12 @@ impl WalletRoot {
                 matches!(self.vault_state, VaultState::ViewUnlocked),
                 |this| this.child(app_masked_input(&self.add_wallet_password_input, false)),
             )
-            .child(app_input(&self.import_mnemonic_input))
+            .child(
+                gpui_component::input::Textarea::new(&self.import_mnemonic_input)
+                    .bg(rgb(theme::SURFACE))
+                    .w_full()
+                    .px(px(8.0)),
+            )
             .child(
                 app_button("store-imported-wallet", "Import wallet")
                     .primary()
@@ -771,6 +775,9 @@ impl WalletRoot {
                 };
                 this.child(
                     div()
+                        .id("trezor-passphrase-mode")
+                        .role(gpui::accesskit::Role::Group)
+                        .aria_label("Trezor passphrase entry mode")
                         .w_full()
                         .p(px(12.0))
                         .flex()
@@ -795,28 +802,25 @@ impl WalletRoot {
                         .child(
                             ButtonGroup::new("trezor-passphrase-mode-toggle")
                                 .w_full()
-                                .outline()
                                 .disabled(self.hardware_profile_unlock.in_progress)
-                                .children([
-                                    trezor_passphrase_mode_segment_button(
-                                        "trezor-passphrase-none".into(),
-                                        "No passphrase",
-                                        mode == TrezorPassphraseMode::NoPassphrase,
-                                        self.hardware_profile_unlock.in_progress,
-                                    ),
-                                    trezor_passphrase_mode_segment_button(
-                                        "trezor-passphrase-on-device".into(),
-                                        "Enter on Trezor",
-                                        mode == TrezorPassphraseMode::EnterOnTrezor,
-                                        self.hardware_profile_unlock.in_progress,
-                                    ),
-                                    trezor_passphrase_mode_segment_button(
-                                        "trezor-passphrase-in-app".into(),
-                                        "Enter in app",
-                                        mode == TrezorPassphraseMode::EnterInApp,
-                                        enter_in_app_disabled,
-                                    ),
-                                ])
+                                .child(trezor_passphrase_mode_segment_button(
+                                    "trezor-passphrase-none".into(),
+                                    "No passphrase",
+                                    mode == TrezorPassphraseMode::NoPassphrase,
+                                    self.hardware_profile_unlock.in_progress,
+                                ))
+                                .child(trezor_passphrase_mode_segment_button(
+                                    "trezor-passphrase-on-device".into(),
+                                    "Enter on Trezor",
+                                    mode == TrezorPassphraseMode::EnterOnTrezor,
+                                    self.hardware_profile_unlock.in_progress,
+                                ))
+                                .child(trezor_passphrase_mode_segment_button(
+                                    "trezor-passphrase-in-app".into(),
+                                    "Enter in app",
+                                    mode == TrezorPassphraseMode::EnterInApp,
+                                    enter_in_app_disabled,
+                                ))
                                 .on_click(move |selected, window, cx| {
                                     let Some(index) = selected.first() else {
                                         return;
@@ -871,14 +875,52 @@ impl WalletRoot {
     }
 
     #[cfg(feature = "hardware")]
+    fn render_hardware_profile_picker_header(
+        &self,
+        root: &Entity<Self>,
+        device_kind: HardwareDeviceKind,
+    ) -> gpui::Div {
+        let edit_label_root = root.clone();
+        let profile = self.hardware_profile_unlock.profile.as_ref();
+        let profile_label =
+            profile.map_or("New hardware profile", |profile| profile.label.as_str());
+        let device_label = hardware_device_label(device_kind);
+        div().w_full().flex().flex_col().gap_2().child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(hardware_device_symbol(device_kind))
+                .child(
+                    app_strong_text(format!("Connected {device_label}: {profile_label}"))
+                        .text_color(rgb(theme::SUCCESS))
+                        .line_height(gpui::relative(1.18))
+                        .truncate(),
+                )
+                .child(
+                    app_button_base("hardware-profile-edit-label")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(RailgunActionIcon::Pencil))
+                        .accessibility_label("Edit label")
+                        .tooltip("Edit label")
+                        .disabled(self.hardware_profile_unlock.in_progress)
+                        .on_click(move |_event, window, cx| {
+                            edit_label_root.update(cx, |root, cx| {
+                                root.begin_hardware_profile_label_edit(window, cx);
+                            });
+                        }),
+                ),
+        )
+    }
+
+    #[cfg(feature = "hardware")]
     fn render_hardware_profile_picker(
         &self,
         root: &Entity<Self>,
         content_width: gpui::Pixels,
     ) -> gpui::Div {
-        let edit_label_root = root.clone();
-        let save_label_root = root.clone();
-        let cancel_label_root = root.clone();
         let default_continue_root = root.clone();
         let default_new_root = root.clone();
         let default_recover_root = root.clone();
@@ -887,9 +929,6 @@ impl WalletRoot {
         let add_root = root.clone();
         let recover_exact_root = root.clone();
         let recover_range_root = root.clone();
-        let profile = self.hardware_profile_unlock.profile.as_ref();
-        let profile_label =
-            profile.map_or("New hardware profile", |profile| profile.label.as_str());
         let device_kind = self
             .hardware_profile_unlock
             .device_kind
@@ -911,7 +950,6 @@ impl WalletRoot {
             .is_some_and(|session| session.device_kind == HardwareDeviceKind::Trezor)
             && self.hardware_profile_unlock.trezor_passphrase_mode
                 == TrezorPassphraseMode::EnterInApp;
-        let label_editing = self.hardware_profile_unlock.editing_label;
         let advanced_open = self.hardware_profile_unlock.advanced_open;
         let advanced_toggle_label = if advanced_open {
             "Hide advanced"
@@ -921,80 +959,12 @@ impl WalletRoot {
         let awaiting_approval = self.hardware_profile_unlock.in_progress
             && hardware_profile_awaiting_approval(&self.hardware_profile_unlock.progress_steps);
 
-        let mut content = div().w_full().flex().flex_col().gap_3().child(
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(hardware_device_symbol(device_kind))
-                        .child(
-                            app_strong_text(format!("Connected {device_label}: {profile_label}"))
-                                .text_color(rgb(theme::SUCCESS))
-                                .line_height(gpui::relative(1.18))
-                                .truncate(),
-                        )
-                        .when(!label_editing, |this| {
-                            this.child(
-                                app_button_base("hardware-profile-edit-label")
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(RailgunActionIcon::Pencil))
-                                    .tooltip("Edit label")
-                                    .disabled(self.hardware_profile_unlock.in_progress)
-                                    .on_click(move |_event, window, cx| {
-                                        edit_label_root.update(cx, |root, cx| {
-                                            root.begin_hardware_profile_label_edit(window, cx);
-                                        });
-                                    }),
-                            )
-                        }),
-                )
-                .when(label_editing, |this| {
-                    this.child(
-                        app_input(&self.hardware_profile_label_input)
-                            .disabled(self.hardware_profile_unlock.in_progress),
-                    )
-                    .child(
-                        app_muted_text(crate::root::vault::hardware_profile_label_warning())
-                            .whitespace_normal()
-                            .text_color(rgb(theme::WARNING)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                app_button("hardware-profile-save-label", "Save")
-                                    .primary()
-                                    .small()
-                                    .disabled(self.hardware_profile_unlock.in_progress)
-                                    .on_click(move |_event, window, cx| {
-                                        save_label_root.update(cx, |root, cx| {
-                                            root.save_hardware_profile_label_edit(window, cx);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                app_button("hardware-profile-cancel-label", "Cancel")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.hardware_profile_unlock.in_progress)
-                                    .on_click(move |_event, window, cx| {
-                                        cancel_label_root.update(cx, |root, cx| {
-                                            root.cancel_hardware_profile_label_edit(window, cx);
-                                        });
-                                    }),
-                            ),
-                    )
-                }),
-        );
+        let mut content = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.render_hardware_profile_picker_header(root, device_kind));
 
         if awaiting_approval {
             let approval_prompt = self
@@ -1279,8 +1249,20 @@ impl WalletRoot {
                     ).whitespace_normal())
                     .child(labeled_field(
                         "Recover exact account index",
-                        app_input(&self.hardware_profile_exact_index_input)
-                            .disabled(self.hardware_profile_unlock.in_progress),
+                        super::ui_helpers::input_enter_scope(
+                            !self.hardware_profile_unlock.in_progress,
+                            {
+                                let root = root.clone();
+                                move |window, cx| {
+                                    root.update(cx, |root, cx| {
+                                        if !root.hardware_profile_unlock.in_progress {
+                                            root.recover_hardware_exact_account_from_profile_picker(window, cx);
+                                        }
+                                    });
+                                }
+                            },
+                        ).child(app_input(&self.hardware_profile_exact_index_input)
+                            .disabled(self.hardware_profile_unlock.in_progress)),
                     ))
                     .child(
                         app_button(
@@ -1308,8 +1290,20 @@ impl WalletRoot {
                                     .flex_1()
                                     .child(labeled_field(
                                         "Range start",
-                                        app_input(&self.hardware_profile_recovery_start_input)
-                                            .disabled(self.hardware_profile_unlock.in_progress),
+                                        super::ui_helpers::input_enter_scope(
+                            !self.hardware_profile_unlock.in_progress,
+                            {
+                                let root = root.clone();
+                                move |window, cx| {
+                                    root.update(cx, |root, cx| {
+                                        if !root.hardware_profile_unlock.in_progress {
+                                            root.recover_hardware_range_from_profile_picker(window, cx);
+                                        }
+                                    });
+                                }
+                            },
+                        ).child(app_input(&self.hardware_profile_recovery_start_input)
+                                            .disabled(self.hardware_profile_unlock.in_progress)),
                                     )),
                             )
                             .child(
@@ -1317,8 +1311,20 @@ impl WalletRoot {
                                     .flex_1()
                                     .child(labeled_field(
                                         "Count",
-                                        app_input(&self.hardware_profile_recovery_count_input)
-                                            .disabled(self.hardware_profile_unlock.in_progress),
+                                        super::ui_helpers::input_enter_scope(
+                            !self.hardware_profile_unlock.in_progress,
+                            {
+                                let root = root.clone();
+                                move |window, cx| {
+                                    root.update(cx, |root, cx| {
+                                        if !root.hardware_profile_unlock.in_progress {
+                                            root.recover_hardware_range_from_profile_picker(window, cx);
+                                        }
+                                    });
+                                }
+                            },
+                        ).child(app_input(&self.hardware_profile_recovery_count_input)
+                                            .disabled(self.hardware_profile_unlock.in_progress)),
                                     )),
                             ),
                     )

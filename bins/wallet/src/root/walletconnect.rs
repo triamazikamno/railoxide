@@ -20,13 +20,15 @@ use gpui_component::{
     button::ButtonVariants,
     input::InputState,
     scroll::ScrollableElement,
-    select::{SearchableVec, Select, SelectItem, SelectState},
+    select::{Select, SelectItem, SelectState},
 };
 use railgun_ui::{chain_icon_asset_path, chain_name, short_address};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    FullWidthSelectItems, app_button, app_button_base, app_input, app_muted_text, app_strong_text,
+};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     HardwareTrezorPinMatrixProvider, HttpContext, PublicActionSessionEvent,
@@ -78,8 +80,7 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     WalletRoot, app_step_row, app_stepper_container, dialog_content_max_height,
-    format_report_chain, new_text_input, rgb_with_alpha, scrollable_dialog_content,
-    secondary_dialog_content_width,
+    format_report_chain, new_text_input, rgb_with_alpha, secondary_dialog_content_width,
 };
 
 mod account_select;
@@ -150,7 +151,8 @@ pub(in crate::root) const fn walletconnect_attention_transition(
 
 pub(super) struct WalletConnectUiState {
     pub(super) uri_input: Entity<InputState>,
-    pub(super) account_select: Entity<SelectState<SearchableVec<WalletConnectAccountSelectItem>>>,
+    pub(super) account_select:
+        Entity<SelectState<FullWidthSelectItems<WalletConnectAccountSelectItem>>>,
     pending_pairings: BTreeMap<String, WalletConnectPairingUri>,
     pending_proposal: Option<WalletConnectProposalUi>,
     pending_requests: BTreeMap<String, WalletConnectRequestUi>,
@@ -250,7 +252,8 @@ impl WalletConnectUiState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<'_, WalletRoot>) -> Self {
         let uri_input = new_text_input(window, cx, "paste wc: URI");
         let account_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
+            SelectState::new(FullWidthSelectItems::new(Vec::new()), None, window, cx)
+                .searchable(true)
         });
         let request_dialog_focus = cx.focus_handle();
         let walletconnect_gas_fee = Eip1559GasFeeEditorState::new(window, cx);

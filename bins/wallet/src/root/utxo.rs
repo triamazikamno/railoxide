@@ -16,7 +16,7 @@ use gpui_component::{
     checkbox::Checkbox,
     input::InputState,
     spinner::Spinner,
-    table::{Column, Table, TableDelegate, TableState},
+    table::{Column, DataTable, TableDelegate, TableState},
     tag::Tag,
     tooltip::Tooltip,
 };
@@ -44,9 +44,8 @@ use super::spend_authorization::{
 };
 use super::tokens::parse_address;
 use super::{
-    SECONDS_PER_HOUR, SECONDS_PER_MINUTE, WalletRoot, centered_message, dialog_content_max_height,
-    dialog_max_height, rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
-    token_label_row,
+    SECONDS_PER_HOUR, SECONDS_PER_MINUTE, WalletRoot, centered_message, dialog_max_height,
+    rgb_with_alpha, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
@@ -588,7 +587,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -602,8 +600,7 @@ impl WalletRoot {
                         root.clear_trezor_pin_matrix_prompt(cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_blocked_shield_refund_progress_dialog_content(
@@ -611,7 +608,7 @@ impl WalletRoot {
                             utxo_id,
                             content_width,
                         ),
-                ))
+                )
         });
     }
 
@@ -730,7 +727,7 @@ impl WalletRoot {
     pub(super) fn focus_utxo_table_if_requested(
         &mut self,
         window: &mut Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if !self.focus_utxo_table_on_render
             || !should_focus_utxo_table(
@@ -750,7 +747,7 @@ impl WalletRoot {
             return;
         }
 
-        self.utxo_table.read(cx).focus_handle(cx).focus(window);
+        self.utxo_table.read(cx).focus_handle(cx).focus(window, cx);
         self.focus_utxo_table_on_render = false;
     }
 
@@ -806,7 +803,7 @@ impl WalletRoot {
                             let table = self.utxo_table.clone();
                             move |_event, window, cx| {
                                 table.update(cx, |table, cx| {
-                                    table.focus_handle(cx).focus(window);
+                                    table.focus_handle(cx).focus(window, cx);
                                 });
                             }
                         })
@@ -814,7 +811,7 @@ impl WalletRoot {
                         .on_action(window.listener_for(root, Self::on_action_utxo_page_down))
                         .on_action(window.listener_for(root, Self::on_action_utxo_home))
                         .on_action(window.listener_for(root, Self::on_action_utxo_end))
-                        .child(Table::new(&self.utxo_table).large()),
+                        .child(DataTable::new(&self.utxo_table).large()),
                 ),
             _ => centered_message("Select a chain to load UTXOs"),
         }
@@ -842,6 +839,7 @@ impl WalletRoot {
                     app_button_base("wallet-search-clear")
                         .ghost()
                         .xsmall()
+                        .accessibility_label("Clear search")
                         .tooltip("Clear search")
                         .icon(IconName::Close)
                         .on_click(move |_event, window, cx| {
@@ -849,7 +847,7 @@ impl WalletRoot {
                                 input.set_value("", window, cx);
                             });
                             clear_search_table.update(cx, |table, cx| {
-                                table.focus_handle(cx).focus(window);
+                                table.focus_handle(cx).focus(window, cx);
                             });
                         }),
                 )
@@ -1225,8 +1223,8 @@ impl TableDelegate for UtxoDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
     }
 
     fn render_th(
@@ -1723,6 +1721,7 @@ fn tx_hash_cell(
                     )))
                     .ghost()
                     .xsmall()
+                    .accessibility_label("Filter by this transaction")
                     .tooltip("Filter by this transaction")
                     .icon(IconName::Search)
                     .on_click(move |_event, window, cx| {

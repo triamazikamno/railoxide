@@ -141,7 +141,7 @@ impl WalletRoot {
                                 root.prover_cache_build_completed = true;
                             }
                         });
-                        let _ = editor.update(cx, |editor, cx| {
+                        editor.update(cx, |editor, cx| {
                             editor.cache_building = false;
                             editor.cache_build_progress = None;
                             editor.status = Some(Arc::from(match result {
@@ -166,7 +166,7 @@ impl WalletRoot {
                         let _ = this.update(cx, |root, cx| {
                             root.update_prover_cache_build_progress(progress, cx);
                         });
-                        let _ = editor.update(cx, |editor, cx| {
+                        editor.update(cx, |editor, cx| {
                             editor.cache_build_progress = Some(editor_progress);
                             cx.notify();
                         });

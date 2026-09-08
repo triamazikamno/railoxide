@@ -35,9 +35,8 @@ use super::public_broadcaster_cost::{
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
-    app_panel, app_status_tag, app_step_row, app_stepper_container, dialog_content_max_height,
-    dialog_max_height, format_native_token_amount_for_display,
-    format_recipient_amount_with_native_top_up, scrollable_dialog_content,
+    app_panel, app_status_tag, app_step_row, app_stepper_container, dialog_max_height,
+    format_native_token_amount_for_display, format_recipient_amount_with_native_top_up,
     secondary_dialog_content_width,
 };
 
@@ -91,6 +90,29 @@ pub(super) struct SelfBroadcastGasRetryDialogContent {
 }
 
 impl SelfBroadcastGasRetryDialogContent {
+    pub(in crate::root) fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let (max_fee, max_tip) = match self.gas_inputs.parse(cx) {
+            Ok(values) => values,
+            Err(error) => {
+                self.error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.root.update(cx, |root, cx| {
+            root.submit_self_broadcast_gas_retry(
+                self.kind,
+                self.key,
+                self.generation_id,
+                self.retry_kind,
+                max_fee,
+                max_tip,
+                cx,
+            );
+        });
+        window.close_dialog(cx);
+    }
+
     fn new(
         root: Entity<WalletRoot>,
         kind: DeliveryFormKind,
@@ -143,14 +165,6 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
                 "Uses the same nonce to replace the pending transaction. Values are prefilled +12.5%."
             }
         };
-        let submit_root = self.root.clone();
-        let cancel_root = self.root.clone();
-        let dialog = cx.entity();
-        let gas_inputs = self.gas_inputs.clone();
-        let kind = self.kind;
-        let key = self.key;
-        let generation_id = self.generation_id;
-        let retry_kind = self.retry_kind;
         div()
             .w_full()
             .flex()
@@ -173,7 +187,6 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
                         app_button("self-broadcast-gas-retry-cancel", "Cancel")
                             .flex_none()
                             .on_click(move |_event, window, cx| {
-                                let _ = &cancel_root;
                                 window.close_dialog(cx);
                             }),
                     )
@@ -181,30 +194,9 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
                         app_button("self-broadcast-gas-retry-confirm", "Submit")
                             .primary()
                             .flex_none()
-                            .on_click(move |_event, window, cx| {
-                                let (max_fee, max_tip) = match gas_inputs.parse(cx) {
-                                    Ok(values) => values,
-                                    Err(error) => {
-                                        dialog.update(cx, |this, cx| {
-                                            this.error = Some(Arc::from(error));
-                                            cx.notify();
-                                        });
-                                        return;
-                                    }
-                                };
-                                submit_root.update(cx, |root, cx| {
-                                    root.submit_self_broadcast_gas_retry(
-                                        kind,
-                                        key,
-                                        generation_id,
-                                        retry_kind,
-                                        max_fee,
-                                        max_tip,
-                                        cx,
-                                    );
-                                });
-                                window.close_dialog(cx);
-                            }),
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.submit(window, cx);
+                            })),
                     ),
             )
     }
@@ -373,7 +365,6 @@ impl WalletRoot {
         let dialog_width =
             (viewport_size.width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -405,15 +396,14 @@ impl WalletRoot {
                         cx.notify();
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_private_broadcaster_progress_dialog_content(
                             &content_root,
                             content_width,
                         ),
-                ))
+                )
         });
     }
 
@@ -882,15 +872,16 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         window.open_dialog(cx, move |dialog, _window, _cx| {
+            let submit_content = content.clone();
             dialog
+                .on_ok(move |_event, window, cx| {
+                    submit_content.update(cx, |content, cx| content.submit(window, cx));
+                    false
+                })
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content.clone(),
-                ))
+                .child(content.clone())
         });
     }
 
@@ -1106,6 +1097,7 @@ impl WalletRoot {
                 .outline()
                 .xsmall()
                 .icon(Icon::new(IconName::Star))
+                .accessibility_label("Add broadcaster to favorites")
                 .tooltip(
                     "Save this broadcaster to your favorites so future transactions can prefer it.",
                 )

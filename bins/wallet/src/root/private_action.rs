@@ -15,7 +15,6 @@ use gpui_component::{
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     collapsible::Collapsible,
-    dialog::DialogButtonProps,
     input::{Escape as InputEscape, Input, InputEvent, InputState, Position},
     popover::Popover,
     scroll::ScrollableElement,
@@ -27,8 +26,8 @@ use railgun_ui::{format_token_amount, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_inline_control_row, app_input,
-    app_muted_text, app_segment_button, app_strong_text,
+    FullWidthSelectItems, app_button, app_button_base, app_button_label, app_inline_control_row,
+    app_input, app_muted_text, app_segment_button, app_strong_text,
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
@@ -102,7 +101,7 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     ChainUtxoState, PRIVATE_ASSET_LIST_WIDTH, PublicBroadcasterFeeTokenOption, WalletRoot,
-    copyable_mono_field, dialog_content_max_height, dialog_max_height, effective_fee_handling_mode,
+    copyable_mono_field, dialog_max_height, effective_fee_handling_mode,
     format_exact_token_amount_for_display, format_native_token_amount_ceiling_for_display,
     format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
     format_recipient_amount_with_native_top_up, format_report_chain, format_send_amount_input,
@@ -111,9 +110,9 @@ use super::{
     labeled_field, native_token_display_label, native_wrapped_output_labels, new_prefilled_input,
     new_text_input, parse_address, public_balance_amount_label,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    scrollable_dialog_content, secondary_dialog_content_width, send_form_max_entered_amount,
-    should_show_fee_mode_toggle, token_display_metadata, token_label_row,
-    unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode, vault_error_kind,
+    secondary_dialog_content_width, send_form_max_entered_amount, should_show_fee_mode_toggle,
+    token_display_metadata, token_label_row, unshield_form_max_entered_amount,
+    unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
 mod delivery;

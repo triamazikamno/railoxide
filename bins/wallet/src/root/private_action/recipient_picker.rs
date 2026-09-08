@@ -1,3 +1,5 @@
+use crate::root::ui_helpers::dialog_footer;
+
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,11 +382,12 @@ impl RenderOnce for RecipientPicker {
                             .outline()
                             .small()
                             .compact()
+                            .accessibility_label("Select recipient")
                             .tooltip("Select recipient")
                             .disabled(generating || options.is_empty())
                             .on_click(move |_event, window, cx| {
                                 cx.stop_propagation();
-                                focus_input.read(cx).focus_handle(cx).focus(window);
+                                focus_input.read(cx).focus_handle(cx).focus(window, cx);
                                 toggle_root.update(cx, |root, cx| {
                                     root.toggle_recipient_suggestions(kind, key, cx);
                                 });
@@ -398,6 +401,7 @@ impl RenderOnce for RecipientPicker {
                                 .outline()
                                 .small()
                                 .compact()
+                                .accessibility_label("Save recipient")
                                 .tooltip("Save recipient")
                                 .disabled(generating)
                                 .on_click(move |_event, window, cx| {
@@ -421,7 +425,7 @@ impl RenderOnce for RecipientPicker {
                     &suggestions_scroll,
                     bounds,
                 ))
-                .with_priority(2)
+                .with_priority(gpui_kit::base::POPUP_PRIORITY)
             }))
     }
 }
@@ -948,7 +952,6 @@ impl WalletRoot {
         let save_recipient = recipient.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -960,8 +963,7 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Save recipient"))
-                .button_props(DialogButtonProps::default().ok_text("Save"))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer("Save", true))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.address_book_save_error = None;
@@ -978,17 +980,14 @@ impl WalletRoot {
                         )
                     })
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_save_recipient_dialog_content(
-                        &dialog_label_input,
-                        &recipient,
-                        content_width,
-                    ),
+                .child(content_root.read(cx).render_save_recipient_dialog_content(
+                    &dialog_label_input,
+                    &recipient,
+                    content_width,
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {
-            label_input.read(cx).focus_handle(cx).focus(window);
+            label_input.read(cx).focus_handle(cx).focus(window, cx);
         });
     }
 

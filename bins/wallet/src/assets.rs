@@ -190,7 +190,7 @@ impl AssetSource for WalletAssets {
         {
             Some(bytes)
         } else {
-            gpui_component_assets::Assets.load(path)?
+            gpui_kit_assets::Assets.load(path)?
         };
 
         #[cfg(feature = "heap-profiling")]
@@ -201,7 +201,7 @@ impl AssetSource for WalletAssets {
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut assets = gpui_component_assets::Assets.list(path)?;
+        let mut assets = gpui_kit_assets::Assets.list(path)?;
         append_embedded_asset_list::<UiAssets>(&mut assets, UI_ASSET_PREFIX, path);
         append_embedded_asset_list::<RailgunUiAssets>(&mut assets, RAILGUN_UI_ASSET_PREFIX, path);
         assets.extend(

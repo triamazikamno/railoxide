@@ -40,10 +40,7 @@ use super::settings::{
     startup_settings_action_state,
 };
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
-use super::{
-    WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha,
-    scrollable_dialog_content,
-};
+use super::{WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha};
 
 struct WalletStartupReady {
     http: HttpContext,
@@ -712,7 +709,8 @@ impl WalletStartupRoot {
                 .max_h(dialog_max_height)
                 .margin_top(px(16.0))
                 .title(app_strong_text("Startup Settings"))
-                .child(scrollable_dialog_content(content_height, content))
+                .on_ok(|_, _, _| false)
+                .child(content)
         });
     }
 
@@ -816,7 +814,7 @@ impl WalletStartupRoot {
                     .items_center()
                     .gap_3()
                     .child(
-                        UiProgress::new()
+                        UiProgress::new("wallet-startup-progress")
                             .flex_1()
                             .h(px(7.0))
                             .value(f32::from(percent)),
@@ -927,6 +925,7 @@ impl WalletStartupRoot {
                 .outline()
                 .h(px(40.0))
                 .w(px(40.0))
+                .accessibility_label("Settings")
                 .tooltip("Settings")
                 .icon(IconName::Settings)
                 .on_click(move |_event, window, cx| {
@@ -1311,7 +1310,8 @@ mod activity_tests {
             }
         });
         cx.update(|window, app| {
-            window.focus(&probe.read(app).root_focus);
+            let focus = probe.read(app).root_focus.clone();
+            window.focus(&focus, app);
             window.activate_window();
         });
         cx.refresh().expect("refresh test window");
@@ -1332,6 +1332,7 @@ mod activity_tests {
         cx.simulate_event(KeyDownEvent {
             keystroke: Keystroke::parse("a").expect("valid test keystroke"),
             is_held: false,
+            prefer_character_input: false,
         });
         assert_eq!(count.get(), 4);
 
@@ -1341,7 +1342,8 @@ mod activity_tests {
         });
         cx.run_until_parked();
         cx.update(|window, app| {
-            window.focus(&probe.read(app).dialog_focus);
+            let focus = probe.read(app).dialog_focus.clone();
+            window.focus(&focus, app);
         });
         let dialog_position = cx
             .debug_bounds("activity-dialog")
@@ -1359,6 +1361,7 @@ mod activity_tests {
         cx.simulate_event(KeyDownEvent {
             keystroke: Keystroke::parse("b").expect("valid test keystroke"),
             is_held: false,
+            prefer_character_input: false,
         });
         assert_eq!(count.get(), 8);
     }
@@ -1379,7 +1382,8 @@ mod activity_tests {
             _keystroke_interceptor: cx.intercept_keystrokes(|_, _, _| {}),
         });
         cx.update(|window, app| {
-            window.focus(&probe.read(app).root_focus);
+            let focus = probe.read(app).root_focus.clone();
+            window.focus(&focus, app);
             window.activate_window();
         });
         cx.refresh().expect("refresh test window");

@@ -1,4 +1,20 @@
 use super::*;
+use ui::controls::app_segment_button;
+
+pub(in crate::root) fn public_action_form(
+    content_width: Pixels,
+    submit_disabled: bool,
+    on_submit: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div().w(content_width).flex().flex_col().gap_3().on_action(
+        move |_: &gpui_component::dialog::Confirm, window, cx| {
+            cx.stop_propagation();
+            if !submit_disabled {
+                on_submit(window, cx);
+            }
+        },
+    )
+}
 
 const MIMIC_RAILWAY_TITLE: &str = "Mimic Railway";
 const MIMIC_RAILWAY_INTRO: &str = "Construct this shield like Railway so on-chain observers cannot easily identify which wallet created it.";
@@ -141,6 +157,7 @@ pub(in crate::root) fn public_action_segment_button(
     selected: bool,
 ) -> Button {
     let button = Button::new(id)
+        .secondary()
         .flex_1()
         .min_w(px(0.0))
         .selected(selected)
@@ -161,10 +178,9 @@ pub(in crate::root) fn public_send_kind_segment_button(
     id: SharedString,
     label: &'static str,
     selected: bool,
+    disabled: bool,
 ) -> Button {
-    Button::new(id)
-        .selected(selected)
-        .child(div().text_size(APP_TEXT_SIZE).child(label))
+    app_segment_button(id, label, selected, disabled, None)
 }
 
 pub(in crate::root) fn public_action_title_row(
@@ -525,5 +541,83 @@ pub(in crate::root) fn public_action_asset_label(
     match asset {
         PublicAssetId::Native => native_token_display_label(chain_id).to_string(),
         PublicAssetId::Erc20(_) => public_asset_label(chain_id, asset, registry),
+    }
+}
+
+#[cfg(test)]
+mod form_enter_tests {
+    use super::*;
+
+    struct PublicFormEnterProbe {
+        input: Entity<InputState>,
+        focus: gpui::FocusHandle,
+        submit_disabled: bool,
+        submissions: usize,
+        dialog_confirmations: usize,
+        dialog_closes: usize,
+    }
+
+    impl gpui::Render for PublicFormEnterProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            let submit_probe = cx.entity();
+            let confirm_probe = cx.entity();
+            let close_probe = cx.entity();
+            gpui_kit::base::Dialog::new(cx)
+                .focus_handle(self.focus.clone())
+                .on_ok(move |_, _, cx| {
+                    confirm_probe.update(cx, |probe, _| probe.dialog_confirmations += 1);
+                    true
+                })
+                .on_close(move |_, _, cx| {
+                    close_probe.update(cx, |probe, _| probe.dialog_closes += 1);
+                })
+                .popup(
+                    public_action_form(px(400.0), self.submit_disabled, move |_, cx| {
+                        submit_probe.update(cx, |probe, _| probe.submissions += 1);
+                    })
+                    .child(app_input(&self.input)),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn public_form_enter_submits_once_when_enabled_without_confirming_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| PublicFormEnterProbe {
+            input: cx.new(|cx| InputState::new(window, cx)),
+            focus: cx.focus_handle(),
+            submit_disabled: false,
+            submissions: 0,
+            dialog_confirmations: 0,
+            dialog_closes: 0,
+        });
+        for disabled in [false, true] {
+            probe.update(cx, |probe, cx| {
+                probe.submit_disabled = disabled;
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let focus = probe.read(cx).input.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            });
+            let keystroke = gpui::Keystroke::parse("enter").expect("Enter key");
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let probe = probe.read(cx);
+                assert_eq!(probe.submissions, 1);
+                assert_eq!(probe.dialog_confirmations, 0);
+                assert_eq!(probe.dialog_closes, 0);
+            });
+        }
     }
 }

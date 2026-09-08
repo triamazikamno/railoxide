@@ -12,10 +12,10 @@ use gpui::{
 use gpui_component::{
     Icon, IconName, IndexPath, Sizable, WindowExt,
     button::{Button, ButtonVariants},
-    divider::Divider,
     input::{InputEvent, InputState},
     list::{ListDelegate, ListItem, ListState},
     popover::Popover,
+    separator::Separator,
     tooltip::Tooltip,
     window_paddings,
 };
@@ -119,7 +119,7 @@ impl Render for BroadcasterPickerScrollIndicator {
         }
         let handle = self.list.read(cx).scroll_handle().base_handle().clone();
         let visible =
-            broadcaster_picker_scroll_hint_visible(handle.offset().y, handle.max_offset().height);
+            broadcaster_picker_scroll_hint_visible(handle.offset().y, handle.max_offset().y);
         div()
             .absolute()
             .left(px(12.0))
@@ -1174,7 +1174,10 @@ impl WalletRoot {
             cx,
         );
         cx.defer_in(window, move |_this, window, cx| {
-            focus_query_input.read(cx).focus_handle(cx).focus(window);
+            focus_query_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
         });
         cx.notify();
     }
@@ -1199,6 +1202,7 @@ impl WalletRoot {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
+                .on_ok(|_, _, _| false)
                 .w(dialog_width)
                 .h(dialog_height)
                 .margin_top(margin_top)
@@ -1958,10 +1962,6 @@ impl ListDelegate for BroadcasterPickerDelegate {
         _cx: &mut Context<'_, ListState<Self>>,
     ) {
     }
-
-    fn is_eof(&self, _cx: &App) -> bool {
-        false
-    }
 }
 
 pub(super) fn selected_broadcaster_label(
@@ -2129,7 +2129,7 @@ pub(super) fn render_broadcaster_picker_header(
         )
         .child(
             div()
-                .flex_shrink()
+                .flex_shrink(1.0)
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
@@ -2137,7 +2137,7 @@ pub(super) fn render_broadcaster_picker_header(
                 .child(
                     div()
                         .w(BROADCASTER_PICKER_FEE_WIDTH)
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .min_w(px(0.0))
                         .truncate()
                         .child("Est. tx fee"),
@@ -2145,7 +2145,7 @@ pub(super) fn render_broadcaster_picker_header(
                 .child(
                     div()
                         .w(BROADCASTER_PICKER_STATUS_WIDTH)
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .min_w(px(0.0))
                         .flex()
                         .items_center()
@@ -2164,7 +2164,10 @@ pub(super) fn render_broadcaster_picker_header(
                                         );
                                     });
                                     if !*open {
-                                        focus_query_input.read(cx).focus_handle(cx).focus(window);
+                                        focus_query_input
+                                            .read(cx)
+                                            .focus_handle(cx)
+                                            .focus(window, cx);
                                     }
                                 })
                                 .trigger(
@@ -2262,7 +2265,7 @@ fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
                 .child(div().min_w(px(0.0)).truncate().child(row.label.clone()))
                 .children(row.favorite.then(|| {
                     div()
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .flex()
                         .items_center()
                         .text_color(rgb(theme::WARNING))
@@ -2271,7 +2274,7 @@ fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
         )
         .child(
             div()
-                .flex_shrink()
+                .flex_shrink(1.0)
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
@@ -2282,7 +2285,7 @@ fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
 }
 
 fn render_broadcaster_picker_section_divider(inset: Pixels) -> impl IntoElement {
-    Divider::horizontal()
+    Separator::horizontal()
         .absolute()
         .top(px(0.0))
         .left(inset)
@@ -2327,7 +2330,7 @@ fn render_broadcaster_picker_estimated_fee_cell(
     let (primary_color, secondary_color) = broadcaster_picker_fee_text_colors(muted);
     div()
         .w(BROADCASTER_PICKER_FEE_WIDTH)
-        .flex_shrink()
+        .flex_shrink(1.0)
         .min_w(px(0.0))
         .overflow_hidden()
         .flex()
@@ -2479,7 +2482,7 @@ fn render_broadcaster_picker_group(
         )
         .child(
             div()
-                .flex_shrink()
+                .flex_shrink(1.0)
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
@@ -2506,7 +2509,7 @@ fn render_broadcaster_picker_tier_cell(
 ) -> gpui::Div {
     div()
         .w(BROADCASTER_PICKER_STATUS_WIDTH)
-        .flex_shrink()
+        .flex_shrink(1.0)
         .children(
             tier.badge_label(show_uncompensated_badge)
                 .map(|label| render_broadcaster_picker_status_badge(id, tier, label, detail)),
@@ -2528,7 +2531,7 @@ fn render_broadcaster_picker_status_badge(
             id.as_ref()
         )))
         .w(BROADCASTER_PICKER_STATUS_WIDTH)
-        .flex_shrink()
+        .flex_shrink(1.0)
         .flex()
         .overflow_hidden()
         .items_center()
@@ -2593,7 +2596,7 @@ fn render_broadcaster_picker_status_tooltip(
                 ),
         )
         .child(
-            Divider::horizontal()
+            Separator::horizontal()
                 .color(rgb(theme::BORDER_SUBTLE))
                 .my(px(1.0)),
         )

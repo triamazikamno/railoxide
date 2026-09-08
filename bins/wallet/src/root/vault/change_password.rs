@@ -81,11 +81,11 @@ impl ChangeVaultPasswordDialogContent {
         }
     }
 
-    fn focus_current_password(&self, window: &mut Window, cx: &Context<'_, Self>) {
+    fn focus_current_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.current_password_input
             .read(cx)
             .focus_handle(cx)
-            .focus(window);
+            .focus(window, cx);
     }
 
     fn handle_enter(
@@ -102,13 +102,13 @@ impl ChangeVaultPasswordDialogContent {
                 self.new_password_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
             ChangeVaultPasswordEnterAction::FocusConfirmPassword => {
                 self.confirm_password_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
             ChangeVaultPasswordEnterAction::Submit => self.submit(window, cx),
         }
@@ -290,6 +290,7 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .title(app_strong_text("Change vault password"))
                 .child(div().w(content_width).child(content.clone()))
         });

@@ -32,8 +32,8 @@ use super::utxo::{
 };
 use super::{
     ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, centered_message,
-    count_label, dialog_content_max_height, dialog_max_height, parse_address, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width, token_display_metadata,
+    count_label, dialog_max_height, parse_address, rgb_with_alpha, secondary_dialog_content_width,
+    token_display_metadata,
 };
 
 #[cfg(test)]
@@ -622,7 +622,6 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let address_text = SharedString::from(address);
         let copy_id = SharedString::from("wallet-private-receive-address-copy");
@@ -631,15 +630,12 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Private receive address"))
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_public_address_qr_dialog_content(
-                        None,
-                        address_text.clone(),
-                        None,
-                        copy_id.clone(),
-                        content_width,
-                    ),
+                .child(render_public_address_qr_dialog_content(
+                    None,
+                    address_text.clone(),
+                    None,
+                    copy_id.clone(),
+                    content_width,
                 ))
         });
     }
@@ -839,6 +835,7 @@ impl WalletRoot {
         app_button(id, "Receive")
             .child(Icon::new(RailgunActionIcon::QrCode).small())
             .outline()
+            .when(receive_available, |button| button.bg(rgb(theme::SURFACE)))
             .disabled(!receive_available)
             .tooltip("Show private receive address")
             .on_click(move |_event, window, cx| {
@@ -858,7 +855,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -885,7 +881,7 @@ impl WalletRoot {
                         root.private_pending_status_dialog_open = false;
                     });
                 })
-                .child(scrollable_dialog_content(content_max_height, content))
+                .child(content)
         });
     }
 
@@ -1176,6 +1172,7 @@ impl WalletRoot {
                         app_button("wallet-private-hero-send", "Send")
                             .child(Icon::new(RailgunActionIcon::Send).small())
                             .outline()
+                            .when(can_send, |button| button.bg(rgb(theme::SURFACE)))
                             .disabled(!can_send)
                             .tooltip(private_send_action_tooltip(
                                 can_send,
@@ -1196,6 +1193,7 @@ impl WalletRoot {
                         app_button("wallet-private-hero-unshield", "Unshield")
                             .child(Icon::new(IconName::Globe).small())
                             .outline()
+                            .when(can_unshield, |button| button.bg(rgb(theme::SURFACE)))
                             .disabled(!can_unshield)
                             .tooltip(private_unshield_action_tooltip(
                                 can_unshield,
@@ -1294,6 +1292,7 @@ impl WalletRoot {
                         )
                         .child(Icon::new(RailgunActionIcon::Send).small())
                         .outline()
+                        .when(can_send, |button| button.bg(rgb(theme::SURFACE)))
                         .disabled(!can_send)
                         .opacity(send_opacity)
                         .tooltip(send_tooltip)
@@ -1313,6 +1312,7 @@ impl WalletRoot {
                         )
                         .child(Icon::new(IconName::Globe).small())
                         .outline()
+                        .when(can_unshield, |button| button.bg(rgb(theme::SURFACE)))
                         .disabled(!can_unshield)
                         .opacity(unshield_opacity)
                         .tooltip(unshield_tooltip)

@@ -359,48 +359,26 @@ pub(super) fn render_eip1559_gas_fee_editor(
             .outline()
             .compact()
             .disabled(disabled)
-            .child(
-                app_segment_button(
-                    SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
-                    "Auto",
-                    auto_selected,
-                    Some(render_auto_refresh_button(
-                        refresh_root,
-                        SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
-                        target.clone(),
-                        auto_selected && state.refreshing,
-                        auto_selected && !disabled && !state.refreshing,
-                    )),
-                )
-                .bg(if auto_selected {
-                    rgb(theme::SURFACE_HOVER)
-                } else {
-                    gpui::transparent_black().into()
-                })
-                .text_color(rgb(if auto_selected {
-                    theme::PRIMARY
-                } else {
-                    theme::TEXT_MUTED
-                })),
-            )
-            .child(
-                app_segment_button(
-                    SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
-                    "Custom",
-                    custom_selected,
-                    None,
-                )
-                .bg(if custom_selected {
-                    rgb(theme::SURFACE_HOVER)
-                } else {
-                    gpui::transparent_black().into()
-                })
-                .text_color(rgb(if custom_selected {
-                    theme::PRIMARY
-                } else {
-                    theme::TEXT_MUTED
-                })),
-            )
+            .child(app_segment_button(
+                SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
+                "Auto",
+                auto_selected,
+                disabled,
+                Some(render_auto_refresh_button(
+                    refresh_root,
+                    SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
+                    target.clone(),
+                    auto_selected && state.refreshing,
+                    auto_selected && !disabled && !state.refreshing,
+                )),
+            ))
+            .child(app_segment_button(
+                SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
+                "Custom",
+                custom_selected,
+                disabled,
+                None,
+            ))
             .on_click(move |selected, window, cx| {
                 let Some(index) = selected.first() else {
                     return;
@@ -555,6 +533,7 @@ fn render_auto_gas_fee_edit_button(
         .ghost()
         .xsmall()
         .compact()
+        .accessibility_label("Customize gas fee")
         .tooltip("Customize gas fee")
         .disabled(!enabled)
         .on_click(move |_event, window, cx| {

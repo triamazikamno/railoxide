@@ -1,14 +1,14 @@
 use gpui::{
-    Corner, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px,
-    rgb,
+    Anchor, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, img,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Icon, IconName, Sizable,
+    Collapsible, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     popover::Popover,
     progress::Progress as UiProgress,
-    sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
+    sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem},
     spinner::Spinner,
     tooltip::Tooltip,
 };
@@ -49,6 +49,8 @@ impl WalletRoot {
         root: Entity<Self>,
         collapsed: bool,
         sidebar_is_narrow: bool,
+        window: &mut Window,
+        cx: &mut App,
     ) -> impl IntoElement {
         let wallet_root = root.clone();
         let broadcaster_root = root.clone();
@@ -65,7 +67,7 @@ impl WalletRoot {
         let walletconnect_attention =
             walletconnect_pending_count > 0 && self.active_activity != Activity::Wallet;
 
-        Sidebar::left()
+        Sidebar::new("wallet-sidebar")
             .w(SIDEBAR_WIDTH)
             .collapsed(collapsed)
             .header(Self::render_sidebar_header(
@@ -86,9 +88,11 @@ impl WalletRoot {
                             )
                             .active(self.active_activity == Activity::Wallet)
                             .when(walletconnect_attention, |item| {
-                                item.suffix(Self::render_walletconnect_attention_badge(
-                                    walletconnect_pending_count,
-                                ))
+                                item.suffix(move |_window, _cx| {
+                                    Self::render_walletconnect_attention_badge(
+                                        walletconnect_pending_count,
+                                    )
+                                })
                             })
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
@@ -116,9 +120,11 @@ impl WalletRoot {
                             )
                             .active(self.active_activity == Activity::Broadcaster)
                             .when(public_broadcaster_count > 0, |item| {
-                                item.suffix(Self::render_public_broadcaster_count_badge(
-                                    public_broadcaster_count,
-                                ))
+                                item.suffix(move |_window, _cx| {
+                                    Self::render_public_broadcaster_count_badge(
+                                        public_broadcaster_count,
+                                    )
+                                })
                             })
                             .on_click(move |_event, window, cx| {
                                 broadcaster_root.update(cx, |root, cx| {
@@ -192,16 +198,21 @@ impl WalletRoot {
                     )
                     .child(self.render_network_status_pill(&network_root, collapsed))
                     .child(
-                        SidebarMenuItem::new("Logs")
-                            .icon(Icon::new(RailgunSidebarIcon::Logs).size_4())
-                            .active(self.logs_open)
+                        SidebarMenu::new()
+                            .w_full()
                             .collapsed(collapsed)
-                            .on_click(move |_event, _window, cx| {
-                                logs_root.update(cx, |root, cx| {
-                                    root.logs_open = !root.logs_open;
-                                    cx.notify();
-                                });
-                            }),
+                            .child(
+                                SidebarMenuItem::new("Logs")
+                                    .icon(Icon::new(RailgunSidebarIcon::Logs).size_4())
+                                    .active(self.logs_open)
+                                    .on_click(move |_event, _window, cx| {
+                                        logs_root.update(cx, |root, cx| {
+                                            root.logs_open = !root.logs_open;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .render("wallet-sidebar-footer-menu", window, cx),
                     ),
             )
     }
@@ -250,6 +261,7 @@ impl WalletRoot {
         let tor_state_reset_confirming = self.tor_state_reset_confirming;
 
         let trigger = Button::new("wallet-network-status-pill-trigger")
+            .accessibility_label("Network status")
             .text()
             .tab_stop(false)
             .child(Self::render_network_status_chip(
@@ -268,13 +280,13 @@ impl WalletRoot {
                     - SIDEBAR_FOOTER_HORIZONTAL_INSET
                     - SIDEBAR_FOOTER_HORIZONTAL_INSET)
                 .min_w(px(0.0))
-                .flex_shrink()
+                .flex_shrink(1.0)
         } else {
             trigger
         };
 
         let popover = Popover::new("wallet-network-status-popover")
-            .anchor(Corner::BottomLeft)
+            .anchor(Anchor::BottomLeft)
             .open(self.network_status_popover_open)
             .on_open_change(move |open, _window, cx| {
                 popover_root.update(cx, |root, cx| {
@@ -475,6 +487,7 @@ impl WalletRoot {
         let popover_root = root.clone();
         let content_progress = progress;
         let trigger = Button::new("wallet-prover-cache-build-pill-trigger")
+            .accessibility_label("Prover cache build status")
             .text()
             .tab_stop(false)
             .tooltip("Building prover cache")
@@ -600,7 +613,7 @@ impl WalletRoot {
                     .items_center()
                     .gap_3()
                     .child(
-                        UiProgress::new()
+                        UiProgress::new("prover-cache-build-progress")
                             .flex_1()
                             .h(px(7.0))
                             .value(f32::from(percent)),
@@ -768,7 +781,7 @@ impl WalletRoot {
                     .gap_1()
                     .child(Self::render_sidebar_social_copy_button(
                         "wallet-sidebar-repository-url-copy",
-                        Icon::new(IconName::GitHub).size_4(),
+                        Icon::new(IconName::Github).size_4(),
                         RAILOXIDE_REPOSITORY_URL,
                     ))
                     .child(Self::render_sidebar_social_copy_button(

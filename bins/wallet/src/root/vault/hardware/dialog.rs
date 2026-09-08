@@ -1,17 +1,19 @@
 #[cfg(feature = "hardware")]
+use gpui::{InteractiveElement, StatefulInteractiveElement};
+
+#[cfg(feature = "hardware")]
 use super::{
     Arc, Context, DesktopVaultStore, Focusable, HardwareDerivationError, HardwareDeviceKind,
     HardwareProfilePickerView, HardwareProfileProgressUpdate, HardwareProfileSession,
     HardwareProfileStep, HardwareProfileStepStatus, HardwareProfileUnlockPurpose, ParentElement,
-    ScrollableElement, Styled, TrezorPassphraseMode, TrezorPinMatrixPromptState,
-    TrezorPinMatrixProvider, VaultError, ViewUnlock, WalletRoot, Window, WindowExt, Zeroize,
-    Zeroizing, app_strong_text, default_hardware_profile_label, default_hardware_profile_steps,
-    dismiss_hardware_profile_unlock_state, div, hardware_device_kind_from_source,
-    hardware_device_label, hardware_profile_hardware_error_message,
-    hardware_profile_should_reconnect_after_error, hardware_session_needs_trezor_app_passphrase,
-    hardware_wallet_creation_result_is_current, mpsc, next_trezor_passphrase_mode, px,
-    secondary_dialog_content_width, trezor_pin_matrix_provider, trezor_session_stale_error_message,
-    vault_error_message,
+    Styled, TrezorPassphraseMode, TrezorPinMatrixPromptState, TrezorPinMatrixProvider, VaultError,
+    ViewUnlock, WalletRoot, Window, WindowExt, Zeroize, Zeroizing, app_strong_text,
+    default_hardware_profile_label, default_hardware_profile_steps,
+    dismiss_hardware_profile_unlock_state, hardware_device_kind_from_source, hardware_device_label,
+    hardware_profile_hardware_error_message, hardware_profile_should_reconnect_after_error,
+    hardware_session_needs_trezor_app_passphrase, hardware_wallet_creation_result_is_current, mpsc,
+    next_trezor_passphrase_mode, px, secondary_dialog_content_width, trezor_pin_matrix_provider,
+    trezor_session_stale_error_message, vault_error_message,
 };
 #[cfg(not(feature = "hardware"))]
 use super::{Context, WalletRoot};
@@ -476,7 +478,6 @@ impl WalletRoot {
         self.hardware_profile_unlock.approval_prompt = None;
         self.hardware_profile_unlock.picker_view = HardwareProfilePickerView::Summary;
         self.hardware_profile_unlock.advanced_open = false;
-        self.hardware_profile_unlock.editing_label = false;
         self.hardware_profile_unlock.error = None;
         self.hardware_profile_unlock.progress_steps = default_hardware_profile_steps();
         self.hardware_profile_unlock.reconnect_notice = Some(Arc::from(
@@ -591,13 +592,15 @@ impl WalletRoot {
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(px(620.0));
         let dialog_max_height = viewport_size.height * 0.84;
-        let dialog_content_max_height = viewport_size.height * 0.74;
         let content_width = secondary_dialog_content_width(dialog_width);
+        let content_focus = cx.focus_handle();
+        let dialog_content_focus = content_focus.clone();
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(format!("{device_label} wallet")))
                 .on_close(move |_event, window, cx| {
@@ -606,20 +609,16 @@ impl WalletRoot {
                     });
                 })
                 .child(
-                    div()
-                        .max_h(dialog_content_max_height)
-                        .min_h(px(0.0))
-                        .overflow_y_scrollbar()
-                        .child(
-                            content_root
-                                .read(cx)
-                                .render_hardware_profile_unlock_dialog_content(
-                                    &content_root,
-                                    content_width,
-                                ),
-                        ),
+                    content_root
+                        .read(cx)
+                        .render_hardware_profile_unlock_dialog_content(&content_root, content_width)
+                        .id("hardware-profile-unlock-content")
+                        .role(gpui::accesskit::Role::Group)
+                        .aria_label(format!("{device_label} wallet"))
+                        .track_focus(&dialog_content_focus),
                 )
         });
+        content_focus.focus(window, cx);
         if self.hardware_profile_unlock_requires_password() {
             cx.defer_in(window, move |root, window, cx| {
                 if root.hardware_profile_unlock.device_kind == Some(device_kind)
@@ -630,7 +629,7 @@ impl WalletRoot {
                     root.hardware_profile_password_input
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window);
+                        .focus(window, cx);
                 }
             });
         } else if self.hardware_profile_unlock_auto_starts() {
@@ -644,12 +643,12 @@ impl WalletRoot {
                 }
             });
         } else if device_kind == HardwareDeviceKind::Trezor {
-            cx.defer_in(window, move |root, window, _cx| {
+            cx.defer_in(window, move |root, window, cx| {
                 if root.hardware_profile_unlock.device_kind == Some(device_kind)
                     && root.hardware_profile_unlock.session.is_none()
                     && !root.hardware_profile_unlock.in_progress
                 {
-                    root.trezor_passphrase_mode_focus.focus(window);
+                    root.trezor_passphrase_mode_focus.focus(window, cx);
                 }
             });
         }
@@ -689,7 +688,7 @@ impl WalletRoot {
         if mode != TrezorPassphraseMode::EnterInApp {
             self.trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
-            self.trezor_passphrase_mode_focus.focus(window);
+            self.trezor_passphrase_mode_focus.focus(window, cx);
         }
         cx.notify();
         if mode == TrezorPassphraseMode::EnterInApp {
@@ -703,7 +702,7 @@ impl WalletRoot {
                     root.trezor_app_passphrase_input
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window);
+                        .focus(window, cx);
                 }
             });
         }

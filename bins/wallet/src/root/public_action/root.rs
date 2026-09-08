@@ -16,7 +16,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let asset_label = public_asset_label(
             self.selected_chain,
@@ -38,18 +37,16 @@ impl WalletRoot {
                     asset_label.clone(),
                     icon_path.clone(),
                 ))
+                .on_ok(|_, _, _| false)
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.clear_public_action_dialog_inputs(window, cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_public_action_dialog_content(
-                        content_root.clone(),
-                        content_width,
-                        cx,
-                    ),
+                .child(content_root.read(cx).render_public_action_dialog_content(
+                    content_root.clone(),
+                    content_width,
+                    cx,
                 ))
         });
         self.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
@@ -61,7 +58,7 @@ impl WalletRoot {
     pub(in crate::root) fn focus_public_action_dialog_input(
         &self,
         window: &mut Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match self.public_form.action_mode {
             PublicActionMode::Shield => self
@@ -69,14 +66,14 @@ impl WalletRoot {
                 .shield_amount_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             PublicActionMode::Send => {
                 let input = match self.public_form.public_send_kind {
                     PublicSendKind::Transfer => &self.public_form.send_recipient_input,
                     PublicSendKind::ContractCall => &self.public_form.advanced_send_to_input,
                     PublicSendKind::Deploy => &self.public_form.advanced_send_value_input,
                 };
-                input.read(cx).focus_handle(cx).focus(window);
+                input.read(cx).focus_handle(cx).focus(window, cx);
             }
         }
     }
@@ -110,6 +107,7 @@ impl WalletRoot {
         let advanced_mode_root = root.clone();
         let advanced_estimate_root = root.clone();
         let advanced_submit_root = root.clone();
+        let keyboard_submit_root = root.clone();
         let max_root = root;
         let show_form_errors = !self.public_action_has_active_progress();
         let amount_hint = format!("{asset_label} amount");
@@ -152,46 +150,62 @@ impl WalletRoot {
             PublicActionMode::Send => self.public_form.send_gas_fee.refreshing,
         };
         let fee_ready = fee_display.expected_gas_cost.is_some();
-        let mut content = div()
-            .w(content_width)
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(account.map(|account| {
-                app_muted_text(format!("From {}", short_address(&account.address)))
-                    .font_family(APP_MONO_FONT_FAMILY)
-            }))
-            .child(
-                ButtonGroup::new("wallet-public-action-mode-toggle")
-                    .w_full()
-                    .outline()
-                    .disabled(submitting)
-                    .child(public_action_segment_button(
-                        "wallet-public-action-mode-shield".into(),
-                        "Shield",
-                        Icon::new(RailgunActionIcon::Shield),
-                        mode == PublicActionMode::Shield,
-                    ))
-                    .child(public_action_segment_button(
+        let submit_disabled = disabled
+            || match mode {
+                PublicActionMode::Shield => self.public_form.shielding || !fee_ready,
+                PublicActionMode::Send if self.public_form.public_send_kind.is_advanced() => {
+                    self.public_form.sending
+                        || self.public_form.advanced_send_estimate_pending
+                        || self.public_form.advanced_send_estimate.is_none()
+                }
+                PublicActionMode::Send => self.public_form.sending || !fee_ready,
+            };
+        let mut content = public_action_form(content_width, submit_disabled, move |window, cx| {
+            keyboard_submit_root.update(cx, |root, cx| match mode {
+                PublicActionMode::Shield => root.submit_public_shield_from_form(window, cx),
+                PublicActionMode::Send => root.submit_public_send_from_form(window, cx),
+            });
+        })
+        .children(account.map(|account| {
+            app_muted_text(format!("From {}", short_address(&account.address)))
+                .font_family(APP_MONO_FONT_FAMILY)
+        }))
+        .child(
+            ButtonGroup::new("wallet-public-action-mode-toggle")
+                .w_full()
+                .outline()
+                .disabled(submitting)
+                .child(public_action_segment_button(
+                    "wallet-public-action-mode-shield".into(),
+                    "Shield",
+                    Icon::new(RailgunActionIcon::Shield),
+                    mode == PublicActionMode::Shield,
+                ))
+                .child(
+                    public_action_segment_button(
                         "wallet-public-action-mode-send".into(),
                         "Send",
                         Icon::new(RailgunActionIcon::Send),
                         mode == PublicActionMode::Send,
-                    ))
-                    .on_click(move |selected, window, cx| {
-                        let Some(index) = selected.first() else {
-                            return;
-                        };
-                        let mode = if *index == 0 {
-                            PublicActionMode::Shield
-                        } else {
-                            PublicActionMode::Send
-                        };
-                        mode_root.update(cx, |root, cx| {
-                            root.set_public_action_mode(mode, window, cx);
-                        });
+                    )
+                    .when(mode == PublicActionMode::Send, |button| {
+                        button.border_l_1().ml(-px(1.0))
                     }),
-            );
+                )
+                .on_click(move |selected, window, cx| {
+                    let Some(index) = selected.first() else {
+                        return;
+                    };
+                    let mode = if *index == 0 {
+                        PublicActionMode::Shield
+                    } else {
+                        PublicActionMode::Send
+                    };
+                    mode_root.update(cx, |root, cx| {
+                        root.set_public_action_mode(mode, window, cx);
+                    });
+                }),
+        );
 
         match mode {
             PublicActionMode::Shield => {
@@ -230,7 +244,7 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.shielding)
-                        .disabled(disabled || self.public_form.shielding || !fee_ready)
+                        .disabled(submit_disabled)
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.submit_public_shield_from_form(window, cx);
@@ -256,16 +270,19 @@ impl WalletRoot {
                                     "wallet-public-send-transfer".into(),
                                     "Transfer",
                                     send_kind == PublicSendKind::Transfer,
+                                    self.public_form.sending,
                                 ))
                                 .child(public_send_kind_segment_button(
                                     "wallet-public-send-contract-call".into(),
                                     "Contract call",
                                     send_kind == PublicSendKind::ContractCall,
+                                    self.public_form.sending,
                                 ))
                                 .child(public_send_kind_segment_button(
                                     "wallet-public-send-deploy".into(),
                                     "Deploy",
                                     send_kind == PublicSendKind::Deploy,
+                                    self.public_form.sending,
                                 ))
                                 .on_click(move |selected, window, cx| {
                                     let Some(index) = selected.first() else {
@@ -310,140 +327,138 @@ impl WalletRoot {
                     } else {
                         "Calldata"
                     };
-                    content = content
-                        .child(
-                            labeled_field(
-                                format!(
-                                    "Value ({})",
-                                    native_token_display_label(self.selected_chain)
+                    content =
+                        content
+                            .child(
+                                labeled_field(
+                                    format!(
+                                        "Value ({})",
+                                        native_token_display_label(self.selected_chain)
+                                    ),
+                                    app_input(&self.public_form.advanced_send_value_input)
+                                        .disabled(disabled || self.public_form.sending),
+                                )
+                                .children(
+                                    self.public_form.advanced_send_value_error.as_ref().map(
+                                        |error| {
+                                            Alert::error(
+                                                "wallet-public-send-advanced-value-error",
+                                                error.to_string(),
+                                            )
+                                            .small()
+                                        },
+                                    ),
                                 ),
-                                app_input(&self.public_form.advanced_send_value_input)
-                                    .disabled(disabled || self.public_form.sending),
                             )
-                            .children(
-                                self.public_form
-                                    .advanced_send_value_error
-                                    .as_ref()
-                                    .map(|error| {
-                                        Alert::error(
-                                            "wallet-public-send-advanced-value-error",
-                                            error.to_string(),
-                                        )
-                                        .small()
-                                    }),
-                            ),
-                        )
-                        .child(
-                            labeled_field(
-                                data_label,
-                                app_input(&self.public_form.advanced_send_data_input)
+                            .child(
+                                labeled_field(
+                                    data_label,
+                                    gpui_component::input::Textarea::new(
+                                        &self.public_form.advanced_send_data_input,
+                                    )
+                                    .bg(rgb(theme::SURFACE))
+                                    .px(px(8.0))
                                     .w_full()
                                     .min_w(px(0.0))
                                     .font_family(APP_MONO_FONT_FAMILY)
                                     .text_size(APP_TEXT_SIZE)
                                     .disabled(disabled || self.public_form.sending),
-                            )
-                            .w_full()
-                            .min_w(px(0.0))
-                            .children(
-                                self.public_form
-                                    .advanced_send_data_error
-                                    .as_ref()
-                                    .map(|error| {
-                                        Alert::error(
-                                            "wallet-public-send-advanced-data-error",
-                                            error.to_string(),
-                                        )
-                                        .small()
-                                    }),
-                            ),
-                        )
-                        .child(render_eip1559_gas_fee_editor(
-                            gas_fee_root,
-                            &Eip1559GasFeeTarget::Public {
-                                mode: PublicActionMode::Send,
-                            },
-                            &self.public_form.send_gas_fee,
-                            disabled || self.public_form.sending,
-                        ))
-                        .child(match self.public_form.advanced_send_estimate.as_ref() {
-                            Some(estimate) => render_public_advanced_transaction_estimate(
-                                self.selected_chain,
-                                estimate,
-                                self.public_broadcaster_anchor_cache
-                                    .cached_native_usd_micro_value(
-                                        self.selected_chain,
-                                        estimate.expected_gas_cost,
+                                )
+                                .w_full()
+                                .min_w(px(0.0))
+                                .children(
+                                    self.public_form.advanced_send_data_error.as_ref().map(
+                                        |error| {
+                                            Alert::error(
+                                                "wallet-public-send-advanced-data-error",
+                                                error.to_string(),
+                                            )
+                                            .small()
+                                        },
                                     ),
-                                self.public_broadcaster_anchor_cache
-                                    .cached_native_usd_micro_value(
-                                        self.selected_chain,
-                                        estimate.max_gas_cost,
-                                    ),
-                            ),
-                            None => Alert::info(
-                                "wallet-public-send-advanced-estimate-required",
-                                advanced_public_send_estimate_required_message(
-                                    self.public_form.advanced_send_estimate_invalidated,
                                 ),
                             )
-                            .small()
-                            .into_any_element(),
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    app_button(
-                                        "wallet-public-send-advanced-estimate",
-                                        if self.public_form.advanced_send_estimate_pending {
-                                            "Estimating..."
-                                        } else {
-                                            "Estimate gas"
-                                        },
-                                    )
-                                    .outline()
-                                    .small()
-                                    .loading(self.public_form.advanced_send_estimate_pending)
-                                    .disabled(
-                                        disabled
-                                            || self.public_form.sending
-                                            || self.public_form.advanced_send_estimate_pending,
-                                    )
-                                    .on_click(
-                                        move |_event, _window, cx| {
-                                            advanced_estimate_root.update(cx, |root, cx| {
-                                                root.estimate_advanced_public_send(cx);
-                                            });
-                                        },
+                            .child(render_eip1559_gas_fee_editor(
+                                gas_fee_root,
+                                &Eip1559GasFeeTarget::Public {
+                                    mode: PublicActionMode::Send,
+                                },
+                                &self.public_form.send_gas_fee,
+                                disabled || self.public_form.sending,
+                            ))
+                            .child(match self.public_form.advanced_send_estimate.as_ref() {
+                                Some(estimate) => render_public_advanced_transaction_estimate(
+                                    self.selected_chain,
+                                    estimate,
+                                    self.public_broadcaster_anchor_cache
+                                        .cached_native_usd_micro_value(
+                                            self.selected_chain,
+                                            estimate.expected_gas_cost,
+                                        ),
+                                    self.public_broadcaster_anchor_cache
+                                        .cached_native_usd_micro_value(
+                                            self.selected_chain,
+                                            estimate.max_gas_cost,
+                                        ),
+                                ),
+                                None => Alert::info(
+                                    "wallet-public-send-advanced-estimate-required",
+                                    advanced_public_send_estimate_required_message(
+                                        self.public_form.advanced_send_estimate_invalidated,
                                     ),
                                 )
-                                .child(
-                                    app_button(
-                                        "wallet-public-send-advanced-authorize",
-                                        "Review and authorize",
+                                .small()
+                                .into_any_element(),
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        app_button(
+                                            "wallet-public-send-advanced-estimate",
+                                            if self.public_form.advanced_send_estimate_pending {
+                                                "Estimating..."
+                                            } else {
+                                                "Estimate gas"
+                                            },
+                                        )
+                                        .outline()
+                                        .small()
+                                        .loading(self.public_form.advanced_send_estimate_pending)
+                                        .disabled(
+                                            disabled
+                                                || self.public_form.sending
+                                                || self.public_form.advanced_send_estimate_pending,
+                                        )
+                                        .on_click(
+                                            move |_event, _window, cx| {
+                                                advanced_estimate_root.update(cx, |root, cx| {
+                                                    root.estimate_advanced_public_send(cx);
+                                                });
+                                            },
+                                        ),
                                     )
-                                    .primary()
-                                    .small()
-                                    .disabled(
-                                        disabled
-                                            || self.public_form.sending
-                                            || self.public_form.advanced_send_estimate_pending
-                                            || self.public_form.advanced_send_estimate.is_none(),
-                                    )
-                                    .on_click(
-                                        move |_event, window, cx| {
-                                            advanced_submit_root.update(cx, |root, cx| {
-                                                root.submit_public_send_from_form(window, cx);
-                                            });
-                                        },
+                                    .child(
+                                        app_button(
+                                            "wallet-public-send-advanced-authorize",
+                                            "Review and authorize",
+                                        )
+                                        .primary()
+                                        .small()
+                                        .disabled(submit_disabled)
+                                        .on_click(
+                                            move |_event, window, cx| {
+                                                advanced_submit_root.update(cx, |root, cx| {
+                                                    root.submit_public_send_from_form(window, cx);
+                                                });
+                                            },
+                                        ),
                                     ),
-                                ),
-                        );
+                            );
                 } else {
                     content = content
                         .child(labeled_field(
@@ -480,7 +495,7 @@ impl WalletRoot {
                             .primary()
                             .small()
                             .loading(self.public_form.sending)
-                            .disabled(disabled || self.public_form.sending || !fee_ready)
+                            .disabled(submit_disabled)
                             .on_click(move |_event, window, cx| {
                                 submit_root.update(cx, |root, cx| {
                                     root.submit_public_send_from_form(window, cx);
@@ -545,11 +560,13 @@ impl WalletRoot {
             &self.public_form.send_amount_input,
             &self.public_form.advanced_send_to_input,
             &self.public_form.advanced_send_value_input,
-            &self.public_form.advanced_send_data_input,
             &self.public_form.shield_amount_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
+        self.public_form
+            .advanced_send_data_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_trezor_app_passphrase_input(window, cx);
         self.clear_trezor_pin_matrix_prompt(cx);
         self.public_form.send_error = None;
@@ -851,7 +868,7 @@ impl WalletRoot {
             self.invalidate_advanced_public_send_estimate();
         }
         self.set_public_action_error(action_mode, None);
-        focus_input.read(cx).focus_handle(cx).focus(window);
+        focus_input.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
@@ -1308,7 +1325,6 @@ impl WalletRoot {
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -1325,12 +1341,11 @@ impl WalletRoot {
                         }
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_public_action_progress_dialog_content(&content_root, content_width),
-                ))
+                )
         });
     }
 
@@ -1544,15 +1559,16 @@ impl WalletRoot {
         });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         window.open_dialog(cx, move |dialog, _window, _cx| {
+            let submit_content = content.clone();
             dialog
+                .on_ok(move |_event, window, cx| {
+                    submit_content.update(cx, |content, cx| content.submit(window, cx));
+                    false
+                })
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content.clone(),
-                ))
+                .child(content.clone())
         });
     }
 

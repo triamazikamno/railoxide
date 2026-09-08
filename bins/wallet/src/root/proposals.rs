@@ -18,7 +18,7 @@ use gpui::{
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
-    button::ButtonVariants,
+    button::{ButtonCustomVariant, ButtonVariants},
     collapsible::Collapsible,
     list::{List, ListDelegate, ListItem, ListState},
     progress::Progress,
@@ -1297,7 +1297,7 @@ impl WalletRoot {
         if let Some(proposal) = selected_proposal.as_ref() {
             self.start_proposal_participation(proposal, cx);
         }
-        self.proposal_detail_focus.focus(window);
+        self.proposal_detail_focus.focus(window, cx);
         cx.notify();
     }
     pub(super) fn clear_selected_proposal(&mut self, cx: &mut Context<'_, Self>) {
@@ -1669,6 +1669,7 @@ impl WalletRoot {
             .min_h(px(0.0))
             .flex()
             .flex_col()
+            .items_center()
             .bg(rgb(theme::SURFACE_ELEVATED));
         let mut body = div()
             .w(CONTENT_WIDTH)
@@ -1709,6 +1710,7 @@ impl WalletRoot {
                         .gap_2()
                         .child(
                             app_button_base("wallet-proposals-previous")
+                                .accessibility_label("Previous proposals page")
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -1731,6 +1733,7 @@ impl WalletRoot {
                         )
                         .child(
                             app_button_base("wallet-proposals-next")
+                                .accessibility_label("Next proposals page")
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -1889,6 +1892,8 @@ impl WalletRoot {
         let detail_scroll = self.proposals.detail_scroll_handle.clone();
         let mut detail_scroller = div()
             .id("wallet-proposals-detail-scroll")
+            .role(gpui::accesskit::Role::Group)
+            .aria_label("Proposal details")
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
@@ -1923,6 +1928,7 @@ impl WalletRoot {
                                         .xsmall()
                                         .compact()
                                         .icon(IconName::ArrowLeft)
+                                        .accessibility_label("Back to governance")
                                         .tooltip("Back to governance")
                                         .on_click(move |_event, _window, cx| {
                                             back_root.update(cx, |root, cx| {
@@ -2007,6 +2013,7 @@ impl WalletRoot {
                         self,
                         proposal,
                         status.stage,
+                        cx,
                     ))
                     .child(
                         div()
@@ -2778,11 +2785,53 @@ fn proposal_detail_title(proposal: &ResolvedProposal) -> gpui::Div {
     }
 }
 
+fn render_proposal_participant_account_column(account: &PublicAccountMetadata) -> gpui::Div {
+    let label = super::public_account::public_account_display_label(account).unwrap_or_else(|| {
+        super::spend_authorization::spend_authorization_recipient_display(&format!(
+            "{:#x}",
+            account.address
+        ))
+    });
+    let mut account_column = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w(px(250.0))
+        .flex_none()
+        .min_w(px(0.0))
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(app_strong_text(label))
+                .child(
+                    app_muted_text(
+                        super::spend_authorization::spend_authorization_recipient_display(
+                            &format!("{:#x}", account.address),
+                        ),
+                    )
+                    .font_family(APP_MONO_FONT_FAMILY)
+                    .text_size(px(11.0))
+                    .truncate(),
+                ),
+        );
+    if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
+        account_column = account_column.child(
+            app_muted_text("Inactive account")
+                .text_size(px(10.0))
+                .text_color(rgb(theme::WARNING)),
+        );
+    }
+    account_column
+}
+
 fn render_proposal_participation_card(
     root: &Entity<WalletRoot>,
     wallet: &WalletRoot,
     proposal: &ResolvedProposal,
     stage: GovernanceProposalStage,
+    cx: &App,
 ) -> gpui::Div {
     let history_kind = proposal_closed_history_kind(stage);
     let actionable = matches!(
@@ -2915,13 +2964,6 @@ fn render_proposal_participation_card(
             .proposal_participation
             .rows
             .get(&account.address);
-        let label =
-            super::public_account::public_account_display_label(account).unwrap_or_else(|| {
-                super::spend_authorization::spend_authorization_recipient_display(&format!(
-                    "{:#x}",
-                    account.address
-                ))
-            });
         let mut row_card = div()
             .flex()
             .flex_wrap()
@@ -2931,38 +2973,7 @@ fn render_proposal_participation_card(
             .px(px(2.0))
             .border_t_1()
             .border_color(rgb(theme::BORDER_SUBTLE));
-        let mut account_column = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w(px(250.0))
-            .flex_none()
-            .min_w(px(0.0))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .child(app_strong_text(label))
-                    .child(
-                        app_muted_text(
-                            super::spend_authorization::spend_authorization_recipient_display(
-                                &format!("{:#x}", account.address),
-                            ),
-                        )
-                        .font_family(APP_MONO_FONT_FAMILY)
-                        .text_size(px(11.0))
-                        .truncate(),
-                    ),
-            );
-        if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
-            account_column = account_column.child(
-                app_muted_text("Inactive account")
-                    .text_size(px(10.0))
-                    .text_color(rgb(theme::WARNING)),
-            );
-        }
-        row_card = row_card.child(account_column);
+        row_card = row_card.child(render_proposal_participant_account_column(account));
         let mut capacity_column = div().flex().flex_col().gap_1().flex_1().min_w(px(220.0));
         let mut actions = div().flex().flex_wrap().gap_2().flex_none();
         match row {
@@ -3063,9 +3074,13 @@ fn render_proposal_participation_card(
                                         .text_size(px(11.0)),
                                     );
                                     capacity_column = capacity_column.child(
-                                        Progress::new().w_full().max_w(px(340.0)).value(
-                                            f32::from(per_mille(remaining, snapshot)) / 10.0,
-                                        ),
+                                        Progress::new(SharedString::from(format!(
+                                            "proposal-account-capacity-{}",
+                                            account.public_account_uuid
+                                        )))
+                                        .w_full()
+                                        .max_w(px(340.0))
+                                        .value(f32::from(per_mille(remaining, snapshot)) / 10.0),
                                     );
                                     if remaining.is_zero() {
                                         capacity_column = capacity_column.child(
@@ -3420,7 +3435,7 @@ fn render_proposal_participation_card(
                 ProposalCapacitySummaryState::Partial | ProposalCapacitySummaryState::Exhausted
             ) {
                 summary = summary.child(
-                    Progress::new()
+                    Progress::new("proposal-capacity-summary")
                         .w_full()
                         .value(f32::from(per_mille(available, maximum)) / 10.0),
                 );
@@ -3446,32 +3461,58 @@ fn render_proposal_participation_card(
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(0.0))
+            .bottom(px(1.0))
             .flex()
             .justify_center()
-            .child(
-                app_button_base(toggle_id)
-                    .outline()
-                    .bg(rgb(theme::SURFACE))
-                    .xsmall()
-                    .rounded_full()
-                    .icon(if expanded {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .tooltip(if expanded {
-                        "Hide participation details"
-                    } else {
-                        "Show participation details"
-                    })
-                    .on_click(move |_event, _window, cx| {
-                        toggle_root.update(cx, |root, cx| {
-                            root.toggle_proposal_participation(cx);
-                        });
-                    }),
-            ),
+            .child(render_proposal_participation_toggle(
+                toggle_root,
+                toggle_id,
+                expanded,
+                cx,
+            )),
     )
+}
+
+fn render_proposal_participation_toggle(
+    toggle_root: Entity<WalletRoot>,
+    toggle_id: SharedString,
+    expanded: bool,
+    cx: &App,
+) -> gpui::AnyElement {
+    app_button_base(toggle_id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(rgb(theme::SURFACE).into())
+                .foreground(rgb(theme::TEXT).into())
+                .hover(rgb(theme::SURFACE_HOVER_SUBTLE).into())
+                .active(rgb(theme::SURFACE_HOVER).into()),
+        )
+        .outline()
+        .bg(rgb(theme::SURFACE))
+        .border_color(rgb(theme::BORDER))
+        .xsmall()
+        .rounded_full()
+        .icon(Icon::new(if expanded {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        }))
+        .accessibility_label(if expanded {
+            "Hide participation details"
+        } else {
+            "Show participation details"
+        })
+        .tooltip(if expanded {
+            "Hide participation details"
+        } else {
+            "Show participation details"
+        })
+        .on_click(move |_event, _window, cx| {
+            toggle_root.update(cx, |root, cx| {
+                root.toggle_proposal_participation(cx);
+            });
+        })
+        .into_any_element()
 }
 
 pub(super) const fn proposal_action_title(kind: ProposalActionKind) -> &'static str {
@@ -3601,11 +3642,28 @@ fn render_proposal_action_form(
     let close_root = root.clone();
     let max_root = root.clone();
     let review_root = root.clone();
+    let prepare = move |window: &mut Window, cx: &mut App| {
+        review_root.update(cx, |root, cx| {
+            root.review_proposal_action(&proposal_for_review, selection, amount, window, cx);
+        });
+    };
+    let prepare_on_enter = prepare.clone();
     let max_input = amount_input.clone();
     let max_value = maximum.map(|maximum| format_send_amount_input(maximum, decimals));
     let action_label = "Prepare authorization";
     let display_label = public_account_display_label_for_proposal_actor(wallet, selection.actor);
     let mut content = div()
+        .when(
+            !matches!(selection.kind, ProposalActionKind::CallVote),
+            |this| {
+                this.on_action(move |_: &gpui_component::dialog::Confirm, window, cx| {
+                    cx.stop_propagation();
+                    if ready && !action_pending {
+                        prepare_on_enter(window, cx);
+                    }
+                })
+            },
+        )
         .w(content_width)
         .flex()
         .flex_col()
@@ -3661,94 +3719,97 @@ fn render_proposal_action_form(
                 }),
         );
     if !matches!(selection.kind, ProposalActionKind::CallVote) {
-        content =
-            content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(app_muted_text("Amount").text_size(px(12.0)))
-                            .when_some(maximum, |this, maximum| {
-                                this.child(
-                                    app_button_base("governance-action-max")
-                                        .link()
-                                        .xsmall()
-                                        .compact()
-                                        .disabled(sponsor_lockout_until.is_some())
-                                        .child(format!(
-                                            "Max: {} RAIL",
-                                            format_send_amount_input(maximum, decimals)
-                                        ))
-                                        .on_click(move |_event, window, cx| {
-                                            if let Some(value) = &max_value {
-                                                max_input.update(cx, |input, cx| {
-                                                    input.set_value(value.clone(), window, cx);
-                                                    cx.notify();
-                                                });
-                                            }
-                                            max_root.update(cx, |_, cx| cx.notify());
-                                        }),
-                                )
-                            }),
-                    )
-                    .child(
-                        app_input(amount_input)
-                            .small()
-                            .disabled(sponsor_lockout_until.is_some())
-                            .suffix(app_muted_text("RAIL").text_size(px(11.0))),
-                    )
-                    .children(validation.clone().map(|error| {
-                        app_muted_text(error)
-                            .text_color(rgb(theme::DANGER))
-                            .text_size(px(11.0))
-                    }))
-                    .children(
-                        (validation.is_none()
-                            && amount.is_some()
-                            && matches!(selection.kind, ProposalActionKind::Unsponsor))
-                        .then(|| {
-                            app_muted_text("Returns to this account's available sponsorship power")
-                                .text_size(px(11.0))
-                        }),
-                    )
-                    .children(
-                        (validation.is_none()
-                            && amount.is_some()
-                            && !matches!(selection.kind, ProposalActionKind::Unsponsor))
-                        .then(|| {
-                            let remaining = maximum.and_then(|maximum| {
-                                amount.and_then(|amount| maximum.checked_sub(amount))
-                            });
-                            remaining.map(|remaining| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        app_muted_text(format!(
-                                            "{} RAIL will remain available",
-                                            format_compact_rail_amount(remaining)
-                                        ))
-                                        .text_size(px(11.0)),
-                                    )
-                                    .child(Progress::new().w_full().value(
-                                        maximum.filter(|maximum| !maximum.is_zero()).map_or(
-                                            0.0,
-                                            |maximum| {
-                                                f32::from(per_mille(remaining, maximum)) / 10.0
-                                            },
-                                        ),
+        content = content.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(app_muted_text("Amount").text_size(px(12.0)))
+                        .when_some(maximum, |this, maximum| {
+                            this.child(
+                                app_button_base("governance-action-max")
+                                    .link()
+                                    .xsmall()
+                                    .compact()
+                                    .disabled(sponsor_lockout_until.is_some())
+                                    .child(format!(
+                                        "Max: {} RAIL",
+                                        format_send_amount_input(maximum, decimals)
                                     ))
-                            })
+                                    .on_click(move |_event, window, cx| {
+                                        if let Some(value) = &max_value {
+                                            max_input.update(cx, |input, cx| {
+                                                input.set_value(value.clone(), window, cx);
+                                                cx.notify();
+                                            });
+                                        }
+                                        max_root.update(cx, |_, cx| cx.notify());
+                                    }),
+                            )
+                        }),
+                )
+                .child(
+                    app_input(amount_input)
+                        .small()
+                        .disabled(sponsor_lockout_until.is_some())
+                        .suffix(app_muted_text("RAIL").text_size(px(11.0))),
+                )
+                .children(validation.clone().map(|error| {
+                    app_muted_text(error)
+                        .text_color(rgb(theme::DANGER))
+                        .text_size(px(11.0))
+                }))
+                .children(
+                    (validation.is_none()
+                        && amount.is_some()
+                        && matches!(selection.kind, ProposalActionKind::Unsponsor))
+                    .then(|| {
+                        app_muted_text("Returns to this account's available sponsorship power")
+                            .text_size(px(11.0))
+                    }),
+                )
+                .children(
+                    (validation.is_none()
+                        && amount.is_some()
+                        && !matches!(selection.kind, ProposalActionKind::Unsponsor))
+                    .then(|| {
+                        let remaining = maximum.and_then(|maximum| {
+                            amount.and_then(|amount| maximum.checked_sub(amount))
+                        });
+                        remaining.map(|remaining| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    app_muted_text(format!(
+                                        "{} RAIL will remain available",
+                                        format_compact_rail_amount(remaining)
+                                    ))
+                                    .text_size(px(11.0)),
+                                )
+                                .child(
+                                    Progress::new("proposal-action-remaining-capacity")
+                                        .w_full()
+                                        .value(
+                                            maximum.filter(|maximum| !maximum.is_zero()).map_or(
+                                                0.0,
+                                                |maximum| {
+                                                    f32::from(per_mille(remaining, maximum)) / 10.0
+                                                },
+                                            ),
+                                        ),
+                                )
                         })
-                        .flatten(),
-                    ),
-            );
+                    })
+                    .flatten(),
+                ),
+        );
     }
     if matches!(selection.kind, ProposalActionKind::Sponsor) {
         if let Some(unlock) = sponsor_lockout_until {
@@ -3814,17 +3875,7 @@ fn render_proposal_action_form(
                     } else {
                         action_label
                     })
-                    .on_click(move |_event, window, cx| {
-                        review_root.update(cx, |root, cx| {
-                            root.review_proposal_action(
-                                &proposal_for_review,
-                                selection,
-                                amount,
-                                window,
-                                cx,
-                            );
-                        });
-                    }),
+                    .on_click(move |_event, window, cx| prepare(window, cx)),
             ),
     );
     Some(content)
@@ -4861,8 +4912,6 @@ fn render_proposal_blocks(
     path: &str,
     identity: &ProposalIdentity,
     table_scroll_handles: &BTreeMap<String, ScrollHandle>,
-    window: &mut Window,
-    cx: &mut Context<'_, WalletRoot>,
 ) -> gpui::AnyElement {
     let mut container = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
     for (index, block) in blocks.iter().enumerate() {
@@ -4871,8 +4920,6 @@ fn render_proposal_blocks(
             ProposalBlock::Markdown(source) => TextView::markdown(
                 SharedString::from(format!("{description_id}-text-{block_path}")),
                 source.clone(),
-                window,
-                cx,
             )
             .selectable(true)
             .into_any_element(),
@@ -4888,8 +4935,6 @@ fn render_proposal_blocks(
                 let text = TextView::markdown(
                     SharedString::from(format!("{table_id}-text")),
                     table.render_source.clone(),
-                    window,
-                    cx,
                 )
                 .w(px(f32::from(table.render_width_px)))
                 .min_w_full()
@@ -4917,8 +4962,6 @@ fn render_proposal_blocks(
                 &block_path,
                 identity,
                 table_scroll_handles,
-                window,
-                cx,
             ),
             ProposalBlock::Blockquote(blockquote) => div()
                 .id(SharedString::from(format!(
@@ -4935,8 +4978,6 @@ fn render_proposal_blocks(
                     &block_path,
                     identity,
                     table_scroll_handles,
-                    window,
-                    cx,
                 ))
                 .into_any_element(),
         };
@@ -4951,8 +4992,6 @@ fn render_proposal_list(
     path: &str,
     identity: &ProposalIdentity,
     table_scroll_handles: &BTreeMap<String, ScrollHandle>,
-    window: &mut Window,
-    cx: &mut Context<'_, WalletRoot>,
 ) -> gpui::AnyElement {
     let mut container = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
     let start = list.start.unwrap_or(1);
@@ -4971,8 +5010,6 @@ fn render_proposal_list(
             &item_path,
             identity,
             table_scroll_handles,
-            window,
-            cx,
         );
         container = container.child(
             div()
@@ -6159,8 +6196,8 @@ fn proposal_document_card(
     proposal: &ResolvedProposal,
     description_id: SharedString,
     table_scroll_handles: &BTreeMap<String, ScrollHandle>,
-    window: &mut Window,
-    cx: &mut Context<'_, WalletRoot>,
+    _window: &mut Window,
+    _cx: &mut Context<'_, WalletRoot>,
 ) -> gpui::Div {
     let mut card = div()
         .w_full()
@@ -6227,19 +6264,15 @@ fn proposal_document_card(
                 "root",
                 &proposal.identity(),
                 table_scroll_handles,
-                window,
-                cx,
             ),
             Some(ProposalPresentation::RawParseFallback(source)) => {
-                TextView::markdown(description_id, source.clone(), window, cx)
+                TextView::markdown(description_id, source.clone())
                     .selectable(true)
                     .into_any_element()
             }
             None => TextView::markdown(
                 description_id,
                 inert_raw_fallback_source(&document.description),
-                window,
-                cx,
             )
             .selectable(true)
             .into_any_element(),

@@ -9,7 +9,7 @@ use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_worker
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
     IndexPath, WindowExt,
-    input::{InputEvent, InputState},
+    input::{InputEvent, InputState, TextareaState},
     resizable::ResizableState,
     select::{SearchableVec, SelectEvent, SelectState},
     table::{TableEvent, TableState},
@@ -17,6 +17,7 @@ use gpui_component::{
 use rand::RngExt;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use ui::controls::FullWidthSelectItems;
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
@@ -142,7 +143,7 @@ use ui_helpers::{
     ConfirmationDialogProps, app_panel, app_refresh_button, app_status_tag, app_step_row,
     app_stepper_container, centered_message, confirmation_dialog, copyable_mono_field, count_label,
     dialog_content_max_height, dialog_max_height, labeled_field, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    secondary_dialog_content_width, token_label_row,
 };
 use utxo::{
     BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table, should_refresh_utxo_ages,
@@ -461,7 +462,7 @@ pub(crate) struct WalletRoot {
     confirm_password_input: Entity<InputState>,
     wallet_name_input: Entity<InputState>,
     add_wallet_password_input: Entity<InputState>,
-    import_mnemonic_input: Entity<InputState>,
+    import_mnemonic_input: Entity<TextareaState>,
     public_accounts: Vec<PublicAccountMetadata>,
     address_book: AddressBookState,
     governance: GovernanceState,
@@ -1136,13 +1137,21 @@ impl WalletRoot {
         #[cfg(feature = "hardware")]
         let trezor_passphrase_mode_focus = cx.focus_handle();
         let import_mnemonic_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 6)
                 .placeholder("paste recovery phrase")
         });
         let public_account_search_input = new_text_input(window, cx, "search accounts");
-        let governance_participant_search_input =
-            new_text_input(window, cx, "search participating accounts");
+        let governance_participant_picker = cx.new(|cx| {
+            gpui_component::combobox::ComboboxState::new(
+                SearchableVec::<governance::ParticipantChoice>::new(Vec::new()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .multiple(true)
+            .searchable(true)
+        });
         let governance_proposal_action_amount_input = new_text_input(window, cx, "amount");
         let governance_staking_delegate_input = new_text_input(window, cx, "delegate address");
         let address_book_search_input = new_text_input(window, cx, "search saved recipients");
@@ -1158,7 +1167,6 @@ impl WalletRoot {
             edit_address_input: new_text_input(window, cx, "recipient address"),
             search_query: Arc::from(""),
             editing_entry: None,
-            pending_delete: None,
             error: None,
         };
         let public_form = PublicAccountFormState {
@@ -1174,7 +1182,7 @@ impl WalletRoot {
             advanced_send_to_input: new_text_input(window, cx, "0x…"),
             advanced_send_value_input: new_text_input(window, cx, "0"),
             advanced_send_data_input: cx.new(|cx| {
-                InputState::new(window, cx)
+                TextareaState::new(window, cx)
                     .auto_grow(4, 12)
                     .placeholder("0x…")
             }),
@@ -1230,7 +1238,6 @@ impl WalletRoot {
             shielding: false,
             active_accounts_open: true,
             inactive_accounts_open: false,
-            pending_global_delete_uuid: None,
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
@@ -1420,7 +1427,7 @@ impl WalletRoot {
             public_accounts: Vec::new(),
             address_book,
             governance: GovernanceState::new(
-                governance_participant_search_input,
+                governance_participant_picker,
                 governance_proposal_action_amount_input,
                 governance_staking_delegate_input,
             ),
@@ -1501,12 +1508,11 @@ impl WalletRoot {
             },
         )
         .detach();
-        cx.subscribe(
-            &root.governance.participant_search_input,
-            |_this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
+        cx.subscribe_in(
+            &root.governance.participant_picker,
+            window,
+            |this, _picker, event, window, cx| {
+                this.participant_picker_event(event, window, cx);
             },
         )
         .detach();
@@ -1540,7 +1546,6 @@ impl WalletRoot {
         for input in [
             root.public_form.advanced_send_to_input.clone(),
             root.public_form.advanced_send_value_input.clone(),
-            root.public_form.advanced_send_data_input.clone(),
             root.public_form.send_gas_fee.max_fee_input.clone(),
             root.public_form.send_gas_fee.max_priority_fee_input.clone(),
         ] {
@@ -1552,6 +1557,16 @@ impl WalletRoot {
             })
             .detach();
         }
+        cx.subscribe(
+            &root.public_form.advanced_send_data_input,
+            |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.invalidate_advanced_public_send_estimate();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         cx.subscribe(
             &root.address_book.search_input,
             |this, input, event: &InputEvent, cx| {
@@ -1612,7 +1627,7 @@ impl WalletRoot {
                 this.select_chain(*chain_id, window, cx);
                 cx.defer_in(window, |_this, window, cx| {
                     if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur();
+                        window.blur(cx);
                     }
                 });
             },
@@ -1638,7 +1653,9 @@ impl WalletRoot {
             window,
             |this,
              _select,
-             event: &SelectEvent<SearchableVec<walletconnect::WalletConnectAccountSelectItem>>,
+             event: &SelectEvent<
+                FullWidthSelectItems<walletconnect::WalletConnectAccountSelectItem>,
+            >,
              window,
              cx| {
                 let SelectEvent::Confirm(Some(public_account_uuid)) = event else {
@@ -1647,7 +1664,7 @@ impl WalletRoot {
                 this.set_walletconnect_selected_account(public_account_uuid.clone(), cx);
                 cx.defer_in(window, |_this, window, cx| {
                     if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur();
+                        window.blur(cx);
                     }
                 });
             },
@@ -1663,7 +1680,7 @@ impl WalletRoot {
                 this.select_wallet(value.as_ref(), window, cx);
                 cx.defer_in(window, |_this, window, cx| {
                     if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur();
+                        window.blur(cx);
                     }
                 });
             },
@@ -1697,7 +1714,7 @@ impl WalletRoot {
                     this.confirm_password_input
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window);
+                        .focus(window, cx);
                 } else {
                     this.create_vault_from_inputs(window, cx);
                 }
@@ -1719,7 +1736,7 @@ impl WalletRoot {
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_default_hardware_wallet_setup(window, cx);
+                    this.submit_wallet_setup_from_input(window, cx);
                 }
             },
         )
@@ -1729,7 +1746,7 @@ impl WalletRoot {
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_default_hardware_wallet_setup(window, cx);
+                    this.submit_wallet_setup_from_input(window, cx);
                 }
             },
         )
@@ -1859,6 +1876,31 @@ impl WalletRoot {
             }
         })
         .detach();
+        cx.subscribe_in(
+            &root.public_form.add_label_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_public_derived_account_from_input(window, cx);
+                }
+            },
+        )
+        .detach();
+        for input in [
+            &root.public_form.import_label_input,
+            &root.public_form.import_private_key_input,
+        ] {
+            cx.subscribe_in(
+                input,
+                window,
+                |this, _input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.import_public_account_from_input(window, cx);
+                    }
+                },
+            )
+            .detach();
+        }
         cx.subscribe_in(
             &root.public_form.add_password_input,
             window,

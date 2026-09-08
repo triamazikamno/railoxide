@@ -909,7 +909,7 @@ impl WalletRoot {
                 .max_priority_fee_input
                 .clone(),
         };
-        input.read(cx).focus_handle(cx).focus(window);
+        input.read(cx).focus_handle(cx).focus(window, cx);
         self.walletconnect_fee_state_changed_by_editor(cx);
         cx.notify();
     }

@@ -1351,7 +1351,7 @@ fn wallet_status_bar(
         })
         .when(show_progress, |bar| {
             bar.child(
-                UiProgress::new()
+                UiProgress::new("chain-load-progress")
                     .w(px(190.0))
                     .h(px(6.0))
                     .value(f32::from(labels.percent)),

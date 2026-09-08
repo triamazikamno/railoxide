@@ -598,11 +598,13 @@ pub(in crate::root) fn settings_icon_button(
     icon: impl Into<Icon>,
     tooltip: impl Into<SharedString>,
 ) -> Button {
+    let tooltip: SharedString = tooltip.into();
     app_button_base(id)
         .icon(icon)
         .ghost()
         .xsmall()
         .compact()
+        .accessibility_label(tooltip.clone())
         .tooltip(tooltip)
 }
 
@@ -611,11 +613,13 @@ pub(in crate::root) fn settings_danger_icon_button(
     icon: impl Into<Icon>,
     tooltip: impl Into<SharedString>,
 ) -> Button {
+    let tooltip: SharedString = tooltip.into();
     app_button_base(id)
         .icon(icon)
         .ghost()
         .xsmall()
         .compact()
+        .accessibility_label(tooltip.clone())
         .tooltip(tooltip)
         .text_color(rgb(theme::DANGER))
 }

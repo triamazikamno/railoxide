@@ -1,8 +1,8 @@
-# Install RailOxide From Source
+# Install RailOxide from source
 
-RailOxide is alpha software. The source installer builds from GitHub instead of installing prebuilt signed binaries.
+The installer builds RailOxide on your computer using source code from GitHub.
 
-## Quick Install
+## Quick install
 
 macOS/Linux:
 
@@ -16,7 +16,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
 ```
 
-## Inspect First
+## Inspect first
 
 macOS/Linux:
 
@@ -34,13 +34,13 @@ notepad .\install-wallet.ps1
 powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 ```
 
-## What It Does
+## What it does
 
 - Prompts for the source to build: latest release, latest `main`, or a specific tag/branch/commit.
 - Uses the latest published GitHub release by default, including pre-releases.
 - Clones or updates `https://github.com/triamazikamno/railoxide.git`.
 - Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
-- Installs Rust `1.94.0` through `rustup` if needed.
+- Installs Rust `1.94.1` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Prints the exact source commit before building.
 - Refuses to run as root on macOS/Linux.
@@ -50,13 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 
 The installer checks for Apple Command Line Tools, Rust, and Git.
 
-If full Xcode and the Metal tools are available, the installer builds with build-time Metal shader compilation. If full Xcode is installed but the Metal tools are missing, it asks before running:
-
-```bash
-xcodebuild -downloadComponent MetalToolchain
-```
-
-If Metal is unavailable or the download is skipped, it falls back to `gpui/runtime_shaders`, which works with Command Line Tools-only installs.
+The wallet uses Metal GPU acceleration. Apple Command Line Tools are sufficient; full Xcode is not required.
 
 The installed app is written to:
 
@@ -73,8 +67,6 @@ The installer also writes a command wrapper to:
 Useful macOS options:
 
 ```bash
-bash install-wallet --metal
-bash install-wallet --runtime-shaders
 bash install-wallet --main
 bash install-wallet --ref v0.1.0-alpha.1
 ```
@@ -123,8 +115,6 @@ macOS/Linux options:
 --ref REF              Build a specific tag, branch, or commit without prompting
 --no-deps              Do not install missing system dependencies
 --no-hardware          Build without hardware-wallet support
---metal                On macOS, require build-time Metal shader compilation
---runtime-shaders      On macOS, force runtime shaders instead of Metal
 -y, --yes              Do not prompt before dependency installs/downloads
 --dry-run              Print what would happen without changing anything
 --verbose              Print commands as they run

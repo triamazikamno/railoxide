@@ -29,7 +29,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(640.0));
         let dialog_max_height = (window.viewport_size().height * 0.88).min(px(820.0));
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.close_all_dialogs(cx);
         window.open_dialog(cx, move |dialog, _window, cx| {
@@ -37,6 +36,7 @@ impl WalletRoot {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(walletconnect_title_row("WalletConnect"))
                 .on_close(move |_event, _window, cx| {
@@ -45,22 +45,21 @@ impl WalletRoot {
                         cx.notify();
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_walletconnect_connection_dialog_content(
                             &content_root,
                             content_width,
                         ),
-                ))
+                )
         });
         cx.defer_in(window, |root, window, cx| {
             root.walletconnect
                 .uri_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window);
+                .focus(window, cx);
         });
         cx.notify();
     }

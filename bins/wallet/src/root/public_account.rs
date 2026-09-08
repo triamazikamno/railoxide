@@ -74,9 +74,9 @@ use super::public_balances::{
     public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
 };
 use super::{
-    PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, WalletRoot,
-    dialog_content_max_height, dialog_max_height, public_account_visible_balances_for_chain,
-    scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+    ConfirmationDialogProps, PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH,
+    WalletRoot, confirmation_dialog, dialog_max_height, public_account_visible_balances_for_chain,
+    secondary_dialog_content_width, vault_error_kind,
 };
 
 const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
@@ -96,13 +96,13 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(kind.title()))
                 .on_close(move |_event, window, cx| {
@@ -111,13 +111,10 @@ impl WalletRoot {
                         root.clear_public_account_dialog_inputs(kind, window, cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_public_account_dialog_content(
-                        content_root.clone(),
-                        kind,
-                        content_width,
-                    ),
+                .child(content_root.read(cx).render_public_account_dialog_content(
+                    content_root.clone(),
+                    kind,
+                    content_width,
                 ))
         });
         cx.defer_in(window, move |root, window, cx| {
@@ -138,13 +135,13 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(PublicAccountDialogKind::EditLabel.title()))
                 .on_close(move |_event, window, cx| {
@@ -157,13 +154,10 @@ impl WalletRoot {
                         );
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_public_account_dialog_content(
-                        content_root.clone(),
-                        PublicAccountDialogKind::EditLabel,
-                        content_width,
-                    ),
+                .child(content_root.read(cx).render_public_account_dialog_content(
+                    content_root.clone(),
+                    PublicAccountDialogKind::EditLabel,
+                    content_width,
                 ))
         });
         cx.defer_in(window, |root, window, cx| {
@@ -183,7 +177,6 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let address_text = SharedString::from(public_address_qr_payload(address));
         let account_label = label.map(SharedString::from);
@@ -200,15 +193,12 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Public account address"))
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_public_address_qr_dialog_content(
-                        account_label.clone(),
-                        address_text.clone(),
-                        Some(receive_warning.clone()),
-                        copy_id.clone(),
-                        content_width,
-                    ),
+                .child(render_public_address_qr_dialog_content(
+                    account_label.clone(),
+                    address_text.clone(),
+                    Some(receive_warning.clone()),
+                    copy_id.clone(),
+                    content_width,
                 ))
         });
     }
@@ -217,7 +207,7 @@ impl WalletRoot {
         &self,
         kind: PublicAccountDialogKind,
         window: &mut Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         match kind {
             PublicAccountDialogKind::Derive => self
@@ -225,19 +215,19 @@ impl WalletRoot {
                 .add_password_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             PublicAccountDialogKind::Import => self
                 .public_form
                 .import_private_key_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             PublicAccountDialogKind::EditLabel => self
                 .public_form
                 .edit_label_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
         }
     }
 
@@ -337,7 +327,6 @@ impl WalletRoot {
         self.public_form.shielding = false;
         self.public_form.active_accounts_open = true;
         self.public_form.inactive_accounts_open = false;
-        self.public_form.pending_global_delete_uuid = None;
     }
 
     pub(super) fn reset_public_wallet_state(
@@ -357,12 +346,14 @@ impl WalletRoot {
             &self.public_form.send_amount_input,
             &self.public_form.advanced_send_to_input,
             &self.public_form.advanced_send_value_input,
-            &self.public_form.advanced_send_data_input,
             &self.public_form.shield_amount_input,
             &self.walletconnect.uri_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
+        self.public_form
+            .advanced_send_data_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.public_form.import_global = false;
         self.public_form.action_mode = PublicActionMode::Shield;
         self.public_form.public_send_kind = PublicSendKind::Transfer;
@@ -526,7 +517,6 @@ impl WalletRoot {
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
         self.invalidate_advanced_public_send_estimate();
-        self.public_form.pending_global_delete_uuid = None;
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         self.sync_public_edit_label_input(window, cx);
@@ -560,7 +550,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.adding_account {
+        if self.public_form.adding_account
+            || self.public_form.hardware_derivation_status
+                == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation
+        {
             return;
         }
         let Some(store) = self.vault_store.clone() else {
@@ -961,15 +954,52 @@ impl WalletRoot {
         else {
             return;
         };
-        if account.is_global()
-            && self.public_form.pending_global_delete_uuid.as_deref()
-                != Some(account.public_account_uuid.as_str())
-        {
-            self.public_form.pending_global_delete_uuid =
-                Some(Arc::from(account.public_account_uuid.as_str()));
-            cx.notify();
-            return;
+        if account.is_global() {
+            let root = cx.entity();
+            let account_uuid = account.public_account_uuid.clone();
+            let label = public_account_display_label(&account)
+                .unwrap_or_else(|| short_address(&account.address));
+            let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+            let dialog_max_height = dialog_max_height(window);
+            window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+                let confirm_root = root.clone();
+                let account_uuid = account_uuid.clone();
+                confirmation_dialog(
+                    dialog,
+                    ConfirmationDialogProps::danger(
+                        "Delete global account?",
+                        "Deleting this global account removes it from every Private wallet.",
+                        None,
+                        "Delete account",
+                    ),
+                    dialog_width,
+                    dialog_max_height,
+                )
+                .child(app_strong_text(label.clone()).whitespace_normal())
+                .on_ok(move |_event, window, cx| {
+                    confirm_root.update(cx, |root, cx| {
+                        root.delete_public_account_confirmed(&account_uuid, window, cx);
+                    });
+                    true
+                })
+            });
+        } else {
+            self.delete_public_account_confirmed(public_account_uuid, window, cx);
         }
+    }
+
+    fn delete_public_account_confirmed(
+        &mut self,
+        public_account_uuid: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(account) = self
+            .public_account_for_uuid(Some(public_account_uuid))
+            .cloned()
+        else {
+            return;
+        };
         let Some(store) = self.vault_store.clone() else {
             return;
         };
@@ -1001,7 +1031,6 @@ impl WalletRoot {
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
                     self.public_form.selected_account_uuid = None;
                 }
-                self.public_form.pending_global_delete_uuid = None;
                 self.reload_public_accounts(window, cx);
                 self.schedule_public_balance_refresh(cx);
             }
@@ -1149,10 +1178,21 @@ impl WalletRoot {
                                             .whitespace_normal(),
                                         )
                                         .child(
-                                            app_masked_input(
+                                            super::ui_helpers::input_enter_scope(
+                                                !self.public_form.adding_account
+                                                    && hardware_status != HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
+                                                {
+                                                    let root = root.clone();
+                                                    move |window, cx| {
+                                                        root.update(cx, |root, cx| {
+                                                            root.add_public_derived_account_from_input(window, cx);
+                                                        });
+                                                    }
+                                                },
+                                            ).child(app_masked_input(
                                                 &self.trezor_app_passphrase_input,
                                                 self.public_form.adding_account,
-                                            ),
+                                            )),
                                         ),
                                 )
                             }
@@ -1347,6 +1387,7 @@ impl WalletRoot {
                         app_button_base("wallet-public-account-search-clear")
                             .ghost()
                             .xsmall()
+                            .accessibility_label("Clear search")
                             .tooltip("Clear search")
                             .icon(IconName::Close)
                             .on_click(move |_event, window, cx| {
@@ -1717,9 +1758,6 @@ impl WalletRoot {
             }
             PublicAccountSource::Imported => {
                 let delete_uuid = Arc::clone(&account_uuid);
-                let confirming_global_delete = account.is_global()
-                    && self.public_form.pending_global_delete_uuid.as_deref()
-                        == Some(account.public_account_uuid.as_str());
                 action_buttons.child(
                     public_account_icon_button(
                         SharedString::from(format!(
@@ -1727,11 +1765,7 @@ impl WalletRoot {
                             account.public_account_uuid
                         )),
                         Icon::new(RailgunActionIcon::Trash2),
-                        if confirming_global_delete {
-                            "Confirm global delete"
-                        } else {
-                            "Delete account"
-                        },
+                        "Delete account",
                     )
                     .danger()
                     .on_click(move |_event, window, cx| {
@@ -1869,7 +1903,7 @@ impl WalletRoot {
             }
             account_content = account_content.child(balance_chips);
         }
-        let mut account_card = div()
+        div()
             .group(row_group)
             .w_full()
             .flex()
@@ -1888,23 +1922,7 @@ impl WalletRoot {
                     .gap_4()
                     .child(render_public_account_identicon(&account.address))
                     .child(account_content),
-            );
-        if account.is_global()
-            && self.public_form.pending_global_delete_uuid.as_deref()
-                == Some(account.public_account_uuid.as_str())
-        {
-            account_card = account_card.child(
-                Alert::warning(
-                    SharedString::from(format!(
-                        "wallet-public-global-delete-warning-{}",
-                        account.public_account_uuid
-                    )),
-                    "Deleting this global account removes it from every Private wallet.",
-                )
-                .small(),
-            );
-        }
-        account_card
+            )
     }
 
     fn render_public_account_balance_chip(

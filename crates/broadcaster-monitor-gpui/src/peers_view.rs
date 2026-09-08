@@ -8,7 +8,7 @@ use gpui_component::{
     Sizable,
     button::{Button, ButtonVariants},
     popover::Popover,
-    table::{Column, Table, TableDelegate, TableState},
+    table::{Column, DataTable, TableDelegate, TableState},
     tooltip::Tooltip,
 };
 
@@ -82,8 +82,8 @@ impl TableDelegate for PeersDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
     }
 
     fn render_td(
@@ -262,7 +262,7 @@ pub(crate) fn render_pane(
                         .child(SharedString::from(summary.network_label.to_string())),
                 ),
         )
-        .child(div().flex_1().min_h_0().child(Table::new(state)))
+        .child(div().flex_1().min_h_0().child(DataTable::new(state)))
 }
 
 fn capabilities(row: &PeerRow) -> String {

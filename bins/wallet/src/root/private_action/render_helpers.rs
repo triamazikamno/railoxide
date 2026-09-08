@@ -222,6 +222,7 @@ pub(in crate::root) fn render_fee_mode_toggle(
                         "Deduct",
                         deduct_tooltip,
                         mode == FeeHandlingMode::DeductFromAmount,
+                        generating,
                     ))
                     .child(fee_mode_segment_button(
                         delivery_element_id(key, kind, "fee-mode-add"),
@@ -229,6 +230,7 @@ pub(in crate::root) fn render_fee_mode_toggle(
                         "Add on top",
                         add_tooltip,
                         mode == FeeHandlingMode::AddToAmount,
+                        generating,
                     ))
                     .on_click(move |selected, window, cx| {
                         let Some(index) = selected.first() else {
@@ -258,16 +260,14 @@ pub(in crate::root) fn fee_mode_segment_button(
     label: &'static str,
     tooltip: &'static str,
     selected: bool,
+    disabled: bool,
 ) -> Button {
-    Button::new(id).selected(selected).child(
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .text_size(APP_TEXT_SIZE)
-            .child(label)
-            .child(render_private_action_info_icon(info_id, label, tooltip)),
+    app_segment_button(
+        id,
+        label,
+        selected,
+        disabled,
+        Some(render_private_action_info_icon(info_id, label, tooltip).into_any_element()),
     )
 }
 
@@ -413,6 +413,7 @@ pub(in crate::root) fn render_self_broadcast_gas_payer_warning_icon(
         .compact()
         .icon(IconName::TriangleAlert)
         .text_color(rgb(theme::DANGER))
+        .accessibility_label(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
         .tooltip(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
         .into_any_element()
 }

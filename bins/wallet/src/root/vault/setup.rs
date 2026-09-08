@@ -167,6 +167,18 @@ fn load_software_profile_unlock_target(
 }
 
 impl WalletRoot {
+    pub(in crate::root) fn submit_wallet_setup_from_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match self.wallet_setup_mode {
+            WalletSetupMode::Import => self.store_imported_wallet(window, cx),
+            WalletSetupMode::Hardware(_) => self.submit_default_hardware_wallet_setup(window, cx),
+            WalletSetupMode::Choose | WalletSetupMode::GeneratedReview => {}
+        }
+    }
+
     pub(in crate::root) fn create_vault_from_inputs(
         &mut self,
         window: &mut Window,
@@ -361,7 +373,7 @@ impl WalletRoot {
                 root.import_mnemonic_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
         });
     }
@@ -401,7 +413,7 @@ impl WalletRoot {
                 root.add_wallet_password_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
         });
     }
@@ -572,7 +584,9 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let mnemonic = Self::read_and_clear_input(&self.import_mnemonic_input, window, cx);
+        let mnemonic = Zeroizing::new(self.import_mnemonic_input.read(cx).value().to_string());
+        self.import_mnemonic_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         if mnemonic.trim().is_empty() {
             self.set_vault_error("Paste a recovery phrase to import", cx);
             return;

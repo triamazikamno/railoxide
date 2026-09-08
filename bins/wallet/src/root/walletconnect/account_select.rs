@@ -71,7 +71,7 @@ pub(super) fn walletconnect_account_select_index(
 }
 
 pub(super) fn sync_walletconnect_account_select_entity(
-    select: &Entity<SelectState<SearchableVec<WalletConnectAccountSelectItem>>>,
+    select: &Entity<SelectState<FullWidthSelectItems<WalletConnectAccountSelectItem>>>,
     accounts: &[PublicAccountMetadata],
     snapshot: Option<&PublicBalanceSnapshot>,
     chain_id: u64,
@@ -83,7 +83,7 @@ pub(super) fn sync_walletconnect_account_select_entity(
     let items = walletconnect_account_select_items(accounts, snapshot, chain_id, anchor_cache);
     let selected_index = walletconnect_account_select_index(&items, selected_uuid);
     select.update(cx, |select, cx| {
-        select.set_items(SearchableVec::new(items), window, cx);
+        select.set_items(FullWidthSelectItems::new(items), window, cx);
         select.set_selected_index(selected_index, window, cx);
     });
 }
@@ -110,36 +110,52 @@ pub(super) fn walletconnect_account_select_row(
     item: &WalletConnectAccountSelectItem,
     include_details: bool,
 ) -> gpui::Div {
-    let details = walletconnect_account_select_details(item);
-    div().w_full().min_w(px(0.0)).flex().items_start().child(
-        div()
-            .min_w(px(0.0))
-            .flex_1()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .truncate()
-                    .text_color(rgb(theme::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(SharedString::from(if include_details {
-                        item.label.to_string()
-                    } else {
-                        walletconnect_account_select_summary(item)
-                    })),
-            )
-            .when(include_details, |this| {
-                this.child(
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap_3()
+        .when(include_details, gpui::Styled::py_1)
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
                     div()
                         .truncate()
-                        .font_family(APP_MONO_FONT_FAMILY)
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(details)),
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(SharedString::from(if include_details {
+                            item.label.to_string()
+                        } else {
+                            walletconnect_account_select_summary(item)
+                        })),
                 )
-            }),
-    )
+                .when(include_details, |this| {
+                    this.child(
+                        div()
+                            .truncate()
+                            .font_family(APP_MONO_FONT_FAMILY)
+                            .text_size(px(11.0))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(short_address(&item.address)),
+                    )
+                }),
+        )
+        .when(include_details, |row| {
+            row.when_some(item.usd_total_label.as_ref(), |row, balance| {
+                row.child(
+                    app_muted_text(SharedString::from(balance.to_string()))
+                        .debug_selector(|| format!("walletconnect-balance-{}", item.label))
+                        .flex_none()
+                        .text_right(),
+                )
+            })
+        })
 }
 
 pub(super) fn walletconnect_account_select_summary(
@@ -148,16 +164,6 @@ pub(super) fn walletconnect_account_select_summary(
     walletconnect_join_account_parts(
         &item.label,
         short_address(&item.address),
-        item.usd_total_label.as_deref(),
-    )
-}
-
-pub(super) fn walletconnect_account_select_details(
-    item: &WalletConnectAccountSelectItem,
-) -> String {
-    walletconnect_join_account_parts(
-        short_address(&item.address),
-        "",
         item.usd_total_label.as_deref(),
     )
 }
@@ -194,4 +200,35 @@ pub(in crate::root) fn walletconnect_account_matches_search(
             .public_account_uuid
             .to_ascii_lowercase()
             .contains(&query)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn walletconnect_balances_align_at_menu_edge_and_rows_remain_selectable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let items = [("A", "$1.00"), ("Longer account", "$123.45")]
+            .into_iter()
+            .map(|(label, balance)| WalletConnectAccountSelectItem {
+                public_account_uuid: Arc::from(label),
+                label: Arc::from(label),
+                address: alloy::primitives::Address::ZERO,
+                usd_total_label: Some(Arc::from(balance)),
+            })
+            .collect();
+        crate::root::ui_helpers::select_layout_test::assert_balances_align_and_rows_select(
+            cx,
+            items,
+            [500.0, 320.0],
+            true,
+            [
+                "walletconnect-balance-A",
+                "walletconnect-balance-Longer account",
+            ],
+            "Longer account",
+        );
+    }
 }

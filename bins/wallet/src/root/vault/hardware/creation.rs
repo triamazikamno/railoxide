@@ -82,7 +82,7 @@ impl WalletRoot {
         };
         let pending_create_new_chain_ids = self.enabled_chain_ids_for_created_wallet();
 
-        window.blur();
+        window.blur(cx);
         self.focus_vault_input_on_render = false;
         self.hardware_wallet_creation_in_progress = true;
         self.hardware_wallet_creation_generation =
@@ -200,12 +200,12 @@ impl WalletRoot {
                         .wallet_name_input
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window),
+                        .focus(window, cx),
                     HardwareSetupErrorFocus::VaultPassword => root
                         .add_wallet_password_input
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window),
+                        .focus(window, cx),
                 }
             }
         });

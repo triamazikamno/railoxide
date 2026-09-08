@@ -4,11 +4,7 @@ use std::time::Duration;
 
 #[cfg(feature = "hardware")]
 use alloy::primitives::Address;
-#[cfg(feature = "hardware")]
-use gpui::div;
 use gpui::{Context, Entity, Focusable, ParentElement, Styled, Window, px};
-#[cfg(feature = "hardware")]
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::{WindowExt, input::InputState, select::SearchableVec};
 #[cfg(feature = "hardware")]
 use tokio::{sync::mpsc, time::sleep};
@@ -45,8 +41,8 @@ use zeroize::Zeroizing;
 
 use super::wallet_header::WalletSelectItem;
 use super::{
-    BroadcasterActivityTab, ChainUtxoState, WalletRoot, WalletTab, dialog_content_max_height,
-    dialog_max_height, scrollable_dialog_content, secondary_dialog_content_width,
+    BroadcasterActivityTab, ChainUtxoState, WalletRoot, WalletTab, dialog_max_height,
+    secondary_dialog_content_width,
 };
 
 mod change_password;

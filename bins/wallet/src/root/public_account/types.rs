@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use gpui::Entity;
-use gpui_component::input::InputState;
+use gpui_component::input::{InputState, TextareaState};
 use wallet_ops::{
     PublicActionAttemptInfo, PublicActionCommandSender, PublicActionGasFeeSelection,
     PublicActionProgressStep, PublicAdvancedTransactionEstimate, PublicAssetId,
@@ -30,7 +30,7 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) send_amount_input: Entity<InputState>,
     pub(in crate::root) advanced_send_to_input: Entity<InputState>,
     pub(in crate::root) advanced_send_value_input: Entity<InputState>,
-    pub(in crate::root) advanced_send_data_input: Entity<InputState>,
+    pub(in crate::root) advanced_send_data_input: Entity<TextareaState>,
     pub(in crate::root) shield_amount_input: Entity<InputState>,
     pub(in crate::root) send_gas_fee: Eip1559GasFeeEditorState,
     pub(in crate::root) shield_gas_fee: Eip1559GasFeeEditorState,
@@ -83,5 +83,4 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) shielding: bool,
     pub(in crate::root) active_accounts_open: bool,
     pub(in crate::root) inactive_accounts_open: bool,
-    pub(in crate::root) pending_global_delete_uuid: Option<Arc<str>>,
 }

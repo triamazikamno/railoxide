@@ -1254,7 +1254,7 @@ impl WalletRoot {
         selected_uuid: Option<&str>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) -> Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>> {
+    ) -> Entity<SelectState<FullWidthSelectItems<SelfBroadcastGasPayerSelectItem>>> {
         let accounts = self.active_self_broadcast_gas_payer_accounts();
         let items = self_broadcast_gas_payer_select_items(
             &accounts,
@@ -1263,7 +1263,8 @@ impl WalletRoot {
         );
         let selected_index = self_broadcast_gas_payer_select_index(&items, selected_uuid);
         cx.new(|cx| {
-            SelectState::new(SearchableVec::new(items), selected_index, window, cx).searchable(true)
+            SelectState::new(FullWidthSelectItems::new(items), selected_index, window, cx)
+                .searchable(true)
         })
     }
 
@@ -1746,7 +1747,7 @@ pub(in crate::root) fn self_broadcast_gas_payer_select_index(
 }
 
 pub(in crate::root) fn sync_self_broadcast_gas_payer_select_entity(
-    select: &Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
+    select: &Entity<SelectState<FullWidthSelectItems<SelfBroadcastGasPayerSelectItem>>>,
     accounts: &[PublicAccountMetadata],
     chain_id: u64,
     snapshot: Option<&PublicBalanceSnapshot>,
@@ -1756,7 +1757,7 @@ pub(in crate::root) fn sync_self_broadcast_gas_payer_select_entity(
 ) {
     let items = self_broadcast_gas_payer_select_items(accounts, chain_id, snapshot);
     select.update(cx, |select, cx| {
-        select.set_items(SearchableVec::new(items), window, cx);
+        select.set_items(FullWidthSelectItems::new(items), window, cx);
         if let Some(uuid) = selected_uuid {
             select.set_selected_value(uuid, window, cx);
         } else {

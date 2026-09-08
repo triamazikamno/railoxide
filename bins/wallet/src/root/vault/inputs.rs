@@ -95,7 +95,7 @@ impl WalletRoot {
     pub(in crate::root) fn focus_vault_input_if_requested(
         &mut self,
         window: &mut Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if !self.focus_vault_input_on_render
             || !should_focus_vault_input(&self.vault_state, self.wallet_setup_mode)
@@ -109,17 +109,17 @@ impl WalletRoot {
                 .new_password_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             VaultState::UnlockVault => self
                 .unlock_password_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             VaultState::SetupWallet if self.wallet_setup_mode == WalletSetupMode::Import => self
                 .import_mnemonic_input
                 .read(cx)
                 .focus_handle(cx)
-                .focus(window),
+                .focus(window, cx),
             VaultState::SetupWallet
             | VaultState::SwitchingWallet
             | VaultState::PendingSoftwareProfileOpen

@@ -26,15 +26,13 @@ use super::vault::{
 };
 use super::{
     APP_TEXT_SIZE, ConfirmationDialogProps, WalletRoot,
-    chain_load::WalletSyncLifecycleCleanupWaitGroup, confirmation_dialog,
-    dialog_content_max_height, dialog_max_height, participant::remove_private_wallet_participants,
-    scrollable_dialog_content, secondary_dialog_content_width,
+    chain_load::WalletSyncLifecycleCleanupWaitGroup, confirmation_dialog, dialog_max_height,
+    participant::remove_private_wallet_participants, secondary_dialog_content_width,
 };
 
 #[derive(Default)]
 pub(super) struct ManageWalletsState {
     pub(super) editing_wallet_id: Option<Arc<str>>,
-    pub(super) pending_delete_wallet_id: Option<Arc<str>>,
     pub(super) deleting_wallet_id: Option<Arc<str>>,
     pub(super) hardware_delete_wallet_id: Option<Arc<str>>,
     hardware_delete_unlock_lifecycle: HardwareDeleteUnlockLifecycle,
@@ -190,6 +188,27 @@ pub(super) fn wallet_ids_after_drop(
     (reordered != original).then_some(reordered)
 }
 
+pub(super) fn complete_active_wallet_order(
+    metadata: &[WalletMetadataBundle],
+    ordered_wallet_ids: &[String],
+) -> Result<Vec<String>, VaultError> {
+    let mut active_ids = active_wallet_management_rows(metadata)
+        .into_iter()
+        .map(|metadata| metadata.wallet_uuid)
+        .collect::<Vec<_>>();
+    let mut requested_ids = ordered_wallet_ids.iter();
+    // Concealed passphrase wallets omitted from the UI keep their existing slots.
+    for wallet_id in &mut active_ids {
+        if ordered_wallet_ids.contains(wallet_id) {
+            wallet_id.clone_from(requested_ids.next().ok_or(VaultError::InvalidWalletOrder)?);
+        }
+    }
+    if requested_ids.next().is_some() {
+        return Err(VaultError::InvalidWalletOrder);
+    }
+    Ok(active_ids)
+}
+
 pub(super) fn selected_wallet_after_metadata_refresh(
     selected_wallet_id: Option<&str>,
     options: &[WalletOption],
@@ -224,10 +243,6 @@ pub(super) fn wallet_management_delete_requires_device(
     open_session_wallet_id: Option<&str>,
 ) -> bool {
     source.is_hardware_derived() && open_session_wallet_id != Some(wallet_id)
-}
-
-pub(super) const fn wallet_management_delete_uses_dialog(source: WalletSource) -> bool {
-    !source.is_hardware_derived()
 }
 
 pub(super) fn wallet_management_delete_kind(
@@ -316,20 +331,19 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(680.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Manage wallets"))
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_manage_wallets_dialog_content(&content_root, content_width),
-                ))
+                )
         });
     }
 
@@ -349,6 +363,7 @@ impl WalletRoot {
         });
         if self.manage_wallets.error.is_none() {
             self.manage_wallets.editing_wallet_id = None;
+            window.close_dialog(cx);
         }
     }
 
@@ -360,15 +375,37 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.manage_wallets.editing_wallet_id = Some(wallet_id);
-        self.manage_wallets.pending_delete_wallet_id = None;
         self.manage_wallets.error = None;
         self.manage_wallet_label_input.update(cx, |input, cx| {
             input.set_value(label.to_owned(), window, cx);
         });
-        self.manage_wallet_label_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .on_ok(|_, _, _| false)
+                .max_h(dialog_max_height)
+                .title(app_strong_text("Edit wallet name"))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.cancel_wallet_label_edit(cx);
+                    });
+                })
+                .child(
+                    root.read(cx)
+                        .render_wallet_label_editor(root.clone(), content_width),
+                )
+        });
+        cx.defer_in(window, |root, window, cx| {
+            root.manage_wallet_label_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        });
         cx.notify();
     }
 
@@ -395,7 +432,7 @@ impl WalletRoot {
     fn delete_wallet_from_dialog(
         &mut self,
         wallet_id: Arc<str>,
-        software_delete_confirmed: bool,
+        delete_confirmed: bool,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -433,35 +470,50 @@ impl WalletRoot {
             );
             return;
         }
-        if wallet_management_delete_uses_dialog(target.source) && !software_delete_confirmed {
-            self.manage_wallets.pending_delete_wallet_id = None;
+        if !delete_confirmed {
             self.manage_wallets.error = None;
             cx.notify();
             let root = cx.entity();
             let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
             let dialog_max_height = dialog_max_height(window);
-            let content_max_height = dialog_content_max_height(window);
-            window.open_dialog(cx, move |dialog, _window, _cx| {
+            let hardware_delete = target.source.is_hardware_derived();
+            window.open_alert_dialog(cx, move |dialog, _window, _cx| {
                 let confirm_root = root.clone();
+                let cancel_root = root.clone();
                 let confirm_wallet_id = Arc::clone(&wallet_id);
                 confirmation_dialog(
                     dialog,
                     ConfirmationDialogProps::danger(
                         "Delete wallet?",
-                        software_wallet_delete_confirmation_copy(),
+                        if hardware_delete {
+                            "This permanently deletes the local wallet and its saved data. Your hardware device is not changed."
+                        } else {
+                            software_wallet_delete_confirmation_copy()
+                        },
                         None,
                         "Delete wallet",
                     ),
                     dialog_width,
                     dialog_max_height,
-                    content_max_height,
                 )
+                .child(app_strong_text(target.label.clone()).whitespace_normal())
+                .on_cancel(move |_event, _window, cx| {
+                    if hardware_delete {
+                        cancel_root.update(cx, |root, cx| {
+                            root.manage_wallets.clear_hardware_delete_unlock_intent();
+                            root.manage_wallets.error = None;
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
                 .on_ok(move |_event, window, cx| {
+                    window.close_dialog(cx);
                     let confirm_wallet_id = Arc::clone(&confirm_wallet_id);
                     confirm_root.update(cx, |root, cx| {
                         root.delete_wallet_from_dialog(confirm_wallet_id, true, window, cx);
                     });
-                    true
+                    false
                 })
             });
             return;
@@ -488,16 +540,6 @@ impl WalletRoot {
                 Some(metadata),
             )
         };
-        if !wallet_management_delete_uses_dialog(target.source)
-            && delete_kind == WalletManagementDeleteKind::Wallet
-            && self.manage_wallets.pending_delete_wallet_id.as_deref() != Some(wallet_id.as_ref())
-        {
-            self.manage_wallets.pending_delete_wallet_id = Some(wallet_id);
-            self.manage_wallets.error = None;
-            cx.notify();
-            return;
-        }
-
         let target_session = self
             .view_session
             .clone()
@@ -605,7 +647,6 @@ impl WalletRoot {
                             root.save_ui_state();
                             root.invalidate_governance_context();
                         }
-                        root.manage_wallets.pending_delete_wallet_id = None;
                         root.manage_wallets.clear_hardware_delete_unlock_intent();
                         root.manage_wallets.error = None;
                         if deleting_selected_wallet {
@@ -768,6 +809,8 @@ impl WalletRoot {
             return;
         };
         self.run_wallet_management_mutation(window, cx, move |store, view| {
+            let metadata = store.list_wallet_metadata_with_view_unlock(view, false)?;
+            let ordered_wallet_ids = complete_active_wallet_order(&metadata, &ordered_wallet_ids)?;
             store
                 .reorder_active_wallets_with_view_unlock(view, &ordered_wallet_ids)
                 .map(|_| ())
@@ -792,7 +835,6 @@ impl WalletRoot {
         };
         match mutate(store.as_ref(), view.as_ref()) {
             Ok(()) => {
-                self.manage_wallets.pending_delete_wallet_id = None;
                 self.manage_wallets.error = None;
                 self.refresh_wallet_management_metadata(window, cx);
             }
@@ -942,9 +984,11 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_4()
-            .children(self.manage_wallets.error.as_ref().map(|message| {
-                Alert::error("wallet-management-error", message.to_string()).small()
-            }))
+            .when(self.manage_wallets.editing_wallet_id.is_none(), |content| {
+                content.children(self.manage_wallets.error.as_ref().map(|message| {
+                    Alert::error("wallet-management-error", message.to_string()).small()
+                }))
+            })
             .child(self.render_active_wallets_section(root, &active))
             .child(self.render_hidden_wallets_section(root, &hidden))
     }
@@ -1021,11 +1065,6 @@ impl WalletRoot {
         let wallet_id: Arc<str> = Arc::from(wallet.wallet_uuid.clone());
         let label: Arc<str> = Arc::from(wallet.label.clone());
         let is_current = self.selected_wallet_id.as_deref() == Some(wallet.wallet_uuid.as_str());
-        let is_editing =
-            self.manage_wallets.editing_wallet_id.as_deref() == Some(wallet.wallet_uuid.as_str());
-        let confirming_delete = wallet.source.is_hardware_derived()
-            && self.manage_wallets.pending_delete_wallet_id.as_deref()
-                == Some(wallet.wallet_uuid.as_str());
         let drag = WalletManagementDrag {
             wallet_id: Arc::clone(&wallet_id),
             label: Arc::clone(&label),
@@ -1063,13 +1102,6 @@ impl WalletRoot {
                 .into_any_element()
         };
 
-        let label_content = if is_editing {
-            self.render_wallet_label_editor(root.clone())
-                .into_any_element()
-        } else {
-            wallet_label_content(wallet, is_current).into_any_element()
-        };
-
         div()
             .id(SharedString::from(format!(
                 "wallet-management-row-{}",
@@ -1086,50 +1118,60 @@ impl WalletRoot {
             .border_color(rgb(theme::BORDER))
             .bg(rgb(theme::SURFACE))
             .child(affordance)
-            .child(div().flex_1().min_w(px(0.0)).child(label_content))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(wallet_label_content(wallet, is_current)),
+            )
             .child(Self::render_wallet_row_actions(
                 root,
                 &wallet_id,
                 &label,
                 wallet.source,
                 active,
-                confirming_delete,
                 self.manage_wallets.deleting_wallet_id.is_some(),
             ))
     }
 
-    fn render_wallet_label_editor(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_wallet_label_editor(&self, root: Entity<Self>, content_width: Pixels) -> gpui::Div {
         let save_root = root.clone();
         let cancel_root = root;
         div()
+            .w(content_width)
             .flex()
-            .items_center()
-            .gap_2()
+            .flex_col()
+            .gap_3()
+            .child(app_input(&self.manage_wallet_label_input))
+            .children(self.manage_wallets.error.as_ref().map(|message| {
+                Alert::error("wallet-management-label-error", message.to_string()).small()
+            }))
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .child(app_input(&self.manage_wallet_label_input)),
-            )
-            .child(
-                app_button("wallet-management-save-label", "Save")
-                    .primary()
-                    .xsmall()
-                    .on_click(move |_event, window, cx| {
-                        save_root.update(cx, |root, cx| {
-                            root.save_wallet_label_edit(window, cx);
-                        });
-                    }),
-            )
-            .child(
-                app_button("wallet-management-cancel-label", "Cancel")
-                    .outline()
-                    .xsmall()
-                    .on_click(move |_event, _window, cx| {
-                        cancel_root.update(cx, |root, cx| {
-                            root.cancel_wallet_label_edit(cx);
-                        });
-                    }),
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        app_button("wallet-management-cancel-label", "Cancel")
+                            .outline()
+                            .small()
+                            .on_click(move |_event, window, cx| {
+                                cancel_root.update(cx, |root, cx| {
+                                    root.cancel_wallet_label_edit(cx);
+                                });
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .child(
+                        app_button("wallet-management-save-label", "Save")
+                            .primary()
+                            .small()
+                            .on_click(move |_event, window, cx| {
+                                save_root.update(cx, |root, cx| {
+                                    root.save_wallet_label_edit(window, cx);
+                                });
+                            }),
+                    ),
             )
     }
 
@@ -1139,22 +1181,19 @@ impl WalletRoot {
         label: &Arc<str>,
         source: WalletSource,
         active: bool,
-        confirming_delete: bool,
         deletion_in_progress: bool,
     ) -> gpui::Div {
         let edit_root = root.clone();
         #[cfg(feature = "hardware")]
         let unlock_root = root.clone();
         let visibility_root = root.clone();
-        let delete_root = root.clone();
-        let cancel_delete_root = root;
+        let delete_root = root;
         let edit_wallet_id = Arc::clone(wallet_id);
         #[cfg(feature = "hardware")]
         let unlock_wallet_id = Arc::clone(wallet_id);
         let edit_label = Arc::clone(label);
         let visibility_wallet_id = Arc::clone(wallet_id);
         let delete_wallet_id = Arc::clone(wallet_id);
-        let cancel_wallet_id = Arc::clone(wallet_id);
         let mut actions = div().flex().items_center().gap_2();
 
         if active {
@@ -1232,11 +1271,7 @@ impl WalletRoot {
             wallet_management_icon_button(
                 SharedString::from(format!("wallet-management-delete-{wallet_id}")),
                 Icon::new(RailgunActionIcon::Trash2),
-                if confirming_delete {
-                    "Confirm delete wallet"
-                } else {
-                    "Delete wallet"
-                },
+                "Delete wallet",
             )
             .danger()
             .disabled(deletion_in_progress)
@@ -1247,31 +1282,6 @@ impl WalletRoot {
                 });
             }),
         );
-
-        if confirming_delete {
-            actions = actions.child(
-                app_button(
-                    SharedString::from(format!("wallet-management-cancel-delete-{wallet_id}")),
-                    "Cancel",
-                )
-                .outline()
-                .xsmall()
-                .disabled(deletion_in_progress)
-                .on_click(move |_event, _window, cx| {
-                    let wallet_id = Arc::clone(&cancel_wallet_id);
-                    cancel_delete_root.update(cx, |root, cx| {
-                        if root.manage_wallets.pending_delete_wallet_id.as_deref()
-                            == Some(wallet_id.as_ref())
-                        {
-                            root.manage_wallets.pending_delete_wallet_id = None;
-                            root.manage_wallets.clear_hardware_delete_unlock_intent();
-                            root.manage_wallets.error = None;
-                            cx.notify();
-                        }
-                    });
-                }),
-            );
-        }
 
         actions
     }
@@ -1298,7 +1308,13 @@ fn wallet_management_icon_button(
     icon: impl Into<Icon>,
     tooltip: impl Into<SharedString>,
 ) -> Button {
-    Button::new(id).icon(icon).ghost().small().tooltip(tooltip)
+    let tooltip: SharedString = tooltip.into();
+    Button::new(id)
+        .icon(icon)
+        .ghost()
+        .small()
+        .accessibility_label(tooltip.clone())
+        .tooltip(tooltip)
 }
 
 fn wallet_label_content(wallet: &WalletMetadataBundle, current: bool) -> gpui::Div {

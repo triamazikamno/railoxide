@@ -1,3 +1,5 @@
+use crate::root::ui_helpers::dialog_footer;
+
 use super::*;
 
 const WALLET_DELETION_APPLY_STATUS: &str =
@@ -211,8 +213,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -224,7 +225,6 @@ impl WalletSettingsEditor {
                 ),
                 dialog_width,
                 dialog_max_height,
-                content_max_height,
             )
             .on_ok(move |_event, _window, cx| {
                 confirm_editor.update(cx, |editor, cx| {
@@ -255,8 +255,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -268,7 +267,6 @@ impl WalletSettingsEditor {
                 ),
                 dialog_width,
                 dialog_max_height,
-                content_max_height,
             )
             .on_ok(move |_event, _window, cx| {
                 confirm_editor.update(cx, |editor, cx| {
@@ -299,8 +297,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(560.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -312,7 +309,6 @@ impl WalletSettingsEditor {
                 ),
                 dialog_width,
                 dialog_max_height,
-                content_max_height,
             )
             .on_ok(move |_event, _window, cx| {
                 confirm_editor.update(cx, |editor, cx| {
@@ -732,9 +728,9 @@ impl WalletSettingsEditor {
 
             let input = state.read(cx).input.clone();
             settings_text_input(&input)
-                .with_size(options.size)
+                .with_size(options.size())
                 .map(|this| {
-                    if matches!(options.layout, Axis::Horizontal) {
+                    if matches!(options.layout(), Axis::Horizontal) {
                         this.w_64()
                     } else {
                         this.w_full()
@@ -768,7 +764,7 @@ impl WalletSettingsEditor {
                     .child(
                         Switch::new(SharedString::from(format!("{row_id}-switch")))
                             .checked(checked)
-                            .with_size(options.size)
+                            .with_size(options.size())
                             .on_click(move |enabled, _window, cx| {
                                 set_editor.update(cx, |editor, cx| {
                                     set_from_switch(&mut editor.draft, *enabled);
@@ -836,7 +832,9 @@ impl WalletSettingsEditor {
                                       _slider,
                                       event: &SliderEvent,
                                       cx| {
-                                    let SliderEvent::Change(value) = event;
+                                    let SliderEvent::Change(value) = event else {
+                                        return;
+                                    };
                                     editor.update(cx, |editor, cx| {
                                         set_broadcaster_anchor_bps_range(
                                             &mut editor.draft,
@@ -1018,9 +1016,10 @@ impl WalletSettingsEditor {
 
             let input = state.read(cx).input.clone();
             NumberInput::new(&input)
-                .with_size(render_options.size)
+                .bg(rgb(theme::SURFACE))
+                .with_size(render_options.size())
                 .map(|this| {
-                    if matches!(render_options.layout, Axis::Horizontal) {
+                    if matches!(render_options.layout(), Axis::Horizontal) {
                         this.w_32()
                     } else {
                         this.w_full()
@@ -1065,7 +1064,6 @@ impl WalletSettingsEditor {
         let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(560.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let dialog_input = input.clone();
@@ -1078,8 +1076,7 @@ impl WalletSettingsEditor {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(title.clone()))
-                .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(action_label.clone(), true))
                 .on_ok(move |_event, _window, cx| {
                     let value = save_input.read(cx).value().trim().to_string();
                     let save_kind = save_kind.clone();
@@ -1092,14 +1089,15 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_settings_url_dialog_content(&dialog_input, content_width, help),
+                .child(render_settings_url_dialog_content(
+                    &dialog_input,
+                    content_width,
+                    help,
                 ))
         });
         let focus_input = input;
         cx.defer_in(window, move |_editor, window, cx| {
-            focus_input.read(cx).focus_handle(cx).focus(window);
+            focus_input.read(cx).focus_handle(cx).focus(window, cx);
         });
     }
 
@@ -1245,7 +1243,6 @@ impl WalletSettingsEditor {
         let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let dialog_inputs = inputs.clone();
@@ -1257,8 +1254,7 @@ impl WalletSettingsEditor {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(title))
-                .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(action_label.clone(), true))
                 .on_ok(move |_event, _window, cx| {
                     let peer = waku_direct_peer_from_dialog_inputs(&save_inputs, cx);
                     save_editor.update(cx, |editor, cx| {
@@ -1270,14 +1266,14 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_waku_direct_peer_dialog_content(&dialog_inputs, content_width),
+                .child(render_waku_direct_peer_dialog_content(
+                    &dialog_inputs,
+                    content_width,
                 ))
         });
         let focus_input = inputs.peer_id;
         cx.defer_in(window, move |_editor, window, cx| {
-            focus_input.read(cx).focus_handle(cx).focus(window);
+            focus_input.read(cx).focus_handle(cx).focus(window, cx);
         });
     }
 
@@ -1448,7 +1444,6 @@ impl WalletSettingsEditor {
         let readonly_identity = matches!(target, TokenEditTarget::BuiltIn(_));
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let save_inputs = inputs.clone();
@@ -1462,8 +1457,7 @@ impl WalletSettingsEditor {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(title.clone()))
-                .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(action_label.clone(), true))
                 .on_ok(move |_event, _window, cx| {
                     let values = match token_dialog_values_from_inputs(&save_inputs, cx) {
                         Ok(values) => values,
@@ -1482,9 +1476,10 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_token_dialog_content(&render_inputs, content_width, readonly_identity),
+                .child(render_token_dialog_content(
+                    &render_inputs,
+                    content_width,
+                    readonly_identity,
                 ))
         });
         let focus_input = if readonly_identity {
@@ -1493,7 +1488,7 @@ impl WalletSettingsEditor {
             inputs.chain_id
         };
         cx.defer_in(window, move |_editor, window, cx| {
-            focus_input.read(cx).focus_handle(cx).focus(window);
+            focus_input.read(cx).focus_handle(cx).focus(window, cx);
         });
     }
 
@@ -1591,7 +1586,6 @@ impl WalletSettingsEditor {
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(px(620.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let save_inputs = inputs.clone();
@@ -1614,8 +1608,7 @@ impl WalletSettingsEditor {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(title))
-                .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(action_label.clone(), true))
                 .on_ok(move |_event, _window, cx| {
                     let anchor = match price_anchor_override_from_dialog_inputs(&save_inputs, cx) {
                         Ok(anchor) => anchor,
@@ -1634,14 +1627,15 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_price_anchor_dialog_content(&render_inputs, content_width, cx),
+                .child(render_price_anchor_dialog_content(
+                    &render_inputs,
+                    content_width,
+                    cx,
                 ))
         });
         let focus_input = inputs.chain_id;
         cx.defer_in(window, move |_editor, window, cx| {
-            focus_input.read(cx).focus_handle(cx).focus(window);
+            focus_input.read(cx).focus_handle(cx).focus(window, cx);
         });
     }
 

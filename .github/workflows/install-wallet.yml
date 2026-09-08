@@ -56,6 +56,58 @@ jobs:
       - name: Dry run ref installer
         run: scripts/install-wallet --dry-run --ref test-ref --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
 
+      - name: Dry run runtime shader compatibility option
+        run: scripts/install-wallet --dry-run --runtime-shaders --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
+
+      - name: Check macOS packaging features for current and legacy refs
+        shell: bash
+        run: |
+          # Load functions without invoking the installer's final main call.
+          source <(sed '$d' scripts/install-wallet)
+          source_dir="$(mktemp -d "$RUNNER_TEMP/railoxide-shader-ref.XXXXXX")"
+          export RAILOXIDE_FEATURE_CAPTURE="$source_dir/features"
+          mkdir -p "$source_dir/scripts"
+          cat > "$source_dir/scripts/package-wallet-macos" <<'EOF'
+          #!/usr/bin/env bash
+          printf '%s\n' "$CARGO_FEATURES" > "$RAILOXIDE_FEATURE_CAPTURE"
+          EOF
+          chmod +x "$source_dir/scripts/package-wallet-macos"
+          # Execute only the mock packaging handoff; suppress installation writes.
+          run() {
+            if [[ "$1" == env ]]; then
+              "$@"
+            fi
+          }
+          confirm() { return 0; }
+          write_macos_wrapper() { :; }
+          for package in gpui-pre gpui; do
+            printf '[[package]]\nname = "%s"\nversion = "0.0.0"\n' "$package" > "$source_dir/Cargo.lock"
+            for hardware in 1 0; do
+              expected=""
+              if [[ "$hardware" -eq 1 ]]; then expected=hardware; fi
+              if [[ "$package" == gpui ]]; then
+                expected="${expected:+$expected,}gpui/runtime_shaders"
+              fi
+              build_and_install_macos
+              test "$(cat "$RAILOXIDE_FEATURE_CAPTURE")" = "$expected"
+            done
+          done
+
+      - name: Reject build-time shaders before platform setup
+        shell: bash
+        run: |
+          uname() {
+            printf 'unexpected platform setup\n' > "$RUNNER_TEMP/railoxide-metal-platform-called"
+            return 99
+          }
+          export -f uname
+          status=0
+          scripts/install-wallet --metal --dry-run > "$RUNNER_TEMP/railoxide-metal-output" 2> "$RUNNER_TEMP/railoxide-metal-error" || status=$?
+          test "$status" -eq 1
+          test -s "$RUNNER_TEMP/railoxide-metal-error"
+          test ! -s "$RUNNER_TEMP/railoxide-metal-output"
+          test ! -e "$RUNNER_TEMP/railoxide-metal-platform-called"
+
   windows-smoke:
     name: windows-2022
     runs-on: windows-2022

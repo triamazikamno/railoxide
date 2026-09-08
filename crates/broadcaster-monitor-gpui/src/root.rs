@@ -12,7 +12,7 @@ use gpui_component::{
     input::{InputEvent, InputState},
     resizable::{ResizableState, h_resizable, resizable_panel},
     select::{SearchableVec, SelectEvent, SelectState},
-    table::{Table, TableDelegate, TableEvent, TableState},
+    table::{DataTable, TableDelegate, TableEvent, TableState},
 };
 use ui::table::ColumnWidthSync;
 use ui::theme;
@@ -160,7 +160,7 @@ impl BroadcasterMonitorPane {
                     state.delegate_mut().sync_filter_selects(window, cx);
                     cx.notify();
                 });
-                cx.defer_in(window, |_this, window, _cx| window.blur());
+                cx.defer_in(window, |_this, window, cx| window.blur(cx));
             },
         )
         .detach();
@@ -176,7 +176,7 @@ impl BroadcasterMonitorPane {
                     state.delegate_mut().sync_filter_selects(window, cx);
                     cx.notify();
                 });
-                cx.defer_in(window, |_this, window, _cx| window.blur());
+                cx.defer_in(window, |_this, window, cx| window.blur(cx));
             },
         )
         .detach();
@@ -325,7 +325,7 @@ impl Render for BroadcasterMonitorPane {
                                         .min_w(px(0.0))
                                         .min_h(px(0.0))
                                         .pr(MONITOR_SPLIT_GUTTER)
-                                        .child(Table::new(&self.fees_table)),
+                                        .child(DataTable::new(&self.fees_table)),
                                 ),
                             )
                             .child(

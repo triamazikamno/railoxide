@@ -1,4 +1,16 @@
 #[cfg(feature = "hardware")]
+use crate::root::{dialog_max_height, secondary_dialog_content_width, ui_helpers::dialog_footer};
+#[cfg(feature = "hardware")]
+use gpui::{ParentElement, Styled, div, px, rgb};
+#[cfg(feature = "hardware")]
+use gpui_component::{Sizable, WindowExt, alert::Alert};
+#[cfg(feature = "hardware")]
+use ui::{
+    controls::{app_input, app_muted_text, app_strong_text},
+    theme,
+};
+
+#[cfg(feature = "hardware")]
 use super::super::visible_wallet_metadata;
 #[cfg(not(feature = "hardware"))]
 use super::WalletRoot;
@@ -150,11 +162,60 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.hardware_profile_unlock.editing_label = true;
-        self.hardware_profile_label_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
+        if self.hardware_profile_unlock.in_progress {
+            return;
+        }
+        self.hardware_profile_unlock.error = None;
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let save_root = root.clone();
+            let close_root = root.clone();
+            let state = root.read(cx);
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .title(app_strong_text("Edit hardware profile name"))
+                .footer(dialog_footer("Save", true))
+                .on_ok(move |_event, window, cx| {
+                    save_root.update(cx, |root, cx| {
+                        root.save_hardware_profile_label_edit(window, cx)
+                    })
+                })
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.cancel_hardware_profile_label_edit(window, cx);
+                    });
+                })
+                .child(
+                    div()
+                        .w(content_width)
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            app_input(&state.hardware_profile_label_input)
+                                .disabled(state.hardware_profile_unlock.in_progress),
+                        )
+                        .child(
+                            app_muted_text(super::hardware_profile_label_warning())
+                                .whitespace_normal()
+                                .text_color(rgb(theme::WARNING)),
+                        )
+                        .children(state.hardware_profile_unlock.error.as_ref().map(|message| {
+                            Alert::error("hardware-profile-label-error", message.to_string())
+                                .small()
+                        })),
+                )
+        });
+        cx.defer_in(window, |root, window, cx| {
+            root.hardware_profile_label_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        });
         cx.notify();
     }
 
@@ -169,7 +230,6 @@ impl WalletRoot {
                 input.set_value(profile.label.clone(), window, cx);
             });
         }
-        self.hardware_profile_unlock.editing_label = false;
         self.hardware_profile_unlock.error = None;
         cx.notify();
     }
@@ -179,16 +239,19 @@ impl WalletRoot {
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> bool {
+        if self.hardware_profile_unlock.in_progress {
+            return false;
+        }
         let Some(device_kind) = self.hardware_profile_unlock.device_kind else {
             self.hardware_profile_unlock.error = Some(Arc::from("Choose a hardware wallet first"));
             cx.notify();
-            return;
+            return false;
         };
-        let Some(profile) = self.hardware_profile_unlock.profile.as_mut() else {
+        let Some(mut profile) = self.hardware_profile_unlock.profile.clone() else {
             self.hardware_profile_unlock.error = Some(Arc::from("Unlock a hardware profile first"));
             cx.notify();
-            return;
+            return false;
         };
         let label = self
             .hardware_profile_label_input
@@ -210,17 +273,18 @@ impl WalletRoot {
             self.vault_store.as_ref(),
             self.hardware_profile_unlock.vault_view_unlock.as_ref(),
         ) && let Err(error) =
-            store.store_hardware_profile_metadata_with_view_unlock(vault_view_unlock, profile)
+            store.store_hardware_profile_metadata_with_view_unlock(vault_view_unlock, &profile)
         {
             self.handle_hardware_profile_vault_error(&error);
             cx.notify();
-            return;
+            return false;
         }
 
+        self.hardware_profile_unlock.profile = Some(profile);
         self.active_hardware_profile = self.hardware_profile_unlock.profile.clone();
-        self.hardware_profile_unlock.editing_label = false;
         self.hardware_profile_unlock.error = None;
         cx.notify();
+        true
     }
 
     #[cfg(feature = "hardware")]
@@ -407,7 +471,6 @@ impl WalletRoot {
         self.hardware_profile_unlock.locked_accounts = locked_accounts;
         self.hardware_profile_unlock.picker_view = HardwareProfilePickerView::Summary;
         self.hardware_profile_unlock.advanced_open = false;
-        self.hardware_profile_unlock.editing_label = false;
         self.hardware_profile_unlock.set_progress_step(
             HardwareProfileStep::UnlockDevice,
             HardwareProfileStepStatus::Done,

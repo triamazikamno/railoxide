@@ -127,7 +127,6 @@ pub(in crate::root) struct HardwareProfileUnlockState {
     pub(in crate::root) progress_steps: Vec<HardwareProfileStepState>,
     pub(in crate::root) picker_view: HardwareProfilePickerView,
     pub(in crate::root) advanced_open: bool,
-    pub(in crate::root) editing_label: bool,
     pub(super) reconnect_notice: Option<Arc<str>>,
 }
 
@@ -153,7 +152,6 @@ impl Default for HardwareProfileUnlockState {
             progress_steps: default_hardware_profile_steps(),
             picker_view: HardwareProfilePickerView::Summary,
             advanced_open: false,
-            editing_label: false,
             reconnect_notice: None,
         }
     }
@@ -204,7 +202,6 @@ impl HardwareProfileUnlockState {
         self.progress_steps = default_hardware_profile_steps();
         self.picker_view = HardwareProfilePickerView::Summary;
         self.advanced_open = false;
-        self.editing_label = false;
         self.reconnect_notice = None;
     }
 

@@ -63,7 +63,6 @@ impl WalletRoot {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
             let max_height = window.viewport_size().height * 0.88;
-            let content_max_height = dialog_content_max_height(window);
             let close_root = root.clone();
             let content_root = root.clone();
             root.update(cx, |root, cx| {
@@ -87,6 +86,7 @@ impl WalletRoot {
             };
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(max_height)
                 .title(private_action_title_row(
                     title_action,
@@ -101,7 +101,7 @@ impl WalletRoot {
                         DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
                     });
                 })
-                .child(scrollable_dialog_content(content_max_height, child))
+                .child(child)
         });
     }
 
@@ -249,7 +249,7 @@ impl WalletRoot {
             window,
             move |this,
                   _select,
-                  event: &SelectEvent<SearchableVec<SelfBroadcastGasPayerSelectItem>>,
+                  event: &SelectEvent<FullWidthSelectItems<SelfBroadcastGasPayerSelectItem>>,
                   window,
                   cx| {
                 if let SelectEvent::Confirm(Some(uuid)) = event {
@@ -365,7 +365,7 @@ impl WalletRoot {
                 focus_recipient_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
         });
         cx.notify();
@@ -1364,7 +1364,7 @@ impl WalletRoot {
         };
         if changed {
             if let Some(input) = focus_input {
-                input.read(cx).focus_handle(cx).focus(window);
+                input.read(cx).focus_handle(cx).focus(window, cx);
             }
             self.sync_self_broadcast_custom_gas_fee_error(kind, key, cx);
             self.debounce_sponsored_funding_estimate(kind, key, cx);
@@ -1591,7 +1591,7 @@ impl WalletRoot {
             window,
             move |this,
                   _select,
-                  event: &SelectEvent<SearchableVec<SelfBroadcastGasPayerSelectItem>>,
+                  event: &SelectEvent<FullWidthSelectItems<SelfBroadcastGasPayerSelectItem>>,
                   window,
                   cx| {
                 if let SelectEvent::Confirm(Some(uuid)) = event {
@@ -1719,7 +1719,7 @@ impl WalletRoot {
                 focus_recipient_input
                     .read(cx)
                     .focus_handle(cx)
-                    .focus(window);
+                    .focus(window, cx);
             }
         });
         cx.notify();

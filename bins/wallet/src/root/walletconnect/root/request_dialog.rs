@@ -1,4 +1,5 @@
 use super::*;
+use gpui::StatefulInteractiveElement as _;
 use std::time::Duration;
 
 impl WalletRoot {
@@ -121,7 +122,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
         let dialog_max_height = (window.viewport_size().height * 0.88).min(px(820.0));
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -133,26 +133,27 @@ impl WalletRoot {
                 .title(walletconnect_title_row("WalletConnect request"))
                 // A footer otherwise gives Enter a default confirm-and-close path.
                 .on_ok(|_, _, _| false)
-                .footer(move |_, _, _window, cx| {
-                    footer_root
-                        .read(cx)
-                        .render_walletconnect_request_footer(&footer_root)
-                })
+                .footer(
+                    gpui_component::dialog::DialogFooter::new().children(
+                        footer_root
+                            .read(cx)
+                            .render_walletconnect_request_footer(&footer_root),
+                    ),
+                )
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.clear_walletconnect_request_dialog_state(window, cx);
                         cx.notify();
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_walletconnect_request_dialog_content(&content_root, content_width),
-                ))
+                )
         });
-        cx.defer_in(window, |root, window, _cx| {
-            root.walletconnect.request_dialog_focus.focus(window);
+        cx.defer_in(window, |root, window, cx| {
+            root.walletconnect.request_dialog_focus.focus(window, cx);
         });
         cx.notify();
     }
@@ -215,10 +216,13 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         content_width: Pixels,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         let keyboard_root = root.clone();
         let focus_handle = self.walletconnect.request_dialog_focus.clone();
         let mut content = div()
+            .id("walletconnect-request-content")
+            .role(gpui::accesskit::Role::Group)
+            .aria_label("WalletConnect request")
             .w(content_width)
             .flex()
             .flex_col()
@@ -293,6 +297,7 @@ impl WalletRoot {
             .gap_2()
             .child(
                 app_button_base("walletconnect-request-previous")
+                    .accessibility_label("Previous WalletConnect request")
                     .icon(IconName::ArrowLeft)
                     .outline()
                     .small()
@@ -313,6 +318,7 @@ impl WalletRoot {
             )
             .child(
                 app_button_base("walletconnect-request-next")
+                    .accessibility_label("Next WalletConnect request")
                     .icon(IconName::ArrowRight)
                     .outline()
                     .small()

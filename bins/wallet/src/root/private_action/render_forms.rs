@@ -4,7 +4,7 @@ use super::{
     Styled, UnshieldAssetKey, UnshieldResult, WalletRoot, app_button, app_muted_text,
     app_strong_text, delivery_element_id, div, effective_self_broadcast_funding_mode,
     fee_policy_eligible_public_broadcasters, format_form_error_for_asset,
-    is_effective_wrapped_native_token, labeled_field, private_action_input,
+    is_effective_wrapped_native_token, labeled_field, private_action_amount_input,
     private_broadcaster_closed_active_progress, public_broadcaster_cost_status,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
     px, render_delivery_selector, render_fee_mode_toggle, render_private_action_metrics,
@@ -42,6 +42,8 @@ impl WalletRoot {
         let estimate_root = root.clone();
         let progress_root = root.clone();
         let recipient_root = root.clone();
+        let delivery_submit_root = root.clone();
+        let amount_submit_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
@@ -150,7 +152,7 @@ impl WalletRoot {
                 );
             }
             card = card.child(render_public_broadcaster_settings(
-                chooser_root,
+                chooser_root.clone(),
                 key,
                 DeliveryFormKind::Send,
                 form.allow_suspicious_broadcasters,
@@ -191,6 +193,15 @@ impl WalletRoot {
                 .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
                 .is_none()
                 || !sponsored_estimate_ready;
+        }
+
+        let submit_disabled = !generation_ready
+            || form.generating
+            || public_broadcaster_submit_disabled
+            || self_broadcast_submit_disabled
+            || submitted;
+
+        if form.delivery_mode == DeliveryMode::SelfBroadcast {
             card = card.child(render_self_broadcast_settings(
                 chooser_root,
                 key,
@@ -207,6 +218,12 @@ impl WalletRoot {
                 sponsorship_enabled,
                 sponsorship_unavailable_reason,
                 form.generating,
+                !submit_disabled,
+                move |window, cx| {
+                    delivery_submit_root.update(cx, |root, cx| {
+                        root.generate_send_calldata_from_form(key, window, cx);
+                    });
+                },
             ));
         }
 
@@ -237,7 +254,16 @@ impl WalletRoot {
                 .child(
                     labeled_field(
                         unit_hint,
-                        private_action_input(&form.amount_input).disabled(form.generating),
+                        private_action_amount_input(
+                            &form.amount_input,
+                            form.generating,
+                            !submit_disabled,
+                            move |window, cx| {
+                                amount_submit_root.update(cx, |root, cx| {
+                                    root.generate_send_calldata_from_form(key, window, cx);
+                                });
+                            },
+                        ),
                     )
                     .w(px(220.0)),
                 ),
@@ -269,13 +295,7 @@ impl WalletRoot {
                 )
                 .primary()
                 .loading(form.generating)
-                .disabled(
-                    !generation_ready
-                        || form.generating
-                        || public_broadcaster_submit_disabled
-                        || self_broadcast_submit_disabled
-                        || submitted,
-                )
+                .disabled(submit_disabled)
                 .tooltip(if generation_ready {
                     "Prepare private transaction"
                 } else {
@@ -423,6 +443,8 @@ impl WalletRoot {
         let progress_root = root.clone();
         let recipient_root = root.clone();
         let top_up_root = root.clone();
+        let delivery_submit_root = root.clone();
+        let amount_submit_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
@@ -532,7 +554,7 @@ impl WalletRoot {
                 );
             }
             card = card.child(render_public_broadcaster_settings(
-                chooser_root,
+                chooser_root.clone(),
                 key,
                 DeliveryFormKind::Unshield,
                 form.allow_suspicious_broadcasters,
@@ -573,6 +595,15 @@ impl WalletRoot {
                 .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
                 .is_none()
                 || !sponsored_estimate_ready;
+        }
+
+        let submit_disabled = !generation_ready
+            || form.generating
+            || public_broadcaster_submit_disabled
+            || self_broadcast_submit_disabled
+            || submitted;
+
+        if form.delivery_mode == DeliveryMode::SelfBroadcast {
             card = card.child(render_self_broadcast_settings(
                 chooser_root,
                 key,
@@ -589,6 +620,12 @@ impl WalletRoot {
                 sponsorship_enabled,
                 sponsorship_unavailable_reason,
                 form.generating,
+                !submit_disabled,
+                move |window, cx| {
+                    delivery_submit_root.update(cx, |root, cx| {
+                        root.generate_unshield_calldata_from_form(key, window, cx);
+                    });
+                },
             ));
         }
 
@@ -638,7 +675,16 @@ impl WalletRoot {
                     .child(
                         labeled_field(
                             unit_hint,
-                            private_action_input(&form.amount_input).disabled(form.generating),
+                            private_action_amount_input(
+                                &form.amount_input,
+                                form.generating,
+                                !submit_disabled,
+                                move |window, cx| {
+                                    amount_submit_root.update(cx, |root, cx| {
+                                        root.generate_unshield_calldata_from_form(key, window, cx);
+                                    });
+                                },
+                            ),
                         )
                         .w(px(220.0)),
                     ),
@@ -678,13 +724,7 @@ impl WalletRoot {
                 )
                 .primary()
                 .loading(form.generating)
-                .disabled(
-                    !generation_ready
-                        || form.generating
-                        || public_broadcaster_submit_disabled
-                        || self_broadcast_submit_disabled
-                        || submitted,
-                )
+                .disabled(submit_disabled)
                 .tooltip(if generation_ready {
                     "Prepare private transaction"
                 } else {

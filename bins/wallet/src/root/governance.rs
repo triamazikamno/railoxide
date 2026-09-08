@@ -14,12 +14,14 @@ use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    combobox::{Combobox, ComboboxEvent, ComboboxState},
+    input::InputState,
     popover::Popover,
     scroll::{ScrollableElement, Scrollbar},
+    searchable_list::{SearchableListItem, SearchableVec},
     spinner::Spinner,
     tab::{Tab, TabBar},
-    table::{Column, Table, TableDelegate, TableState},
+    table::{Column, DataTable, TableDelegate, TableState},
     tooltip::Tooltip,
 };
 use railgun_ui::{format_usd_micro_value, governance_contracts, short_address};
@@ -738,7 +740,69 @@ pub(super) struct ParticipantChoice {
     pub address: Address,
     pub global: bool,
     pub inactive: bool,
-    pub selected: bool,
+}
+
+impl SearchableListItem for ParticipantChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .child(app_text(self.label.clone()).truncate())
+            .child(
+                app_muted_text(format!(
+                    "{}{}{}",
+                    short_address(&self.address),
+                    if self.global { " · Global" } else { "" },
+                    if self.inactive { " · Inactive" } else { "" }
+                ))
+                .text_size(px(11.0))
+                .truncate(),
+            )
+    }
+
+    fn value(&self) -> &String {
+        &self.uuid
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || self.label.to_ascii_lowercase().contains(&query)
+            || format!("{:#x}", self.address).contains(&query)
+    }
+}
+
+pub(super) type ParticipantPickerState = ComboboxState<SearchableVec<ParticipantChoice>>;
+
+// Change carries the complete selection, including choices hidden by the query.
+// Confirm is dismissal only; callers perform persistence and refresh only on Some.
+fn participant_picker_change(
+    event: &ComboboxEvent<SearchableVec<ParticipantChoice>>,
+    accounts: &[PublicAccountMetadata],
+    wallet_id: Option<&str>,
+    picker_wallet_id: Option<&str>,
+    saved: &[String],
+) -> Option<Vec<String>> {
+    let ComboboxEvent::Change(values) = event else {
+        return None;
+    };
+    let wallet_id = wallet_id.filter(|wallet| Some(*wallet) == picker_wallet_id)?;
+    let selected = saved.iter().cloned().collect();
+    let eligible = participant_choices(accounts, &selected, Some(wallet_id), "");
+    let values = values
+        .iter()
+        .filter(|value| eligible.iter().any(|item| item.uuid == **value))
+        .cloned()
+        .collect::<Vec<_>>();
+    let normalized = normalize_participant_ids(&values, accounts, wallet_id).uuids;
+    (normalized != saved).then_some(normalized)
 }
 
 pub(super) fn participant_summary(
@@ -786,7 +850,6 @@ pub(super) fn participant_choices(
             address: account.address,
             global: account.is_global(),
             inactive: account.status == PublicAccountStatus::Inactive,
-            selected: selected.contains(&account.public_account_uuid),
         })
         .collect()
 }
@@ -1397,16 +1460,17 @@ pub(super) struct GovernanceState {
     pub proposal_action_amount_input: Entity<InputState>,
     pub action_flow: GovernanceActionFlowState,
     pub staking_delegate_input: Entity<InputState>,
-    pub participant_picker_open: bool,
     pub compact_position_details: Option<(String, U256)>,
-    pub participant_search_input: Entity<InputState>,
+    pub participant_picker: Entity<ParticipantPickerState>,
+    participant_picker_wallet: Option<String>,
+    participant_picker_items: Vec<ParticipantChoice>,
     staking_tables: BTreeMap<String, Entity<TableState<StakeTableDelegate>>>,
     participant_time_tick_generation: Option<u64>,
 }
 
 impl GovernanceState {
     pub(super) fn new(
-        participant_search_input: Entity<InputState>,
+        participant_picker: Entity<ParticipantPickerState>,
         proposal_action_amount_input: Entity<InputState>,
         staking_delegate_input: Entity<InputState>,
     ) -> Self {
@@ -1417,12 +1481,44 @@ impl GovernanceState {
             proposal_action_amount_input,
             action_flow: GovernanceActionFlowState::default(),
             staking_delegate_input,
-            participant_picker_open: false,
             compact_position_details: None,
-            participant_search_input,
+            participant_picker,
+            participant_picker_wallet: None,
+            participant_picker_items: Vec::new(),
             staking_tables: BTreeMap::new(),
             participant_time_tick_generation: None,
         }
+    }
+
+    fn sync_participant_picker(
+        &mut self,
+        wallet_id: Option<String>,
+        items: Vec<ParticipantChoice>,
+        values: &[String],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let wallet_changed = self.participant_picker_wallet != wallet_id;
+        if !wallet_changed
+            && items == self.participant_picker_items
+            && self.participant_picker.read(cx).selected_values() == values
+        {
+            return;
+        }
+        self.participant_picker_wallet = wallet_id;
+        self.participant_picker_items.clone_from(&items);
+        self.participant_picker.update(cx, |picker, cx| {
+            let query = if wallet_changed {
+                SharedString::default()
+            } else {
+                picker.query(cx)
+            };
+            picker.set_items(SearchableVec::new(items), window, cx);
+            picker.set_selected_values(values, window, cx);
+            if !query.is_empty() {
+                picker.set_query(query, window, cx);
+            }
+        });
     }
 
     pub(super) fn invalidate_action(&mut self) {
@@ -1702,7 +1798,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(440.0));
         let dialog_max_height = super::dialog_max_height(window);
-        let content_max_height = super::dialog_content_max_height(window);
         let content_width = super::secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -1711,18 +1806,16 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(super::proposals::proposal_action_title(kind))
+                .on_ok(|_, _, _| false)
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.close_proposal_action(cx);
                     });
                 })
-                .child(super::scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_proposal_action_dialog_content(
-                        content_root.clone(),
-                        content_width,
-                        cx,
-                    ),
+                .child(content_root.read(cx).render_proposal_action_dialog_content(
+                    content_root.clone(),
+                    content_width,
+                    cx,
                 ))
         });
         if matches!(kind, ProposalActionKind::CallVote)
@@ -1782,7 +1875,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(440.0));
         let dialog_max_height = super::dialog_max_height(window);
-        let content_max_height = super::dialog_content_max_height(window);
         let content_width = super::secondary_dialog_content_width(dialog_width);
         let dialog_title =
             staking_action_dialog_title(kind, self.selected_chain, &self.effective_token_registry);
@@ -1793,18 +1885,16 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(dialog_title.clone()))
+                .on_ok(|_, _, _| false)
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.close_staking_action(cx);
                     });
                 })
-                .child(super::scrollable_dialog_content(
-                    content_max_height,
-                    content_root.read(cx).render_staking_action_dialog_content(
-                        content_root.clone(),
-                        content_width,
-                        cx,
-                    ),
+                .child(content_root.read(cx).render_staking_action_dialog_content(
+                    content_root.clone(),
+                    content_width,
+                    cx,
                 ))
         });
         let focus_input = match kind {
@@ -1816,7 +1906,7 @@ impl WalletRoot {
         };
         if let Some(focus_input) = focus_input {
             cx.defer_in(window, move |_root, window, cx| {
-                focus_input.read(cx).focus_handle(cx).focus(window);
+                focus_input.read(cx).focus_handle(cx).focus(window, cx);
             });
         }
         if !matches!(
@@ -2258,7 +2348,7 @@ impl WalletRoot {
                     .is_some_and(|draft| {
                         !matches!(
                             &draft.target,
-                            super::governance_action::GovernanceRefreshTarget::Proposal(action_key)
+                            GovernanceRefreshTarget::Proposal(action_key)
                                 if action_key == &key
                         )
                     });
@@ -2342,22 +2432,38 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(super) fn toggle_governance_participant(&mut self, uuid: &str, cx: &mut Context<'_, Self>) {
-        let Some(wallet_id) = self.selected_wallet_id.as_deref() else {
+    pub(super) fn participant_picker_event(
+        &mut self,
+        event: &ComboboxEvent<SearchableVec<ParticipantChoice>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if matches!(event, ComboboxEvent::Confirm(_)) {
+            self.governance
+                .participant_picker
+                .update(cx, |picker, cx| picker.set_query("", window, cx));
+            return;
+        }
+        let saved = self
+            .selected_wallet_id
+            .as_deref()
+            .and_then(|wallet| self.ui_state.governance_participants.get(wallet))
+            .map_or(&[][..], Vec::as_slice);
+        let Some(values) = participant_picker_change(
+            event,
+            &self.public_accounts,
+            self.selected_wallet_id.as_deref(),
+            self.governance.participant_picker_wallet.as_deref(),
+            saved,
+        ) else {
             return;
         };
-        let ids = self
-            .ui_state
+        let Some(wallet_id) = self.selected_wallet_id.clone() else {
+            return;
+        };
+        self.ui_state
             .governance_participants
-            .entry(wallet_id.to_owned())
-            .or_default();
-        if let Some(index) = ids.iter().position(|candidate| candidate == uuid) {
-            ids.remove(index);
-        } else if self.public_accounts.iter().any(|account| {
-            account.public_account_uuid == uuid && account.is_scoped_to_wallet(wallet_id)
-        }) {
-            ids.push(uuid.to_owned());
-        }
+            .insert(wallet_id.to_string(), values);
         self.save_ui_state();
         self.invalidate_governance_context();
         if self.governance.tab == GovernanceTab::Staking {
@@ -2684,6 +2790,32 @@ impl WalletRoot {
         .detach();
     }
 
+    fn sync_governance_participant_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let values = self
+            .governance_participants()
+            .iter()
+            .map(|account| account.public_account_uuid.clone())
+            .collect::<Vec<_>>();
+        let selected = values.iter().cloned().collect();
+        let items = participant_choices(
+            &self.public_accounts,
+            &selected,
+            self.selected_wallet_id.as_deref(),
+            "",
+        );
+        self.governance.sync_participant_picker(
+            self.selected_wallet_id.as_deref().map(str::to_owned),
+            items,
+            &values,
+            window,
+            cx,
+        );
+    }
+
     pub(super) fn render_governance_workspace(
         &mut self,
         root: &Entity<Self>,
@@ -2706,207 +2838,64 @@ impl WalletRoot {
         };
         let selected_index = usize::from(self.governance.tab == GovernanceTab::Staking);
         let tab_root = root.clone();
-        let participant_root = root.clone();
-        let participant_query = self.governance.participant_search_input.read(cx).value();
-        let wallet_id = self.selected_wallet_id.as_deref();
-        let participants = self.governance_participants();
-        let selected_ids = participants
+        self.sync_governance_participant_picker(window, cx);
+        let selected_ids = self
+            .governance_participants()
             .iter()
             .map(|account| account.public_account_uuid.clone())
             .collect::<BTreeSet<_>>();
-        let choices = participant_choices(
+        let summary = participant_summary(
             &self.public_accounts,
             &selected_ids,
-            wallet_id,
-            &participant_query,
+            self.selected_wallet_id.as_deref(),
         );
-        let summary = participant_summary(&self.public_accounts, &selected_ids, wallet_id);
-        let trigger_label = if summary.selected == 0 {
-            app_muted_text("Enroll accounts...")
-                .min_w(px(0.0))
-                .truncate()
-                .into_any_element()
-        } else {
-            let account_word = if summary.selected == 1 {
-                "account"
-            } else {
-                "accounts"
-            };
-            app_text(format!("{} {account_word} enrolled", summary.selected))
-                .min_w(px(0.0))
-                .truncate()
-                .into_any_element()
-        };
-        let trigger_content = div()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex()
-            .items_center()
-            .flex_nowrap()
-            .overflow_hidden()
-            .child(trigger_label);
-        let trigger = div()
+        let picker = Combobox::new(&self.governance.participant_picker)
+            .small()
             .w(participant_trigger_width)
-            .h(px(24.0))
-            .min_w(px(0.0))
-            .px(px(8.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_1()
-            .child(
-                Icon::empty()
-                    .path(USERS_ICON_PATH)
-                    .size_4()
-                    .flex_none()
-                    .text_color(rgb(theme::TEXT_MUTED)),
-            )
-            .child(trigger_content)
-            .child(
-                Icon::new(IconName::ChevronDown)
-                    .xsmall()
-                    .flex_none()
-                    .text_color(rgb(theme::TEXT_PLACEHOLDER)),
-            );
-        let picker_choices = choices;
-        let picker_root = participant_root.clone();
-        let participant_search_input = self.governance.participant_search_input.clone();
-        let participant_search_focus = participant_search_input.read(cx).focus_handle(cx);
-        let picker = Popover::new("governance-participant-picker")
-            .open(self.governance.participant_picker_open)
-            .track_focus(&participant_search_focus)
-            .on_open_change({
-                let open_root = participant_root;
-                let search_input = participant_search_input.clone();
-                move |open, window, cx| {
-                    if !*open {
-                        search_input.update(cx, |input, cx| {
-                            input.set_value("", window, cx);
-                        });
-                    }
-                    open_root.update(cx, |root, cx| {
-                        root.governance.participant_picker_open = *open;
-                        cx.notify();
-                    });
-                }
-            })
-            .w(GOVERNANCE_PARTICIPANT_POPUP_WIDTH)
             .max_w_full()
-            .p_1()
-            .trigger(
-                app_button_base("governance-participants")
-                    .text()
-                    .small()
-                    .px_0()
-                    .justify_start()
-                    .w(participant_trigger_width)
-                    .max_w_full()
-                    .child(trigger),
-            )
-            .content(move |_state, _window, _cx| {
-                let mut list = div()
-                    .id("governance-participant-picker-list")
-                    .max_h(px(300.0))
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .children(picker_choices.iter().map(|choice| {
-                        let uuid = choice.uuid.clone();
-                        let toggle_root = picker_root.clone();
-                        let scope_suffix = if choice.global { " · Global" } else { "" };
-                        div()
-                            .id(SharedString::from(format!(
-                                "governance-participant-{}",
-                                choice.uuid
-                            )))
-                            .flex()
-                            .items_center()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .p_1()
-                            .rounded_sm()
-                            .when(choice.selected, |this| {
-                                this.bg(rgb(theme::SURFACE_HOVER_SUBTLE))
-                            })
-                            .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_1()
-                                    .child(
-                                        div().flex().w_full().min_w(px(0.0)).items_center().child(
-                                            div()
-                                                .w_full()
-                                                .min_w(px(0.0))
-                                                .overflow_hidden()
-                                                .flex()
-                                                .flex_col()
-                                                .child(
-                                                    app_text(choice.label.clone())
-                                                        .whitespace_nowrap(),
-                                                )
-                                                .child(
-                                                    app_muted_text(format!(
-                                                        "{}{}{}",
-                                                        short_address(&choice.address),
-                                                        scope_suffix,
-                                                        if choice.inactive {
-                                                            " · Inactive"
-                                                        } else {
-                                                            ""
-                                                        }
-                                                    ))
-                                                    .text_size(px(11.0))
-                                                    .whitespace_nowrap(),
-                                                ),
-                                        ),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::Check)
-                                            .xsmall()
-                                            .flex_none()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .when(!choice.selected, gpui::Styled::invisible),
-                                    ),
-                            )
-                            .on_click(move |_event, _window, cx| {
-                                toggle_root.update(cx, |root, cx| {
-                                    root.toggle_governance_participant(&uuid, cx);
-                                });
-                            })
-                    }));
-                if picker_choices.is_empty() {
-                    list = list.child(app_muted_text("No visible accounts match this search."));
-                }
+            .p_0()
+            .appearance(false)
+            .menu_width(GOVERNANCE_PARTICIPANT_POPUP_WIDTH)
+            .menu_max_h(px(350.0))
+            .search_placeholder("search participating accounts")
+            .empty(|_, _| app_muted_text("No visible accounts match this search."))
+            .render_trigger(move |_, _, _| {
+                let label = match summary.selected {
+                    0 => "Enroll accounts...".to_owned(),
+                    1 => "1 account enrolled".to_owned(),
+                    count => format!("{count} accounts enrolled"),
+                };
                 div()
                     .w_full()
+                    .h(px(24.0))
                     .min_w(px(0.0))
+                    .px(px(8.0))
                     .flex()
-                    .flex_col()
+                    .items_center()
                     .gap_1()
+                    .overflow_hidden()
                     .child(
-                        div()
-                            .px(px(6.0))
-                            .border_b_1()
-                            .border_color(rgb(theme::BORDER))
-                            .child(
-                                Input::new(&participant_search_input)
-                                    .small()
-                                    .prefix(
-                                        Icon::new(IconName::Search)
-                                            .text_color(rgb(theme::TEXT_MUTED)),
-                                    )
-                                    .cleanable(true)
-                                    .p_0()
-                                    .appearance(false),
-                            ),
+                        Icon::empty()
+                            .path(USERS_ICON_PATH)
+                            .size_4()
+                            .flex_none()
+                            .text_color(rgb(theme::TEXT_MUTED)),
                     )
-                    .child(list)
+                    .child(
+                        app_text(label)
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .when(summary.selected == 0, |this| {
+                                this.text_color(rgb(theme::TEXT_MUTED))
+                            }),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .xsmall()
+                            .flex_none()
+                            .text_color(rgb(theme::TEXT_PLACEHOLDER)),
+                    )
             });
         let governance_tab = |label: &'static str, icon: Icon| {
             Tab::new().min_w(px(92.0)).child(
@@ -2984,7 +2973,13 @@ impl WalletRoot {
                         )
                     })
                     .child(self.render_wallet_selector())
-                    .child(picker)
+                    .child(
+                        div()
+                            .w(participant_trigger_width)
+                            .h(px(24.0))
+                            .flex_none()
+                            .child(picker),
+                    )
                     .when(summary.inactive > 0, |this| {
                         this.child(app_status_tag(
                             format!("{} inactive", summary.inactive),
@@ -3167,34 +3162,7 @@ impl WalletRoot {
         let participants = self.governance_participants();
         content = content.child(app_strong_text("Positions & rewards").text_size(px(16.0)));
         if participants.is_empty() {
-            let picker_root = root.clone();
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .p_4()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(app_strong_text("Enroll accounts to get started"))
-                    .child(app_muted_text(
-                        "Choose Public accounts to view their positions and rewards.",
-                    ))
-                    .child(
-                        app_button_base("governance-staking-enroll")
-                            .outline()
-                            .small()
-                            .child("Enroll accounts")
-                            .on_click(move |_event, _window, cx| {
-                                picker_root.update(cx, |root, cx| {
-                                    root.governance.participant_picker_open = true;
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            );
+            content = content.child(render_staking_enrollment_prompt(root));
         }
         for account in participants {
             let uuid = account.public_account_uuid.clone();
@@ -3391,7 +3359,7 @@ impl WalletRoot {
                         .border_color(rgb(theme::BORDER_SUBTLE))
                         .id(staking_control_id(&actor_uuid, "table-scroll", "positions"));
                     let table_scroller = table_scroller.child(
-                        Table::new(&table)
+                        DataTable::new(&table)
                             .large()
                             .bordered(false)
                             .scrollbar_visible(false, table_horizontal_scrollbar),
@@ -3633,6 +3601,39 @@ impl WalletRoot {
         }
         content
     }
+}
+
+fn render_staking_enrollment_prompt(root: &Entity<WalletRoot>) -> gpui::Div {
+    let picker_root = root.clone();
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_2()
+        .p_4()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_strong_text("Enroll accounts to get started"))
+        .child(app_muted_text(
+            "Choose Public accounts to view their positions and rewards.",
+        ))
+        .child(
+            app_button_base("governance-staking-enroll")
+                .outline()
+                .small()
+                .child("Enroll accounts")
+                .on_click(move |_event, window, cx| {
+                    picker_root.update(cx, |root, cx| {
+                        root.governance
+                            .participant_picker
+                            .read(cx)
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                        window.dispatch_action(Box::new(gpui_kit::base::actions::SelectDown), cx);
+                    });
+                }),
+        )
 }
 
 fn voting_power_metric(value: &str, qualifier: Option<String>) -> gpui::Div {
@@ -4044,17 +4045,8 @@ impl TableDelegate for StakeTableDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix].1
-    }
-
-    fn render_tr(
-        &mut self,
-        row_ix: usize,
-        _window: &mut Window,
-        _cx: &mut Context<'_, TableState<Self>>,
-    ) -> gpui::Stateful<gpui::Div> {
-        render_staking_table_row(row_ix)
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].1.clone()
     }
 
     fn render_header(
@@ -4078,6 +4070,15 @@ impl TableDelegate for StakeTableDelegate {
         _cx: &mut Context<'_, TableState<Self>>,
     ) -> impl IntoElement {
         div().h(px(0.0)).max_h(px(0.0)).overflow_hidden()
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<'_, TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        render_staking_table_row(row_ix)
     }
 
     fn render_td(
@@ -4183,7 +4184,7 @@ impl TableDelegate for StakeTableDelegate {
                 .content(move |popover_state, window, cx| {
                     let focus_handle = popover_state.focus_handle(cx);
                     if focus_on_materialize {
-                        focus_handle.focus(window);
+                        focus_handle.focus(window, cx);
                     }
                     let full_id = full_id.clone();
                     let amount = amount.clone();
@@ -4772,6 +4773,16 @@ fn render_staking_action_form(
         amount.is_some()
     };
     let ready = selection_ready && delegate_ready && !wallet.governance.action_flow.pending;
+    let prepare = move |window: &mut Window, cx: &mut App| {
+        review_root.update(cx, |root, cx| root.review_staking_action(window, cx));
+    };
+    let prepare_on_enter = prepare.clone();
+    content = content.on_action(move |_: &gpui_component::dialog::Confirm, window, cx| {
+        cx.stop_propagation();
+        if ready {
+            prepare_on_enter(window, cx);
+        }
+    });
     content = content.child(
         div()
             .flex()
@@ -4798,9 +4809,7 @@ fn render_staking_action_form(
                     } else {
                         "Prepare authorization"
                     })
-                    .on_click(move |_event, window, cx| {
-                        review_root.update(cx, |root, cx| root.review_staking_action(window, cx));
-                    }),
+                    .on_click(move |_event, window, cx| prepare(window, cx)),
             ),
     );
     if let Some(error) = wallet.governance.action_flow.error.as_ref() {
@@ -4825,6 +4834,180 @@ mod tests {
 
     use super::*;
     use gpui_component::scroll::ScrollbarHandle;
+
+    struct ParticipantPickerProbe {
+        governance: GovernanceState,
+        accounts: Vec<PublicAccountMetadata>,
+        saved: Vec<String>,
+        commits: Vec<Vec<String>>,
+    }
+
+    impl ParticipantPickerProbe {
+        fn sync_picker(&mut self, window: &mut Window, cx: &mut App) {
+            let selected = self.saved.iter().cloned().collect();
+            let items = participant_choices(&self.accounts, &selected, Some("wallet"), "");
+            self.governance.sync_participant_picker(
+                Some("wallet".to_owned()),
+                items,
+                &self.saved,
+                window,
+                cx,
+            );
+        }
+    }
+
+    impl Render for ParticipantPickerProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            self.sync_picker(window, cx);
+            div()
+                .p_3()
+                .child(Combobox::new(&self.governance.participant_picker).w(px(220.0)))
+        }
+    }
+
+    #[gpui::test]
+    fn participant_picker_preserves_query_cursor_and_enrollment_order(cx: &TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx
+            .update(|app| {
+                app.open_window(WindowOptions::default(), |window, cx| {
+                    let accounts = vec![
+                        account("alice", PublicAccountStatus::Active, false),
+                        account("amy", PublicAccountStatus::Active, false),
+                        account("ava", PublicAccountStatus::Active, false),
+                        account("inactive", PublicAccountStatus::Inactive, false),
+                        account("global", PublicAccountStatus::Active, true),
+                    ];
+                    let saved = vec!["inactive".to_owned(), "global".to_owned()];
+                    let selected = saved.iter().cloned().collect();
+                    let items = participant_choices(&accounts, &selected, Some("wallet"), "");
+                    let picker = cx.new(|cx| {
+                        let mut picker =
+                            ComboboxState::new(SearchableVec::new(items), vec![], window, cx)
+                                .multiple(true)
+                                .searchable(true);
+                        picker.set_selected_values(&saved, window, cx);
+                        picker
+                    });
+                    cx.new(|cx| {
+                        cx.subscribe_in(
+                            &picker,
+                            window,
+                            |this: &mut ParticipantPickerProbe, picker, event, window, cx| {
+                                if let Some(values) = participant_picker_change(
+                                    event,
+                                    &this.accounts,
+                                    Some("wallet"),
+                                    Some("wallet"),
+                                    &this.saved,
+                                ) {
+                                    this.saved = values.clone();
+                                    this.commits.push(values);
+                                    this.sync_picker(window, cx);
+                                    cx.notify();
+                                }
+                                if matches!(event, ComboboxEvent::Confirm(_)) {
+                                    picker
+                                        .update(cx, |picker, cx| picker.set_query("", window, cx));
+                                }
+                            },
+                        )
+                        .detach();
+                        ParticipantPickerProbe {
+                            governance: GovernanceState::new(
+                                picker,
+                                cx.new(|cx| InputState::new(window, cx)),
+                                cx.new(|cx| InputState::new(window, cx)),
+                            ),
+                            accounts,
+                            saved,
+                            commits: Vec::new(),
+                        }
+                    })
+                })
+            })
+            .expect("open participant picker probe");
+        let mut cx = VisualTestContext::from_window(*window, cx);
+        cx.refresh().expect("render participant picker");
+        let probe = window.root(&mut cx).expect("participant picker probe");
+        let picker = probe.read_with(&cx, |probe, _| probe.governance.participant_picker.clone());
+        cx.update(|window, cx| picker.read(cx).focus_handle(cx).focus(window, cx));
+        cx.simulate_keystrokes("down");
+        cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.set_query(" alice ", window, cx));
+        });
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        probe.read_with(&cx, |probe, _| {
+            assert_eq!(probe.saved, ["inactive", "global", "alice"]);
+            assert_eq!(
+                probe.commits.len(),
+                1,
+                "Change must commit before dismissal"
+            );
+        });
+        cx.update(|window, cx| picker.update(cx, |picker, cx| picker.set_query("a", window, cx)));
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        cx.refresh().expect("render after selecting Amy");
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        probe.read_with(&cx, |probe, cx| {
+            assert_eq!(probe.saved, ["inactive", "global", "alice", "amy"]);
+            assert_eq!(probe.governance.participant_picker.read(cx).query(cx), "a");
+        });
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        cx.refresh().expect("render after selecting Ava");
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        probe.read_with(&cx, |probe, cx| {
+            assert_eq!(probe.saved, ["inactive", "global", "alice", "amy", "ava"]);
+            assert_eq!(probe.governance.participant_picker.read(cx).query(cx), "a");
+        });
+        cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.set_query("inactive", window, cx));
+        });
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        probe.read_with(&cx, |probe, _| {
+            assert_eq!(probe.saved, ["global", "alice", "amy", "ava"]);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        probe.read_with(&cx, |probe, cx| {
+            assert_eq!(
+                probe.commits.len(),
+                4,
+                "dismissal must not commit a second time"
+            );
+            assert!(
+                probe
+                    .governance
+                    .participant_picker
+                    .read(cx)
+                    .query(cx)
+                    .is_empty()
+            );
+            assert!(
+                participant_picker_change(
+                    &ComboboxEvent::Change(vec!["global".to_owned()]),
+                    &probe.accounts,
+                    Some("other-wallet"),
+                    Some("wallet"),
+                    &probe.saved
+                )
+                .is_none(),
+                "a stale picker must not change the next wallet"
+            );
+        });
+    }
 
     struct TableProbeDelegate {
         columns: Vec<(StakeTableColumnKind, Column)>,
@@ -4864,24 +5047,8 @@ mod tests {
             self.row_count
         }
 
-        fn column(&self, col_ix: usize, _: &App) -> &Column {
-            &self.columns[col_ix].1
-        }
-
-        fn render_tr(
-            &mut self,
-            row_ix: usize,
-            _window: &mut Window,
-            _cx: &mut Context<'_, TableState<Self>>,
-        ) -> gpui::Stateful<gpui::Div> {
-            let row = render_staking_table_row(row_ix);
-            if row_ix == 5 {
-                row.debug_selector(|| "staking-test-row-six".to_owned())
-            } else if row_ix == 0 {
-                row.debug_selector(|| "staking-test-row".to_owned())
-            } else {
-                row
-            }
+        fn column(&self, col_ix: usize, _: &App) -> Column {
+            self.columns[col_ix].1.clone()
         }
 
         fn render_header(
@@ -4905,6 +5072,22 @@ mod tests {
             _cx: &mut Context<'_, TableState<Self>>,
         ) -> impl IntoElement {
             div().h(px(0.0)).max_h(px(0.0)).overflow_hidden()
+        }
+
+        fn render_tr(
+            &mut self,
+            row_ix: usize,
+            _window: &mut Window,
+            _cx: &mut Context<'_, TableState<Self>>,
+        ) -> gpui::Stateful<gpui::Div> {
+            let row = render_staking_table_row(row_ix);
+            if row_ix == 5 {
+                row.debug_selector(|| "staking-test-row-six".to_owned())
+            } else if row_ix == 0 {
+                row.debug_selector(|| "staking-test-row".to_owned())
+            } else {
+                row
+            }
         }
 
         fn render_td(
@@ -5006,7 +5189,7 @@ mod tests {
                 .min_w(px(0.0))
                 .min_h(px(0.0))
                 .child(
-                    Table::new(&self.table)
+                    DataTable::new(&self.table)
                         .large()
                         .bordered(false)
                         .scrollbar_visible(false, false),
@@ -5253,7 +5436,7 @@ mod tests {
         assert_eq!(cx.update(|_, app| table.read(app).selected_row()), None);
 
         cx.update_window(*window, |_, window, app| {
-            window.focus(&table.read(app).focus_handle(app));
+            window.focus(&table.read(app).focus_handle(app), app);
         })
         .expect("focus staking table");
         cx.simulate_keystrokes("down");
@@ -5320,7 +5503,7 @@ mod tests {
             ScrollbarHandle::content_size(&vertical_scroll_handle).height,
             px(240.0)
         );
-        assert_eq!(scroll_handle.max_offset().height, px(40.0));
+        assert_eq!(scroll_handle.max_offset().y, px(40.0));
 
         ScrollbarHandle::set_offset(&vertical_scroll_handle, point(px(0.0), px(-40.0)));
         cx.update(|_, app| probe.update(app, |_, cx| cx.notify()));

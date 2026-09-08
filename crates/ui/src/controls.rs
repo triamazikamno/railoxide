@@ -1,19 +1,88 @@
 use gpui::{
-    AnyElement, Div, ElementId, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, Styled, div, px, relative, rgb,
+    AnyElement, App, Div, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
+    rgb,
 };
 use gpui_component::input::{
     Copy, Cut, DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToNextWordEnd,
     DeleteToPreviousWordStart, Input, InputState, MoveToEnd, MoveToNextWord, MoveToPreviousWord,
     MoveToStart, SelectToEnd, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
 };
-use gpui_component::{Selectable, button::Button};
+use gpui_component::{
+    Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
+    button::{Button, ButtonVariants},
+    select::{SearchableVec, SelectDelegate, SelectItem},
+};
 
 use crate::theme::{self, APP_TEXT_SIZE};
 
+/// Searchable items whose custom rows fill the menu width.
+///
+/// Uses the delegate hook to bypass the default `SelectItem` content-sized wrapper.
+pub struct FullWidthSelectItems<T: SelectItem + 'static>(SearchableVec<T>);
+
+impl<T: SelectItem + 'static> FullWidthSelectItems<T> {
+    #[must_use]
+    pub fn new(items: Vec<T>) -> Self {
+        Self(SearchableVec::new(items))
+    }
+}
+
+impl<T: SelectItem + 'static> SelectDelegate for FullWidthSelectItems<T> {
+    type Item = T;
+
+    fn items_count(&self, section: usize) -> usize {
+        self.0.items_count(section)
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        self.0.item(ix)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SelectItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0.position(value)
+    }
+
+    fn perform_search(&mut self, query: &str, window: &mut Window, cx: &mut App) -> gpui::Task<()> {
+        self.0.perform_search(query, window, cx)
+    }
+
+    fn render_item(
+        &self,
+        _: IndexPath,
+        item: &Self::Item,
+        checked: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(item.render(window, cx))
+                .child(
+                    Icon::new(IconName::Check)
+                        .xsmall()
+                        .when(!checked, Styled::invisible),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 #[must_use]
 pub fn app_input(state: &Entity<InputState>) -> Input {
-    Input::new(state).w_full().px(px(8.0))
+    Input::new(state)
+        .w_full()
+        .px(px(8.0))
+        .bg(rgb(theme::SURFACE))
 }
 
 #[must_use]
@@ -46,17 +115,24 @@ pub fn app_masked_input(state: &Entity<InputState>, disabled: bool) -> Div {
             cx.stop_propagation();
             window.dispatch_action(Box::new(DeleteToEndOfLine), cx);
         })
-        .child(app_input(state).disabled(disabled))
+        .child(
+            app_input(state)
+                .role(gpui::accesskit::Role::PasswordInput)
+                .disabled(disabled),
+        )
 }
 
 #[must_use]
 pub fn app_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    app_button_base(id).child(app_button_label(label))
+    let label: SharedString = label.into();
+    app_button_base(id)
+        .accessibility_label(label.clone())
+        .child(app_button_label(label))
 }
 
 #[must_use]
 pub fn app_button_base(id: impl Into<ElementId>) -> Button {
-    Button::new(id)
+    Button::new(id).secondary()
 }
 
 #[must_use]
@@ -64,17 +140,36 @@ pub fn app_segment_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     selected: bool,
+    disabled: bool,
     accessory: Option<AnyElement>,
 ) -> Button {
-    app_button_base(id).selected(selected).child(
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .child(app_button_label(label))
-            .children(accessory),
-    )
+    let label: SharedString = label.into();
+    app_button_base(id)
+        .accessibility_label(label.clone())
+        .selected(selected)
+        .disabled(disabled)
+        .when(!disabled, |button| {
+            button
+                .bg(if selected {
+                    rgb(theme::SURFACE_HOVER)
+                } else {
+                    gpui::transparent_black().into()
+                })
+                .text_color(rgb(if selected {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_MUTED
+                }))
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(app_button_label(label))
+                .children(accessory),
+        )
 }
 
 #[must_use]
@@ -157,7 +252,7 @@ mod tests {
         let cx = VisualTestContext::from_window(*window, cx).into_mut();
 
         cx.update(|window, app| {
-            input.read(app).focus_handle(app).focus(window);
+            input.read(app).focus_handle(app).focus(window, app);
         });
         cx.refresh().expect("refresh masked input test window");
         cx.run_until_parked();

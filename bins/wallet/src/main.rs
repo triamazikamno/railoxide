@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use eyre::{Result, WrapErr};
-use gpui::{App, Application};
+use gpui::App;
 use railgun_ui::DEFAULT_CHAINS;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -96,9 +96,9 @@ fn main() -> Result<()> {
     let chain_ids = DEFAULT_CHAINS.to_vec();
     let runtime_guard = runtime.enter();
     let wallet_options = WalletAppOptions::try_from(opts)?;
-    let application = Application::new().with_assets(WalletAssets);
+    let application = gpui_kit::application().with_assets(WalletAssets);
     application.run(move |app: &mut App| {
-        gpui_component::init(app);
+        gpui_kit::init(app);
         ui::theme::apply_zenburn_component_theme(app);
         install_quit_behavior(app);
         #[cfg(all(target_os = "macos", feature = "heap-profiling"))]
@@ -257,7 +257,7 @@ fn install_tracing(logs: LogStore) -> Result<()> {
 
 fn install_quit_behavior(app: &mut App) {
     app.on_action(|_: &Quit, cx| cx.quit());
-    app.on_window_closed(|cx| {
+    app.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
             cx.quit();
         }
@@ -269,6 +269,7 @@ fn install_quit_behavior(app: &mut App) {
         app.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
         app.set_menus(vec![gpui::Menu {
             name: "RailOxide".into(),
+            disabled: false,
             items: vec![
                 gpui::MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
                 gpui::MenuItem::separator(),

@@ -12,10 +12,10 @@ use super::{
     PendingSoftwareProfileOpen, RememberedWalletKind, SearchableVec, Styled, VaultError,
     VaultState, ViewUnlock, WalletMetadataBundle, WalletOption, WalletRoot, WalletSetupMode,
     WalletTab, Window, WindowExt, Zeroizing, app_strong_text, default_wallet_label_for_metadata,
-    dialog_content_max_height, dialog_max_height, hardware_device_kind_from_wallet_select_value,
-    px, scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
-    vault_error_message, visible_wallet_metadata, wallet_options_from_metadata,
-    wallet_select_items_from_metadata, wallet_select_value_for_selected_wallet,
+    dialog_max_height, hardware_device_kind_from_wallet_select_value, px,
+    secondary_dialog_content_width, vault_error_kind, vault_error_message, visible_wallet_metadata,
+    wallet_options_from_metadata, wallet_select_items_from_metadata,
+    wallet_select_value_for_selected_wallet,
 };
 
 const PENDING_SOFTWARE_PROFILE_OPEN_TIMEOUT: Duration = Duration::from_mins(5);
@@ -194,20 +194,19 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Add wallet"))
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_add_wallet_dialog_content(content_root.clone(), content_width),
-                ))
+                )
         });
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);

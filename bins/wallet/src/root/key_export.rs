@@ -14,8 +14,8 @@ use wallet_ops::vault::{
 use zeroize::Zeroizing;
 
 use super::{
-    APP_TEXT_SIZE, WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
-    scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+    APP_TEXT_SIZE, WalletRoot, dialog_max_height, new_masked_input, secondary_dialog_content_width,
+    vault_error_kind,
 };
 
 pub(in crate::root) const WALLET_EXPORT_MENU_LABEL: &str = "Export keys";
@@ -104,8 +104,11 @@ impl KeyExportPasswordDialogContent {
         }
     }
 
-    fn focus_password(&self, window: &mut Window, cx: &Context<'_, Self>) {
-        self.password_input.read(cx).focus_handle(cx).focus(window);
+    fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.password_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -193,7 +196,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(KEY_EXPORT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -207,12 +209,11 @@ impl WalletRoot {
                         root.clear_key_export_dialog_state(window, cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_key_export_dialog_content(&content_root, content_width),
-                ))
+                )
         });
     }
 
@@ -240,6 +241,7 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .title(app_strong_text(key_export_password_dialog_title(kind)))
                 .child(div().w(content_width).child(content.clone()))
         });

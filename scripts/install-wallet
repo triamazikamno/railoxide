@@ -16,10 +16,6 @@ verbose=0
 source_mode="release"
 source_ref=""
 source_mode_set=0
-macos_shader_mode="auto"
-macos_shader_mode_set=0
-macos_build_features=""
-macos_build_developer_dir=""
 
 usage() {
   cat <<'EOF'
@@ -39,8 +35,6 @@ Options:
   --ref REF              Build a specific tag, branch, or commit without prompting
   --no-deps              Do not install missing system dependencies
   --no-hardware          Build without hardware-wallet support
-  --metal                On macOS, require build-time Metal shader compilation
-  --runtime-shaders      On macOS, force runtime shaders instead of Metal
   -y, --yes              Do not prompt before dependency installs/downloads
   --dry-run              Print what would happen without changing anything
   --verbose              Print commands as they run
@@ -54,10 +48,6 @@ EOF
 
 log() {
   printf '==> %s\n' "$*" >&2
-}
-
-warn() {
-  printf 'warning: %s\n' "$*" >&2
 }
 
 die() {
@@ -201,15 +191,10 @@ parse_args() {
         shift
         ;;
       --metal)
-        [[ "$macos_shader_mode_set" -eq 0 ]] || die '--metal and --runtime-shaders cannot be combined'
-        macos_shader_mode="metal"
-        macos_shader_mode_set=1
-        shift
+        die '--metal is not supported. Run the installer without it; Metal GPU acceleration is enabled automatically on macOS.'
         ;;
       --runtime-shaders)
-        [[ "$macos_shader_mode_set" -eq 0 ]] || die '--metal and --runtime-shaders cannot be combined'
-        macos_shader_mode="runtime"
-        macos_shader_mode_set=1
+        # Accepted for compatibility with existing install commands.
         shift
         ;;
       -y|--yes)
@@ -267,7 +252,6 @@ dry_run_plan() {
   printf 'hardware support: %s\n' "$([[ "$hardware" -eq 1 ]] && printf yes || printf no)"
   printf 'detected OS: %s\n' "$os_name"
   if [[ "$os_name" == "Darwin" ]]; then
-    printf 'macOS shader mode: %s\n' "$macos_shader_mode"
     printf 'would install: ~/Applications/RailOxide.app and %s/bin/railoxide-wallet\n' "$prefix"
   elif [[ "$os_name" == "Linux" ]]; then
     printf 'would install: %s/bin/railoxide-wallet\n' "$prefix"
@@ -330,103 +314,6 @@ ensure_macos_command_line_tools() {
   fi
 
   die "Apple Command Line Tools are required to build RailOxide"
-}
-
-full_xcode_developer_dir() {
-  if [[ -n "${DEVELOPER_DIR:-}" && -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
-    printf '%s\n' "$DEVELOPER_DIR"
-    return 0
-  fi
-
-  local selected=""
-  selected="$(xcode-select -p 2>/dev/null || true)"
-  if [[ "$selected" == */Xcode.app/Contents/Developer && -x "$selected/usr/bin/xcodebuild" ]]; then
-    printf '%s\n' "$selected"
-    return 0
-  fi
-
-  if [[ -x "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild" ]]; then
-    printf '%s\n' "/Applications/Xcode.app/Contents/Developer"
-    return 0
-  fi
-
-  return 1
-}
-
-has_metal_tools() {
-  local developer_dir="$1"
-  env DEVELOPER_DIR="$developer_dir" xcrun --find metal >/dev/null 2>&1 && \
-    env DEVELOPER_DIR="$developer_dir" xcrun --find metallib >/dev/null 2>&1
-}
-
-maybe_download_metal_toolchain() {
-  local developer_dir="$1"
-
-  [[ "$install_deps" -eq 1 ]] || return 1
-
-  if confirm "Full Xcode is installed, but Metal tools are missing. Download the Metal toolchain component?"; then
-    log 'downloading Xcode Metal toolchain component'
-    if run env DEVELOPER_DIR="$developer_dir" xcodebuild -downloadComponent MetalToolchain; then
-      has_metal_tools "$developer_dir"
-      return $?
-    fi
-  fi
-
-  return 1
-}
-
-runtime_shader_features() {
-  local feature_prefix="$1"
-
-  if [[ -n "$feature_prefix" ]]; then
-    printf '%s,gpui/runtime_shaders\n' "$feature_prefix"
-  else
-    printf 'gpui/runtime_shaders\n'
-  fi
-}
-
-set_macos_build_settings() {
-  local feature_prefix=""
-  if [[ "$hardware" -eq 1 ]]; then
-    feature_prefix="hardware"
-  fi
-
-  macos_build_features=""
-  macos_build_developer_dir=""
-
-  if [[ "$macos_shader_mode" == "runtime" ]]; then
-    macos_build_features="$(runtime_shader_features "$feature_prefix")"
-    return
-  fi
-
-  local developer_dir=""
-  if developer_dir="$(full_xcode_developer_dir)"; then
-    if has_metal_tools "$developer_dir"; then
-      log "using Xcode Metal shader compilation from $developer_dir"
-      macos_build_developer_dir="$developer_dir"
-      macos_build_features="$feature_prefix"
-      return
-    fi
-
-    if maybe_download_metal_toolchain "$developer_dir"; then
-      log "using Xcode Metal shader compilation from $developer_dir"
-      macos_build_developer_dir="$developer_dir"
-      macos_build_features="$feature_prefix"
-      return
-    fi
-
-    if [[ "$macos_shader_mode" == "metal" ]]; then
-      die 'Metal build was requested, but full Xcode Metal tools are unavailable'
-    fi
-
-    warn 'full Xcode is installed, but Metal tools are unavailable; falling back to runtime shaders'
-  elif [[ "$macos_shader_mode" == "metal" ]]; then
-    die 'Metal build was requested, but full Xcode is not installed'
-  else
-    log 'full Xcode not found; using runtime shaders'
-  fi
-
-  macos_build_features="$(runtime_shader_features "$feature_prefix")"
 }
 
 ensure_linux_packages() {
@@ -691,18 +578,17 @@ install_linux_desktop_entry() {
 
 build_and_install_macos() {
   local features app_src app_dst wrapper
-  set_macos_build_settings
-  features="$macos_build_features"
+  features="$(base_features)"
+  # Older release/ref checkouts need the legacy feature to use runtime shaders.
+  if grep -qx 'name = "gpui"' "$source_dir/Cargo.lock"; then
+    features="${features:+$features,}gpui/runtime_shaders"
+  fi
   app_src="$source_dir/target/macos/RailOxide.app"
   app_dst="$HOME/Applications/RailOxide.app"
   wrapper="$prefix/bin/railoxide-wallet"
 
-  log "packaging RailOxide.app with features: ${features:-none}"
-  if [[ -n "$macos_build_developer_dir" ]]; then
-    run env DEVELOPER_DIR="$macos_build_developer_dir" CARGO_TOOLCHAIN="$toolchain" CARGO_FEATURES="$features" "$source_dir/scripts/package-wallet-macos"
-  else
-    run env CARGO_TOOLCHAIN="$toolchain" CARGO_FEATURES="$features" "$source_dir/scripts/package-wallet-macos"
-  fi
+  log 'building RailOxide.app'
+  run env CARGO_TOOLCHAIN="$toolchain" CARGO_FEATURES="$features" "$source_dir/scripts/package-wallet-macos"
 
   if [[ -d "$app_dst" ]]; then
     if confirm "Replace existing $app_dst?"; then

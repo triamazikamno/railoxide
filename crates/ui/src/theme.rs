@@ -62,13 +62,13 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     let theme = gpui_component::Theme::global_mut(cx);
     theme.shadow = false;
     theme.tile_shadow = false;
+    theme.focus_ring = false;
 
     let rgb = |value: u32| -> Hsla { rgb(value).into() };
     let colors = &mut theme.colors;
     colors.accent = rgb(SURFACE_HOVER);
     colors.accent_foreground = rgb(TEXT);
     colors.accordion = rgb(SURFACE);
-    colors.accordion_hover = rgb(SURFACE_HOVER);
     colors.background = rgb(SURFACE);
     colors.border = rgb(BORDER);
     colors.group_box = rgb(SURFACE_ELEVATED);
@@ -134,8 +134,8 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.success_foreground = rgb(PRIMARY_FOREGROUND);
     colors.success_hover = rgb(0x8fb28f);
     colors.success_active = rgb(0x5f7f5f);
-    colors.bullish = rgb(SUCCESS);
-    colors.bearish = rgb(DANGER);
+    colors.chart_bullish = rgb(SUCCESS);
+    colors.chart_bearish = rgb(DANGER);
     colors.switch = rgb(SURFACE_HOVER);
     colors.switch_thumb = rgb(SURFACE);
     colors.tab = rgb(SURFACE);
@@ -174,4 +174,38 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.magenta_light = rgb(0xec93d3);
     colors.cyan = rgb(PRIMARY);
     colors.cyan_light = rgb(INFO);
+
+    // Buttons now have independent colors instead of inheriting the generic palette.
+    colors.button = colors.secondary;
+    colors.button_active = colors.secondary_active;
+    colors.button_foreground = colors.secondary_foreground;
+    colors.button_hover = colors.secondary_hover;
+    colors.button_primary = colors.primary;
+    colors.button_primary_active = colors.primary_active;
+    colors.button_primary_foreground = colors.primary_foreground;
+    colors.button_primary_hover = colors.primary_hover;
+    colors.button_secondary = colors.secondary;
+    colors.button_secondary_active = colors.secondary_active;
+    colors.button_secondary_foreground = colors.secondary_foreground;
+    colors.button_secondary_hover = colors.secondary_hover;
+    colors.button_danger = colors.danger;
+    colors.button_danger_active = colors.danger_active;
+    colors.button_danger_foreground = colors.danger_foreground;
+    colors.button_danger_hover = colors.danger_hover;
+    colors.button_info = colors.info;
+    colors.button_info_active = colors.info_active;
+    colors.button_info_foreground = colors.info_foreground;
+    colors.button_info_hover = colors.info_hover;
+    colors.button_success = colors.success;
+    colors.button_success_active = colors.success_active;
+    colors.button_success_foreground = colors.success_foreground;
+    colors.button_success_hover = colors.success_hover;
+    colors.button_warning = colors.warning;
+    colors.button_warning_active = colors.warning_active;
+    colors.button_warning_foreground = colors.warning_foreground;
+    colors.button_warning_hover = colors.warning_hover;
+
+    // Components paint token backgrounds; Base also owns scrollbar and resize styles.
+    theme.tokens = theme.colors.into();
+    gpui_component::Theme::sync_base(cx);
 }

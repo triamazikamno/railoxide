@@ -6,11 +6,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
-    IconName, Sizable, WindowExt,
-    dialog::DialogButtonProps,
-    divider::Divider,
+    Icon, IconName, Sizable, WindowExt,
     menu::{DropdownMenu, PopupMenuItem},
     select::{Select, SelectItem},
+    separator::Separator,
     tooltip::Tooltip,
 };
 use railgun_ui::{chain_icon_asset_path, chain_name};
@@ -23,6 +22,7 @@ use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSou
 use crate::assets::{
     LEDGER_LOGO_SHORT_WHITE_ICON_PATH, RailgunActionIcon, TREZOR_SYMBOL_WHITE_ICON_PATH,
 };
+use crate::root::ui_helpers::dialog_footer;
 
 use super::key_export::WALLET_EXPORT_MENU_LABEL;
 use super::utxo::short_hash;
@@ -31,8 +31,8 @@ use super::vault::{
     hardware_wallet_display_info, passphrase_open_action_is_eligible,
 };
 use super::{
-    APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, dialog_content_max_height,
-    dialog_max_height, scrollable_dialog_content, secondary_dialog_content_width,
+    APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, dialog_max_height,
+    secondary_dialog_content_width,
 };
 
 #[derive(Clone)]
@@ -145,7 +145,6 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let submit_root = root.clone();
@@ -154,17 +153,15 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Repair wallet cache"))
-                .button_props(DialogButtonProps::default().ok_text("Repair"))
-                .footer(|ok, _, window, cx| vec![ok(window, cx)])
+                .footer(dialog_footer("Repair", false))
                 .on_ok(move |_event, _window, cx| {
                     submit_root.update(cx, Self::repair_wallet_cache_from_input)
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
+                .child(
                     content_root
                         .read(cx)
                         .render_repair_cache_dialog_content(content_width),
-                ))
+                )
         });
     }
 
@@ -210,11 +207,9 @@ impl WalletRoot {
             .child(
                 app_button_base("wallet-lock-vault")
                     .outline()
-                    .xsmall()
-                    .px(px(5.0))
-                    .py(px(12.0))
+                    .accessibility_label("Lock vault")
                     .tooltip("Lock vault")
-                    .child(img(icons::lock_icon_path()).size(px(18.0)).flex_none())
+                    .icon(Icon::default().path(icons::lock_icon_path()))
                     .on_click(move |_event, window, cx| {
                         lock_root.update(cx, |root, cx| {
                             root.lock_vault(window, cx);
@@ -249,6 +244,7 @@ impl WalletRoot {
             .xsmall()
             .h(px(24.0))
             .w(px(28.0))
+            .accessibility_label("Wallet actions")
             .tooltip("Wallet actions")
             .icon(IconName::Ellipsis)
             .dropdown_menu(move |menu, _window, _cx| {
@@ -515,7 +511,7 @@ fn render_hardware_wallet_chip(info: HardwareWalletDisplayInfo) -> impl IntoElem
 }
 
 fn header_divider() -> impl IntoElement {
-    Divider::vertical()
+    Separator::vertical()
         .h(px(18.0))
         .mx(px(2.0))
         .color(rgb(theme::BORDER))

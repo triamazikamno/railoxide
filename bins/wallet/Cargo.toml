@@ -21,7 +21,8 @@ eyre = { workspace = true }
 futures-util = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
-gpui-component-assets = { workspace = true }
+gpui-kit = { workspace = true }
+gpui-kit-assets = { workspace = true }
 markdown = "=1.0.0"
 qrcodegen = { workspace = true }
 rand = { workspace = true }

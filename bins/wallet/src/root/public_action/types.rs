@@ -669,6 +669,27 @@ pub(in crate::root) struct PublicActionGasRetryDialogContent {
 }
 
 impl PublicActionGasRetryDialogContent {
+    pub(in crate::root) fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let (max_fee, max_tip) = match self.gas_inputs.parse(cx) {
+            Ok(values) => values,
+            Err(error) => {
+                self.error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.root.update(cx, |root, cx| {
+            root.submit_public_action_gas_retry(
+                self.generation,
+                self.retry_kind,
+                max_fee,
+                max_tip,
+                cx,
+            );
+        });
+        window.close_dialog(cx);
+    }
+
     pub(in crate::root) fn new(
         root: Entity<WalletRoot>,
         generation: u64,
@@ -721,11 +742,7 @@ impl gpui::Render for PublicActionGasRetryDialogContent {
                 "Network fees changed. Review the updated Railway Standard fee to continue."
             }
         };
-        let submit_root = self.root.clone();
-        let gas_inputs = self.gas_inputs.clone();
-        let generation = self.generation;
         let retry_kind = self.retry_kind;
-        let dialog = cx.entity();
         div()
             .w_full()
             .flex()
@@ -762,24 +779,11 @@ impl gpui::Render for PublicActionGasRetryDialogContent {
                         )
                         .primary()
                         .flex_none()
-                        .on_click(move |_event, window, cx| {
-                            let (max_fee, max_tip) = match gas_inputs.parse(cx) {
-                                Ok(values) => values,
-                                Err(error) => {
-                                    dialog.update(cx, |this, cx| {
-                                        this.error = Some(Arc::from(error));
-                                        cx.notify();
-                                    });
-                                    return;
-                                }
-                            };
-                            submit_root.update(cx, |root, cx| {
-                                root.submit_public_action_gas_retry(
-                                    generation, retry_kind, max_fee, max_tip, cx,
-                                );
-                            });
-                            window.close_dialog(cx);
-                        }),
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.submit(window, cx);
+                            },
+                        )),
                     ),
             )
     }

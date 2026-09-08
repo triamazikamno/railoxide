@@ -1,8 +1,8 @@
 use super::*;
 use crate::root::manage_wallets::{
-    WalletManagementDeleteKind, restart_selected_wallet_sync_after_deletion,
-    wallet_management_delete_kind, wallet_management_delete_requires_device,
-    wallet_management_delete_uses_dialog, wallet_management_deletion_affects_selected_wallet,
+    WalletManagementDeleteKind, complete_active_wallet_order,
+    restart_selected_wallet_sync_after_deletion, wallet_management_delete_kind,
+    wallet_management_delete_requires_device, wallet_management_deletion_affects_selected_wallet,
     wallet_management_preserves_hidden_delete_session, wallet_management_switch_requires_device,
 };
 use crate::root::vault::{
@@ -61,20 +61,6 @@ fn hardware_delete_requires_matching_open_session() {
         "software-wallet",
         WalletSource::Generated,
         None,
-    ));
-}
-
-#[test]
-fn software_wallet_deletion_uses_the_shared_dialog() {
-    assert!(wallet_management_delete_uses_dialog(
-        WalletSource::Generated
-    ));
-    assert!(wallet_management_delete_uses_dialog(WalletSource::Imported));
-    assert!(!wallet_management_delete_uses_dialog(
-        WalletSource::LedgerDerived
-    ));
-    assert!(!wallet_management_delete_uses_dialog(
-        WalletSource::TrezorDerived
     ));
 }
 
@@ -205,7 +191,6 @@ fn whole_profile_deletion_of_selected_child_requires_profile_cleanup() {
 fn reopening_management_preserves_in_flight_deletion_guard() {
     let mut state = ManageWalletsState::default();
     state.editing_wallet_id = Some(Arc::from("editing"));
-    state.pending_delete_wallet_id = Some(Arc::from("pending"));
     state.deleting_wallet_id = Some(Arc::from("deleting"));
     state.hardware_delete_wallet_id = Some(Arc::from("hardware"));
     state.error = Some(Arc::from("error"));
@@ -215,7 +200,6 @@ fn reopening_management_preserves_in_flight_deletion_guard() {
     assert_eq!(state.deleting_wallet_id.as_deref(), Some("deleting"));
     assert_eq!(state.hardware_delete_wallet_id.as_deref(), Some("hardware"));
     assert!(state.editing_wallet_id.is_none());
-    assert!(state.pending_delete_wallet_id.is_none());
     assert!(state.error.is_none());
 }
 
@@ -1594,6 +1578,88 @@ fn wallet_ids_after_drop_moves_active_wallets_between_drop_zones() {
     );
     assert_eq!(wallet_ids_after_drop(&active, "wallet-b", 1), None);
     assert_eq!(wallet_ids_after_drop(&active, "missing", 1), None);
+}
+
+#[test]
+fn wallet_drop_preserves_concealed_active_wallets_in_persisted_order() {
+    let first = wallet_metadata(
+        "wallet-a",
+        "Alpha",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        0,
+    );
+    let mut concealed = wallet_metadata(
+        "concealed-child",
+        "Concealed child",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        1,
+    );
+    concealed.software_context = Some(wallet_ops::vault::WalletSoftwareContext::passphrase(
+        "wallet-a",
+    ));
+    let second = wallet_metadata(
+        "wallet-b",
+        "Beta",
+        WalletSource::LedgerDerived,
+        WalletStatus::Active,
+        2,
+    );
+    let inactive = wallet_metadata(
+        "inactive-wallet",
+        "Inactive",
+        WalletSource::Imported,
+        WalletStatus::Inactive,
+        3,
+    );
+    let metadata = vec![first, concealed, second, inactive];
+    let visible = crate::root::vault::visible_wallet_metadata(&metadata, None);
+    let active_ids = active_wallet_management_rows(&visible)
+        .into_iter()
+        .map(|metadata| Arc::from(metadata.wallet_uuid))
+        .collect::<Vec<_>>();
+
+    let visible_order = wallet_ids_after_drop(&active_ids, "wallet-b", 0)
+        .expect("moving the second visible wallet to the first slot changes the order");
+    let persisted_order = complete_active_wallet_order(&metadata, &visible_order)
+        .expect("visible wallet order should retain all active wallets");
+
+    assert_eq!(
+        persisted_order,
+        vec!["wallet-b", "concealed-child", "wallet-a"]
+    );
+}
+
+#[test]
+fn complete_active_wallet_order_rejects_stale_or_duplicate_ids() {
+    let metadata = vec![
+        wallet_metadata(
+            "wallet-a",
+            "Alpha",
+            WalletSource::Imported,
+            WalletStatus::Active,
+            0,
+        ),
+        wallet_metadata(
+            "inactive-wallet",
+            "Inactive",
+            WalletSource::Imported,
+            WalletStatus::Inactive,
+            1,
+        ),
+    ];
+    for requested in [
+        vec!["wallet-a", "missing"],
+        vec!["wallet-a", "wallet-a"],
+        vec!["wallet-a", "inactive-wallet"],
+    ] {
+        let requested = requested.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert!(matches!(
+            complete_active_wallet_order(&metadata, &requested),
+            Err(wallet_ops::vault::VaultError::InvalidWalletOrder)
+        ));
+    }
 }
 
 #[test]

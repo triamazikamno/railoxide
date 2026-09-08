@@ -9,7 +9,6 @@ use gpui_component::{
     Icon, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariants},
-    dialog::DialogButtonProps,
     input::InputState,
     scroll::ScrollableElement,
 };
@@ -22,11 +21,12 @@ use wallet_ops::{
 };
 
 use crate::assets::RailgunActionIcon;
+use crate::root::ui_helpers::dialog_footer;
 
 use super::utxo::short_hash;
 use super::{
-    WalletRoot, app_status_tag, dialog_content_max_height, dialog_max_height,
-    scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+    ConfirmationDialogProps, WalletRoot, app_status_tag, confirmation_dialog, dialog_max_height,
+    secondary_dialog_content_width, vault_error_kind,
 };
 
 const ADDRESS_BOOK_CONTENT_WIDTH: Pixels = px(980.0);
@@ -100,10 +100,6 @@ impl AddressBookEntryTarget {
             entry_uuid: entry_uuid.into(),
         }
     }
-
-    fn matches(&self, kind: AddressBookEntryKind, entry_uuid: &str) -> bool {
-        self.kind == kind && self.entry_uuid.as_ref() == entry_uuid
-    }
 }
 
 pub(super) struct AddressBookState {
@@ -114,7 +110,6 @@ pub(super) struct AddressBookState {
     pub(super) edit_address_input: Entity<InputState>,
     pub(super) search_query: Arc<str>,
     pub(super) editing_entry: Option<AddressBookEntryTarget>,
-    pub(super) pending_delete: Option<AddressBookEntryTarget>,
     pub(super) error: Option<Arc<str>>,
 }
 
@@ -125,7 +120,6 @@ impl AddressBookState {
         cx: &mut Context<'_, WalletRoot>,
     ) {
         self.editing_entry = None;
-        self.pending_delete = None;
         self.error = None;
         self.add_label_input
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -338,7 +332,7 @@ impl WalletRoot {
             return section.child(address_book_empty_state(&self.address_book.search_query));
         }
         for entry in entries {
-            section = section.child(self.render_private_address_book_row(root, entry));
+            section = section.child(Self::render_private_address_book_row(root, entry));
         }
         section
     }
@@ -358,18 +352,17 @@ impl WalletRoot {
             return section.child(address_book_empty_state(&self.address_book.search_query));
         }
         for entry in entries {
-            section = section.child(self.render_public_address_book_row(root, entry));
+            section = section.child(Self::render_public_address_book_row(root, entry));
         }
         section
     }
 
     fn render_private_address_book_row(
-        &self,
         root: &Entity<Self>,
         entry: &PrivateAddressBookEntry,
     ) -> gpui::AnyElement {
         let display_address = short_hash(&entry.address);
-        self.render_address_book_row(
+        Self::render_address_book_row(
             root,
             AddressBookEntryKind::Private,
             &entry.entry_uuid,
@@ -379,12 +372,11 @@ impl WalletRoot {
     }
 
     fn render_public_address_book_row(
-        &self,
         root: &Entity<Self>,
         entry: &PublicAddressBookEntry,
     ) -> gpui::AnyElement {
         let display_address = short_address(&entry.address);
-        self.render_address_book_row(
+        Self::render_address_book_row(
             root,
             AddressBookEntryKind::Public,
             &entry.entry_uuid,
@@ -394,18 +386,12 @@ impl WalletRoot {
     }
 
     fn render_address_book_row(
-        &self,
         root: &Entity<Self>,
         kind: AddressBookEntryKind,
         entry_uuid: &str,
         label: &str,
         display_address: &str,
     ) -> gpui::AnyElement {
-        let confirming_delete = self
-            .address_book
-            .pending_delete
-            .as_ref()
-            .is_some_and(|target| target.matches(kind, entry_uuid));
         let row_group = SharedString::from(format!("address-book-row-group-{entry_uuid}"));
 
         div()
@@ -439,10 +425,7 @@ impl WalletRoot {
                     ),
             )
             .child(Self::render_address_book_row_actions(
-                root,
-                kind,
-                entry_uuid,
-                confirming_delete,
+                root, kind, entry_uuid, label,
             ))
             .into_any_element()
     }
@@ -451,89 +434,67 @@ impl WalletRoot {
         root: &Entity<Self>,
         kind: AddressBookEntryKind,
         entry_uuid: &str,
-        confirming_delete: bool,
+        label: &str,
     ) -> gpui::Div {
-        let target = AddressBookEntryTarget::new(kind, Arc::<str>::from(entry_uuid));
         let edit_root = root.clone();
         let delete_root = root.clone();
-        let cancel_root = root.clone();
-        let edit_target = target.clone();
-        let delete_target = target.clone();
-        let cancel_target = target;
-        let mut actions = div().flex().items_center().gap_2();
-
-        if confirming_delete {
-            actions = actions
-                .child(
-                    app_button(
-                        SharedString::from(format!(
-                            "wallet-address-book-confirm-delete-{entry_uuid}"
-                        )),
-                        "Confirm delete",
-                    )
-                    .danger()
-                    .xsmall()
-                    .on_click(move |_event, window, cx| {
-                        let target = delete_target.clone();
-                        delete_root.update(cx, |root, cx| {
-                            root.delete_address_book_entry(&target, window, cx);
-                        });
-                    }),
+        let edit_target = AddressBookEntryTarget::new(kind, Arc::<str>::from(entry_uuid));
+        let delete_target = edit_target.clone();
+        let label = label.to_owned();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                address_book_icon_button(
+                    SharedString::from(format!("wallet-address-book-edit-{entry_uuid}")),
+                    Icon::new(RailgunActionIcon::Pencil),
+                    "Edit entry",
                 )
-                .child(
-                    app_button(
-                        SharedString::from(format!(
-                            "wallet-address-book-cancel-delete-{entry_uuid}"
-                        )),
-                        "Cancel",
-                    )
-                    .outline()
-                    .xsmall()
-                    .on_click(move |_event, _window, cx| {
-                        let target = cancel_target.clone();
-                        cancel_root.update(cx, |root, cx| {
-                            if root.address_book.pending_delete.as_ref() == Some(&target) {
-                                root.address_book.pending_delete = None;
-                                root.address_book.error = None;
-                                cx.notify();
-                            }
-                        });
-                    }),
-                );
-        } else {
-            actions = actions
-                .child(
-                    address_book_icon_button(
-                        SharedString::from(format!("wallet-address-book-edit-{entry_uuid}")),
-                        Icon::new(RailgunActionIcon::Pencil),
-                        "Edit entry",
-                    )
-                    .on_click(move |_event, window, cx| {
-                        let target = edit_target.clone();
-                        edit_root.update(cx, |root, cx| {
-                            root.open_address_book_edit_dialog(&target, window, cx);
-                        });
-                    }),
+                .on_click(move |_event, window, cx| {
+                    edit_root.update(cx, |root, cx| {
+                        root.open_address_book_edit_dialog(&edit_target, window, cx);
+                    });
+                }),
+            )
+            .child(
+                address_book_icon_button(
+                    SharedString::from(format!("wallet-address-book-delete-{entry_uuid}")),
+                    Icon::new(RailgunActionIcon::Trash2),
+                    "Delete entry",
                 )
-                .child(
-                    address_book_icon_button(
-                        SharedString::from(format!("wallet-address-book-delete-{entry_uuid}")),
-                        Icon::new(RailgunActionIcon::Trash2),
-                        "Delete entry",
-                    )
-                    .danger()
-                    .on_click(move |_event, _window, cx| {
-                        let target = delete_target.clone();
-                        delete_root.update(cx, |root, cx| {
-                            root.address_book.pending_delete = Some(target);
-                            root.address_book.error = None;
-                            cx.notify();
-                        });
-                    }),
-                );
-        }
-
-        actions
+                .danger()
+                .on_click(move |_event, window, cx| {
+                    let root = delete_root.clone();
+                    let target = delete_target.clone();
+                    let label = label.clone();
+                    let dialog_width =
+                        (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
+                    let dialog_max_height = dialog_max_height(window);
+                    window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+                        let confirm_root = root.clone();
+                        let target = target.clone();
+                        confirmation_dialog(
+                            dialog,
+                            ConfirmationDialogProps::danger(
+                                "Delete address-book entry?",
+                                "This removes the saved recipient from your address book.",
+                                None,
+                                "Delete entry",
+                            ),
+                            dialog_width,
+                            dialog_max_height,
+                        )
+                        .child(app_strong_text(label.clone()).whitespace_normal())
+                        .on_ok(move |_event, window, cx| {
+                            confirm_root.update(cx, |root, cx| {
+                                root.delete_address_book_entry(&target, window, cx);
+                            });
+                            true
+                        })
+                    });
+                }),
+            )
     }
 
     fn open_address_book_add_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -545,7 +506,6 @@ impl WalletRoot {
         let focus_label_input = add_label_input.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -556,10 +516,10 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(AddressBookDialogMode::Add.title()))
-                .button_props(
-                    DialogButtonProps::default().ok_text(AddressBookDialogMode::Add.action_label()),
-                )
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(
+                    AddressBookDialogMode::Add.action_label(),
+                    true,
+                ))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.address_book.clear_dialog_state(window, cx);
@@ -570,20 +530,20 @@ impl WalletRoot {
                         root.add_address_book_entry_from_dialog(window, cx)
                     })
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_address_book_dialog_content(
-                        AddressBookDialogMode::Add,
-                        content_width,
-                        &add_label_input,
-                        &add_address_input,
-                        error.as_ref(),
-                        cx,
-                    ),
+                .child(render_address_book_dialog_content(
+                    AddressBookDialogMode::Add,
+                    content_width,
+                    &add_label_input,
+                    &add_address_input,
+                    error.as_ref(),
+                    cx,
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {
-            focus_label_input.read(cx).focus_handle(cx).focus(window);
+            focus_label_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
         });
     }
 
@@ -615,7 +575,6 @@ impl WalletRoot {
         let focus_label_input = edit_label_input.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let mode = AddressBookDialogMode::Edit(target.kind);
         window.open_dialog(cx, move |dialog, _window, cx| {
@@ -627,8 +586,7 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(mode.title()))
-                .button_props(DialogButtonProps::default().ok_text(mode.action_label()))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer(mode.action_label(), true))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.address_book.clear_dialog_state(window, cx);
@@ -639,20 +597,20 @@ impl WalletRoot {
                         root.update_address_book_entry_from_dialog(window, cx)
                     })
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    render_address_book_dialog_content(
-                        mode,
-                        content_width,
-                        &edit_label_input,
-                        &edit_address_input,
-                        error.as_ref(),
-                        cx,
-                    ),
+                .child(render_address_book_dialog_content(
+                    mode,
+                    content_width,
+                    &edit_label_input,
+                    &edit_address_input,
+                    error.as_ref(),
+                    cx,
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {
-            focus_label_input.read(cx).focus_handle(cx).focus(window);
+            focus_label_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
         });
     }
 
@@ -821,7 +779,6 @@ impl WalletRoot {
         match result {
             Ok(()) => {
                 self.address_book.error = None;
-                self.address_book.pending_delete = None;
                 self.address_book.editing_entry = None;
                 self.reload_address_books(cx);
                 true
@@ -941,10 +898,12 @@ fn address_book_icon_button(
     icon: impl Into<Icon>,
     tooltip: impl Into<SharedString>,
 ) -> Button {
+    let tooltip: SharedString = tooltip.into();
     Button::new(id)
         .icon(icon)
         .ghost()
         .small()
+        .accessibility_label(tooltip.clone())
         .tooltip(tooltip)
         .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
             cx.stop_propagation();

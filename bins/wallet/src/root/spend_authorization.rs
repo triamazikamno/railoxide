@@ -14,7 +14,6 @@ use gpui_component::{
     button::{Button, ButtonGroup, ButtonVariants},
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList},
-    dialog::DialogButtonProps,
     input::{InputEvent, InputState},
     spinner::Spinner,
     tooltip::Tooltip,
@@ -41,16 +40,14 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
+use crate::root::ui_helpers::dialog_footer;
 
 use super::governance_action::GovernanceSpendDraft;
 use super::private_action::UnshieldAssetKey;
 use super::public_action::{PublicSendDraft, PublicShieldDraft};
 use super::vault::hardware_device_label;
 use super::walletconnect::WalletConnectReviewedFeeProjection;
-use super::{
-    WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
-    scrollable_dialog_content, secondary_dialog_content_width,
-};
+use super::{WalletRoot, dialog_max_height, new_masked_input, secondary_dialog_content_width};
 
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
 const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "Spending remains authorized for the selected lifetime without re-entering the password. Only use this on a trusted device.";
@@ -579,8 +576,11 @@ impl SpendAuthorizationDialogContent {
         }
     }
 
-    fn focus_password(&self, window: &mut Window, cx: &Context<'_, Self>) {
-        self.password_input.read(cx).focus_handle(cx).focus(window);
+    fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.password_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -619,6 +619,7 @@ impl SpendAuthorizationDialogContent {
 impl gpui::Render for SpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let lifetime_dialog = dialog.clone();
         let cancel_root = self.root.clone();
         let cancel_intent = self.intent.clone();
         let payload_dialog = dialog.clone();
@@ -651,8 +652,10 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .child(app_masked_input(&self.password_input, false))
             .child(app_muted_text("Remember authorization"))
             .child(render_spend_authorization_lifetime_buttons(
-                dialog.clone(),
                 self.lifetime,
+                move |lifetime, cx| {
+                    lifetime_dialog.update(cx, |dialog, cx| dialog.set_lifetime(lifetime, cx));
+                },
             ))
             .when(
                 self.lifetime.requires_reusable_authorization_warning(),
@@ -986,48 +989,42 @@ pub(in crate::root) fn spend_authorization_recipient_display(value: &str) -> Str
 }
 
 fn render_spend_authorization_lifetime_buttons(
-    dialog: Entity<SpendAuthorizationDialogContent>,
     selected: SpendAuthorizationLifetime,
+    on_select: impl Fn(SpendAuthorizationLifetime, &mut App) + 'static,
 ) -> ButtonGroup {
+    let on_select = Rc::new(on_select);
     ButtonGroup::new("wallet-spend-auth-lifetime")
         .w_full()
         .outline()
         .warning()
         .small()
         .layout(Axis::Vertical)
-        .child(spend_authorization_lifetime_button(
-            SpendAuthorizationLifetime::Once,
-            selected,
-            "wallet-spend-auth-once",
-        ))
-        .child(spend_authorization_lifetime_button(
-            SpendAuthorizationLifetime::FiveMinutes,
-            selected,
-            "wallet-spend-auth-five-minutes",
-        ))
-        .child(spend_authorization_lifetime_button(
-            SpendAuthorizationLifetime::FifteenMinutes,
-            selected,
-            "wallet-spend-auth-fifteen-minutes",
-        ))
-        .child(spend_authorization_lifetime_button(
-            SpendAuthorizationLifetime::UntilVaultLock,
-            selected,
-            "wallet-spend-auth-until-lock",
-        ))
-        .on_click(move |selected, _window, cx| {
-            let Some(index) = selected.first() else {
-                return;
-            };
-            let lifetime = match *index {
-                0 => SpendAuthorizationLifetime::Once,
-                1 => SpendAuthorizationLifetime::FiveMinutes,
-                2 => SpendAuthorizationLifetime::FifteenMinutes,
-                3 => SpendAuthorizationLifetime::UntilVaultLock,
-                _ => return,
-            };
-            dialog.update(cx, |dialog, cx| dialog.set_lifetime(lifetime, cx));
-        })
+        .children(
+            [
+                (SpendAuthorizationLifetime::Once, "wallet-spend-auth-once"),
+                (
+                    SpendAuthorizationLifetime::FiveMinutes,
+                    "wallet-spend-auth-five-minutes",
+                ),
+                (
+                    SpendAuthorizationLifetime::FifteenMinutes,
+                    "wallet-spend-auth-fifteen-minutes",
+                ),
+                (
+                    SpendAuthorizationLifetime::UntilVaultLock,
+                    "wallet-spend-auth-until-lock",
+                ),
+            ]
+            .map(|(lifetime, id)| {
+                let on_select = Rc::clone(&on_select);
+                let on_confirm = Rc::clone(&on_select);
+                spend_authorization_lifetime_button(lifetime, selected, id)
+                    .on_click(move |_, _, cx| on_select(lifetime, cx))
+                    .on_action(move |_: &gpui_kit::base::actions::Confirm, _, cx| {
+                        on_confirm(lifetime, cx);
+                    })
+            }),
+        )
 }
 
 fn spend_authorization_lifetime_button(
@@ -1035,8 +1032,17 @@ fn spend_authorization_lifetime_button(
     selected: SpendAuthorizationLifetime,
     id: &'static str,
 ) -> Button {
-    app_button(id, lifetime.label())
+    let button = app_button(id, lifetime.label());
+    #[cfg(test)]
+    let button = button.debug_selector(move || id.to_owned());
+    button
+        .accessibility_label(lifetime.label())
         .selected(lifetime == selected)
+        .when(lifetime != SpendAuthorizationLifetime::Once, |button| {
+            button
+                .pt(px(1.0))
+                .focus_visible(|style| style.border_t_1().pt_0())
+        })
         .w_full()
 }
 
@@ -1099,13 +1105,13 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let close_root = root.clone();
             let close_intent = intent.clone();
             dialog
                 .w(dialog_width)
+                .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text(dialog_title.clone()))
                 .on_close(move |_event, _window, cx| {
@@ -1113,10 +1119,7 @@ impl WalletRoot {
                         root.cancel_governance_authorization(&close_intent, cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    div().w(content_width).child(content.clone()),
-                ))
+                .child(div().w(content_width).child(content.clone()))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
@@ -1133,7 +1136,6 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let payload_disclosure = summary
             .payload
@@ -1153,8 +1155,7 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Authorize hardware public action"))
-                .button_props(DialogButtonProps::default().ok_text("Approve on device"))
-                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .footer(dialog_footer("Approve on device", true))
                 .on_close({
                     let handed_off = handed_off.clone();
                     move |_event, window, cx| {
@@ -1185,60 +1186,57 @@ impl WalletRoot {
                         true
                     }
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    div()
-                        .w(content_width)
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(app_strong_text(summary.title.to_string()))
-                        .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
-                        .child(render_spend_authorization_summary(&summary))
-                        .children(summary.warnings.iter().enumerate().map(|(index, warning)| {
-                            Alert::warning(
-                                SharedString::from(format!(
-                                    "wallet-hardware-public-action-warning-{index}"
-                                )),
-                                warning.to_string(),
-                            )
-                            .small()
-                        }))
-                        .children(payload_disclosure.clone())
-                        .when(show_trezor_app_passphrase, |this| {
-                            #[cfg(feature = "hardware")]
-                            {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .p(px(12.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(theme::BORDER))
-                                        .bg(rgb(theme::SURFACE))
-                                        .child(app_strong_text("Trezor app passphrase"))
-                                        .child(
-                                            app_muted_text(
-                                                "If the Trezor session expired, enter the app passphrase for this public account request.",
-                                            )
-                                            .whitespace_normal(),
+                .child(div()
+                    .w(content_width)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(app_strong_text(summary.title.to_string()))
+                    .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
+                    .child(render_spend_authorization_summary(&summary))
+                    .children(summary.warnings.iter().enumerate().map(|(index, warning)| {
+                        Alert::warning(
+                            SharedString::from(format!(
+                                "wallet-hardware-public-action-warning-{index}"
+                            )),
+                            warning.to_string(),
+                        )
+                        .small()
+                    }))
+                    .children(payload_disclosure.clone())
+                    .when(show_trezor_app_passphrase, |this| {
+                        #[cfg(feature = "hardware")]
+                        {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .p(px(12.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(theme::BORDER))
+                                    .bg(rgb(theme::SURFACE))
+                                    .child(app_strong_text("Trezor app passphrase"))
+                                    .child(
+                                        app_muted_text(
+                                            "If the Trezor session expired, enter the app passphrase for this public account request.",
                                         )
-                                        .child(app_masked_input(&trezor_app_passphrase_input, false)),
-                                )
-                            }
-                            #[cfg(not(feature = "hardware"))]
-                            {
-                                this
-                            }
-                        })
-                        .child(
-                            app_muted_text("The app will verify the stored public account address against the connected device before signing.")
-                                .whitespace_normal(),
-                        ),
-                ))
+                                        .whitespace_normal(),
+                                    )
+                                    .child(app_masked_input(&trezor_app_passphrase_input, false)),
+                            )
+                        }
+                        #[cfg(not(feature = "hardware"))]
+                        {
+                            this
+                        }
+                    })
+                    .child(
+                        app_muted_text("The app will verify the stored public account address against the connected device before signing.")
+                            .whitespace_normal(),
+                    ))
         });
     }
 
@@ -1261,7 +1259,6 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let content = cx.new(|_cx| {
             HardwareSpendAuthorizationDialogContent::new(
@@ -1278,6 +1275,13 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Authorize hardware spend"))
+                .on_ok({
+                    let content = content.clone();
+                    move |_event, window, cx| {
+                        content.update(cx, |content, cx| content.start(window, cx));
+                        false
+                    }
+                })
                 .on_close(move |_event, window, cx| {
                     close_content.update(cx, HardwareSpendAuthorizationDialogContent::cancel);
                     close_root.update(cx, |root, cx| {
@@ -1285,10 +1289,7 @@ impl WalletRoot {
                         root.clear_trezor_pin_matrix_prompt(cx);
                     });
                 })
-                .child(scrollable_dialog_content(
-                    content_max_height,
-                    div().w(content_width).child(content.clone()),
-                ))
+                .child(div().w(content_width).child(content.clone()))
         });
     }
 
@@ -1768,6 +1769,171 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LifetimePickerProbe {
+        focus: gpui::FocusHandle,
+        password_input: Entity<InputState>,
+        width: gpui::Pixels,
+        selected: SpendAuthorizationLifetime,
+        changes: Vec<SpendAuthorizationLifetime>,
+    }
+
+    impl gpui::Render for LifetimePickerProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            let probe = cx.entity();
+            gpui_kit::base::Dialog::new(cx)
+                .focus_handle(self.focus.clone())
+                .on_ok(|_, _, _| false)
+                .popup(
+                    div()
+                        .w(self.width)
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .debug_selector(|| "lifetime-password".to_owned())
+                                .child(app_masked_input(&self.password_input, false)),
+                        )
+                        .child(
+                            app_muted_text("Remember authorization")
+                                .debug_selector(|| "lifetime-label".to_owned()),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .debug_selector(|| "lifetime-group".to_owned())
+                                .child(render_spend_authorization_lifetime_buttons(
+                                    self.selected,
+                                    move |lifetime, cx| {
+                                        probe.update(cx, |probe, cx| {
+                                            probe.selected = lifetime;
+                                            probe.changes.push(lifetime);
+                                            cx.notify();
+                                        });
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "lifetime-footer".to_owned())
+                                .w_full()
+                                .flex()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap_2()
+                                .child(app_button("lifetime-cancel", "Cancel").flex_none())
+                                .child(
+                                    app_button("lifetime-submit", "Authorize and continue")
+                                        .primary()
+                                        .flex_none(),
+                                ),
+                        ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn lifetime_rows_stay_between_password_and_footer(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| LifetimePickerProbe {
+            focus: cx.focus_handle(),
+            password_input: new_masked_input(window, cx, "Vault password"),
+            width: px(400.0),
+            selected: SpendAuthorizationLifetime::Once,
+            changes: Vec::new(),
+        });
+        for width in [400.0, 280.0] {
+            probe.update(cx, |probe, cx| {
+                probe.width = px(width);
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let password = cx
+                .debug_bounds("lifetime-password")
+                .expect("password input");
+            let label = cx.debug_bounds("lifetime-label").expect("lifetime label");
+            let group = cx.debug_bounds("lifetime-group").expect("lifetime group");
+            let footer = cx.debug_bounds("lifetime-footer").expect("dialog footer");
+            assert!(password.bottom() <= label.top());
+            let mut previous_bottom = label.bottom();
+            for id in [
+                "wallet-spend-auth-once",
+                "wallet-spend-auth-five-minutes",
+                "wallet-spend-auth-fifteen-minutes",
+                "wallet-spend-auth-until-lock",
+            ] {
+                let row = cx.debug_bounds(id).expect("lifetime row");
+                assert!(row.size.height > px(0.0), "{id} collapsed at width {width}");
+                assert!(
+                    row.top() >= previous_bottom,
+                    "{id} overlaps preceding content at width {width}"
+                );
+                assert!(
+                    row.bottom() <= footer.top(),
+                    "{id} overlaps footer at width {width}"
+                );
+                assert!(
+                    row.top() >= group.top() && row.bottom() <= group.bottom(),
+                    "group does not contain {id} at width {width}"
+                );
+                assert!(
+                    row.left() >= group.left() && row.right() <= group.right(),
+                    "{id} overflows group width {width}"
+                );
+                previous_bottom = row.bottom();
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn lifetime_choices_activate_once_with_space_and_enter(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| LifetimePickerProbe {
+            focus: cx.focus_handle(),
+            password_input: new_masked_input(window, cx, "Vault password"),
+            width: px(400.0),
+            selected: SpendAuthorizationLifetime::Once,
+            changes: Vec::new(),
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let focus = probe.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            window.focus_next(cx);
+            window.focus_next(cx);
+        });
+        for (key, expected) in [
+            ("space", SpendAuthorizationLifetime::FiveMinutes),
+            ("enter", SpendAuthorizationLifetime::FifteenMinutes),
+        ] {
+            cx.update(Window::focus_next);
+            let keystroke = gpui::Keystroke::parse(key).expect("activation key");
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            cx.update(|window, cx| {
+                assert_eq!(probe.read(cx).selected, expected);
+                window.draw(cx).clear(cx);
+            });
+        }
+        cx.update(|_, cx| {
+            assert_eq!(
+                probe.read(cx).changes,
+                [
+                    SpendAuthorizationLifetime::FiveMinutes,
+                    SpendAuthorizationLifetime::FifteenMinutes,
+                ]
+            );
+        });
+    }
 
     #[test]
     fn remembered_authorization_is_bound_to_exact_wallet_scope() {

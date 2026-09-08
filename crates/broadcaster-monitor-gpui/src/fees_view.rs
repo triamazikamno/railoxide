@@ -312,7 +312,7 @@ impl FeesDelegate {
     }
 
     /// Advance fee sort through Default → Descending → Ascending → Default,
-    /// matching the cycle `gpui_component::Table` uses for its built-in
+    /// matching the cycle `gpui_component::table::DataTable` uses for its built-in
     /// sort icon.
     pub(crate) fn toggle_fee_sort(&mut self) {
         self.fee_sort = match self.fee_sort {
@@ -590,8 +590,8 @@ impl TableDelegate for FeesDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
     }
 
     fn render_th(
@@ -613,6 +613,7 @@ impl TableDelegate for FeesDelegate {
                 })
                 .child(
                     Input::new(&self.broadcaster_input)
+                        .bg(rgb(theme::SURFACE))
                         .with_size(Size::XSmall)
                         .w_full(),
                 )

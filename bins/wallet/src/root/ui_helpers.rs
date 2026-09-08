@@ -1,12 +1,11 @@
 use gpui::{
-    App, ElementId, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, img,
-    prelude::FluentBuilder as _, px, rgb,
+    App, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, Styled,
+    Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     Disableable, Icon, Sizable,
     button::{Button, ButtonVariant, ButtonVariants},
-    dialog::{Dialog, DialogButtonProps},
+    dialog::{AlertDialog, Cancel, Confirm, DialogButtonProps, DialogFooter},
     tag::Tag,
 };
 use ui::clipboard::clipboard_with_toast;
@@ -15,6 +14,18 @@ use ui::icons;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
 use crate::assets::WalletIconSource;
+
+pub(super) fn input_enter_scope(
+    enabled: bool,
+    submit: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div().on_action(move |_: &gpui_component::input::Enter, window, cx| {
+        cx.stop_propagation();
+        if enabled {
+            submit(window, cx);
+        }
+    })
+}
 
 const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
 
@@ -175,17 +186,6 @@ pub(super) fn dialog_content_max_height(window: &Window) -> Pixels {
     window.viewport_size().height * 0.74
 }
 
-pub(super) fn scrollable_dialog_content(
-    max_height: Pixels,
-    content: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .max_h(max_height)
-        .min_h(px(0.0))
-        .overflow_y_scrollbar()
-        .child(content)
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct ConfirmationDialogProps {
     title: &'static str,
@@ -212,28 +212,44 @@ impl ConfirmationDialogProps {
     }
 }
 
+pub(super) fn dialog_footer(ok_text: impl Into<SharedString>, show_cancel: bool) -> DialogFooter {
+    DialogFooter::new()
+        .when(show_cancel, |footer| {
+            footer.child(Button::new("cancel").secondary().label("Cancel").on_click(
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(Cancel), cx);
+                },
+            ))
+        })
+        .child(
+            Button::new("ok")
+                .label(ok_text)
+                .primary()
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+                }),
+        )
+}
+
 pub(super) fn confirmation_dialog(
-    dialog: Dialog,
+    dialog: AlertDialog,
     props: ConfirmationDialogProps,
     dialog_width: Pixels,
     dialog_max_height: Pixels,
-    content_max_height: Pixels,
-) -> Dialog {
+) -> AlertDialog {
     let content_width = secondary_dialog_content_width(dialog_width);
     dialog
-        .w(dialog_width)
+        .width(dialog_width)
         .max_h(dialog_max_height)
         .title(app_strong_text(props.title))
         .button_props(
             DialogButtonProps::default()
+                .cancel_variant(ButtonVariant::Secondary)
                 .ok_text(props.confirm_text)
                 .ok_variant(props.confirm_variant),
         )
         .confirm()
-        .child(scrollable_dialog_content(
-            content_max_height,
-            confirmation_dialog_content(props, content_width),
-        ))
+        .child(confirmation_dialog_content(props, content_width))
 }
 
 fn confirmation_dialog_content(props: ConfirmationDialogProps, content_width: Pixels) -> gpui::Div {
@@ -276,11 +292,13 @@ pub(super) fn app_refresh_button(
     enabled: bool,
     on_refresh: impl Fn(&mut Window, &mut App) + 'static,
 ) -> Button {
+    let tooltip: SharedString = tooltip.into();
     let button = app_button_base(id)
         .ghost()
         .xsmall()
         .compact()
         .icon(Icon::empty().path(icons::refresh_ccw_icon_path()))
+        .accessibility_label(tooltip.clone())
         .tooltip(tooltip)
         .loading(refreshing)
         .disabled(refreshing || !enabled);
@@ -409,4 +427,200 @@ pub(super) fn token_label_row(
         row = row.child(img(path).size(icon_size).rounded_full().flex_none());
     }
     row.child(label)
+}
+
+#[cfg(test)]
+mod input_enter_tests {
+    use gpui::{AppContext as _, Context, Entity, Focusable as _, Render, TestAppContext};
+    use gpui_component::input::InputState;
+
+    use super::*;
+
+    struct InputEnterProbe {
+        inputs: [Entity<InputState>; 2],
+        focus: gpui::FocusHandle,
+        enabled: bool,
+        submissions: [usize; 2],
+        dialog_confirmations: usize,
+        dialog_closes: usize,
+    }
+
+    impl Render for InputEnterProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            let confirm_probe = cx.entity();
+            let close_probe = cx.entity();
+            gpui_kit::base::Dialog::new(cx)
+                .focus_handle(self.focus.clone())
+                .on_ok(move |_, _, cx| {
+                    confirm_probe.update(cx, |probe, _| probe.dialog_confirmations += 1);
+                    true
+                })
+                .on_close(move |_, _, cx| {
+                    close_probe.update(cx, |probe, _| probe.dialog_closes += 1);
+                })
+                .popup(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children(self.inputs.iter().enumerate().map(|(index, input)| {
+                            let submit_probe = cx.entity();
+                            input_enter_scope(self.enabled, move |_, cx| {
+                                submit_probe.update(cx, |probe, _| probe.submissions[index] += 1);
+                            })
+                            .child(ui::controls::app_input(input))
+                        })),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn input_enter_scopes_submit_only_the_focused_operation_and_consume_when_disabled(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| InputEnterProbe {
+            inputs: [
+                cx.new(|cx| InputState::new(window, cx)),
+                cx.new(|cx| InputState::new(window, cx)),
+            ],
+            focus: cx.focus_handle(),
+            enabled: true,
+            submissions: [0; 2],
+            dialog_confirmations: 0,
+            dialog_closes: 0,
+        });
+        let mut expected = [0; 2];
+        for enabled in [true, false, true] {
+            for index in 0..2 {
+                probe.update(cx, |probe, cx| {
+                    probe.enabled = enabled;
+                    cx.notify();
+                });
+                cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    probe.read(cx).inputs[index]
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                });
+                let keystroke = gpui::Keystroke::parse("enter").expect("Enter key");
+                cx.simulate_event(gpui::KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                });
+                cx.simulate_event(gpui::KeyUpEvent { keystroke });
+                cx.run_until_parked();
+                expected[index] += usize::from(enabled);
+                cx.update(|_, cx| {
+                    let probe = probe.read(cx);
+                    assert_eq!(probe.submissions, expected);
+                    assert_eq!(probe.dialog_confirmations, 0);
+                    assert_eq!(probe.dialog_closes, 0);
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod select_layout_test {
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, Context, Entity, Render, TestAppContext};
+    use gpui_component::{
+        IndexPath,
+        select::{Select, SelectItem, SelectState},
+    };
+    use ui::controls::FullWidthSelectItems;
+
+    use super::*;
+
+    struct SelectProbe<T: SelectItem + 'static> {
+        select: Entity<SelectState<FullWidthSelectItems<T>>>,
+        width: Pixels,
+        small: bool,
+    }
+
+    impl<T: SelectItem + 'static> Render for SelectProbe<T> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+            div().p_4().child(
+                div()
+                    .debug_selector(|| "select-layout-trigger".to_owned())
+                    .w(self.width)
+                    .child(
+                        Select::new(&self.select)
+                            .when(self.small, Sizable::small)
+                            .w_full()
+                            .menu_width(self.width),
+                    ),
+            )
+        }
+    }
+
+    pub(in crate::root) fn assert_balances_align_and_rows_select<T>(
+        cx: &mut TestAppContext,
+        items: Vec<T>,
+        widths: [f32; 2],
+        small: bool,
+        balance_selectors: [&'static str; 2],
+        expected_value: &str,
+    ) where
+        T: SelectItem<Value = Arc<str>> + 'static,
+    {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| SelectProbe {
+            select: cx.new(|cx| {
+                SelectState::new(
+                    FullWidthSelectItems::new(items),
+                    Some(IndexPath::new(0)),
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            }),
+            width: px(widths[0]),
+            small,
+        });
+        for width in widths {
+            probe.update(cx, |probe, cx| {
+                probe.width = px(width);
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let trigger = cx
+                .debug_bounds("select-layout-trigger")
+                .expect("select trigger");
+            cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let first = cx
+                .debug_bounds(balance_selectors[0])
+                .expect("first balance");
+            let second = cx
+                .debug_bounds(balance_selectors[1])
+                .expect("second balance");
+            assert!((first.right() - second.right()).abs() < px(1.0));
+            assert!(
+                second.right() > trigger.right() - px(50.0),
+                "balance must reach the menu's trailing content edge"
+            );
+            assert!(second.right() < trigger.right());
+            cx.simulate_click(second.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                assert_eq!(
+                    probe
+                        .read(cx)
+                        .select
+                        .read(cx)
+                        .selected_value()
+                        .map(AsRef::as_ref),
+                    Some(expected_value)
+                );
+            });
+        }
+    }
 }

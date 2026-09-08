@@ -17,11 +17,13 @@ pub(super) fn public_account_icon_button(
     icon: impl Into<Icon>,
     tooltip: impl Into<SharedString>,
 ) -> Button {
+    let tooltip: SharedString = tooltip.into();
     Button::new(id)
         .icon(icon)
         .ghost()
         .xsmall()
         .compact()
+        .accessibility_label(tooltip.clone())
         .tooltip(tooltip)
 }
 
@@ -34,6 +36,11 @@ pub(super) fn public_account_walletconnect_button(
         .xsmall()
         .compact()
         .cursor_pointer()
+        .accessibility_label(if has_active_session {
+            "Manage WalletConnect sessions"
+        } else {
+            "Connect dapp with WalletConnect"
+        })
         .tooltip(if has_active_session {
             "Manage WalletConnect sessions"
         } else {

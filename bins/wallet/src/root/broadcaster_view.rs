@@ -288,6 +288,7 @@ impl WalletRoot {
                 .danger()
                 .ghost()
                 .xsmall()
+                .accessibility_label("Remove broadcaster")
                 .tooltip("Remove broadcaster")
                 .icon(Icon::new(RailgunActionIcon::Trash2))
                 .on_click(move |_event, _window, cx| {

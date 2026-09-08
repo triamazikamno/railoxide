@@ -244,7 +244,7 @@ pub(crate) fn open_wallet_window(
             )
         });
         register_wallet_shortcut_root(window, &root, cx);
-        cx.new(|cx| Root::new(root, window, cx))
+        cx.new(|cx| Root::new(root, window, cx).window_shadow_size(px(12.0)))
     }) {
         tracing::error!(%error, "failed to open wallet window");
     }
@@ -271,7 +271,7 @@ impl WalletRoot {
     pub(super) fn focus_public_account_search_if_requested(
         &mut self,
         window: &mut Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         if !self.focus_public_account_search_on_render
             || self.active_activity != Activity::Wallet
@@ -284,7 +284,7 @@ impl WalletRoot {
             .search_input
             .read(cx)
             .focus_handle(cx)
-            .focus(window);
+            .focus(window, cx);
         self.focus_public_account_search_on_render = false;
     }
 }
@@ -340,7 +340,13 @@ impl Render for WalletRoot {
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
-            .child(self.render_sidebar(root.clone(), sidebar_collapsed, sidebar_is_narrow))
+            .child(self.render_sidebar(
+                root.clone(),
+                sidebar_collapsed,
+                sidebar_is_narrow,
+                window,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -600,7 +606,7 @@ fn render_wallet_build_metadata() -> gpui::Div {
                 .gap_1()
                 .child(render_wallet_social_copy_button(
                     "wallet-hero-repository-url-copy",
-                    Icon::new(IconName::GitHub).size_4(),
+                    Icon::new(IconName::Github).size_4(),
                     RAILOXIDE_REPOSITORY_URL,
                 ))
                 .child(render_wallet_social_copy_button(
@@ -1155,6 +1161,7 @@ impl WalletRoot {
                         app_button_base("close-wallet-logs-drawer")
                             .ghost()
                             .xsmall()
+                            .accessibility_label("Hide logs")
                             .tooltip("Hide logs")
                             .icon(IconName::Close)
                             .on_click(move |_event, _window, cx| {
@@ -1541,7 +1548,7 @@ fn render_ppoi_artifact_progress_section(
                 ),
         )
         .child(
-            UiProgress::new()
+            UiProgress::new("ppoi-artifact-progress")
                 .h(px(7.0))
                 .value(f32::from(percent))
                 .bg(rgb(color)),
@@ -1775,7 +1782,7 @@ fn render_balance_sync_progress_section(
                 .items_center()
                 .gap_3()
                 .child(
-                    UiProgress::new()
+                    UiProgress::new("balance-sync-progress")
                         .flex_1()
                         .h(px(7.0))
                         .value(f32::from(labels.percent))

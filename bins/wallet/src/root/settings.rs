@@ -15,7 +15,6 @@ use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariants},
-    dialog::DialogButtonProps,
     group_box::GroupBoxVariant,
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     label::Label,
@@ -59,8 +58,8 @@ use super::WalletRoot;
 use super::maintenance::{WalletMaintenanceController, WalletMaintenanceReset};
 use super::startup::WalletStartupRoot;
 use super::ui_helpers::{
-    ConfirmationDialogProps, confirmation_dialog, dialog_content_max_height, dialog_max_height,
-    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
+    ConfirmationDialogProps, confirmation_dialog, dialog_max_height, rgb_with_alpha,
+    secondary_dialog_content_width,
 };
 use super::wallet_header::ChainSelectItem;
 

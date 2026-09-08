@@ -1,7 +1,25 @@
 use super::*;
 
 pub(in crate::root) fn private_action_input(state: &Entity<InputState>) -> Input {
-    Input::new(state).px(px(12.0)).py(px(8.0))
+    Input::new(state)
+        .px(px(12.0))
+        .py(px(8.0))
+        .bg(rgb(theme::SURFACE))
+}
+
+pub(in crate::root) fn private_action_amount_input(
+    state: &Entity<InputState>,
+    generating: bool,
+    submit_enabled: bool,
+    submit: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .on_action(move |_: &gpui_component::input::Enter, window, cx| {
+            if submit_enabled {
+                submit(window, cx);
+            }
+        })
+        .child(private_action_input(state).disabled(generating))
 }
 
 pub(in crate::root) fn new_prefilled_amount_input(
@@ -889,4 +907,98 @@ pub(in crate::root) fn render_unshield_generating_status(
                 )
                 .child(app_muted_text(stage.detail())),
         )
+}
+
+#[cfg(test)]
+mod amount_enter_tests {
+    use super::*;
+
+    struct AmountEnterProbe {
+        input: Entity<InputState>,
+        focus: gpui::FocusHandle,
+        width: Pixels,
+        submit_enabled: bool,
+        submissions: usize,
+        dialog_confirmations: usize,
+        dialog_closes: usize,
+    }
+
+    impl gpui::Render for AmountEnterProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            let submit_probe = cx.entity();
+            let confirm_probe = cx.entity();
+            let close_probe = cx.entity();
+            gpui_kit::base::Dialog::new(cx)
+                .focus_handle(self.focus.clone())
+                .on_ok(move |_, _, cx| {
+                    confirm_probe.update(cx, |probe, _| probe.dialog_confirmations += 1);
+                    true
+                })
+                .on_close(move |_, _, cx| {
+                    close_probe.update(cx, |probe, _| probe.dialog_closes += 1);
+                })
+                .popup(
+                    div().w(self.width).child(
+                        private_action_amount_input(
+                            &self.input,
+                            false,
+                            self.submit_enabled,
+                            move |_, cx| {
+                                submit_probe.update(cx, |probe, _| probe.submissions += 1);
+                            },
+                        )
+                        .debug_selector(|| "amount-enter-input".to_owned()),
+                    ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn amount_enter_submits_once_when_enabled_without_confirming_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(ui::theme::apply_zenburn_component_theme);
+        let (probe, cx) = cx.add_window_view(|window, cx| AmountEnterProbe {
+            input: cx.new(|cx| InputState::new(window, cx)),
+            focus: cx.focus_handle(),
+            width: px(400.0),
+            submit_enabled: true,
+            submissions: 0,
+            dialog_confirmations: 0,
+            dialog_closes: 0,
+        });
+        let mut expected_submissions = 0;
+        for width in [400.0, 280.0] {
+            for enabled in [true, false] {
+                probe.update(cx, |probe, cx| {
+                    probe.width = px(width);
+                    probe.submit_enabled = enabled;
+                    cx.notify();
+                });
+                cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    let focus = probe.read(cx).input.read(cx).focus_handle(cx);
+                    focus.focus(window, cx);
+                });
+                let input = cx.debug_bounds("amount-enter-input").expect("amount input");
+                assert!((input.size.width - px(width)).abs() < px(1.0));
+                let keystroke = gpui::Keystroke::parse("enter").expect("Enter key");
+                cx.simulate_event(gpui::KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                });
+                cx.simulate_event(gpui::KeyUpEvent { keystroke });
+                cx.run_until_parked();
+                expected_submissions += usize::from(enabled);
+                cx.update(|_, cx| {
+                    let probe = probe.read(cx);
+                    assert_eq!(probe.submissions, expected_submissions);
+                    assert_eq!(probe.dialog_confirmations, 0);
+                    assert_eq!(probe.dialog_closes, 0);
+                });
+            }
+        }
+    }
 }

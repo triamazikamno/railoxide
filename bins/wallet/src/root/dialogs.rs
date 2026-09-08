@@ -127,7 +127,7 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                         kind,
                         "broadcaster-picker-view-mode",
                     ))
-                    .children([
+                    .child(
                         Button::new(delivery_element_id(
                             key,
                             kind,
@@ -135,7 +135,10 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                         ))
                         .icon(Icon::empty().path(GROUP_ICON_PATH))
                         .selected(view_mode == BroadcasterPickerViewMode::Grouped)
+                        .accessibility_label("Grouped view")
                         .tooltip("Grouped view"),
+                    )
+                    .child(
                         Button::new(delivery_element_id(
                             key,
                             kind,
@@ -143,8 +146,9 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                         ))
                         .icon(Icon::empty().path(LIST_ICON_PATH))
                         .selected(view_mode == BroadcasterPickerViewMode::List)
+                        .accessibility_label("List view")
                         .tooltip("List view"),
-                    ])
+                    )
                     .compact()
                     .outline()
                     .small()

@@ -182,8 +182,8 @@ mod tests {
         window
             .update(cx, |probe, window, cx| {
                 let input_focus = probe.input_focus.clone();
-                cx.defer_in(window, move |_probe, window, _cx| {
-                    input_focus.focus(window);
+                cx.defer_in(window, move |_probe, window, cx| {
+                    input_focus.focus(window, cx);
                 });
             })
             .expect("schedule probe input focus");
