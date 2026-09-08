@@ -63,7 +63,9 @@ jobs:
         shell: bash
         run: |
           # Load functions without invoking the installer's final main call.
-          source <(sed '$d' scripts/install-wallet)
+          installer_functions=$(mktemp "$RUNNER_TEMP/railoxide-installer-functions.XXXXXX")
+          sed '$d' scripts/install-wallet > "$installer_functions"
+          source "$installer_functions"
           source_dir="$(mktemp -d "$RUNNER_TEMP/railoxide-shader-ref.XXXXXX")"
           export RAILOXIDE_FEATURE_CAPTURE="$source_dir/features"
           mkdir -p "$source_dir/scripts"
