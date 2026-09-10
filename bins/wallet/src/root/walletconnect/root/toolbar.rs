@@ -39,14 +39,14 @@ impl WalletRoot {
             .when(!disabled, gpui::Styled::cursor_pointer)
             .disabled(disabled)
             .accessibility_label(if pending_count > 0 {
-                "Review WalletConnect request"
+                "Review dapp request"
             } else if session_count > 0 {
                 "Manage WalletConnect sessions"
             } else {
                 "Connect dapp with WalletConnect"
             })
             .tooltip(if pending_count > 0 {
-                "Review WalletConnect request"
+                "Review dapp request"
             } else if session_count > 0 {
                 "Manage WalletConnect sessions"
             } else {

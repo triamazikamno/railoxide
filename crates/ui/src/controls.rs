@@ -14,7 +14,7 @@ use gpui_component::{
     select::{SearchableVec, SelectDelegate, SelectItem},
 };
 
-use crate::theme::{self, APP_TEXT_SIZE};
+use crate::theme::{self, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 
 /// Searchable items whose custom rows fill the menu width.
 ///
@@ -183,16 +183,21 @@ pub fn app_inline_control_row(label: impl Into<SharedString>, control: impl Into
         .child(div().flex_none().child(control))
 }
 
+/// Inherits the control's font size while keeping shared proportional leading.
 #[must_use]
 pub fn app_button_label(label: impl Into<SharedString>) -> Div {
-    app_text(label).flex_none()
+    div()
+        .flex_none()
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .child(label.into())
 }
 
+/// Body text owns its font size and line height; control labels inherit their size.
 #[must_use]
 pub fn app_text(label: impl Into<SharedString>) -> Div {
     div()
         .text_size(APP_TEXT_SIZE)
-        .line_height(relative(1.0))
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
         .child(label.into())
 }
 

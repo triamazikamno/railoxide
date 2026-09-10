@@ -1173,3 +1173,40 @@ fn total_failure_reports_only_whole_submission_transport_failures() {
     assert!(total_failure(&[Ok(Bytes::from_static(b"ok")), Err(request_failure)]).is_none());
     assert!(total_failure::<Bytes>(&[]).is_none());
 }
+
+#[test]
+fn gateway_web_origins_normalize_scope_and_reject_opaque_origins() {
+    for (input, expected) in [
+        (
+            "HTTPS://EXAMPLE.COM:443/path?q=1#fragment",
+            "https://example.com/",
+        ),
+        ("http://example.com:80/path", "http://example.com/"),
+        (
+            "https://例え.テスト/path",
+            "https://xn--r8jz45g.xn--zckzah/",
+        ),
+        (
+            "https://[2001:db8::1]:8443/path",
+            "https://[2001:db8::1]:8443/",
+        ),
+        ("blob:https://example.com/document", "https://example.com/"),
+    ] {
+        assert_eq!(
+            RpcOrigin::dapp_web_origin("peer", input).unwrap(),
+            RpcOrigin::dapp("peer", expected).unwrap()
+        );
+    }
+    for input in [
+        "null",
+        "data:text/plain,opaque",
+        "file:///tmp/page",
+        "ftp://example.com",
+        "custom:page",
+    ] {
+        assert_eq!(
+            RpcOrigin::dapp_web_origin("peer", input).unwrap_err(),
+            RpcOriginError::InvalidOrigin
+        );
+    }
+}

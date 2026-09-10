@@ -2226,6 +2226,15 @@ impl WalletRoot {
             gas_fee,
             ..
         } = draft;
+        let transaction_tracking =
+            match self.public_transaction_tracking_context(chain_id, &public_account_uuid) {
+                Ok(context) => context,
+                Err(error) => {
+                    self.public_form.send_error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
             self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
@@ -2279,6 +2288,7 @@ impl WalletRoot {
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicSendRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
             view_session,
@@ -2300,13 +2310,13 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.runtime.spawn(async move {
+        let join = self.spawn_public_transaction_submission(async move {
             submit_public_send_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await
         });
-        self.public_form.action_task_abort_handle = Some(join.abort_handle());
+        self.public_form.action_task_abort_handle = join.abort_handle();
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let _ = this.update(cx, |root, cx| {
@@ -2548,6 +2558,15 @@ impl WalletRoot {
             authorized_fee_ceiling,
             ..
         } = draft;
+        let transaction_tracking =
+            match self.public_transaction_tracking_context(chain_id, &public_account_uuid) {
+                Ok(context) => context,
+                Err(error) => {
+                    self.public_form.shield_error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
             self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
@@ -2600,6 +2619,7 @@ impl WalletRoot {
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicShieldRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
             view_session,
@@ -2619,13 +2639,13 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.runtime.spawn(async move {
+        let join = self.spawn_public_transaction_submission(async move {
             submit_public_shield_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await
         });
-        self.public_form.action_task_abort_handle = Some(join.abort_handle());
+        self.public_form.action_task_abort_handle = join.abort_handle();
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let _ = this.update(cx, |root, cx| {

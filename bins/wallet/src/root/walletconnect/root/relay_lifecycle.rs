@@ -32,6 +32,14 @@ impl WalletRoot {
         session: &WalletConnectSessionRecord,
         cx: &Context<'_, Self>,
     ) -> Result<WalletConnectClientContext, Arc<str>> {
+        self.walletconnect_client_context_for_relay_client(&session.relay_client_id, cx)
+    }
+
+    fn walletconnect_client_context_for_relay_client(
+        &mut self,
+        relay_client_id: &str,
+        cx: &Context<'_, Self>,
+    ) -> Result<WalletConnectClientContext, Arc<str>> {
         let Some(store) = self.vault_store.as_ref() else {
             return Err(Arc::from("Wallet vault storage is unavailable"));
         };
@@ -39,10 +47,7 @@ impl WalletRoot {
             return Err(Arc::from("Unlock a wallet before using WalletConnect"));
         };
         let identity = store
-            .load_walletconnect_relay_identity_for_client_id(
-                view_session.as_ref(),
-                &session.relay_client_id,
-            )
+            .load_walletconnect_relay_identity_for_client_id(view_session.as_ref(), relay_client_id)
             .map_err(|error| {
                 Arc::from(format!(
                     "Could not load WalletConnect relay identity: {error}"
@@ -58,6 +63,35 @@ impl WalletRoot {
         let http = self.http.clone();
         let worker = self.ensure_walletconnect_relay_worker(client, http, cx);
         Ok(WalletConnectClientContext { worker })
+    }
+
+    pub(in crate::root::walletconnect) fn walletconnect_response_sender(
+        &mut self,
+        request: &WalletConnectRequestUi,
+        cx: &Context<'_, Self>,
+    ) -> Result<DappResponseSender, Arc<str>> {
+        let route = self
+            .walletconnect
+            .request_routes
+            .get(&request.key)
+            .cloned()
+            .ok_or_else(|| Arc::from("WalletConnect request response route is unavailable"))?;
+        match &route {
+            DappRequestRoute::Gateway {
+                handle,
+                approval_id,
+            } => Ok(DappResponseSender::gateway(
+                handle.clone(),
+                approval_id.clone(),
+            )),
+            DappRequestRoute::WalletConnect {
+                relay_client_id, ..
+            } => {
+                let context =
+                    self.walletconnect_client_context_for_relay_client(relay_client_id, cx)?;
+                Ok(route.response_sender(context.worker, request.item.id))
+            }
+        }
     }
 
     pub(in crate::root::walletconnect) fn walletconnect_effective_project_id(
@@ -551,9 +585,9 @@ impl WalletRoot {
             self.walletconnect
                 .subscriptions
                 .remove(&updated_session.session_topic);
-            self.walletconnect
-                .pending_requests
-                .retain(|_, request| request.session.session_uuid != session_uuid);
+            self.walletconnect.retain_pending_requests(|_, request| {
+                request.session_identity.walletconnect_session_id() != Some(session_uuid.as_str())
+            });
             if let (Some(store), Some(view_session)) = (store.as_ref(), view_session.as_ref())
                 && let Err(error) =
                     store.update_walletconnect_session(view_session.as_ref(), &updated_session)
@@ -637,7 +671,7 @@ impl WalletRoot {
                     ));
                     self.walletconnect.error = None;
                 }
-                for request in result.pending_requests {
+                for (request, route) in result.pending_requests {
                     if self
                         .walletconnect
                         .pending_requests
@@ -648,6 +682,9 @@ impl WalletRoot {
                         })
                     {
                         let request_key = request.key.clone();
+                        self.walletconnect
+                            .request_routes
+                            .insert(request_key.clone(), route);
                         self.walletconnect
                             .pending_requests
                             .insert(request_key.clone(), request);
@@ -694,6 +731,9 @@ impl WalletRoot {
                         "queued walletconnect request"
                     );
                     self.walletconnect
+                        .request_routes
+                        .insert(request.key.clone(), route);
+                    self.walletconnect
                         .pending_requests
                         .insert(request.key.clone(), request);
                 }
@@ -707,7 +747,8 @@ impl WalletRoot {
                         .sessions
                         .retain(|session| session.session_uuid != session_uuid);
                     self.walletconnect.retain_pending_requests(|_, request| {
-                        request.session.session_uuid != session_uuid
+                        request.session_identity.walletconnect_session_id()
+                            != Some(session_uuid.as_str())
                     });
                 }
                 self.walletconnect
@@ -744,25 +785,29 @@ impl WalletRoot {
         );
         let mut changed = false;
         for request_key in expired_keys {
-            let Some(request) = self.walletconnect.remove_pending_request(&request_key) else {
+            let Some(request) = self
+                .walletconnect
+                .pending_requests
+                .get(&request_key)
+                .cloned()
+            else {
                 continue;
             };
+            let response_sender = self.walletconnect_response_sender(&request, cx);
+            self.walletconnect.remove_pending_request(&request_key);
             changed = true;
-            let context = match self.walletconnect_client_context_for_session(&request.session, cx)
-            {
-                Ok(context) => context,
+            let response_sender = match response_sender {
+                Ok(sender) => sender,
                 Err(error) => {
                     self.walletconnect.error = Some(error);
                     continue;
                 }
             };
-            let response = build_walletconnect_jsonrpc_error(
-                request.item.id,
-                WalletConnectRequestErrorKind::ExpiredRequest,
-                "WalletConnect request expired before approval",
-            );
-            let topic = request.session.session_topic.clone();
-            let sym_key = request.session.keys.sym_key;
+            let response = Err(DappRequestError {
+                provider_failure: None,
+                kind: WalletConnectRequestErrorKind::ExpiredRequest,
+                message: "WalletConnect request expired before approval".to_owned(),
+            });
             self.walletconnect
                 .request_actions
                 .insert(request_key.clone());
@@ -774,10 +819,9 @@ impl WalletRoot {
                 dapp = request.item.dapp_name.as_str(),
                 "expiring walletconnect pending request"
             );
-            let join = self.runtime.spawn(async move {
-                publish_walletconnect_session_response(context.worker, topic, sym_key, response)
-                    .await
-            });
+            let join = self
+                .runtime
+                .spawn(async move { response_sender.send(response).await });
             cx.spawn(async move |this, cx| {
                 let result = join.await;
                 let _ = this.update(cx, |root, cx| {

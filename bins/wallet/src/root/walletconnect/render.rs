@@ -187,7 +187,9 @@ pub(super) fn walletconnect_approval_progress_steps(
         ],
         WalletConnectParsedRequest::EthAccounts
         | WalletConnectParsedRequest::EthRequestAccounts
-        | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. } => {
+        | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletAddEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletWatchAsset { .. } => {
             vec![WalletConnectApprovalProgressStep::RespondToDapp]
         }
     }
@@ -241,6 +243,7 @@ const fn walletconnect_approval_step_detail(
             WalletConnectApprovalProgressStep::BroadcastTransaction => "Transaction broadcast.",
             WalletConnectApprovalProgressStep::RespondToDapp => "Dapp response published.",
         },
+        PublicActionStepStatus::Warning => "Transaction inclusion could not be observed.",
         PublicActionStepStatus::Error => "Failed.",
         PublicActionStepStatus::Stopped => "Stopped locally.",
     }

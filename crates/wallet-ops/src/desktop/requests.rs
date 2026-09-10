@@ -421,6 +421,7 @@ pub async fn quote_desktop_self_broadcast_gas_fee(
 }
 
 pub struct DesktopUnshieldSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -446,6 +447,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
 }
 
 pub struct DesktopSendSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -507,6 +509,7 @@ pub struct DesktopSponsoredUnshieldCalldataRequest {
 }
 
 pub struct DesktopPreparedSponsoredSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -523,6 +526,7 @@ pub struct DesktopPreparedSponsoredSelfBroadcastRequest {
 }
 
 pub struct DesktopSponsoredSendSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -546,6 +550,7 @@ pub struct DesktopSponsoredSendSelfBroadcastRequest {
 }
 
 pub struct DesktopSponsoredUnshieldSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -619,6 +624,7 @@ pub struct BlockedShieldRescuePreview {
 }
 
 pub struct BlockedShieldRescueSelfBroadcastRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,

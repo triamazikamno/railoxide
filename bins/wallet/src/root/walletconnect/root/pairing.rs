@@ -479,7 +479,7 @@ impl WalletRoot {
                         root.apply_walletconnect_relay_processing_result(Ok(processing_result), cx);
                         if let Some(error) = approval_relay_error {
                             root.walletconnect.retain_pending_requests(|_, request| {
-                                request.session.session_topic.as_str() != handoff_topic.as_str()
+                                request.session_identity.walletconnect_session_id().is_none() || request.item.topic.as_str() != handoff_topic.as_str()
                             });
                             root.walletconnect.subscriptions.remove(&handoff_topic);
                             root.walletconnect.status = Some(Arc::from(
@@ -503,7 +503,7 @@ impl WalletRoot {
                             .approval_handoff_sessions
                             .remove(&handoff_topic);
                         root.walletconnect.retain_pending_requests(|_, request| {
-                            request.session.session_topic.as_str() != handoff_topic.as_str()
+                            request.session_identity.walletconnect_session_id().is_none() || request.item.topic.as_str() != handoff_topic.as_str()
                         });
                         root.walletconnect.error = Some(Arc::from(error));
                     }
@@ -512,7 +512,7 @@ impl WalletRoot {
                             .approval_handoff_sessions
                             .remove(&handoff_topic);
                         root.walletconnect.retain_pending_requests(|_, request| {
-                            request.session.session_topic.as_str() != handoff_topic.as_str()
+                            request.session_identity.walletconnect_session_id().is_none() || request.item.topic.as_str() != handoff_topic.as_str()
                         });
                         root.walletconnect.error = Some(Arc::from(format!(
                             "WalletConnect approval task failed: {error}"

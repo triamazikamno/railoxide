@@ -229,7 +229,7 @@ pub(in crate::root) fn private_broadcaster_progress_is_successful(
             progress
                 .self_broadcast_result
                 .as_ref()
-                .is_some_and(|result| result.tx.status)
+                .is_some_and(|result| result.tx.receipt().is_some_and(|receipt| receipt.status))
                 || progress
                     .sponsored_self_broadcast_outcome
                     .as_ref()
@@ -284,11 +284,24 @@ pub(in crate::root) fn apply_private_broadcaster_progress_stage(
     }
 }
 
+pub(super) const SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE: &str =
+    "Unable to observe transaction inclusion. Check the transaction hash before sending again.";
+
 pub(in crate::root) fn finish_private_self_broadcast_progress_steps(
     steps: &mut [PrivateBroadcasterProgressStepState],
-    receipt_status: bool,
+    receipt_status: Option<bool>,
 ) {
-    if receipt_status {
+    if receipt_status.is_none() {
+        for step in steps {
+            if step.stage == TransactionGenerationStage::WaitingForSelfBroadcastReceipt {
+                step.status = PublicActionStepStatus::Warning;
+                step.message = Some(Arc::from(SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE));
+            } else {
+                step.status = PublicActionStepStatus::Done;
+                step.message = None;
+            }
+        }
+    } else if receipt_status == Some(true) {
         for step in steps {
             step.status = PublicActionStepStatus::Done;
             step.message = None;
@@ -335,7 +348,7 @@ pub(in crate::root) fn finish_private_broadcaster_progress_steps_at_stage(
 pub(in crate::root) fn finish_private_self_broadcast_progress_steps_at_stage(
     steps: &mut [PrivateBroadcasterProgressStepState],
     final_stage: TransactionGenerationStage,
-    receipt_status: bool,
+    receipt_status: Option<bool>,
 ) {
     apply_private_broadcaster_progress_stage(steps, final_stage);
     finish_private_self_broadcast_progress_steps(steps, receipt_status);
@@ -542,6 +555,7 @@ pub(super) const fn private_broadcaster_stage_detail(
         }
         PublicActionStepStatus::Pending => stage.detail(),
         PublicActionStepStatus::Done => "Complete.",
+        PublicActionStepStatus::Warning => SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE,
         PublicActionStepStatus::Error => "Failed.",
         PublicActionStepStatus::Stopped => {
             "Stopped locally. Already-submitted network work may continue."

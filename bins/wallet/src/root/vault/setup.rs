@@ -239,6 +239,7 @@ impl WalletRoot {
         }
 
         let store = Arc::clone(store);
+        let gateway_unlock = self.begin_gateway_unlock();
         let remembered_wallet_id = self.ui_state.last_wallet_id.clone();
         let remembered_wallet_kind = self.ui_state.last_wallet_kind;
         let active_wallet_generation = self.active_wallet_generation;
@@ -305,9 +306,10 @@ impl WalletRoot {
                 match result {
                     Ok(Ok(unlock)) if unlock.session.is_some() => {
                         root.install_vault_view_unlock(unlock.vault_view_unlock);
-                        root.enter_view_unlocked(
+                        root.install_view_session_for_gateway_unlock(
                             unlock.session.expect("checked above"),
                             &unlock.metadata,
+                            gateway_unlock,
                             window,
                             cx,
                         );
@@ -318,22 +320,32 @@ impl WalletRoot {
                             unlock.vault_view_unlock,
                             unlock.setup_password,
                             unlock.pending_software_profile_open,
+                            gateway_unlock,
                             window,
                             cx,
                         );
                         #[cfg(feature = "hardware")]
                         if let Some(wallet_id) = unlock.remembered_hardware_wallet_id {
                             root.vault_error = None;
-                            root.open_hardware_profile_unlock_dialog_for_wallet(
-                                wallet_id, window, cx,
+                            root.open_hardware_profile_unlock_dialog_for_wallet_continuing(
+                                wallet_id,
+                                gateway_unlock,
+                                window,
+                                cx,
                             );
                         }
                     }
                     Ok(Err(error)) => {
+                        if root.gateway_unlock_is_current(gateway_unlock) {
+                            root.retire_gateway_unlock();
+                        }
                         root.focus_vault_input_on_render = true;
                         root.handle_vault_error(&error, cx);
                     }
                     Err(error) => {
+                        if root.gateway_unlock_is_current(gateway_unlock) {
+                            root.retire_gateway_unlock();
+                        }
                         tracing::warn!(%error, "desktop wallet vault unlock task failed");
                         root.focus_vault_input_on_render = true;
                         root.set_vault_error(

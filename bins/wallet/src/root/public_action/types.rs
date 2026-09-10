@@ -453,6 +453,7 @@ pub(in crate::root) enum PublicActionStepStatus {
     NotStarted,
     Pending,
     Done,
+    Warning,
     Error,
     Stopped,
 }

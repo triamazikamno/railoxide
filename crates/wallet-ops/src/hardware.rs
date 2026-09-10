@@ -134,6 +134,47 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hardware")]
+    #[test]
+    fn user_rejection_requires_typed_cancellation() {
+        use trezor_client::protos::failure::FailureType;
+
+        for (code, expected) in [
+            (FailureType::Failure_ActionCancelled, true),
+            (FailureType::Failure_PinCancelled, true),
+            (FailureType::Failure_DataError, false),
+            (FailureType::Failure_PinInvalid, false),
+        ] {
+            let mut failure = trezor_client::protos::Failure::new();
+            failure.set_code(code);
+            failure.set_message("cancelled/rejected".to_owned());
+            let error =
+                HardwareDerivationError::Trezor(trezor_client::Error::FailureResponse(failure));
+            assert_eq!(error.is_user_rejected(), expected);
+        }
+
+        for (status, expected) in [
+            (0x6982, true),
+            (0x6985, true),
+            (0x6a80, false),
+            (0x6511, false),
+        ] {
+            let error = HardwareDerivationError::LedgerStatus {
+                operation: "sign",
+                status,
+                message: "cancelled/rejected",
+            };
+            assert_eq!(error.is_user_rejected(), expected);
+        }
+
+        assert!(HardwareDerivationError::TrezorPinEntryCancelled.is_user_rejected());
+        assert!(!HardwareDerivationError::TrezorLocked.is_user_rejected());
+        assert!(
+            !HardwareDerivationError::TrezorBridge("cancelled/rejected".to_owned())
+                .is_user_rejected()
+        );
+    }
+
     #[test]
     fn descriptor_debug_redacts_fingerprint() {
         let descriptor = test_descriptor();

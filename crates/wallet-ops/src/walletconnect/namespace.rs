@@ -342,7 +342,9 @@ const fn walletconnect_method_supported_for_hardware_account(
         | WalletConnectSupportedMethod::EthSendTransaction => false,
         WalletConnectSupportedMethod::EthAccounts
         | WalletConnectSupportedMethod::EthRequestAccounts
-        | WalletConnectSupportedMethod::WalletSwitchEthereumChain => true,
+        | WalletConnectSupportedMethod::WalletSwitchEthereumChain
+        | WalletConnectSupportedMethod::WalletAddEthereumChain
+        | WalletConnectSupportedMethod::WalletWatchAsset => true,
         #[cfg(feature = "hardware")]
         WalletConnectSupportedMethod::PersonalSign
         | WalletConnectSupportedMethod::EthSendTransaction => true,

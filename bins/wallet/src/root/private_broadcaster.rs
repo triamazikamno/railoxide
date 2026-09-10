@@ -686,7 +686,7 @@ impl WalletRoot {
         finish_private_self_broadcast_progress_steps_at_stage(
             &mut progress.steps,
             final_stage,
-            result.tx.status,
+            result.tx.receipt().map(|receipt| receipt.status),
         );
         progress
             .self_broadcast_attempts
@@ -724,7 +724,7 @@ impl WalletRoot {
                 finish_private_self_broadcast_progress_steps_at_stage(
                     &mut progress.steps,
                     final_stage,
-                    receipt.status,
+                    Some(receipt.status),
                 );
             }
             SponsoredSelfBroadcastSessionOutcome::Stopped { .. } => {
@@ -1007,7 +1007,7 @@ impl WalletRoot {
         }
         if let Some(result) = progress.self_broadcast_result.as_ref() {
             content = content.child(render_public_broadcaster_tx_hash_row(
-                result.tx.tx_hash.clone(),
+                result.tx.tx_hash().to_owned(),
                 delivery_element_id(progress.key, progress.kind, "progress-copy-self-tx"),
             ));
         }
@@ -1303,17 +1303,19 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
             ))
             .child(private_broadcaster_context_row(
                 "Receipt",
-                if result.tx.status {
-                    "confirmed"
-                } else {
-                    "reverted"
+                match result.tx.receipt() {
+                    Some(receipt) if receipt.status => "confirmed",
+                    Some(_) => "reverted",
+                    None => "inclusion unknown",
                 }
                 .to_string(),
-            ))
-            .child(private_broadcaster_context_row(
-                "Block",
-                result.tx.block_number.to_string(),
             ));
+        if let Some(receipt) = result.tx.receipt() {
+            context = context.child(private_broadcaster_context_row(
+                "Block",
+                receipt.block_number.to_string(),
+            ));
+        }
     }
     if let Some(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt)) =
         progress.sponsored_self_broadcast_outcome.as_ref()
@@ -1605,18 +1607,22 @@ pub(super) fn render_private_self_broadcast_status_notice(
     kind: DeliveryFormKind,
     result: &DesktopSelfBroadcastResult,
 ) -> gpui::Div {
-    let (title, detail, border) = if result.tx.status {
-        (
+    let (title, detail, border) = match result.tx.receipt() {
+        Some(receipt) if receipt.status => (
             "Self-broadcast confirmed",
             "Open the self-broadcast status dialog for transaction details.",
             theme::SUCCESS,
-        )
-    } else {
-        (
+        ),
+        Some(_) => (
             "Self-broadcast reverted",
             "Open the self-broadcast status dialog for receipt details.",
             theme::DANGER,
-        )
+        ),
+        None => (
+            "Transaction inclusion unknown",
+            progress::SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE,
+            theme::WARNING,
+        ),
     };
     render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border, None)
 }

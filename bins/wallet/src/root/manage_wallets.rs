@@ -560,6 +560,7 @@ impl WalletRoot {
         self.manage_wallets.deleting_wallet_id = Some(Arc::clone(&wallet_id));
         self.manage_wallets.error = None;
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
+        self.begin_public_transaction_shutdown();
         let cleanup = if deleting_selected_wallet {
             self.begin_wallet_deletion_sync_shutdown(cx)
         } else {
@@ -626,6 +627,7 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.manage_wallets.deleting_wallet_id = None;
+                root.resume_public_transactions();
                 let deletion_succeeded =
                     matches!(&result, Ok(Ok(wallet_ids)) if !wallet_ids.is_empty());
                 if restart_selected_wallet_sync_after_deletion(
@@ -911,6 +913,7 @@ impl WalletRoot {
                     self.enter_password_metadata_unlocked(
                         &visible_metadata,
                         view,
+                        None,
                         None,
                         None,
                         window,

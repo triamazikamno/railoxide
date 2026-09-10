@@ -1,7 +1,8 @@
 use super::*;
 use crate::root::private_broadcaster::{
-    cancel_private_broadcaster_progress, request_sponsored_session_cancel,
-    spawn_sponsored_abort_watchdog, sponsored_stop_uses_session_command,
+    cancel_private_broadcaster_progress, private_broadcaster_progress_is_terminal,
+    request_sponsored_session_cancel, spawn_sponsored_abort_watchdog,
+    sponsored_stop_uses_session_command,
 };
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
@@ -315,7 +316,7 @@ fn self_broadcast_reverted_receipt_marks_receipt_step_error() {
     finish_private_self_broadcast_progress_steps_at_stage(
         &mut steps,
         TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
-        false,
+        Some(false),
     );
 
     assert_eq!(
@@ -1025,6 +1026,55 @@ fn private_self_broadcast_success_requires_successful_receipt() {
 
     progress.self_broadcast_result = Some(test_self_broadcast_result(false));
     assert!(!private_broadcaster_progress_is_successful(&progress));
+
+    let mut result = test_self_broadcast_result(true);
+    result.tx = wallet_ops::SelfBroadcastTxOutcome::InclusionUnobserved {
+        tx_hash: "0xunobserved".to_string(),
+    };
+    result.attempts.push(SelfBroadcastAttemptInfo {
+        tx_hash: result.tx.tx_hash().to_owned(),
+        nonce: 7,
+        gas_limit: result.gas_limit,
+        max_fee_per_gas: result.max_fee_per_gas,
+        max_priority_fee_per_gas: result.max_priority_fee_per_gas,
+    });
+    finish_private_self_broadcast_progress_steps_at_stage(
+        &mut progress.steps,
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        result.tx.receipt().map(|receipt| receipt.status),
+    );
+    progress
+        .self_broadcast_attempts
+        .clone_from(&result.attempts);
+    progress.self_broadcast_result = Some(result);
+    assert!(!private_broadcaster_progress_is_successful(&progress));
+    assert!(private_broadcaster_progress_is_terminal(&progress));
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Close,
+    );
+    let receipt_step = progress.steps.last().expect("receipt step");
+    assert_eq!(receipt_step.status, PublicActionStepStatus::Warning);
+    assert!(receipt_step.message.is_some());
+    assert!(
+        progress.steps[..progress.steps.len() - 1]
+            .iter()
+            .all(|step| step.status == PublicActionStepStatus::Done)
+    );
+    assert_eq!(
+        self_broadcast_step_retry_kind(&progress, receipt_step),
+        None
+    );
+    assert_eq!(
+        progress
+            .self_broadcast_result
+            .as_ref()
+            .expect("result retained")
+            .tx
+            .tx_hash(),
+        "0xunobserved",
+    );
+    assert!(progress.error.is_none());
 }
 
 #[test]
@@ -1063,13 +1113,13 @@ fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
         max_priority_fee_per_gas: 1,
         estimated_native_gas_cost: U256::from(21_000),
         live_native_balance: U256::from(42_000),
-        tx: TxReceiptOutput {
+        tx: wallet_ops::SelfBroadcastTxOutcome::Receipt(TxReceiptOutput {
             tx_hash: "0xabc".to_string(),
             status,
             block_number: 10,
             gas_used: 21_000,
             contract_address: None,
-        },
+        }),
         attempts: Vec::new(),
         native_top_up: None,
     }

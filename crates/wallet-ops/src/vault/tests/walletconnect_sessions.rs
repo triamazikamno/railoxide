@@ -268,6 +268,62 @@ fn walletconnect_session_account_resolution_handles_scope_pause_and_invalid() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 #[test]
+fn walletconnect_session_account_resolution_reads_only_the_selected_record() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view_session = import_wallet_with_metadata(&store, "wc-selected-account", "WC Selected");
+    let mut account = store
+        .list_active_public_accounts_for_session(&view_session)
+        .expect("active accounts")
+        .into_iter()
+        .next()
+        .expect("public account");
+    let session = test_walletconnect_session("selected-session", &account, "relay-client");
+    let selected_uuid = account.public_account_uuid.clone();
+    let selected_key = public_account_metadata_record_key(&selected_uuid);
+    account.public_account_uuid = "stale-payload-uuid".to_owned();
+    let record = view_session
+        .view
+        .encrypt_public_account_metadata(&selected_uuid, &account)
+        .expect("encrypt selected metadata with stale payload UUID");
+    let (_, payload) = record
+        .to_record_entry(selected_key.clone())
+        .expect("encode selected metadata");
+    db.put_desktop_wallet_vault_record(&selected_key, &payload)
+        .expect("store selected metadata");
+    db.put_desktop_wallet_vault_record(
+        &public_account_metadata_record_key("unrelated-account"),
+        &payload,
+    )
+    .expect("store unrelated metadata with mismatched authenticated UUID");
+
+    assert!(matches!(
+        store
+            .resolve_walletconnect_session_account(&view_session, &session)
+            .expect("unrelated corrupt metadata does not block selected account"),
+        WalletConnectSessionAccountResolution::Usable(resolved)
+            if resolved.public_account_uuid == selected_uuid
+    ));
+
+    let wrong_record = view_session
+        .view
+        .encrypt_public_account_metadata("unrelated-account", &account)
+        .expect("encrypt metadata for another account");
+    let (_, wrong_payload) = wrong_record
+        .to_record_entry(selected_key.clone())
+        .expect("encode metadata for another account");
+    db.put_desktop_wallet_vault_record(&selected_key, &wrong_payload)
+        .expect("replace selected metadata with mismatched authenticated UUID");
+    assert!(
+        store
+            .resolve_walletconnect_session_account(&view_session, &session)
+            .is_err()
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+#[test]
 fn walletconnect_invalid_session_does_not_reactivate_with_public_account() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let view_session = import_wallet_with_metadata(&store, "wc-invalid-account", "WC Invalid");

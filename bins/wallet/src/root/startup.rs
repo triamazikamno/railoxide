@@ -117,6 +117,7 @@ pub(super) struct WalletStartupRoot {
     error: Option<Arc<str>>,
     vault_store: Option<Arc<DesktopVaultStore>>,
     wallet_root: Option<Entity<WalletRoot>>,
+    public_transaction_tracker: wallet_ops::PublicTransactionTracker,
     maintenance_controller: Entity<WalletMaintenanceController>,
     startup_generation: u64,
     retained_tor_http: Option<HttpContext>,
@@ -167,7 +168,11 @@ impl WalletStartupRoot {
                     .update(cx, |startup, cx| {
                         startup.wallet_root.as_ref().is_some_and(|root| {
                             root.update(cx, |root, cx| {
-                                root.handle_wallet_activity(event_window, cx)
+                                root.handle_wallet_activity(
+                                    super::auto_lock::WalletActivitySource::Desktop,
+                                    event_window,
+                                    cx,
+                                )
                             })
                         })
                     })
@@ -188,6 +193,7 @@ impl WalletStartupRoot {
             error,
             vault_store: vault_store.clone(),
             wallet_root: None,
+            public_transaction_tracker: wallet_ops::PublicTransactionTracker::default(),
             maintenance_controller,
             startup_generation: 1,
             retained_tor_http: None,
@@ -370,6 +376,7 @@ impl WalletStartupRoot {
         let root = cx.new(|cx| {
             WalletRoot::new(
                 self.options.clone(),
+                self.public_transaction_tracker.clone(),
                 ready.http,
                 ready.vault_store,
                 &enabled_chain_ids,
@@ -489,7 +496,10 @@ impl WalletStartupRoot {
             .as_ref()
             .map(|root| root.update(cx, super::WalletRoot::begin_root_replacement_shutdown));
         let (cleanup, outgoing_http) =
-            replacement.map_or((None, None), |(cleanup, http)| (Some(cleanup), Some(http)));
+            replacement.map_or((None, None), |(cleanup, http, tracker)| {
+                self.public_transaction_tracker = tracker;
+                (Some(cleanup), Some(http))
+            });
         let active_http = match outgoing_http {
             Some(http) => {
                 drop(reusable_http);
@@ -977,7 +987,13 @@ impl Render for WalletStartupRoot {
                 move |_, (), window, _cx| {
                     let callback: WalletActivityCallback = Rc::new({
                         move |window, cx| {
-                            root.update(cx, |root, cx| root.handle_wallet_activity(window, cx))
+                            root.update(cx, |root, cx| {
+                                root.handle_wallet_activity(
+                                    super::auto_lock::WalletActivitySource::Desktop,
+                                    window,
+                                    cx,
+                                )
+                            })
                         }
                     });
                     register_wallet_activity_listeners(window, callback);

@@ -37,11 +37,10 @@ use wallet_ops::{
     WalletConnectHardwareTypedDataCapabilityRequest, WalletConnectJsonRpcRequest,
     WalletConnectJsonRpcResponse, WalletConnectLifecycleRequestOutcome,
     WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
-    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPendingRequest,
-    WalletConnectPersonalSignRequest, WalletConnectProposalRejectionReason,
-    WalletConnectRelayClient, WalletConnectRelayClientAuth, WalletConnectRelayConfig,
-    WalletConnectRelayRpc, WalletConnectRelaySocket, WalletConnectRelayStep,
-    WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
+    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPersonalSignRequest,
+    WalletConnectProposalRejectionReason, WalletConnectRelayClient, WalletConnectRelayClientAuth,
+    WalletConnectRelayConfig, WalletConnectRelayRpc, WalletConnectRelaySocket,
+    WalletConnectRelayStep, WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
     WalletConnectSendTransactionRequest, WalletConnectSessionProposal,
     WalletConnectSupportedMethod, WalletConnectTypedDataSignRequest,
     approve_walletconnect_session_with_account_support, build_walletconnect_disconnect_plan,
@@ -81,6 +80,11 @@ use super::utxo::short_hash;
 use super::{
     WalletRoot, app_step_row, app_stepper_container, dialog_content_max_height,
     format_report_chain, new_text_input, rgb_with_alpha, secondary_dialog_content_width,
+};
+
+use super::dapp_request::{
+    DappApprovalTaskError, DappRequestBinding, DappRequestError, DappRequestRoute, DappRequestUi,
+    DappResponseSender, DappSessionIdentity,
 };
 
 mod account_select;
@@ -156,6 +160,9 @@ pub(super) struct WalletConnectUiState {
     pending_pairings: BTreeMap<String, WalletConnectPairingUri>,
     pending_proposal: Option<WalletConnectProposalUi>,
     pending_requests: BTreeMap<String, WalletConnectRequestUi>,
+    watch_asset_metadata:
+        BTreeMap<String, Option<Result<wallet_ops::settings::CustomTokenSettings, String>>>,
+    request_routes: BTreeMap<String, WalletConnectRequestRoute>,
     completed_request_dialogs: BTreeMap<String, WalletConnectCompletedRequestUi>,
     sessions: Vec<WalletConnectSessionRecord>,
     approval_handoff_sessions: BTreeMap<String, WalletConnectSessionRecord>,
@@ -169,6 +176,7 @@ pub(super) struct WalletConnectUiState {
     request_dialog_refresh_generation: u64,
     walletconnect_gas_fee: Eip1559GasFeeEditorState,
     walletconnect_fee_state: Option<WalletConnectFeeState>,
+    walletconnect_fee_quote_task: Option<gpui::Task<()>>,
     walletconnect_fee_request_generation: u64,
     request_disclosure_states: BTreeMap<String, WalletConnectRequestDisclosureState>,
     dismissed_request_dialog_keys: BTreeSet<String>,
@@ -305,6 +313,8 @@ impl WalletConnectUiState {
             pending_pairings: BTreeMap::new(),
             pending_proposal: None,
             pending_requests: BTreeMap::new(),
+            watch_asset_metadata: BTreeMap::new(),
+            request_routes: BTreeMap::new(),
             completed_request_dialogs: BTreeMap::new(),
             sessions: Vec::new(),
             approval_handoff_sessions: BTreeMap::new(),
@@ -318,6 +328,7 @@ impl WalletConnectUiState {
             request_dialog_refresh_generation: 0,
             walletconnect_gas_fee,
             walletconnect_fee_state: None,
+            walletconnect_fee_quote_task: None,
             walletconnect_fee_request_generation: 0,
             request_disclosure_states: BTreeMap::new(),
             dismissed_request_dialog_keys: BTreeSet::new(),
@@ -342,10 +353,21 @@ impl WalletConnectUiState {
         }
     }
 
+    fn invalidate_gateway_pending_requests(&self) {
+        for request in self.pending_requests.values() {
+            if let Some(control) = &request.request_control {
+                control.invalidate(&wallet_ops::RpcBrokerError::OriginRejected);
+            }
+        }
+    }
+
     pub(super) fn clear_runtime(&mut self) {
+        self.invalidate_gateway_pending_requests();
         self.pending_pairings.clear();
         self.pending_proposal = None;
         self.pending_requests.clear();
+        self.watch_asset_metadata.clear();
+        self.request_routes.clear();
         self.completed_request_dialogs.clear();
         self.sessions.clear();
         self.approval_handoff_sessions.clear();
@@ -363,6 +385,7 @@ impl WalletConnectUiState {
         self.walletconnect_gas_fee.refreshing = false;
         self.walletconnect_gas_fee.error = None;
         self.walletconnect_gas_fee.quote_error = None;
+        self.walletconnect_fee_quote_task = None;
         self.walletconnect_fee_state = None;
         self.walletconnect_fee_request_generation =
             self.walletconnect_fee_request_generation.wrapping_add(1);
@@ -395,12 +418,16 @@ impl WalletConnectUiState {
         self.dismissed_request_dialog_keys.remove(request_key);
         self.request_approval_progress.remove(request_key);
         self.request_disclosure_states.remove(request_key);
+        self.watch_asset_metadata.remove(request_key);
         let request = self.pending_requests.remove(request_key);
+        self.request_routes.remove(request_key);
         if self
             .walletconnect_fee_state
             .as_ref()
             .is_some_and(|state| state.request_key.as_ref() == request_key)
         {
+            self.walletconnect_fee_quote_task = None;
+            self.walletconnect_gas_fee.refreshing = false;
             self.walletconnect_fee_state = None;
         }
         if request.is_some() {
@@ -428,6 +455,8 @@ impl WalletConnectUiState {
     ) {
         self.pending_requests
             .retain(|key, request| keep(key, request));
+        self.request_routes
+            .retain(|key, _| self.pending_requests.contains_key(key));
         self.prune_dismissed_request_dialog_keys();
         self.prune_request_approval_progress();
         self.prune_request_disclosure_states();
@@ -436,6 +465,8 @@ impl WalletConnectUiState {
                 .pending_requests
                 .contains_key(state.request_key.as_ref())
         }) {
+            self.walletconnect_fee_quote_task = None;
+            self.walletconnect_gas_fee.refreshing = false;
             self.walletconnect_fee_state = None;
         }
     }
@@ -665,10 +696,10 @@ const fn walletconnect_completed_request_message(
 ) -> &'static str {
     match status {
         WalletConnectCompletedRequestStatus::Approved => {
-            "Request approved and WalletConnect response published."
+            "Request approved and response sent to the dapp."
         }
         WalletConnectCompletedRequestStatus::TransactionSubmitted => {
-            "Transaction submitted and WalletConnect response published."
+            "Transaction submitted and response sent to the dapp."
         }
         WalletConnectCompletedRequestStatus::AuthorizationFailed => {
             "Request was not authorized; error response published to the dapp."
@@ -680,10 +711,10 @@ const fn walletconnect_completed_request_message(
             "Request expired before approval completed."
         }
         WalletConnectCompletedRequestStatus::RelayResponseFailed => {
-            "Request was handled locally, but the WalletConnect response failed to publish."
+            "Request was handled locally, but the response to the dapp could not be sent."
         }
         WalletConnectCompletedRequestStatus::TransactionSubmittedRelayResponseFailed => {
-            "Transaction submitted, but the WalletConnect response failed to publish."
+            "Transaction submitted, but the response to the dapp could not be sent."
         }
     }
 }
@@ -702,14 +733,73 @@ struct WalletConnectProposalUi {
     proposal: WalletConnectSessionProposal,
 }
 
-#[derive(Clone)]
-struct WalletConnectRequestUi {
-    key: String,
-    review_token: u64,
-    session: WalletConnectSessionRecord,
-    parsed: WalletConnectParsedRequest,
-    item: WalletConnectPendingRequest,
-    account_source: PublicAccountSource,
+type WalletConnectRequestUi = DappRequestUi;
+type WalletConnectRequestRoute = DappRequestRoute;
+
+impl WalletConnectRequestRoute {
+    fn from_session(session: &WalletConnectSessionRecord) -> Self {
+        Self::WalletConnect {
+            relay_client_id: session.relay_client_id.clone(),
+            topic: session.session_topic.clone(),
+            sym_key: session.keys.sym_key,
+        }
+    }
+
+    fn response_sender(
+        &self,
+        worker: WalletConnectRelayWorkerHandle,
+        request_id: u64,
+    ) -> DappResponseSender {
+        let Self::WalletConnect { topic, sym_key, .. } = self else {
+            unreachable!("relay response sender requires a WalletConnect route");
+        };
+        let topic = topic.clone();
+        let sym_key = *sym_key;
+        DappResponseSender::new(move |result| {
+            let worker = worker.clone();
+            let topic = topic.clone();
+            Box::pin(async move {
+                let response = match result {
+                    Ok(value) => WalletConnectJsonRpcResponse {
+                        id: request_id,
+                        jsonrpc: "2.0".to_owned(),
+                        result: Some(value),
+                        error: None,
+                    },
+                    Err(error) => {
+                        build_walletconnect_jsonrpc_error(request_id, error.kind, error.message)
+                    }
+                };
+                relay::publish_walletconnect_session_response(worker, topic, sym_key, response)
+                    .await
+            })
+        })
+    }
+}
+
+impl DappRequestBinding {
+    fn from_walletconnect_session(session: &WalletConnectSessionRecord) -> Self {
+        Self {
+            public_account_uuid: session.selected_public_account_uuid.clone(),
+            public_account_scope: session.selected_public_account_scope.clone(),
+            owning_private_wallet_uuid: session.owning_private_wallet_uuid.clone(),
+            peer_name: session.peer_metadata.name.clone(),
+            peer_url: session.peer_metadata.url.clone(),
+        }
+    }
+}
+
+impl DappSessionIdentity {
+    const fn walletconnect(session_uuid: String) -> Self {
+        Self {
+            transport: "walletconnect",
+            id: session_uuid,
+        }
+    }
+
+    fn walletconnect_session_id(&self) -> Option<&str> {
+        (self.transport == "walletconnect").then_some(self.id.as_str())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -817,7 +907,7 @@ struct WalletConnectRelayProcessingPlan {
 struct WalletConnectRelayProcessingResult {
     proposals: Vec<WalletConnectProposalUi>,
     removed_pairings: Vec<String>,
-    pending_requests: Vec<WalletConnectRequestUi>,
+    pending_requests: Vec<(WalletConnectRequestUi, WalletConnectRequestRoute)>,
     removed_sessions: Vec<String>,
     subscriptions: BTreeMap<String, String>,
     error: Option<String>,

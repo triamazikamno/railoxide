@@ -202,6 +202,7 @@ pub(super) struct WalletSyncLifecycleCleanupTask {
 #[derive(Clone)]
 pub(super) struct WalletSyncLifecycleCleanupWaitGroup {
     tasks: Vec<WalletSyncLifecycleCleanupTask>,
+    public_transactions: Option<super::public_transactions::PublicTransactionCleanup>,
 }
 
 #[derive(Clone)]
@@ -567,7 +568,10 @@ impl WalletSyncLifecycleCleanupTask {
 
 impl WalletSyncLifecycleCleanupWaitGroup {
     pub(super) const fn new(tasks: Vec<WalletSyncLifecycleCleanupTask>) -> Self {
-        Self { tasks }
+        Self {
+            tasks,
+            public_transactions: None,
+        }
     }
 
     pub(super) async fn shutdown_for_merkle_reset(
@@ -593,9 +597,16 @@ impl WalletSyncLifecycleCleanupWaitGroup {
         self.tasks
             .iter()
             .all(WalletSyncLifecycleCleanupTask::is_finished)
+            && self
+                .public_transactions
+                .as_ref()
+                .is_none_or(super::public_transactions::PublicTransactionCleanup::is_finished)
     }
 
     async fn wait(self) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        if let Some(cleanup) = self.public_transactions {
+            cleanup.wait().await?;
+        }
         let mut combined = WalletSyncLifecycleCleanupReport::default();
         for task in self.tasks {
             let report = task.wait().await?;
@@ -613,12 +624,13 @@ impl WalletRootReplacementCleanup {
         sync_cleanup: WalletSyncLifecycleCleanupWaitGroup,
         waku_completion: Option<WakuWorkerCompletionToken>,
         proposal_cleanup: ProposalCleanup,
+        gateway: Option<wallet_ops::gateway::GatewayHandle>,
         monitor_state: Shared,
         monitor_event_tx: EventTx,
     ) -> Self {
         let (completed_tx, completed_rx) = watch::channel(None);
         runtime.spawn(async move {
-            let (sync_result, waku_result, proposal_result) = tokio::join!(
+            let (sync_result, waku_result, proposal_result, gateway_result) = tokio::join!(
                 sync_cleanup.wait(),
                 async {
                     match waku_completion {
@@ -627,6 +639,12 @@ impl WalletRootReplacementCleanup {
                     }
                 },
                 proposal_cleanup.shutdown(),
+                async {
+                    match gateway {
+                        Some(gateway) => gateway.shutdown().await,
+                        None => Ok(()),
+                    }
+                },
             );
 
             if let Some(rev) = monitor_state.write().clear() {
@@ -656,6 +674,11 @@ impl WalletRootReplacementCleanup {
                 (Err(sync_error), Err(waku_error), Err(proposal_error)) => Err(format!(
                     "wallet sync cleanup failed during root replacement: {sync_error}; Waku worker cleanup failed during root replacement: {waku_error}; Proposal worker cleanup failed during root replacement: {proposal_error}"
                 )),
+            };
+            let result = match (result, gateway_result) {
+                (result, Ok(())) => result,
+                (Ok(_), Err(error)) => Err(format!("Gateway cleanup failed during root replacement: {error}")),
+                (Err(previous), Err(error)) => Err(format!("{previous}; Gateway cleanup failed during root replacement: {error}")),
             };
             let _ = completed_tx.send(Some(result));
         });
@@ -1519,6 +1542,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        self.begin_public_transaction_shutdown();
         self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;
         self.advance_active_wallet_generation();
@@ -1541,6 +1565,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        self.begin_public_transaction_shutdown();
         self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;
         self.advance_active_wallet_generation();
@@ -1565,6 +1590,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.public_sync_cache_resetting = false;
+        self.resume_public_transactions();
         if restart_safe && self.view_session.is_some() {
             self.ensure_chain_load(self.selected_chain, cx);
         } else {
@@ -1581,6 +1607,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
+        self.begin_public_transaction_shutdown();
         self.advance_active_wallet_generation();
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
@@ -1596,7 +1623,12 @@ impl WalletRoot {
     pub(super) fn begin_root_replacement_shutdown(
         &mut self,
         cx: &mut Context<'_, Self>,
-    ) -> (WalletRootReplacementCleanup, HttpContext) {
+    ) -> (
+        WalletRootReplacementCleanup,
+        HttpContext,
+        wallet_ops::PublicTransactionTracker,
+    ) {
+        self.begin_public_transaction_shutdown();
         self.advance_active_wallet_generation();
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
@@ -1615,10 +1647,15 @@ impl WalletRoot {
             sync_cleanup,
             waku_completion,
             proposal_cleanup,
+            self.gateway.take_shutdown_handle(),
             self.monitor_state.clone(),
             self.monitor_event_tx.clone(),
         );
-        (root_replacement_cleanup, outgoing_http)
+        (
+            root_replacement_cleanup,
+            outgoing_http,
+            self.public_transaction_tracker.successor(),
+        )
     }
 
     fn start_wallet_sync_cleanup(
@@ -1640,19 +1677,29 @@ impl WalletRoot {
         self.prune_finished_wallet_sync_cleanups();
         destructive_cache_reset_admission_is_allowed(
             self.manage_wallets.deleting_wallet_id.is_some(),
-            !self.wallet_sync_cleanup_tasks.is_empty(),
+            !self.wallet_sync_cleanup_tasks.is_empty()
+                || self
+                    .public_transaction_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| !cleanup.is_finished()),
         )
     }
 
     pub(super) fn wallet_sync_cleanup_wait_group(&mut self) -> WalletSyncLifecycleCleanupWaitGroup {
         self.prune_finished_wallet_sync_cleanups();
-        WalletSyncLifecycleCleanupWaitGroup::new(self.wallet_sync_cleanup_tasks.clone())
+        let mut cleanup =
+            WalletSyncLifecycleCleanupWaitGroup::new(self.wallet_sync_cleanup_tasks.clone());
+        cleanup
+            .public_transactions
+            .clone_from(&self.public_transaction_cleanup);
+        cleanup
     }
 
     pub(super) fn begin_merkle_forest_cache_reset(
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
+        self.begin_public_transaction_shutdown();
         self.merkle_forest_cache_resetting = true;
         self.advance_active_wallet_generation();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
@@ -1677,6 +1724,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.merkle_forest_cache_resetting = false;
+        self.resume_public_transactions();
         self.prune_finished_wallet_sync_cleanups();
         if reset_succeeded && self.view_session.is_some() {
             self.ensure_chain_load(self.selected_chain, cx);
@@ -2750,6 +2798,7 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        self.publish_gateway_desktop_state();
         self.invalidate_proposals_chain(chain_id);
         self.invalidate_governance_context();
         self.ui_state.last_chain_id = Some(chain_id);

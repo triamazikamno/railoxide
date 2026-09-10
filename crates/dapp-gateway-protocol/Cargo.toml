@@ -1,0 +1,23 @@
+[package]
+name = "dapp-gateway-protocol"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+spake2 = "=0.4.0"
+snow = "=0.9.6"
+getrandom02 = { package = "getrandom", version = "=0.2.17" }
+zeroize.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom02 = { package = "getrandom", version = "=0.2.17", features = ["js"] }
+wasm-bindgen = "=0.2.126"
+js-sys = "=0.3.103"
+
+[lints]
+workspace = true

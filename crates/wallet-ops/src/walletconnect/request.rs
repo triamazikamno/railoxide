@@ -10,8 +10,8 @@ use alloy::sol_types::SolCall;
 use serde_json::{Value, json};
 
 use crate::vault::{
-    WalletConnectSessionAccountResolution, WalletConnectSessionLifecycleState,
-    WalletConnectSessionRecord,
+    PublicAccountMetadata, WalletConnectSessionAccountResolution,
+    WalletConnectSessionLifecycleState, WalletConnectSessionRecord,
 };
 
 use super::eip155::WalletConnectSupportedMethod;
@@ -93,12 +93,30 @@ pub enum WalletConnectParsedRequest {
     WalletSwitchEthereumChain {
         chain_id: u64,
     },
+    WalletAddEthereumChain {
+        chain_id: u64,
+        raw: Value,
+    },
+    WalletWatchAsset {
+        address: Address,
+        chain_id: Option<u64>,
+        raw: Value,
+    },
 }
 
 impl WalletConnectParsedRequest {
     #[must_use]
+    pub const fn account(&self) -> Option<Address> {
+        request_account(self)
+    }
+
+    #[must_use]
     pub const fn method(&self) -> WalletConnectSupportedMethod {
         match self {
+            Self::WalletAddEthereumChain { .. } => {
+                WalletConnectSupportedMethod::WalletAddEthereumChain
+            }
+            Self::WalletWatchAsset { .. } => WalletConnectSupportedMethod::WalletWatchAsset,
             Self::EthAccounts => WalletConnectSupportedMethod::EthAccounts,
             Self::EthRequestAccounts => WalletConnectSupportedMethod::EthRequestAccounts,
             Self::PersonalSign { .. } => WalletConnectSupportedMethod::PersonalSign,
@@ -109,6 +127,66 @@ impl WalletConnectParsedRequest {
                 WalletConnectSupportedMethod::WalletSwitchEthereumChain
             }
         }
+    }
+
+    #[must_use]
+    pub fn pending_approval(
+        &self,
+        id: u64,
+        topic: &str,
+        dapp_name: &str,
+        chain_id: &str,
+        selected_account: Address,
+        expiry_timestamp: Option<u64>,
+    ) -> Option<WalletConnectPendingRequest> {
+        self.approval_required().then(|| {
+            self.desktop_approval(
+                id,
+                topic,
+                dapp_name,
+                chain_id,
+                selected_account,
+                expiry_timestamp,
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn desktop_approval(
+        &self,
+        id: u64,
+        topic: &str,
+        dapp_name: &str,
+        chain_id: &str,
+        selected_account: Address,
+        expiry_timestamp: Option<u64>,
+    ) -> WalletConnectPendingRequest {
+        WalletConnectPendingRequest {
+            id,
+            topic: topic.to_owned(),
+            dapp_name: dapp_name.to_owned(),
+            chain_id: chain_id.to_owned(),
+            method: self.method(),
+            account: self.account().unwrap_or(selected_account),
+            decoded_transaction: match self {
+                Self::EthSendTransaction { transaction } => {
+                    Some(decode_walletconnect_transaction(transaction))
+                }
+                _ => None,
+            },
+            raw_details: request_raw_details(self),
+            expiry_timestamp,
+        }
+    }
+
+    #[must_use]
+    pub const fn desktop_policy(&self) -> bool {
+        matches!(
+            self,
+            Self::WalletSwitchEthereumChain { .. }
+                | Self::WalletAddEthereumChain { .. }
+                | Self::WalletWatchAsset { .. }
+        )
     }
 
     #[must_use]
@@ -267,7 +345,7 @@ pub fn parse_walletconnect_session_request(
     match method {
         "eth_accounts" => Ok(WalletConnectParsedRequest::EthAccounts),
         "eth_requestAccounts" => Ok(WalletConnectParsedRequest::EthRequestAccounts),
-        "personal_sign" => parse_personal_sign(params),
+        "personal_sign" => parse_personal_sign(params, None),
         "eth_sendTransaction" => parse_send_transaction(params),
         "eth_signTypedData" => {
             parse_typed_data(WalletConnectSupportedMethod::EthSignTypedData, params)
@@ -287,6 +365,140 @@ pub fn parse_walletconnect_session_request(
             "{id}:{other}"
         ))),
     }
+}
+
+/// Parses native dapp policies and resolves personal-sign order using the approved account.
+/// Alloy 2.3.0 has no `wallet_addEthereumChain` or `wallet_watchAsset` request model.
+/// This adapter reads their routing identity with Alloy Address/U64 and retains raw extension fields.
+pub fn parse_dapp_request_for_account(
+    id: u64,
+    method: &str,
+    params: &Value,
+    approved_account: Address,
+) -> Result<WalletConnectParsedRequest> {
+    if matches!(
+        method,
+        "wallet_addEthereumChain" | "wallet_switchEthereumChain"
+    ) {
+        let chain_id = params
+            .as_array()
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("chainId"))
+            .and_then(|value| serde_json::from_value::<alloy::primitives::U64>(value.clone()).ok())
+            .map(|value| value.to())
+            .ok_or_else(|| malformed_params("chainId is required"))?;
+        if method == "wallet_switchEthereumChain" {
+            Ok(WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id })
+        } else {
+            Ok(WalletConnectParsedRequest::WalletAddEthereumChain {
+                chain_id,
+                raw: params.clone(),
+            })
+        }
+    } else if method == "wallet_watchAsset" {
+        let value = if let Some(values) = params.as_array() {
+            if values.len() != 1 {
+                return Err(malformed_params("watch asset requires one object"));
+            }
+            &values[0]
+        } else {
+            params
+        };
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed_params("asset type is required"))?;
+        if kind != "ERC20" {
+            return Err(WalletConnectError::UnsupportedMethod(
+                "wallet_watchAsset type".to_owned(),
+            ));
+        }
+        let options = value
+            .get("options")
+            .ok_or_else(|| malformed_params("asset options are required"))?;
+        let address = options
+            .get("address")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| malformed_params("asset address is required"))?;
+        let chain_id = value
+            .get("chainId")
+            .or_else(|| options.get("chainId"))
+            .map(|value| {
+                serde_json::from_value::<alloy::primitives::U64>(value.clone())
+                    .map(|value| value.to())
+                    .map_err(|_| malformed_params("invalid asset chainId"))
+            })
+            .transpose()?;
+        Ok(WalletConnectParsedRequest::WalletWatchAsset {
+            address,
+            chain_id,
+            raw: params.clone(),
+        })
+    } else if method == "personal_sign" {
+        parse_personal_sign(params, Some(approved_account))
+    } else {
+        parse_walletconnect_session_request(id, method, params)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DappRequestValidationError {
+    #[error("request method is not supported for selected Public account")]
+    UnsupportedMethod,
+    #[error("request account does not match selected Public account")]
+    AccountMismatch,
+    #[error("transaction chainId does not match request chain")]
+    TransactionChainMismatch,
+    #[error("typed-data domain.chainId does not match request chain")]
+    TypedDataChainMismatch,
+}
+
+pub fn validate_dapp_request_account(
+    request: &WalletConnectParsedRequest,
+    selected_account: &PublicAccountMetadata,
+    chain_id: u64,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
+) -> std::result::Result<(), DappRequestValidationError> {
+    if !walletconnect_approved_request_method_supported_for_account_support(
+        request.method(),
+        selected_account_support,
+    ) {
+        return Err(DappRequestValidationError::UnsupportedMethod);
+    }
+    if request
+        .account()
+        .is_some_and(|account| account != selected_account.address)
+    {
+        return Err(DappRequestValidationError::AccountMismatch);
+    }
+    match request {
+        WalletConnectParsedRequest::EthSendTransaction { transaction } => {
+            if transaction
+                .chain_id
+                .is_some_and(|embedded| embedded != chain_id)
+            {
+                return Err(DappRequestValidationError::TransactionChainMismatch);
+            }
+        }
+        WalletConnectParsedRequest::EthSignTypedData {
+            domain_chain_id, ..
+        }
+        | WalletConnectParsedRequest::EthSignTypedDataV4 {
+            domain_chain_id, ..
+        } => {
+            if domain_chain_id.is_some_and(|embedded| embedded != U256::from(chain_id)) {
+                return Err(DappRequestValidationError::TypedDataChainMismatch);
+            }
+        }
+        WalletConnectParsedRequest::EthAccounts
+        | WalletConnectParsedRequest::EthRequestAccounts
+        | WalletConnectParsedRequest::PersonalSign { .. }
+        | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletAddEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletWatchAsset { .. } => {}
+    }
+    Ok(())
 }
 
 pub fn validate_walletconnect_session_request(
@@ -368,83 +580,34 @@ pub fn validate_walletconnect_session_request_with_account_support(
     let request_chain_id = parse_caip2_eip155_chain(chain_id)
         .ok_or_else(|| WalletConnectError::UnsupportedChain(chain_id.to_owned()))?;
     ensure_method_approved(session, chain_id, request.method())?;
-    if !walletconnect_approved_request_method_supported_for_account_support(
-        request.method(),
+    validate_dapp_request_account(
+        &request,
+        selected_account,
+        request_chain_id,
         selected_account_support,
-    ) {
-        return Err(WalletConnectError::UnsupportedMethod(
-            request.method().as_str().to_owned(),
-        ));
-    }
-
-    let account = request_account(&request);
-    if let Some(account) = account
-        && account != selected_account.address
+    )
+    .map_err(|error| match error {
+        DappRequestValidationError::UnsupportedMethod => {
+            WalletConnectError::UnsupportedMethod(request.method().as_str().to_owned())
+        }
+        other => WalletConnectError::Relay(other.to_string()),
+    })?;
+    let account = request.account();
+    if let WalletConnectParsedRequest::WalletSwitchEthereumChain {
+        chain_id: switch_chain,
+    } = &request
     {
-        return Err(WalletConnectError::Relay(
-            "request account does not match selected Public account".to_owned(),
-        ));
+        ensure_chain_approved(session, &format!("eip155:{switch_chain}"))?;
     }
 
-    match &request {
-        WalletConnectParsedRequest::EthSendTransaction { transaction } => {
-            if transaction.from != selected_account.address {
-                return Err(WalletConnectError::Relay(
-                    "transaction from does not match selected Public account".to_owned(),
-                ));
-            }
-            if transaction
-                .chain_id
-                .is_some_and(|embedded| embedded != request_chain_id)
-            {
-                return Err(WalletConnectError::Relay(
-                    "transaction chainId does not match request chain".to_owned(),
-                ));
-            }
-        }
-        WalletConnectParsedRequest::EthSignTypedData {
-            domain_chain_id, ..
-        }
-        | WalletConnectParsedRequest::EthSignTypedDataV4 {
-            domain_chain_id, ..
-        } => {
-            if domain_chain_id.is_some_and(|embedded| embedded != U256::from(request_chain_id)) {
-                return Err(WalletConnectError::Relay(
-                    "typed-data domain.chainId does not match request chain".to_owned(),
-                ));
-            }
-        }
-        WalletConnectParsedRequest::WalletSwitchEthereumChain {
-            chain_id: switch_chain,
-        } => {
-            ensure_chain_approved(session, &format!("eip155:{switch_chain}"))?;
-        }
-        WalletConnectParsedRequest::EthAccounts
-        | WalletConnectParsedRequest::EthRequestAccounts
-        | WalletConnectParsedRequest::PersonalSign { .. } => {}
-    }
-
-    let approval_item = if request.approval_required() {
-        let account = account.unwrap_or(selected_account.address);
-        Some(WalletConnectPendingRequest {
-            id,
-            topic: topic.to_owned(),
-            dapp_name: session.peer_metadata.name.clone(),
-            chain_id: chain_id.to_owned(),
-            method: request.method(),
-            account,
-            decoded_transaction: match &request {
-                WalletConnectParsedRequest::EthSendTransaction { transaction } => {
-                    Some(decode_walletconnect_transaction(transaction))
-                }
-                _ => None,
-            },
-            raw_details: request_raw_details(&request),
-            expiry_timestamp,
-        })
-    } else {
-        None
-    };
+    let approval_item = request.pending_approval(
+        id,
+        topic,
+        &session.peer_metadata.name,
+        chain_id,
+        selected_account.address,
+        expiry_timestamp,
+    );
 
     Ok(WalletConnectRequestValidation {
         request,
@@ -545,12 +708,25 @@ pub fn handle_walletconnect_lifecycle_request(
     }
 }
 
-fn parse_personal_sign(params: &Value) -> Result<WalletConnectParsedRequest> {
+fn parse_personal_sign(
+    params: &Value,
+    approved_account: Option<Address>,
+) -> Result<WalletConnectParsedRequest> {
     let values = params
         .as_array()
         .ok_or_else(|| malformed_params("personal_sign params must be an array"))?;
-    let message = values
-        .first()
+    let canonical_account = parse_address_value(values.get(1));
+    let first_account = parse_address_value(values.first());
+    let address_first = (canonical_account.is_none() && first_account.is_some())
+        || approved_account.is_some_and(|approved| {
+            canonical_account != Some(approved) && first_account == Some(approved)
+        });
+    let (message_value, account) = if address_first {
+        (values.get(1), first_account)
+    } else {
+        (values.first(), canonical_account)
+    };
+    let message = message_value
         .and_then(Value::as_str)
         .ok_or_else(|| malformed_params("personal_sign message is required"))?;
     if let Some(encoded) = message.strip_prefix("0x")
@@ -560,8 +736,7 @@ fn parse_personal_sign(params: &Value) -> Result<WalletConnectParsedRequest> {
             "personal_sign message must be valid hex when prefixed with 0x",
         ));
     }
-    let account = parse_address_value(values.get(1))
-        .ok_or_else(|| malformed_params("personal_sign account is required"))?;
+    let account = account.ok_or_else(|| malformed_params("personal_sign account is required"))?;
     Ok(WalletConnectParsedRequest::PersonalSign {
         message: message.to_owned(),
         account,
@@ -665,12 +840,16 @@ const fn request_account(request: &WalletConnectParsedRequest) -> Option<Address
         WalletConnectParsedRequest::EthSendTransaction { transaction } => Some(transaction.from),
         WalletConnectParsedRequest::EthAccounts
         | WalletConnectParsedRequest::EthRequestAccounts
-        | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. } => None,
+        | WalletConnectParsedRequest::WalletSwitchEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletAddEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletWatchAsset { .. } => None,
     }
 }
 
 fn request_raw_details(request: &WalletConnectParsedRequest) -> Value {
     match request {
+        WalletConnectParsedRequest::WalletAddEthereumChain { raw, .. }
+        | WalletConnectParsedRequest::WalletWatchAsset { raw, .. } => raw.clone(),
         WalletConnectParsedRequest::PersonalSign { message, account } => json!({
             "message": message,
             "account": account.to_string(),

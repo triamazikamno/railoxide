@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+browser_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$browser_root"
+
+if ! command -v wasm-bindgen >/dev/null 2>&1; then
+  echo 'Missing wasm-bindgen 0.2.126. See docs/browser-extension.md for the pinned installation command.' >&2
+  exit 1
+fi
+if [[ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.126' ]]; then
+  echo 'Expected exactly wasm-bindgen 0.2.126. Put the matching helper on PATH; see docs/browser-extension.md.' >&2
+  exit 1
+fi
+if [[ $# -gt 0 ]]; then
+  echo 'Usage: scripts/build-browser-extension' >&2
+  exit 1
+fi
+
+cargo +nightly-2026-08-16 build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked
+browser_metadata="$(mktemp)"
+trap 'rm -f -- "$browser_metadata"' EXIT
+cargo +nightly-2026-08-16 metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "$browser_metadata"
+python3 scripts/package-browser-extension.py "$browser_metadata"

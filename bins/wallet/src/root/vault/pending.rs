@@ -188,6 +188,7 @@ impl WalletRoot {
             .wrapping_add(1);
         self.pending_software_profile_open_operation_generation = operation_generation;
         pending.set_operation_generation(operation_generation);
+        let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
         let selected_chain = self.selected_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
@@ -223,7 +224,12 @@ impl WalletRoot {
                 match result {
                     Ok(Ok((session, metadata))) => {
                         root.install_verified_software_context(
-                            session, &metadata, None, window, cx,
+                            session,
+                            &metadata,
+                            None,
+                            gateway_unlock,
+                            window,
+                            cx,
                         );
                     }
                     Ok(Err(error)) => {
@@ -262,6 +268,7 @@ impl WalletRoot {
             .wrapping_add(1);
         self.pending_software_profile_open_operation_generation = operation_generation;
         pending.set_operation_generation(operation_generation);
+        let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
         let selected_chain = self.selected_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
@@ -331,6 +338,7 @@ impl WalletRoot {
                             session,
                             &metadata,
                             Some(protected_seed_session),
+                            gateway_unlock,
                             window,
                             cx,
                         );
@@ -498,7 +506,7 @@ impl WalletRoot {
                     return;
                 }
                 match result {
-                    Ok(Ok(pending)) => root.enter_pending_software_profile_open(pending, window, cx),
+                    Ok(Ok(pending)) => root.enter_pending_software_profile_open(pending, None, window, cx),
                     Ok(Err(error)) => root.handle_vault_error(&error, cx),
                     Err(error) => {
                         tracing::warn!(%error, "fresh passphrase authorization task failed");
@@ -539,6 +547,7 @@ impl WalletRoot {
             .wrapping_add(1);
         self.pending_software_profile_open_operation_generation = operation_generation;
         pending.set_operation_generation(operation_generation);
+        let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
         let selected_chain = self.selected_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
@@ -603,6 +612,7 @@ impl WalletRoot {
                                 session,
                                 &metadata,
                                 Some(protected_seed_session),
+                                gateway_unlock,
                                 window,
                                 cx,
                             );

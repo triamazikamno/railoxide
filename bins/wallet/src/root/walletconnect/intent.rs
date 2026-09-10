@@ -46,6 +46,8 @@ pub(super) enum WalletConnectIntentAction {
     TypedDataSign,
     AccountRequest,
     ChainSwitch,
+    ChainAdd,
+    WatchAsset,
 }
 
 impl WalletConnectIntentAction {
@@ -62,6 +64,8 @@ impl WalletConnectIntentAction {
             Self::TypedDataSign => "Sign typed data",
             Self::AccountRequest => "Request account access",
             Self::ChainSwitch => "Switch chain",
+            Self::ChainAdd => "Confirm configured chain",
+            Self::WatchAsset => "Watch token",
         }
     }
 
@@ -164,6 +168,7 @@ pub(super) struct WalletConnectNativeAmount {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WalletConnectHeroSummary {
+    Policy(String),
     Amount,
     PersonalMessage(WalletConnectPersonalMessageSummary),
     TypedData(WalletConnectTypedDataSummary),
@@ -331,7 +336,9 @@ pub(super) fn walletconnect_moving_usd_micro_value(
         | WalletConnectIntentAction::PersonalSign
         | WalletConnectIntentAction::TypedDataSign
         | WalletConnectIntentAction::AccountRequest
-        | WalletConnectIntentAction::ChainSwitch => None,
+        | WalletConnectIntentAction::ChainSwitch
+        | WalletConnectIntentAction::ChainAdd
+        | WalletConnectIntentAction::WatchAsset => None,
     }
 }
 
@@ -477,9 +484,24 @@ pub(super) fn build_walletconnect_intent<'a>(
             action = WalletConnectIntentAction::AccountRequest;
             hero_summary = WalletConnectHeroSummary::None;
         }
-        WalletConnectParsedRequest::WalletSwitchEthereumChain { .. } => {
+        WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
+            action = WalletConnectIntentAction::ChainAdd;
+            hero_summary = WalletConnectHeroSummary::Policy(format!(
+                "Use saved configuration for chain {chain_id}"
+            ));
+        }
+        WalletConnectParsedRequest::WalletWatchAsset { address, .. } => {
+            action = WalletConnectIntentAction::WatchAsset;
+            hero_summary = WalletConnectHeroSummary::Policy(format!(
+                "Token {address} on chain {}",
+                context.chain.chain_id
+            ));
+        }
+        WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
             action = WalletConnectIntentAction::ChainSwitch;
-            hero_summary = WalletConnectHeroSummary::None;
+            hero_summary = WalletConnectHeroSummary::Policy(format!(
+                "Permit this website on chain {chain_id}"
+            ));
         }
     }
 
@@ -502,21 +524,22 @@ pub(super) fn build_walletconnect_intent<'a>(
         transaction,
         raw_request: &request.item.raw_details,
         authorization,
-        provenance: walletconnect_peer_provenance(&request.session.peer_metadata),
+        provenance: walletconnect_peer_provenance(
+            &request.binding.peer_name,
+            &request.binding.peer_url,
+        ),
     }
 }
 
-fn walletconnect_peer_provenance(
-    metadata: &wallet_ops::vault::WalletConnectPeerMetadata,
-) -> WalletConnectPeerProvenance {
-    let site = reqwest::Url::parse(&metadata.url)
+fn walletconnect_peer_provenance(name: &str, url: &str) -> WalletConnectPeerProvenance {
+    let site = reqwest::Url::parse(url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| "Unknown peer site".to_owned());
     WalletConnectPeerProvenance {
         site,
-        dapp_name: sanitize_walletconnect_dapp_name(&metadata.name),
+        dapp_name: sanitize_walletconnect_dapp_name(name),
     }
 }
 
@@ -1322,7 +1345,8 @@ fn authorization_projection(
                 |preview| format!("Personal message: {preview:?}"),
             ));
         }
-        WalletConnectHeroSummary::TypedData(_)
+        WalletConnectHeroSummary::Policy(_)
+        | WalletConnectHeroSummary::TypedData(_)
         | WalletConnectHeroSummary::Amount
         | WalletConnectHeroSummary::UndecodedCall { .. }
         | WalletConnectHeroSummary::None => {}
@@ -1333,6 +1357,7 @@ fn authorization_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::root::dapp_request::{DappRequestBinding, DappSessionIdentity};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -1342,7 +1367,6 @@ mod tests {
     };
     use wallet_ops::vault::{
         PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletConnectPeerMetadata,
-        WalletConnectSessionKeys, WalletConnectSessionLifecycleState, WalletConnectSessionRecord,
     };
 
     #[test]
@@ -1614,7 +1638,7 @@ mod tests {
             url: "HTTPS://Example.COM:443/path".to_owned(),
             icons: Vec::new(),
         };
-        let projection = walletconnect_peer_provenance(&metadata);
+        let projection = walletconnect_peer_provenance(&metadata.name, &metadata.url);
         assert_eq!(projection.site, "example.com");
         let dapp_name = projection.dapp_name.expect("sanitized dapp name");
         assert!(!dapp_name.contains('\u{202e}'));
@@ -1626,7 +1650,7 @@ mod tests {
             url: "not a url".to_owned(),
             icons: Vec::new(),
         };
-        let projection = walletconnect_peer_provenance(&empty);
+        let projection = walletconnect_peer_provenance(&empty.name, &empty.url);
         assert_eq!(projection.site, "Unknown peer site");
         assert_eq!(projection.dapp_name, None);
     }
@@ -1689,32 +1713,18 @@ mod tests {
         let account = Address::from([0x11; 20]);
         let method = parsed.method();
         WalletConnectRequestUi {
+            request_control: None,
+            rpc_reads: None,
             key: "session-topic:7".to_owned(),
             review_token: 1,
-            session: WalletConnectSessionRecord {
-                session_uuid: "session-uuid".to_owned(),
-                pairing_topic: "pairing-topic".to_owned(),
-                session_topic: "session-topic".to_owned(),
-                relay_protocol: "irn".to_owned(),
-                relay_client_id: "relay-client".to_owned(),
-                peer_metadata: WalletConnectPeerMetadata {
-                    name: "Aave".to_owned(),
-                    description: String::new(),
-                    url: "https://app.aave.com".to_owned(),
-                    icons: Vec::new(),
-                },
-                approved_namespaces: BTreeMap::new(),
-                selected_public_account_uuid: "public-account".to_owned(),
-                selected_public_account_scope: PublicAccountScope::Global,
+            binding: DappRequestBinding {
+                public_account_uuid: "public-account".to_owned(),
+                public_account_scope: PublicAccountScope::Global,
                 owning_private_wallet_uuid: None,
-                keys: WalletConnectSessionKeys {
-                    sym_key: [1; 32],
-                    responder_private_key: [2; 32],
-                    responder_public_key: [3; 32],
-                },
-                expiry_timestamp: 1_700_000_300,
-                lifecycle_state: WalletConnectSessionLifecycleState::Active,
+                peer_name: "Aave".to_owned(),
+                peer_url: "https://app.aave.com".to_owned(),
             },
+            session_identity: DappSessionIdentity::walletconnect("session-uuid".to_owned()),
             parsed,
             item: WalletConnectPendingRequest {
                 id: 7,

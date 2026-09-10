@@ -73,6 +73,7 @@ pub(in crate::root) const fn public_action_step_detail_for_context(
             (_, false, false) => "Broadcasting and waiting for confirmation.",
         },
         PublicActionStepStatus::Done => "Confirmed on-chain.",
+        PublicActionStepStatus::Warning => "Transaction inclusion could not be observed.",
         PublicActionStepStatus::Error => "Failed.",
         PublicActionStepStatus::Stopped => STOPPED_PROGRESS_MESSAGE,
     }

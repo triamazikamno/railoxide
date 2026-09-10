@@ -440,11 +440,22 @@ pub async fn quote_public_action_gas_fee(
     effective_chain: Option<&EffectiveChainConfig>,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuote> {
-    quote_public_action_gas_fee_with_profile(
-        chain_id,
-        effective_chain,
-        PublicShieldTransactionProfile::Railoxide,
-        http,
+    quote_public_action_gas_fee_with_reads(chain_id, effective_chain, http, None).await
+}
+
+pub async fn quote_public_action_gas_fee_with_reads(
+    chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+    http: &HttpContext,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> Result<PublicActionGasFeeQuote> {
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
+        &query_rpc_pool,
+        http.network_mode(),
+        public_action_tip_fallback(chain_id),
+        rpc_reads.map(|reads| (reads, chain_id)),
     )
     .await
 }
@@ -514,7 +525,7 @@ pub async fn estimate_public_advanced_transaction_with_fee(
     http: &HttpContext,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     validate_advanced_transaction_estimate_request(&request)?;
-    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http)
+    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http, None)
         .await
         .map_err(|error| eyre!(simulation_error_reason(&error).to_owned()))
         .wrap_err("all advanced public transaction query RPC attempts failed")
@@ -527,10 +538,23 @@ pub async fn simulate_public_advanced_transaction_with_fee(
     http: &HttpContext,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
+    simulate_public_advanced_transaction_with_fee_and_reads(request, quote, resolved, http, None)
+        .await
+}
+
+pub async fn simulate_public_advanced_transaction_with_fee_and_reads(
+    request: PublicAdvancedTransactionEstimateRequest,
+    quote: PublicActionGasFeeQuote,
+    resolved: PublicActionResolvedGasFee,
+    http: &HttpContext,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
+{
     validate_advanced_transaction_estimate_request(&request).map_err(|error| {
         PublicAdvancedTransactionSimulationError::Unavailable(error.to_string())
     })?;
-    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http).await
+    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http, rpc_reads)
+        .await
 }
 
 fn validate_advanced_transaction_estimate_request(
@@ -550,6 +574,7 @@ async fn estimate_public_advanced_transaction_with_fee_core(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
     let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())
@@ -571,7 +596,33 @@ async fn estimate_public_advanced_transaction_with_fee_core(
 
     let mut failures = Vec::with_capacity(providers.len());
     for provider_handle in providers {
-        match provider_handle.provider.estimate_gas(tx_req.clone()).await {
+        let estimate = match rpc_reads {
+            Some(reads) => match reads
+                .estimate_gas(
+                    provider_handle.url.clone().into(),
+                    request.chain_id,
+                    &tx_req,
+                )
+                .await
+            {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    if super::stops_dapp_read_retries(&error) {
+                        return Err(PublicAdvancedTransactionSimulationError::RpcRead(error));
+                    }
+                    Err(classify_broker_provider_failure(&error))
+                }
+            },
+            None => provider_handle
+                .provider
+                .estimate_gas(tx_req.clone())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "advanced public transaction gas estimate failed");
+                    classify_provider_failure(&error)
+                }),
+        };
+        match estimate {
             Ok(estimated_gas) => {
                 let gas_limit =
                     buffered_advanced_gas_limit(estimated_gas, chain.gas.gas_limit_buffer);
@@ -601,8 +652,7 @@ async fn estimate_public_advanced_transaction_with_fee_core(
                 });
             }
             Err(error) => {
-                tracing::warn!(%error, "advanced public transaction gas estimate failed");
-                failures.push(classify_provider_failure(&error));
+                failures.push(error);
             }
         }
     }
@@ -623,6 +673,35 @@ enum ProviderFailureGroup {
 struct ProviderFailure {
     group: ProviderFailureGroup,
     reason: String,
+}
+
+fn classify_broker_provider_failure(error: &crate::rpc_broker::RpcBrokerError) -> ProviderFailure {
+    use crate::rpc_broker::RpcBrokerError;
+
+    match error {
+        RpcBrokerError::InnerRevert(revert) => {
+            let data = revert.expose_bytes().to_vec();
+            ProviderFailure {
+                reason: friendly_revert_data(&data),
+                group: ProviderFailureGroup::RevertData(data),
+            }
+        }
+        RpcBrokerError::Remote(remote) => ProviderFailure {
+            group: ProviderFailureGroup::JsonRpc {
+                code: remote.code(),
+                message: String::new(),
+            },
+            reason: format!("RPC error {}.", remote.code()),
+        },
+        RpcBrokerError::HttpStatus(status) => ProviderFailure {
+            group: ProviderFailureGroup::Http(*status),
+            reason: format!("RPC returned HTTP status {status}."),
+        },
+        _ => ProviderFailure {
+            group: ProviderFailureGroup::Other,
+            reason: "RPC provider is unavailable.".to_owned(),
+        },
+    }
 }
 
 fn classify_provider_failure(error: &alloy::transports::TransportError) -> ProviderFailure {
@@ -709,6 +788,7 @@ fn unavailable_simulation_error(reason: &str) -> PublicAdvancedTransactionSimula
 
 fn simulation_error_reason(error: &PublicAdvancedTransactionSimulationError) -> &str {
     match error {
+        PublicAdvancedTransactionSimulationError::RpcRead(_) => "RPC read is unavailable.",
         PublicAdvancedTransactionSimulationError::Reverted(reason)
         | PublicAdvancedTransactionSimulationError::Unavailable(reason) => reason,
     }
@@ -1126,6 +1206,37 @@ mod tests {
         assert_eq!(
             friendly_revert_data(&[0x12, 0x34, 0x56, 0x78, 0xab, 0xcd]),
             "Custom error 0x12345678"
+        );
+    }
+
+    #[test]
+    fn broker_simulation_classification_preserves_remote_and_revert_distinction() {
+        use crate::{RpcBrokerError, RpcRemoteError, RpcRevert};
+
+        let remote = RpcRemoteError::from(
+            serde_json::from_value::<
+                alloy::serde::WithOtherFields<
+                    alloy::rpc::json_rpc::ErrorPayload<serde_json::Value>,
+                >,
+            >(serde_json::json!({
+                "code": -32000, "message": "execution reverted: provider failure",
+            }))
+            .unwrap(),
+        );
+        let error = select_provider_failure(vec![classify_broker_provider_failure(
+            &RpcBrokerError::Remote(remote),
+        )]);
+        assert!(matches!(
+            error,
+            PublicAdvancedTransactionSimulationError::Unavailable(_)
+        ));
+        let revert = RpcRevert::from_multicall(Revert::from("Order expired").abi_encode().into());
+        let error = select_provider_failure(vec![classify_broker_provider_failure(
+            &RpcBrokerError::InnerRevert(revert),
+        )]);
+        assert!(
+            matches!(error, PublicAdvancedTransactionSimulationError::Reverted(reason)
+            if reason == "Order expired")
         );
     }
 

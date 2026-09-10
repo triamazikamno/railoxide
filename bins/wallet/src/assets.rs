@@ -19,6 +19,7 @@ const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
 const BROADCASTER_ICON_PATH: &str = "railgun/icons/robot.svg";
+const BROWSER_EXTENSIONS_ICON_PATH: &str = "railgun/icons/browser-extensions.svg";
 const LOGS_ICON_PATH: &str = "railgun/icons/logs.svg";
 const DICES_ICON_PATH: &str = "railgun/icons/dices.svg";
 const SQUARE_ICON_PATH: &str = "railgun/icons/square.svg";
@@ -63,6 +64,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
     BROADCASTER_ICON_PATH,
+    BROWSER_EXTENSIONS_ICON_PATH,
     LOGS_ICON_PATH,
     DICES_ICON_PATH,
     SQUARE_ICON_PATH,
@@ -108,6 +110,8 @@ const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
 const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
 const WALLET_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/wallet.svg");
 const BROADCASTER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/robot.svg");
+const BROWSER_EXTENSIONS_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/browser-extensions.svg");
 const LOGS_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/logs.svg");
 const DICES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/dices.svg");
 const SQUARE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square.svg");
@@ -369,6 +373,7 @@ impl IconNamed for RailgunPublicAccountIcon {
 pub(crate) enum RailgunSidebarIcon {
     Wallet,
     Broadcaster,
+    BrowserExtensions,
     BookUser,
     Landmark,
     Logs,
@@ -379,6 +384,7 @@ impl IconNamed for RailgunSidebarIcon {
         match self {
             Self::Wallet => WALLET_ICON_PATH,
             Self::Broadcaster => BROADCASTER_ICON_PATH,
+            Self::BrowserExtensions => BROWSER_EXTENSIONS_ICON_PATH,
             Self::BookUser => BOOK_USER_ICON_PATH,
             Self::Landmark => LANDMARK_ICON_PATH,
             Self::Logs => LOGS_ICON_PATH,
@@ -434,6 +440,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
         BROADCASTER_ICON_PATH => Some(BROADCASTER_ICON_BYTES),
+        BROWSER_EXTENSIONS_ICON_PATH => Some(BROWSER_EXTENSIONS_ICON_BYTES),
         LOGS_ICON_PATH => Some(LOGS_ICON_BYTES),
         DICES_ICON_PATH => Some(DICES_ICON_BYTES),
         SQUARE_ICON_PATH => Some(SQUARE_ICON_BYTES),

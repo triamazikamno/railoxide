@@ -8,6 +8,14 @@ use wallet_ops::{
 };
 
 const AUTO_LOCK_MONITOR_INTERVAL: Duration = Duration::from_secs(15);
+const EXTENSION_ACTIVITY_INTERVAL: Duration = Duration::from_secs(15);
+const EXTENSION_ACTIVITY_BUDGET: Duration = Duration::from_mins(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WalletActivitySource {
+    Desktop,
+    Extension,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AutoLockTimestamp {
@@ -69,6 +77,8 @@ pub(super) struct AutoLockState {
     effective_timeout: Option<Duration>,
     last_activity: Option<AutoLockTimestamp>,
     pending_activity: Option<AutoLockTimestamp>,
+    extension_budget_remaining: Duration,
+    last_extension_activity: Option<AutoLockTimestamp>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +243,8 @@ impl AutoLockState {
             effective_timeout,
             last_activity: None,
             pending_activity: None,
+            extension_budget_remaining: EXTENSION_ACTIVITY_BUDGET,
+            last_extension_activity: None,
         }
     }
 
@@ -245,6 +257,57 @@ impl AutoLockState {
         self.effective_timeout = effective_timeout;
         self.last_activity = is_unlocked.then_some(now);
         self.pending_activity = None;
+    }
+
+    fn record_wallet_activity(
+        &mut self,
+        source: WalletActivitySource,
+        is_unlocked: bool,
+        now: AutoLockTimestamp,
+    ) -> AutoLockActivityStatus {
+        if source == WalletActivitySource::Desktop {
+            self.extension_budget_remaining = EXTENSION_ACTIVITY_BUDGET;
+            self.last_extension_activity = None;
+            return self.record_activity(is_unlocked, now);
+        }
+        match self.deadline_status(is_unlocked, now) {
+            AutoLockDeadlineStatus::Overdue => return AutoLockActivityStatus::Overdue,
+            AutoLockDeadlineStatus::Locked | AutoLockDeadlineStatus::Disabled => {
+                return AutoLockActivityStatus::Ignored;
+            }
+            AutoLockDeadlineStatus::Waiting => {}
+        }
+        if self.extension_budget_remaining.is_zero()
+            || self.last_extension_activity.is_some_and(|last| {
+                now.monotonic.saturating_duration_since(last.monotonic)
+                    < EXTENSION_ACTIVITY_INTERVAL
+            })
+        {
+            return AutoLockActivityStatus::Ignored;
+        }
+        let last = self.last_activity.expect("waiting deadline has activity");
+        let Some(monotonic_elapsed) = now.monotonic.checked_duration_since(last.monotonic) else {
+            return AutoLockActivityStatus::Ignored;
+        };
+        let Ok(wall_elapsed) = now.wall.duration_since(last.wall) else {
+            return AutoLockActivityStatus::Ignored;
+        };
+        // Cap each clock's advance so a partial final marker spends only the remaining
+        // deadline extension, without moving either timestamp backward or past now.
+        let monotonic_extension = monotonic_elapsed.min(self.extension_budget_remaining);
+        let wall_extension = wall_elapsed.min(self.extension_budget_remaining);
+        let extension = monotonic_extension.max(wall_extension);
+        if extension.is_zero() {
+            return AutoLockActivityStatus::Ignored;
+        }
+        self.last_activity = Some(AutoLockTimestamp {
+            monotonic: last.monotonic + monotonic_extension,
+            wall: last.wall + wall_extension,
+        });
+        self.pending_activity = None;
+        self.extension_budget_remaining -= extension;
+        self.last_extension_activity = Some(now);
+        AutoLockActivityStatus::Recorded
     }
 
     fn record_activity(
@@ -301,9 +364,20 @@ impl AutoLockState {
 
 impl super::WalletRoot {
     pub(super) fn advance_active_wallet_generation(&mut self) {
+        self.advance_active_wallet_generation_for_gateway_unlock(None);
+    }
+
+    pub(super) fn advance_active_wallet_generation_for_gateway_unlock(
+        &mut self,
+        continuation: Option<u64>,
+    ) {
+        if !self.gateway_unlock_is_current(continuation) {
+            self.retire_gateway_unlock();
+        }
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.initial_sync_activity
             .reset_wallet_generation(self.active_wallet_generation);
+        self.publish_gateway_desktop_state();
     }
 
     pub(super) fn install_vault_view_unlock(&mut self, view_unlock: Arc<ViewUnlock>) {
@@ -314,13 +388,14 @@ impl super::WalletRoot {
 
     pub(super) fn handle_wallet_activity(
         &mut self,
+        source: WalletActivitySource,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
         let now = AutoLockTimestamp::now();
         if self
             .auto_lock
-            .record_activity(self.vault_view_unlock.is_some(), now)
+            .record_wallet_activity(source, self.vault_view_unlock.is_some(), now)
             != AutoLockActivityStatus::Overdue
         {
             return false;
@@ -670,6 +745,230 @@ mod tests {
             state.deadline_status(true, overdue_activity),
             AutoLockDeadlineStatus::Waiting,
             "qualifying activity may reset the deadline after lock admission is denied"
+        );
+    }
+
+    #[test]
+    fn extension_activity_throttles_and_caps_total_deadline_extension() {
+        let started = AutoLockTimestamp::now();
+        let timeout = Duration::from_mins(10);
+        let mut state = AutoLockState::new(Some(timeout));
+        state.arm_after_view_unlock(started);
+
+        for (seconds, expected) in [
+            (140, AutoLockActivityStatus::Recorded),
+            (154, AutoLockActivityStatus::Ignored),
+            (155, AutoLockActivityStatus::Recorded),
+            (290, AutoLockActivityStatus::Recorded),
+            (305, AutoLockActivityStatus::Recorded),
+            (320, AutoLockActivityStatus::Ignored),
+        ] {
+            assert_eq!(
+                state.record_wallet_activity(
+                    WalletActivitySource::Extension,
+                    true,
+                    started + Duration::from_secs(seconds),
+                ),
+                expected,
+            );
+        }
+        let capped_activity = started + Duration::from_mins(5);
+        assert_eq!(state.last_activity, Some(capped_activity));
+        assert_eq!(
+            state.deadline_status(true, capped_activity + timeout),
+            AutoLockDeadlineStatus::Overdue,
+        );
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                capped_activity + timeout,
+            ),
+            AutoLockActivityStatus::Overdue,
+            "an exhausted budget must still enforce expiry",
+        );
+        state.accept_pending_activity_after_denial();
+        assert_eq!(
+            state.deadline_status(true, capped_activity + timeout),
+            AutoLockDeadlineStatus::Overdue,
+            "an overdue extension marker cannot rescue a denied lock",
+        );
+    }
+
+    #[test]
+    fn only_desktop_activity_replenishes_extension_budget() {
+        let started = AutoLockTimestamp::now();
+        let timeout = Duration::from_mins(10);
+        let mut state = AutoLockState::new(Some(timeout));
+        state.arm_after_view_unlock(started);
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                started + Duration::from_mins(5),
+            ),
+            AutoLockActivityStatus::Recorded,
+        );
+        let resumed = started + Duration::from_mins(6);
+        let mut tracker = InitialSyncActivity::new(1);
+        assert!(apply_initial_sync_observation(
+            &mut tracker,
+            &mut state,
+            true,
+            1,
+            1,
+            InitialSyncObservation::Progress(progress(10)),
+            resumed,
+        ));
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                resumed + Duration::from_secs(1),
+            ),
+            AutoLockActivityStatus::Ignored,
+        );
+        state.disarm();
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, false, resumed),
+            AutoLockActivityStatus::Ignored,
+        );
+        state.arm_after_view_unlock(resumed);
+        state.apply_policy(None, true, resumed);
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, true, resumed),
+            AutoLockActivityStatus::Ignored,
+        );
+        state.apply_policy(Some(timeout), true, resumed);
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                resumed + Duration::from_secs(1),
+            ),
+            AutoLockActivityStatus::Ignored,
+        );
+        let desktop = resumed + Duration::from_secs(2);
+        state.record_wallet_activity(WalletActivitySource::Desktop, true, desktop);
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                desktop + Duration::from_secs(1),
+            ),
+            AutoLockActivityStatus::Recorded,
+        );
+        state.record_wallet_activity(
+            WalletActivitySource::Desktop,
+            true,
+            desktop + Duration::from_secs(2),
+        );
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                desktop + Duration::from_secs(3),
+            ),
+            AutoLockActivityStatus::Recorded,
+            "desktop input also clears the extension throttle",
+        );
+    }
+
+    #[test]
+    fn extension_markers_cannot_arm_or_rescue_an_expired_deadline() {
+        let started = AutoLockTimestamp::now();
+        let timeout = Duration::from_mins(1);
+        let mut state = AutoLockState::new(Some(timeout));
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, true, started),
+            AutoLockActivityStatus::Ignored,
+        );
+        assert_eq!(
+            state.deadline_status(true, started),
+            AutoLockDeadlineStatus::Locked
+        );
+        state.arm_after_view_unlock(started);
+        let activity = started + Duration::from_secs(1);
+        state.record_wallet_activity(WalletActivitySource::Extension, true, activity);
+        state.apply_policy(Some(Duration::from_secs(1)), true, activity);
+        let overdue = activity + Duration::from_secs(1);
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, true, overdue),
+            AutoLockActivityStatus::Overdue,
+            "expiry takes precedence even during the throttle interval",
+        );
+        state.accept_pending_activity_after_denial();
+        assert!(invoke_auto_lock_lifecycle(
+            state.deadline_status(true, overdue),
+            || state.disarm(),
+        ));
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, false, overdue),
+            AutoLockActivityStatus::Ignored,
+        );
+        assert_eq!(
+            state.deadline_status(true, overdue),
+            AutoLockDeadlineStatus::Locked
+        );
+    }
+
+    #[test]
+    fn extension_budget_accounts_for_both_clocks_without_rewinding_activity() {
+        let started = AutoLockTimestamp::now();
+        let timeout = Duration::from_mins(10);
+        for wall_leads in [false, true] {
+            let mut state = AutoLockState::new(Some(timeout));
+            state.arm_after_view_unlock(started);
+            let now = AutoLockTimestamp {
+                monotonic: started.monotonic
+                    + Duration::from_secs(if wall_leads { 10 } else { 290 }),
+                wall: started.wall + Duration::from_secs(if wall_leads { 290 } else { 10 }),
+            };
+            assert_eq!(
+                state.record_wallet_activity(WalletActivitySource::Extension, true, now),
+                AutoLockActivityStatus::Recorded,
+            );
+            let wall_jump = AutoLockTimestamp {
+                monotonic: now.monotonic + Duration::from_secs(14),
+                wall: now.wall + Duration::from_secs(20),
+            };
+            assert_eq!(
+                state.record_wallet_activity(WalletActivitySource::Extension, true, wall_jump),
+                AutoLockActivityStatus::Ignored,
+                "wall-clock advances cannot bypass the monotonic throttle",
+            );
+            let final_marker = now + Duration::from_secs(15);
+            assert_eq!(
+                state.record_wallet_activity(WalletActivitySource::Extension, true, final_marker),
+                AutoLockActivityStatus::Recorded,
+            );
+            assert_eq!(state.last_activity, Some(now + Duration::from_secs(10)));
+            assert_eq!(
+                state.deadline_status(true, now + Duration::from_secs(10) + timeout),
+                AutoLockDeadlineStatus::Overdue,
+            );
+        }
+        let mut state = AutoLockState::new(Some(timeout));
+        state.arm_after_view_unlock(started);
+        let rollback = AutoLockTimestamp {
+            monotonic: started.monotonic + Duration::from_secs(15),
+            wall: started.wall - Duration::from_secs(15),
+        };
+        assert_eq!(
+            state.record_wallet_activity(WalletActivitySource::Extension, true, rollback),
+            AutoLockActivityStatus::Ignored,
+        );
+        assert_eq!(state.last_activity, Some(started));
+        assert_eq!(
+            state.record_wallet_activity(
+                WalletActivitySource::Extension,
+                true,
+                AutoLockTimestamp {
+                    monotonic: started.monotonic + timeout,
+                    wall: rollback.wall,
+                },
+            ),
+            AutoLockActivityStatus::Overdue,
         );
     }
 

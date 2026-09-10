@@ -54,6 +54,7 @@ pub(super) const fn pending_software_profile_open_timeout_is_current(
 }
 
 struct WalletContextInstallation {
+    gateway_unlock: Option<u64>,
     session: Arc<DesktopViewSession>,
     metadata: Vec<WalletMetadataBundle>,
     created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
@@ -304,6 +305,7 @@ impl WalletRoot {
             return;
         };
 
+        let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         let switch_generation = self.wallet_switch_generation;
@@ -322,7 +324,13 @@ impl WalletRoot {
                     return;
                 }
                 match result {
-                    Ok(Ok(session)) => root.install_view_session(session, &metadata, window, cx),
+                    Ok(Ok(session)) => root.install_view_session_for_gateway_unlock(
+                        session,
+                        &metadata,
+                        gateway_unlock,
+                        window,
+                        cx,
+                    ),
                     Ok(Err(error)) => {
                         root.handle_vault_error(&error, cx);
                         root.sync_wallet_select(window, cx);
@@ -407,6 +415,26 @@ impl WalletRoot {
         );
     }
 
+    pub(super) fn install_view_session_for_gateway_unlock(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: &[WalletMetadataBundle],
+        gateway_unlock: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.begin_view_session_installation(
+            session,
+            metadata,
+            true,
+            wallet_ops::CreatedWalletChainInitPolicy::Resumed,
+            None,
+            gateway_unlock,
+            window,
+            cx,
+        );
+    }
+
     pub(in crate::root) fn install_view_session_after_management(
         &mut self,
         session: DesktopViewSession,
@@ -429,6 +457,7 @@ impl WalletRoot {
         session: DesktopViewSession,
         metadata: &[WalletMetadataBundle],
         protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -438,6 +467,7 @@ impl WalletRoot {
             true,
             wallet_ops::CreatedWalletChainInitPolicy::Resumed,
             protected_seed_session,
+            gateway_unlock,
             window,
             cx,
         );
@@ -482,6 +512,7 @@ impl WalletRoot {
             close_dialogs,
             created_wallet_init_policy,
             None,
+            None,
             window,
             cx,
         );
@@ -494,6 +525,7 @@ impl WalletRoot {
         close_dialogs: bool,
         created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
         protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -501,6 +533,11 @@ impl WalletRoot {
             self.sync_wallet_select(window, cx);
             return;
         }
+        self.begin_gateway_wallet_installation(session.wallet_id());
+        if !self.gateway_unlock_is_current(gateway_unlock) {
+            self.retire_gateway_unlock();
+        }
+        self.transfer_gateway_unlock_to_installation(gateway_unlock);
         #[cfg(feature = "hardware")]
         let active_hardware_profile =
             self.active_hardware_profile_for_wallet(session.wallet_id(), metadata);
@@ -516,7 +553,7 @@ impl WalletRoot {
         if close_dialogs {
             window.close_all_dialogs(cx);
         }
-        self.advance_active_wallet_generation();
+        self.advance_active_wallet_generation_for_gateway_unlock(gateway_unlock);
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         let wallet_switch_generation = self.wallet_switch_generation;
         clear_wallet_context_visibility(
@@ -529,6 +566,7 @@ impl WalletRoot {
         );
         self.vault_view_unlock = None;
         self.vault_state = VaultState::SwitchingWallet;
+        self.publish_gateway_desktop_state();
         self.wallet_switch_delayed = false;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = false;
@@ -554,6 +592,7 @@ impl WalletRoot {
         cx.notify();
 
         let installation = WalletContextInstallation {
+            gateway_unlock,
             session: Arc::new(session),
             metadata: metadata.to_vec(),
             created_wallet_init_policy,
@@ -685,6 +724,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let WalletContextInstallation {
+            gateway_unlock,
             session,
             metadata,
             created_wallet_init_policy,
@@ -785,7 +825,10 @@ impl WalletRoot {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
         self.vault_error = None;
+        self.complete_gateway_unlock(gateway_unlock);
         self.vault_state = VaultState::ViewUnlocked;
+        self.finish_gateway_wallet_installation();
+        self.publish_gateway_desktop_state();
         self.wallet_switch_delayed = false;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.ensure_waku_started(cx);
@@ -805,6 +848,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.retire_gateway_unlock();
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
@@ -834,6 +878,7 @@ impl WalletRoot {
         self.wallet_switch_delayed = false;
         self.vault_error = Some(Arc::from(WALLET_REPLACEMENT_TIMEOUT_MESSAGE));
         self.vault_state = VaultState::UnlockVault;
+        self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = true;
         self.sync_wallet_select(window, cx);
@@ -930,9 +975,13 @@ impl WalletRoot {
         vault_view_unlock: Arc<ViewUnlock>,
         setup_password: Option<Zeroizing<String>>,
         pending_software_profile_open: Option<PendingSoftwareProfileOpen>,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.gateway_unlock_is_current(gateway_unlock) {
+            self.retire_gateway_unlock();
+        }
         self.clear_protected_software_seed_session(cx);
         let active = wallet_options_from_metadata(metadata.to_owned());
         if active.is_empty() {
@@ -943,6 +992,7 @@ impl WalletRoot {
             self.install_vault_view_unlock(vault_view_unlock);
             self.vault_error = None;
             self.vault_state = VaultState::SetupWallet;
+            self.publish_gateway_desktop_state();
             self.wallet_setup_mode = WalletSetupMode::Choose;
             self.ensure_waku_started(cx);
             cx.notify();
@@ -950,12 +1000,12 @@ impl WalletRoot {
         }
 
         if let Some(pending) = pending_software_profile_open {
-            self.enter_pending_software_profile_open(pending, window, cx);
+            self.enter_pending_software_profile_open(pending, gateway_unlock, window, cx);
             return;
         }
 
         window.close_all_dialogs(cx);
-        self.advance_active_wallet_generation();
+        self.advance_active_wallet_generation_for_gateway_unlock(gateway_unlock);
         self.pending_software_profile_base_profile_uuid = None;
         self.view_session = None;
         self.install_vault_view_unlock(vault_view_unlock);
@@ -982,6 +1032,7 @@ impl WalletRoot {
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
+        self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.ensure_waku_started(cx);
         cx.notify();
@@ -990,6 +1041,7 @@ impl WalletRoot {
     pub(super) fn enter_pending_software_profile_open(
         &mut self,
         mut pending: PendingSoftwareProfileOpen,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1005,7 +1057,7 @@ impl WalletRoot {
             Some(Arc::clone(&pending.base_profile_uuid));
         self.pending_software_profile_open = Some(pending);
         self.shutdown_wallet_session_store();
-        self.advance_active_wallet_generation();
+        self.advance_active_wallet_generation_for_gateway_unlock(gateway_unlock);
         self.clear_protected_software_seed_session(cx);
         clear_wallet_context_visibility(
             &mut self.view_session,
@@ -1026,6 +1078,7 @@ impl WalletRoot {
         self.generated_seed = None;
         self.vault_error = None;
         self.vault_state = VaultState::PendingSoftwareProfileOpen;
+        self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         cx.notify();
         self.schedule_pending_software_profile_open_timeout(window, cx);
@@ -1098,6 +1151,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.retire_gateway_unlock();
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
         self.invalidate_pending_profile_open_tokens();
@@ -1119,6 +1173,7 @@ impl WalletRoot {
         self.reset_wallet_scoped_state(cx);
         self.sync_wallet_select(window, cx);
         self.vault_state = VaultState::UnlockVault;
+        self.publish_gateway_desktop_state();
         self.focus_vault_input_on_render = true;
         cx.notify();
     }
@@ -1139,6 +1194,8 @@ impl WalletRoot {
         ) {
             return;
         }
+        self.vault_state = VaultState::UnlockVault;
+        self.retire_gateway_unlock();
         self.shutdown_wallet_session_store();
         self.invalidate_governance_context();
         self.invalidate_proposals_chain(self.selected_chain);
@@ -1199,7 +1256,7 @@ impl WalletRoot {
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.repair_cache_error = None;
-        self.vault_state = VaultState::UnlockVault;
+        self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = true;
         for state in self.chain_states.values_mut() {
@@ -1231,8 +1288,10 @@ impl WalletRoot {
     }
 
     fn set_wallet_replacement_error(&mut self, message: &'static str, cx: &mut Context<'_, Self>) {
+        self.retire_gateway_unlock();
         self.vault_error = None;
         self.vault_state = VaultState::Error(Arc::from(message));
+        self.publish_gateway_desktop_state();
         self.focus_vault_input_on_render = false;
         cx.notify();
     }

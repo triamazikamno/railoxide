@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
+use alloy::eips::{BlockId, BlockNumHash};
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
@@ -464,7 +465,9 @@ fn balance_plan_batches_native_and_known_tokens_per_account() {
         status: PublicAccountStatus::Active,
         display_order: 0,
     };
-    let calls = plan_public_balance_calls(1, std::slice::from_ref(&account), None);
+    let calls =
+        plan_public_balance_calls(1, std::slice::from_ref(&account), None, BlockId::latest())
+            .unwrap();
 
     let native = calls.first().expect("native call");
     assert_eq!(native.asset.id, PublicAssetId::Native);
@@ -504,7 +507,7 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
             display_order: u32::from(index),
         })
         .collect::<Vec<_>>();
-    let planned = plan_public_balance_calls(1, &accounts, None);
+    let planned = plan_public_balance_calls(1, &accounts, None, BlockId::latest()).unwrap();
     assert!(
         planned.len() > 64,
         "a three-account chain 1 refresh must exceed the dapp read cap, planned {}",
@@ -526,6 +529,107 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
         .expect("wallet balance submission is admitted");
     assert_eq!(results.len(), planned.len());
     assert!(results.iter().all(std::result::Result::is_ok));
+}
+
+fn public_balance_block_for_test(identity: BlockNumHash) -> Value {
+    let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+    block.header.inner.number = identity.number;
+    block.header.hash = identity.hash;
+    serde_json::to_value(block).unwrap()
+}
+
+#[tokio::test]
+async fn balance_refresh_pins_canonical_hash_and_rejects_unsatisfied_minimum() {
+    let head = BlockNumHash::new(10, B256::repeat_byte(10));
+    let account = PublicAccountMetadata {
+        public_account_uuid: "public-1".to_string(),
+        address: Address::repeat_byte(1),
+        label: None,
+        source: PublicAccountSource::Derived,
+        scope: PublicAccountScope::PrivateWallet {
+            wallet_uuid: "wallet-1".to_string(),
+        },
+        derivation_index: Some(0),
+        hardware_descriptor: None,
+        status: PublicAccountStatus::Active,
+        display_order: 0,
+    };
+    let token = Address::repeat_byte(2);
+    let registry = crate::settings::EffectiveTokenRegistry {
+        tokens: [(
+            (1, token.to_string()),
+            crate::settings::EffectiveTokenInfo {
+                chain_id: 1,
+                token_address: token.to_string(),
+                symbol: "TEST".to_string(),
+                decimals: 18,
+                icon_path: None,
+                price_anchor: None,
+                built_in: false,
+            },
+        )]
+        .into(),
+    };
+    for minimum in [
+        head,
+        BlockNumHash::new(11, head.hash),
+        BlockNumHash::new(10, B256::repeat_byte(11)),
+    ] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request| {
+                recorded.lock().unwrap().push(request.clone());
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_getBlockByNumber" => public_balance_block_for_test(head),
+                    "eth_getBalance" => json!("0x7"),
+                    "eth_call" => json!(Bytes::from(U256::from(9).to_be_bytes::<32>().to_vec())),
+                    _ => panic!("unexpected balance refresh RPC"),
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
+        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+        let http = HttpContext::direct_for_tests();
+        let started = Instant::now();
+        let result = refresh_public_balances_at_least(
+            1,
+            std::slice::from_ref(&account),
+            Some(&chain),
+            Some(&registry),
+            &http,
+            Some(minimum),
+        )
+        .await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
+        assert_eq!(calls[0]["params"], json!(["latest", false]));
+        if minimum == head {
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.accounts[0].observed_block, Some(head));
+            assert!(snapshot.accounts[0].observed_at.unwrap() >= started);
+            assert_eq!(calls.len(), 3);
+            for method in ["eth_getBalance", "eth_call"] {
+                let call = calls.iter().find(|call| call["method"] == method).unwrap();
+                assert_eq!(
+                    call["params"][1],
+                    json!({"blockHash": head.hash, "requireCanonical": true})
+                );
+            }
+        } else {
+            assert!(result.is_err());
+            assert_eq!(
+                calls.len(),
+                1,
+                "an unsatisfied minimum must not submit balance reads"
+            );
+        }
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -570,7 +674,9 @@ async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_acceptin
     };
     let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
         Arc::new(move |request| {
-            let result = if request["method"] == "eth_getBalance" {
+            let result = if request["method"] == "eth_getBlockByNumber" {
+                public_balance_block_for_test(BlockNumHash::new(10, B256::repeat_byte(10)))
+            } else if request["method"] == "eth_getBalance" {
                 json!("0x7")
             } else {
                 let transaction: TransactionRequest = serde_json::from_value(request["params"][0].clone()).unwrap();
@@ -635,6 +741,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
 
     let denied = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new("wrong password".to_owned()),
@@ -651,6 +758,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
     let signature = runtime
         .block_on(walletconnect_sign_personal_message(
             WalletConnectPersonalSignRequest {
+                request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -713,6 +821,7 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
     let signature = runtime
         .block_on(walletconnect_sign_typed_data_v4(
             WalletConnectTypedDataSignRequest {
+                request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -779,6 +888,7 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
     let signature = runtime
         .block_on(walletconnect_sign_typed_data_v4(
             WalletConnectTypedDataSignRequest {
+                request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -825,6 +935,7 @@ fn walletconnect_typed_data_signing_error_preserves_method_label() {
         let error = runtime
             .block_on(walletconnect_sign_typed_data(
                 WalletConnectTypedDataSignRequest {
+                    request_control: None,
                     view_session: Arc::clone(&view_session),
                     vault_store: Arc::clone(&store),
                     vault_password: Zeroizing::new("wrong password".to_owned()),
@@ -903,6 +1014,7 @@ fn hardware_typed_data_signer_with_mode(
         .cache_typed_data_signing_mode(&descriptor, mode)
         .expect("cache typed-data mode");
     HardwarePublicEvmSigner {
+        request_control: None,
         address: address!("0x1111111111111111111111111111111111111111"),
         descriptor,
         hardware_session: std::sync::Mutex::new(hardware_session),
@@ -1063,7 +1175,9 @@ fn balance_snapshot_preserves_partial_success() {
         status: PublicAccountStatus::Active,
         display_order: 0,
     };
-    let planned = vec![
+    let mut successful_account = account.clone();
+    successful_account.public_account_uuid = "public-2".to_string();
+    let mut planned = vec![
         PlannedPublicBalanceCall {
             public_account_uuid: account.public_account_uuid.clone(),
             asset: PublicBalanceAsset {
@@ -1087,19 +1201,41 @@ fn balance_snapshot_preserves_partial_success() {
         },
     ];
 
+    let mut successful_call = planned[0].clone();
+    successful_call.public_account_uuid = successful_account.public_account_uuid.clone();
+    planned.push(successful_call);
+    let observed_at = Instant::now();
+    let observed_block = BlockNumHash::new(10, B256::repeat_byte(10));
     let snapshot = public_balance_snapshot_from_results(
         1,
-        &[account],
+        &[account, successful_account],
         &planned,
-        vec![Some(U256::from(7_u64)), None],
+        vec![Some(U256::from(7_u64)), None, Some(U256::from(9_u64))],
+        observed_at,
+        observed_block,
     );
 
+    assert_eq!(snapshot.accounts[0].observed_at, None);
+    assert_eq!(snapshot.accounts[0].observed_block, None);
+    assert_eq!(snapshot.accounts[1].observed_at, Some(observed_at));
+    assert_eq!(snapshot.accounts[1].observed_block, Some(observed_block));
     let balances = &snapshot.accounts[0].balances;
     assert_eq!(balances[0].amount.amount(), Some(U256::from(7_u64)));
     assert!(matches!(
         balances[1].amount,
         PublicBalanceAmount::Unavailable
     ));
+
+    let truncated = public_balance_snapshot_from_results(
+        1,
+        &[snapshot.accounts[0].account.clone()],
+        &planned[..2],
+        vec![Some(U256::from(7_u64))],
+        observed_at,
+        observed_block,
+    );
+    assert_eq!(truncated.accounts[0].observed_at, None);
+    assert_eq!(truncated.accounts[0].observed_block, None);
 }
 
 #[test]
@@ -2538,6 +2674,7 @@ fn public_actions_reject_zero_amount_before_signing() {
 
     let send_result = runtime.block_on(submit_public_send(
         PublicSendRequest {
+            transaction_tracking: None,
             chain_id: 1,
             effective_chain: None,
             view_session: Arc::clone(&view_session),
@@ -2566,6 +2703,7 @@ fn public_actions_reject_zero_amount_before_signing() {
 
     let shield_result = runtime.block_on(submit_public_shield(
         PublicShieldRequest {
+            transaction_tracking: None,
             chain_id: 1,
             effective_chain: None,
             view_session,
@@ -2712,6 +2850,12 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
         0,
     )
     .expect("hardware public descriptor");
+    #[cfg(not(feature = "hardware"))]
+    assert!(
+        hardware_session
+            .typed_data_signing_mode(&hardware_public_descriptor)
+            .is_none()
+    );
     let hardware_public = store
         .add_hardware_public_account(
             &hardware_view_session,
@@ -2743,6 +2887,39 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
     .expect("hardware signer with profile session");
     assert_eq!(hardware_signer.address(), hardware_public.address);
     assert!(hardware_signer.requires_device_approval());
+    #[cfg(not(feature = "hardware"))]
+    {
+        // The uncached capability is admitted, then the default-build probe reports unsupported.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let error = runtime.block_on(walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
+            request_control: None,
+            vault_store: store.clone(),
+            view_session: Arc::new(hardware_view_session),
+            vault_password: Zeroizing::new(TEST_PASSWORD.into()),
+            protected_software_seed_session: None,
+            trezor_app_passphrase: None,
+            trezor_pin_matrix_provider: None,
+            public_account_uuid: hardware_public.public_account_uuid,
+            typed_data: serde_json::json!({
+                "types": {"EIP712Domain": [], "Message": [{"name": "text", "type": "string"}]},
+                "primaryType": "Message", "domain": {}, "message": {"text": "hello"}
+            }),
+            hash_fallback_confirmed: false,
+            event_tx: Some(events),
+        })).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<crate::walletconnect::WalletConnectError>(),
+            Some(crate::walletconnect::WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4")
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "unsupported capability must stop before device signing"
+        );
+    }
 
     let imported = store
         .import_public_account(
@@ -2817,6 +2994,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
 
     let missing = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -2852,6 +3030,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
     };
     let wrong = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -2868,6 +3047,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
     let signature = runtime
         .block_on(walletconnect_sign_personal_message(
             WalletConnectPersonalSignRequest {
+                request_control: None,
                 view_session,
                 vault_store: store,
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
@@ -2898,6 +3078,7 @@ fn hardware_public_signer_consumes_trezor_app_passphrase_once() {
     );
     hardware_session.set_trezor_passphrase_mode(TrezorPassphraseMode::EnterInApp);
     let signer = HardwarePublicEvmSigner {
+        request_control: None,
         address: address!("0x1111111111111111111111111111111111111111"),
         descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
             HardwareDeviceKind::Trezor,
@@ -2934,6 +3115,7 @@ fn hardware_public_signer_updates_in_memory_trezor_session_id_preserving_typed_d
         .cache_typed_data_signing_mode(&descriptor, HardwareTypedDataSigningMode::ClearSign)
         .expect("cache typed-data mode");
     let signer = HardwarePublicEvmSigner {
+        request_control: None,
         address: address!("0x1111111111111111111111111111111111111111"),
         descriptor,
         hardware_session: std::sync::Mutex::new(hardware_session),
@@ -2988,6 +3170,7 @@ fn hardware_typed_data_probe_is_unsupported_without_hardware_feature() {
         None,
     );
     let signer = HardwarePublicEvmSigner {
+        request_control: None,
         address: address!("0x1111111111111111111111111111111111111111"),
         descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
             HardwareDeviceKind::Ledger,
@@ -3016,4 +3199,556 @@ fn hardware_typed_data_probe_is_unsupported_without_hardware_feature() {
             .typed_data_signing_mode(&signer.descriptor),
         Some(HardwareTypedDataSigningMode::Unsupported)
     );
+}
+
+#[tokio::test]
+async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_preflight() {
+    let server = MockRpcServer::spawn(false, 42_000).await;
+    let chain = effective_chain_for_rpc(&server.url, 8_000);
+    let http = http_context_for_route(WalletNetworkMode::Direct, "native");
+    let admitted_http = http_context_for_route(WalletNetworkMode::Direct, "admitted");
+    let callback_calls = Arc::new(AtomicU64::new(0));
+    let recorded = callback_calls.clone();
+    let reads = DappRpcReadClient::new(move |endpoint, read| {
+        let http = admitted_http.clone();
+        recorded.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let route = RpcChainRoute::new(1, vec![endpoint.into_exposed_url()]);
+            let mut results = http
+                .rpc_broker()
+                .submit(RpcSubmission::new(
+                    route.into(),
+                    vec![read],
+                    crate::RpcOrigin::dapp("test-peer", "https://example.test").unwrap(),
+                ))
+                .await?;
+            results.remove(0).map(crate::RpcResult::into_value)
+        })
+    });
+    let native_quote = quote_public_action_gas_fee(1, Some(&chain), &http)
+        .await
+        .unwrap();
+    let before = server.calls().len();
+    let quote = quote_public_action_gas_fee_with_reads(1, Some(&chain), &http, Some(&reads))
+        .await
+        .unwrap();
+    assert_eq!(quote, native_quote);
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 3);
+    assert!(
+        server.calls()[before..]
+            .iter()
+            .all(|call| call.route.as_deref() == Some("admitted"))
+    );
+
+    let from = Address::repeat_byte(1);
+    let to = Address::repeat_byte(2);
+    let gas_fee = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+    let resolved = resolve_public_action_gas_fee(
+        1,
+        PublicShieldTransactionProfile::Railoxide,
+        gas_fee,
+        Some(quote),
+    )
+    .unwrap();
+    let request = || PublicAdvancedTransactionEstimateRequest {
+        chain_id: 1,
+        effective_chain: Some(chain.clone()),
+        from,
+        intent: PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::from(7),
+            data: Bytes::from_static(&[1, 2, 3, 4]),
+        },
+        gas_fee,
+        access_list: Some(AccessList::default()),
+    };
+    let native = simulate_public_advanced_transaction_with_fee(request(), quote, resolved, &http)
+        .await
+        .unwrap();
+    let before = server.calls().len();
+    let admitted = simulate_public_advanced_transaction_with_fee_and_reads(
+        request(),
+        quote,
+        resolved,
+        &http,
+        Some(&reads),
+    )
+    .await
+    .unwrap();
+    assert_eq!(admitted, native);
+    let calls = server.calls();
+    assert_eq!(calls.len() - before, 1);
+    assert_eq!(calls[before].route.as_deref(), Some("admitted"));
+    assert_eq!(calls[before].params[1], json!("pending"));
+
+    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    let before = server.calls().len();
+    let before_callbacks = callback_calls.load(Ordering::SeqCst);
+    super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+        &pool,
+        WalletNetworkMode::Direct,
+        1,
+        from,
+        TransactionRequest::default()
+            .with_to(to)
+            .with_value(U256::from(7)),
+        PublicActionGasFeeSelection::Auto,
+        &chain.gas,
+        PublicShieldTransactionProfile::Railoxide,
+        super::types::PublicActionGasLimitStrategy::ChainBuffer,
+        Some(admitted.gas_limit),
+        None,
+        None,
+        super::submission::PublicActionPreflightMode::Managed,
+        None,
+        false,
+        Some(&reads),
+    )
+    .await
+    .expect("admitted post-approval preflight");
+    assert_eq!(callback_calls.load(Ordering::SeqCst) - before_callbacks, 6);
+    let calls = server.calls();
+    let preflight = &calls[before..];
+    assert_eq!(preflight.len(), 6);
+    assert!(
+        preflight
+            .iter()
+            .all(|call| call.route.as_deref() == Some("admitted"))
+    );
+    for method in [
+        "eth_gasPrice",
+        "eth_maxPriorityFeePerGas",
+        "eth_feeHistory",
+        "eth_getTransactionCount",
+        "eth_estimateGas",
+        "eth_getBalance",
+    ] {
+        assert_eq!(rpc_calls_for(preflight, method).len(), 1);
+    }
+    let estimate = rpc_calls_for(preflight, "eth_estimateGas")[0];
+    let tx: TransactionRequest = serde_json::from_value(estimate.params[0].clone()).unwrap();
+    assert_eq!(tx.nonce, Some(7));
+    assert_eq!(tx.from, Some(from));
+    assert_eq!(tx.max_fee_per_gas, Some(quote.suggested_max_fee_per_gas));
+
+    // A failed live-balance read must fail preflight even when the selected provider
+    // would return enough funds over its native client.
+    let fail_balance = DappRpcReadClient::new(move |endpoint, read| {
+        let reads = reads.clone();
+        Box::pin(async move {
+            if read == RpcRead::get_balance(from) {
+                Err(crate::RpcBrokerError::Transport)
+            } else {
+                reads.read(endpoint, read).await
+            }
+        })
+    });
+    let before_balance = rpc_calls_for(&server.calls(), "eth_getBalance").len();
+    let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+        &pool,
+        WalletNetworkMode::Direct,
+        1,
+        from,
+        TransactionRequest::default()
+            .with_to(to)
+            .with_value(U256::from(7)),
+        gas_fee,
+        &chain.gas,
+        PublicShieldTransactionProfile::Railoxide,
+        super::types::PublicActionGasLimitStrategy::ChainBuffer,
+        None,
+        None,
+        None,
+        super::submission::PublicActionPreflightMode::Managed,
+        None,
+        false,
+        Some(&fail_balance),
+    )
+    .await
+    .err()
+    .expect("live balance failure must stop preflight");
+    assert!(
+        matches!(error, super::submission::PublicActionPreflightError::Other(error)
+        if error.downcast_ref::<crate::RpcBrokerError>() == Some(&crate::RpcBrokerError::Transport))
+    );
+    assert_eq!(
+        rpc_calls_for(&server.calls(), "eth_getBalance").len(),
+        before_balance
+    );
+}
+
+#[tokio::test]
+async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() {
+    use crate::RpcBrokerError;
+
+    let server = MockRpcServer::spawn(false, 42_000).await;
+    let other = MockRpcServer::spawn(false, 42_000).await;
+    let mut chain = effective_chain_for_rpc(&server.url, 8_000);
+    chain.rpc_route = RpcChainRoute::new(
+        1,
+        vec![
+            Url::parse(&server.url).unwrap(),
+            Url::parse(&other.url).unwrap(),
+        ],
+    );
+    let http = HttpContext::direct_for_tests();
+    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    let from = Address::repeat_byte(1);
+    let to = Address::repeat_byte(2);
+    let gas_fee = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(80),
+        suggested_max_fee_per_gas: 100,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let resolved = resolve_public_action_gas_fee(
+        1,
+        PublicShieldTransactionProfile::Railoxide,
+        gas_fee,
+        Some(quote),
+    )
+    .unwrap();
+    for rejection in [
+        RpcBrokerError::OriginRejected,
+        RpcBrokerError::AdmissionRejected,
+        RpcBrokerError::TimeoutBeforeDispatch,
+        RpcBrokerError::Shutdown,
+    ] {
+        let count = Arc::new(AtomicU64::new(0));
+        let recorded = count.clone();
+        let error = rejection.clone();
+        let reads = DappRpcReadClient::new(move |_, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            let error = error.clone();
+            Box::pin(async move { Err(error) })
+        });
+        let error = quote_public_action_gas_fee_with_reads(1, Some(&chain), &http, Some(&reads))
+            .await
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<RpcBrokerError>(), Some(&rejection));
+        count.store(0, Ordering::SeqCst);
+        let error = simulate_public_advanced_transaction_with_fee_and_reads(
+            PublicAdvancedTransactionEstimateRequest {
+                chain_id: 1,
+                effective_chain: Some(chain.clone()),
+                from,
+                intent: PublicTransactionIntent::Raw {
+                    to: Some(to),
+                    value: U256::from(1_u8),
+                    data: Bytes::new(),
+                },
+                gas_fee,
+                access_list: None,
+            },
+            quote,
+            resolved,
+            &http,
+            Some(&reads),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, PublicAdvancedTransactionSimulationError::RpcRead(error) if error == rejection)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        count.store(0, Ordering::SeqCst);
+        let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+            &pool,
+            WalletNetworkMode::Direct,
+            1,
+            from,
+            TransactionRequest::default().with_to(to),
+            gas_fee,
+            &chain.gas,
+            PublicShieldTransactionProfile::Railoxide,
+            super::types::PublicActionGasLimitStrategy::ChainBuffer,
+            None,
+            None,
+            None,
+            super::submission::PublicActionPreflightMode::Managed,
+            None,
+            false,
+            Some(&reads),
+        )
+        .await
+        .err()
+        .expect("rejected preflight");
+        assert!(
+            matches!(error, super::submission::PublicActionPreflightError::Other(error)
+            if error.downcast_ref::<RpcBrokerError>() == Some(&rejection))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+    for rejection in [
+        RpcBrokerError::Remote(crate::RpcRemoteError::from(serde_json::from_value::<alloy::serde::WithOtherFields<alloy::rpc::json_rpc::ErrorPayload<serde_json::Value>>>(serde_json::json!({
+            "code": -32042, "message": "nonce rejected", "data": {"nested": [null, 5]}, "extension": true
+        })).unwrap())),
+        RpcBrokerError::InnerRevert(crate::RpcRevert::from_multicall(Bytes::from_static(&[1, 2, 3]))),
+    ] {
+        let expected = rejection.clone();
+        let reads = DappRpcReadClient::new(move |_, read| {
+            assert_eq!(read, RpcRead::from_method_params("eth_getTransactionCount", serde_json::json!([from, "latest"]), 1).unwrap());
+            let error = rejection.clone();
+            Box::pin(async move { Err(error) })
+        });
+        let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+            &pool, WalletNetworkMode::Direct, 1, from, TransactionRequest::default().with_to(to),
+            gas_fee, &chain.gas, PublicShieldTransactionProfile::Railoxide,
+            super::types::PublicActionGasLimitStrategy::ChainBuffer,
+            None, None, None, super::submission::PublicActionPreflightMode::Managed,
+            None, false, Some(&reads),
+        ).await.err().expect("remote nonce failure");
+        assert!(matches!(error, super::submission::PublicActionPreflightError::Other(error)
+            if error.downcast_ref::<RpcBrokerError>() == Some(&expected)));
+    }
+    assert!(server.calls().is_empty());
+    assert!(other.calls().is_empty());
+}
+
+#[tokio::test]
+async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
+    let (root_dir, db, store, view_session) = public_action_request_parts();
+    let control = crate::dapp_request::DappRequestControl::new(
+        tokio::time::Instant::now() + std::time::Duration::from_mins(1),
+        || Ok(()),
+    );
+    control.invalidate(&crate::RpcBrokerError::OriginRejected);
+    // Invalid vault credentials distinguish request rejection from signer construction.
+    let personal = walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
+        request_control: Some(control.clone()),
+        view_session: view_session.clone(),
+        vault_store: store.clone(),
+        vault_password: Zeroizing::new("wrong password".into()),
+        protected_software_seed_session: None,
+        trezor_app_passphrase: None,
+        trezor_pin_matrix_provider: None,
+        public_account_uuid: "missing".into(),
+        message: b"hello".to_vec(),
+        event_tx: None,
+    })
+    .await
+    .unwrap_err();
+    let typed = walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
+        request_control: Some(control),
+        view_session: view_session.clone(),
+        vault_store: store.clone(),
+        vault_password: Zeroizing::new("wrong password".into()),
+        protected_software_seed_session: None,
+        trezor_app_passphrase: None,
+        trezor_pin_matrix_provider: None,
+        public_account_uuid: "missing".into(),
+        typed_data: Value::Null,
+        hash_fallback_confirmed: false,
+        event_tx: None,
+    })
+    .await
+    .unwrap_err();
+    for error in [personal, typed] {
+        assert_eq!(
+            error.downcast_ref::<crate::RpcBrokerError>(),
+            Some(&crate::RpcBrokerError::OriginRejected)
+        );
+    }
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
+    #[derive(Clone, Copy)]
+    enum InvalidateAt {
+        Entry,
+        Preflight,
+        Signed,
+    }
+
+    let (root_dir, db, store, view_session) = public_action_request_parts();
+    let account = store
+        .import_public_account(
+            TEST_PASSWORD,
+            &view_session,
+            TEST_IMPORTED_PRIVATE_KEY,
+            Some("Dapp send signer"),
+            false,
+        )
+        .expect("import public account");
+    for phase in [
+        InvalidateAt::Entry,
+        InvalidateAt::Preflight,
+        InvalidateAt::Signed,
+    ] {
+        let server = MockRpcServer::spawn(false, 42_000).await;
+        let chain = effective_chain_for_rpc(&server.url, 8_000);
+        let http = HttpContext::direct_for_tests();
+        let control = crate::dapp_request::DappRequestControl::new(
+            tokio::time::Instant::now() + std::time::Duration::from_mins(1),
+            || Ok(()),
+        );
+        if matches!(phase, InvalidateAt::Entry) {
+            control.invalidate(&crate::RpcBrokerError::OriginRejected);
+        }
+        let read_control = control.clone();
+        let read_http = http.clone();
+        let reads = DappRpcReadClient::new(move |endpoint, read| {
+            let http = read_http.clone();
+            let control = read_control.clone();
+            Box::pin(async move {
+                let route = RpcChainRoute::new(1, vec![endpoint.into_exposed_url()]);
+                let mut results = http
+                    .rpc_broker()
+                    .submit(RpcSubmission::new(
+                        route.into(),
+                        vec![read],
+                        crate::RpcOrigin::dapp("test-peer", "https://example.test").unwrap(),
+                    ))
+                    .await?;
+                let result = results.remove(0).map(crate::RpcResult::into_value);
+                if matches!(phase, InvalidateAt::Preflight) {
+                    control.invalidate(&crate::RpcBrokerError::OriginRejected);
+                }
+                result
+            })
+        });
+        let (tracker, tracking) = super::transaction_tracker::test_tracking_context();
+        let changes = tracker.subscribe();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let invalidation = if matches!(phase, InvalidateAt::Signed) {
+            let control = control.clone();
+            Some(tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event, PublicActionSessionEvent::AttemptHandoff { .. }) {
+                        // The software signer runs before the broadcast checkpoint yields.
+                        control.invalidate(&crate::RpcBrokerError::OriginRejected);
+                        return;
+                    }
+                }
+                panic!("send must reach signing before invalidation");
+            }))
+        } else {
+            None
+        };
+        let error = submit_walletconnect_send_transaction(
+            WalletConnectSendTransactionRequest {
+                request_control: Some(control.clone()),
+                rpc_reads: Some(reads),
+                transaction_tracking: Some(tracking),
+                chain_id: 1,
+                effective_chain: Some(chain),
+                view_session: view_session.clone(),
+                vault_store: store.clone(),
+                vault_password: Zeroizing::new(
+                    if matches!(phase, InvalidateAt::Entry) {
+                        "wrong password"
+                    } else {
+                        TEST_PASSWORD
+                    }
+                    .into(),
+                ),
+                protected_software_seed_session: None,
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                tx_req: TransactionRequest::default()
+                    .with_to(Address::repeat_byte(2))
+                    .with_value(U256::from(7)),
+                decoded_transaction: None,
+                reviewed_transaction: None,
+                reviewed_fee: None,
+                gas_fee: PublicActionGasFeeSelection::Auto,
+                expiry_timestamp: None,
+                event_tx: Some(event_tx),
+            },
+            &http,
+        )
+        .await
+        .unwrap_err();
+        if let Some(invalidation) = invalidation {
+            invalidation.await.expect("invalidation task");
+        }
+        assert_eq!(
+            error.downcast_ref::<crate::RpcBrokerError>(),
+            Some(&crate::RpcBrokerError::OriginRejected)
+        );
+        assert!(!control.handed_off());
+        assert!(
+            !changes.has_changed().expect("tracker remains open"),
+            "no pending transaction was registered"
+        );
+        let calls = server.calls();
+        assert!(rpc_calls_for(&calls, "eth_sendRawTransaction").is_empty());
+        match phase {
+            InvalidateAt::Entry => assert!(calls.is_empty()),
+            InvalidateAt::Preflight => {
+                assert!(!rpc_calls_for(&calls, "eth_getBalance").is_empty());
+                assert!(rpc_calls_for(&calls, "eth_blockNumber").is_empty());
+            }
+            InvalidateAt::Signed => assert_eq!(rpc_calls_for(&calls, "eth_blockNumber").len(), 1),
+        }
+        tracker.shutdown().await;
+    }
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn dapp_raw_broadcast_does_not_log_or_return_remote_payloads() {
+    use std::io::Write;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let server = MockRpcServer::spawn(true, 21_000).await;
+    let http = HttpContext::direct_for_tests();
+    let pool =
+        crate::query_rpc_pool_with_http_client(vec![Url::parse(&server.url).unwrap()], &http);
+    let tx_hash = B256::repeat_byte(0xab);
+    for log_transaction_details in [true, false] {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = crate::self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
+            &pool,
+            WalletNetworkMode::Direct,
+            vec![1, 2, 3],
+            tx_hash,
+            log_transaction_details,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .err()
+        .expect("RPC rejects broadcast");
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        if log_transaction_details {
+            assert!(logs.contains("mock route failure"));
+            assert!(logs.contains(&alloy::hex::encode_prefixed(tx_hash)));
+            assert!(error.to_string().contains("mock route failure"));
+        } else {
+            assert!(!logs.contains("mock route failure"));
+            assert!(!logs.contains(&alloy::hex::encode_prefixed(tx_hash)));
+            assert!(!error.to_string().contains("mock route failure"));
+        }
+    }
 }

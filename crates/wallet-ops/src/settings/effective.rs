@@ -177,7 +177,7 @@ pub fn default_chain_rpc_route(chain_id: u64) -> Option<RpcChainRoute> {
 }
 
 /// Resolve and validate the RPC route for a requested chain.
-pub(crate) fn resolve_effective_chain_rpc_route(
+pub fn resolve_effective_chain_rpc_route(
     requested_chain_id: u64,
     effective_chain: Option<&EffectiveChainConfig>,
 ) -> EyreResult<RpcChainRoute> {

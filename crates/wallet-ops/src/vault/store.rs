@@ -63,6 +63,7 @@ mod address_book;
 mod base;
 mod broadcaster_preferences;
 mod chain_cache;
+mod gateway;
 mod hardware;
 mod key_export;
 mod public_accounts;
@@ -72,4 +73,5 @@ mod wallet_metadata;
 mod walletconnect;
 mod wallets;
 
+pub use gateway::GatewayPermission;
 pub use software_context::SoftwareContextMatch;

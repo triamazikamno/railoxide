@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
@@ -25,6 +25,8 @@ pub type PublicActionResolvedGasFee = crate::SelfBroadcastResolvedGasFee;
 
 #[derive(Debug, Error)]
 pub enum PublicAdvancedTransactionSimulationError {
+    #[error(transparent)]
+    RpcRead(crate::rpc_broker::RpcBrokerError),
     #[error("simulation would revert: {0}")]
     Reverted(String),
     #[error("simulation unavailable: {0}")]
@@ -198,11 +200,16 @@ pub struct PublicBalanceEntry {
 pub struct PublicAccountBalance {
     pub account: PublicAccountMetadata,
     pub balances: Vec<PublicBalanceEntry>,
+    /// Monotonic start of a complete account observation; never persisted.
+    pub observed_at: Option<Instant>,
+    /// Canonical block shared by every successful balance in this observation.
+    pub observed_block: Option<alloy::eips::BlockNumHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicBalanceSnapshot {
     pub chain_id: u64,
+    /// UI refresh time; carried accounts retain their own observation freshness.
     pub refreshed_at: SystemTime,
     pub accounts: Vec<PublicAccountBalance>,
 }
@@ -252,6 +259,7 @@ impl Drop for PublicBalanceRefreshGuard {
 }
 
 pub struct PublicSendRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<EffectiveChainConfig>,
     pub view_session: Arc<DesktopViewSession>,
@@ -301,6 +309,7 @@ pub struct PublicSendResult {
 }
 
 pub struct PublicShieldRequest {
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<EffectiveChainConfig>,
     pub view_session: Arc<DesktopViewSession>,
@@ -321,6 +330,7 @@ pub struct PublicShieldRequest {
 }
 
 pub struct WalletConnectPersonalSignRequest {
+    pub request_control: Option<crate::dapp_request::DappRequestControl>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -333,6 +343,7 @@ pub struct WalletConnectPersonalSignRequest {
 }
 
 pub struct WalletConnectTypedDataSignRequest {
+    pub request_control: Option<crate::dapp_request::DappRequestControl>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -412,6 +423,9 @@ pub struct WalletConnectHardwareTypedDataCapabilityResult {
 }
 
 pub struct WalletConnectSendTransactionRequest {
+    pub request_control: Option<crate::dapp_request::DappRequestControl>,
+    pub rpc_reads: Option<super::DappRpcReadClient>,
+    pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<EffectiveChainConfig>,
     pub view_session: Arc<DesktopViewSession>,

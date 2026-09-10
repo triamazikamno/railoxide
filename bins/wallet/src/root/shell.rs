@@ -353,7 +353,14 @@ impl Render for WalletRoot {
                     .h_full()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
-                    .child(self.render_workspace(root, window, cx)),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .child(self.render_workspace(root, window, cx)),
+                    ),
             )
     }
 }
@@ -732,7 +739,10 @@ impl WalletRoot {
             .min_h(px(0.0))
             .bg(rgb(theme::SURFACE))
             .p(px(16.0))
-            .child(content)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().flex_1().min_h(px(0.0)).child(content))
     }
 
     fn render_wallet_view(&self, root: &Entity<Self>, window: &Window) -> impl IntoElement {

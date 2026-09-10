@@ -32,6 +32,7 @@ use alloy::primitives::Address;
 use gpui::relative;
 use gpui_component::collapsible::Collapsible;
 use railgun_ui::format_usd_micro_value;
+use ui::controls::app_button_label;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WalletConnectRequestFooterActionState {
@@ -59,7 +60,122 @@ const fn walletconnect_request_footer_action_state(
     }
 }
 
+pub(in crate::root::walletconnect) fn gateway_pending_request(
+    approval: &wallet_ops::gateway::GatewayApprovalRequest,
+    rpc_reads: wallet_ops::DappRpcReadClient,
+) -> Option<WalletConnectRequestUi> {
+    approval.control.ensure_current().ok()?;
+    let key = format!("gateway:{}", approval.id);
+    let chain_id = format!("eip155:{}", approval.chain_id);
+    let remaining = approval
+        .deadline
+        .saturating_duration_since(tokio::time::Instant::now());
+    let expiry = current_unix_seconds()
+        .saturating_add(remaining.as_secs())
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+    let item = approval.parsed.desktop_approval(
+        0,
+        &key,
+        "Browser dapp",
+        &chain_id,
+        approval.account.address,
+        Some(expiry),
+    );
+    Some(WalletConnectRequestUi {
+        key,
+        review_token: walletconnect_request_id_seed(),
+        binding: DappRequestBinding {
+            public_account_uuid: approval.permission.public_account_uuid.clone(),
+            public_account_scope: approval.permission.public_account_scope.clone(),
+            owning_private_wallet_uuid: approval.permission.owning_private_wallet_uuid.clone(),
+            peer_name: approval.origin.paired_peer_id()?.to_owned(),
+            peer_url: approval.origin.web_origin()?.as_str().to_owned(),
+        },
+        session_identity: DappSessionIdentity {
+            transport: "gateway",
+            id: approval.id.clone(),
+        },
+        parsed: approval.parsed.clone(),
+        item,
+        account_source: approval.account.source,
+        request_control: Some(approval.control.clone()),
+        rpc_reads: Some(rpc_reads),
+    })
+}
+
 impl WalletRoot {
+    pub(in crate::root) fn reconcile_gateway_approvals(
+        &mut self,
+        handle: &wallet_ops::gateway::GatewayHandle,
+        ready: &[Arc<wallet_ops::gateway::GatewayApprovalRequest>],
+        cx: &mut Context<'_, Self>,
+    ) {
+        let removed: Vec<_> = self
+            .walletconnect
+            .pending_requests
+            .iter()
+            .filter(|(_, request)| request.request_control.is_some())
+            .filter(|(key, request)| {
+                !request.is_current()
+                    || (!self.walletconnect.request_actions.contains(key.as_str())
+                        && !ready
+                            .iter()
+                            .any(|item| request.key == format!("gateway:{}", item.id)))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in removed {
+            self.walletconnect.remove_pending_request(&key);
+            self.walletconnect.request_actions.remove(&key);
+            if self.walletconnect.request_dialog_key.as_deref() == Some(key.as_str()) {
+                self.clear_spend_authorization(cx);
+                self.discard_walletconnect_fee_for_request_replacement();
+            }
+        }
+        if let (Some(store), Some(view)) = (&self.vault_store, &self.view_session) {
+            for approval in ready {
+                let key = format!("gateway:{}", approval.id);
+                if !walletconnect_request_should_queue(
+                    &self.walletconnect.pending_requests,
+                    &self.walletconnect.handled_request_keys,
+                    &key,
+                ) {
+                    continue;
+                }
+                let Some(request) =
+                    gateway_pending_request(approval, handle.approval_reads(approval.id.clone()))
+                else {
+                    continue;
+                };
+                let resolution = store.resolve_dapp_session_account(
+                    view,
+                    &request.binding.public_account_uuid,
+                    &request.binding.public_account_scope,
+                    request.binding.owning_private_wallet_uuid.as_deref(),
+                );
+                if !matches!(resolution, Ok(WalletConnectSessionAccountResolution::Usable(account)) if account == approval.account)
+                {
+                    continue;
+                }
+                self.walletconnect.request_routes.insert(
+                    request.key.clone(),
+                    DappRequestRoute::Gateway {
+                        handle: handle.clone(),
+                        approval_id: approval.id.clone(),
+                    },
+                );
+                self.walletconnect
+                    .pending_requests
+                    .insert(request.key.clone(), request);
+            }
+        }
+        self.publish_gateway_summaries(self.gateway_request_summaries());
+        self.load_gateway_asset_metadata(cx);
+        self.ensure_walletconnect_pending_request_expiry_timer(cx);
+        self.sync_walletconnect_attention();
+        cx.notify();
+    }
+
     pub(in crate::root::walletconnect) fn render_walletconnect_request(
         &self,
         root: &Entity<Self>,
@@ -117,6 +233,33 @@ impl WalletRoot {
                 self.walletconnect_request_hardware_typed_data_mode(request),
             );
         let mut content = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
+        match &request.parsed {
+            WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
+                content = content.child(walletconnect_kv_row("Requested chain", chain_id.to_string()))
+                    .child(app_muted_text("Confirm changing this website's permitted chain. The wallet's selected chain stays unchanged."));
+            }
+            WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
+                content = content.child(walletconnect_kv_row("Configured chain", chain_id.to_string()))
+                    .child(app_muted_text("This network is already configured. This confirms that the network is available with the wallet's saved settings. Supplied network metadata is ignored."));
+            }
+            WalletConnectParsedRequest::WalletWatchAsset { address, .. } => {
+                content = content
+                    .child(walletconnect_kv_row(
+                        "Token chain",
+                        request.item.chain_id.clone(),
+                    ))
+                    .child(walletconnect_kv_row("Token address", address.to_string()));
+                content = match self.walletconnect.watch_asset_metadata.get(&request.key).and_then(Option::as_ref) {
+                    Some(Ok(token)) => content.child(walletconnect_kv_row("Token symbol", token.symbol.clone()))
+                        .child(walletconnect_kv_row("Token decimals", token.decimals.to_string()))
+                        .child(app_muted_text("Confirm adding this token to the wallet. Website metadata and images are ignored.")),
+                    Some(Err(message)) => content.child(app_muted_text(message.clone())),
+                    None => content.child(app_muted_text("Loading token metadata from the saved network...")),
+                };
+            }
+            _ => {}
+        }
+
         for (risk_index, risk) in intent.risks.iter().enumerate() {
             content = content.child(render_walletconnect_intent_risk(
                 &request.key,
@@ -170,7 +313,19 @@ impl WalletRoot {
                 WalletConnectRequestDisclosure::RawRequest,
                 WALLETCONNECT_RAW_REQUEST_LABEL,
                 disclosure_state.raw_request_open,
-                walletconnect_raw_details(&request.key, intent.raw_request),
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when(request.request_control.is_some(), |this| {
+                        this.child(walletconnect_kv_row(
+                            "Paired browser",
+                            request.binding.peer_name.clone(),
+                        ))
+                    })
+                    .child(walletconnect_raw_details(&request.key, intent.raw_request)),
             ));
         if hardware_typed_data_hash_fallback {
             content = content.child(
@@ -184,7 +339,9 @@ impl WalletRoot {
                 .small(),
             );
         }
-        if matches!(request.account_source, PublicAccountSource::HardwareDerived) {
+        if matches!(request.account_source, PublicAccountSource::HardwareDerived)
+            && !request.parsed.desktop_policy()
+        {
             content = content.child(
                 Alert::warning(
                     SharedString::from(format!(
@@ -240,10 +397,7 @@ impl WalletRoot {
             return Vec::new();
         };
         let in_flight = self.walletconnect.request_actions.contains(request_key);
-        let locally_expired = !walletconnect_request_approval_admitted(
-            request.item.expiry_timestamp,
-            current_unix_seconds(),
-        );
+        let locally_expired = !request.approval_admitted(current_unix_seconds());
         let (intent_context_available, unlimited_allowance) =
             match self.walletconnect_intent_context(request) {
                 Ok(context) => {
@@ -257,7 +411,8 @@ impl WalletRoot {
                 }
                 Err(_) => (false, false),
             };
-        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived;
+        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived
+            && !request.parsed.desktop_policy();
         let hardware_typed_data_hash_fallback =
             walletconnect_request_uses_hardware_typed_data_hash_fallback(
                 request,
@@ -266,7 +421,14 @@ impl WalletRoot {
         let action_state = walletconnect_request_footer_action_state(
             in_flight,
             locally_expired,
-            intent_context_available,
+            intent_context_available
+                && (!matches!(
+                    request.parsed,
+                    WalletConnectParsedRequest::WalletWatchAsset { .. }
+                ) || matches!(
+                    self.walletconnect.watch_asset_metadata.get(request_key),
+                    Some(Some(Ok(_)))
+                )),
             unlimited_allowance,
             hardware_request,
             hardware_typed_data_hash_fallback,
@@ -297,7 +459,11 @@ impl WalletRoot {
         .into_any_element();
         let approve = app_button(
             SharedString::from(format!("walletconnect-request-approve-{request_key}")),
-            approve_label,
+            if request.parsed.desktop_policy() {
+                "Confirm"
+            } else {
+                approve_label
+            },
         )
         .primary()
         .small()
@@ -327,6 +493,28 @@ impl WalletRoot {
             &self.public_accounts,
             self.view_session.as_deref(),
         )
+    }
+
+    pub(in crate::root) fn gateway_request_summaries(&self) -> Vec<(String, String)> {
+        self.walletconnect
+            .pending_requests
+            .values()
+            .filter_map(|request| {
+                let Some(DappRequestRoute::Gateway { approval_id, .. }) =
+                    self.walletconnect.request_routes.get(&request.key)
+                else {
+                    return None;
+                };
+                if !request.is_current() {
+                    return None;
+                }
+                let context = self.walletconnect_intent_context(request).ok()?;
+                Some((
+                    approval_id.clone(),
+                    build_walletconnect_intent(request, context).authorization,
+                ))
+            })
+            .collect()
     }
 
     fn walletconnect_intent_context(
@@ -365,14 +553,15 @@ impl WalletRoot {
         else {
             return;
         };
-        if !walletconnect_request_approval_admitted(
-            request.item.expiry_timestamp,
-            current_unix_seconds(),
-        ) {
+        if !request.approval_admitted(current_unix_seconds()) {
             self.walletconnect.error = Some(Arc::from(
                 "WalletConnect request expired before approval could start.",
             ));
             cx.notify();
+            return;
+        }
+        if request.request_control.is_some() && request.parsed.desktop_policy() {
+            self.approve_gateway_policy(request, window, cx);
             return;
         }
         let reviewed_fee = if walletconnect_request_fee_eligible(&request.parsed) {
@@ -500,35 +689,61 @@ impl WalletRoot {
             view_session.as_ref(),
             current_unix_seconds(),
         ) {
-            Ok(request) => request,
+            Ok((request, route)) => {
+                self.walletconnect
+                    .request_routes
+                    .insert(request.key.clone(), route);
+                request
+            }
             Err(error) => {
-                let context =
-                    match self.walletconnect_client_context_for_session(&request.session, cx) {
-                        Ok(context) => context,
-                        Err(context_error) => {
-                            self.walletconnect.error = Some(context_error);
-                            cx.notify();
-                            return;
-                        }
-                    };
+                let response_sender = match self.walletconnect_response_sender(&request, cx) {
+                    Ok(context) => context,
+                    Err(context_error) => {
+                        self.walletconnect.error = Some(context_error);
+                        cx.notify();
+                        return;
+                    }
+                };
                 self.publish_invalid_walletconnect_pending_request(
                     request_key,
-                    &request,
                     &error,
-                    context,
+                    response_sender,
                     window,
                     cx,
                 );
                 return;
             }
         };
-        let context = match self.walletconnect_client_context_for_session(&request.session, cx) {
+        let response_sender = match self.walletconnect_response_sender(&request, cx) {
             Ok(context) => context,
             Err(error) => {
                 self.walletconnect.error = Some(error);
                 cx.notify();
                 return;
             }
+        };
+        let transaction_tracking = if matches!(
+            request.parsed,
+            WalletConnectParsedRequest::EthSendTransaction { .. }
+        ) {
+            let tracking = parse_caip2_chain_id(&request.item.chain_id)
+                .ok_or_else(|| "WalletConnect request chain is not EIP-155".to_owned())
+                .and_then(|chain_id| {
+                    self.public_transaction_tracking_context(
+                        chain_id,
+                        &request.binding.public_account_uuid,
+                    )
+                });
+            match tracking {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    self.walletconnect.error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
         };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase =
@@ -570,6 +785,17 @@ impl WalletRoot {
             );
             event_tx
         });
+        if self
+            .walletconnect
+            .walletconnect_fee_state
+            .as_ref()
+            .is_some_and(|state| {
+                state.request_key.as_ref() == request_key && state.review_token == review_token
+            })
+        {
+            self.walletconnect.walletconnect_fee_quote_task = None;
+            self.walletconnect.walletconnect_gas_fee.refreshing = false;
+        }
         self.walletconnect
             .request_actions
             .insert(request_key.to_owned());
@@ -583,7 +809,8 @@ impl WalletRoot {
             "submitting authorized walletconnect request"
         );
         let request_key = request_key.to_owned();
-        let join = self.runtime.spawn(async move {
+        let native_control = request.request_control.clone();
+        let join = self.spawn_public_transaction_submission(async move {
             Box::pin(approve_walletconnect_request_task(
                 request,
                 vault_store,
@@ -593,11 +820,12 @@ impl WalletRoot {
                 trezor_app_passphrase,
                 trezor_pin_matrix_provider,
                 effective_chain,
-                context,
+                response_sender,
                 http,
                 hash_fallback_confirmed,
                 reviewed_fee,
                 approval_event_tx,
+                transaction_tracking,
             ))
             .await
         });
@@ -605,6 +833,12 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.walletconnect.request_actions.remove(&request_key);
+                if native_control.as_ref().is_some_and(|control| control.ensure_current().is_err()) {
+                    root.walletconnect.remove_pending_request(&request_key);
+                    root.sync_walletconnect_attention();
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(Ok(outcome)) => {
                         tracing::info!(
@@ -674,6 +908,10 @@ impl WalletRoot {
                         }
                     }
                     Ok(Err(error)) => {
+                        if native_control.is_some() && !matches!(error, DappApprovalTaskError::AdmissionBusy) {
+                            root.walletconnect.remove_pending_request(&request_key);
+                        }
+                        let error = error.to_string();
                         tracing::warn!(
                             target: "wallet::root::walletconnect",
                             request_key = %walletconnect_request_key_log_label(&request_key),
@@ -690,7 +928,10 @@ impl WalletRoot {
                         root.walletconnect.error = Some(Arc::from(error));
                     }
                     Err(error) => {
-                        let message = format!("WalletConnect approval task failed: {error}");
+                        if native_control.is_some() {
+                            root.walletconnect.remove_pending_request(&request_key);
+                        }
+                        let message = format!("Dapp approval task failed: {error}");
                         if let Some(generation) = progress_generation {
                             root.walletconnect.fail_request_approval_progress(
                                 &request_key,
@@ -701,6 +942,7 @@ impl WalletRoot {
                         root.walletconnect.error = Some(Arc::from(message));
                     }
                 }
+                root.refresh_walletconnect_gas_fee_quote(Arc::from(request_key.as_str()), cx);
                 root.sync_walletconnect_attention();
                 cx.notify();
             });
@@ -834,16 +1076,96 @@ impl WalletRoot {
         store: &DesktopVaultStore,
         view_session: &DesktopViewSession,
         now: u64,
-    ) -> Result<WalletConnectRequestUi, WalletConnectSessionRequestFailure> {
+    ) -> Result<
+        (WalletConnectRequestUi, WalletConnectRequestRoute),
+        WalletConnectSessionRequestFailure,
+    > {
+        if let Some(control) = &request.request_control {
+            let failure = || WalletConnectSessionRequestFailure {
+                kind: WalletConnectRequestErrorKind::Unauthorized,
+                message: "Dapp approval is no longer current".to_owned(),
+            };
+            control.ensure_current().map_err(|_| failure())?;
+            let route = self
+                .walletconnect
+                .request_routes
+                .get(&request.key)
+                .cloned()
+                .ok_or_else(failure)?;
+            let DappRequestRoute::Gateway {
+                handle,
+                approval_id,
+            } = &route
+            else {
+                return Err(failure());
+            };
+            let approvals = handle.approval_requests();
+            let approvals = approvals.borrow();
+            let ready = approvals
+                .iter()
+                .find(|ready| &ready.id == approval_id)
+                .ok_or_else(failure)?;
+            let account = store
+                .resolve_dapp_session_account(
+                    view_session,
+                    &request.binding.public_account_uuid,
+                    &request.binding.public_account_scope,
+                    request.binding.owning_private_wallet_uuid.as_deref(),
+                )
+                .map_err(|_| failure())?;
+            let WalletConnectSessionAccountResolution::Usable(account) = account else {
+                return Err(failure());
+            };
+            if account != ready.account
+                || request.item.account != account.address
+                || request.item.chain_id != format!("eip155:{}", ready.chain_id)
+            {
+                return Err(failure());
+            }
+            wallet_ops::walletconnect::validate_dapp_request_account(
+                &request.parsed,
+                &account,
+                ready.chain_id,
+                walletconnect_namespace_account_support(&account, Some(view_session)),
+            )
+            .map_err(|error| WalletConnectSessionRequestFailure {
+                kind: match error {
+                    wallet_ops::walletconnect::DappRequestValidationError::UnsupportedMethod => {
+                        WalletConnectRequestErrorKind::UnsupportedMethod
+                    }
+                    wallet_ops::walletconnect::DappRequestValidationError::AccountMismatch => {
+                        WalletConnectRequestErrorKind::Unauthorized
+                    }
+                    _ => WalletConnectRequestErrorKind::MalformedParams,
+                },
+                message: "Dapp request is not supported by the current account".to_owned(),
+            })?;
+            self.ensure_walletconnect_chain_enabled(&request.item.chain_id)?;
+            control.ensure_current().map_err(|_| failure())?;
+            return Ok((request.clone(), route));
+        }
         walletconnect_validate_pending_request_expiry(request.item.expiry_timestamp, now)?;
+        let session_uuid = request
+            .session_identity
+            .walletconnect_session_id()
+            .ok_or_else(|| WalletConnectSessionRequestFailure {
+                kind: WalletConnectRequestErrorKind::Unauthorized,
+                message: "Request does not belong to a WalletConnect session".to_owned(),
+            })?;
         let session = store
-            .load_walletconnect_session(view_session, &request.session.session_uuid)
+            .load_walletconnect_session(view_session, session_uuid)
             .map_err(|error| WalletConnectSessionRequestFailure {
                 kind: WalletConnectRequestErrorKind::Internal,
                 message: format!("Could not reload WalletConnect session: {error}"),
             })?;
+        let binding = DappRequestBinding::from_walletconnect_session(&session);
         let resolution = store
-            .resolve_walletconnect_session_account(view_session, &session)
+            .resolve_dapp_session_account(
+                view_session,
+                &binding.public_account_uuid,
+                &binding.public_account_scope,
+                binding.owning_private_wallet_uuid.as_deref(),
+            )
             .map_err(|error| WalletConnectSessionRequestFailure {
                 kind: WalletConnectRequestErrorKind::Internal,
                 message: format!("Could not resolve WalletConnect Public account: {error}"),
@@ -905,32 +1227,36 @@ impl WalletRoot {
             });
         };
         item.expiry_timestamp = request.item.expiry_timestamp;
-        Ok(WalletConnectRequestUi {
-            key: request.key.clone(),
-            review_token: request.review_token,
-            session,
-            parsed: request.parsed.clone(),
-            item,
-            account_source,
-        })
+        let route = WalletConnectRequestRoute::from_session(&session);
+        Ok((
+            WalletConnectRequestUi {
+                request_control: None,
+                rpc_reads: None,
+                key: request.key.clone(),
+                review_token: request.review_token,
+                binding,
+                session_identity: request.session_identity.clone(),
+                parsed: request.parsed.clone(),
+                item,
+                account_source,
+            },
+            route,
+        ))
     }
 
     pub(in crate::root::walletconnect) fn publish_invalid_walletconnect_pending_request(
         &mut self,
         request_key: &str,
-        request: &WalletConnectRequestUi,
         failure: &WalletConnectSessionRequestFailure,
-        context: WalletConnectClientContext,
+        response_sender: DappResponseSender,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let response = build_walletconnect_jsonrpc_error(
-            request.item.id,
-            failure.kind,
-            failure.message.clone(),
-        );
-        let topic = request.session.session_topic.clone();
-        let sym_key = request.session.keys.sym_key;
+        let response = Err(DappRequestError {
+            provider_failure: None,
+            kind: failure.kind,
+            message: failure.message.clone(),
+        });
         let request_key = request_key.to_owned();
         self.walletconnect
             .request_actions
@@ -942,7 +1268,11 @@ impl WalletRoot {
             "walletconnect pending request failed revalidation"
         );
         let join = self.runtime.spawn(async move {
-            publish_walletconnect_session_response(context.worker, topic, sym_key, response).await
+            response_sender
+                .begin_approval()
+                .await
+                .map_err(|_| "Dapp approval is unavailable".to_owned())?;
+            response_sender.send(response).await
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
@@ -986,7 +1316,7 @@ impl WalletRoot {
         else {
             return;
         };
-        let context = match self.walletconnect_client_context_for_session(&request.session, cx) {
+        let response_sender = match self.walletconnect_response_sender(&request, cx) {
             Ok(context) => context,
             Err(error) => {
                 self.walletconnect.error = Some(error);
@@ -994,13 +1324,12 @@ impl WalletRoot {
                 return;
             }
         };
-        let response = build_walletconnect_jsonrpc_error(
-            request.item.id,
-            WalletConnectRequestErrorKind::UserRejected,
-            "User rejected WalletConnect request",
-        );
-        let topic = request.session.session_topic.clone();
-        let sym_key = request.session.keys.sym_key;
+        let response = Err(DappRequestError {
+            provider_failure: None,
+            kind: WalletConnectRequestErrorKind::UserRejected,
+            message: "User rejected WalletConnect request".to_owned(),
+        });
+        let native = request.request_control.is_some();
         let request_key = request_key.to_owned();
         self.walletconnect
             .request_actions
@@ -1013,9 +1342,9 @@ impl WalletRoot {
             dapp = request.item.dapp_name.as_str(),
             "rejecting walletconnect request"
         );
-        let join = self.runtime.spawn(async move {
-            publish_walletconnect_session_response(context.worker, topic, sym_key, response).await
-        });
+        let join = self
+            .runtime
+            .spawn(async move { response_sender.send(response).await });
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
@@ -1024,7 +1353,7 @@ impl WalletRoot {
                     target: "wallet::root::walletconnect",
                     request_key = %walletconnect_request_key_log_label(&request_key),
                     relay_failed = matches!(&result, Ok(Err(_))),
-                    relay_not_sent = matches!(&result, Ok(Err(error)) if walletconnect_relay_request_was_not_sent(error)),
+                    relay_not_sent = matches!(&result, Ok(Err(error)) if !native && walletconnect_relay_request_was_not_sent(error)),
                     "walletconnect request rejection handled"
                 );
                 match result {
@@ -1038,7 +1367,7 @@ impl WalletRoot {
                         }
                         root.walletconnect.status = Some(Arc::from("WalletConnect request rejected."));
                     }
-                    Ok(Err(error)) if walletconnect_relay_request_was_not_sent(&error) => {
+                    Ok(Err(error)) if !native && walletconnect_relay_request_was_not_sent(&error) => {
                         root.walletconnect.status = Some(Arc::from(
                             "WalletConnect relay is reconnecting; rejection was not sent. The request remains pending so you can retry.",
                         ));
@@ -1294,6 +1623,9 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Opt
                 body = body.child(app_muted_text(walletconnect_approximate_usd_label(usd)));
             }
         }
+        WalletConnectHeroSummary::Policy(detail) => {
+            body = body.child(app_muted_text(detail.clone()));
+        }
         WalletConnectHeroSummary::None => {
             body = body.child(app_strong_text("Review request details"));
         }
@@ -1436,9 +1768,18 @@ fn render_walletconnect_request_provenance(
         .flex_col()
         .gap_1()
         .px(px(2.0))
-        .child(walletconnect_kv_row("Site", intent.provenance.site.clone()))
-        .when_some(intent.provenance.dapp_name.as_ref(), |this, name| {
-            this.child(walletconnect_provenance_dapp_row(name))
+        .child(walletconnect_kv_row(
+            "Site",
+            if request.request_control.is_some() {
+                request.binding.peer_url.clone()
+            } else {
+                intent.provenance.site.clone()
+            },
+        ))
+        .when(request.request_control.is_none(), |this| {
+            this.when_some(intent.provenance.dapp_name.as_ref(), |this, name| {
+                this.child(walletconnect_provenance_dapp_row(name))
+            })
         })
         .when(
             walletconnect_selected_account_provenance_visible(
@@ -1539,7 +1880,7 @@ fn render_walletconnect_request_disclosure(
             IconName::ChevronRight
         })
         .text_color(rgb(theme::TEXT_MUTED))
-        .child(app_muted_text(label))
+        .child(app_button_label(label))
         .on_click(move |_event, _window, cx| {
             cx.stop_propagation();
             toggle_root.update(cx, |root, cx| {
@@ -1727,7 +2068,7 @@ fn render_walletconnect_network_fee(
         IconName::ChevronRight
     })
     .text_color(rgb(theme::TEXT_MUTED))
-    .child(app_muted_text(WALLETCONNECT_NETWORK_FEE_LABEL))
+    .child(app_button_label(WALLETCONNECT_NETWORK_FEE_LABEL))
     .on_click(move |_event, _window, cx| {
         cx.stop_propagation();
         toggle_root.update(cx, |root, cx| {

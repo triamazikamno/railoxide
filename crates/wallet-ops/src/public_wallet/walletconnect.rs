@@ -4,7 +4,8 @@ use super::runtime::public_chain_runtime_config;
 use super::signer::{VaultedPublicSigner, vaulted_public_signer};
 use super::submission::{
     PublicActionPreflightMode, emit_public_action_event,
-    emit_refreshed_public_action_hardware_session, public_action_preflight_from_rpc_pool_with_mode,
+    emit_refreshed_public_action_hardware_session,
+    public_action_preflight_from_rpc_pool_with_mode_and_reads,
     sanitize_walletconnect_transaction_request, submit_public_action_attempt,
     validate_walletconnect_reviewed_transaction,
 };
@@ -25,6 +26,9 @@ use crate::{HttpContext, query_rpc_pool_with_http_client, report_chain_string};
 pub async fn walletconnect_sign_personal_message(
     request: WalletConnectPersonalSignRequest,
 ) -> Result<String> {
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
@@ -33,11 +37,15 @@ pub async fn walletconnect_sign_personal_message(
         request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
-    )?;
+    )?
+    .with_request_control(request.request_control.clone());
     let event_tx = request.event_tx.as_ref();
     let requires_device_approval = signer.requires_device_approval();
     if requires_device_approval {
         emit_public_action_event(event_tx, PublicActionSessionEvent::HardwareApprovalStarted);
+    }
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
     }
     let signature = match signer.sign_personal_message(&request.message).await {
         Ok(signature) => {
@@ -61,6 +69,9 @@ pub async fn walletconnect_sign_personal_message(
             return Err(error).wrap_err("WalletConnect personal_sign");
         }
     };
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
 }
 
@@ -78,6 +89,9 @@ pub async fn walletconnect_sign_typed_data(
             ));
         }
     };
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
@@ -87,7 +101,8 @@ pub async fn walletconnect_sign_typed_data(
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )
-    .wrap_err_with(|| format!("WalletConnect {operation}"))?;
+    .wrap_err_with(|| format!("WalletConnect {operation}"))?
+    .with_request_control(request.request_control.clone());
     let typed_data = HardwareEip712Model::from_walletconnect_typed_data_json(request.typed_data)
         .wrap_err("WalletConnect typed-data payload")
         .wrap_err_with(|| format!("WalletConnect {operation}"))?;
@@ -97,11 +112,15 @@ pub async fn walletconnect_sign_typed_data(
         .typed_data_signing_mode()
         .await
         .wrap_err_with(|| format!("WalletConnect {operation}"))?;
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     if let Some(mode) = hardware_typed_data_mode {
         if !mode.is_supported() {
-            return Err(eyre!(
-                "WalletConnect {operation} is unsupported for this hardware Public account session"
-            ));
+            return Err(crate::walletconnect::WalletConnectError::UnsupportedMethod(
+                method.as_str().to_owned(),
+            ))
+            .wrap_err_with(|| format!("WalletConnect {operation}"));
         }
         if mode.requires_hash_fallback_warning() && !request.hash_fallback_confirmed {
             return Err(
@@ -116,6 +135,9 @@ pub async fn walletconnect_sign_typed_data(
     }
     if requires_device_approval {
         emit_public_action_event(event_tx, PublicActionSessionEvent::HardwareApprovalStarted);
+    }
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
     }
     let signature = match signer
         .sign_typed_data_v4(
@@ -151,6 +173,9 @@ pub async fn walletconnect_sign_typed_data(
             return Err(error);
         }
     };
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
 }
 
@@ -192,6 +217,9 @@ pub async fn submit_walletconnect_send_transaction(
     request: WalletConnectSendTransactionRequest,
     http: &HttpContext,
 ) -> Result<WalletConnectSendTransactionResult> {
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
     let signer = vaulted_public_signer(
         &request.vault_store,
@@ -201,7 +229,8 @@ pub async fn submit_walletconnect_send_transaction(
         request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
-    )?;
+    )?
+    .with_request_control(request.request_control.clone());
     let from_address = signer.address();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let tx_req =
@@ -238,7 +267,7 @@ pub async fn submit_walletconnect_send_transaction(
     } else {
         None
     };
-    let preflight = public_action_preflight_from_rpc_pool_with_mode(
+    let preflight = public_action_preflight_from_rpc_pool_with_mode_and_reads(
         &query_rpc_pool,
         http.network_mode(),
         request.chain_id,
@@ -254,15 +283,40 @@ pub async fn submit_walletconnect_send_transaction(
         PublicActionPreflightMode::Managed,
         None,
         false,
+        request.rpc_reads.as_ref(),
     )
     .await
+    .map_err(super::submission::PublicActionPreflightError::into_report)
     .wrap_err("WalletConnect eth_sendTransaction preflight")?;
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
+    let mut observation = match request.transaction_tracking.as_ref() {
+        Some(context) => {
+            let observer = crate::block_observer::BlockObserver::establish(
+                query_rpc_pool.clone(),
+                chain.finality_depth,
+                http.rpc_broker(),
+                request.chain_id,
+            )
+            .await?;
+            Some(context.admit_observer(observer)?)
+        }
+        None => None,
+    };
+    if let Some(guard) = observation.as_ref() {
+        guard.ensure_open()?;
+    }
+    let mut handed_off = false;
     emit_public_action_event(
         request.event_tx.as_ref(),
         PublicActionSessionEvent::AttemptHandoff {
             step: PublicActionProgressStep::Send,
         },
     );
+    if let Some(control) = request.request_control.as_ref() {
+        control.ensure_current()?;
+    }
     let attempt = submit_public_action_attempt(
         PublicActionProgressStep::Send,
         preflight,
@@ -272,9 +326,32 @@ pub async fn submit_walletconnect_send_transaction(
         "WalletConnect eth_sendTransaction",
         request.event_tx.as_ref(),
         request.expiry_timestamp,
+        request.request_control.is_none(),
+        &mut |attempt| {
+            if let Some(guard) = observation.as_mut() {
+                guard.ensure_open()?;
+            }
+            if let Some(control) = request.request_control.as_ref() {
+                control.before_broadcast()?;
+            }
+            if let Some(guard) = observation.as_mut() {
+                guard.observer_mut().register(attempt.tx_hash, 0);
+            }
+            handed_off = true;
+            Ok(())
+        },
     )
-    .await
-    .map_err(|error| eyre!(error.message()))?;
+    .await;
+    if handed_off && let Some(guard) = observation {
+        guard.handoff()?;
+    }
+    let attempt = attempt.map_err(|error| {
+        if request.request_control.is_some() {
+            error.into_report()
+        } else {
+            eyre!(error.message())
+        }
+    })?;
 
     Ok(WalletConnectSendTransactionResult {
         tx_hash: attempt.info.tx_hash,

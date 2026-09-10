@@ -4,6 +4,8 @@ members = [
     "crates/broadcaster-monitor",
     "crates/broadcaster-monitor-waku",
     "crates/broadcaster-monitor-gpui",
+    "crates/browser-frontend",
+    "crates/dapp-gateway-protocol",
     "crates/railgun-ui",
     "crates/ui",
     "crates/wallet-ops",

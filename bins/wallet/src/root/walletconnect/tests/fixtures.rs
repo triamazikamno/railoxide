@@ -1,4 +1,5 @@
 use super::*;
+use wallet_ops::WalletConnectPendingRequest;
 
 pub(super) const TEST_PASSWORD: &str = "correct horse battery staple";
 pub(super) const TEST_MNEMONIC: &str =
@@ -110,9 +111,16 @@ pub(super) fn test_walletconnect_request(
 ) -> WalletConnectRequestUi {
     let account = alloy::primitives::Address::from([0x11; 20]);
     WalletConnectRequestUi {
+        request_control: None,
+        rpc_reads: None,
         key: key.to_owned(),
         review_token: 1,
-        session: test_walletconnect_session("session-topic"),
+        binding: DappRequestBinding::from_walletconnect_session(&test_walletconnect_session(
+            "session-topic",
+        )),
+        session_identity: DappSessionIdentity::walletconnect(
+            test_walletconnect_session("session-topic").session_uuid,
+        ),
         parsed: WalletConnectParsedRequest::EthAccounts,
         item: WalletConnectPendingRequest {
             id: 7,

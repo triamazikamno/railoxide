@@ -27,6 +27,7 @@ pub(crate) enum VaultedPublicSigner {
 }
 
 pub(crate) struct HardwarePublicEvmSigner {
+    pub(super) request_control: Option<crate::dapp_request::DappRequestControl>,
     pub(super) address: Address,
     pub(super) descriptor: HardwarePublicAccountDescriptor,
     pub(super) hardware_session: Mutex<HardwareProfileSession>,
@@ -35,6 +36,17 @@ pub(crate) struct HardwarePublicEvmSigner {
 }
 
 impl VaultedPublicSigner {
+    #[must_use]
+    pub(super) fn with_request_control(
+        mut self,
+        control: Option<crate::dapp_request::DappRequestControl>,
+    ) -> Self {
+        if let Self::Hardware(signer) = &mut self {
+            signer.request_control = control;
+        }
+        self
+    }
+
     pub(crate) fn address(&self) -> Address {
         match self {
             Self::Software(signer) => signer.address(),
@@ -172,6 +184,7 @@ impl HardwarePublicEvmSigner {
             self.trezor_pin_matrix_provider(),
             self.address,
             tx,
+            self.request_control.as_ref(),
         )
         .await?;
         self.replace_trezor_session_id_if_trezor(trezor_session_id)?;
@@ -187,6 +200,7 @@ impl HardwarePublicEvmSigner {
             self.trezor_pin_matrix_provider(),
             self.address,
             message,
+            self.request_control.as_ref(),
         )
         .await?;
         self.replace_trezor_session_id_if_trezor(trezor_session_id)?;
@@ -226,6 +240,7 @@ impl HardwarePublicEvmSigner {
                 self.address,
                 typed_data,
                 mode,
+                self.request_control.as_ref(),
             )
             .await?;
             let HardwareTypedDataSignOutcome::Signed {
@@ -361,6 +376,7 @@ async fn sign_hardware_public_typed_data(
     expected_address: Address,
     typed_data: &HardwareEip712Model,
     mode: HardwareTypedDataSigningMode,
+    request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<HardwareTypedDataSignOutcome> {
     match descriptor.device_kind {
         crate::hardware::HardwareDeviceKind::Ledger => {
@@ -379,6 +395,7 @@ async fn sign_hardware_public_typed_data(
                 .await
                 .wrap_err("verify Ledger public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            let client = client.with_request_control(request_control.cloned());
             let signature = match mode {
                 HardwareTypedDataSigningMode::ClearSign => match client
                     .sign_typed_data_clear_or_downgrade(descriptor, typed_data)
@@ -439,6 +456,9 @@ async fn sign_hardware_public_typed_data(
                 .public_ethereum_address(descriptor)
                 .wrap_err("verify Trezor public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            if let Some(control) = request_control {
+                control.ensure_current()?;
+            }
             let signature = match mode {
                 HardwareTypedDataSigningMode::ClearSign => client
                     .sign_typed_data_clear(descriptor, typed_data)
@@ -470,6 +490,7 @@ async fn sign_hardware_public_typed_data(
     _expected_address: Address,
     _typed_data: &HardwareEip712Model,
     _mode: HardwareTypedDataSigningMode,
+    _request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<HardwareTypedDataSignOutcome> {
     Err(eyre!(
         "hardware public signing is not enabled in this build"
@@ -559,6 +580,7 @@ async fn sign_hardware_public_transaction(
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     expected_address: Address,
     tx: &dyn SignableTransaction<Signature>,
+    request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<(Signature, Option<Vec<u8>>)> {
     match descriptor.device_kind {
         crate::hardware::HardwareDeviceKind::Ledger => {
@@ -577,6 +599,7 @@ async fn sign_hardware_public_transaction(
                 .await
                 .wrap_err("verify Ledger public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            let client = client.with_request_control(request_control.cloned());
             let signature = client
                 .sign_transaction_rlp(descriptor, &tx.encoded_for_signing())
                 .await
@@ -607,6 +630,9 @@ async fn sign_hardware_public_transaction(
                 .public_ethereum_address(descriptor)
                 .wrap_err("verify Trezor public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            if let Some(control) = request_control {
+                control.ensure_current()?;
+            }
             let signature = client
                 .sign_transaction(descriptor, tx)
                 .wrap_err("sign public transaction on Trezor")?;
@@ -624,6 +650,7 @@ async fn sign_hardware_public_transaction(
     _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     _expected_address: Address,
     _tx: &dyn SignableTransaction<Signature>,
+    _request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<(Signature, Option<Vec<u8>>)> {
     Err(eyre!(
         "hardware public signing is not enabled in this build"
@@ -638,6 +665,7 @@ async fn sign_hardware_public_message(
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     expected_address: Address,
     message: &[u8],
+    request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<(Signature, Option<Vec<u8>>)> {
     match descriptor.device_kind {
         crate::hardware::HardwareDeviceKind::Ledger => {
@@ -656,6 +684,7 @@ async fn sign_hardware_public_message(
                 .await
                 .wrap_err("verify Ledger public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            let client = client.with_request_control(request_control.cloned());
             let signature = client
                 .sign_message(descriptor, message)
                 .await
@@ -686,6 +715,9 @@ async fn sign_hardware_public_message(
                 .public_ethereum_address(descriptor)
                 .wrap_err("verify Trezor public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
+            if let Some(control) = request_control {
+                control.ensure_current()?;
+            }
             let signature = client
                 .sign_message(descriptor, message)
                 .wrap_err("sign public message on Trezor")?;
@@ -703,6 +735,7 @@ async fn sign_hardware_public_message(
     _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     _expected_address: Address,
     _message: &[u8],
+    _request_control: Option<&crate::dapp_request::DappRequestControl>,
 ) -> Result<(Signature, Option<Vec<u8>>)> {
     Err(eyre!(
         "hardware public signing is not enabled in this build"
@@ -762,6 +795,7 @@ pub(crate) fn vaulted_public_signer(
             .map_err(|error| eyre!(error))
             .wrap_err("validate hardware public account descriptor")?;
         return Ok(VaultedPublicSigner::Hardware(HardwarePublicEvmSigner {
+            request_control: None,
             address: account.address,
             descriptor,
             hardware_session: Mutex::new(

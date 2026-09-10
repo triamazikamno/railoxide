@@ -1,12 +1,15 @@
 mod actions;
+mod balance_cache;
 mod balances;
 mod contracts;
+mod dapp_reads;
 mod gas;
 mod runtime;
 mod signer;
 mod submission;
 #[cfg(test)]
 mod tests;
+mod transaction_tracker;
 mod types;
 mod walletconnect;
 
@@ -15,9 +18,17 @@ pub use actions::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,
 };
+pub use balance_cache::{
+    PublicBalanceCache, PublicBalanceRefreshCompletion, PublicBalanceRefreshTicket,
+    PublicBalanceScope,
+};
+pub(crate) use balances::native_asset_for_chain;
 pub use balances::{
     public_balance_assets_for_chain, public_balance_refresh_interval_secs, refresh_public_balances,
+    refresh_public_balances_at_least,
 };
+pub use dapp_reads::DappRpcReadClient;
+pub(crate) use dapp_reads::stops_dapp_read_retries;
 pub use gas::{
     PUBLIC_NATIVE_UNWRAP_GAS_UNITS, estimate_public_action_gas_cost,
     estimate_public_action_gas_cost_with_profile,
@@ -29,14 +40,21 @@ pub use gas::{
     public_native_action_gas_units, public_native_action_gas_units_from_walletconnect_intent,
     public_shield_protocol_fee_amount, public_walletconnect_operation_gas_limit,
     quote_public_action_gas_fee, quote_public_action_gas_fee_bundle_with_profile,
-    quote_public_action_gas_fee_with_profile, resolve_public_action_gas_fee,
-    simulate_public_advanced_transaction_with_fee,
+    quote_public_action_gas_fee_with_profile, quote_public_action_gas_fee_with_reads,
+    resolve_public_action_gas_fee, simulate_public_advanced_transaction_with_fee,
+    simulate_public_advanced_transaction_with_fee_and_reads,
 };
 pub(crate) use signer::{VaultedPublicSigner, vaulted_public_signer};
 pub use submission::public_action_replacement_bumped_fee;
 pub use submission::{
     sanitize_walletconnect_transaction_request, validate_walletconnect_reviewed_transaction,
     walletconnect_transaction_payload_fingerprint,
+};
+#[cfg(test)]
+pub(crate) use transaction_tracker::test_tracking_context;
+pub(crate) use transaction_tracker::{PublicTransactionFamily, PublicTransactionObservationGuard};
+pub use transaction_tracker::{
+    PublicTransactionLookup, PublicTransactionTracker, PublicTransactionTrackingContext,
 };
 pub use types::{
     HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,

@@ -1205,6 +1205,8 @@ fn public_balance_snapshot_for_test(chain_id: u64) -> PublicBalanceSnapshot {
         chain_id,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![PublicBalanceEntry {
                 asset: PublicBalanceAsset {
@@ -1228,6 +1230,8 @@ fn public_native_balance_snapshot_for_test(
         accounts: accounts
             .into_iter()
             .map(|(account, amount)| PublicAccountBalance {
+                observed_at: None,
+                observed_block: None,
                 account,
                 balances: vec![PublicBalanceEntry {
                     asset: PublicBalanceAsset {
@@ -1381,6 +1385,8 @@ fn public_account_usd_total_label_sums_priced_balances() {
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![
                 PublicBalanceEntry {
@@ -1425,6 +1431,8 @@ fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![
                 PublicBalanceEntry {
@@ -1457,26 +1465,6 @@ fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
         ),
         None
     );
-}
-
-#[test]
-fn public_balance_merge_preserves_other_account_status_group() {
-    let active = public_balance_snapshot_for_test(1);
-    let mut inactive = public_balance_snapshot_for_test(1);
-    inactive.accounts[0].account.public_account_uuid = "inactive-account".to_string();
-    inactive.accounts[0].account.status = PublicAccountStatus::Inactive;
-
-    let merged =
-        merge_public_balance_snapshot(Some(&active), inactive, PublicAccountStatus::Inactive);
-
-    assert!(merged.accounts.iter().any(|account| {
-        account.account.public_account_uuid == "public-account"
-            && account.account.status == PublicAccountStatus::Active
-    }));
-    assert!(merged.accounts.iter().any(|account| {
-        account.account.public_account_uuid == "inactive-account"
-            && account.account.status == PublicAccountStatus::Inactive
-    }));
 }
 
 #[test]

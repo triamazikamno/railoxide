@@ -40,12 +40,13 @@ pub use relay::{
     WalletConnectRelaySubscriptionPayload, WalletConnectRelaySubscriptionRequest,
 };
 pub use request::{
-    WalletConnectDecodedCallKind, WalletConnectDecodedTransaction, WalletConnectEvmTransaction,
-    WalletConnectLifecycleRequestOutcome, WalletConnectParsedRequest, WalletConnectPendingRequest,
-    WalletConnectPendingRequestQueue, WalletConnectRequestErrorKind,
+    DappRequestValidationError, WalletConnectDecodedCallKind, WalletConnectDecodedTransaction,
+    WalletConnectEvmTransaction, WalletConnectLifecycleRequestOutcome, WalletConnectParsedRequest,
+    WalletConnectPendingRequest, WalletConnectPendingRequestQueue, WalletConnectRequestErrorKind,
     WalletConnectRequestValidation, build_walletconnect_jsonrpc_error,
     build_walletconnect_session_event, handle_walletconnect_lifecycle_request,
-    parse_walletconnect_session_request, validate_walletconnect_session_request,
+    parse_dapp_request_for_account, parse_walletconnect_session_request,
+    validate_dapp_request_account, validate_walletconnect_session_request,
     validate_walletconnect_session_request_with_account_support,
 };
 pub use session::{

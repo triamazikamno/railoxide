@@ -294,15 +294,13 @@ impl WalletRoot {
     }
 
     pub(super) fn clear_public_wallet_runtime_state(&mut self) {
+        self.public_balance_cache.clear();
         self.public_accounts.clear();
         self.public_balance_snapshot = None;
         self.public_balance_error = None;
         self.public_balance_refreshing = false;
-        self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
         self.public_inactive_balance_error = None;
         self.public_inactive_balance_refreshing = false;
-        self.public_inactive_balance_generation =
-            self.public_inactive_balance_generation.wrapping_add(1);
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
@@ -417,6 +415,7 @@ impl WalletRoot {
         };
         let Some(view_session) = self.view_session.as_ref() else {
             self.public_accounts.clear();
+            self.publish_gateway_desktop_state();
             self.public_form.selected_account_uuid = None;
             self.sync_walletconnect_account_select(window, cx);
             self.sync_self_broadcast_gas_payer_selects(window, cx);
@@ -443,7 +442,14 @@ impl WalletRoot {
                             .find(|account| account.status == PublicAccountStatus::Active)
                             .map(|account| Arc::from(account.public_account_uuid.as_str()))
                     });
+                if self.public_accounts != accounts {
+                    self.public_balance_cache.clear();
+                    self.public_balance_snapshot = None;
+                    self.public_balance_refreshing = false;
+                    self.public_inactive_balance_refreshing = false;
+                }
                 self.public_accounts = accounts;
+                self.publish_gateway_desktop_state();
                 self.public_form.selected_account_uuid = selected;
                 self.public_form.next_derived_index = store
                     .next_derived_public_account_index_for_session(view_session.as_ref())

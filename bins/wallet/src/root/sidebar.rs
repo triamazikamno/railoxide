@@ -32,7 +32,8 @@ use super::{
     SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
 };
 
-const SIDEBAR_FOOTER_HORIZONTAL_INSET: Pixels = px(12.0);
+pub(super) const SIDEBAR_FOOTER_HORIZONTAL_INSET: Pixels = px(12.0);
+pub(super) const SIDEBAR_STATUS_PILL_HEIGHT: Pixels = px(42.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Activity {
@@ -59,6 +60,7 @@ impl WalletRoot {
         let settings_root = root.clone();
         let logs_root = root.clone();
         let network_root = root.clone();
+        let gateway_root = root.clone();
         let cache_root = root.clone();
         let public_broadcaster_count = self.sidebar_public_broadcaster_count;
         let public_broadcaster_color =
@@ -196,6 +198,7 @@ impl WalletRoot {
                             ))
                         },
                     )
+                    .child(self.render_gateway_status_pill(&gateway_root, collapsed))
                     .child(self.render_network_status_pill(&network_root, collapsed))
                     .child(
                         SidebarMenu::new()
@@ -389,7 +392,7 @@ impl WalletRoot {
 
         div()
             .id("wallet-network-status-pill")
-            .h_auto()
+            .h(SIDEBAR_STATUS_PILL_HEIGHT)
             .w(SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET)
             .p_2()
             .flex()

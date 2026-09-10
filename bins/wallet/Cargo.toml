@@ -23,6 +23,7 @@ gpui = { workspace = true }
 gpui-component = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-kit-assets = { workspace = true }
+if-addrs = "=0.15.0"
 markdown = "=1.0.0"
 qrcodegen = { workspace = true }
 rand = { workspace = true }
@@ -55,6 +56,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Wind
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

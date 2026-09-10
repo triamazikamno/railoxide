@@ -1,15 +1,15 @@
-use super::operation::{self, RpcOperation};
+use super::operation::{self, ReceiptBlock, RpcOperation};
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::{Address, Bytes, TxKind, U256};
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rlp::Encodable;
 use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::eth::state::StateOverride;
 use alloy::rpc::types::eth::transaction::{TransactionInput, TransactionRequest};
 use alloy::serde::WithOtherFields;
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
 use poi::SensitiveUrl;
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -66,6 +66,34 @@ pub struct RpcRead {
     operation: RpcOperation,
 }
 
+/// Balance candidates extracted only from a fully validated read.
+#[derive(Clone, Copy)]
+pub(crate) enum BalanceRead {
+    Native { account: Address },
+    Token { account: Address, token: Address },
+}
+impl BalanceRead {
+    pub(crate) const fn account(self) -> Address {
+        match self {
+            Self::Native { account } | Self::Token { account, .. } => account,
+        }
+    }
+
+    pub(crate) fn encode_result(self, amount: U256) -> Value {
+        match self {
+            Self::Native { .. } => serde_json::json!(amount),
+            Self::Token { .. } => serde_json::json!(Bytes::from(amount.abi_encode())),
+        }
+    }
+}
+
+/// Hash lookup classification for authorized local consumers of validated reads.
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionHashRead {
+    Transaction,
+    Receipt,
+}
+
 /// Validation failures for RPC read parameters before they enter the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RpcReadValidationError {
@@ -87,6 +115,46 @@ impl RpcReadValidationError {
 }
 
 impl RpcRead {
+    pub(crate) fn balance_candidate(&self) -> Option<BalanceRead> {
+        match &self.operation {
+            RpcOperation::GetBalance { account, block } if *block == BlockId::latest() => {
+                Some(BalanceRead::Native { account: *account })
+            }
+            RpcOperation::EthCall {
+                request,
+                block,
+                state_overrides,
+            } if *block == BlockId::latest() && state_overrides.is_none() => {
+                let TxKind::Call(token) = request.to? else {
+                    return None;
+                };
+                let input = request.input.unique_input().ok()??;
+                let call = RpcBrokerViewCalls::balanceOfCall::abi_decode_validate(input).ok()?;
+                // Re-encoding excludes trailing bytes and noncanonical ABI words.
+                if call.abi_encode().as_slice() != input.as_ref() {
+                    return None;
+                }
+                Some(BalanceRead::Token {
+                    account: call.account,
+                    token,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn transaction_hash_lookup(&self) -> Option<(TransactionHashRead, B256)> {
+        match &self.operation {
+            RpcOperation::GetTransactionByHash(hash) => {
+                Some((TransactionHashRead::Transaction, *hash))
+            }
+            RpcOperation::GetTransactionReceipt(hash) => {
+                Some((TransactionHashRead::Receipt, *hash))
+            }
+            _ => None,
+        }
+    }
+
     /// Creates an `eth_call` read for the target contract and calldata.
     ///
     /// Defaults to `latest` with no sender, value, gas limit, or state overrides.
@@ -108,13 +176,87 @@ impl RpcRead {
     /// Requests the account's native balance at `latest`.
     #[must_use]
     pub const fn get_balance(account: Address) -> Self {
+        Self::get_balance_at(account, BlockId::latest())
+    }
+
+    #[must_use]
+    pub(crate) const fn get_balance_at(account: Address, block: BlockId) -> Self {
         Self {
-            operation: RpcOperation::GetBalance {
-                account,
-                block: BlockId::latest(),
-            },
+            operation: RpcOperation::GetBalance { account, block },
         }
     }
+
+    #[must_use]
+    pub(crate) const fn get_transaction_count(account: Address, block: BlockId) -> Self {
+        Self {
+            operation: RpcOperation::GetTransactionCount(account, block),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn get_block_by_number(block: BlockNumberOrTag, full: bool) -> Self {
+        Self {
+            operation: RpcOperation::GetBlockByNumber(block, full),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn get_transaction_by_block_hash_and_index(hash: B256, index: U256) -> Self {
+        Self {
+            operation: RpcOperation::GetTransactionByBlockHashAndIndex(hash, index),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn get_block_receipts_by_hash(hash: B256) -> Self {
+        Self {
+            operation: RpcOperation::GetBlockReceipts(ReceiptBlock::Hash(hash)),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn gas_price() -> Self {
+        Self {
+            operation: RpcOperation::GasPrice,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn max_priority_fee_per_gas() -> Self {
+        Self {
+            operation: RpcOperation::MaxPriorityFeePerGas,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn fee_history(
+        count: U256,
+        newest: BlockNumberOrTag,
+        percentiles: Option<Vec<Number>>,
+    ) -> Self {
+        Self {
+            operation: RpcOperation::FeeHistory(count, newest, percentiles),
+        }
+    }
+
+    pub(crate) fn estimate_gas(
+        transaction: WithOtherFields<TransactionRequest>,
+        block: Option<BlockNumberOrTag>,
+        route_chain_id: u64,
+    ) -> Result<Self, RpcReadValidationError> {
+        let read = Self::from_rpc(transaction, BlockId::latest(), None, route_chain_id)?;
+        let RpcOperation::EthCall { request, .. } = read.operation else {
+            unreachable!()
+        };
+        Ok(Self {
+            operation: RpcOperation::EstimateGas(request, block),
+        })
+    }
+
+    pub(crate) const fn method(&self) -> &'static str {
+        self.operation.method()
+    }
+
     #[must_use]
     pub(super) const fn reuse_block_id(&self) -> Option<BlockId> {
         match &self.operation {
@@ -582,6 +724,22 @@ impl RpcOrigin {
             paired_peer_id,
             origin: url,
         }))
+    }
+
+    /// Applies the gateway policy for HTTP(S) origins, using the URL parser's
+    /// scheme, host, and effective port normalization. Opaque origins are rejected.
+    pub fn dapp_web_origin(
+        paired_peer_id: impl Into<String>,
+        url: &str,
+    ) -> Result<Self, RpcOriginError> {
+        let origin = Url::parse(url)
+            .map_err(|_| RpcOriginError::InvalidOrigin)?
+            .origin();
+        if !matches!(&origin, url::Origin::Tuple(scheme, _, _) if scheme == "http" || scheme == "https")
+        {
+            return Err(RpcOriginError::InvalidOrigin);
+        }
+        Self::dapp(paired_peer_id, &origin.ascii_serialization())
     }
 
     #[must_use]

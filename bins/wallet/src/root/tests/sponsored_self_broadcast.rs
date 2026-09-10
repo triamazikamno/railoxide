@@ -143,6 +143,8 @@ fn sponsored_balance_snapshot(amount: PublicBalanceAmount) -> PublicBalanceSnaps
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account: PublicAccountMetadata {
                 public_account_uuid: "sponsored-signer".to_string(),
                 address: Address::from([0x44; 20]),

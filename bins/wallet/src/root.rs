@@ -22,8 +22,9 @@ use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
-    PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot, SponsoredSelfBroadcastCommand,
-    TokenAnchorRateCache, TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
+    PoiReadSource, ProverCacheBuildProgress, PublicBalanceCache, PublicBalanceSnapshot,
+    SponsoredSelfBroadcastCommand, TokenAnchorRateCache, TokenAnchorRefreshHandle,
+    WakuDeliveryClient, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -45,8 +46,10 @@ mod broadcaster_picker;
 mod broadcaster_preferences;
 mod broadcaster_view;
 mod chain_load;
+mod dapp_request;
 mod dialogs;
 mod gas_fee;
+mod gateway;
 mod governance;
 mod governance_action;
 mod key_export;
@@ -64,6 +67,7 @@ mod public_action;
 mod public_balances;
 mod public_broadcaster;
 mod public_broadcaster_cost;
+mod public_transactions;
 mod retry;
 mod settings;
 mod shell;
@@ -238,9 +242,7 @@ use public_action::{
     public_action_step_uses_stop_marker, public_action_uses_railway_authorization_ceiling,
 };
 #[cfg(test)]
-use public_balances::{
-    merge_public_balance_snapshot, public_asset_icon_path, public_balance_usd_label,
-};
+use public_balances::{public_asset_icon_path, public_balance_usd_label};
 #[cfg(test)]
 use public_broadcaster::{
     fee_token_option_has_eligible_broadcaster, public_broadcaster_fee_token_options_from_snapshot,
@@ -406,6 +408,7 @@ pub(crate) struct WalletRoot {
     tor_bridge_activity: Option<wallet_ops::TorBridgeActivitySnapshot>,
     tor_download_rate: Option<u64>,
     root_shutdown: watch::Sender<bool>,
+    gateway: gateway::GatewayUi,
     network_status_popover_open: bool,
     network_status_error: Option<Arc<str>>,
     tor_exit_ip_query: TorExitIpQueryState,
@@ -479,13 +482,15 @@ pub(crate) struct WalletRoot {
     address_book_label_input: Entity<InputState>,
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
+    public_balance_cache: PublicBalanceCache,
+    public_transaction_tracker: wallet_ops::PublicTransactionTracker,
+    public_transaction_submissions: public_transactions::PublicTransactionSubmissions,
+    public_transaction_cleanup: Option<public_transactions::PublicTransactionCleanup>,
     public_balance_snapshot: Option<Arc<PublicBalanceSnapshot>>,
     public_balance_error: Option<Arc<str>>,
     public_balance_refreshing: bool,
-    public_balance_generation: u64,
     public_inactive_balance_error: Option<Arc<str>>,
     public_inactive_balance_refreshing: bool,
-    public_inactive_balance_generation: u64,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
@@ -715,6 +720,7 @@ fn complete_waku_worker_generation(
 
 impl Drop for WalletRoot {
     fn drop(&mut self) {
+        self.begin_public_transaction_shutdown();
         self.pending_software_profile_open = None;
         self.pending_software_profile_open_operation_generation = self
             .pending_software_profile_open_operation_generation
@@ -732,6 +738,11 @@ impl Drop for WalletRoot {
             let _ = command_tx.send(SponsoredSelfBroadcastCommand::Shutdown);
         }
         self.stop_waku();
+        if let Some(gateway) = self.gateway.take_shutdown_handle() {
+            self.runtime.spawn(async move {
+                let _ = gateway.shutdown().await;
+            });
+        }
         let _ = self.root_shutdown.send(true);
         if !self.wallet_sync_lifecycle_shutdown_started {
             let cleanup = self.wallet_sync_lifecycle.invalidate();
@@ -1015,6 +1026,7 @@ impl WalletRoot {
 impl WalletRoot {
     fn new(
         options: WalletAppOptions,
+        public_transaction_tracker: wallet_ops::PublicTransactionTracker,
         http: HttpContext,
         vault_store: Arc<DesktopVaultStore>,
         chain_ids: &[u64],
@@ -1065,6 +1077,7 @@ impl WalletRoot {
             maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
         let public_sync_cache_resetting =
             maintenance_blocks_public_sync(maintenance_controller.read(cx).reset());
+        let gateway = gateway::GatewayUi::start(vault_store.as_ref(), &runtime, window, cx);
         let vault_store = Some(vault_store);
         let (settings_editor, settings_error) = match vault_store.as_ref() {
             Some(store) => {
@@ -1368,6 +1381,7 @@ impl WalletRoot {
             tor_bridge_activity,
             tor_download_rate: None,
             root_shutdown,
+            gateway,
             network_status_popover_open: false,
             network_status_error: None,
             tor_exit_ip_query: TorExitIpQueryState::Idle,
@@ -1444,13 +1458,16 @@ impl WalletRoot {
             address_book_label_input,
             address_book_save_error: None,
             public_form,
+            public_balance_cache: PublicBalanceCache::default(),
+            public_transaction_tracker,
+            public_transaction_submissions:
+                public_transactions::PublicTransactionSubmissions::default(),
+            public_transaction_cleanup: None,
             public_balance_snapshot: None,
             public_balance_error: None,
             public_balance_refreshing: false,
-            public_balance_generation: 0,
             public_inactive_balance_error: None,
             public_inactive_balance_refreshing: false,
-            public_inactive_balance_generation: 0,
             send_forms: BTreeMap::new(),
             private_action_form: None,
             send_generation_seq: 0,
@@ -2003,6 +2020,7 @@ impl WalletRoot {
         .detach();
         root.spawn_network_health_monitor(cx);
         root.spawn_tor_bridge_activity_sampler(cx);
+        root.watch_public_transactions(cx);
         root
     }
 }

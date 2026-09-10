@@ -191,6 +191,7 @@ impl WalletRoot {
 
         if let Ok(effective_chain_configs) = build_effective_chain_configs(settings) {
             self.effective_chain_configs = effective_chain_configs;
+            self.publish_gateway_desktop_state();
         }
         self.public_broadcaster_policy = new_policy;
         self.public_broadcaster_response_timeout =

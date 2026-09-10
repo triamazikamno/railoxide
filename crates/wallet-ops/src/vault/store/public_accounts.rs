@@ -36,6 +36,17 @@ impl DesktopVaultStore {
         Ok(accounts)
     }
 
+    /// Every public account in the vault, regardless of wallet scope; for
+    /// cross-wallet display lookups only.
+    pub fn list_all_public_accounts(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
+        let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        sort_public_account_metadata(&mut accounts);
+        Ok(accounts)
+    }
+
     pub fn next_derived_public_account_index_for_session(
         &self,
         view_session: &DesktopViewSession,

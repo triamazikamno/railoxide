@@ -30,6 +30,7 @@ chacha20poly1305 = { workspace = true }
 cid = "0.11"
 coins-bip32 = "0.13"
 coins-ledger = { workspace = true, optional = true }
+dapp-gateway-protocol = { path = "../dapp-gateway-protocol" }
 ed25519-dalek = { workspace = true }
 eyre = { workspace = true }
 getrandom = { workspace = true }
@@ -47,7 +48,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 tor-rtcompat = { workspace = true }
 trezor-client = { workspace = true, optional = true }
 tracing = { workspace = true }
