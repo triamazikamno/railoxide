@@ -96,6 +96,8 @@ impl GatewayUnlock {
 type GatewayDesktopState = (GatewayWalletState, u64, Vec<(String, String)>);
 
 pub(super) struct GatewayUi {
+    pub(super) drafts: RefCell<super::gateway_drafts::GatewayDraftBook>,
+    pub(super) draft_watch: Option<gpui::Task<()>>,
     unlock: RefCell<GatewayUnlock>,
     wallet_switch: RefCell<Option<GatewaySwitchContinuation>>,
     switch_dialog: Option<GatewaySwitchDialog>,
@@ -130,6 +132,7 @@ struct GatewayPermissionAccount {
 
 impl GatewayUi {
     fn retire_unlock(&self) {
+        self.drafts.borrow_mut().retire();
         self.unlock.borrow_mut().retire();
     }
 
@@ -180,8 +183,11 @@ impl GatewayUi {
                             return;
                         }
                         match event.kind {
-                            wallet_ops::gateway::GatewayUiEventKind::PublicView(command) => {
-                                root.apply_gateway_public_command(command, window, cx);
+                            wallet_ops::gateway::GatewayUiEventKind::PublicView {
+                                peer_id,
+                                command,
+                            } => {
+                                root.apply_gateway_public_command(&peer_id, command, window, cx);
                             }
                             wallet_ops::gateway::GatewayUiEventKind::SummonDesktop => {
                                 window.activate_window();
@@ -243,6 +249,10 @@ impl GatewayUi {
                         previous_remote = remote;
                         root.reconcile_gateway_pairing_dialog(&snapshot, window, cx);
                         root.gateway.snapshot = snapshot;
+                        root.gateway
+                            .drafts
+                            .borrow_mut()
+                            .retain_peers(&root.gateway.snapshot.peers);
                         root.refresh_gateway_permission_accounts();
                         cx.notify();
                     })
@@ -277,6 +287,8 @@ impl GatewayUi {
             }
         });
         Self {
+            drafts: RefCell::default(),
+            draft_watch: None,
             unlock: RefCell::new(GatewayUnlock::default()),
             wallet_switch: RefCell::new(None),
             switch_dialog: None,
@@ -302,6 +314,8 @@ impl GatewayUi {
     }
 
     pub(super) fn take_shutdown_handle(&mut self) -> Option<GatewayHandle> {
+        self.drafts.borrow_mut().retire();
+        self.draft_watch = None;
         self.pairing_dialog = None;
         self.desktop_state = None;
         self.approval_task = None;
@@ -418,6 +432,10 @@ impl WalletRoot {
     }
 
     pub(super) fn publish_gateway_desktop_state(&self) {
+        self.gateway
+            .drafts
+            .borrow_mut()
+            .reconcile_wallet(self.view_session.as_ref(), self.active_wallet_generation);
         // Keep effective networking visible to cohort retirement even while the vault is locked.
         let mut network = GatewayWalletState::default();
         network.set_rpc_context(self.http.clone(), &self.effective_chain_configs);

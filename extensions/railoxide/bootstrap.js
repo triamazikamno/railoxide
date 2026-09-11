@@ -1,6 +1,8 @@
 // This module owns only startup, failure reporting and document lifecycle.
 // Gateway presentation belongs to Rust/GPUI; the worker owns transport.
 import { configuration } from './gateway-config.js';
+// Match GPUI's web platform detection; the WASM target cannot identify the host OS.
+const isMac = navigator.platform.includes('Mac') || navigator.userAgent.includes('Mac');
 const STARTUP_TIMEOUT_MS = 30_000;
 const REQUIRED_COMPONENT_ICONS = ['check', 'search', 'close', 'inbox', 'loader', 'settings', 'copy',
   'chevron-down', 'chevron-right', 'chevron-left', 'arrow-down', 'triangle-alert', 'circle-check', 'circle-x', 'globe'];
@@ -258,6 +260,7 @@ const deadline = setTimeout(() => fail('The 30-second startup limit expired.'), 
 reload.addEventListener('click', () => location.reload());
 
 Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
+  isMac: () => isMac,
   isActive: () => state === 'loading' || state === 'ready',
   stage(next) {
     if (state !== 'loading') return;

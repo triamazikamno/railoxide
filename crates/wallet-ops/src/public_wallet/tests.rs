@@ -3752,3 +3752,64 @@ async fn dapp_raw_broadcast_does_not_log_or_return_remote_payloads() {
         }
     }
 }
+
+#[tokio::test]
+async fn ens_recipient_uses_normalized_alloy_calls_on_the_configured_desktop_route() {
+    use alloy::ens::{
+        EnsResolver, UNIVERSAL_RESOLVER_ADDRESS, UniversalResolver, dns_encode, namehash,
+    };
+    let target = Address::repeat_byte(9);
+    let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+        Arc::new(move |request| {
+            assert_eq!(request["method"], "eth_call");
+            let transaction: TransactionRequest =
+                serde_json::from_value(request["params"][0].clone()).unwrap();
+            assert_eq!(transaction.to, Some(UNIVERSAL_RESOLVER_ADDRESS.into()));
+            let call =
+                UniversalResolver::resolveCall::abi_decode(transaction.input.input().unwrap())
+                    .unwrap();
+            let assigned = call.name == dns_encode("raffy.eth");
+            let name = if assigned {
+                "raffy.eth"
+            } else {
+                "unassigned.eth"
+            };
+            assert_eq!(call.name, Bytes::from(dns_encode(name)));
+            assert_eq!(
+                EnsResolver::addrCall::abi_decode(&call.data).unwrap().node,
+                namehash(name)
+            );
+            let address = if assigned { target } else { Address::ZERO };
+            let result = UniversalResolver::resolveCall::abi_encode_returns(
+                &UniversalResolver::resolveReturn {
+                    _0: EnsResolver::addrCall::abi_encode_returns(&address).into(),
+                    _1: Address::repeat_byte(8),
+                },
+            );
+            json!({"jsonrpc":"2.0", "id":request["id"], "result":Bytes::from(result)})
+        }),
+        Arc::default(),
+        Arc::default(),
+    )
+    .await;
+    let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
+    chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+    let http = HttpContext::direct_for_tests();
+    assert_eq!(
+        resolve_public_ens_recipient("RaFFY.eth", Some(&chain), &http)
+            .await
+            .unwrap(),
+        target
+    );
+    assert!(
+        resolve_public_ens_recipient("Unassigned.eth", Some(&chain), &http)
+            .await
+            .is_err()
+    );
+    assert!(
+        resolve_public_ens_recipient("a\u{200d}b.eth", Some(&chain), &http)
+            .await
+            .is_err()
+    );
+    server.abort();
+}

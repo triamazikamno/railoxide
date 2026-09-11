@@ -12,6 +12,7 @@ pub struct GatewayPublicView {
     pub balances: Vec<GatewayAccountBalances>,
     pub refreshing: bool,
     pub balance_error: bool,
+    pub drafts: Vec<super::GatewayDraftView>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize)]
@@ -28,6 +29,8 @@ pub struct GatewayAssetBalance {
     pub asset: String,
     pub symbol: String,
     pub amount: String,
+    /// Exact token balance for Max, before recipient or fee validation.
+    pub max_amount: Option<String>,
     pub usd: Option<String>,
     pub icon: Option<String>,
 }
@@ -44,6 +47,9 @@ pub struct GatewaySitePermission {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayPublicCommand {
+    Draft {
+        command: Box<super::GatewayDraftCommand>,
+    },
     SelectAccount {
         public_account_uuid: String,
     },
@@ -75,7 +81,10 @@ pub struct GatewayPendingRequest {
 pub enum GatewayUiEventKind {
     SummonDesktop,
     UserActivity,
-    PublicView(GatewayPublicCommand),
+    PublicView {
+        peer_id: String,
+        command: GatewayPublicCommand,
+    },
 }
 
 #[derive(Clone)]

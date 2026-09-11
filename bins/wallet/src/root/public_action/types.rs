@@ -4,6 +4,7 @@ pub(in crate::root) const PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI: u128 = 1_000_000_
 
 #[derive(Clone)]
 pub(in crate::root) struct PublicSendDraft {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) asset: PublicAssetId,
     pub(in crate::root) asset_label: String,
@@ -177,6 +178,7 @@ pub(in crate::root) fn public_action_uses_railway_authorization_ceiling(
 
 #[derive(Clone)]
 pub(in crate::root) struct PublicShieldDraft {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) asset: PublicAssetId,
     pub(in crate::root) asset_label: String,
@@ -205,6 +207,52 @@ pub(in crate::root) struct PublicActionFeeDisplay {
 }
 
 impl PublicActionFeeDisplay {
+    pub(in crate::root) fn from_estimate(
+        chain_id: u64,
+        gas_cost: Option<Eip1559GasCostProjection>,
+        gas_limit: Option<u64>,
+        protocol_fee: Option<(PublicAssetId, U256)>,
+        registry: &wallet_ops::settings::EffectiveTokenRegistry,
+        anchors: &wallet_ops::TokenAnchorRateCache,
+    ) -> Self {
+        let format_gas_cost = |cost| {
+            format_value_with_usd_label(
+                format_native_token_amount_for_display(chain_id, cost),
+                cost,
+                Some(18),
+                anchors.cached_native_usd_micro_value(chain_id, cost),
+                false,
+            )
+        };
+        Self {
+            gas_limit,
+            expected_gas_cost: gas_cost.map(|cost| format_gas_cost(cost.expected_cost)),
+            maximum_gas_cost: gas_cost.map(|cost| format_gas_cost(cost.maximum_cost)),
+            show_maximum_gas_cost: gas_cost.is_some_and(|cost| {
+                public_action_maximum_gas_cost_is_significant(cost.expected_cost, cost.maximum_cost)
+            }),
+            protocol_fee: protocol_fee.map(|(asset, amount)| {
+                let (token_value, usd_micro_value) = match asset {
+                    PublicAssetId::Native => (
+                        format_native_token_amount_for_display(chain_id, amount),
+                        anchors.cached_native_usd_micro_value(chain_id, amount),
+                    ),
+                    PublicAssetId::Erc20(token) => (
+                        format_token_amount_for_display(chain_id, token, amount, Some(registry)),
+                        anchors.cached_token_usd_micro_value(chain_id, token, amount),
+                    ),
+                };
+                format_value_with_usd_label(
+                    token_value,
+                    amount,
+                    public_asset_decimals(chain_id, asset, Some(registry)),
+                    usd_micro_value,
+                    false,
+                )
+            }),
+        }
+    }
+
     pub(in crate::root) fn visible_maximum_gas_cost(&self) -> Option<&str> {
         self.show_maximum_gas_cost
             .then_some(self.maximum_gas_cost.as_deref())
@@ -594,9 +642,18 @@ pub(in crate::root) const fn public_action_accepts_update(
 
 pub(in crate::root) fn public_action_progress_footer_action(
     stop_available: bool,
+    command_available: bool,
     steps: &[PublicActionStepState],
 ) -> ProgressFooterAction {
-    progress_footer_action(stop_available, public_action_progress_is_terminal(steps))
+    // A failed attempt can still be waiting for a retry command. Keep Stop available
+    // until the final handoff, just as for a pending step.
+    let retry_pending = steps
+        .iter()
+        .any(|step| public_action_discard_attempt_available(command_available, step));
+    progress_footer_action(
+        stop_available,
+        public_action_progress_is_terminal(steps) && !retry_pending,
+    )
 }
 
 pub(in crate::root) fn public_action_progress_is_terminal(steps: &[PublicActionStepState]) -> bool {

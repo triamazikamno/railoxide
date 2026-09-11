@@ -11,8 +11,14 @@ pub use provider::{
     GatewayPermissionSummary, GatewayUnlockState, GatewayWalletState, GatewayWalletSwitchRequest,
     GatewayWalletSwitchTransition,
 };
+mod drafts;
 mod storage;
 mod ui;
+pub use drafts::{
+    GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftExecution, GatewayDraftFee,
+    GatewayDraftGasQuote, GatewayDraftInput, GatewayDraftKind, GatewayDraftProgress,
+    GatewayDraftRecipient, GatewayDraftStatus, GatewayDraftView,
+};
 pub use ui::{
     GatewayAccountBalances, GatewayAssetBalance, GatewayPendingRequest, GatewayPublicCommand,
     GatewayPublicView, GatewaySitePermission, GatewayUiEvent, GatewayUiEventKind,

@@ -5,19 +5,18 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Bounds, Context, ElementId, Entity, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, RenderOnce,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder as _, px, rgb,
+    Animation, AnimationExt as _, App, AppContext, Context, ElementId, Entity, Focusable,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     collapsible::Collapsible,
-    input::{Escape as InputEscape, Input, InputEvent, InputState, Position},
+    input::{Input, InputEvent, InputState, Position},
     popover::Popover,
-    scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tooltip::Tooltip,

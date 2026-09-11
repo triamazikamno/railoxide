@@ -10,7 +10,7 @@ use gpui_component::input::{
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonGroup, ButtonVariants},
     select::{SearchableVec, SelectDelegate, SelectItem},
 };
 
@@ -85,6 +85,26 @@ pub fn app_input(state: &Entity<InputState>) -> Input {
         .bg(rgb(theme::SURFACE))
 }
 
+/// Recipient field shared by Unshield and browser Send, with integrated trailing actions.
+#[must_use]
+pub fn recipient_input(state: &Entity<InputState>, actions: impl IntoElement) -> Input {
+    app_input(state)
+        .px_3()
+        .aria_label("Recipient")
+        .suffix(actions)
+}
+
+#[must_use]
+pub fn recipient_book_button(id: impl Into<ElementId>) -> Button {
+    app_button_base(id)
+        .icon(Icon::empty().path("ui/icons/book-user.svg"))
+        .outline()
+        .small()
+        .compact()
+        .accessibility_label("Select recipient")
+        .tooltip("Select recipient")
+}
+
 #[must_use]
 pub fn app_masked_input(state: &Entity<InputState>, disabled: bool) -> Div {
     div()
@@ -131,8 +151,51 @@ pub fn app_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> B
 }
 
 #[must_use]
+pub fn amount_max_button(id: impl Into<ElementId>, amount: Option<String>) -> Button {
+    app_button(
+        id,
+        amount.map_or_else(|| "Max".to_owned(), |amount| format!("Max: {amount}")),
+    )
+    .link()
+    .xsmall()
+    .compact()
+}
+
+#[must_use]
 pub fn app_button_base(id: impl Into<ElementId>) -> Button {
     Button::new(id).secondary()
+}
+
+/// Shared Public action mode control. The caller owns the selected mode.
+#[must_use]
+pub fn public_action_mode_group(
+    id: impl Into<ElementId>,
+    shield_selected: bool,
+    disabled: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> ButtonGroup {
+    let on_change = std::rc::Rc::new(on_change);
+    let segment = |id, label, icon, shield| {
+        let on_change = on_change.clone();
+        let selected = shield == shield_selected;
+        app_button(id, label)
+            .flex_1()
+            .min_w_0()
+            .icon(Icon::empty().path(icon).small())
+            .selected(selected)
+            .when(selected, ButtonVariants::primary)
+            .on_click(move |_, window, cx| on_change(&shield, window, cx))
+    };
+    ButtonGroup::new(id)
+        .w_full()
+        .outline()
+        .disabled(disabled)
+        .child(segment("shield", "Shield", "ui/icons/shield.svg", true))
+        .child(
+            segment("send", "Send", "ui/icons/arrow-big-right-dash.svg", false)
+                // The selected segment owns the shared one-pixel border, as on desktop.
+                .when(!shield_selected, |button| button.border_l_1().ml(-px(1.0))),
+        )
 }
 
 #[must_use]

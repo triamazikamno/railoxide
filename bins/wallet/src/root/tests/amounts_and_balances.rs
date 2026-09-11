@@ -846,6 +846,71 @@ fn public_account_for_search_with_uuid(
 }
 
 #[test]
+fn public_account_selection_restores_per_wallet_and_falls_back_when_unavailable() {
+    use crate::root::public_account::restored_public_account_selection;
+
+    let mut accounts: Vec<_> = ["first", "second", "third"]
+        .into_iter()
+        .map(|uuid| public_account_for_search_with_uuid(uuid, None, Address::ZERO))
+        .collect();
+    let ui_state = WalletUiState {
+        last_public_accounts: std::collections::BTreeMap::from([
+            ("wallet-a".to_owned(), "second".to_owned()),
+            ("wallet-b".to_owned(), "third".to_owned()),
+        ]),
+        ..WalletUiState::default()
+    };
+    // Lock and wallet replacement clear the runtime selection. Each unlocked wallet
+    // must recover its own saved choice even when all public accounts are global.
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-b").as_deref(),
+        Some("third")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "new-wallet").as_deref(),
+        Some("first")
+    );
+    // A live selection takes precedence during a reload or transport reconnect.
+    assert_eq!(
+        restored_public_account_selection(&accounts, Some("third"), &ui_state, "wallet-a")
+            .as_deref(),
+        Some("third")
+    );
+
+    accounts[1].status = PublicAccountStatus::Inactive;
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, Some("second"), &ui_state, "wallet-a")
+            .as_deref(),
+        Some("second")
+    );
+    accounts[1].status = PublicAccountStatus::Active;
+    accounts[1].scope = PublicAccountScope::PrivateWallet {
+        wallet_uuid: "wallet-b".to_owned(),
+    };
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    accounts.remove(1);
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    for account in &mut accounts {
+        account.status = PublicAccountStatus::Inactive;
+    }
+    assert!(restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").is_none());
+}
+
+#[test]
 fn public_account_search_matches_empty_query() {
     let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
 

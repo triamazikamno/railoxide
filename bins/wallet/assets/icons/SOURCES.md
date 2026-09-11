@@ -8,7 +8,6 @@
 - `folder-cog.svg`: Lucide `folder-cog`, ISC License, https://lucide.dev/icons/folder-cog
 - `sparkles.svg`: Lucide `sparkles`, ISC License, https://lucide.dev/icons/sparkles
 - `clock.svg`: Lucide `clock`, ISC License, https://lucide.dev/icons/clock
-- `book-user.svg`: Lucide `book-user`, ISC License, https://lucide.dev/icons/book-user
 - `save.svg`: Lucide `save`, ISC License, https://lucide.dev/icons/save
 - `import.svg`: Lucide `import`, ISC License, https://lucide.dev/icons/import
 - `chevrons-down.svg`: Lucide `chevrons-down`, ISC License, https://lucide.dev/icons/chevrons-down
@@ -24,3 +23,11 @@
 - `trezor-symbol-white-rgb.svg`: Trezor official white symbol for screens, https://satoshilabs.visualbook.pro/content/2_trezor/1_logos/2_symbol/trezor-symbol-white-rgb.svg. Brand guidance: https://satoshilabs.visualbook.pro/trezor/logos/symbol. Render at minimum 22px height; do not recolor, rotate, deform, or add shadows.
 - `ledger-logo-short-white.svg`: Ledger official short white logo from Ledger site header, https://shop.ledger.com/ledger-logo-short-white.svg. Press kit: https://www.ledger.com/press. Used only to identify Ledger hardware wallet support; do not recolor, rotate, deform, or add shadows.
 - `browser-extensions.svg`: Brave Leo `browser-extensions`, MPL-2.0, https://github.com/brave/leo/blob/39ccad32354b98a3ccbec43760b1c2b320dbe0d3/icons/browser-extensions.svg. License: https://github.com/brave/leo/blob/39ccad32354b98a3ccbec43760b1c2b320dbe0d3/LICENSE.md, vendored as [brave-leo-LICENSE.md](brave-leo-LICENSE.md).
+- `shield.svg`: Lucide `shield`, ISC License, https://lucide.dev/icons/shield
+- `arrow-big-right-dash.svg`: Lucide `arrow-big-right-dash`, ISC License, https://lucide.dev/icons/arrow-big-right-dash. Existing RailOxide stroke-color adaptation.
+- `book-user.svg`: Lucide `book-user`, ISC License, https://lucide.dev/icons/book-user
+- `qr-code.svg`: Lucide `qr-code`, ISC License, https://lucide.dev/icons/qr-code
+- `pencil.svg`: Lucide `pencil`, ISC License, https://lucide.dev/icons/pencil
+- `refresh-ccw.svg`: Lucide `refresh-ccw`, ISC License, https://lucide.dev/icons/refresh-ccw
+- `screen-share.svg`: Lucide `screen-share`, unchanged, https://lucide.dev/icons/screen-share
+- `monitor.svg`: Lucide `monitor`, unchanged, https://lucide.dev/icons/monitor

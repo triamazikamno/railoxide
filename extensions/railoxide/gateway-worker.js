@@ -336,7 +336,7 @@ async function receive(session, bytes) {
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
       if (message.locked && (message.accounts.length ||
           message.pending_connects.some(prompt => prompt.accounts?.length) ||
-          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.permissions?.length)) return;
+          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length)) return;
       publishSnapshot({ ...message, public_view: message.locked ? null : message.public_view,
         permissions: message.locked ? [] : (message.permissions ?? []),
         ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
@@ -520,6 +520,38 @@ chrome.runtime.onConnect.addListener(port => {
         value = { type: input.type, chain_id: input.chain_id };
       } else if (input.type === 'refresh_balances') {
         value = { type: input.type };
+      } else if (input.type === 'draft') {
+        const draft = input.command;
+        if (!draft || typeof draft.action !== 'string') return;
+        const bounded = (value, length) => typeof value === 'string' && value.length <= length;
+        if (['create', 'update'].includes(draft.action)) {
+          const data = draft.input;
+          if (!data || data.account !== uiSnapshot.public_view?.selected_account || data.chain_id !== uiSnapshot.public_view?.selected_chain ||
+              !['send', 'shield'].includes(data.kind) || !bounded(data.asset, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
+              !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
+              typeof data.max !== 'boolean' || typeof data.mimic_railway !== 'boolean') return;
+          const fee = data.fee;
+          if (!fee || !['slow', 'normal', 'fast', 'custom'].includes(fee.mode)) return;
+          if (fee.mode === 'custom' && (!bounded(fee.max_fee_gwei, 100) || !bounded(fee.priority_fee_gwei, 100))) return;
+          const prepared = { account: data.account, chain_id: data.chain_id, kind: data.kind, asset: data.asset, amount: data.amount,
+            recipient: data.recipient, address_book_entry: data.address_book_entry, max: data.max, mimic_railway: data.mimic_railway,
+            fee: fee.mode === 'custom' ? { mode: fee.mode, max_fee_gwei: fee.max_fee_gwei, priority_fee_gwei: fee.priority_fee_gwei } : { mode: fee.mode } };
+          if (draft.action === 'create') {
+            if (!bounded(draft.request_id, 64) || !draft.request_id) return;
+            value = { type: 'draft', command: { action: 'create', request_id: draft.request_id, input: prepared } };
+          } else {
+            if (!uiSnapshot.public_view?.drafts?.some(current => current.draft_id === draft.draft_id) || !Number.isSafeInteger(draft.revision) || draft.revision < 0) return;
+            value = { type: 'draft', command: { action: 'update', draft_id: draft.draft_id, revision: draft.revision, input: prepared } };
+          }
+        } else if (['submit', 'cancel', 'dismiss'].includes(draft.action)) {
+          if (!uiSnapshot.public_view?.drafts?.some(current => current.draft_id === draft.draft_id)) return;
+          const command = { action: draft.action, draft_id: draft.draft_id };
+          if (draft.action === 'submit') {
+            if (!Number.isSafeInteger(draft.revision) || draft.revision < 0) return;
+            command.revision = draft.revision;
+          }
+          value = { type: 'draft', command };
+        }
       } else if (['revoke_permission', 'reissue_permission'].includes(input.type) &&
           uiSnapshot.permissions?.some(permission => permission.permission_id === input.permission_id)) {
         value = { type: input.type, permission_id: input.permission_id };

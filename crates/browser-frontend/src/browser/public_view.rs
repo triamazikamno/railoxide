@@ -27,23 +27,26 @@ fn command(value: &serde_json::Value) {
 
 #[derive(Default)]
 pub(super) struct PublicView {
+    pub(super) drafts_supported: bool,
     pub selected_account: Option<String>,
-    selected_chain: Option<u64>,
+    pub(super) selected_chain: Option<u64>,
     balances: Vec<AccountBalances>,
     refreshing: bool,
     error: bool,
 }
-struct AccountBalances {
+pub(super) struct AccountBalances {
     uuid: String,
     total: String,
-    assets: Vec<AssetBalance>,
+    pub(super) assets: Vec<AssetBalance>,
 }
-struct AssetBalance {
-    id: String,
-    symbol: String,
-    amount: String,
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AssetBalance {
+    pub(super) id: String,
+    pub(super) symbol: String,
+    pub(super) amount: String,
+    pub(super) max_amount: Option<String>,
     usd: String,
-    icon: String,
+    pub(super) icon: String,
 }
 pub(super) struct SitePermission {
     id: String,
@@ -67,6 +70,7 @@ impl PublicView {
         }
         let value = field(snapshot, "public_view");
         Self {
+            drafts_supported: js_sys::Array::is_array(&field(&value, "drafts")),
             selected_account: field(&value, "selected_account").as_string(),
             selected_chain: chain_id_field(&value, "selected_chain"),
             refreshing: flag_field(&value, "refreshing"),
@@ -82,6 +86,7 @@ impl PublicView {
                             id: text_field(value, "asset"),
                             symbol: text_field(value, "symbol"),
                             amount: text_field(value, "amount"),
+                            max_amount: field(value, "max_amount").as_string(),
                             usd: text_field(value, "usd"),
                             icon: text_field(value, "icon"),
                         })
@@ -90,7 +95,7 @@ impl PublicView {
                 .collect(),
         }
     }
-    fn balances(&self, uuid: &str) -> Option<&AccountBalances> {
+    pub(super) fn balances(&self, uuid: &str) -> Option<&AccountBalances> {
         self.balances.iter().find(|balance| balance.uuid == uuid)
     }
 }
@@ -131,14 +136,14 @@ pub(super) fn identicon(address: &str, cell_size: Rems) -> Div {
             }))
         }))
 }
-fn name(account: &ConnectAccount) -> String {
+pub(super) fn name(account: &ConnectAccount) -> String {
     if account.label.is_empty() {
         short_address(&account.address)
     } else {
         account.label.clone()
     }
 }
-fn chain_name(chains: &[ChainChoice], id: u64) -> String {
+pub(super) fn chain_name(chains: &[ChainChoice], id: u64) -> String {
     chains
         .iter()
         .find(|chain| chain.id == id)
@@ -270,6 +275,7 @@ impl ListDelegate for PickerList {
 impl GatewayView {
     pub(super) fn clear_public_ui(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.close_sheet(cx);
+        self.clear_draft_ui();
         self.accounts.clear();
         self.public_view = PublicView::default();
         self.home_form = None;
@@ -417,6 +423,9 @@ impl GatewayView {
     pub(super) fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some(picker) = self.picker.take() {
             picker.return_focus.focus(window, cx);
+        } else if self.handoff_open || self.draft_form.is_some() {
+            self.hide_draft(cx);
+            self.focus.focus(window, cx);
         } else {
             self.sites_open = false;
             self.focus.focus(window, cx);
@@ -437,7 +446,7 @@ impl GatewayView {
                 Badge::new()
                     .count(count)
                     .color(cx.theme().muted)
-                    .child(Icon::new(IconName::Globe).size_4()),
+                    .child(Icon::new(IconName::Globe).size_5()),
             )
             .accessibility_label(if here {
                 "Connected sites, this tab is connected"
@@ -542,42 +551,93 @@ impl GatewayView {
                     ),
             )
             .child(
-                app_button("receive", "Receive…")
-                    .outline()
-                    .icon(IconName::ArrowDown)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_receive(window, cx))),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        app_button("shield", "Shield")
+                            .icon(Icon::empty().path("ui/icons/shield.svg").small())
+                            .disabled(!self.public_view.drafts_supported)
+                            .primary()
+                            .flex_1()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_draft("shield", None, window, cx);
+                            })),
+                    )
+                    .child(
+                        app_button("send", "Send")
+                            .icon(
+                                Icon::empty()
+                                    .path("ui/icons/arrow-big-right-dash.svg")
+                                    .small(),
+                            )
+                            .disabled(!self.public_view.drafts_supported)
+                            .outline()
+                            .flex_1()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_draft("send", None, window, cx);
+                            })),
+                    )
+                    .child(
+                        app_button("receive", "Receive")
+                            .icon(Icon::empty().path("ui/icons/qr-code.svg").small())
+                            .outline()
+                            .flex_1()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_receive(window, cx)),
+                            ),
+                    ),
             );
+        if !self.public_view.drafts_supported {
+            body = body.child(note("Update the desktop app to use Send and Shield."));
+        }
         if self.public_view.error {
             body = body.child(note("Could not refresh balances. Try again."));
         }
         if let Some(balances) = balances {
             for asset in &balances.assets {
+                let asset_id = asset.id.clone();
                 body = body.child(
-                    div()
-                        .id(SharedString::from(format!("asset-{}", asset.id)))
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .min_w_0()
-                        .py_1()
-                        .when(!asset.icon.is_empty(), |this| {
-                            this.child(img(asset.icon.clone()).size_6().flex_none())
-                        })
-                        .child(
-                            app_strong_text(asset.symbol.clone())
-                                .flex_1()
-                                .min_w_0()
-                                .truncate(),
-                        )
+                    app_button_base(SharedString::from(format!("send-asset-{}", asset.id)))
+                        .disabled(!self.public_view.drafts_supported)
+                        .ghost()
+                        .w_full()
+                        .h_auto()
+                        .accessibility_label(format!("Send {}", asset.symbol))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_draft("send", Some(asset_id.clone()), window, cx);
+                        }))
                         .child(
                             div()
+                                .id(SharedString::from(format!("asset-{}", asset.id)))
+                                .w_full()
                                 .flex()
-                                .flex_col()
-                                .items_end()
-                                .child(app_text(format!("{} {}", asset.amount, asset.symbol)))
-                                .when(!asset.usd.is_empty(), |this| {
-                                    this.child(note(asset.usd.clone()))
-                                }),
+                                .items_center()
+                                .gap_3()
+                                .min_w_0()
+                                .py_1()
+                                .when(!asset.icon.is_empty(), |this| {
+                                    this.child(img(asset.icon.clone()).size_6().flex_none())
+                                })
+                                .child(
+                                    app_strong_text(asset.symbol.clone())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate(),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .child(app_text(format!(
+                                            "{} {}",
+                                            asset.amount, asset.symbol
+                                        )))
+                                        .when(!asset.usd.is_empty(), |this| {
+                                            this.child(note(asset.usd.clone()))
+                                        }),
+                                ),
                         ),
                 );
             }
@@ -599,6 +659,7 @@ impl GatewayView {
                     app_button("refresh-balances", "Refresh")
                         .ghost()
                         .small()
+                        .icon(Icon::empty().path(ui::icons::refresh_ccw_icon_path()))
                         .loading(self.public_view.refreshing)
                         .disabled(self.public_view.refreshing)
                         .on_click(|_, _, _| command(&json!({ "type": "refresh_balances" }))),
@@ -802,7 +863,7 @@ impl GatewayView {
         }
         body.child(note("Sites see only the account address. Signing and spending still need approval in the desktop app.").mt_auto())
     }
-    fn back_title(title: &str, cx: &Context<'_, Self>) -> Div {
+    pub(super) fn back_title(title: &str, cx: &Context<'_, Self>) -> Div {
         div()
             .flex()
             .items_center()

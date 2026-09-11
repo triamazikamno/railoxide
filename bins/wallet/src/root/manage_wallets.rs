@@ -639,14 +639,22 @@ impl WalletRoot {
                 match result {
                     Ok(Ok(deleted_wallet_ids)) => {
                         let mut participation_changed = false;
+                        let mut selection_changed = false;
                         for wallet_id in &deleted_wallet_ids {
+                            selection_changed |= root
+                                .ui_state
+                                .last_public_accounts
+                                .remove(wallet_id)
+                                .is_some();
                             participation_changed |= remove_private_wallet_participants(
                                 &mut root.ui_state.governance_participants,
                                 wallet_id,
                             );
                         }
-                        if participation_changed {
+                        if participation_changed || selection_changed {
                             root.save_ui_state();
+                        }
+                        if participation_changed {
                             root.invalidate_governance_context();
                         }
                         root.manage_wallets.clear_hardware_delete_unlock_intent();

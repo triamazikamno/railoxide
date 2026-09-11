@@ -4594,6 +4594,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ens-normalize-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c916b4f7647f93321222ec36a6c2c1d65bcd32a1e49fba804c010df681088c4"
+dependencies = [
+ "anyhow",
+ "itertools 0.13.0",
+ "lazy_static",
+ "serde",
+ "serde_json",
+ "serde_plain",
+ "serde_with",
+ "thiserror 2.0.19",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "enum-as-inner"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12582,6 +12599,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15384,6 +15410,7 @@ name = "ui"
 version = "0.1.0"
 dependencies = [
  "gpui-component",
+ "gpui-kit",
  "gpui-pre",
  "parking_lot",
  "qrcodegen",
@@ -15907,6 +15934,7 @@ dependencies = [
  "coins-ledger",
  "dapp-gateway-protocol",
  "ed25519-dalek 3.0.0",
+ "ens-normalize-rs",
  "eyre",
  "futures-util",
  "getrandom 0.4.3",

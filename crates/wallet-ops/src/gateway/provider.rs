@@ -1603,12 +1603,20 @@ impl DappProvider {
                 })
                 .collect()
         });
+        let mut public_view = self.wallet.public_view.clone();
+        let peer_id = self
+            .ui_peers
+            .get(&session)
+            .map(|peer| alloy::hex::encode(peer.to_bytes()));
+        public_view
+            .drafts
+            .retain(|draft| peer_id.as_deref() == Some(draft.peer_id.as_str()));
         GatewayServerMessage::UiSnapshot {
             version: 1,
             generation: self.generation,
             locked: self.wallet.view.is_none(),
             accounts: wallet_accounts,
-            public_view: self.wallet.public_view.clone(),
+            public_view,
             chains: self
                 .wallet
                 .chain_ids

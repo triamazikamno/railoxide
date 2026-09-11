@@ -811,6 +811,7 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             progress_rx,
+            None,
             cx,
         );
         Self::spawn_public_action_session_event_listener(
@@ -818,6 +819,7 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             event_rx,
+            None,
             cx,
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);

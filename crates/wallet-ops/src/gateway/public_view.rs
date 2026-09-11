@@ -42,7 +42,9 @@ impl DappProvider {
                 }
                 Err(GatewayError::Unavailable)
             }
-            GatewayPublicCommand::RefreshBalances => return Some(command),
+            GatewayPublicCommand::Draft { .. } | GatewayPublicCommand::RefreshBalances => {
+                return Some(command);
+            }
             GatewayPublicCommand::RevokePermission { permission_id }
             | GatewayPublicCommand::ReissuePermission { permission_id, .. } => {
                 self.edit_peer_permission(peer, permission_id, &command)

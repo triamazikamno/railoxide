@@ -21,6 +21,7 @@ impl WalletRoot {
             return GatewayPublicView::default();
         };
         let mut presentation = GatewayPublicView::default();
+        presentation.drafts = self.gateway.drafts.borrow().views(self);
         presentation.selected_account = self
             .selected_public_account()
             .filter(|account| account.is_active_for_wallet(view.wallet_id()))
@@ -67,6 +68,12 @@ impl WalletRoot {
                         asset.symbol.clone_from(&entry.asset.symbol);
                         asset.amount =
                             public_balance_amount_label(&entry.amount, entry.asset.decimals);
+                        asset.max_amount = match entry.asset.id {
+                            PublicAssetId::Erc20(_) => entry.amount.amount().map(|amount| {
+                                super::format_send_amount_input(amount, Some(entry.asset.decimals))
+                            }),
+                            PublicAssetId::Native => None,
+                        };
                         asset.usd = public_balance_usd_label(
                             self.selected_chain,
                             entry.asset.id,
@@ -96,6 +103,7 @@ impl WalletRoot {
 
     pub(super) fn apply_gateway_public_command(
         &mut self,
+        peer_id: &str,
         command: GatewayPublicCommand,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -104,6 +112,10 @@ impl WalletRoot {
             return;
         };
         match command {
+            GatewayPublicCommand::Draft { command } => {
+                self.apply_gateway_draft_command(peer_id, *command, window, cx);
+                return;
+            }
             GatewayPublicCommand::SelectAccount {
                 public_account_uuid,
             } => {

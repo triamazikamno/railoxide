@@ -172,6 +172,14 @@ pub(super) enum SpendAuthorizationIntent {
 }
 
 impl SpendAuthorizationIntent {
+    fn gateway_execution(&self) -> Option<&wallet_ops::gateway::GatewayDraftExecution> {
+        match self {
+            Self::PublicSend(draft) => draft.gateway_execution.as_ref(),
+            Self::PublicShield(draft) => draft.gateway_execution.as_ref(),
+            _ => None,
+        }
+    }
+
     const fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
@@ -684,7 +692,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                             .flex_none()
                             .on_click(move |_event, window, cx| {
                                 cancel_root.update(cx, |root, cx| {
-                                    root.cancel_governance_authorization(&cancel_intent, cx);
+                                    root.cancel_spend_authorization(&cancel_intent, cx);
                                 });
                                 window.close_dialog(cx);
                             }),
@@ -1116,7 +1124,7 @@ impl WalletRoot {
                 .title(app_strong_text(dialog_title.clone()))
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
-                        root.cancel_governance_authorization(&close_intent, cx);
+                        root.cancel_spend_authorization(&close_intent, cx);
                     });
                 })
                 .child(div().w(content_width).child(content.clone()))
@@ -1162,7 +1170,7 @@ impl WalletRoot {
                         close_root.update(cx, |root, cx| {
                             root.clear_trezor_app_passphrase_input(window, cx);
                             if !handed_off.get() {
-                                root.cancel_governance_authorization(&close_intent, cx);
+                                root.cancel_spend_authorization(&close_intent, cx);
                             }
                         });
                     }
@@ -1172,6 +1180,7 @@ impl WalletRoot {
                     let handed_off = handed_off.clone();
                     move |_event, window, cx| {
                         let intent = intent.clone();
+                        if intent.gateway_execution().is_some_and(|execution| !execution.approve_review()) { return true; }
                         handed_off.set(true);
                         submit_root.update(cx, |root, cx| {
                             root.continue_authorized_spend(
@@ -1365,6 +1374,17 @@ impl WalletRoot {
         None
     }
 
+    fn cancel_spend_authorization(
+        &mut self,
+        intent: &SpendAuthorizationIntent,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(execution) = intent.gateway_execution() {
+            execution.cancel_review();
+        }
+        self.cancel_governance_authorization(intent, cx);
+    }
+
     pub(super) fn finish_spend_authorization(
         &mut self,
         intent: SpendAuthorizationIntent,
@@ -1380,6 +1400,13 @@ impl WalletRoot {
                 return;
             }
         };
+        if intent
+            .gateway_execution()
+            .is_some_and(|execution| !execution.approve_review())
+        {
+            window.close_dialog(cx);
+            return;
+        }
         self.spend_authorization_lifetime = lifetime;
         self.spend_authorization_cache = SpendAuthorizationCache::new(
             password,
@@ -1616,9 +1643,14 @@ impl WalletRoot {
         if view_session.hardware_profile_session().is_none() {
             return;
         }
-        self.view_session = Some(Arc::new(
-            view_session.clone_with_hardware_profile_session(hardware_session),
-        ));
+        let refreshed =
+            Arc::new(view_session.clone_with_hardware_profile_session(hardware_session));
+        self.gateway.drafts.borrow_mut().refresh_hardware_session(
+            view_session,
+            &refreshed,
+            self.active_wallet_generation,
+        );
+        self.view_session = Some(refreshed);
         cx.notify();
     }
 

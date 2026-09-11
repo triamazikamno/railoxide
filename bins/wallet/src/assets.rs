@@ -106,8 +106,8 @@ const TREZOR_SYMBOL_WHITE_ICON_BYTES: &[u8] =
 const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletconnect.svg");
 const TELEGRAM_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/telegram.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
-    include_bytes!("../assets/icons/arrow-big-right-dash.svg");
-const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
+    include_bytes!("../../../crates/ui/assets/icons/arrow-big-right-dash.svg");
+const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/shield.svg");
 const WALLET_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/wallet.svg");
 const BROADCASTER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/robot.svg");
 const BROWSER_EXTENSIONS_ICON_BYTES: &[u8] =
@@ -116,11 +116,11 @@ const LOGS_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/l
 const DICES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/dices.svg");
 const SQUARE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square.svg");
 const SQUARE_ASTERISK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square-asterisk.svg");
-const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pencil.svg");
-const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
+const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/pencil.svg");
+const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
-const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/book-user.svg");
+const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/book-user.svg");
 const LANDMARK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/landmark.svg");
 const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
@@ -307,7 +307,6 @@ fn append_embedded_asset_list<T: RustEmbed>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RailgunActionIcon {
-    Wallet,
     Send,
     Shield,
     Dices,
@@ -329,7 +328,6 @@ pub(crate) enum RailgunActionIcon {
 impl IconNamed for RailgunActionIcon {
     fn path(self) -> SharedString {
         match self {
-            Self::Wallet => WALLET_ICON_PATH,
             Self::Send => ARROW_BIG_RIGHT_DASH_ICON_PATH,
             Self::Shield => SHIELD_ICON_PATH,
             Self::Dices => DICES_ICON_PATH,

@@ -602,7 +602,7 @@ fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started()
 
 #[test]
 fn public_send_stop_footer_follows_send_handoff_boundary() {
-    let steps = vec![PublicActionStepState {
+    let mut steps = vec![PublicActionStepState {
         step: PublicActionProgressStep::Send,
         status: PublicActionStepStatus::Pending,
         tx_hash: None,
@@ -615,7 +615,7 @@ fn public_send_stop_footer_follows_send_handoff_boundary() {
         ProgressFooterAction::Stop
     );
     assert_eq!(
-        public_action_progress_footer_action(true, &steps),
+        public_action_progress_footer_action(true, true, &steps),
         ProgressFooterAction::Stop,
     );
     assert!(public_action_step_is_final_handoff(
@@ -623,7 +623,22 @@ fn public_send_stop_footer_follows_send_handoff_boundary() {
         PublicActionProgressStep::Send,
     ));
     assert_eq!(
-        public_action_progress_footer_action(false, &steps),
+        public_action_progress_footer_action(false, true, &steps),
+        ProgressFooterAction::Close,
+    );
+
+    // A pre-handoff failure waits for a retry and must still accept Cancel/Stop.
+    steps[0].status = PublicActionStepStatus::Error;
+    assert_eq!(
+        public_action_progress_footer_action(true, true, &steps),
+        ProgressFooterAction::Stop,
+    );
+    assert_eq!(
+        public_action_progress_footer_action(false, true, &steps),
+        ProgressFooterAction::Close,
+    );
+    assert_eq!(
+        public_action_progress_footer_action(true, false, &steps),
         ProgressFooterAction::Close,
     );
 }
@@ -656,11 +671,11 @@ fn erc20_public_shield_stop_footer_allows_approval_until_final_shield() {
         PublicActionProgressStep::Shield,
     ));
     assert_eq!(
-        public_action_progress_footer_action(true, &prerequisite_attempt_steps),
+        public_action_progress_footer_action(true, true, &prerequisite_attempt_steps),
         ProgressFooterAction::Stop,
     );
     assert_eq!(
-        public_action_progress_footer_action(false, &prerequisite_attempt_steps),
+        public_action_progress_footer_action(false, true, &prerequisite_attempt_steps),
         ProgressFooterAction::Close,
     );
 }

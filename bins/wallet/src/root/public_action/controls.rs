@@ -1,5 +1,6 @@
 use super::*;
-use ui::controls::app_segment_button;
+use ui::controls::{amount_max_button, app_segment_button};
+use ui::fees::estimated_fees;
 
 pub(in crate::root) fn public_action_form(
     content_width: Pixels,
@@ -135,10 +136,7 @@ pub(in crate::root) fn render_public_action_amount_input(
                 .gap_2()
                 .child(app_muted_text(label))
                 .children(max_label.map(|label| {
-                    app_button(max_id, format!("Max: {label}"))
-                        .link()
-                        .xsmall()
-                        .compact()
+                    amount_max_button(max_id, Some(label))
                         .disabled(disabled)
                         .on_click(move |_event, window, cx| {
                             max_root.update(cx, |root, cx| {
@@ -148,30 +146,6 @@ pub(in crate::root) fn render_public_action_amount_input(
                 })),
         )
         .child(app_input(input).disabled(disabled))
-}
-
-pub(in crate::root) fn public_action_segment_button(
-    id: SharedString,
-    label: &'static str,
-    icon: impl Into<Icon>,
-    selected: bool,
-) -> Button {
-    let button = Button::new(id)
-        .secondary()
-        .flex_1()
-        .min_w(px(0.0))
-        .selected(selected)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .text_size(APP_TEXT_SIZE)
-                .child(icon.into().small())
-                .child(label),
-        );
-    if selected { button.primary() } else { button }
 }
 
 pub(in crate::root) fn public_send_kind_segment_button(
@@ -219,39 +193,18 @@ pub(in crate::root) fn render_public_action_fee_estimate(
             "Unavailable".to_string()
         }
     });
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(app_strong_text("Estimated fees"))
-        .when_some(display.gas_limit, |this, gas_limit| {
-            this.child(public_action_fee_row(
-                "Gas limit",
-                format_gas_limit(gas_limit),
-            ))
-        })
-        .child(public_action_fee_row(
-            "Expected gas cost",
-            expected_gas_cost,
-        ))
-        .when_some(display.visible_maximum_gas_cost(), |this, maximum| {
-            this.child(public_action_muted_fee_row(
-                "Maximum gas cost",
-                maximum.to_string(),
-            ))
-        })
-        .when_some(display.protocol_fee.as_ref(), |this, protocol_fee| {
-            this.child(public_action_fee_row(
+    estimated_fees(
+        display.gas_limit.map(format_gas_limit),
+        expected_gas_cost,
+        display.visible_maximum_gas_cost().map(str::to_owned),
+        display.protocol_fee.as_ref().map(|fee| {
+            (
                 public_action_protocol_fee_label(RAILGUN_PROTOCOL_FEE_BPS),
-                protocol_fee.clone(),
-            ))
-        })
+                fee.clone(),
+            )
+        }),
+        APP_MONO_FONT_FAMILY,
+    )
 }
 
 pub(in crate::root) fn render_public_advanced_transaction_estimate(
@@ -264,85 +217,32 @@ pub(in crate::root) fn render_public_advanced_transaction_estimate(
         format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
     let maximum_token_value =
         format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
-    div()
-        .w_full()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(app_strong_text("Estimated fees"))
-        .child(public_action_fee_row(
-            "Gas limit",
-            format_gas_limit(estimate.gas_limit),
-        ))
-        .child(public_action_fee_row(
-            "Expected gas cost",
+    estimated_fees(
+        Some(format_gas_limit(estimate.gas_limit)),
+        format_value_with_usd_label(
+            expected_token_value,
+            estimate.expected_gas_cost,
+            Some(18),
+            expected_usd_micro_value,
+            false,
+        ),
+        public_action_maximum_gas_cost_is_significant(
+            estimate.expected_gas_cost,
+            estimate.max_gas_cost,
+        )
+        .then(|| {
             format_value_with_usd_label(
-                expected_token_value,
-                estimate.expected_gas_cost,
-                Some(18),
-                expected_usd_micro_value,
-                false,
-            ),
-        ))
-        .when(
-            public_action_maximum_gas_cost_is_significant(
-                estimate.expected_gas_cost,
+                maximum_token_value,
                 estimate.max_gas_cost,
-            ),
-            |this| {
-                this.child(public_action_muted_fee_row(
-                    "Maximum gas cost",
-                    format_value_with_usd_label(
-                        maximum_token_value,
-                        estimate.max_gas_cost,
-                        Some(18),
-                        maximum_usd_micro_value,
-                        false,
-                    ),
-                ))
-            },
-        )
-        .into_any_element()
-}
-
-fn public_action_fee_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .child(app_muted_text(label).flex_none())
-        .child(
-            app_strong_text(value)
-                .min_w(px(0.0))
-                .text_size(px(13.0))
-                .font_family(APP_MONO_FONT_FAMILY)
-                .whitespace_normal(),
-        )
-}
-
-fn public_action_muted_fee_row(label: &'static str, value: String) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .child(app_muted_text(label).flex_none())
-        .child(
-            app_muted_text(value)
-                .min_w(px(0.0))
-                .text_size(px(13.0))
-                .font_family(APP_MONO_FONT_FAMILY)
-                .whitespace_normal(),
-        )
+                Some(18),
+                maximum_usd_micro_value,
+                false,
+            )
+        }),
+        None,
+        APP_MONO_FONT_FAMILY,
+    )
+    .into_any_element()
 }
 
 pub(in crate::root) fn render_public_action_active_status_notice(

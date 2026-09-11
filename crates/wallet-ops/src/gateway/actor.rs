@@ -933,10 +933,13 @@ impl Actor {
                             generation,
                             command,
                         ) {
+                            let peer_id = alloy::hex::encode(
+                                session.peer().ok_or(GatewayError::Unavailable)?.to_bytes(),
+                            );
                             self.emit_ui_event(
                                 id,
                                 generation,
-                                super::GatewayUiEventKind::PublicView(command),
+                                super::GatewayUiEventKind::PublicView { peer_id, command },
                             );
                         }
                     }
@@ -1437,6 +1440,7 @@ mod integration_tests {
                     "selected_account": null,
                     "selected_chain": null,
                     "balances": [],
+                    "drafts": [],
                     "refreshing": false,
                     "balance_error": false,
                 },

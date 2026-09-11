@@ -10,6 +10,8 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Window,
     WindowOptions, div, img, prelude::FluentBuilder as _, px, rems, rgb,
 };
+mod drafts;
+mod keymap;
 mod public_view;
 use public_view::{HomeForm, PublicView, SitePermission};
 
@@ -42,6 +44,8 @@ thread_local! {
 
 #[wasm_bindgen]
 extern "C" {
+    #[wasm_bindgen(js_namespace = railoxideHost, js_name = isMac)]
+    fn host_is_mac() -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = isActive)]
     fn host_is_active() -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = stage)]
@@ -126,6 +130,7 @@ pub fn run(
             return;
         }
         gpui_kit::init(cx);
+        keymap::init(cx, host_is_mac());
         theme::apply_zenburn_component_theme(cx);
         if cx
             .text_system()
@@ -503,6 +508,12 @@ struct GatewayView {
     view_notice: String,
     accounts: Vec<ConnectAccount>,
     public_view: PublicView,
+    draft: Option<drafts::DraftSnapshot>,
+    draft_form: Option<drafts::DraftForm>,
+    handoff_open: bool,
+    draft_completion: Option<gpui::Task<()>>,
+    completed_draft: Option<String>,
+    cancel_draft_on_arrival: Option<String>,
     home_form: Option<HomeForm>,
     chains: Vec<ChainChoice>,
     permissions: Vec<SitePermission>,
@@ -587,6 +598,7 @@ impl GatewayView {
             let requests = pending_requests(&snapshot);
             let accounts = wallet_accounts(&snapshot);
             let presentation = PublicView::from_snapshot(&snapshot);
+            let draft = drafts::DraftSnapshot::from_snapshot(&snapshot);
             let chains = chain_field(&snapshot, "chains");
             let permissions = public_view::permissions(&snapshot);
             let current_tab = text_field(&snapshot, "current_tab_origin");
@@ -597,7 +609,15 @@ impl GatewayView {
             let _ = app.update_window(handle, |_, window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     if locked || view.generation != generation {
+                        let keep_handoff = !locked
+                            && view.handoff_open
+                            && view
+                                .draft
+                                .as_ref()
+                                .zip(draft.as_ref())
+                                .is_some_and(|(previous, next)| previous.continues(next));
                         view.clear_public_ui(window, cx);
+                        view.handoff_open = keep_handoff;
                     }
                     view.generation = generation;
                     view.public_view = presentation;
@@ -609,6 +629,7 @@ impl GatewayView {
                     view.pending_requests = requests;
                     view.accounts = accounts;
                     view.sync_home_form(window, cx);
+                    view.sync_draft(draft, window, cx);
                     view.sync_connect_form(window, cx);
                     cx.notify();
                 });
@@ -632,6 +653,12 @@ impl GatewayView {
             view_notice: String::new(),
             accounts: Vec::new(),
             public_view: PublicView::default(),
+            draft: None,
+            draft_form: None,
+            handoff_open: false,
+            draft_completion: None,
+            completed_draft: None,
+            cancel_draft_on_arrival: None,
             home_form: None,
             chains: Vec::new(),
             permissions: Vec::new(),
@@ -689,7 +716,7 @@ impl GatewayView {
                         rgb(color).into(),
                         rgb(color).into(),
                     )
-                    .small()
+                    .text_sm()
                     .rounded_full()
                     .child(label),
                 ),
@@ -701,8 +728,9 @@ impl GatewayView {
                 Button::new("gateway-settings")
                     .ghost()
                     .small()
+                    .compact()
                     .flex_none()
-                    .icon(IconName::Settings)
+                    .child(Icon::new(IconName::Settings).size_5())
                     .accessibility_label("Settings")
                     .tooltip("Settings")
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
@@ -875,6 +903,10 @@ impl GatewayView {
     fn render_connected(&self, cx: &Context<'_, Self>) -> Div {
         if self.sites_open {
             self.render_sites(cx)
+        } else if self.handoff_open {
+            self.render_draft_handoff(cx)
+        } else if self.draft_form.is_some() {
+            self.render_draft_form(cx)
         } else {
             self.render_home(cx)
         }
@@ -1031,7 +1063,7 @@ impl GatewayView {
                         .small(),
                     )
                     .child(
-                        app_button("switch-wallet", "Switch wallet in desktop app")
+                        desktop_action_button("switch-wallet", "Switch wallet in desktop app")
                             .w_full()
                             .on_click(move |_, _, _| {
                                 host_command("request_wallet_switch", &switch_request);
@@ -1155,8 +1187,12 @@ fn unavailable_select() -> Div {
         .child("Unavailable")
 }
 
+fn desktop_action_button(id: &'static str, label: &'static str) -> Button {
+    app_button(id, label).icon(Icon::empty().path("ui/icons/screen-share.svg"))
+}
+
 fn summon_desktop_button() -> Button {
-    app_button("summon-desktop", "Open desktop app")
+    desktop_action_button("summon-desktop", "Open desktop app")
         .primary()
         .on_click(|_, _, _| host_command("summon_desktop", ""))
 }
@@ -1219,6 +1255,7 @@ impl Render for GatewayView {
                     .gap_4()
                     .p_4()
                     .child(self.render_header(cx))
+                    .children(self.render_draft_banner(cx))
                     .when(!self.view_notice.is_empty(), |this| {
                         this.child(note(self.view_notice.clone()))
                     })
@@ -1227,8 +1264,18 @@ impl Render for GatewayView {
                             .id("gateway-content")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .child(div().min_h_full().flex().flex_col().child(body)),
+                            .when(
+                                self.draft_form.is_none(),
+                                gpui::StatefulInteractiveElement::overflow_y_scroll,
+                            )
+                            .child(
+                                div()
+                                    .when(self.draft_form.is_some(), |this| this.h_full().min_h_0())
+                                    .when(self.draft_form.is_none(), gpui::Styled::min_h_full)
+                                    .flex()
+                                    .flex_col()
+                                    .child(body),
+                            ),
                     ),
             )
     }

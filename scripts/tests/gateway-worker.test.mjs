@@ -583,7 +583,7 @@ test('public presentation is purged on lock and cannot return through late snaps
   const session = await established(h);
   const accounts = [{ uuid: 'first', label: 'Spending', address: '0xabc' }];
   const rich = { accounts, public_view: { selected_account: 'first', selected_chain: 1,
-    balances: [{ account_uuid: 'first', total: '$12.00', assets: [] }] },
+    balances: [{ account_uuid: 'first', total: '$12.00', assets: [] }], drafts: [{ draft_id: 'draft', status: 'attention', input: { recipient: 'recipient.eth' } }] },
     permissions: [{ permission_id: 'grant', origin: 'https://dapp.test/', account_uuid: 'first', chain_id: 1 }] };
   const delivered = () => JSON.parse(JSON.stringify(h.states.filter(message => message.type === 'ui_snapshot').at(-1)));
   const snapshot = (generation, locked) => session.send({ type: 'ui_snapshot', version: 1, generation, locked,
@@ -596,6 +596,9 @@ test('public presentation is purged on lock and cannot return through late snaps
   assert.deepEqual(delivered().accounts, []);
   assert.ok(!delivered().public_view?.balances?.length);
   assert.ok(!h.ui().port.messages[0].permissions?.length);
+  assert.ok(!delivered().public_view?.drafts?.length);
+  await session.send({ type: 'ui_snapshot', version: 1, generation: 2, locked: true, accounts: [], pending_connects: [], pending_requests: [], public_view: { drafts: rich.public_view.drafts } });
+  assert.ok(!delivered().public_view?.drafts?.length);
   await session.send({ type: 'state', version: 1, generation: 3, locked: false });
   await snapshot(3, false);
   assert.deepEqual(delivered().permissions, rich.permissions);
@@ -646,7 +649,8 @@ test('current-tab connect is view-scoped and browser-attested across navigation'
   assert.equal(sent().length, selected);
 });
 
-async function bootstrapView({ popup = false, tab = false, mode = 'notification', ready = true } = {}) {
+async function bootstrapView({ popup = false, tab = false, mode = 'notification', ready = true,
+  platform = 'Linux x86_64', userAgent = '' } = {}) {
   const bootstrap = await readFile(new URL('../../extensions/railoxide/bootstrap.js', import.meta.url), 'utf8');
   const domEvents = new Map(), windowEvents = new Map(), sent = [], viewCalls = [];
   let time = 0;
@@ -663,6 +667,7 @@ async function bootstrapView({ popup = false, tab = false, mode = 'notification'
   }
   const context = {
     configuration, URL, Uint8Array, AbortController, queueMicrotask, TextDecoder,
+    navigator: { platform, userAgent },
     console: { info() {} },
     performance: { now: () => time, mark() {} },
     location: { href: `chrome-extension://test/index.html${mode ? `?mode=${mode}` : ''}`, reload() {} },
@@ -695,6 +700,16 @@ async function bootstrapView({ popup = false, tab = false, mode = 'notification'
     disconnected: () => ports.at(-1).disconnected(),
     setTime(value) { time = value; } };
 }
+
+test('the GPUI host selects Mac editing from the browser platform with a user-agent fallback', async () => {
+  for (const [platform, userAgent, expected] of [
+    ['MacIntel', '', true], ['Win32', '', false], ['Linux x86_64', '', false],
+    ['', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', true],
+  ]) {
+    const view = await bootstrapView({ platform, userAgent });
+    assert.equal(view.context.railoxideHost.isMac(), expected);
+  }
+});
 
 test('only trusted extension input emits activity, never startup, focus, synthetic input or host commands', async () => {
   const view = await bootstrapView();
@@ -1011,4 +1026,44 @@ test('worker handoffs require a live side panel and saved mode; API failures pre
       assert.equal(result.opened, false);
     }
   }
+});
+
+
+test('draft commands are UI-only, scoped to current desktop selection, and never replay after reconnect', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const input = { account: 'first', chain_id: 1, kind: 'send', asset: 'native', amount: '1', recipient: 'recipient.eth',
+    address_book_entry: null, fee: { mode: 'normal' }, max: false, mimic_railway: false };
+  const snapshot = { type: 'ui_snapshot', version: 1, generation: 1, locked: false, accounts: [{ uuid: 'first' }], chains: [{ id: 1 }],
+    pending_connects: [], pending_requests: [], public_view: { selected_account: 'first', selected_chain: 1,
+      drafts: [{ draft_id: 'draft', revision: 3, input, status: 'ready' }] } };
+  await session.send(snapshot);
+  const ui = h.ui();
+  const sent = () => session.socket.sent.map(bytes => { try { return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes))); } catch { return null; } }).filter(Boolean);
+  const command = draft => ui.request({ type: 'public_view', generation: 1, command: { type: 'draft', command: draft } });
+  const before = sent().length;
+  for (const altered of [{ ...input, account: 'other' }, { ...input, chain_id: 10 }, { ...input, amount: '1'.repeat(101) }]) {
+    command({ action: 'create', request_id: 'new', input: altered });
+  }
+  command({ action: 'submit', draft_id: 'unknown', revision: 3 });
+  assert.equal(sent().length, before);
+  command({ action: 'update', draft_id: 'draft', revision: 4, input: { ...input, rpc_origin: 'other', password: 'never-forward' } });
+  command({ action: 'submit', draft_id: 'draft', revision: 4, password: 'never-forward' });
+  assert.deepEqual(sent().slice(before).map(message => message.command), [
+    { type: 'draft', command: { action: 'update', draft_id: 'draft', revision: 4, input } },
+    { type: 'draft', command: { action: 'submit', draft_id: 'draft', revision: 4 } },
+  ]);
+  const provider = h.provider(); await flush();
+  provider.request({ id: 'draft-request', method: 'public_view', params: { type: 'draft', command: { action: 'submit', draft_id: 'draft', revision: 4 } } });
+  await flush();
+  assert.equal(sent().filter(message => message.type === 'public_view').length, 2);
+  session.socket.close(); await flush();
+  await h.alarm();
+  const socket = h.sockets.at(-1);
+  socket.open(); socket.message(2); await flush();
+  socket.message(new TextEncoder().encode(JSON.stringify({ type: 'state', version: 1, generation: 1, locked: false })).buffer); await flush();
+  socket.message(new TextEncoder().encode(JSON.stringify(snapshot)).buffer); await flush();
+  const reopened = h.ui(); await flush();
+  assert.equal(reopened.port.messages[0].public_view.drafts[0].draft_id, 'draft');
+  assert.equal(socket.sent.some(bytes => new TextDecoder().decode(Uint8Array.from(bytes)).includes('"submit"')), false);
 });

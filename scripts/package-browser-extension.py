@@ -87,6 +87,13 @@ def package(metadata_path):
         # Keep the source attribution beside the unchanged chain and token bytes.
         asset_paths = sorted(str(path.relative_to(stage / 'assets')) for path in wallet_assets.rglob('*')
                              if path.is_file() and path.suffix in ('.svg', '.png'))
+        shared_icons = stage / 'assets/ui/icons'
+        shared_icons.mkdir(parents=True)
+        for name in ('shield', 'arrow-big-right-dash', 'book-user', 'wallet', 'pencil', 'refresh-ccw',
+                     'screen-share', 'monitor', 'qr-code'):
+            path = shared_icons / f'{name}.svg'
+            shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
+            asset_paths.append(str(path.relative_to(stage / 'assets')))
         (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n')
         icons = package_source / 'assets/icons'
         target_icons = stage / 'assets/icons'

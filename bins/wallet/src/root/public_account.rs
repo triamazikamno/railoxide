@@ -85,6 +85,38 @@ const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
 const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
 const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
 
+pub(super) fn restored_public_account_selection(
+    accounts: &[PublicAccountMetadata],
+    current: Option<&str>,
+    ui_state: &wallet_ops::settings::WalletUiState,
+    wallet_id: &str,
+) -> Option<Arc<str>> {
+    // Preserve an explicit desktop selection, including an inactive account being inspected.
+    current
+        .filter(|uuid| {
+            accounts.iter().any(|account| {
+                account.public_account_uuid == *uuid && account.is_scoped_to_wallet(wallet_id)
+            })
+        })
+        .or_else(|| {
+            let remembered = ui_state.last_public_accounts.get(wallet_id)?;
+            accounts
+                .iter()
+                .find(|account| {
+                    account.public_account_uuid == *remembered
+                        && account.is_active_for_wallet(wallet_id)
+                })
+                .map(|account| account.public_account_uuid.as_str())
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .find(|account| account.is_active_for_wallet(wallet_id))
+                .map(|account| account.public_account_uuid.as_str())
+        })
+        .map(Arc::from)
+}
+
 impl WalletRoot {
     pub(super) fn open_public_account_dialog(
         &mut self,
@@ -428,22 +460,12 @@ impl WalletRoot {
             Ok(accounts) => {
                 self.public_form.next_account_label_number =
                     next_public_account_label_number(accounts.len());
-                let selected = self
-                    .public_form
-                    .selected_account_uuid
-                    .as_ref()
-                    .filter(|selected| {
-                        accounts.iter().any(|account| {
-                            account.public_account_uuid.as_str() == selected.as_ref()
-                        })
-                    })
-                    .cloned()
-                    .or_else(|| {
-                        accounts
-                            .iter()
-                            .find(|account| account.status == PublicAccountStatus::Active)
-                            .map(|account| Arc::from(account.public_account_uuid.as_str()))
-                    });
+                let selected = restored_public_account_selection(
+                    &accounts,
+                    self.public_form.selected_account_uuid.as_deref(),
+                    &self.ui_state,
+                    view_session.wallet_id(),
+                );
                 if self.public_accounts != accounts {
                     self.public_balance_cache.clear();
                     self.public_balance_snapshot = None;
@@ -452,10 +474,11 @@ impl WalletRoot {
                 }
                 self.public_accounts = accounts;
                 self.public_form.selected_account_uuid = selected;
-                self.publish_gateway_desktop_state();
                 self.public_form.next_derived_index = store
                     .next_derived_public_account_index_for_session(view_session.as_ref())
                     .ok();
+                self.remember_public_account_selection();
+                self.publish_gateway_desktop_state();
                 self.sync_self_broadcast_gas_payer_selects(window, cx);
                 self.sync_public_edit_label_input(window, cx);
                 self.invalidate_blocked_shield_rescue_rows(cx);
@@ -527,9 +550,32 @@ impl WalletRoot {
         self.invalidate_advanced_public_send_estimate();
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
+        self.remember_public_account_selection();
         self.sync_public_edit_label_input(window, cx);
         self.publish_gateway_desktop_state();
         cx.notify();
+    }
+
+    fn remember_public_account_selection(&mut self) {
+        let Some(view) = self.view_session.as_ref() else {
+            return;
+        };
+        let Some(account) = self
+            .selected_public_account()
+            .filter(|account| account.is_active_for_wallet(view.wallet_id()))
+        else {
+            return;
+        };
+        if self.ui_state.last_public_accounts.get(view.wallet_id())
+            != Some(&account.public_account_uuid)
+        {
+            let wallet_id = view.wallet_id().to_owned();
+            let account_uuid = account.public_account_uuid.clone();
+            self.ui_state
+                .last_public_accounts
+                .insert(wallet_id, account_uuid);
+            self.save_ui_state();
+        }
     }
 
     pub(super) fn set_public_account_section_open(

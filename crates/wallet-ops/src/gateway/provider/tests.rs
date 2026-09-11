@@ -434,12 +434,46 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
         }],
         ..GatewayPublicView::default()
     };
+    let peer = PeerId::from_bytes([1; 16]);
+    let draft = |peer_id: String, id: &str| crate::gateway::GatewayDraftView {
+        peer_id,
+        draft_id: id.into(),
+        request_id: id.into(),
+        revision: 2,
+        input: crate::gateway::GatewayDraftInput {
+            account: active.public_account_uuid.clone(),
+            chain_id: 10,
+            kind: crate::gateway::GatewayDraftKind::Send,
+            asset: "native".into(),
+            amount: "1".into(),
+            recipient: "recipient.eth".into(),
+            address_book_entry: None,
+            fee: crate::gateway::GatewayDraftFee::Normal,
+            mimic_railway: false,
+            max: false,
+        },
+        status: crate::gateway::GatewayDraftStatus::Attention,
+        estimate: None,
+        gas_quote: None,
+        recipients: Vec::new(),
+        step_label: String::new(),
+        message: String::new(),
+        warning: false,
+        can_cancel: true,
+        can_retry: false,
+    };
+    let mine = draft(alloy::hex::encode(peer.to_bytes()), "mine");
+    wallet.public_view.drafts = vec![mine.clone(), draft("other-peer".into(), "other")];
+    provider.attach_ui_peer(1, peer);
+    messages(&mut provider);
     provider.update_wallet(wallet.clone(), 2);
     provider.push_ui(1);
     let unlocked = messages(&mut provider);
+    let mut expected = wallet.public_view.clone();
+    expected.drafts = vec![mine];
     assert_eq!(
         snapshot(&unlocked)["public_view"],
-        serde_json::to_value(&wallet.public_view).unwrap()
+        serde_json::to_value(&expected).unwrap()
     );
     assert_eq!(
         snapshot(&unlocked)["accounts"],
@@ -580,7 +614,16 @@ fn public_view_commands_preserve_selection_and_scope_permission_edits_to_the_pee
         Some(GatewayPublicCommand::SelectAccount { .. })
     ));
     assert_eq!(provider.permissions()[0].chain_id, 10);
+    let submit = || GatewayPublicCommand::Draft {
+        command: Box::new(crate::gateway::GatewayDraftCommand::Submit {
+            draft_id: "draft".into(),
+            revision: 2,
+        }),
+    };
+    assert!(provider.public_command(1, peer, 1, submit()).is_none());
+    assert!(provider.public_command(1, peer, 2, submit()).is_some());
     invalidate_authority(&provider, true);
+    assert!(provider.public_command(1, peer, 2, submit()).is_none());
     assert!(
         provider
             .public_command(

@@ -50,6 +50,7 @@ mod dapp_request;
 mod dialogs;
 mod gas_fee;
 mod gateway;
+mod gateway_drafts;
 mod gateway_public_view;
 mod governance;
 mod governance_action;

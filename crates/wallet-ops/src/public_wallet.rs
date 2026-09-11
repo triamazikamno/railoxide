@@ -4,7 +4,9 @@ mod balances;
 mod contracts;
 mod dapp_reads;
 mod gas;
+mod recipient;
 mod runtime;
+pub use recipient::resolve_public_ens_recipient;
 mod signer;
 mod submission;
 #[cfg(test)]
