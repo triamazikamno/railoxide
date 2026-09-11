@@ -31,7 +31,12 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
     if (index >= 0) windows.splice(index, 1);
     removed?.(id);
   };
-  const event = () => ({ addListener() {} });
+  const event = () => {
+    const listeners = [];
+    return { addListener(callback) { listeners.push(callback); }, fire(value) { for (const callback of listeners) callback(value); } };
+  };
+  const activeTabs = new Map([[17, { id: 1 }]]);
+  const frames = new Map([[1, { documentId: 'browser-document', documentLifecycle: 'active', url: 'https://dapp.test/' }]]);
   const timer = (callback, delay) => { timers.set(++nextTimer, { callback, delay, due: clockTime + delay }); return nextTimer; };
   class Socket {
     static OPEN = 1;
@@ -108,8 +113,9 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
         for (const key of [keys].flat()) delete data[key];
       },
     } },
+    tabs: { async query({ windowId }) { return [activeTabs.get(windowId)].filter(Boolean); }, onActivated: event(), onRemoved: event() },
     webNavigation: { onCommitted: event(), onHistoryStateUpdated: event(), onReferenceFragmentUpdated: event(),
-      async getFrame(query) { return { documentId: query.documentId, documentLifecycle: 'active', url: 'https://dapp.test/' }; } },
+      async getFrame(query) { return frames.get(query.tabId); } },
     permissions: { async contains() { return true; } },
     alarms: { create() {}, clear() {}, onAlarm: { addListener(value) { alarm = value; } } },
     runtime: { id: 'test', getURL: value => `chrome-extension://test/${value}`, onConnect: { addListener(value) { listener = value; } },
@@ -130,7 +136,7 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
     postMessage: value => states.push(value), onDisconnect: event(),
     onMessage: { addListener(value) { command = value; } }, disconnect() { assert.fail('trusted port disconnected'); } });
   await flush();
-  return { chrome, data, sockets, clients, states, command, timers, windows, created, badges, closeWindow, popups, panelBehaviors,
+  return { chrome, data, sockets, clients, states, command, timers, windows, created, badges, closeWindow, popups, panelBehaviors, frames, activeTabs,
     toolbarHook(value) { toolbarHook = value; },
     createHook(value) { createHook = value; },
     contextsVisible(value) { contextsVisible = value; },
@@ -572,19 +578,72 @@ test('desktop switch, summon and activity require the current privileged UI gene
 });
 
 
-test('account presentation reaches the views only while desktop is unlocked', async () => {
+test('public presentation is purged on lock and cannot return through late snapshots or a new view', async () => {
   const h = await worker({ gatewayCredential: credential() });
   const session = await established(h);
   const accounts = [{ uuid: 'first', label: 'Spending', address: '0xabc' }];
-  const delivered = () => JSON.parse(JSON.stringify(h.states.filter(message => message.type === 'ui_snapshot').at(-1).accounts));
+  const rich = { accounts, public_view: { selected_account: 'first', selected_chain: 1,
+    balances: [{ account_uuid: 'first', total: '$12.00', assets: [] }] },
+    permissions: [{ permission_id: 'grant', origin: 'https://dapp.test/', account_uuid: 'first', chain_id: 1 }] };
+  const delivered = () => JSON.parse(JSON.stringify(h.states.filter(message => message.type === 'ui_snapshot').at(-1)));
+  const snapshot = (generation, locked) => session.send({ type: 'ui_snapshot', version: 1, generation, locked,
+    pending_connects: [], pending_requests: [], ...rich });
+  await snapshot(1, false);
+  assert.deepEqual(delivered().public_view, rich.public_view);
   await session.send({ type: 'state', version: 1, generation: 2, locked: true });
-  await session.send({ type: 'ui_snapshot', version: 1, generation: 2, locked: true, accounts,
-    pending_connects: [], pending_requests: [] });
-  assert.deepEqual(delivered(), [], 'a locked snapshot carrying accounts is rejected');
+  await snapshot(1, false);
+  await snapshot(2, true);
+  assert.deepEqual(delivered().accounts, []);
+  assert.ok(!delivered().public_view?.balances?.length);
+  assert.ok(!h.ui().port.messages[0].permissions?.length);
   await session.send({ type: 'state', version: 1, generation: 3, locked: false });
-  await session.send({ type: 'ui_snapshot', version: 1, generation: 3, locked: false, accounts,
-    pending_connects: [], pending_requests: [] });
-  assert.deepEqual(delivered(), accounts);
+  await snapshot(3, false);
+  assert.deepEqual(delivered().permissions, rich.permissions);
+  session.socket.close(); await flush();
+  assert.ok(!h.ui().port.messages[0].public_view?.balances?.length);
+});
+
+test('current-tab connect is view-scoped and browser-attested across navigation', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const provider = h.provider(); await flush();
+  await session.send({ type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+    accounts: [{ uuid: 'first' }], chains: [{ id: 1 }], permissions: [], pending_connects: [], pending_requests: [] });
+  const ui = h.ui('chrome-extension://test/index.html');
+  ui.request({ type: 'popup_presence', ready: true, visible: true });
+  ui.request({ type: 'tab_context', window_id: 17 }); await flush();
+  const tab = ui.port.messages.at(-1);
+  assert.equal(tab.current_tab_origin, 'https://dapp.test/');
+  const sent = () => session.socket.sent.map(bytes => { try { return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))); } catch { return {}; } }).filter(message => message.type === 'public_view');
+  const connect = token => ui.request({ type: 'public_view', generation: 1, tab_token: token, command: { type: 'connect_tab' } });
+  connect(tab.current_tab_token); await flush();
+  assert.equal(sent().at(-1).command.type, 'connect_tab');
+  await session.snapshot([], [connectPrompt(false)]);
+  assert.equal(h.created.length, 0, 'a wallet-originated connect stays in the visible popup');
+  await session.send({ type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+    accounts: [{ uuid: 'first' }], chains: [{ id: 1 }], permissions: [], pending_connects: [], pending_requests: [] });
+  const count = sent().length;
+  // A different window cannot reuse this view's attestation token.
+  h.activeTabs.set(18, { id: 2 });
+  const second = h.ui(); second.request({ type: 'tab_context', window_id: 18 }); await flush();
+  second.request({ type: 'public_view', generation: 1, tab_token: tab.current_tab_token, command: { type: 'connect_tab' } });
+  // The browser can navigate before its event reaches the worker.
+  h.frames.set(1, { documentId: 'replacement', documentLifecycle: 'active', url: 'https://new.test/' });
+  connect(tab.current_tab_token); await flush();
+  assert.equal(sent().length, count);
+  h.chrome.webNavigation.onCommitted.fire({ tabId: 1, frameId: 0, ...h.frames.get(1) }); await flush();
+  const replacement = ui.port.messages.at(-1);
+  assert.equal(replacement.current_tab_origin, 'https://new.test/');
+  assert.notEqual(replacement.current_tab_token, tab.current_tab_token);
+  connect(tab.current_tab_token); await flush();
+  assert.equal(sent().length, count);
+  ui.request({ type: 'public_view', generation: 1, command: { type: 'select_account', public_account_uuid: 'first' } });
+  assert.equal(sent().at(-1).command.public_account_uuid, 'first');
+  const selected = sent().length;
+  for (const generation of [0, 2]) ui.request({ type: 'public_view', generation, command: { type: 'refresh_balances' } });
+  provider.request({ id: 'privileged', method: 'public_view', params: { type: 'refresh_balances' } });
+  await flush();
+  assert.equal(sent().length, selected);
 });
 
 async function bootstrapView({ popup = false, tab = false, mode = 'notification', ready = true } = {}) {
@@ -603,7 +662,7 @@ async function bootstrapView({ popup = false, tab = false, mode = 'notification'
     return port;
   }
   const context = {
-    configuration, URL, Uint8Array, AbortController, queueMicrotask,
+    configuration, URL, Uint8Array, AbortController, queueMicrotask, TextDecoder,
     console: { info() {} },
     performance: { now: () => time, mark() {} },
     location: { href: `chrome-extension://test/index.html${mode ? `?mode=${mode}` : ''}`, reload() {} },
@@ -624,7 +683,7 @@ async function bootstrapView({ popup = false, tab = false, mode = 'notification'
     },
     setTimeout(callback, delay) { timers.set(delay, callback); return delay; },
     clearTimeout(delay) { timers.delete(delay); },
-    fetch: async () => ({ ok: true, arrayBuffer: async () => Uint8Array.of(1).buffer }),
+    fetch: async url => ({ ok: true, arrayBuffer: async () => url.endsWith('WALLET-ASSETS.json') ? new TextEncoder().encode('[]').buffer : Uint8Array.of(1).buffer }),
     browserRuntime: { async default() {}, run() { if (ready) context.railoxideHost.ready(); }, stop() {} },
   };
   vm.createContext(context);
@@ -641,7 +700,7 @@ test('only trusted extension input emits activity, never startup, focus, synthet
   const view = await bootstrapView();
   const { context, domEvents, windowEvents, sent, incoming, disconnected } = view;
   incoming({ type: 'ui_snapshot', generation: 7, locked: false, accounts: [], pending_connects: [], pending_requests: [pending('one')] });
-  assert.equal(sent.length, 0, 'automatic startup and snapshot delivery are not activity');
+  assert.equal(sent.filter(message => message.type === 'user_activity').length, 0, 'automatic startup and snapshot delivery are not activity');
   domEvents.get('pointerdown')({ isTrusted: false });
   domEvents.get('keydown')({ isTrusted: false });
   domEvents.get('wheel')({ isTrusted: false });
@@ -672,14 +731,14 @@ test('toolbar popup opening emits activity once and cannot survive lock, generat
   for (const ready of [false, true]) {
     const view = await bootstrapView({ popup: true, mode: '', ready });
     view.incoming(snapshot());
-    assert.equal(view.sent.length, ready ? 1 : 0);
+    assert.equal(view.sent.filter(message => message.type === 'user_activity').length, ready ? 1 : 0);
     view.context.railoxideHost.ready();
     view.incoming(snapshot());
     view.domEvents.get('pointerdown')({ isTrusted: true });
     view.setTime(1000);
     view.incoming(snapshot());
     view.context.railoxideHost.ready();
-    assert.deepEqual(view.sent.map(message => [message.type, message.generation]), [['user_activity', 7]],
+    assert.deepEqual(view.sent.filter(message => message.type === 'user_activity').map(message => [message.type, message.generation]), [['user_activity', 7]],
       'opening and immediate trusted input share the local throttle');
   }
   for (const mode of ['', 'window', 'notification', 'sidepanel']) {
@@ -706,7 +765,7 @@ test('toolbar popup opening emits activity once and cannot survive lock, generat
     view.incoming(snapshot());
     view.context.railoxideHost.ready();
     view.incoming(snapshot());
-    assert.equal(view.sent.length, 0, `${retirement} must not replay popup opening`);
+    assert.equal(view.sent.filter(message => message.type === 'user_activity').length, 0, `${retirement} must not replay popup opening`);
   }
 });
 
@@ -782,7 +841,7 @@ test('side panel readiness, visibility and reconnect report presence without ext
   const view = await bootstrapView({ mode: 'sidepanel', ready: false });
   const snapshot = { type: 'ui_snapshot', generation: 7, locked: false, accounts: [], pending_connects: [], pending_requests: [] };
   view.incoming(snapshot);
-  assert.equal(view.sent.length, 0);
+  assert.equal(view.sent.filter(message => message.type === 'sidepanel_presence').length, 0);
   view.context.railoxideHost.ready();
   assert.equal(view.sent.at(-1).visible, true);
   view.context.document.visibilityState = 'hidden';

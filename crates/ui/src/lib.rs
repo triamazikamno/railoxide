@@ -9,3 +9,5 @@ pub mod logs;
 pub mod style;
 pub mod table;
 pub mod theme;
+
+pub mod public_address;

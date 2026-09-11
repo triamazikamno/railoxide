@@ -188,6 +188,15 @@ export function createPageBridge({ chrome, crypto, send, session, preferences })
   chrome.webNavigation.onReferenceFragmentUpdated.addListener(navigation);
   return {
     connect, receive,
+    async connectTab(tabId, documentId, origin, stillCurrent) {
+      const expected = session();
+      const doc = [...documents.values()].find(value => value.tabId === tabId && value.frameId === 0 &&
+        value.browserDocument === documentId && value.url === origin && value.owner === expected);
+      if (!expected || !doc || !await attest(doc, expected) || !stillCurrent() || doc.owner !== expected) return false;
+      send(expected, { type: 'public_view', version: 1, generation: expected.generation,
+        command: { type: 'connect_tab', document: doc.id } });
+      return true;
+    },
     authenticated() { for (const doc of documents.values()) void register(doc); },
     retire() { for (const doc of documents.values()) { unregister(doc); purge(doc, 4900); } },
     lockState(locked, generationChanged = false) {

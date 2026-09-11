@@ -1,21 +1,15 @@
-use std::ops::Range;
-
 use alloy::primitives::Address;
 use gpui::{
     InteractiveElement, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
     div, px, rgb,
 };
 use gpui_component::tooltip::Tooltip;
-use qrcodegen::{QrCode, QrCodeEcc};
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 
 use crate::root::ui_helpers::rgb_with_alpha;
 
 const PUBLIC_ADDRESS_QR_MODULE_SIZE: Pixels = px(6.0);
-pub(in crate::root) const PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES: i32 = 4;
-const PUBLIC_ADDRESS_QR_FOREGROUND: u32 = 0x1e3c67;
-const PUBLIC_ADDRESS_QR_BACKGROUND: u32 = 0xffffff;
 
 pub(in crate::root) fn render_public_address_qr_dialog_content(
     label: Option<SharedString>,
@@ -90,50 +84,9 @@ pub(in crate::root) fn render_public_address_qr_dialog_content(
 }
 
 fn render_public_address_qr_code(payload: &str) -> gpui::Div {
-    let Ok(qr) = QrCode::encode_text(payload, QrCodeEcc::Medium) else {
-        return div()
-            .p(px(14.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(theme::DANGER))
-            .bg(rgb(theme::SURFACE_ELEVATED))
-            .text_color(rgb(theme::DANGER))
-            .child("QR code unavailable");
-    };
-    let mut grid = div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
-        .bg(rgb(PUBLIC_ADDRESS_QR_BACKGROUND))
-        .p(px(6.0));
-    let module_range = public_address_qr_module_range(qr.size());
-    for y in module_range.clone() {
-        let mut row = div().flex().flex_none();
-        for x in module_range.clone() {
-            let active = x >= 0 && y >= 0 && x < qr.size() && y < qr.size() && qr.get_module(x, y);
-            row = row.child(
-                div()
-                    .size(PUBLIC_ADDRESS_QR_MODULE_SIZE)
-                    .flex_none()
-                    .bg(rgb(if active {
-                        PUBLIC_ADDRESS_QR_FOREGROUND
-                    } else {
-                        PUBLIC_ADDRESS_QR_BACKGROUND
-                    })),
-            );
-        }
-        grid = grid.child(row);
-    }
-    grid
+    ui::public_address::render_public_address_qr_code(payload, PUBLIC_ADDRESS_QR_MODULE_SIZE)
 }
 
 pub(in crate::root) fn public_address_qr_payload(address: Address) -> String {
     format!("{address:#x}")
-}
-
-pub(in crate::root) const fn public_address_qr_module_range(qr_size: i32) -> Range<i32> {
-    -PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES..qr_size + PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES
 }

@@ -82,6 +82,12 @@ def package(metadata_path):
                 '--out-dir', str(stage), '--out-name', crate, str(compiled),
             ], check=True)
         package_protocol_licenses(metadata, stage)
+        wallet_assets = stage / 'assets/railgun-ui'
+        shutil.copytree(ROOT / 'crates/railgun-ui/assets', wallet_assets)
+        # Keep the source attribution beside the unchanged chain and token bytes.
+        asset_paths = sorted(str(path.relative_to(stage / 'assets')) for path in wallet_assets.rglob('*')
+                             if path.is_file() and path.suffix in ('.svg', '.png'))
+        (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n')
         icons = package_source / 'assets/icons'
         target_icons = stage / 'assets/icons'
         shutil.copytree(icons, target_icons)

@@ -3,7 +3,7 @@
 import { configuration } from './gateway-config.js';
 const STARTUP_TIMEOUT_MS = 30_000;
 const REQUIRED_COMPONENT_ICONS = ['check', 'search', 'close', 'inbox', 'loader', 'settings', 'copy',
-  'chevron-down', 'chevron-right', 'triangle-alert', 'circle-x', 'globe'];
+  'chevron-down', 'chevron-right', 'chevron-left', 'arrow-down', 'triangle-alert', 'circle-check', 'circle-x', 'globe'];
 const startedAt = 0; // performance.timeOrigin is this document navigation start.
 const shell = document.querySelector('#startup');
 const message = document.querySelector('#startup-message');
@@ -19,9 +19,9 @@ let stateCallback;
 let snapshotCallback;
 let connectSnapshot = { locked: true, accounts: [], pending_connects: [], pending_requests: [] };
 const isSidePanel = new URL(location.href).search === '?mode=sidepanel';
-function sendPanelPresence() {
-  if (isSidePanel && state === 'ready' && uiPort) {
-    uiPort.postMessage({ type: 'sidepanel_presence', ready: true, visible: document.visibilityState === 'visible' });
+function sendViewPresence() {
+  if ((isSidePanel || isToolbarPopup) && state === 'ready' && uiPort) {
+    uiPort.postMessage({ type: isSidePanel ? 'sidepanel_presence' : 'popup_presence', ready: true, visible: document.visibilityState === 'visible' });
   }
 }
 let openingSnapshotPending = false;
@@ -181,6 +181,7 @@ function attachWorker() {
   if (state !== 'loading' && state !== 'ready') return;
   const port = chrome.runtime.connect({ name: 'gateway-ui-v1' });
   uiPort = port;
+  if (Number.isInteger(hostingWindowId)) port.postMessage({ type: 'tab_context', window_id: hostingWindowId });
   port.onMessage.addListener(message => {
     if (uiPort === port && message?.type === 'view_result' && viewChange?.port === port &&
         message.request_id === viewChange.id && typeof message.success === 'boolean') {
@@ -214,7 +215,7 @@ function attachWorker() {
     deliverStatus('disconnected');
     portRetry = setTimeout(attachWorker, 1000);
   });
-  sendPanelPresence();
+  sendViewPresence();
 }
 function detachWorker() {
   cancelViewChange();
@@ -268,7 +269,7 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
     state = 'ready';
     clearTimeout(deadline);
     shell.hidden = true;
-    sendPanelPresence();
+    sendViewPresence();
     deliverPopupOpening();
     performance.mark('railoxide-first-interactive');
     const firstInteractiveMs = performance.now() - startedAt;
@@ -289,7 +290,12 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   },
   command(command, value) {
     if (state !== 'ready' || !uiPort) return;
-    if (command === 'request_wallet_switch' || command === 'summon_desktop') {
+    if (command === 'public_view') {
+      try {
+        uiPort.postMessage({ type: 'public_view', generation: connectSnapshot.generation,
+          tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });
+      } catch { /* Only the packaged frontend supplies serialized UI commands. */ }
+    } else if (command === 'request_wallet_switch' || command === 'summon_desktop') {
       uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
         ...(command === 'request_wallet_switch' ? { request_id: value } : {}) });
     } else if (command === 'view' && ['popup', 'sidepanel'].includes(value)) {
@@ -350,7 +356,7 @@ for (const type of ['pointerdown', 'keydown', 'wheel']) {
   }, { capture: true, passive: true, signal: controller.signal });
 }
 
-document.addEventListener('visibilitychange', sendPanelPresence, { signal: controller.signal });
+document.addEventListener('visibilitychange', sendViewPresence, { signal: controller.signal });
 
 window.addEventListener('pagehide', () => {
   state = 'closed';
@@ -387,6 +393,10 @@ async function start() {
       return [path, await localBytes(`assets/${path}`)];
     })).then(Object.fromEntries),
   ]);
+  const walletAssets = JSON.parse(new TextDecoder().decode(await localBytes('assets/WALLET-ASSETS.json')));
+  await Promise.all(walletAssets.map(async path => {
+    icons[path] = await localBytes(`assets/${path}`);
+  }));
   if (state !== 'loading') return;
   attachWorker();
   runtime.run(chrome.runtime.getURL('').replace(/\/$/, ''), inter, mono, icons);

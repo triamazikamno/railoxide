@@ -273,6 +273,7 @@ impl WalletRoot {
         if let Some(ticket) = self.public_balance_cache.begin_refresh(&scope, status) {
             self.run_public_balance_refresh(ticket, window, cx);
         }
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 
@@ -403,6 +404,7 @@ impl WalletRoot {
         if let Some(follow_up) = completion.follow_up {
             self.run_public_balance_refresh(follow_up, window, cx);
         }
+        self.publish_gateway_desktop_state();
         cx.notify();
         completion.accepted && selected && active && succeeded
     }

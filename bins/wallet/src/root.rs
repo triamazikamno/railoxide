@@ -50,6 +50,7 @@ mod dapp_request;
 mod dialogs;
 mod gas_fee;
 mod gateway;
+mod gateway_public_view;
 mod governance;
 mod governance_action;
 mod key_export;
@@ -1887,7 +1888,13 @@ impl WalletRoot {
         .detach();
         cx.spawn(async move |this, cx| {
             while anchor_refresh_rx.changed().await.is_ok() {
-                if this.update(cx, |_root, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |root, cx| {
+                        root.publish_gateway_desktop_state();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }

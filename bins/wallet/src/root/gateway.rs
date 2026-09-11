@@ -180,6 +180,9 @@ impl GatewayUi {
                             return;
                         }
                         match event.kind {
+                            wallet_ops::gateway::GatewayUiEventKind::PublicView(command) => {
+                                root.apply_gateway_public_command(command, window, cx);
+                            }
                             wallet_ops::gateway::GatewayUiEventKind::SummonDesktop => {
                                 window.activate_window();
                             }
@@ -324,6 +327,14 @@ impl Drop for GatewayUi {
 }
 
 impl WalletRoot {
+    pub(super) fn gateway_has_connected_browser(&self) -> bool {
+        self.gateway
+            .snapshot
+            .peers
+            .iter()
+            .any(|peer| peer.connected_sessions > 0)
+    }
+
     pub(super) fn publish_gateway_summaries(&self, summaries: Vec<(String, String)>) {
         if let Some(state) = &self.gateway.desktop_state {
             state.send_if_modified(|(_, _, current)| {
@@ -439,6 +450,11 @@ impl WalletRoot {
         if let Some(state) = self.gateway.desktop_state.as_ref() {
             let unlocked = matches!(self.vault_state, VaultState::ViewUnlocked);
             let mut snapshot = GatewayWalletState {
+                public_view: if unlocked {
+                    self.gateway_public_view()
+                } else {
+                    wallet_ops::gateway::GatewayPublicView::default()
+                },
                 waiting_unlock: self.gateway.unlock.borrow().state,
                 view: if unlocked {
                     self.view_session.clone()

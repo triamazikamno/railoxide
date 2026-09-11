@@ -2572,11 +2572,14 @@ dependencies = [
 name = "browser-frontend"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "gpui-component",
  "gpui-kit",
  "gpui-kit-assets",
  "gpui-pre",
  "js-sys",
+ "railgun-ui",
+ "serde_json",
  "ui",
  "wasm-bindgen",
 ]
@@ -15383,6 +15386,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "parking_lot",
+ "qrcodegen",
  "tracing",
  "tracing-subscriber",
  "url",

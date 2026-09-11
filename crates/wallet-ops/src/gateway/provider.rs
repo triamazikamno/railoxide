@@ -23,6 +23,8 @@ use tokio::{task::JoinSet, time::Instant};
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "public_view.rs"]
+mod public_view;
 use crate::dapp_request::DappRequestControl;
 pub use approvals::GatewayApprovalRequest;
 use approvals::{ApprovalDelivery, PendingApproval};
@@ -47,6 +49,7 @@ pub struct GatewayUnlockState {
 /// View capability and immutable networking authority. Presentation defaults do not advance the epoch.
 #[derive(Clone, Default)]
 pub struct GatewayWalletState {
+    pub public_view: super::GatewayPublicView,
     pub waiting_unlock: GatewayUnlockState,
     pub wallet_switch: Option<GatewayWalletSwitchTransition>,
     pub view: Option<Arc<DesktopViewSession>>,
@@ -81,6 +84,7 @@ impl GatewayWalletState {
     #[must_use]
     pub fn same_state(&self, other: &Self) -> bool {
         self.same_authority(other)
+            && self.public_view == other.public_view
             && self.wallet_switch == other.wallet_switch
             && self.public_accounts == other.public_accounts
             && self.default_chain_id == other.default_chain_id
@@ -281,6 +285,8 @@ pub(super) struct DappProvider {
     outbox: Vec<(u64, Delivery)>,
     next_document: u64,
     ui_snapshots: HashMap<u64, Value>,
+    ui_peers: HashMap<u64, PeerId>,
+    ui_errors: HashMap<u64, String>,
 }
 impl DappProvider {
     pub(super) fn new(store: DesktopVaultStore, generation: u64) -> Self {
@@ -304,10 +310,14 @@ impl DappProvider {
             outbox: Vec::new(),
             next_document: 0,
             ui_snapshots: HashMap::new(),
+            ui_peers: HashMap::new(),
+            ui_errors: HashMap::new(),
         }
     }
     pub(super) fn retire_sessions(&mut self, live: impl Fn(u64) -> bool) {
         self.ui_snapshots.retain(|session, _| live(*session));
+        self.ui_peers.retain(|session, _| live(*session));
+        self.ui_errors.retain(|session, _| live(*session));
         self.documents.retain(|(session, _), _| live(*session));
         self.pending.retain(|pending| live(pending.session));
         self.outbox.retain(|(session, _)| live(*session));
@@ -390,6 +400,8 @@ impl DappProvider {
     }
     pub(super) fn update_wallet(&mut self, mut wallet: GatewayWalletState, generation: u64) {
         if wallet.view.is_none() {
+            wallet.public_view = super::GatewayPublicView::default();
+            self.ui_errors.clear();
             wallet.public_accounts.clear();
             wallet.token_registry = None;
             wallet.chain_ids.clear();
@@ -518,6 +530,7 @@ impl DappProvider {
             return Ok(());
         };
         let key = (session, document);
+        self.ui_peers.insert(session, peer);
         if let Some(existing) = self.documents.get(&key) {
             if existing.origin != origin {
                 return Err(GatewayError::Unavailable);
@@ -1423,6 +1436,7 @@ impl DappProvider {
         for session in changed {
             self.push_ui(session);
         }
+        self.push_pending_ui();
         Ok(())
     }
     pub(super) fn tick(&mut self, now: Instant) {
@@ -1594,6 +1608,31 @@ impl DappProvider {
             generation: self.generation,
             locked: self.wallet.view.is_none(),
             accounts: wallet_accounts,
+            public_view: self.wallet.public_view.clone(),
+            chains: self
+                .wallet
+                .chain_ids
+                .iter()
+                .map(|&id| GatewayChainChoice {
+                    id,
+                    name: railgun_ui::chain_name(id)
+                        .map_or_else(|| format!("Chain {id}"), str::to_owned),
+                })
+                .collect(),
+            permissions: self.ui_peers.get(&session).map_or_else(Vec::new, |peer| {
+                let peer = alloy::hex::encode(peer.to_bytes());
+                self.permissions()
+                    .into_iter()
+                    .filter(|permission| permission.paired_peer_id == peer)
+                    .map(|permission| super::GatewaySitePermission {
+                        permission_id: permission.permission_id,
+                        origin: permission.url,
+                        account_uuid: permission.public_account_uuid,
+                        chain_id: permission.chain_id,
+                    })
+                    .collect()
+            }),
+            ui_error: self.ui_errors.get(&session).cloned(),
             pending_connects,
             pending_requests: self.pending_request_summaries(session),
         }

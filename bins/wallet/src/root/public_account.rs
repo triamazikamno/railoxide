@@ -62,10 +62,12 @@ pub(super) use identicon::{
     PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
     public_account_identicon_color, public_account_identicon_pattern,
 };
-#[cfg(test)]
-pub(super) use qr::{PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, public_address_qr_module_range};
 pub(super) use qr::{public_address_qr_payload, render_public_address_qr_dialog_content};
 pub(super) use types::PublicAccountFormState;
+#[cfg(test)]
+pub(super) use ui::public_address::{
+    PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, public_address_qr_module_range,
+};
 
 use super::dialogs::PublicAccountDialogKind;
 use super::participant::{remove_global_participant, remove_scoped_participant};
@@ -415,8 +417,8 @@ impl WalletRoot {
         };
         let Some(view_session) = self.view_session.as_ref() else {
             self.public_accounts.clear();
-            self.publish_gateway_desktop_state();
             self.public_form.selected_account_uuid = None;
+            self.publish_gateway_desktop_state();
             self.sync_walletconnect_account_select(window, cx);
             self.sync_self_broadcast_gas_payer_selects(window, cx);
             self.invalidate_blocked_shield_rescue_rows(cx);
@@ -449,8 +451,8 @@ impl WalletRoot {
                     self.public_inactive_balance_refreshing = false;
                 }
                 self.public_accounts = accounts;
-                self.publish_gateway_desktop_state();
                 self.public_form.selected_account_uuid = selected;
+                self.publish_gateway_desktop_state();
                 self.public_form.next_derived_index = store
                     .next_derived_public_account_index_for_session(view_session.as_ref())
                     .ok();
@@ -526,6 +528,7 @@ impl WalletRoot {
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         self.sync_public_edit_label_input(window, cx);
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 

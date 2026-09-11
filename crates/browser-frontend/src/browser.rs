@@ -6,20 +6,21 @@ use std::{
 
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, ApplicationHandle, AssetSource, Context, Div, Entity,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Window,
     WindowOptions, div, img, prelude::FluentBuilder as _, px, rems, rgb,
 };
+mod public_view;
+use public_view::{HomeForm, PublicView, SitePermission};
+
 use gpui_component::{
-    Disableable as _, Icon, IconName, IndexPath, Root, Sizable as _, Theme,
+    Disableable as _, Icon, IconName, IndexPath, Root, Sizable as _, Theme, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariants as _},
     clipboard::Clipboard,
-    collapsible::Collapsible,
     input::{InputState, OtpInput, OtpState},
     menu::{DropdownMenu as _, PopupMenuItem},
     select::{SearchableVec, Select, SelectItem, SelectState},
-    separator::Separator,
     tag::Tag,
 };
 use ui::{
@@ -33,8 +34,6 @@ use wasm_bindgen::prelude::*;
 
 const SANS: &str = "Inter Variable";
 const MONO: &str = "JetBrains Mono";
-/// Aligns collapsible content with the header label, past the chevron and its gap.
-const SECTION_INDENT: Rems = rems(0.875 + 0.25);
 
 thread_local! {
     static STARTED: Cell<bool> = const { Cell::new(false) };
@@ -140,6 +139,8 @@ pub fn run(
         component_theme.font_family = SANS.into();
         component_theme.mono_font_family = MONO.into();
         component_theme.font_size = theme::APP_TEXT_SIZE;
+        // Extension views have no native title bar.
+        component_theme.sheet.margin_top = px(0.0);
         Theme::sync_base(cx);
         host_stage("first rendered frame");
         if cx
@@ -150,7 +151,8 @@ pub fn run(
                         host_ready();
                     }
                 });
-                cx.new(|cx| Root::new(gateway, window, cx))
+                let view = cx.new(|_| GatewayWindow { gateway });
+                cx.new(|cx| Root::new(view, window, cx))
             })
             .is_err()
         {
@@ -170,12 +172,14 @@ pub fn stop() {
 }
 
 // These are desktop-supplied presentation choices. The desktop validates and commits grants.
+#[derive(Clone, PartialEq, Eq)]
 struct ConnectAccount {
     uuid: String,
     label: String,
     address: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct ChainChoice {
     id: u64,
     name: String,
@@ -201,7 +205,7 @@ struct ConnectRequestForm {
     _subscriptions: Vec<Subscription>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct AccountSelectItem {
     uuid: String,
     label: String,
@@ -246,16 +250,24 @@ fn account_select_row(item: &AccountSelectItem) -> Div {
     div()
         .flex()
         .items_center()
-        .gap_2()
+        .gap_3()
         .min_w_0()
-        .when(!item.label.is_empty(), |row| {
-            row.child(app_text(item.label.clone()).flex_1().min_w_0().truncate())
-        })
+        .w_full()
+        .child(public_view::identicon(&item.address, rems(0.45)))
         .child(
-            app_muted_text(short_address(&item.address))
-                .flex_none()
-                .font_family(MONO)
-                .text_size(px(12.0)),
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(app_button_label(item.title()).truncate())
+                .when(!item.label.is_empty(), |this| {
+                    this.child(
+                        app_button_label(short_address(&item.address))
+                            .font_family(MONO)
+                            .text_color(rgb(theme::TEXT_MUTED)),
+                    )
+                }),
         )
 }
 
@@ -272,6 +284,25 @@ impl SelectItem for ChainSelectItem {
         SharedString::from(self.name.clone())
     }
 
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(public_view::chain_icon(self.id))
+                .child(self.name.clone())
+                .into_any_element(),
+        )
+    }
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(public_view::chain_icon(self.id))
+            .child(self.name.clone())
+    }
     fn value(&self) -> &Self::Value {
         &self.id
     }
@@ -471,7 +502,17 @@ struct GatewayView {
     view: String,
     view_notice: String,
     accounts: Vec<ConnectAccount>,
-    accounts_open: bool,
+    public_view: PublicView,
+    home_form: Option<HomeForm>,
+    chains: Vec<ChainChoice>,
+    permissions: Vec<SitePermission>,
+    current_tab: String,
+    ui_error: String,
+    sites_open: bool,
+    sites_show_all: bool,
+    picker: Option<public_view::AccountPicker>,
+    focus: gpui::FocusHandle,
+    generation: Option<u64>,
     connect_prompts: Vec<ConnectPrompt>,
     connect_form: Option<ConnectRequestForm>,
     pending_requests: Vec<PendingRequest>,
@@ -482,6 +523,8 @@ struct GatewayView {
 
 impl GatewayView {
     fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        public_view::init(cx);
+        let focus = cx.focus_handle();
         let code = cx.new(|cx| OtpState::new(6, window, cx));
         let endpoint = cx.new(|cx| InputState::new(window, cx).placeholder("127.0.0.1:43110"));
         let handle = window.window_handle();
@@ -515,7 +558,7 @@ impl GatewayView {
                         }
                     }
                     if status != "unlocked" {
-                        view.accounts.clear();
+                        view.clear_public_ui(window, cx);
                     }
                     view.status = status;
                     view.configured_endpoint = configured_endpoint;
@@ -543,12 +586,29 @@ impl GatewayView {
             let prompts = connect_prompts(&snapshot);
             let requests = pending_requests(&snapshot);
             let accounts = wallet_accounts(&snapshot);
+            let presentation = PublicView::from_snapshot(&snapshot);
+            let chains = chain_field(&snapshot, "chains");
+            let permissions = public_view::permissions(&snapshot);
+            let current_tab = text_field(&snapshot, "current_tab_origin");
+            let ui_error = text_field(&snapshot, "ui_error");
+            let locked = flag_field(&snapshot, "locked");
+            let generation = chain_id_field(&snapshot, "generation");
             // The window is needed to build the connect screen's select states.
             let _ = app.update_window(handle, |_, window, cx| {
                 let _ = view.update(cx, |view, cx| {
+                    if locked || view.generation != generation {
+                        view.clear_public_ui(window, cx);
+                    }
+                    view.generation = generation;
+                    view.public_view = presentation;
+                    view.chains = chains;
+                    view.permissions = permissions;
+                    view.current_tab = current_tab;
+                    view.ui_error = ui_error;
                     view.connect_prompts = prompts;
                     view.pending_requests = requests;
                     view.accounts = accounts;
+                    view.sync_home_form(window, cx);
                     view.sync_connect_form(window, cx);
                     cx.notify();
                 });
@@ -571,7 +631,17 @@ impl GatewayView {
             view: "popup".into(),
             view_notice: String::new(),
             accounts: Vec::new(),
-            accounts_open: true,
+            public_view: PublicView::default(),
+            home_form: None,
+            chains: Vec::new(),
+            permissions: Vec::new(),
+            current_tab: String::new(),
+            ui_error: String::new(),
+            sites_open: false,
+            sites_show_all: false,
+            picker: None,
+            focus,
+            generation: None,
             connect_prompts: Vec::new(),
             connect_form: None,
             pending_requests: Vec::new(),
@@ -592,23 +662,26 @@ impl GatewayView {
         }
     }
 
-    fn render_header(&self) -> impl IntoElement {
+    fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let (label, color) = self.transport_tag();
         let selected_view = self.view.clone();
         let takeover = self.takeover;
         let metamask = self.metamask;
         div()
             .flex()
+            .flex_none()
             .items_center()
-            .gap_3()
-            .child(img("railoxide/logo.svg").size(px(32.0)).flex_none())
+            .gap_2()
+            .child(img("railoxide/logo.svg").size_8().flex_none())
             .child(
-                img("railoxide/wordmark.svg")
-                    .w(px(154.0))
-                    .h(px(21.3))
-                    .flex_none(),
+                div().flex_1().min_w_0().child(
+                    img("railoxide/wordmark.svg")
+                        .w_full()
+                        .max_w(px(154.0))
+                        .h(px(21.3))
+                        .object_fit(gpui::ObjectFit::Contain),
+                ),
             )
-            .child(div().flex_1().min_w_0())
             .child(
                 div().flex().flex_none().child(
                     Tag::custom(
@@ -621,6 +694,9 @@ impl GatewayView {
                     .child(label),
                 ),
             )
+            .when(self.status == "unlocked", |this| {
+                this.child(self.render_sites_button(cx))
+            })
             .child(
                 Button::new("gateway-settings")
                     .ghost()
@@ -772,14 +848,14 @@ impl GatewayView {
             )
     }
 
-    fn render_locked(&self) -> Div {
+    fn render_locked(&self, cx: &Context<'_, Self>) -> Div {
         div()
             .flex()
             .flex_col()
             .gap_4()
             .flex_1()
             .min_w_0()
-            .children(self.render_pending_requests())
+            .children(self.render_pending_requests(cx))
             .child(
                 div()
                     .flex_1()
@@ -797,123 +873,18 @@ impl GatewayView {
     }
 
     fn render_connected(&self, cx: &Context<'_, Self>) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .flex_1()
-            .min_w_0()
-            .children(self.render_pending_requests())
-            .when(!self.pending_requests.is_empty(), |this| {
-                this.child(summon_desktop_button())
-            })
-            .child(self.render_accounts(cx))
-    }
-
-    fn render_accounts(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let count = self.accounts.len();
-        let mut content = div().min_w_0().pl(SECTION_INDENT).flex().flex_col();
-        if self.accounts.is_empty() {
-            content = content.child(note("No public accounts in the active wallet."));
+        if self.sites_open {
+            self.render_sites(cx)
+        } else {
+            self.render_home(cx)
         }
-        for (index, account) in self.accounts.iter().enumerate() {
-            let short = short_address(&account.address);
-            let name = if account.label.is_empty() {
-                short.clone()
-            } else {
-                account.label.clone()
-            };
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .py_1p5()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(app_text(name).flex_1().min_w_0().truncate())
-                            .child(
-                                Clipboard::new(SharedString::from(format!(
-                                    "copy-{}",
-                                    account.uuid
-                                )))
-                                .value(account.address.clone())
-                                .tooltip("Copy address"),
-                            ),
-                    )
-                    .child(
-                        app_muted_text(short)
-                            .font_family(MONO)
-                            .text_size(theme::ACCOUNT_ADDRESS_TEXT_SIZE)
-                            .text_color(rgb(theme::TEXT_SUBTLE)),
-                    ),
-            );
-            if index + 1 < count {
-                content = content.child(Separator::horizontal());
-            }
-        }
-        Collapsible::new()
-            .open(self.accounts_open)
-            .w_full()
-            .min_w_0()
-            .gap_3()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        app_button_base("public-accounts-toggle")
-                            .text()
-                            .small()
-                            .compact()
-                            .flex_1()
-                            .min_w_0()
-                            .accessibility_label("Public accounts")
-                            .icon(if self.accounts_open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        app_button_label("Public accounts")
-                                            .text_color(rgb(theme::TEXT))
-                                            .font_weight(FontWeight::SEMIBOLD),
-                                    )
-                                    .when(count > 0, |this| {
-                                        this.child(
-                                            app_button_label(format!("({count})"))
-                                                .text_color(rgb(theme::TEXT_MUTED)),
-                                        )
-                                    }),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.accounts_open = !this.accounts_open;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .content(content)
     }
 
     /// Rebuilds the connect screen's selects whenever the leading prompt offers different choices.
     fn sync_connect_form(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(prompt) = self.connect_prompts.first() else {
             self.connect_form = None;
+            self.picker = None;
             return;
         };
         let account_uuids: Vec<String> = prompt
@@ -929,6 +900,7 @@ impl GatewayView {
         }) {
             return;
         }
+        self.picker = None;
         let request_id = prompt.request_id.clone();
         let accounts: Vec<AccountSelectItem> = prompt
             .accounts
@@ -948,7 +920,15 @@ impl GatewayView {
             })
             .collect();
         let default_chain_id = prompt.default_chain_id;
-        let account_index = (!accounts.is_empty()).then(|| IndexPath::default().row(0));
+        let account_index = (!accounts.is_empty()).then(|| {
+            IndexPath::default().row(
+                self.public_view
+                    .selected_account
+                    .as_ref()
+                    .and_then(|id| accounts.iter().position(|account| &account.uuid == id))
+                    .unwrap_or_default(),
+            )
+        });
         let chain_index = (!chains.is_empty()).then(|| {
             IndexPath::default().row(
                 default_chain_id
@@ -996,6 +976,9 @@ impl GatewayView {
         let Some(prompt) = self.connect_prompts.first() else {
             return div();
         };
+        if self.picker.is_some() && !prompt.needs_unlock {
+            return self.render_account_picker(cx);
+        }
         let queued = self.connect_prompts.len();
         let form = self.connect_form.as_ref();
         let ready = form.is_some_and(|form| {
@@ -1063,15 +1046,7 @@ impl GatewayView {
                         .gap_1()
                         .min_w_0()
                         .child(note("Account"))
-                        .child(match form {
-                            Some(form) => Select::new(&form.account)
-                                .w_full()
-                                .placeholder("No public accounts in the active wallet")
-                                .search_placeholder("Search accounts")
-                                .menu_width(px(360.0))
-                                .into_any_element(),
-                            None => unavailable_select().into_any_element(),
-                        }),
+                        .child(self.render_connect_account(cx)),
                 )
                 .child(
                     div()
@@ -1082,6 +1057,7 @@ impl GatewayView {
                         .child(note("Network"))
                         .child(match form {
                             Some(form) => Select::new(&form.chain)
+                                .accessibility_label("Network")
                                 .w_full()
                                 .search_placeholder("Search networks")
                                 .into_any_element(),
@@ -1125,31 +1101,6 @@ impl GatewayView {
                         .into_any_element()
                 }),
         )
-    }
-
-    fn render_pending_requests(&self) -> Vec<Div> {
-        self.pending_requests
-            .iter()
-            .map(|request| {
-                let mut row = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(theme::SURFACE))
-                    .child(request.url.clone());
-                if request.needs_unlock {
-                    row = row.child("Unlock the desktop wallet to review this request.");
-                } else {
-                    if let Some(summary) = &request.summary {
-                        row = row.child(summary.clone());
-                    }
-                    row = row.child("Review and approve this request in desktop.");
-                }
-                row
-            })
-            .collect()
     }
 }
 
@@ -1210,6 +1161,21 @@ fn summon_desktop_button() -> Button {
         .on_click(|_, _, _| host_command("summon_desktop", ""))
 }
 
+struct GatewayWindow {
+    gateway: Entity<GatewayView>,
+}
+
+impl Render for GatewayWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .size_full()
+            .child(self.gateway.clone())
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
+    }
+}
+
 impl Render for GatewayView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let connecting = self.paired
@@ -1219,7 +1185,7 @@ impl Render for GatewayView {
             self.render_connect_request(cx)
         } else if self.paired {
             match self.status.as_str() {
-                "locked" => self.render_locked(),
+                "locked" => self.render_locked(cx),
                 "paired" | "unlocked" => self.render_connected(cx),
                 _ => self.render_unreachable(cx),
             }
@@ -1228,8 +1194,16 @@ impl Render for GatewayView {
         };
         div()
             .id("gateway-scroll")
+            .track_focus(&self.focus)
+            .key_context("GatewayView")
+            .on_action(cx.listener(|this, _: &public_view::Back, window, cx| {
+                this.navigate_back(window, cx);
+            }))
+            .relative()
             .size_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .min_h_0()
             .font_family(SANS)
             .text_size(theme::APP_TEXT_SIZE)
             .bg(rgb(theme::BACKGROUND))
@@ -1238,16 +1212,24 @@ impl Render for GatewayView {
                 div()
                     .w_full()
                     .min_w(px(0.0))
-                    .min_h_full()
+                    .h_full()
+                    .min_h_0()
                     .flex()
                     .flex_col()
                     .gap_4()
                     .p_4()
-                    .child(self.render_header())
+                    .child(self.render_header(cx))
                     .when(!self.view_notice.is_empty(), |this| {
                         this.child(note(self.view_notice.clone()))
                     })
-                    .child(body),
+                    .child(
+                        div()
+                            .id("gateway-content")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(div().min_h_full().flex().flex_col().child(body)),
+                    ),
             )
     }
 }

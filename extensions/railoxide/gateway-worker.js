@@ -3,6 +3,7 @@ import { configuration } from './gateway-config.js';
 import { createPageBridge } from './gateway-page-bridge.js';
 
 const ports = new Set();
+const tabContexts = new Map();
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const now = () => BigInt(Math.floor(performance.now()));
@@ -20,9 +21,9 @@ let providerPreferences = { takeover: false, metamask: false };
 let view = 'popup';
 let viewError = false;
 let paired = false;
-const visiblePanels = new Set();
-function panelVisible() {
-  return [...visiblePanels].some(port => ports.has(port));
+const visibleViews = new Set();
+function walletViewVisible() {
+  return [...visibleViews].some(port => ports.has(port));
 }
 async function applyView(value) {
   await chrome.action.setPopup({ popup: value === 'sidepanel' ? '' : 'index.html' });
@@ -47,7 +48,7 @@ let notificationDiscovered = false;
 // Retain only identities so redaction neither closes the window nor resets dismissal.
 let notificationPending = [];
 function wantsNotification() {
-  return notificationPending.length > 0 && !panelVisible();
+  return notificationPending.length > 0 && !walletViewVisible();
 }
 async function removeNotification(window) {
   const contexts = await chrome.runtime.getContexts({ documentUrls: [notificationUrl] });
@@ -119,9 +120,37 @@ function publishSnapshot(snapshot, authoritative = true) {
   uiSnapshot = snapshot;
   updateNotification(false, authoritative);
   for (const port of ports) {
-    try { port.postMessage(snapshot); } catch { ports.delete(port); }
+    try { port.postMessage(snapshotFor(port)); } catch { ports.delete(port); tabContexts.delete(port); }
   }
 }
+function snapshotFor(port) {
+  const tab = uiSnapshot.locked ? null : tabContexts.get(port)?.tab;
+  return { ...uiSnapshot, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
+}
+async function updateTab(port) {
+  const context = tabContexts.get(port);
+  if (!context) return;
+  const revision = ++context.revision;
+  context.tab = null;
+  port.postMessage(snapshotFor(port));
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId: context.windowId });
+    if (!Number.isInteger(tab?.id)) return;
+    const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
+    if (tabContexts.get(port) !== context || context.revision !== revision ||
+        frame?.documentLifecycle !== 'active' || !frame.documentId) return;
+    const url = new URL(frame.url);
+    if (!['http:', 'https:'].includes(url.protocol)) return;
+    context.tab = { id: tab.id, documentId: frame.documentId, origin: url.origin, token: crypto.randomUUID() };
+    port.postMessage(snapshotFor(port));
+  } catch { /* A closed tab or a browser page has no connect action. */ }
+}
+function updateTabs() {
+  for (const port of tabContexts.keys()) void updateTab(port);
+}
+chrome.tabs?.onActivated?.addListener(updateTabs);
+chrome.webNavigation.onCommitted.addListener(event => { if (event.frameId === 0) updateTabs(); });
+chrome.tabs?.onRemoved?.addListener(updateTabs);
 function purgeSnapshot(authoritative = true) {
   publishSnapshot({ type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] }, authoritative);
 }
@@ -306,8 +335,11 @@ async function receive(session, bytes) {
       if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
       if (message.locked && (message.accounts.length ||
-          message.pending_connects.some(prompt => prompt.accounts?.length))) return;
-      publishSnapshot({ ...message, pending_requests: message.pending_requests.map(request => ({
+          message.pending_connects.some(prompt => prompt.accounts?.length) ||
+          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.permissions?.length)) return;
+      publishSnapshot({ ...message, public_view: message.locked ? null : message.public_view,
+        permissions: message.locked ? [] : (message.permissions ?? []),
+        ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
         request_id: request.request_id, url: request.url,
         needs_unlock: message.locked || request.needs_unlock,
         summary: message.locked || request.needs_unlock ? null : request.summary,
@@ -453,19 +485,69 @@ chrome.runtime.onConnect.addListener(port => {
       !['', '?mode=window', '?mode=notification', '?mode=sidepanel'].includes(url.search) || url.hash) { port.disconnect(); return; }
   ports.add(port);
   if (url.search === '?mode=notification') updateNotification(true);
-  port.postMessage(uiSnapshot);
+  port.postMessage(snapshotFor(port));
   port.postMessage(stateMessage());
   port.onDisconnect.addListener(() => {
     ports.delete(port); // Documents never own the socket.
-    if (visiblePanels.delete(port)) updateNotification();
+    tabContexts.delete(port);
+    if (visibleViews.delete(port)) updateNotification();
   });
   port.onMessage.addListener(message => {
     if (!ports.has(port) || !message || typeof message.type !== 'string') return;
-    if (message.type === 'sidepanel_presence') {
-      if (url.search !== '?mode=sidepanel' || message.ready !== true || typeof message.visible !== 'boolean') return;
-      if (message.visible) visiblePanels.add(port);
-      else visiblePanels.delete(port);
+    if (message.type === 'sidepanel_presence' || message.type === 'popup_presence') {
+      const expectedSearch = message.type === 'sidepanel_presence' ? '?mode=sidepanel' : '';
+      if (url.search !== expectedSearch || message.ready !== true || typeof message.visible !== 'boolean') return;
+      if (message.visible) visibleViews.add(port);
+      else visibleViews.delete(port);
       updateNotification(message.visible);
+      return;
+    }
+    if (message.type === 'tab_context' && Number.isInteger(message.window_id) && message.window_id >= 0) {
+      tabContexts.set(port, { windowId: message.window_id, tab: null, revision: 0 });
+      void updateTab(port);
+      return;
+    }
+    if (message.type === 'public_view') {
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || session.locked ||
+          message.generation !== session.generation || uiSnapshot.generation !== session.generation) return;
+      const input = message.command;
+      if (!input || typeof input.type !== 'string') return;
+      let value;
+      if (input.type === 'select_account' && uiSnapshot.accounts.some(account => account.uuid === input.public_account_uuid)) {
+        value = { type: input.type, public_account_uuid: input.public_account_uuid };
+      } else if (input.type === 'select_chain' && uiSnapshot.chains?.some(chain => chain.id === input.chain_id)) {
+        value = { type: input.type, chain_id: input.chain_id };
+      } else if (input.type === 'refresh_balances') {
+        value = { type: input.type };
+      } else if (['revoke_permission', 'reissue_permission'].includes(input.type) &&
+          uiSnapshot.permissions?.some(permission => permission.permission_id === input.permission_id)) {
+        value = { type: input.type, permission_id: input.permission_id };
+        if (input.type === 'reissue_permission') {
+          if (!uiSnapshot.accounts.some(account => account.uuid === input.public_account_uuid)) return;
+          value.public_account_uuid = input.public_account_uuid;
+        }
+      } else if (input.type === 'connect_tab') {
+        const context = tabContexts.get(port);
+        const tab = context?.tab;
+        if (!tab || tab.token !== message.tab_token) return;
+        const generation = session.generation;
+        const stillCurrent = () => ports.has(port) && tabContexts.get(port) === context && context.tab === tab &&
+          current(session) && session.generation === generation && !session.locked;
+        void chrome.tabs.query({ active: true, windowId: context.windowId }).then(([active]) => {
+          if (active?.id !== tab.id || !stillCurrent()) return false;
+          return pageBridge.connectTab(tab.id, tab.documentId, tab.origin, stillCurrent);
+        }).then(sent => {
+          if (!sent && stillCurrent()) {
+            port.postMessage({ ...snapshotFor(port), ui_error: 'This tab is not ready to connect. Reload the page and try again.' });
+          }
+        }).catch(() => {});
+        return;
+      }
+      if (value) {
+        try { command(session, { type: 'public_view', version: 1, generation: session.generation, command: value }); }
+        catch { failed(session, 'disconnected', true); }
+      }
       return;
     }
     const viewRequest = message.type === 'preferences' && message.key === 'view' && ['popup', 'sidepanel'].includes(message.value);

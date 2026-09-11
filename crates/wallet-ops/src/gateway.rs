@@ -13,7 +13,10 @@ pub use provider::{
 };
 mod storage;
 mod ui;
-pub use ui::{GatewayPendingRequest, GatewayUiEvent, GatewayUiEventKind};
+pub use ui::{
+    GatewayAccountBalances, GatewayAssetBalance, GatewayPendingRequest, GatewayPublicCommand,
+    GatewayPublicView, GatewaySitePermission, GatewayUiEvent, GatewayUiEventKind,
+};
 
 pub use dapp_gateway_protocol::{PairingCode, PeerId};
 pub mod policy;
@@ -92,6 +95,11 @@ pub struct GatewayPairingOffer {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayClientMessage {
+    PublicView {
+        version: u16,
+        generation: u64,
+        command: GatewayPublicCommand,
+    },
     GetState {
         version: u16,
     },
@@ -173,6 +181,10 @@ pub enum GatewayServerMessage {
         generation: u64,
         locked: bool,
         accounts: Vec<GatewayAccountChoice>,
+        public_view: GatewayPublicView,
+        chains: Vec<GatewayChainChoice>,
+        permissions: Vec<GatewaySitePermission>,
+        ui_error: Option<String>,
         pending_connects: Vec<GatewayConnectPrompt>,
         pending_requests: Vec<GatewayPendingRequest>,
     },

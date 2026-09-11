@@ -1,4 +1,5 @@
 use super::*;
+use crate::gateway::{GatewayAccountBalances, GatewayPublicCommand, GatewayPublicView};
 use crate::vault::{KdfParams, PublicAccountStatus, WalletSource};
 use local_db::{DbConfig, DbStore};
 
@@ -423,18 +424,195 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
     inactive.status = PublicAccountStatus::Inactive;
     let mut wallet = state(&view);
     wallet.public_accounts = vec![active.clone(), inactive];
-    provider.update_wallet(wallet, 2);
+    wallet.public_view = GatewayPublicView {
+        selected_account: Some(active.public_account_uuid.clone()),
+        selected_chain: Some(10),
+        balances: vec![GatewayAccountBalances {
+            account_uuid: active.public_account_uuid.clone(),
+            total: None,
+            assets: Vec::new(),
+        }],
+        ..GatewayPublicView::default()
+    };
+    provider.update_wallet(wallet.clone(), 2);
     provider.push_ui(1);
+    let unlocked = messages(&mut provider);
     assert_eq!(
-        snapshot(&messages(&mut provider))["accounts"],
+        snapshot(&unlocked)["public_view"],
+        serde_json::to_value(&wallet.public_view).unwrap()
+    );
+    assert_eq!(
+        snapshot(&unlocked)["accounts"],
         json!([{
             "uuid": active.public_account_uuid,
             "label": active.label,
             "address": active.address.to_string(),
         }])
     );
-    provider.update_wallet(GatewayWalletState::default(), 3);
-    assert_eq!(snapshot(&messages(&mut provider))["accounts"], json!([]));
+    // A caller retaining presentation when the view closes cannot disclose it.
+    wallet.view = None;
+    provider.update_wallet(wallet, 3);
+    let locked = messages(&mut provider);
+    assert_eq!(snapshot(&locked)["accounts"], json!([]));
+    assert_eq!(
+        snapshot(&locked)["public_view"],
+        serde_json::to_value(GatewayPublicView::default()).unwrap()
+    );
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn public_view_commands_preserve_selection_and_scope_permission_edits_to_the_peer() {
+    let (path, mut provider, view) = fixture();
+    let peer = PeerId::from_bytes([8; 16]);
+    let other_peer = PeerId::from_bytes([9; 16]);
+    let accounts = provider
+        .store
+        .list_public_accounts_for_session(&view, false)
+        .unwrap();
+    let first = accounts[0].clone();
+    let second = provider
+        .store
+        .import_public_account(
+            PASSWORD,
+            &view,
+            "0x0000000000000000000000000000000000000000000000000000000000000007",
+            Some("Another account"),
+            false,
+        )
+        .unwrap();
+    let mut wallet = state(&view);
+    wallet.public_accounts = vec![first.clone(), second.clone()];
+    wallet.public_view.selected_account = Some(first.public_account_uuid.clone());
+    wallet.public_view.selected_chain = Some(1);
+    provider.update_wallet(wallet, 2);
+    provider
+        .register(1, peer, "doc".to_owned(), "https://example.invalid/")
+        .unwrap();
+    provider.attach_ui_peer(2, other_peer);
+    messages(&mut provider);
+
+    provider.public_command(
+        1,
+        peer,
+        2,
+        GatewayPublicCommand::ConnectTab {
+            document: "doc".to_owned(),
+        },
+    );
+    let pending = messages(&mut provider);
+    let approval = prompt(&pending)["request_id"].as_str().unwrap().to_owned();
+    provider.resolve_connect(
+        1,
+        peer,
+        &approval,
+        Some(&second.public_account_uuid),
+        10,
+        Instant::now(),
+    );
+    messages(&mut provider);
+    assert_eq!(
+        provider.wallet.public_view.selected_account.as_deref(),
+        Some(first.public_account_uuid.as_str())
+    );
+    let permission = provider.permissions()[0].clone();
+    assert_eq!(
+        serde_json::to_value(provider.ui(2)).unwrap()["permissions"],
+        json!([])
+    );
+
+    for (caller, generation) in [(other_peer, 2), (peer, 1)] {
+        provider.public_command(
+            2,
+            caller,
+            generation,
+            GatewayPublicCommand::RevokePermission {
+                permission_id: permission.permission_id.clone(),
+            },
+        );
+        assert_eq!(provider.permissions().len(), 1);
+    }
+    provider.public_command(
+        1,
+        peer,
+        2,
+        GatewayPublicCommand::ReissuePermission {
+            permission_id: permission.permission_id,
+            public_account_uuid: first.public_account_uuid.clone(),
+        },
+    );
+    let updated = messages(&mut provider);
+    assert!(
+        updated
+            .iter()
+            .any(|(_, value)| value["type"] == "provider_state"
+                && value["accounts"] == json!([first.address.to_string()]))
+    );
+    assert_eq!(provider.permissions()[0].chain_id, 10);
+    assert_eq!(
+        provider.store.list_gateway_permissions(&view).unwrap()[0].public_account_uuid,
+        first.public_account_uuid
+    );
+
+    assert!(
+        provider
+            .public_command(
+                1,
+                peer,
+                1,
+                GatewayPublicCommand::SelectAccount {
+                    public_account_uuid: second.public_account_uuid.clone()
+                }
+            )
+            .is_none()
+    );
+    assert!(matches!(
+        provider.public_command(
+            1,
+            peer,
+            2,
+            GatewayPublicCommand::SelectAccount {
+                public_account_uuid: second.public_account_uuid
+            }
+        ),
+        Some(GatewayPublicCommand::SelectAccount { .. })
+    ));
+    assert_eq!(provider.permissions()[0].chain_id, 10);
+    invalidate_authority(&provider, true);
+    assert!(
+        provider
+            .public_command(
+                1,
+                peer,
+                2,
+                GatewayPublicCommand::SelectChain { chain_id: 10 }
+            )
+            .is_none()
+    );
+    provider.update_wallet(provider.wallet.clone(), 2);
+    provider.public_command(
+        1,
+        peer,
+        2,
+        GatewayPublicCommand::RevokePermission {
+            permission_id: provider.permissions()[0].permission_id.clone(),
+        },
+    );
+    let revoked = messages(&mut provider);
+    assert!(
+        revoked
+            .iter()
+            .any(|(_, value)| value["type"] == "provider_state" && value["accounts"] == json!([]))
+    );
+    assert!(
+        provider
+            .store
+            .list_gateway_permissions(&view)
+            .unwrap()
+            .is_empty()
+    );
     drop(provider);
     drop(view);
     std::fs::remove_dir_all(path).unwrap();

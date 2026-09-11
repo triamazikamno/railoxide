@@ -2798,7 +2798,6 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
-        self.publish_gateway_desktop_state();
         self.invalidate_proposals_chain(chain_id);
         self.invalidate_governance_context();
         self.ui_state.last_chain_id = Some(chain_id);
@@ -2812,9 +2811,10 @@ impl WalletRoot {
         self.local_pending_spent_clear_confirming = false;
         self.clear_public_chain_balance_state();
         self.sync_utxo_table(cx);
-        if self.active_wallet_tab == WalletTab::Public {
+        if self.active_wallet_tab == WalletTab::Public || self.gateway_has_connected_browser() {
             self.schedule_public_balance_refresh(cx);
         }
+        self.publish_gateway_desktop_state();
         if should_focus_utxo_table(
             self.active_activity,
             self.active_wallet_tab,

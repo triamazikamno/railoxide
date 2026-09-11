@@ -922,6 +922,24 @@ impl Actor {
                 let command = serde_json::from_slice::<GatewayClientMessage>(&message);
                 Self::trace_extension_command(id, command.as_ref().ok());
                 match command {
+                    Ok(GatewayClientMessage::PublicView {
+                        version: 1,
+                        generation,
+                        command,
+                    }) => {
+                        if let Some(command) = self.provider.public_command(
+                            id,
+                            session.peer().ok_or(GatewayError::Unavailable)?,
+                            generation,
+                            command,
+                        ) {
+                            self.emit_ui_event(
+                                id,
+                                generation,
+                                super::GatewayUiEventKind::PublicView(command),
+                            );
+                        }
+                    }
                     Ok(GatewayClientMessage::GetState { version: 1 }) => {
                         session.application(self.state())?;
                     }
@@ -1055,7 +1073,8 @@ impl Actor {
             self.record_peer_activity(session.peer().ok_or(GatewayError::Unavailable)?);
             tracing::debug!(session_id = id, "gateway session authenticated");
             session.application(self.state())?;
-            self.provider.push_ui(id);
+            self.provider
+                .attach_ui_peer(id, session.peer().ok_or(GatewayError::Unavailable)?);
             session.heartbeat = Instant::now() + HEARTBEAT;
         }
         Ok(())
@@ -1071,6 +1090,7 @@ impl Actor {
             return;
         };
         let (command, version) = match message {
+            GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
             GatewayClientMessage::GetState { version } => ("get_state", version),
             GatewayClientMessage::Heartbeat { version } => ("heartbeat", version),
             GatewayClientMessage::RegisterDocument { version, .. } => {
@@ -1396,14 +1416,31 @@ mod integration_tests {
         generation: u64,
         locked: bool,
     ) {
+        let mut snapshot = state(socket, protocol).await;
+        // Unlocked transport fixtures can already have networks and saved grants.
+        // Provider tests cover their contents; this helper verifies idle/redacted UI.
+        if locked {
+            assert_eq!(snapshot["chains"], serde_json::json!([]));
+            assert_eq!(snapshot["permissions"], serde_json::json!([]));
+        }
+        snapshot.as_object_mut().unwrap().remove("chains");
+        snapshot.as_object_mut().unwrap().remove("permissions");
         assert_eq!(
-            state(socket, protocol).await,
+            snapshot,
             serde_json::json!({
                 "type": "ui_snapshot",
                 "version": 1,
                 "generation": generation,
                 "locked": locked,
                 "accounts": [],
+                "public_view": {
+                    "selected_account": null,
+                    "selected_chain": null,
+                    "balances": [],
+                    "refreshing": false,
+                    "balance_error": false,
+                },
+                "ui_error": null,
                 "pending_connects": [],
                 "pending_requests": [],
             })
@@ -1799,6 +1836,9 @@ mod integration_tests {
             revoked["document_generation"].as_u64().unwrap()
                 > granted_state["document_generation"].as_u64().unwrap()
         );
+        let revoked_ui = state(&mut connection, &mut protocol).await;
+        assert_eq!(revoked_ui["type"], "ui_snapshot");
+        assert_eq!(revoked_ui["permissions"], serde_json::json!([]));
         application(&mut connection, &mut protocol, serde_json::json!({"type":"register_document","version":1,"document":"page","url":"https://other.invalid/"})).await;
         let retired = tokio::time::timeout(Duration::from_secs(5), connection.next())
             .await

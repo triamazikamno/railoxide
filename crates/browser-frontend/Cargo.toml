@@ -9,6 +9,9 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+alloy = { workspace = true }
+railgun-ui = { path = "../railgun-ui" }
+serde_json = { workspace = true }
 gpui = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-component = { workspace = true }
