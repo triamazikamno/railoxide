@@ -82,6 +82,90 @@ fn enqueue(session: &mut Session<DuplexStream>, provider: &mut DappProvider, id:
 }
 
 #[tokio::test]
+async fn small_output_finishes_before_the_next_wallet_transition() {
+    for snapshot in [false, true] {
+        let (path, mut provider, view) = fixture();
+        let (mut writer, mut client, mut protocol) = session().await;
+        provider.attach_ui_peer(1, PeerId::from_bytes([8; 16]));
+        if snapshot {
+            let (_, delivery) = provider
+                .drain()
+                .into_iter()
+                .find(|(_, delivery)| {
+                    matches!(delivery.message, GatewayServerMessage::UiSnapshot { .. })
+                })
+                .unwrap();
+            writer.deliver(delivery).unwrap();
+        } else {
+            writer
+                .application(GatewayServerMessage::State {
+                    version: 1,
+                    generation: 1,
+                    locked: false,
+                    wallet_transition: false,
+                })
+                .unwrap();
+        }
+        // A ready socket must commit its small message before another actor turn.
+        poll_fn(|cx| writer.poll_output(1, &provider, cx))
+            .await
+            .unwrap();
+        invalidate_authority(&provider, true);
+        let heartbeat = protocol
+            .seal_message(br#"{"type":"heartbeat","version":1}"#)
+            .unwrap();
+        for frame in heartbeat {
+            client.send(Message::Binary(frame.into())).await.unwrap();
+        }
+        let mut sessions = HashMap::from([(1, writer)]);
+        let mut cursor = ProgressCursor::default();
+        let Progress::Incoming(1, Some(Ok(Message::Binary(input)))) =
+            poll_fn(|cx| cursor.poll(&mut sessions, &mut provider, cx)).await
+        else {
+            panic!("live input must survive the wallet transition");
+        };
+        let mut writer = sessions.remove(&1).unwrap();
+        let input = writer
+            .protocol
+            .as_mut()
+            .unwrap()
+            .receive_frame(&input, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&input).unwrap()["type"],
+            "heartbeat"
+        );
+        provider.update_wallet(GatewayWalletState::default(), 2);
+        writer
+            .application(GatewayServerMessage::State {
+                version: 1,
+                generation: 2,
+                locked: true,
+                wallet_transition: true,
+            })
+            .unwrap();
+        writer
+            .application(GatewayServerMessage::Heartbeat { version: 1 })
+            .unwrap();
+        let ((), messages) = tokio::join!(flush_output(&mut writer, 1, &mut provider), async {
+            let mut messages = Vec::new();
+            for _ in 0..3 {
+                messages.push(receive(&mut client, &mut protocol).await);
+            }
+            messages
+        });
+        assert_eq!(messages[0]["generation"], 1);
+        assert_eq!(messages[1]["generation"], 2);
+        assert_eq!(messages[1]["locked"], true);
+        assert_eq!(messages[2]["type"], "heartbeat");
+        drop(provider);
+        drop(view);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn fragmented_output_yields_to_invalidation_and_another_session() {
     for invalidation in [
         "none",
@@ -123,11 +207,9 @@ async fn fragmented_output_yields_to_invalidation_and_another_session() {
         };
         writer.deliver(delivery).unwrap();
         // Flush one complete fragment, then stop consuming the socket.
-        for _ in 0..3 {
-            poll_fn(|cx| writer.poll_output(1, &provider, cx))
-                .await
-                .unwrap();
-        }
+        poll_fn(|cx| writer.poll_output(1, &provider, cx))
+            .await
+            .unwrap();
         let Message::Binary(first) = client.next().await.unwrap().unwrap() else {
             panic!("first fragment");
         };
@@ -294,6 +376,14 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
     for authority_only in [false, true] {
         let (path, mut provider, view) = fixture();
         let (peer, _) = authorize(&mut provider, &view, "http://127.0.0.1:1".parse().unwrap());
+        provider.attach_ui_peer(1, peer);
+        let mut wallet = provider.authority().borrow().clone();
+        wallet.private_view_supported = true;
+        wallet.private_view = Some(crate::gateway::GatewayPrivateView {
+            total: Some("synthetic-private-total".into()),
+            ..Default::default()
+        });
+        provider.update_wallet(wallet, 2);
         provider
             .register(
                 1,
@@ -321,6 +411,7 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
             .application(GatewayServerMessage::State {
                 version: 1,
                 locked: false,
+                wallet_transition: false,
                 generation: 2,
             })
             .unwrap();
@@ -370,6 +461,7 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
                 }
                 if message["type"] == "ui_snapshot" {
                     assert_eq!(message["locked"], true);
+                    assert!(message["private_view"].is_null());
                     assert_eq!(message["accounts"], json!([]));
                     for prompt in message["pending_connects"].as_array().unwrap() {
                         assert_eq!(prompt["accounts"], json!([]));

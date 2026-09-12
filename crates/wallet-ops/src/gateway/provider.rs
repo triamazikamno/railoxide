@@ -50,6 +50,11 @@ pub struct GatewayUnlockState {
 #[derive(Clone, Default)]
 pub struct GatewayWalletState {
     pub public_view: super::GatewayPublicView,
+    pub private_view_supported: bool,
+    pub private_view: Option<super::GatewayPrivateView>,
+    /// Fences Home selection dispatch without changing dapp grant ownership.
+    pub wallet_selection_generation: u64,
+    pub wallet_transition: bool,
     pub waiting_unlock: GatewayUnlockState,
     pub wallet_switch: Option<GatewayWalletSwitchTransition>,
     pub view: Option<Arc<DesktopViewSession>>,
@@ -85,6 +90,10 @@ impl GatewayWalletState {
     pub fn same_state(&self, other: &Self) -> bool {
         self.same_authority(other)
             && self.public_view == other.public_view
+            && self.private_view_supported == other.private_view_supported
+            && self.private_view == other.private_view
+            && self.wallet_selection_generation == other.wallet_selection_generation
+            && self.wallet_transition == other.wallet_transition
             && self.wallet_switch == other.wallet_switch
             && self.public_accounts == other.public_accounts
             && self.default_chain_id == other.default_chain_id
@@ -314,6 +323,9 @@ impl DappProvider {
             ui_errors: HashMap::new(),
         }
     }
+    pub(super) const fn wallet_transition(&self) -> bool {
+        self.wallet.wallet_transition
+    }
     pub(super) fn retire_sessions(&mut self, live: impl Fn(u64) -> bool) {
         self.ui_snapshots.retain(|session, _| live(*session));
         self.ui_peers.retain(|session, _| live(*session));
@@ -399,8 +411,12 @@ impl DappProvider {
             .collect()
     }
     pub(super) fn update_wallet(&mut self, mut wallet: GatewayWalletState, generation: u64) {
+        if !wallet.private_view_supported {
+            wallet.private_view = None;
+        }
         if wallet.view.is_none() {
             wallet.public_view = super::GatewayPublicView::default();
+            wallet.private_view = None;
             self.ui_errors.clear();
             wallet.public_accounts.clear();
             wallet.token_registry = None;
@@ -1611,12 +1627,15 @@ impl DappProvider {
         public_view
             .drafts
             .retain(|draft| peer_id.as_deref() == Some(draft.peer_id.as_str()));
-        GatewayServerMessage::UiSnapshot {
+        let mut message = GatewayServerMessage::UiSnapshot {
             version: 1,
             generation: self.generation,
             locked: self.wallet.view.is_none(),
             accounts: wallet_accounts,
             public_view,
+            private_view_supported: self.wallet.private_view_supported,
+            private_view: peer_id.and_then(|_| self.wallet.private_view.clone().map(Box::new)),
+            wallet_transition: self.wallet.wallet_transition,
             chains: self
                 .wallet
                 .chain_ids
@@ -1643,7 +1662,24 @@ impl DappProvider {
             ui_error: self.ui_errors.get(&session).cloned(),
             pending_connects,
             pending_requests: self.pending_request_summaries(session),
+        };
+        if self.wallet.private_view.is_some()
+            && serde_json::to_vec(&message)
+                .is_ok_and(|bytes| bytes.len() > dapp_gateway_protocol::MAX_MESSAGE_LEN)
+            && let GatewayServerMessage::UiSnapshot {
+                private_view,
+                ui_error,
+                ..
+            } = &mut message
+        {
+            // Retire the entire private observation. A truncated asset list would imply a false total.
+            *private_view = None;
+            *ui_error = Some(
+                "Private wallet data is too large to display. Open the desktop app to continue."
+                    .into(),
+            );
         }
+        message
     }
 }
 const fn valid_id(value: &str) -> bool {

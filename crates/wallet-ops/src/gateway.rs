@@ -4,7 +4,13 @@ mod admission;
 mod balance_reads;
 mod errors;
 pub use errors::{GatewayApprovalFailure, LocalProviderFailure, ProviderRpcError};
+mod private_view;
 mod provider;
+pub use private_view::{
+    GatewayPrivateAsset, GatewayPrivateChainState, GatewayPrivateCommand, GatewayPrivatePending,
+    GatewayPrivatePendingAmount, GatewayPrivatePendingCategory, GatewayPrivateView,
+    GatewayPrivateWallet,
+};
 mod reads;
 pub use provider::{
     GatewayAccountChoice, GatewayApprovalRequest, GatewayChainChoice, GatewayConnectPrompt,
@@ -101,6 +107,11 @@ pub struct GatewayPairingOffer {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayClientMessage {
+    PrivateView {
+        version: u16,
+        generation: u64,
+        command: GatewayPrivateCommand,
+    },
     PublicView {
         version: u16,
         generation: u64,
@@ -156,6 +167,8 @@ pub enum GatewayServerMessage {
         version: u16,
         locked: bool,
         generation: u64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        wallet_transition: bool,
     },
     Heartbeat {
         version: u16,
@@ -188,6 +201,10 @@ pub enum GatewayServerMessage {
         locked: bool,
         accounts: Vec<GatewayAccountChoice>,
         public_view: GatewayPublicView,
+        private_view_supported: bool,
+        private_view: Option<Box<GatewayPrivateView>>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        wallet_transition: bool,
         chains: Vec<GatewayChainChoice>,
         permissions: Vec<GatewaySitePermission>,
         ui_error: Option<String>,

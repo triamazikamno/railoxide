@@ -90,9 +90,15 @@ def package(metadata_path):
         shared_icons = stage / 'assets/ui/icons'
         shared_icons.mkdir(parents=True)
         for name in ('shield', 'arrow-big-right-dash', 'book-user', 'wallet', 'pencil', 'refresh-ccw',
-                     'screen-share', 'monitor', 'qr-code'):
+                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye'):
             path = shared_icons / f'{name}.svg'
             shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
+            asset_paths.append(str(path.relative_to(stage / 'assets')))
+        wallet_icons = stage / 'assets/railgun/icons'
+        wallet_icons.mkdir(parents=True)
+        for name in ('clock.svg', 'ledger-logo-short-white.svg', 'trezor-symbol-white-rgb.svg'):
+            path = wallet_icons / name
+            shutil.copy2(ROOT / 'bins/wallet/assets/icons' / name, path)
             asset_paths.append(str(path.relative_to(stage / 'assets')))
         (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n')
         icons = package_source / 'assets/icons'
@@ -111,6 +117,7 @@ def package(metadata_path):
             mapping.append(f'- `assets/icons/{icon.name}` SHA-256 `{digest}`')
         (stage / 'assets/COMPONENT-SOURCES.md').write_text('\n'.join(mapping) + '\n')
         shutil.copy2(ROOT / 'bins/wallet/assets/icons/SOURCES.md', stage / 'licenses/wallet-icon-SOURCES.md')
+        shutil.copy2(ROOT / 'bins/wallet/assets/icons/lucide-icons-LICENSE.txt', stage / 'licenses/lucide-icons-LICENSE.txt')
         if output.is_symlink():
             raise RuntimeError('Refusing to replace a symlink at target/browser-extension')
         if output.exists():

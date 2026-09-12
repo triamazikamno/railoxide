@@ -13,4 +13,7 @@ pub mod style;
 pub mod table;
 pub mod theme;
 
+pub mod private_assets;
 pub mod public_address;
+pub mod wallet_balance;
+pub mod wallet_identity;

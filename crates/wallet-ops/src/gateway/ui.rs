@@ -81,6 +81,9 @@ pub struct GatewayPendingRequest {
 pub enum GatewayUiEventKind {
     SummonDesktop,
     UserActivity,
+    PrivateView {
+        command: super::GatewayPrivateCommand,
+    },
     PublicView {
         peer_id: String,
         command: GatewayPublicCommand,
@@ -100,6 +103,8 @@ impl GatewayUiEvent {
     pub fn is_current(&self, wallet: &GatewayWalletState, generation: u64) -> bool {
         self.generation == generation
             && self.wallet.same_authority(wallet)
+            && (!matches!(self.kind, GatewayUiEventKind::PrivateView { .. })
+                || self.wallet.wallet_selection_generation == wallet.wallet_selection_generation)
             && self.control.ensure_current().is_ok()
     }
 }

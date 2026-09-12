@@ -95,11 +95,16 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.gateway.private_hardware_selection_pending {
+            self.gateway.private_hardware_selection_pending = false;
+            self.gateway.private_selection_message = Some("Wallet selection cancelled.");
+        }
         self.abandon_gateway_unlock_dialog(gateway_unlock);
         self.next_hardware_profile_action_generation();
         self.manage_wallets.finish_hardware_delete_unlock_dialog();
         dismiss_hardware_profile_unlock_state(&mut self.hardware_profile_unlock);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 

@@ -103,3 +103,61 @@ pub fn render_public_address_qr_code(payload: &str, module_size: Pixels) -> gpui
 pub const fn public_address_qr_module_range(qr_size: i32) -> Range<i32> {
     -PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES..qr_size + PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES
 }
+
+/// Complete Receive content. The owner validates the live identity immediately before copying.
+#[must_use]
+pub fn receive_address(
+    label: Option<gpui::SharedString>,
+    address: gpui::SharedString,
+    warning: Option<gpui::SharedString>,
+    copy_id: gpui::SharedString,
+    module_size: Pixels,
+    on_copy: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Div {
+    use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+    use gpui_component::{IconName, button::ButtonVariants as _};
+    let on_copy = std::rc::Rc::new(on_copy);
+    let row_copy = on_copy.clone();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_4()
+        .children(warning.map(|text| crate::controls::app_muted_text(text).w_full()))
+        .children(label.map(crate::controls::app_strong_text))
+        .child(render_public_address_qr_code(&address, module_size))
+        .child(
+            div()
+                .id(gpui::SharedString::from(format!("{copy_id}-row")))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .bg(rgb(theme::SURFACE_ELEVATED))
+                .px_3()
+                .py_2()
+                .cursor_pointer()
+                .on_click(move |_, window, cx| row_copy(window, cx))
+                .child(
+                    crate::controls::app_text(address)
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.0))
+                        .font_family(theme::APP_MONO_FONT_FAMILY)
+                        .text_color(rgb(theme::TEAL)),
+                )
+                .child(
+                    crate::controls::app_button(copy_id, "Copy address")
+                        .ghost()
+                        .icon(IconName::Copy)
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            on_copy(window, cx);
+                        }),
+                ),
+        )
+}

@@ -95,7 +95,23 @@ impl GatewayUnlock {
 
 type GatewayDesktopState = (GatewayWalletState, u64, Vec<(String, String)>);
 
+async fn publish_gateway_desktop_states(
+    handle: GatewayHandle,
+    mut states: watch::Receiver<GatewayDesktopState>,
+) {
+    while states.changed().await.is_ok() {
+        let (state, generation, summaries) = states.borrow_and_update().clone();
+        if let Err(error) = handle.publish_wallet_state(state.clone(), generation).await {
+            tracing::warn!(%error, generation, "gateway desktop state publication rejected");
+            continue;
+        }
+        handle.publish_summaries(state, generation, summaries).await;
+    }
+}
+
 pub(super) struct GatewayUi {
+    pub(super) private_selection_message: Option<&'static str>,
+    pub(super) private_hardware_selection_pending: bool,
     pub(super) drafts: RefCell<super::gateway_drafts::GatewayDraftBook>,
     pub(super) draft_watch: Option<gpui::Task<()>>,
     unlock: RefCell<GatewayUnlock>,
@@ -131,6 +147,10 @@ struct GatewayPermissionAccount {
 }
 
 impl GatewayUi {
+    pub(super) fn wallet_switch_in_progress(&self) -> bool {
+        self.wallet_switch.borrow().is_some() || self.switch_dialog.is_some()
+    }
+
     fn retire_unlock(&self) {
         self.drafts.borrow_mut().retire();
         self.unlock.borrow_mut().retire();
@@ -183,6 +203,9 @@ impl GatewayUi {
                             return;
                         }
                         match event.kind {
+                            wallet_ops::gateway::GatewayUiEventKind::PrivateView { command } => {
+                                root.apply_gateway_private_command(command, window, cx);
+                            }
                             wallet_ops::gateway::GatewayUiEventKind::PublicView {
                                 peer_id,
                                 command,
@@ -210,24 +233,9 @@ impl GatewayUi {
         .detach();
         let mut snapshots = handle.snapshots();
         let snapshot = snapshots.borrow().clone();
-        let (desktop_state, mut state_rx) =
+        let (desktop_state, state_rx) =
             watch::channel((GatewayWalletState::default(), 0_u64, Vec::new()));
-        let state_handle = handle.clone();
-        runtime.spawn(async move {
-            while state_rx.changed().await.is_ok() {
-                let (state, transport_generation, summaries) = state_rx.borrow_and_update().clone();
-                if state_handle
-                    .publish_wallet_state(state.clone(), transport_generation)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                state_handle
-                    .publish_summaries(state, transport_generation, summaries)
-                    .await;
-            }
-        });
+        runtime.spawn(publish_gateway_desktop_states(handle.clone(), state_rx));
         cx.spawn_in(window, async move |this, cx| {
             let mut previous_remote = false;
             loop {
@@ -287,6 +295,8 @@ impl GatewayUi {
             }
         });
         Self {
+            private_selection_message: None,
+            private_hardware_selection_pending: false,
             drafts: RefCell::default(),
             draft_watch: None,
             unlock: RefCell::new(GatewayUnlock::default()),
@@ -432,6 +442,9 @@ impl WalletRoot {
     }
 
     pub(super) fn publish_gateway_desktop_state(&self) {
+        if self.view_session.is_none() {
+            self.private_asset_presentation_cache.borrow_mut().clear();
+        }
         self.gateway
             .drafts
             .borrow_mut()
@@ -466,8 +479,14 @@ impl WalletRoot {
             );
         }
         if let Some(state) = self.gateway.desktop_state.as_ref() {
-            let unlocked = matches!(self.vault_state, VaultState::ViewUnlocked);
+            // Hardware startup can unlock metadata before installing a usable wallet view.
+            let unlocked =
+                matches!(self.vault_state, VaultState::ViewUnlocked) && self.view_session.is_some();
             let mut snapshot = GatewayWalletState {
+                private_view_supported: true,
+                private_view: unlocked.then(|| self.gateway_private_view()),
+                wallet_selection_generation: self.wallet_switch_generation,
+                wallet_transition: matches!(self.vault_state, VaultState::SwitchingWallet),
                 public_view: if unlocked {
                     self.gateway_public_view()
                 } else {
@@ -1378,7 +1397,81 @@ fn gateway_permission_menu(
 
 #[cfg(test)]
 mod tests {
-    use super::GatewayUnlock;
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_state_does_not_stop_later_wallet_publication() {
+        use wallet_ops::vault::{DesktopVaultStore, KdfParams, WalletSource};
+
+        const PASSWORD: &str = "gateway publisher test password";
+        let path = std::env::temp_dir().join(format!(
+            "railoxide-gateway-publisher-{:032x}",
+            rand::random::<u128>()
+        ));
+        let store = DesktopVaultStore::open(path.clone()).unwrap();
+        store
+            .create_vault_with_params(PASSWORD, KdfParams::new(1024, 1, 1))
+            .unwrap();
+        let metadata = store
+            .new_wallet_metadata(PASSWORD, "software", 0, WalletSource::Imported, "Software")
+            .unwrap();
+        store
+            .import_wallet_mnemonic_with_metadata(
+                PASSWORD,
+                "software",
+                0,
+                "english",
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                &metadata,
+            )
+            .unwrap();
+        let view = Arc::new(store.load_view_session(PASSWORD, "software").unwrap());
+        let handle = GatewayHandle::start(store.db(), true, 0);
+        handle.configure(GatewayConfig::default()).await.unwrap();
+        let mut snapshots = handle.snapshots();
+        snapshots.borrow_and_update();
+        let (states, receiver) = watch::channel((GatewayWalletState::default(), 0, Vec::new()));
+        let mut publisher = Box::pin(publish_gateway_desktop_states(handle.clone(), receiver));
+
+        // Reusing the actor's epoch for different authority rejects this publication.
+        let stale = GatewayWalletState {
+            active_wallet_generation: 1,
+            ..GatewayWalletState::default()
+        };
+        handle.set_wallet_authority(stale.clone());
+        states.send((stale, 0, Vec::new())).unwrap();
+        assert!(futures_util::poll!(publisher.as_mut()).is_pending());
+        // This command is queued after the state, so its reply confirms rejection was processed.
+        handle.configure(GatewayConfig::default()).await.unwrap();
+        let publisher = tokio::spawn(publisher);
+        assert!(snapshots.borrow_and_update().locked);
+
+        // A later successful selection must unlock the gateway without restarting it.
+        let unlocked = GatewayWalletState {
+            view: Some(view.clone()),
+            active_wallet_generation: 2,
+            ..GatewayWalletState::default()
+        };
+        handle.set_wallet_authority(unlocked.clone());
+        states
+            .send((unlocked, 1, Vec::new()))
+            .expect("publisher must still accept desktop updates");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            snapshots.wait_for(|snapshot| !snapshot.locked && snapshot.generation == 1),
+        )
+        .await
+        .expect("later wallet state must reach the gateway")
+        .unwrap();
+
+        drop(states);
+        publisher.await.unwrap();
+        handle.shutdown().await.unwrap();
+        drop(handle);
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn unlock_continuation_cannot_complete_after_retirement_or_relock() {

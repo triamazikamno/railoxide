@@ -3,6 +3,8 @@ use crate::gateway::{GatewayAccountBalances, GatewayPublicCommand, GatewayPublic
 use crate::vault::{KdfParams, PublicAccountStatus, WalletSource};
 use local_db::{DbConfig, DbStore};
 
+mod private_view;
+
 const PASSWORD: &str = "gateway synthetic test password";
 
 pub(in crate::gateway) fn wallet(store: &DesktopVaultStore, id: &str) -> Arc<DesktopViewSession> {
@@ -464,6 +466,20 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
     };
     let mine = draft(alloy::hex::encode(peer.to_bytes()), "mine");
     wallet.public_view.drafts = vec![mine.clone(), draft("other-peer".into(), "other")];
+    wallet.private_view_supported = true;
+    wallet.private_view = Some(crate::gateway::GatewayPrivateView {
+        selected_wallet: Some(view.wallet_id().to_owned()),
+        selected_wallet_choice: Some(view.wallet_id().to_owned()),
+        receive_address: Some(view.receive_address().unwrap()),
+        wallets: vec![crate::gateway::GatewayPrivateWallet {
+            wallet_id: view.wallet_id().to_owned(),
+            label: "Private wallet".into(),
+            ..Default::default()
+        }],
+        selected_chain: Some(10),
+        total: Some("$123.45".into()),
+        ..Default::default()
+    });
     provider.attach_ui_peer(1, peer);
     messages(&mut provider);
     provider.update_wallet(wallet.clone(), 2);
@@ -475,6 +491,12 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
         snapshot(&unlocked)["public_view"],
         serde_json::to_value(&expected).unwrap()
     );
+    assert_eq!(snapshot(&unlocked)["private_view_supported"], true);
+    assert_eq!(
+        snapshot(&unlocked)["private_view"],
+        serde_json::to_value(&wallet.private_view).unwrap()
+    );
+    assert!(serde_json::to_value(provider.ui(999)).unwrap()["private_view"].is_null());
     assert_eq!(
         snapshot(&unlocked)["accounts"],
         json!([{
@@ -488,6 +510,7 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
     provider.update_wallet(wallet, 3);
     let locked = messages(&mut provider);
     assert_eq!(snapshot(&locked)["accounts"], json!([]));
+    assert!(snapshot(&locked)["private_view"].is_null());
     assert_eq!(
         snapshot(&locked)["public_view"],
         serde_json::to_value(GatewayPublicView::default()).unwrap()

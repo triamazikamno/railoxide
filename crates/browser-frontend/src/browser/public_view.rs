@@ -55,7 +55,7 @@ pub(super) struct SitePermission {
     chain: u64,
 }
 
-fn array(value: &JsValue, key: &str) -> Vec<JsValue> {
+pub(super) fn array(value: &JsValue, key: &str) -> Vec<JsValue> {
     let value = field(value, key);
     if js_sys::Array::is_array(&value) {
         js_sys::Array::from(&value).iter().collect()
@@ -161,7 +161,7 @@ pub(super) struct HomeForm {
     accounts: Vec<ConnectAccount>,
     chains: Vec<ChainChoice>,
     account: Entity<SelectState<SearchableVec<AccountSelectItem>>>,
-    chain: Entity<SelectState<SearchableVec<ChainSelectItem>>>,
+    pub(super) chain: Entity<SelectState<SearchableVec<ChainSelectItem>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -278,6 +278,9 @@ impl GatewayView {
         self.clear_draft_ui();
         self.accounts.clear();
         self.public_view = PublicView::default();
+        self.private_view = private_view::PrivateView::default();
+        self.private_form = None;
+        self.private_sheet = None;
         self.home_form = None;
         self.connect_form = None;
         self.picker = None;
@@ -289,7 +292,13 @@ impl GatewayView {
         self.sites_show_all = false;
     }
     pub(super) fn sync_home_form(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.accounts.is_empty() || self.public_view.selected_chain.is_none() {
+        if self.chains.is_empty()
+            || self
+                .public_view
+                .selected_chain
+                .or(self.private_view.selected_chain)
+                .is_none()
+        {
             self.home_form = None;
             return;
         }
@@ -363,6 +372,7 @@ impl GatewayView {
             });
         }
         let form = self.home_form.as_mut().expect("created home form");
+        let first_accounts = form.accounts.is_empty() && !self.accounts.is_empty();
         let accounts_changed = form.accounts != self.accounts;
         if accounts_changed {
             form.accounts.clone_from(&self.accounts);
@@ -405,13 +415,16 @@ impl GatewayView {
                 select.set_items(SearchableVec::new(items), window, cx);
             });
         }
-        if let Some(id) = &self.public_view.selected_chain
+        if let Some(id) = &self
+            .public_view
+            .selected_chain
+            .or(self.private_view.selected_chain)
             && (chains_changed || form.chain.read(cx).selected_value() != Some(id))
         {
             form.chain
                 .update(cx, |select, cx| select.set_selected_value(id, window, cx));
         }
-        if new && !self.public_view.refreshing {
+        if (new || first_accounts) && !self.accounts.is_empty() && !self.public_view.refreshing {
             command(&json!({ "type": "refresh_balances" }));
         }
     }
@@ -516,40 +529,21 @@ impl GatewayView {
         };
         let balances = self.public_view.balances(&account.uuid);
         body = body
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                app_strong_text(
-                                    balances
-                                        .filter(|balance| !balance.total.is_empty())
-                                        .map_or("Unavailable", |balance| balance.total.as_str())
-                                        .to_owned(),
-                                )
-                                .text_2xl()
-                                .whitespace_nowrap(),
-                            )
-                            .child(note("Public balance")),
-                    )
-                    .child(
-                        div().w_32().flex_none().child(
-                            Select::new(&form.chain)
-                                .small()
-                                .w_full()
-                                .accessibility_label("Network")
-                                .search_placeholder("Search networks"),
-                        ),
-                    ),
-            )
+            .child(ui::wallet_balance::wallet_balance_summary(
+                balances
+                    .filter(|balance| !balance.total.is_empty())
+                    .map_or("Unavailable", |balance| balance.total.as_str())
+                    .to_owned(),
+                "Public balance",
+                rgb(theme::TEXT).into(),
+                ui::wallet_balance::wallet_balance_network(
+                    Select::new(&form.chain)
+                        .small()
+                        .w_full()
+                        .accessibility_label("Network")
+                        .search_placeholder("Search networks"),
+                ),
+            ))
             .child(
                 div()
                     .flex()
@@ -669,68 +663,68 @@ impl GatewayView {
         )
     }
     fn open_receive(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(account) = self.active_account().cloned() else {
+        let Some(account) = self.active_account() else {
+            return;
+        };
+        let Some(generation) = self.generation else {
             return;
         };
         let view = cx.entity().downgrade();
-        let uuid = account.uuid;
-        // Re-read the live view in the sheet builder; it retains no address after lock.
+        let uuid = account.uuid.clone();
         window.open_sheet_at(Placement::Top, cx, move |sheet, _, cx| {
             let account = view.upgrade().and_then(|view| {
-                view.read(cx)
-                    .accounts
-                    .iter()
-                    .find(|account| account.uuid == uuid)
-                    .cloned()
+                let view = view.read(cx);
+                (view.generation == Some(generation))
+                    .then(|| {
+                        view.active_account()
+                            .filter(|account| account.uuid == uuid)
+                            .cloned()
+                    })
+                    .flatten()
             });
             let Some(account) = account else {
                 return sheet;
             };
+            let copy_view = view.clone();
+            let copy_uuid = uuid.clone();
             sheet
-                .title(format!("Receive to {}", name(&account)))
+                .title("Public account address")
                 .resizable(false)
                 .size(rems(24.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_4()
-                        // QR modules are raster dimensions, including the standard four-module quiet zone.
-                        .child(ui::public_address::render_public_address_qr_code(
-                            &account.address,
-                            px(4.0),
-                        ))
-                        .child(
-                            note(account.address.clone())
-                                .font_family(MONO)
-                                .whitespace_normal(),
-                        ),
-                )
+                .child(ui::public_address::receive_address(
+                    Some(name(&account).into()),
+                    account.address.into(),
+                    Some("Send only public assets on the selected network to this address.".into()),
+                    "copy-receive-address".into(),
+                    px(4.0),
+                    move |window, cx| {
+                        let address = copy_view.upgrade().and_then(|view| {
+                            let view = view.read(cx);
+                            (view.generation == Some(generation))
+                                .then(|| {
+                                    view.active_account()
+                                        .filter(|account| account.uuid == copy_uuid)
+                                        .map(|account| account.address.clone())
+                                })
+                                .flatten()
+                        });
+                        if let Some(address) = address
+                            && host_can_copy_address(
+                                "public",
+                                &chain_value(generation),
+                                &copy_uuid,
+                                &address,
+                            )
+                        {
+                            ui::clipboard::copy_to_clipboard_with_toast(address, window, cx);
+                        }
+                    },
+                ))
                 .footer(
-                    div()
-                        .flex()
+                    app_button("close-receive", "Close")
+                        .outline()
                         .w_full()
-                        .gap_2()
-                        .child(
-                            app_button("close-receive", "Close")
-                                .outline()
-                                .flex_1()
-                                .on_click(|_, window, cx| window.close_sheet(cx)),
-                        )
-                        .child(
-                            app_button("copy-receive-address", "Copy address")
-                                .primary()
-                                .flex_1()
-                                .icon(IconName::Copy)
-                                .on_click(move |_, window, cx| {
-                                    ui::clipboard::copy_to_clipboard_with_toast(
-                                        account.address.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        ),
+                        .on_click(|_, window, cx| window.close_sheet(cx)),
                 )
         });
     }

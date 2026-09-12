@@ -121,7 +121,14 @@ async fn native_ui_events_require_live_session_and_immediate_generation_and_page
             .ui_event(1, GatewayUiEventKind::SummonDesktop, &live)
             .is_none()
     );
-    for method in ["user_activity", "summon_desktop", "request_wallet_switch"] {
+    for method in [
+        "user_activity",
+        "summon_desktop",
+        "request_wallet_switch",
+        "private_view",
+        "select_wallet",
+        "wallets",
+    ] {
         let response = request(&mut provider, 1, "doc", method, method, Instant::now());
         assert_eq!(result(&response)["error"]["code"], 4200);
     }

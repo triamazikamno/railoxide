@@ -1,6 +1,6 @@
 //! Privileged frontend operations reuse the provider's permission and document owners.
 use super::{DappProvider, GatewayError, Instant, PeerId};
-use crate::gateway::GatewayPublicCommand;
+use crate::gateway::{GatewayPrivateCommand, GatewayPublicCommand};
 
 impl DappProvider {
     pub(in crate::gateway) fn attach_ui_peer(&mut self, session: u64, peer: PeerId) {
@@ -126,5 +126,44 @@ impl DappProvider {
         } else {
             self.revoke(permission_id)
         }
+    }
+}
+
+impl DappProvider {
+    pub(in crate::gateway) fn private_command(
+        &mut self,
+        session: u64,
+        peer: PeerId,
+        generation: u64,
+        command: GatewayPrivateCommand,
+    ) -> Option<GatewayPrivateCommand> {
+        if generation != self.generation
+            || self.ui_peers.get(&session) != Some(&peer)
+            || self.wallet.view.is_none()
+            || !self.wallet.private_view_supported
+            || self.authority.borrow().wallet_selection_generation
+                != self.wallet.wallet_selection_generation
+            || !self.authority.borrow().same_authority(&self.wallet)
+        {
+            return None;
+        }
+        self.ui_errors.remove(&session);
+        let GatewayPrivateCommand::SelectWallet { wallet_id } = &command;
+        let eligible = |wallet: &super::GatewayWalletState| {
+            wallet.private_view.as_ref().is_some_and(|view| {
+                view.wallets
+                    .iter()
+                    .any(|wallet| &wallet.wallet_id == wallet_id)
+            })
+        };
+        if eligible(&self.wallet) && eligible(&self.authority.borrow()) {
+            return Some(command);
+        }
+        self.ui_errors.insert(
+            session,
+            "Wallet selection is unavailable. Open the desktop app to continue.".to_owned(),
+        );
+        self.push_ui(session);
+        None
     }
 }

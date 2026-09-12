@@ -34,6 +34,7 @@ mod amounts_and_balances;
 mod broadcaster_picker;
 mod broadcasters;
 mod chain_loading;
+mod gateway_private_view;
 mod helpers;
 mod key_export;
 mod private_assets;

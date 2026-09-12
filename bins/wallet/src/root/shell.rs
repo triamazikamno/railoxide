@@ -174,8 +174,8 @@ impl WalletTab {
 
     pub(super) const fn icon_path(self) -> &'static str {
         match self {
-            Self::Private => icons::shield_check_icon_path(),
-            Self::Public => icons::globe_icon_path(),
+            Self::Private => icons::shield_keyhole_icon_path(),
+            Self::Public => icons::eye_icon_path(),
             Self::Activity => icons::activity_icon_path(),
         }
     }

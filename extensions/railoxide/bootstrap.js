@@ -262,6 +262,18 @@ reload.addEventListener('click', () => location.reload());
 Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   isMac: () => isMac,
   isActive: () => state === 'loading' || state === 'ready',
+  canCopyAddress(kind, generation, identity, address) {
+    // The GPUI callback submits synchronously after this check. Browser writes cannot be cancelled after submission.
+    if (state !== 'ready' || !uiPort || gatewayStatus !== 'unlocked' || connectSnapshot.locked ||
+        connectSnapshot.generation !== generation) return false;
+    if (kind === 'private') {
+      const view = connectSnapshot.private_view;
+      return connectSnapshot.private_view_supported === true && view?.selected_wallet === identity &&
+        view.receive_address === address;
+    }
+    return kind === 'public' && connectSnapshot.public_view?.selected_account === identity &&
+      connectSnapshot.accounts?.some(account => account.uuid === identity && account.address === address) === true;
+  },
   stage(next) {
     if (state !== 'loading') return;
     phase = next;
@@ -293,11 +305,13 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   },
   command(command, value) {
     if (state !== 'ready' || !uiPort) return;
-    if (command === 'public_view') {
+    if (command === 'public_view' || command === 'private_view') {
       try {
-        uiPort.postMessage({ type: 'public_view', generation: connectSnapshot.generation,
+        uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
           tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });
       } catch { /* Only the packaged frontend supplies serialized UI commands. */ }
+    } else if (command === 'home_tab') {
+      uiPort.postMessage({ type: 'home_tab', generation: connectSnapshot.generation, value });
     } else if (command === 'request_wallet_switch' || command === 'summon_desktop') {
       uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
         ...(command === 'request_wallet_switch' ? { request_id: value } : {}) });

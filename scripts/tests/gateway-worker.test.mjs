@@ -578,11 +578,11 @@ test('desktop switch, summon and activity require the current privileged UI gene
 });
 
 
-test('public presentation is purged on lock and cannot return through late snapshots or a new view', async () => {
+test('private and public presentation is purged on lock and cannot return through late snapshots or a new view', async () => {
   const h = await worker({ gatewayCredential: credential() });
   const session = await established(h);
   const accounts = [{ uuid: 'first', label: 'Spending', address: '0xabc' }];
-  const rich = { accounts, public_view: { selected_account: 'first', selected_chain: 1,
+  const rich = { accounts, private_view_supported: true, private_view: { selected_wallet: 'wallet', selected_wallet_choice: 'wallet', receive_address: 'synthetic-private', wallets: [{ wallet_id: 'wallet' }], total: '$12.00', pending: { categories: [] } }, public_view: { selected_account: 'first', selected_chain: 1,
     balances: [{ account_uuid: 'first', total: '$12.00', assets: [] }], drafts: [{ draft_id: 'draft', status: 'attention', input: { recipient: 'recipient.eth' } }] },
     permissions: [{ permission_id: 'grant', origin: 'https://dapp.test/', account_uuid: 'first', chain_id: 1 }] };
   const delivered = () => JSON.parse(JSON.stringify(h.states.filter(message => message.type === 'ui_snapshot').at(-1)));
@@ -590,10 +590,13 @@ test('public presentation is purged on lock and cannot return through late snaps
     pending_connects: [], pending_requests: [], ...rich });
   await snapshot(1, false);
   assert.deepEqual(delivered().public_view, rich.public_view);
+  assert.deepEqual(delivered().private_view, rich.private_view);
   await session.send({ type: 'state', version: 1, generation: 2, locked: true });
   await snapshot(1, false);
   await snapshot(2, true);
   assert.deepEqual(delivered().accounts, []);
+  assert.ok(!delivered().private_view);
+  assert.ok(!h.ui().port.messages[0].private_view);
   assert.ok(!delivered().public_view?.balances?.length);
   assert.ok(!h.ui().port.messages[0].permissions?.length);
   assert.ok(!delivered().public_view?.drafts?.length);
@@ -604,6 +607,7 @@ test('public presentation is purged on lock and cannot return through late snaps
   assert.deepEqual(delivered().permissions, rich.permissions);
   session.socket.close(); await flush();
   assert.ok(!h.ui().port.messages[0].public_view?.balances?.length);
+  assert.ok(!h.ui().port.messages[0].private_view);
 });
 
 test('current-tab connect is view-scoped and browser-attested across navigation', async () => {
@@ -1066,4 +1070,88 @@ test('draft commands are UI-only, scoped to current desktop selection, and never
   const reopened = h.ui(); await flush();
   assert.equal(reopened.port.messages[0].public_view.drafts[0].draft_id, 'draft');
   assert.equal(socket.sent.some(bytes => new TextDecoder().decode(Uint8Array.from(bytes)).includes('"submit"')), false);
+});
+
+
+test('private wallet commands and last-tab navigation stay within the live UI session', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const a = h.ui(), b = h.ui();
+  const snapshot = (generation, extra = {}) => session.send({ type: 'ui_snapshot', version: 1, generation, locked: false,
+    accounts: [], pending_connects: [], pending_requests: [], private_view_supported: true,
+    private_view: { selected_wallet: 'first', wallets: [{ wallet_id: 'first' }, { wallet_id: 'second' }, { wallet_id: 'hardware-device:ledger' }] }, ...extra });
+  await snapshot(1);
+  const last = ui => ui.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
+  a.request({ type: 'home_tab', generation: 1, value: 'private' });
+  assert.equal(last(a).home_tab, 'private');
+  assert.equal(last(b).home_tab, 'public');
+  assert.equal(last(h.ui()).home_tab, 'private');
+  const sent = () => session.socket.sent.map(bytes => { try { return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))); } catch { return {}; } }).filter(message => message.type === 'private_view');
+  const select = (ui, generation, uuid) => ui.request({ type: 'private_view', generation, command: { type: 'select_wallet', wallet_id: uuid } });
+  for (const [generation, uuid] of [[0, 'second'], [2, 'second'], [1, 'concealed'], [1, 'ledger-profile'], [1, 'hardware-device:trezor']]) select(a, generation, uuid);
+  const page = h.provider(); await flush();
+  page.request({ id: 'private', method: 'private_view', params: { type: 'select_wallet', wallet_id: 'second' } });
+  assert.equal(sent().length, 0);
+  select(a, 1, 'second');
+  assert.equal(sent().length, 1);
+  assert.equal(sent()[0].command.wallet_id, 'second');
+  select(a, 1, 'hardware-device:ledger');
+  assert.equal(sent()[1].command.wallet_id, 'hardware-device:ledger');
+  await session.send({ type: 'state', version: 1, generation: 2, locked: true, wallet_transition: true });
+  assert.equal(last(a).home_tab, 'private');
+  assert.ok(!last(a).private_view);
+  select(a, 1, 'first');
+  await session.send({ type: 'state', version: 1, generation: 3, locked: false });
+  await snapshot(3);
+  assert.equal(last(a).home_tab, 'private');
+  assert.equal(last(b).home_tab, 'public');
+  await session.send({ type: 'state', version: 1, generation: 4, locked: true });
+  assert.equal(last(a).home_tab, 'private');
+  assert.equal(last(h.ui()).home_tab, 'private');
+  assert.equal(sent().length, 2);
+  await session.send({ type: 'state', version: 1, generation: 5, locked: false });
+  await snapshot(5, { private_view_supported: false, private_view: null });
+  select(a, 5, 'second');
+  assert.equal(sent().length, 2);
+  await snapshot(5);
+  a.request({ type: 'home_tab', generation: 5, value: 'private' });
+  session.socket.close(); await flush();
+  assert.equal(last(a).home_tab, 'private');
+  assert.equal(last(h.ui()).home_tab, 'private');
+  await flush();
+  assert.equal(h.data.gatewayPreferences.home_tab, 'private');
+  const restarted = await worker(h.data);
+  const reopened = restarted.ui();
+  assert.equal(last(reopened).home_tab, 'private');
+  assert.ok(!last(reopened).private_view);
+  const replacement = await established(restarted);
+  await replacement.send({ type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+    accounts: [], pending_connects: [], pending_requests: [], private_view_supported: true,
+    private_view: { selected_wallet: 'first', wallets: [{ wallet_id: 'first' }] } });
+  assert.equal(last(reopened).home_tab, 'private');
+});
+
+test('clipboard submission checks live host identity before queued frontend snapshots run', async () => {
+  const view = await bootstrapView();
+  const host = view.context.railoxideHost;
+  const snapshot = { type: 'ui_snapshot', locked: false, generation: 1, private_view_supported: true,
+    accounts: [{ uuid: 'account', address: 'public-address' }], public_view: { selected_account: 'account' },
+    private_view: { selected_wallet: 'wallet', selected_wallet_choice: 'hardware-device:ledger', receive_address: 'private-address', wallets: [{ wallet_id: 'hardware-device:ledger' }] } };
+  view.incoming({ type: 'state', status: 'unlocked' });
+  view.incoming(snapshot);
+  assert.ok(host.canCopyAddress('private', 1, 'wallet', 'private-address'));
+  assert.ok(host.canCopyAddress('public', 1, 'account', 'public-address'));
+  for (const args of [['private', 0, 'wallet', 'private-address'], ['private', 1, 'other', 'private-address'], ['private', 1, 'wallet', 'old-address']]) {
+    assert.equal(host.canCopyAddress(...args), false);
+  }
+  view.incoming({ ...snapshot, private_view: { ...snapshot.private_view, selected_wallet: 'other' } });
+  assert.equal(host.canCopyAddress('private', 1, 'wallet', 'private-address'), false);
+  view.incoming({ ...snapshot, private_view: { ...snapshot.private_view, receive_address: 'replacement-address' } });
+  assert.equal(host.canCopyAddress('private', 1, 'wallet', 'private-address'), false);
+  view.incoming(snapshot);
+  view.incoming({ type: 'state', status: 'locked' });
+  assert.equal(host.canCopyAddress('private', 1, 'wallet', 'private-address'), false);
+  view.incoming({ type: 'state', status: 'unlocked' });
+  view.disconnected();
+  assert.equal(host.canCopyAddress('private', 1, 'wallet', 'private-address'), false);
 });

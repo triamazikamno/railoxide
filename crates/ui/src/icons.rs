@@ -7,6 +7,8 @@ const SEARCH_ICON_PATH: &str = "ui/icons/search.svg";
 const WALLET_ICON_PATH: &str = "ui/icons/wallet.svg";
 const SHIELD_PLUS_ICON_PATH: &str = "ui/icons/shield-plus.svg";
 const SHIELD_CHECK_ICON_PATH: &str = "ui/icons/shield-check.svg";
+const SHIELD_KEYHOLE_ICON_PATH: &str = "ui/icons/shield-keyhole.svg";
+const EYE_ICON_PATH: &str = "ui/icons/eye.svg";
 const SHIELD_ALERT_ICON_PATH: &str = "ui/icons/shield-alert.svg";
 const GLOBE_ICON_PATH: &str = "ui/icons/globe.svg";
 const WRENCH_ICON_PATH: &str = "ui/icons/wrench.svg";
@@ -57,6 +59,16 @@ pub const fn shield_plus_icon_path() -> &'static str {
 #[must_use]
 pub const fn shield_check_icon_path() -> &'static str {
     SHIELD_CHECK_ICON_PATH
+}
+
+#[must_use]
+pub const fn shield_keyhole_icon_path() -> &'static str {
+    SHIELD_KEYHOLE_ICON_PATH
+}
+
+#[must_use]
+pub const fn eye_icon_path() -> &'static str {
+    EYE_ICON_PATH
 }
 
 #[must_use]

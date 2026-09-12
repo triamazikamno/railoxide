@@ -4,6 +4,9 @@ import { createPageBridge } from './gateway-page-bridge.js';
 
 const ports = new Set();
 const tabContexts = new Map();
+// Navigation is local to each document; only newly opened views inherit the last choice.
+const homeTabs = new Map();
+let lastHomeTab = 'public';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const now = () => BigInt(Math.floor(performance.now()));
@@ -120,12 +123,12 @@ function publishSnapshot(snapshot, authoritative = true) {
   uiSnapshot = snapshot;
   updateNotification(false, authoritative);
   for (const port of ports) {
-    try { port.postMessage(snapshotFor(port)); } catch { ports.delete(port); tabContexts.delete(port); }
+    try { port.postMessage(snapshotFor(port)); } catch { ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
   }
 }
 function snapshotFor(port) {
   const tab = uiSnapshot.locked ? null : tabContexts.get(port)?.tab;
-  return { ...uiSnapshot, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
+  return { ...uiSnapshot, home_tab: homeTabs.get(port) ?? lastHomeTab, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
 }
 async function updateTab(port) {
   const context = tabContexts.get(port);
@@ -151,8 +154,8 @@ function updateTabs() {
 chrome.tabs?.onActivated?.addListener(updateTabs);
 chrome.webNavigation.onCommitted.addListener(event => { if (event.frameId === 0) updateTabs(); });
 chrome.tabs?.onRemoved?.addListener(updateTabs);
-function purgeSnapshot(authoritative = true) {
-  publishSnapshot({ type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] }, authoritative);
+function purgeSnapshot(authoritative = true, walletTransition = false) {
+  publishSnapshot({ wallet_transition: walletTransition, type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] }, authoritative);
 }
 const ready = Promise.all([
   chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
@@ -160,6 +163,9 @@ const ready = Promise.all([
 ]);
 const preferencesReady = ready.then(() => stored(async () => {
   const saved = await chrome.storage.local.get('gatewayPreferences');
+  lastHomeTab = saved.gatewayPreferences?.home_tab === 'private' ? 'private' : 'public';
+  for (const port of ports) homeTabs.set(port, lastHomeTab);
+  publishSnapshot(uiSnapshot, false);
   providerPreferences = { takeover: saved.gatewayPreferences?.takeover === true, metamask: saved.gatewayPreferences?.metamask === true };
   const savedView = saved.gatewayPreferences?.view === 'sidepanel' ? 'sidepanel' : 'popup';
   try {
@@ -336,8 +342,9 @@ async function receive(session, bytes) {
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
       if (message.locked && (message.accounts.length ||
           message.pending_connects.some(prompt => prompt.accounts?.length) ||
-          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length)) return;
-      publishSnapshot({ ...message, public_view: message.locked ? null : message.public_view,
+          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null)) return;
+      publishSnapshot({ ...message, private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
+        public_view: message.locked ? null : message.public_view,
         permissions: message.locked ? [] : (message.permissions ?? []),
         ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
         request_id: request.request_id, url: request.url,
@@ -358,7 +365,7 @@ async function receive(session, bytes) {
       return;
     }
     const generationChanged = session.generation !== message.generation;
-    if (generationChanged) purgeSnapshot(false);
+    if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
     session.generation = message.generation;
     session.locked = message.locked;
     pageBridge.lockState(message.locked, generationChanged);
@@ -484,12 +491,14 @@ chrome.runtime.onConnect.addListener(port => {
       url.protocol !== 'chrome-extension:' || url.hostname !== chrome.runtime.id || url.pathname !== '/index.html' ||
       !['', '?mode=window', '?mode=notification', '?mode=sidepanel'].includes(url.search) || url.hash) { port.disconnect(); return; }
   ports.add(port);
+  homeTabs.set(port, lastHomeTab);
   if (url.search === '?mode=notification') updateNotification(true);
   port.postMessage(snapshotFor(port));
   port.postMessage(stateMessage());
   port.onDisconnect.addListener(() => {
     ports.delete(port); // Documents never own the socket.
     tabContexts.delete(port);
+    homeTabs.delete(port);
     if (visibleViews.delete(port)) updateNotification();
   });
   port.onMessage.addListener(message => {
@@ -505,6 +514,31 @@ chrome.runtime.onConnect.addListener(port => {
     if (message.type === 'tab_context' && Number.isInteger(message.window_id) && message.window_id >= 0) {
       tabContexts.set(port, { windowId: message.window_id, tab: null, revision: 0 });
       void updateTab(port);
+      return;
+    }
+    if (message.type === 'home_tab' || message.type === 'private_view') {
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
+          message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
+          uiSnapshot.private_view_supported !== true) return;
+      if (message.type === 'home_tab') {
+        if (!['private', 'public'].includes(message.value)) return;
+        lastHomeTab = message.value;
+        homeTabs.set(port, message.value);
+        port.postMessage(snapshotFor(port));
+        const homeTab = message.value;
+        void stored(async () => {
+          const saved = await chrome.storage.local.get('gatewayPreferences');
+          await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, home_tab: homeTab } });
+        }).catch(() => publish('storage_failed'));
+      } else {
+        const input = message.command;
+        if (input?.type !== 'select_wallet' || typeof input.wallet_id !== 'string' ||
+            !uiSnapshot.private_view?.wallets?.some(wallet => wallet.wallet_id === input.wallet_id)) return;
+        try { command(session, { type: 'private_view', version: 1, generation: session.generation,
+          command: { type: 'select_wallet', wallet_id: input.wallet_id } }); }
+        catch { failed(session, 'disconnected', true); }
+      }
       return;
     }
     if (message.type === 'public_view') {

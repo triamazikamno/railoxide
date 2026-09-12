@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -51,6 +52,7 @@ mod dialogs;
 mod gas_fee;
 mod gateway;
 mod gateway_drafts;
+mod gateway_private_view;
 mod gateway_public_view;
 mod governance;
 mod governance_action;
@@ -448,6 +450,7 @@ pub(crate) struct WalletRoot {
     selected_wallet_id: Option<Arc<str>>,
     active_wallet_generation: u64,
     wallet_switch_generation: u64,
+    wallet_switch_loading_generation: Option<u64>,
     wallet_switch_delayed: bool,
     selected_chain: u64,
     ui_state: WalletUiState,
@@ -455,6 +458,7 @@ pub(crate) struct WalletRoot {
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
     private_pending_status_dialog_open: bool,
+    private_asset_presentation_cache: RefCell<private_assets::PrivateAssetPresentationCache>,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
     poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
@@ -1421,12 +1425,14 @@ impl WalletRoot {
             selected_wallet_id: None,
             active_wallet_generation: 0,
             wallet_switch_generation: 0,
+            wallet_switch_loading_generation: None,
             wallet_switch_delayed: false,
             ui_state,
             chain_select: chain_select.clone(),
             chain_states,
             pending_ppoi_validation_toast: None,
             private_pending_status_dialog_open: false,
+            private_asset_presentation_cache: RefCell::default(),
             poi_artifact_cache_progress: BTreeMap::new(),
             poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),
@@ -1956,6 +1962,14 @@ impl WalletRoot {
             },
         )
         .detach();
+        // Owner notifications include private snapshots, progress, metadata, and device outcomes.
+        // Publication does not notify this entity; the gateway coalesces unchanged presentation.
+        cx.observe_self(|root, _cx| {
+            if root.gateway_has_connected_browser() {
+                root.publish_gateway_desktop_state();
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1972,7 +1986,8 @@ impl WalletRoot {
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());
                         }
-                        if root.private_pending_status_dialog_open
+                        if (root.private_pending_status_dialog_open
+                            || root.gateway_has_connected_browser())
                             && root.private_pending_status_has_shield_timer()
                         {
                             cx.notify();

@@ -220,7 +220,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             current
         })
     }
-    /// One frame or flush per actor turn. Never await a peer's write readiness.
+    /// Send and flush at most one frame per actor turn without awaiting readiness.
     fn poll_output(
         &mut self,
         id: u64,
@@ -238,61 +238,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             return Poll::Ready(Err(GatewayError::Unavailable));
         }
         output.first_progress_at.get_or_insert_with(Instant::now);
-        if !output.sealed {
-            let delivery = output.delivery.as_mut().expect("application delivery");
-            if provider.delivery(id, delivery) == DeliveryStatus::Discard {
-                let ticket = delivery.ticket_id();
-                let output = self.outbound.pop_front().expect("queued output");
-                self.outbound_bytes -= output.bytes;
-                return Poll::Ready(Ok(ticket));
-            }
-            let bytes =
-                serde_json::to_vec(&delivery.message).map_err(|_| GatewayError::Unavailable)?;
-            output.frames = self
-                .protocol
-                .as_mut()
-                .ok_or(GatewayError::Unavailable)?
-                .seal_message(&bytes)
-                .map_err(|_| GatewayError::Unavailable)?
-                .into();
-            output.sealed = true;
-            if let Some(deadline) = delivery.deadline() {
-                output.deadline = output.deadline.min(deadline);
-            }
-            // Yield after sealing too: cancellation now requires dropping the transport.
-            return Poll::Ready(Ok(None));
+        if !output.sealed
+            && provider.delivery(id, output.delivery.as_mut().expect("application delivery"))
+                == DeliveryStatus::Discard
+        {
+            let output = self.outbound.pop_front().expect("queued output");
+            self.outbound_bytes -= output.bytes;
+            return Poll::Ready(Ok(output
+                .delivery
+                .and_then(|delivery| delivery.ticket_id())));
         }
-        // Approval controls were checked above, before acquiring this watch guard.
+        // Approval controls were checked before this guard. Keep immediate wallet
+        // authority stable through encryption, submission and the first flush.
         let authority = provider.authority().borrow();
-        if output.delivery.as_mut().is_some_and(|delivery| {
-            provider.delivery_authority(id, delivery, &authority) != DeliveryStatus::Current
-        }) {
-            output.log_failure(id, "live_authority_invalidated", "poll_output");
-            return Poll::Ready(Err(GatewayError::Unavailable));
-        }
-        if output.flushing {
-            match Pin::new(&mut self.socket).poll_flush(cx) {
-                Poll::Pending => {
-                    output.flush_pending_polls = output.flush_pending_polls.saturating_add(1);
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(_)) => {
-                    output.log_failure(id, "socket_flush_failed", "poll_output");
-                    return Poll::Ready(Err(GatewayError::Unavailable));
-                }
-                Poll::Ready(Ok(())) => {}
+        if let Some(delivery) = output.delivery.as_mut() {
+            let status = provider.delivery_authority(id, delivery, &authority);
+            if output.sealed && status != DeliveryStatus::Current {
+                output.log_failure(id, "live_authority_invalidated", "poll_output");
+                return Poll::Ready(Err(GatewayError::Unavailable));
             }
-            output.flushing = false;
-            output.flush_started_at = None;
-            output.flush_pending_polls = 0;
-            if output.frames.is_empty() {
-                let output = self.outbound.pop_front().expect("flushed output");
+            if status == DeliveryStatus::Discard {
+                let output = self.outbound.pop_front().expect("queued output");
                 self.outbound_bytes -= output.bytes;
                 return Poll::Ready(Ok(output
                     .delivery
                     .and_then(|delivery| delivery.ticket_id())));
             }
-        } else {
+        }
+        if !output.flushing {
             match Pin::new(&mut self.socket).poll_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(_)) => {
@@ -300,6 +273,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                     return Poll::Ready(Err(GatewayError::Unavailable));
                 }
                 Poll::Ready(Ok(())) => {}
+            }
+            if !output.sealed {
+                let delivery = output.delivery.as_ref().expect("application delivery");
+                let bytes =
+                    serde_json::to_vec(&delivery.message).map_err(|_| GatewayError::Unavailable)?;
+                output.frames = self
+                    .protocol
+                    .as_mut()
+                    .ok_or(GatewayError::Unavailable)?
+                    .seal_message(&bytes)
+                    .map_err(|_| GatewayError::Unavailable)?
+                    .into();
+                output.sealed = true;
+                if let Some(deadline) = delivery.deadline() {
+                    output.deadline = output.deadline.min(deadline);
+                }
+            }
+            if Instant::now() >= output.deadline {
+                output.log_failure(id, "write_deadline", "poll_output");
+                return Poll::Ready(Err(GatewayError::Unavailable));
             }
             let frame = output.frames.pop_front().expect("sealed frame");
             Pin::new(&mut self.socket)
@@ -311,6 +304,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             output.flushing = true;
             output.flush_started_at = Some(Instant::now());
             output.flush_pending_polls = 0;
+        }
+        // A ready socket can finish small State/UI messages in this same turn.
+        // Backpressure and additional fragments still yield with all fences intact.
+        match Pin::new(&mut self.socket).poll_flush(cx) {
+            Poll::Pending => {
+                output.flush_pending_polls = output.flush_pending_polls.saturating_add(1);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(_)) => {
+                output.log_failure(id, "socket_flush_failed", "poll_output");
+                return Poll::Ready(Err(GatewayError::Unavailable));
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        output.flushing = false;
+        output.flush_started_at = None;
+        output.flush_pending_polls = 0;
+        if output.frames.is_empty() {
+            let output = self.outbound.pop_front().expect("flushed output");
+            self.outbound_bytes -= output.bytes;
+            return Poll::Ready(Ok(output
+                .delivery
+                .and_then(|delivery| delivery.ticket_id())));
         }
         Poll::Ready(Ok(None))
     }
@@ -855,6 +871,7 @@ impl Actor {
             version: 1,
             locked: self.locked,
             generation: self.generation,
+            wallet_transition: self.provider.wallet_transition(),
         }
     }
 
@@ -922,6 +939,24 @@ impl Actor {
                 let command = serde_json::from_slice::<GatewayClientMessage>(&message);
                 Self::trace_extension_command(id, command.as_ref().ok());
                 match command {
+                    Ok(GatewayClientMessage::PrivateView {
+                        version: 1,
+                        generation,
+                        command,
+                    }) => {
+                        if let Some(command) = self.provider.private_command(
+                            id,
+                            session.peer().ok_or(GatewayError::Unavailable)?,
+                            generation,
+                            command,
+                        ) {
+                            self.emit_ui_event(
+                                id,
+                                generation,
+                                super::GatewayUiEventKind::PrivateView { command },
+                            );
+                        }
+                    }
                     Ok(GatewayClientMessage::PublicView {
                         version: 1,
                         generation,
@@ -1093,6 +1128,7 @@ impl Actor {
             return;
         };
         let (command, version) = match message {
+            GatewayClientMessage::PrivateView { version, .. } => ("private_view", version),
             GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
             GatewayClientMessage::GetState { version } => ("get_state", version),
             GatewayClientMessage::Heartbeat { version } => ("heartbeat", version),
@@ -1436,6 +1472,8 @@ mod integration_tests {
                 "generation": generation,
                 "locked": locked,
                 "accounts": [],
+                "private_view_supported": false,
+                "private_view": null,
                 "public_view": {
                     "selected_account": null,
                     "selected_chain": null,

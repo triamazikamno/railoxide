@@ -31,3 +31,5 @@
 - `refresh-ccw.svg`: Lucide `refresh-ccw`, ISC License, https://lucide.dev/icons/refresh-ccw
 - `screen-share.svg`: Lucide `screen-share`, unchanged, https://lucide.dev/icons/screen-share
 - `monitor.svg`: Lucide `monitor`, unchanged, https://lucide.dev/icons/monitor
+- `shield-keyhole.svg`: Lucide `shield-keyhole`, unchanged from [Lucide a79b2d131dab](https://github.com/lucide-icons/lucide/blob/a79b2d131dab2bf20cb224bd0937b439a9c4fa99/icons/shield-keyhole.svg), ISC License.
+- `eye.svg`: Lucide `eye`, unchanged from [Lucide a79b2d131dab](https://github.com/lucide-icons/lucide/blob/a79b2d131dab2bf20cb224bd0937b439a9c4fa99/icons/eye.svg), ISC License.

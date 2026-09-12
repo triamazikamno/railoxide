@@ -222,6 +222,8 @@ impl WalletRoot {
         let receive_warning = SharedString::from(format!(
             "Send only public {chain_label} assets to this address."
         ));
+        let root = cx.entity().downgrade();
+        let generation = self.active_wallet_generation;
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
@@ -233,6 +235,23 @@ impl WalletRoot {
                     Some(receive_warning.clone()),
                     copy_id.clone(),
                     content_width,
+                    {
+                        let root = root.clone();
+                        let address = address_text.clone();
+                        move |window, cx| {
+                            if root.upgrade().is_some_and(|root| {
+                                let root = root.read(cx);
+                                root.active_wallet_generation == generation
+                                    && root.view_session.is_some()
+                            }) {
+                                ui::clipboard::copy_to_clipboard_with_toast(
+                                    address.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    },
                 ))
         });
     }

@@ -12,6 +12,7 @@ use gpui::{
 };
 mod drafts;
 mod keymap;
+mod private_view;
 mod public_view;
 use public_view::{HomeForm, PublicView, SitePermission};
 
@@ -35,7 +36,7 @@ use ui::{
 use wasm_bindgen::prelude::*;
 
 const SANS: &str = "Inter Variable";
-const MONO: &str = "JetBrains Mono";
+const MONO: &str = theme::APP_MONO_FONT_FAMILY;
 
 thread_local! {
     static STARTED: Cell<bool> = const { Cell::new(false) };
@@ -48,6 +49,13 @@ extern "C" {
     fn host_is_mac() -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = isActive)]
     fn host_is_active() -> bool;
+    #[wasm_bindgen(js_namespace = railoxideHost, js_name = canCopyAddress)]
+    fn host_can_copy_address(
+        kind: &str,
+        generation: &JsValue,
+        identity: &str,
+        address: &str,
+    ) -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = stage)]
     fn host_stage(stage: &str);
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = ready)]
@@ -291,22 +299,18 @@ impl SelectItem for ChainSelectItem {
 
     fn display_title(&self) -> Option<AnyElement> {
         Some(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(public_view::chain_icon(self.id))
-                .child(self.name.clone())
-                .into_any_element(),
+            ui::wallet_identity::chain_label_row(
+                self.name.clone(),
+                railgun_ui::chain_icon_asset_path(self.id),
+            )
+            .into_any_element(),
         )
     }
     fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(public_view::chain_icon(self.id))
-            .child(self.name.clone())
+        ui::wallet_identity::chain_label_row(
+            self.name.clone(),
+            railgun_ui::chain_icon_asset_path(self.id),
+        )
     }
     fn value(&self) -> &Self::Value {
         &self.id
@@ -508,6 +512,10 @@ struct GatewayView {
     view_notice: String,
     accounts: Vec<ConnectAccount>,
     public_view: PublicView,
+    private_view: private_view::PrivateView,
+    private_form: Option<private_view::PrivateForm>,
+    home_tab: String,
+    private_sheet: Option<(String, Option<u64>)>,
     draft: Option<drafts::DraftSnapshot>,
     draft_form: Option<drafts::DraftForm>,
     handoff_open: bool,
@@ -598,6 +606,8 @@ impl GatewayView {
             let requests = pending_requests(&snapshot);
             let accounts = wallet_accounts(&snapshot);
             let presentation = PublicView::from_snapshot(&snapshot);
+            let private = private_view::PrivateView::from_snapshot(&snapshot);
+            let home_tab = text_field(&snapshot, "home_tab");
             let draft = drafts::DraftSnapshot::from_snapshot(&snapshot);
             let chains = chain_field(&snapshot, "chains");
             let permissions = public_view::permissions(&snapshot);
@@ -620,6 +630,20 @@ impl GatewayView {
                         view.handoff_open = keep_handoff;
                     }
                     view.generation = generation;
+                    if view.private_sheet.as_ref().is_some_and(|(wallet, chain)| {
+                        private.selected_wallet.as_ref() != Some(wallet)
+                            || private.selected_chain != *chain
+                    }) {
+                        window.close_sheet(cx);
+                        view.private_sheet = None;
+                    }
+                    view.home_tab = if private.supported && home_tab == "private" {
+                        "private"
+                    } else {
+                        "public"
+                    }
+                    .into();
+                    view.private_view = private;
                     view.public_view = presentation;
                     view.chains = chains;
                     view.permissions = permissions;
@@ -629,6 +653,7 @@ impl GatewayView {
                     view.pending_requests = requests;
                     view.accounts = accounts;
                     view.sync_home_form(window, cx);
+                    view.sync_private_form(window, cx);
                     view.sync_draft(draft, window, cx);
                     view.sync_connect_form(window, cx);
                     cx.notify();
@@ -653,6 +678,10 @@ impl GatewayView {
             view_notice: String::new(),
             accounts: Vec::new(),
             public_view: PublicView::default(),
+            private_view: private_view::PrivateView::default(),
+            private_form: None,
+            home_tab: "public".into(),
+            private_sheet: None,
             draft: None,
             draft_form: None,
             handoff_open: false,
@@ -699,28 +728,38 @@ impl GatewayView {
             .flex_none()
             .items_center()
             .gap_2()
-            .child(img("railoxide/logo.svg").size_8().flex_none())
-            .child(
-                div().flex_1().min_w_0().child(
-                    img("railoxide/wordmark.svg")
-                        .w_full()
-                        .max_w(px(154.0))
-                        .h(px(21.3))
-                        .object_fit(gpui::ObjectFit::Contain),
-                ),
-            )
-            .child(
-                div().flex().flex_none().child(
-                    Tag::custom(
-                        tag_color(color, 0.12).into(),
-                        rgb(color).into(),
-                        rgb(color).into(),
+            .child(self.render_wallet_picker().unwrap_or_else(|| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(img("railoxide/logo.svg").size_8().flex_none())
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            img("railoxide/wordmark.svg")
+                                .w_full()
+                                .max_w(px(154.0))
+                                .h(px(21.3))
+                                .object_fit(gpui::ObjectFit::Contain),
+                        ),
                     )
-                    .text_sm()
-                    .rounded_full()
-                    .child(label),
-                ),
-            )
+            }))
+            .when(self.status != "unlocked", |this| {
+                this.child(
+                    div().flex().flex_none().child(
+                        Tag::custom(
+                            tag_color(color, 0.12).into(),
+                            rgb(color).into(),
+                            rgb(color).into(),
+                        )
+                        .text_sm()
+                        .rounded_full()
+                        .child(label),
+                    ),
+                )
+            })
             .when(self.status == "unlocked", |this| {
                 this.child(self.render_sites_button(cx))
             })
@@ -908,7 +947,22 @@ impl GatewayView {
         } else if self.draft_form.is_some() {
             self.render_draft_form(cx)
         } else {
-            self.render_home(cx)
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .flex_1()
+                .min_w_0()
+                .when(self.private_view.supported, |this| {
+                    this.child(self.render_home_tabs(cx))
+                })
+                .child(
+                    if self.home_tab == "private" && self.private_view.supported {
+                        self.render_private_home(cx)
+                    } else {
+                        self.render_home(cx)
+                    },
+                )
         }
     }
 
@@ -1255,6 +1309,14 @@ impl Render for GatewayView {
                     .gap_4()
                     .p_4()
                     .child(self.render_header(cx))
+                    .when(self.status == "unlocked", |this| {
+                        this.children(
+                            self.private_view
+                                .selection_message
+                                .as_ref()
+                                .map(|message| app_muted_text(message.clone())),
+                        )
+                    })
                     .children(self.render_draft_banner(cx))
                     .when(!self.view_notice.is_empty(), |this| {
                         this.child(note(self.view_notice.clone()))

@@ -232,6 +232,7 @@ impl WalletRoot {
             metadata.wallet_uuid == wallet_id
                 && hardware_device_kind_from_source(metadata.source).is_some()
         }) {
+            self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
             self.open_hardware_profile_unlock_dialog_for_wallet(
                 Arc::from(wallet_id.to_owned()),
                 window,
@@ -252,6 +253,7 @@ impl WalletRoot {
         let active_wallet_generation = self.active_wallet_generation;
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         let switch_generation = self.wallet_switch_generation;
+        self.wallet_switch_loading_generation = Some(switch_generation);
         self.vault_error = None;
         let wallet_id_string = wallet_id.to_owned();
         let metadata = self.wallet_metadata.clone();
@@ -261,6 +263,9 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
+                if root.wallet_switch_loading_generation == Some(switch_generation) {
+                    root.wallet_switch_loading_generation = None;
+                }
                 if root.wallet_switch_generation != switch_generation
                     || !root.is_active_wallet_generation(
                         current_wallet_id.as_ref(),
@@ -284,9 +289,15 @@ impl WalletRoot {
                         root.sync_wallet_select(window, cx);
                     }
                 }
+                if root.vault_error.is_some() {
+                    root.gateway.private_selection_message =
+                        Some("Could not switch wallets. Open the desktop app to continue.");
+                }
+                root.publish_gateway_desktop_state();
             });
         })
         .detach();
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 
@@ -534,6 +545,8 @@ impl WalletRoot {
             return;
         }
         self.begin_gateway_wallet_installation(session.wallet_id());
+        self.gateway.private_selection_message = None;
+        self.gateway.private_hardware_selection_pending = false;
         if !self.gateway_unlock_is_current(gateway_unlock) {
             self.retire_gateway_unlock();
         }
