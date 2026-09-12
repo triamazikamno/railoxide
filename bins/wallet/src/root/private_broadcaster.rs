@@ -6,11 +6,9 @@ use gpui::{
     Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{
-    Icon, IconName, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
-};
+use gpui_component::{Icon, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
@@ -24,8 +22,7 @@ use super::gas_fee::{GasRetryInputs, format_gwei};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
     ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
-    progress_dialog_close_behavior, progress_footer_action, public_action_step_color,
-    render_public_action_step_marker,
+    progress_footer_action, public_action_step_color, render_public_action_step_marker,
 };
 use super::public_broadcaster_cost::{
     PrivateBroadcasterProgressContext, PublicBroadcasterCostDisplay, cost_estimate_detail_text,
@@ -45,18 +42,17 @@ const SPONSORED_CANCEL_ABORT_GRACE: Duration = Duration::from_secs(90);
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 
+mod gateway;
 mod progress;
 mod types;
 
-#[cfg(test)]
-pub(super) use progress::private_broadcaster_closed_active_stage;
 pub(super) use progress::{
     apply_private_broadcaster_progress_stage, ensure_self_broadcast_unshield_progress_stage,
     fail_private_broadcaster_progress_steps_at_stage,
     finish_private_broadcaster_progress_steps_at_stage,
     finish_private_self_broadcast_progress_steps_at_stage,
     mark_private_broadcaster_active_step_stopped, private_broadcaster_closed_active_progress,
-    private_broadcaster_progress_footer_action, private_broadcaster_progress_is_successful,
+    private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_footer_action,
     private_broadcaster_progress_is_terminal, private_broadcaster_progress_steps,
     private_progress_stage_disables_stop, private_submission_discard_attempt_available,
     self_broadcast_progress_steps, self_broadcast_step_retry_kind,
@@ -72,6 +68,10 @@ use progress::{
 pub(super) use progress::{
     finish_private_broadcaster_progress_steps, format_public_broadcaster_wait_remaining,
     public_broadcaster_wait_status_detail,
+};
+#[cfg(test)]
+pub(super) use progress::{
+    private_broadcaster_closed_active_stage, private_broadcaster_progress_is_successful,
 };
 pub(super) use types::{
     PrivateBroadcasterClosedActiveProgress, PrivateBroadcasterProgressState,
@@ -204,6 +204,14 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
 
 impl WalletRoot {
     pub(super) fn clear_private_broadcaster_progress_state(&mut self) {
+        self.publish_gateway_private_progress();
+        if let Some(execution) = self
+            .private_broadcaster_progress
+            .as_ref()
+            .and_then(|progress| progress.gateway_execution.as_ref())
+        {
+            execution.retire_private_owner();
+        }
         let sponsored_handle =
             cancel_private_broadcaster_progress(&mut self.private_broadcaster_progress);
         if let Some(sponsored_handle) = sponsored_handle {
@@ -255,7 +263,18 @@ impl WalletRoot {
             .private_broadcaster_progress
             .as_ref()
             .is_some_and(|progress| progress.dialog_open);
+        let gateway_execution = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .and_then(|form| form.gateway_execution.clone()),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .and_then(|form| form.gateway_execution.clone()),
+        };
         self.private_broadcaster_progress = Some(PrivateBroadcasterProgressState {
+            gateway_execution,
             flow: PrivateSubmissionProgressFlow::PublicBroadcaster,
             kind,
             key,
@@ -308,7 +327,18 @@ impl WalletRoot {
             .private_broadcaster_progress
             .as_ref()
             .is_some_and(|progress| progress.dialog_open);
+        let gateway_execution = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .and_then(|form| form.gateway_execution.clone()),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .and_then(|form| form.gateway_execution.clone()),
+        };
         self.private_broadcaster_progress = Some(PrivateBroadcasterProgressState {
+            gateway_execution,
             flow: PrivateSubmissionProgressFlow::SelfBroadcast,
             kind,
             key,
@@ -548,10 +578,7 @@ impl WalletRoot {
         };
         let kind = progress.kind;
         let key = progress.key;
-        let behavior = progress_dialog_close_behavior(
-            private_broadcaster_progress_is_successful(progress),
-            progress.stopped,
-        );
+        let behavior = private_broadcaster_progress_dialog_close_behavior(progress);
         match behavior {
             ProgressDialogCloseBehavior::AllAndClear => {
                 match kind {
@@ -1065,6 +1092,8 @@ impl WalletRoot {
         root: &Entity<Self>,
         progress: &PrivateBroadcasterProgressState,
     ) -> Option<gpui::AnyElement> {
+        use ui::private_submission::OperationControl;
+
         let address = public_broadcaster_progress_address(progress)?;
         if self.is_banned_broadcaster(address) {
             return Some(
@@ -1079,62 +1108,41 @@ impl WalletRoot {
                 PublicBroadcasterResultKind::Submitted { .. }
             )
         });
-        if submitted {
-            if self.is_favorite_broadcaster(address) {
-                return Some(
-                    render_broadcaster_preference_progress_chip("Favorited", theme::WARNING)
-                        .into_any_element(),
-                );
-            }
-            let action_root = root.clone();
-            let address = address.to_owned();
+        if submitted && self.is_favorite_broadcaster(address) {
             return Some(
-                app_button_base(delivery_element_id(
-                    progress.key,
-                    progress.kind,
-                    "favorite-current-broadcaster",
-                ))
-                .outline()
-                .xsmall()
-                .icon(Icon::new(IconName::Star))
-                .accessibility_label("Add broadcaster to favorites")
-                .tooltip(
-                    "Save this broadcaster to your favorites so future transactions can prefer it.",
-                )
-                .on_click(move |_event, _window, cx| {
-                    let address = address.clone();
-                    action_root.update(cx, |root, cx| {
-                        root.add_favorite_broadcaster(&address, cx);
-                    });
-                })
-                .into_any_element(),
+                render_broadcaster_preference_progress_chip("Favorited", theme::WARNING)
+                    .into_any_element(),
             );
         }
-
-        if public_broadcaster_waiting_can_stop(progress, Instant::now()) && !progress.stop_available
+        let control = if submitted {
+            OperationControl::Favorite
+        } else if public_broadcaster_waiting_can_stop(progress, Instant::now())
+            && !progress.stop_available
         {
-            let action_root = root.clone();
-            let address = address.to_owned();
-            return Some(
-                app_button(
-                    delivery_element_id(progress.key, progress.kind, "ban-current-broadcaster"),
-                    "Ban this broadcaster",
-                )
-                .danger()
-                .outline()
-                .xsmall()
-                .tooltip("Exclude this broadcaster from future selections. This does not stop the current wait.")
-                .on_click(move |_event, _window, cx| {
-                    let address = address.clone();
-                    action_root.update(cx, |root, cx| {
-                        root.add_banned_broadcaster(&address, cx);
+            OperationControl::Ban
+        } else {
+            return None;
+        };
+        let action_root = root.clone();
+        let address = address.to_owned();
+        Some(
+            ui::private_submission::operation_controls(
+                delivery_element_id(progress.key, progress.kind, "broadcaster-preference"),
+                [control],
+                move |control, _, cx| {
+                    action_root.update(cx, |root, cx| match control {
+                        OperationControl::Favorite => {
+                            root.add_favorite_broadcaster(&address, cx);
+                        }
+                        OperationControl::Ban => {
+                            root.add_banned_broadcaster(&address, cx);
+                        }
+                        OperationControl::Stop | OperationControl::StopWaiting => {}
                     });
-                })
-                .into_any_element(),
-            );
-        }
-
-        None
+                },
+            )
+            .into_any_element(),
+        )
     }
 }
 
@@ -1388,6 +1396,24 @@ fn render_private_broadcaster_progress_footer(
         private_broadcaster_progress_stop_available(progress, now),
         private_broadcaster_progress_is_terminal(progress),
     );
+    if progress.flow == PrivateSubmissionProgressFlow::PublicBroadcaster
+        && matches!(action, ProgressFooterAction::Stop)
+    {
+        use ui::private_submission::OperationControl;
+        let control =
+            if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
+                OperationControl::StopWaiting
+            } else {
+                OperationControl::Stop
+            };
+        return ui::private_submission::operation_controls(
+            delivery_element_id(progress.key, progress.kind, "progress-controls"),
+            [control],
+            move |_, _, cx| root.update(cx, WalletRoot::stop_private_broadcaster_progress),
+        )
+        .w_full()
+        .justify_end();
+    }
     let button_root = root;
     let (id_suffix, label) = match action {
         ProgressFooterAction::Stop => (
@@ -1452,56 +1478,29 @@ fn render_private_broadcaster_progress_step(
     is_last: bool,
 ) -> gpui::Div {
     let color = public_action_step_color(step.status);
-    let mut body = div()
-        .flex_1()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .pb(if is_last { px(0.0) } else { px(12.0) })
-        .child(
-            app_strong_text(private_broadcaster_stage_label(
-                step.stage,
-                progress.requires_device_approval,
-            ))
-            .text_color(rgb(color))
-            .line_height(gpui::relative(1.0)),
-        );
-    if step.status == PublicActionStepStatus::Error {
-        let message = step
-            .message
+    let error = step.status == PublicActionStepStatus::Error;
+    let detail = if error {
+        step.message
             .as_deref()
-            .unwrap_or("This broadcaster submission step failed.");
-        let copy_id = SharedString::from(format!(
-            "wallet-private-broadcaster-{}-error-copy",
-            private_broadcaster_stage_id(step.stage),
-        ));
-        body = body.child(
-            div()
-                .flex()
-                .items_start()
-                .gap_1()
-                .child(
-                    app_muted_text(message.to_string())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .whitespace_normal()
-                        .text_color(rgb(theme::DANGER))
-                        .line_height(gpui::relative(1.0)),
-                )
-                .child(clipboard_with_toast(copy_id, message.to_string())),
-        );
+            .unwrap_or("This broadcaster submission step failed.")
+            .to_owned()
     } else {
-        let detail = private_broadcaster_step_detail(progress, step, Instant::now());
-        body = body.child(
-            app_muted_text(detail)
-                .text_color(rgb(color))
-                .line_height(gpui::relative(1.0)),
-        );
-    }
-    if let Some(action) = render_self_broadcast_step_action(root, progress, step) {
-        body = body.child(action);
-    }
+        private_broadcaster_step_detail(progress, step, Instant::now())
+    };
+    let copy_id = error.then(|| {
+        SharedString::from(format!(
+            "wallet-private-broadcaster-{}-error-copy",
+            private_broadcaster_stage_id(step.stage)
+        ))
+    });
+    let body = ui::private_submission::progress_step_body(
+        private_broadcaster_stage_label(step.stage, progress.requires_device_approval).into(),
+        detail,
+        copy_id,
+        color,
+        render_self_broadcast_step_action(root, progress, step),
+    )
+    .when(!is_last, gpui::Styled::pb_3);
 
     app_step_row(
         render_public_action_step_marker(step.status, color),

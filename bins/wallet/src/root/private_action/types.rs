@@ -56,6 +56,7 @@ pub(in crate::root) enum DeliveryFormKind {
 }
 
 pub(in crate::root) struct PrivateActionFormState {
+    pub(in crate::root) focus: gpui::FocusHandle,
     pub(in crate::root) kind: DeliveryFormKind,
     pub(in crate::root) key: UnshieldAssetKey,
 }
@@ -539,6 +540,8 @@ pub(in crate::root) fn private_amount_label(
 }
 
 pub(in crate::root) struct UnshieldFormState {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
+    pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
     pub(in crate::root) recipient_value: Arc<str>,
@@ -584,6 +587,8 @@ pub(in crate::root) struct UnshieldFormState {
 }
 
 pub(in crate::root) struct SendFormState {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
+    pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
     pub(in crate::root) recipient_value: Arc<str>,

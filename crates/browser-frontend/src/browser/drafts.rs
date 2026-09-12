@@ -1,4 +1,5 @@
-//! Editable public inputs and peer-scoped desktop progress. This view never signs.
+//! Editable inputs and peer-scoped desktop progress. This view never signs.
+mod private;
 use super::*;
 use gpui::{Focusable as _, Task};
 use gpui_component::button::ButtonVariants;
@@ -70,6 +71,8 @@ pub(super) struct DraftSnapshot {
     status: String,
     estimate: Value,
     gas_quote: Value,
+    private_options: Value,
+    private_progress: Value,
     recipients: Vec<DraftRecipient>,
     step: String,
     message: String,
@@ -110,6 +113,8 @@ impl DraftSnapshot {
             status: text_field(&value, "status"),
             estimate: json_value("estimate"),
             gas_quote: json_value("gas_quote"),
+            private_options: json_value("private_options"),
+            private_progress: json_value("private_progress"),
             recipients: js_sys::Array::from(&field(&value, "recipients"))
                 .iter()
                 .map(|entry| DraftRecipient {
@@ -134,6 +139,7 @@ impl DraftSnapshot {
 }
 
 pub(super) struct DraftForm {
+    private: Option<private::PrivateDraftForm>,
     request_id: String,
     id: Option<String>,
     revision: u64,
@@ -156,7 +162,7 @@ pub(super) struct DraftForm {
 }
 impl DraftForm {
     fn sync_token_max(&mut self, window: &mut Window, cx: &mut App) {
-        if self.input["max"] != true {
+        if self.input["wallet"].is_string() || self.input["max"] != true {
             return;
         }
         let Some(amount) = self
@@ -237,17 +243,24 @@ impl GatewayView {
             }
         }
         self.draft = draft;
-        if let Some(form) = &self.draft_form
-            && (Some(text(&form.input, "account")) != self.public_view.selected_account
-                || form.input["chain_id"].as_u64() != self.public_view.selected_chain)
-        {
-            self.draft_form = None;
+        if let Some(form) = &self.draft_form {
+            let stale = if form.private.is_some() {
+                form.input["wallet"].as_str() != self.private_view.selected_wallet.as_deref()
+                    || form.input["chain_id"].as_u64() != self.private_view.selected_chain
+            } else {
+                Some(text(&form.input, "account")) != self.public_view.selected_account
+                    || form.input["chain_id"].as_u64() != self.public_view.selected_chain
+            };
+            if stale {
+                self.draft_form = None;
+            }
         }
         if let Some(draft) = &self.draft {
             if let Some(form) = &mut self.draft_form {
                 if form.request_id == draft.request_id {
                     form.id = Some(draft.id.clone());
-                    if let Some(id) = form.input["address_book_entry"].as_str()
+                    if form.private.is_none()
+                        && let Some(id) = form.input["address_book_entry"].as_str()
                         && let Some(entry) = draft.recipients.iter().find(|entry| entry.id == id)
                         && form.recipient.read(cx).value().as_ref() != entry.address
                     {
@@ -259,7 +272,7 @@ impl GatewayView {
                     if draft.revision == form.revision
                         && draft.input == form.input
                         && draft.estimate["amount"].is_string()
-                        && form.input["asset"] == "native"
+                        && (form.input["asset"] == "native" || form.private.is_some())
                         && form.input["max"] == true
                     {
                         let amount = text(&draft.estimate, "amount");
@@ -286,7 +299,10 @@ impl GatewayView {
             {
                 self.handoff_open = false;
             }
-            if draft.status == "done" && self.completed_draft.as_ref() != Some(&draft.id) {
+            if draft.status == "done"
+                && !draft.input["wallet"].is_string()
+                && self.completed_draft.as_ref() != Some(&draft.id)
+            {
                 self.completed_draft = Some(draft.id.clone());
                 let id = draft.id.clone();
                 self.draft_completion = Some(cx.spawn(async move |this, cx| {
@@ -304,6 +320,7 @@ impl GatewayView {
             }
         }
         self.sync_draft_assets(window, cx);
+        self.sync_private_draft_options(window, cx);
         self.flush_draft(cx);
     }
 
@@ -311,6 +328,9 @@ impl GatewayView {
         let Some(form) = &mut self.draft_form else {
             return;
         };
+        if form.private.is_some() {
+            return;
+        }
         let assets = self
             .public_view
             .balances(&text(&form.input, "account"))
@@ -525,7 +545,11 @@ impl GatewayView {
             &amount
         };
         let focus_handle = first_input.read(cx).focus_handle(cx);
+        let private = input["wallet"]
+            .is_string()
+            .then(|| self.new_private_draft_form(&input, window, cx));
         self.draft_form = Some(DraftForm {
+            private,
             request_id,
             id,
             revision,
@@ -623,6 +647,13 @@ impl GatewayView {
     }
 
     fn draft_recipient_options(&self) -> Vec<RecipientSuggestion> {
+        if self
+            .draft_form
+            .as_ref()
+            .is_some_and(|form| form.private.is_some())
+        {
+            return self.private_draft_recipient_options();
+        }
         self.accounts
             .iter()
             .map(|account| {
@@ -653,7 +684,12 @@ impl GatewayView {
             return String::new();
         };
         let value = form.recipient.read(cx).value().to_string();
-        if form.input["address_book_entry"].is_string()
+        if (form.private.is_some()
+            && self
+                .draft_recipient_options()
+                .iter()
+                .any(|option| option.address().as_ref() == value.trim()))
+            || form.input["address_book_entry"].is_string()
             || value.trim().parse::<alloy::primitives::Address>().is_ok()
         {
             String::new()
@@ -710,11 +746,12 @@ impl GatewayView {
                 };
                 form.input["address_book_entry"] =
                     id.strip_prefix("book:").map_or(Value::Null, Into::into);
-                form.input["recipient"] = if form.input["address_book_entry"].is_string() {
-                    "".into()
-                } else {
-                    option.address().to_string().into()
-                };
+                form.input["recipient"] =
+                    if form.private.is_none() && form.input["address_book_entry"].is_string() {
+                        "".into()
+                    } else {
+                        option.address().to_string().into()
+                    };
                 form.setting_recipient = Some(option.address().to_string());
                 form.recipient.update(cx, |input, cx| {
                     input.set_value(option.address().clone(), window, cx);
@@ -800,6 +837,7 @@ impl GatewayView {
         cx.notify();
     }
     pub(super) fn hide_draft(&mut self, cx: &mut Context<'_, Self>) {
+        let _ = self.retire_private_picker();
         self.handoff_open = false;
         self.draft_form = None;
         cx.notify();
@@ -824,10 +862,18 @@ impl GatewayView {
         if self.handoff_open || self.draft_form.is_some() {
             return None;
         }
+        let draft_id = draft.id.clone();
         let kind = text(&draft.input, "kind");
-        let action = if kind == "shield" { "Shield" } else { "Send" };
+        let action = match kind.as_str() {
+            "shield" => "Shield",
+            "unshield" => "Unshield",
+            _ => "Send",
+        };
         let amount = text(&draft.estimate, "amount_label");
-        let summary = if amount.is_empty() {
+        let native_summary = text(&draft.private_progress, "summary");
+        let summary = if !native_summary.is_empty() {
+            format!("{action} {native_summary}")
+        } else if amount.is_empty() {
             format!("{action} draft")
         } else {
             format!("{action} {amount}")
@@ -891,18 +937,47 @@ impl GatewayView {
                         .child(note(summary).truncate()),
                 )
                 .child(
-                    app_button(
-                        "show-draft",
-                        if draft.executing() { "Show" } else { "Edit" },
-                    )
-                    .small()
-                    .flex_none()
-                    .when(warning, ButtonVariants::warning)
-                    .when(attention && !warning, ButtonVariants::primary)
-                    .when(!attention, Button::outline)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_draft(&kind, None, window, cx);
-                    })),
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            app_button(
+                                "show-draft",
+                                if draft.executing() { "Show" } else { "Edit" },
+                            )
+                            .small()
+                            .w_full()
+                            .when(warning, ButtonVariants::warning)
+                            .when(attention && !warning, ButtonVariants::primary)
+                            .when(!attention, Button::outline)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    if matches!(kind.as_str(), "private_send" | "unshield") {
+                                        this.open_private_draft(&kind, window, cx);
+                                    } else {
+                                        this.open_draft(&kind, None, window, cx);
+                                    }
+                                },
+                            )),
+                        )
+                        .when(!draft.executing(), |column| {
+                            column.child(
+                                app_button("discard-draft", "Discard")
+                                    .small()
+                                    .w_full()
+                                    .danger()
+                                    .outline()
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        if this.draft.as_ref().is_some_and(|draft| {
+                                            draft.id == draft_id && !draft.executing()
+                                        }) {
+                                            send(&json!({"action":"dismiss", "draft_id":draft_id}));
+                                        }
+                                    })),
+                            )
+                        }),
                 ),
         )
     }
@@ -911,6 +986,9 @@ impl GatewayView {
         let Some(form) = &self.draft_form else {
             return div();
         };
+        if form.private.is_some() {
+            return self.render_private_draft_form(cx);
+        }
         let shield = text(&form.input, "kind") == "shield";
         let account_id = text(&form.input, "account");
         let account = self
@@ -1167,6 +1245,9 @@ impl GatewayView {
         let Some(draft) = &self.draft else {
             return div().child(note("Waiting for the desktop app…"));
         };
+        if draft.input["wallet"].is_string() {
+            return Self::render_private_draft_handoff(draft, cx);
+        }
         let terminal = matches!(draft.status.as_str(), "done" | "failed");
         let id = draft.id.clone();
         div()

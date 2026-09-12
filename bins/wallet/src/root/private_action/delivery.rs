@@ -94,197 +94,62 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     selected_fee_token: Address,
     generating: bool,
 ) -> gpui::Div {
-    let fee_token_root = root.clone();
-    let fee_mode_root = root.clone();
-    let random_root = root.clone();
-    let modal_root = root.clone();
-    let policy_label_root = root.clone();
-    let policy_switch_root = root.clone();
-    let favorites_label_root = root.clone();
-    let favorites_switch_root = root;
-    let specific_label = selected_broadcaster_label(choice, candidates);
-    let random_selected = matches!(choice, BroadcasterChoice::Random);
-    let specific_selected = matches!(choice, BroadcasterChoice::Specific { .. });
-    let selector_disabled = generating || candidates.is_empty();
-    let random_button = app_button(
-        delivery_element_id(key, kind, "random"),
-        "Random broadcaster",
-    )
-    .flex_1()
-    .min_w(px(0.0))
-    .selected(random_selected)
-    .disabled(selector_disabled);
-    let random_button = if random_selected {
-        random_button.primary()
-    } else {
-        random_button
-    };
-    let specific_button = app_button(
-        delivery_element_id(key, kind, "choose-specific"),
-        specific_label,
-    )
-    .flex_1()
-    .min_w(px(0.0))
-    .selected(specific_selected)
-    .disabled(selector_disabled);
-    let specific_button = if specific_selected {
-        specific_button.primary()
-    } else {
-        specific_button
-    };
-
-    let settings = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(10.0))
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(app_muted_text("Allow out-of-range fees"))
-                        .child(cost_estimate_detail_text(
-                            "Allow broadcaster fees outside the configured anchor range.",
-                        ))
-                        .when(!generating, |this| {
-                            this.on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                                cx.stop_propagation();
-                                policy_label_root.update(cx, |root, cx| {
-                                    root.set_allow_suspicious_broadcasters(
-                                        kind,
-                                        key,
-                                        !allow_suspicious_broadcasters,
-                                        cx,
-                                    );
-                                });
-                            })
-                        }),
-                )
-                .child(render_danger_switch(
-                    delivery_element_id(key, kind, "allow-suspicious-broadcasters"),
-                    allow_suspicious_broadcasters,
-                    generating,
-                    move |checked, _window, cx| {
-                        policy_switch_root.update(cx, |root, cx| {
-                            root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
-                        });
-                    },
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(app_muted_text("Favorites only"))
-                        .child(cost_estimate_detail_text(
-                            "Only use broadcasters saved in your favorites list.",
-                        ))
-                        .when(!generating, |this| {
-                            this.on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                                cx.stop_propagation();
-                                favorites_label_root.update(cx, |root, cx| {
-                                    root.set_favorites_only_broadcasters(
-                                        kind,
-                                        key,
-                                        !favorites_only_broadcasters,
-                                        cx,
-                                    );
-                                });
-                            })
-                        }),
-                )
-                .child(render_switch(
-                    delivery_element_id(key, kind, "favorites-only-broadcasters"),
-                    favorites_only_broadcasters,
-                    generating,
-                    theme::PRIMARY,
-                    move |checked, _window, cx| {
-                        favorites_switch_root.update(cx, |root, cx| {
-                            root.set_favorites_only_broadcasters(kind, key, checked, cx);
-                        });
-                    },
-                )),
-        )
-        .child(render_fee_token_selector(
-            fee_token_root,
+    use ui::private_action::{BroadcasterSettings, BroadcasterSettingsEvent};
+    let fee_token = render_fee_token_selector(
+        root.clone(),
+        key,
+        kind,
+        fee_token_options,
+        selected_fee_token,
+        generating,
+    );
+    let fee_mode = (kind == DeliveryFormKind::Send
+        && should_show_fee_mode_toggle(kind, action_token, selected_fee_token))
+    .then(|| {
+        render_fee_mode_toggle(
+            root.clone(),
             key,
             kind,
-            fee_token_options,
-            selected_fee_token,
+            DeliveryMode::PublicBroadcaster,
+            fee_mode,
             generating,
-        ))
-        .child(
-            ButtonGroup::new(delivery_element_id(key, kind, "broadcaster-choice-toggle"))
-                .w_full()
-                .disabled(selector_disabled)
-                .child(random_button)
-                .child(specific_button)
-                .on_click(move |selected, window, cx| {
-                    let Some(index) = selected.first() else {
-                        return;
-                    };
-                    if *index == 0 {
-                        random_root.update(cx, |root, cx| match kind {
-                            DeliveryFormKind::Send => {
-                                root.set_send_broadcaster_choice(
-                                    key,
-                                    BroadcasterChoice::Random,
-                                    cx,
-                                );
-                            }
-                            DeliveryFormKind::Unshield => {
-                                root.set_unshield_broadcaster_choice(
-                                    key,
-                                    BroadcasterChoice::Random,
-                                    cx,
-                                );
-                            }
-                        });
-                    } else {
-                        modal_root.update(cx, |root, cx| {
-                            root.open_broadcaster_picker(kind, key, window, cx);
-                        });
-                    }
-                }),
         )
-        .when(
-            matches!(kind, DeliveryFormKind::Send)
-                && should_show_fee_mode_toggle(kind, action_token, selected_fee_token),
-            |settings| {
-                settings.child(render_fee_mode_toggle(
-                    fee_mode_root,
-                    key,
-                    kind,
-                    DeliveryMode::PublicBroadcaster,
-                    fee_mode,
-                    generating,
-                ))
-            },
-        );
-
-    if candidates.is_empty() {
-        return settings.child(app_muted_text(
-            "No eligible broadcaster currently advertises this token.",
-        ));
-    }
-    settings
+        .into_any_element()
+    });
+    ui::private_action::broadcaster_settings(
+        delivery_element_id(key, kind, "broadcaster-settings"),
+        BroadcasterSettings {
+            allow_out_of_range: allow_suspicious_broadcasters,
+            favorites_only: favorites_only_broadcasters,
+            random_selected: matches!(choice, BroadcasterChoice::Random),
+            specific_label: selected_broadcaster_label(choice, candidates),
+            candidate_count: candidates.len(),
+            disabled: generating,
+        },
+        fee_token,
+        fee_mode,
+        move |event, window, cx| {
+            root.update(cx, |root, cx| match event {
+                BroadcasterSettingsEvent::AllowOutOfRange(checked) => {
+                    root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                }
+                BroadcasterSettingsEvent::FavoritesOnly(checked) => {
+                    root.set_favorites_only_broadcasters(kind, key, checked, cx);
+                }
+                BroadcasterSettingsEvent::ChooseSpecific => {
+                    root.open_broadcaster_picker(kind, key, window, cx);
+                }
+                BroadcasterSettingsEvent::Random => match kind {
+                    DeliveryFormKind::Send => {
+                        root.set_send_broadcaster_choice(key, BroadcasterChoice::Random, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.set_unshield_broadcaster_choice(key, BroadcasterChoice::Random, cx);
+                    }
+                },
+            });
+        },
+    )
 }
 
 pub(in crate::root) fn render_self_broadcast_settings(
@@ -873,76 +738,6 @@ pub(in crate::root) fn self_broadcast_gas_payer_select_menu_row(
         )
 }
 
-pub(in crate::root) fn render_danger_switch(
-    id: SharedString,
-    checked: bool,
-    disabled: bool,
-    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    render_switch(id, checked, disabled, theme::DANGER, on_toggle)
-}
-
-pub(in crate::root) fn render_switch(
-    id: SharedString,
-    checked: bool,
-    disabled: bool,
-    checked_color: u32,
-    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let track_width = px(36.0);
-    let track_height = px(20.0);
-    let thumb_size = px(16.0);
-    let inset = px(2.0);
-    let max_x = track_width - thumb_size - inset * 2.0;
-    let thumb_x = if checked { max_x } else { px(0.0) };
-    let track_color = if checked {
-        checked_color
-    } else {
-        theme::SURFACE_HOVER
-    };
-    let thumb_color = if checked {
-        theme::SURFACE
-    } else {
-        theme::TEXT_MUTED
-    };
-
-    div()
-        .id(id)
-        .w(track_width)
-        .h(track_height)
-        .flex()
-        .items_center()
-        .p(inset)
-        .rounded_full()
-        .bg(rgb(track_color))
-        .opacity(if disabled { 0.5 } else { 1.0 })
-        .when(!disabled, |this| {
-            this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                cx.stop_propagation();
-                on_toggle(!checked, window, cx);
-            })
-        })
-        .child(
-            div()
-                .size(thumb_size)
-                .rounded_full()
-                .bg(rgb(thumb_color))
-                .left(thumb_x)
-                .with_animation(
-                    ElementId::NamedInteger("danger-switch-thumb".into(), u64::from(checked)),
-                    Animation::new(Duration::from_secs_f64(0.15)),
-                    move |this, delta| {
-                        let x = if checked {
-                            max_x * delta
-                        } else {
-                            max_x - max_x * delta
-                        };
-                        this.left(x)
-                    },
-                ),
-        )
-}
-
 pub(in crate::root) fn render_unshield_output_toggle(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -953,35 +748,16 @@ pub(in crate::root) fn render_unshield_output_toggle(
     let Some((native_label, wrapped_label)) = native_wrapped_output_labels(chain_id) else {
         return div();
     };
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(app_muted_text("Output"))
-        .child(
-            ButtonGroup::new(unshield_element_id(key, "output-toggle"))
-                .outline()
-                .disabled(generating)
-                .child(
-                    app_button(unshield_element_id(key, "output-native"), native_label)
-                        .selected(unwrap)
-                        .disabled(generating),
-                )
-                .child(
-                    app_button(unshield_element_id(key, "output-wrapped"), wrapped_label)
-                        .selected(!unwrap)
-                        .disabled(generating),
-                )
-                .on_click(move |selected, _window, cx| {
-                    let Some(index) = selected.first() else {
-                        return;
-                    };
-                    let unwrap = *index == 0;
-                    root.update(cx, |root, cx| {
-                        root.set_unshield_unwrap(key, unwrap, cx);
-                    });
-                }),
-        )
+    ui::private_action::unshield_output_toggle(
+        unshield_element_id(key, "output-toggle"),
+        native_label,
+        wrapped_label,
+        unwrap,
+        generating,
+        move |unwrap, _, cx| {
+            root.update(cx, |root, cx| root.set_unshield_unwrap(key, unwrap, cx));
+        },
+    )
 }
 
 #[cfg(test)]

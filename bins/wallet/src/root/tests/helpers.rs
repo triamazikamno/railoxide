@@ -201,6 +201,7 @@ pub(super) fn private_progress_state(
     key: UnshieldAssetKey,
 ) -> PrivateBroadcasterProgressState {
     PrivateBroadcasterProgressState {
+        gateway_execution: None,
         flow,
         kind: DeliveryFormKind::Send,
         key,

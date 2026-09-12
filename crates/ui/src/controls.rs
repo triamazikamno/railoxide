@@ -174,10 +174,31 @@ pub fn public_action_mode_group(
     disabled: bool,
     on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> ButtonGroup {
+    action_mode_group(
+        id,
+        shield_selected,
+        disabled,
+        [
+            ("shield", "Shield", "ui/icons/shield.svg"),
+            ("send", "Send", "ui/icons/arrow-big-right-dash.svg"),
+        ],
+        on_change,
+    )
+}
+
+/// Two action modes with the same selection and keyboard behavior on both surfaces.
+#[must_use]
+pub fn action_mode_group(
+    id: impl Into<ElementId>,
+    first_selected: bool,
+    disabled: bool,
+    choices: [(&'static str, &'static str, &'static str); 2],
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> ButtonGroup {
     let on_change = std::rc::Rc::new(on_change);
     let segment = |id, label, icon, shield| {
         let on_change = on_change.clone();
-        let selected = shield == shield_selected;
+        let selected = shield == first_selected;
         app_button(id, label)
             .flex_1()
             .min_w_0()
@@ -190,11 +211,11 @@ pub fn public_action_mode_group(
         .w_full()
         .outline()
         .disabled(disabled)
-        .child(segment("shield", "Shield", "ui/icons/shield.svg", true))
+        .child(segment(choices[0].0, choices[0].1, choices[0].2, true))
         .child(
-            segment("send", "Send", "ui/icons/arrow-big-right-dash.svg", false)
+            segment(choices[1].0, choices[1].1, choices[1].2, false)
                 // The selected segment owns the shared one-pixel border, as on desktop.
-                .when(!shield_selected, |button| button.border_l_1().ml(-px(1.0))),
+                .when(!first_selected, |button| button.border_l_1().ml(-px(1.0))),
         )
 }
 

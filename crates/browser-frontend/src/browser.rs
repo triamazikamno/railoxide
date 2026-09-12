@@ -47,6 +47,8 @@ thread_local! {
 extern "C" {
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = isMac)]
     fn host_is_mac() -> bool;
+    #[wasm_bindgen(js_namespace = railoxideHost, js_name = isSidePanel)]
+    fn host_is_side_panel() -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = isActive)]
     fn host_is_active() -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = canCopyAddress)]

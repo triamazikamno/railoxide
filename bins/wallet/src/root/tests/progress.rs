@@ -1,8 +1,8 @@
 use super::*;
 use crate::root::private_broadcaster::{
-    cancel_private_broadcaster_progress, private_broadcaster_progress_is_terminal,
-    request_sponsored_session_cancel, spawn_sponsored_abort_watchdog,
-    sponsored_stop_uses_session_command,
+    cancel_private_broadcaster_progress, private_broadcaster_progress_dialog_close_behavior,
+    private_broadcaster_progress_is_terminal, request_sponsored_session_cancel,
+    spawn_sponsored_abort_watchdog, sponsored_stop_uses_session_command,
 };
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
@@ -500,6 +500,37 @@ fn progress_dialog_close_behavior_distinguishes_success_from_failure_and_stop() 
 }
 
 #[test]
+fn closing_failed_gateway_progress_releases_the_hidden_form_but_hiding_active_work_does_not() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x12; 20]));
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    progress.kind = DeliveryFormKind::Unshield;
+    progress.gateway_execution = Some(wallet_ops::gateway::GatewayDraftExecution::private(
+        "extension-operation".into(),
+    ));
+    assert_eq!(
+        private_broadcaster_progress_dialog_close_behavior(&progress),
+        ProgressDialogCloseBehavior::TopOnly,
+    );
+    finish_private_broadcaster_progress_steps_at_stage(
+        &mut progress.steps,
+        TransactionGenerationStage::WaitingForBroadcasterResponse,
+        &PublicBroadcasterResultKind::Failed {
+            error: "Rejected by broadcaster".into(),
+        },
+    );
+    assert_eq!(
+        private_broadcaster_progress_dialog_close_behavior(&progress),
+        ProgressDialogCloseBehavior::AllAndClear,
+    );
+    progress.gateway_execution = None;
+    assert_eq!(
+        private_broadcaster_progress_dialog_close_behavior(&progress),
+        ProgressDialogCloseBehavior::TopOnly,
+    );
+}
+
+#[test]
 fn replaced_reward_progress_remains_reopenable_but_clear_resets_lifecycle() {
     let history = vec![PublicActionStepState {
         step: PublicActionProgressStep::RewardClaim(0),
@@ -901,6 +932,7 @@ fn stale_progress_update_guards_reject_stopped_generations() {
 fn closed_private_broadcaster_progress_exposes_active_stage() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
     let mut progress = PrivateBroadcasterProgressState {
+        gateway_execution: None,
         flow: PrivateSubmissionProgressFlow::PublicBroadcaster,
         kind: DeliveryFormKind::Send,
         key,

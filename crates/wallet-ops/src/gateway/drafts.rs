@@ -1,4 +1,4 @@
-//! Public draft messages and transaction progress shared with the desktop owner.
+//! Draft messages and transaction progress shared with the desktop owner.
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -41,17 +41,56 @@ pub struct GatewayDraftInput {
     pub max: bool,
 }
 
+/// Public inputs keep their original wire representation. Private kinds cannot parse as Public.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum GatewayDraftPayload {
+    Public(GatewayDraftInput),
+    Private(super::GatewayPrivateDraftInput),
+}
+
+impl GatewayDraftPayload {
+    #[must_use]
+    pub const fn public(&self) -> Option<&GatewayDraftInput> {
+        match self {
+            Self::Public(input) => Some(input),
+            Self::Private(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        match self {
+            Self::Public(input) => input.chain_id,
+            Self::Private(input) => input.chain_id,
+        }
+    }
+}
+
+impl From<GatewayDraftInput> for GatewayDraftPayload {
+    fn from(input: GatewayDraftInput) -> Self {
+        Self::Public(input)
+    }
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum GatewayDraftEstimatePayload {
+    Public(GatewayDraftEstimate),
+    Private(super::GatewayPrivateDraftEstimate),
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayDraftCommand {
     Create {
         request_id: String,
-        input: GatewayDraftInput,
+        input: GatewayDraftPayload,
     },
     Update {
         draft_id: String,
         revision: u64,
-        input: GatewayDraftInput,
+        input: GatewayDraftPayload,
     },
     Submit {
         draft_id: String,
@@ -59,6 +98,18 @@ pub enum GatewayDraftCommand {
     },
     Cancel {
         draft_id: String,
+    },
+    PrivatePicker {
+        draft_id: String,
+        revision: u64,
+        view_id: String,
+        open: bool,
+        query: String,
+    },
+    PrivateControl {
+        draft_id: String,
+        execution_id: String,
+        control: super::GatewayPrivateDraftControl,
     },
     Dismiss {
         draft_id: String,
@@ -124,9 +175,13 @@ pub struct GatewayDraftView {
     pub draft_id: String,
     pub request_id: String,
     pub revision: u64,
-    pub input: GatewayDraftInput,
+    pub input: GatewayDraftPayload,
     pub status: GatewayDraftStatus,
-    pub estimate: Option<GatewayDraftEstimate>,
+    pub estimate: Option<GatewayDraftEstimatePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_progress: Option<super::GatewayPrivateDraftProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_options: Option<super::GatewayPrivateDraftOptions>,
     pub gas_quote: Option<GatewayDraftGasQuote>,
     pub recipients: Vec<GatewayDraftRecipient>,
     pub step_label: String,
@@ -151,6 +206,7 @@ struct ExecutionState {
     step: String,
     message: String,
     warning: bool,
+    private: Option<super::GatewayPrivateDraftProgress>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -160,6 +216,7 @@ pub struct GatewayDraftProgress {
     pub message: String,
     pub warning: bool,
     pub can_retry: bool,
+    pub private: Option<super::GatewayPrivateDraftProgress>,
 }
 
 impl Default for GatewayDraftExecution {
@@ -174,11 +231,73 @@ impl Default for GatewayDraftExecution {
             step: "Approve in the desktop app".into(),
             message: "Review this transaction in the desktop app.".into(),
             warning: false,
+            private: None,
         })))
     }
 }
 
 impl GatewayDraftExecution {
+    #[must_use]
+    pub fn private(execution_id: String) -> Self {
+        let execution = Self::default();
+        let private = super::GatewayPrivateDraftProgress {
+            execution_id,
+            ..Default::default()
+        };
+        execution
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .private = Some(private);
+        execution
+    }
+
+    #[must_use]
+    pub fn same_execution(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[must_use]
+    pub fn has_review_approval(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .review_approved
+    }
+
+    /// Only the native operation owner supplies this display projection.
+    pub fn update_private(
+        &self,
+        status: GatewayDraftStatus,
+        step: String,
+        message: String,
+        warning: bool,
+        private: super::GatewayPrivateDraftProgress,
+    ) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .private
+            .as_ref()
+            .is_none_or(|current| current.execution_id != private.execution_id)
+            || state.cancelled
+            || (matches!(
+                state.status,
+                GatewayDraftStatus::Done | GatewayDraftStatus::Failed
+            ) && state.status != status)
+        {
+            return;
+        }
+        state.handed_off |= private.result == Some(super::GatewayPrivateDraftResult::Submitted);
+        state.private = Some(private);
+        state.status = status;
+        state.step = step;
+        state.message = message;
+        state.warning = warning;
+    }
+
     #[must_use]
     pub fn approve_review(&self) -> bool {
         let mut state = self
@@ -196,6 +315,26 @@ impl GatewayDraftExecution {
         }
         state.review_approved = true;
         true
+    }
+
+    /// Revalidation failure permits an explicit draft retry, never replay of started work.
+    pub fn reject_private_review(&self, message: String) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.started
+            && !state.cancelled
+            && state.status == GatewayDraftStatus::Attention
+            && let Some(private) = state.private.as_mut()
+        {
+            private.result = Some(super::GatewayPrivateDraftResult::Failed);
+            state.review_approved = false;
+            state.status = GatewayDraftStatus::Failed;
+            state.step = "Transaction needs updating".into();
+            state.message = message;
+            state.warning = true;
+        }
     }
 
     pub fn bind_generation(&self, generation: u64) {
@@ -243,13 +382,39 @@ impl GatewayDraftExecution {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.started || state.review_approved {
+        if state.started || state.review_approved || state.status == GatewayDraftStatus::Failed {
             return;
         }
         state.cancelled = true;
         state.status = GatewayDraftStatus::Failed;
         state.step = "Canceled".into();
         state.message = "The transaction was not submitted.".into();
+        if let Some(private) = &mut state.private {
+            private.result = Some(super::GatewayPrivateDraftResult::Cancelled);
+        }
+    }
+
+    /// Retain the last result after the native owner releases its task and controls.
+    pub fn retire_private_owner(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(private) = &mut state.private else {
+            return;
+        };
+        private.stop = false;
+        private.stop_waiting = false;
+        private.ban = false;
+        private.favorite = false;
+        if private.result.is_none() {
+            private.result = Some(super::GatewayPrivateDraftResult::Stopped);
+            state.status = GatewayDraftStatus::Failed;
+            state.step = "Stopped".into();
+            state.message = "Desktop processing stopped. A published transaction may still be submitted; check history before creating another transaction.".into();
+            state.warning = true;
+        }
+        state.cancelled = true;
     }
 
     pub fn stopped(&self) {
@@ -380,10 +545,12 @@ impl GatewayDraftExecution {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         GatewayDraftProgress {
+            private: state.private.clone(),
             status: state.status,
             step_label: state.step.clone(),
             message: state.message.clone(),
-            warning: state.status == GatewayDraftStatus::Attention && state.warning,
+            warning: state.warning
+                && (state.private.is_some() || state.status == GatewayDraftStatus::Attention),
             // Event delivery can lag task completion. Once started, submission may have
             // happened even if the handoff event has not reached this projection yet.
             can_retry: state.status == GatewayDraftStatus::Failed
@@ -409,6 +576,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_execution_requires_native_approval_and_keeps_uncertain_outcomes_terminal() {
+        use crate::gateway::GatewayPrivateDraftResult;
+        let execution = GatewayDraftExecution::private("operation".into());
+        let observer = execution.clone();
+        assert!(!execution.start());
+        let mut projection = execution.snapshot().private.unwrap();
+        projection.execution_id = "old-operation".into();
+        execution.update_private(
+            GatewayDraftStatus::Done,
+            String::new(),
+            String::new(),
+            false,
+            projection,
+        );
+        assert_eq!(observer.snapshot().status, GatewayDraftStatus::Attention);
+        assert!(execution.approve_review());
+        assert!(execution.start());
+        assert!(!observer.start());
+        execution.bind_generation(7);
+        let mut projection = execution.snapshot().private.unwrap();
+        projection.result = Some(GatewayPrivateDraftResult::TimedOut);
+        execution.update_private(
+            GatewayDraftStatus::Failed,
+            "Timed out".into(),
+            String::new(),
+            true,
+            projection.clone(),
+        );
+        projection.result = None;
+        observer.update_private(
+            GatewayDraftStatus::InProgress,
+            String::new(),
+            String::new(),
+            false,
+            projection,
+        );
+        let terminal = observer.snapshot();
+        assert_eq!(terminal.status, GatewayDraftStatus::Failed);
+        assert_eq!(
+            terminal.private.unwrap().result,
+            Some(GatewayPrivateDraftResult::TimedOut)
+        );
+        assert!(!terminal.can_retry);
+        assert!(!observer.approve_review());
+    }
+
+    #[test]
+    fn draft_payload_preserves_public_wire_inputs_and_separates_private_kinds() {
+        let public = serde_json::json!({
+            "account":"public", "chain_id":1, "kind":"send", "asset":"native",
+            "amount":"1", "recipient":"recipient.eth", "address_book_entry":null,
+            "fee":{"mode":"normal"}, "mimic_railway":false, "max":false
+        });
+        for kind in ["send", "shield"] {
+            let mut wire = public.clone();
+            wire["kind"] = kind.into();
+            let parsed: GatewayDraftPayload = serde_json::from_value(wire.clone()).unwrap();
+            assert!(matches!(parsed, GatewayDraftPayload::Public(_)));
+            assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        }
+        let mut private =
+            serde_json::to_value(super::super::GatewayPrivateDraftInput::default()).unwrap();
+        for kind in ["private_send", "unshield"] {
+            private["kind"] = kind.into();
+            let parsed: GatewayDraftPayload = serde_json::from_value(private.clone()).unwrap();
+            assert!(matches!(parsed, GatewayDraftPayload::Private(_)));
+            assert!(serde_json::from_value::<GatewayDraftInput>(private.clone()).is_err());
+        }
+        private["kind"] = "send".into();
+        assert!(serde_json::from_value::<GatewayDraftPayload>(private).is_err());
+    }
+
+    #[test]
     fn canceled_reviews_and_duplicate_approvals_cannot_start_another_transaction() {
         let canceled = GatewayDraftExecution::default();
         let late_approval = canceled.clone();
@@ -431,6 +671,76 @@ mod tests {
         });
         assert_eq!(execution.snapshot().status, GatewayDraftStatus::Failed);
         assert!(!execution.snapshot().can_retry);
+    }
+
+    #[test]
+    fn retiring_private_execution_disables_controls_and_retains_terminal_results() {
+        use super::super::{GatewayPrivateDraftProgress, GatewayPrivateDraftResult};
+        for submitted in [false, true] {
+            let execution = GatewayDraftExecution::private("owned".into());
+            assert!(execution.approve_review());
+            assert!(execution.start());
+            let progress = GatewayPrivateDraftProgress {
+                execution_id: "owned".into(),
+                result: submitted.then_some(GatewayPrivateDraftResult::Submitted),
+                transaction_hash: submitted.then(|| "synthetic-hash".into()),
+                stop: !submitted,
+                favorite: submitted,
+                ..Default::default()
+            };
+            let status = if submitted {
+                GatewayDraftStatus::Done
+            } else {
+                GatewayDraftStatus::InProgress
+            };
+            execution.update_private(
+                status,
+                String::new(),
+                String::new(),
+                false,
+                progress.clone(),
+            );
+            execution.retire_private_owner();
+            execution.update_private(status, String::new(), String::new(), false, progress);
+            let snapshot = execution.snapshot();
+            let private = snapshot.private.unwrap();
+            assert_eq!(
+                private.result,
+                Some(if submitted {
+                    GatewayPrivateDraftResult::Submitted
+                } else {
+                    GatewayPrivateDraftResult::Stopped
+                })
+            );
+            assert_eq!(
+                private.transaction_hash.as_deref(),
+                submitted.then_some("synthetic-hash")
+            );
+            assert!(!private.stop && !private.stop_waiting && !private.ban && !private.favorite);
+            assert!(!snapshot.can_retry);
+        }
+    }
+
+    #[test]
+    fn private_revalidation_failure_releases_approval_without_resetting_started_work() {
+        let review = GatewayDraftExecution::private("review".into());
+        assert!(review.approve_review());
+        review.reject_private_review("Private funds changed".into());
+        assert!(!review.start());
+        assert!(review.snapshot().can_retry);
+        assert_eq!(review.snapshot().message, "Private funds changed");
+        review.cancel_review();
+        assert_eq!(review.snapshot().message, "Private funds changed");
+        assert!(review.snapshot().can_retry);
+        assert!(!review.approve_review());
+
+        let running = GatewayDraftExecution::private("running".into());
+        assert!(running.approve_review());
+        assert!(running.start());
+        running.reject_private_review("A late estimate failed".into());
+        running.cancel_review();
+        assert_eq!(running.snapshot().status, GatewayDraftStatus::InProgress);
+        assert!(!running.snapshot().can_retry);
     }
 
     #[test]

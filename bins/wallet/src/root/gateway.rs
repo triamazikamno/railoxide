@@ -442,6 +442,7 @@ impl WalletRoot {
     }
 
     pub(super) fn publish_gateway_desktop_state(&self) {
+        self.publish_gateway_private_progress();
         if self.view_session.is_none() {
             self.private_asset_presentation_cache.borrow_mut().clear();
         }
@@ -484,6 +485,7 @@ impl WalletRoot {
                 matches!(self.vault_state, VaultState::ViewUnlocked) && self.view_session.is_some();
             let mut snapshot = GatewayWalletState {
                 private_view_supported: true,
+                private_actions_supported: unlocked,
                 private_view: unlocked.then(|| self.gateway_private_view()),
                 wallet_selection_generation: self.wallet_switch_generation,
                 wallet_transition: matches!(self.vault_state, VaultState::SwitchingWallet),

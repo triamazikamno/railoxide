@@ -45,7 +45,7 @@ pub(super) struct AssetBalance {
     pub(super) symbol: String,
     pub(super) amount: String,
     pub(super) max_amount: Option<String>,
-    usd: String,
+    pub(super) usd: String,
     pub(super) icon: String,
 }
 pub(super) struct SitePermission {
@@ -434,6 +434,9 @@ impl GatewayView {
             .find(|account| Some(&account.uuid) == self.public_view.selected_account.as_ref())
     }
     pub(super) fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.close_private_picker(window, cx) {
+            return;
+        }
         if let Some(picker) = self.picker.take() {
             picker.return_focus.focus(window, cx);
         } else if self.handoff_open || self.draft_form.is_some() {

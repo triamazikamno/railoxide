@@ -42,7 +42,26 @@ impl DappProvider {
                 }
                 Err(GatewayError::Unavailable)
             }
-            GatewayPublicCommand::Draft { .. } | GatewayPublicCommand::RefreshBalances => {
+            GatewayPublicCommand::Draft { command: draft } => {
+                let private_input = match draft.as_ref() {
+                    super::super::GatewayDraftCommand::Create { input, .. }
+                    | super::super::GatewayDraftCommand::Update { input, .. } => {
+                        matches!(input, super::super::GatewayDraftPayload::Private(_))
+                    }
+                    super::super::GatewayDraftCommand::PrivateControl { .. }
+                    | super::super::GatewayDraftCommand::PrivatePicker { .. } => true,
+                    _ => false,
+                };
+                if private_input
+                    && (!self.wallet.private_actions_supported
+                        || !self.authority.borrow().private_actions_supported
+                        || self.ui_peers.get(&session) != Some(&peer))
+                {
+                    return None;
+                }
+                return Some(command);
+            }
+            GatewayPublicCommand::RefreshBalances => {
                 return Some(command);
             }
             GatewayPublicCommand::RevokePermission { permission_id }

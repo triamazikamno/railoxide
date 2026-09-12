@@ -1073,6 +1073,76 @@ test('draft commands are UI-only, scoped to current desktop selection, and never
 });
 
 
+test('private drafts admit only current UI inputs and execution controls and purge their presentation on retirement', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const ui = h.ui();
+  const input = { wallet: 'private-wallet', chain_id: 1, kind: 'private_send', asset: 'token', amount: '1', max: false,
+    recipient: 'synthetic-private-recipient', address_book_entry: null, fee_token: 'token', fee_mode: 'deduct',
+    broadcaster: { mode: 'random' }, allow_out_of_range: false, favorites_only: false, unwrap: false, native_top_up: false };
+  const draft = { draft_id: 'private-draft', revision: 2, input, status: 'ready',
+    private_options: { picker: { view_id: 'picker', rows: [{ label: 'synthetic-broadcaster' }] } } };
+  const snapshot = (supported, current = draft) => session.send({ type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+    accounts: [], pending_connects: [], pending_requests: [], private_view_supported: true, private_actions_supported: supported,
+    private_view: { selected_wallet: input.wallet, selected_chain: 1 }, public_view: { drafts: [current] } });
+  const sent = () => session.socket.sent.map(bytes => {
+    try { return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes))); } catch { return null; }
+  }).filter(message => message?.type === 'public_view');
+  const command = (command, generation = 1) => ui.request({ type: 'public_view', generation, command: { type: 'draft', command } });
+  await snapshot(false);
+  command({ action: 'create', request_id: 'private-create', input });
+  assert.equal(sent().length, 0);
+  assert.equal(ui.port.messages.at(-1).public_view.drafts.length, 0);
+  await snapshot(true);
+  for (const altered of [{ ...input, wallet: 'other' }, { ...input, chain_id: 10 }, { ...input, unwrap: true },
+    { ...input, amount: '1'.repeat(101) }, { ...input, broadcaster: { mode: 'specific', id: 'x'.repeat(1025) } }]) {
+    command({ action: 'create', request_id: 'rejected', input: altered });
+  }
+  command({ action: 'submit', draft_id: draft.draft_id, revision: 1 });
+  command({ action: 'update', draft_id: draft.draft_id, revision: 2, input });
+  command({ action: 'private_picker', draft_id: draft.draft_id, revision: 1, view_id: 'old', open: true, query: '' });
+  assert.equal(sent().length, 0);
+  command({ action: 'create', request_id: 'private-create', input: { ...input, password: 'never-forward', rpc_url: 'never-forward' } });
+  command({ action: 'private_picker', draft_id: draft.draft_id, revision: 2, view_id: 'picker', open: true, query: 'candidate', password: 'never-forward' });
+  assert.deepEqual(sent()[0].command.command.input, input);
+  assert.equal(JSON.stringify(sent()).includes('never-forward'), false);
+  const popup = h.ui('chrome-extension://test/index.html');
+  popup.request({ type: 'public_view', generation: 1, command: { type: 'draft', command: {
+    action: 'private_picker', draft_id: draft.draft_id, revision: 2, view_id: 'popup-picker', open: true, query: '' } } });
+  popup.port.disconnect();
+  assert.deepEqual(sent().at(-1).command.command, { action: 'private_picker', draft_id: draft.draft_id,
+    revision: 2, view_id: 'popup-picker', open: false, query: '' });
+  assert.equal(session.socket.readyState, 1, 'picker closure does not retire the shared connection');
+  const lockedPopup = h.ui('chrome-extension://test/index.html');
+  lockedPopup.request({ type: 'public_view', generation: 1, command: { type: 'draft', command: {
+    action: 'private_picker', draft_id: draft.draft_id, revision: 2, view_id: 'retired-picker', open: true, query: '' } } });
+  const execution = { execution_id: 'execution', stop: true, stop_waiting: false, ban: false, favorite: false };
+  await snapshot(true, { ...draft, status: 'in_progress', private_progress: execution });
+  const before = sent().length;
+  command({ action: 'update', draft_id: draft.draft_id, revision: 3, input });
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'old-execution', control: 'stop' });
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'ban' });
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'stop' }, 0);
+  assert.equal(sent().length, before);
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'stop', address: 'never-forward' });
+  assert.deepEqual(sent().at(-1).command.command, { action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'stop' });
+  const provider = h.provider(); await flush();
+  provider.request({ id: 'private-control', method: 'public_view', params: { type: 'draft', command: { action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'stop' } } });
+  await flush();
+  assert.equal(sent().length, before + 1);
+  await session.send({ type: 'state', version: 1, generation: 2, locked: true });
+  await snapshot(true);
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'execution', control: 'stop' });
+  lockedPopup.port.disconnect();
+  assert.equal(sent().length, before + 1, 'retired picker identities cannot dispatch through a later generation');
+  const retired = h.ui().port.messages[0];
+  assert.ok(!retired.public_view?.drafts?.length);
+  assert.ok(!retired.private_view);
+  assert.equal(JSON.stringify(h.data).includes(input.recipient), false);
+  session.socket.close(); await flush();
+  assert.equal(JSON.stringify(h.ui().port.messages[0]).includes('synthetic-broadcaster'), false);
+});
+
 test('private wallet commands and last-tab navigation stay within the live UI session', async () => {
   const h = await worker({ gatewayCredential: credential() });
   const session = await established(h);

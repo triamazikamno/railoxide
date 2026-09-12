@@ -38,6 +38,7 @@ impl PrivateWallet {
 }
 
 struct PrivateAsset {
+    id: String,
     symbol: String,
     amount: String,
     usd: Option<String>,
@@ -50,6 +51,7 @@ struct PrivateAsset {
 #[derive(Default)]
 pub(super) struct PrivateView {
     pub(super) supported: bool,
+    pub(super) actions_supported: bool,
     pub(super) selected_wallet: Option<String>,
     selected_wallet_choice: Option<String>,
     receive_address: Option<String>,
@@ -74,6 +76,7 @@ impl PrivateView {
         let pending = field(&value, "pending");
         Self {
             supported: true,
+            actions_supported: flag_field(snapshot, "private_actions_supported"),
             selected_wallet: field(&value, "selected_wallet").as_string(),
             selected_wallet_choice: field(&value, "selected_wallet_choice").as_string(),
             receive_address: field(&value, "receive_address").as_string(),
@@ -95,6 +98,7 @@ impl PrivateView {
             assets: array(&value, "assets")
                 .iter()
                 .map(|asset| PrivateAsset {
+                    id: text_field(asset, "asset"),
                     symbol: text_field(asset, "symbol"),
                     amount: text_field(asset, "amount"),
                     usd: field(asset, "usd").as_string(),
@@ -108,6 +112,19 @@ impl PrivateView {
                 .collect(),
             pending: (!pending.is_null() && !pending.is_undefined()).then_some(pending),
         }
+    }
+    pub(super) fn draft_assets(&self) -> Vec<public_view::AssetBalance> {
+        self.assets
+            .iter()
+            .map(|asset| public_view::AssetBalance {
+                id: asset.id.clone(),
+                symbol: asset.symbol.clone(),
+                amount: asset.amount.clone(),
+                max_amount: None,
+                usd: asset.usd.clone().unwrap_or_default(),
+                icon: asset.icon.clone().unwrap_or_default(),
+            })
+            .collect()
     }
     fn wallet(&self) -> Option<&PrivateWallet> {
         self.wallets
@@ -227,7 +244,7 @@ impl GatewayView {
     fn private_receive_button(&self, cx: &Context<'_, Self>) -> Button {
         app_button("private-receive", "Receive")
             .outline()
-            .icon(Icon::empty().path("ui/icons/qr-code.svg"))
+            .icon(Icon::empty().path("ui/icons/qr-code.svg").small())
             .disabled(self.private_view.receive_address.is_none())
             .on_click(cx.listener(|this, _, window, cx| this.open_private_receive(window, cx)))
     }
@@ -331,7 +348,36 @@ impl GatewayView {
                     ))
                     .child(self.render_private_sync()),
             ))
-            .child(self.private_receive_button(cx).w_full());
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .when(view.actions_supported, |row| {
+                        row.child(
+                            app_button("private-send", "Send")
+                                .icon(
+                                    Icon::empty()
+                                        .path("ui/icons/arrow-big-right-dash.svg")
+                                        .small(),
+                                )
+                                .outline()
+                                .flex_1()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_private_draft("private_send", window, cx);
+                                })),
+                        )
+                        .child(
+                            app_button("private-unshield", "Unshield")
+                                .icon(Icon::empty().path("ui/icons/shield.svg").small())
+                                .outline()
+                                .flex_1()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_private_draft("unshield", window, cx);
+                                })),
+                        )
+                    })
+                    .child(self.private_receive_button(cx).flex_1()),
+            );
         let syncing = matches!(view.state.as_str(), "loading" | "syncing");
         if !syncing && let Some(message) = &view.message {
             body = body.child(

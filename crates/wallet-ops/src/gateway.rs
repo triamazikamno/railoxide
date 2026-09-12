@@ -17,13 +17,22 @@ pub use provider::{
     GatewayPermissionSummary, GatewayUnlockState, GatewayWalletState, GatewayWalletSwitchRequest,
     GatewayWalletSwitchTransition,
 };
+mod private_drafts;
+pub use private_drafts::{
+    GatewayBroadcasterChoice, GatewayPrivateAmountMetric, GatewayPrivateAssetChoice,
+    GatewayPrivateDisplayRow, GatewayPrivateDraftControl, GatewayPrivateDraftEstimate,
+    GatewayPrivateDraftInput, GatewayPrivateDraftKind, GatewayPrivateDraftOptions,
+    GatewayPrivateDraftPicker, GatewayPrivateDraftProgress, GatewayPrivateDraftResult,
+    GatewayPrivateFeeMode, GatewayPrivateTopUpOption,
+};
 mod drafts;
 mod storage;
 mod ui;
 pub use drafts::{
-    GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftExecution, GatewayDraftFee,
-    GatewayDraftGasQuote, GatewayDraftInput, GatewayDraftKind, GatewayDraftProgress,
-    GatewayDraftRecipient, GatewayDraftStatus, GatewayDraftView,
+    GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload, GatewayDraftExecution,
+    GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput, GatewayDraftKind,
+    GatewayDraftPayload, GatewayDraftProgress, GatewayDraftRecipient, GatewayDraftStatus,
+    GatewayDraftView,
 };
 pub use ui::{
     GatewayAccountBalances, GatewayAssetBalance, GatewayPendingRequest, GatewayPublicCommand,
@@ -202,6 +211,8 @@ pub enum GatewayServerMessage {
         accounts: Vec<GatewayAccountChoice>,
         public_view: GatewayPublicView,
         private_view_supported: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        private_actions_supported: bool,
         private_view: Option<Box<GatewayPrivateView>>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         wallet_transition: bool,

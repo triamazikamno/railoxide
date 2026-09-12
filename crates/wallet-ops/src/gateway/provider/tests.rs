@@ -453,9 +453,12 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
             fee: crate::gateway::GatewayDraftFee::Normal,
             mimic_railway: false,
             max: false,
-        },
+        }
+        .into(),
         status: crate::gateway::GatewayDraftStatus::Attention,
         estimate: None,
+        private_progress: None,
+        private_options: None,
         gas_quote: None,
         recipients: Vec::new(),
         step_label: String::new(),
@@ -645,6 +648,55 @@ fn public_view_commands_preserve_selection_and_scope_permission_edits_to_the_pee
     };
     assert!(provider.public_command(1, peer, 1, submit()).is_none());
     assert!(provider.public_command(1, peer, 2, submit()).is_some());
+    let private_create = || GatewayPublicCommand::Draft {
+        command: Box::new(crate::gateway::GatewayDraftCommand::Create {
+            request_id: "private".into(),
+            input: crate::gateway::GatewayDraftPayload::Private(
+                crate::gateway::GatewayPrivateDraftInput::default(),
+            ),
+        }),
+    };
+    provider.attach_ui_peer(1, peer);
+    assert!(
+        provider
+            .public_command(1, peer, 2, private_create())
+            .is_none()
+    );
+    let mut supported = provider.wallet.clone();
+    supported.private_actions_supported = true;
+    provider.update_wallet(supported, 2);
+    assert!(
+        provider
+            .public_command(1, peer, 1, private_create())
+            .is_none()
+    );
+    assert!(
+        provider
+            .public_command(1, other_peer, 2, private_create())
+            .is_none()
+    );
+    assert!(
+        provider
+            .public_command(2, peer, 2, private_create())
+            .is_none()
+    );
+    assert!(
+        provider
+            .public_command(1, peer, 2, private_create())
+            .is_some()
+    );
+    let mut unsupported = provider.wallet.clone();
+    unsupported.private_actions_supported = false;
+    provider
+        .authority_fallback
+        .as_ref()
+        .unwrap()
+        .send_replace(unsupported);
+    assert!(
+        provider
+            .public_command(1, peer, 2, private_create())
+            .is_none()
+    );
     invalidate_authority(&provider, true);
     assert!(provider.public_command(1, peer, 2, submit()).is_none());
     assert!(

@@ -4,7 +4,7 @@ import { configuration } from './gateway-config.js';
 // Match GPUI's web platform detection; the WASM target cannot identify the host OS.
 const isMac = navigator.platform.includes('Mac') || navigator.userAgent.includes('Mac');
 const STARTUP_TIMEOUT_MS = 30_000;
-const REQUIRED_COMPONENT_ICONS = ['check', 'search', 'close', 'inbox', 'loader', 'settings', 'copy',
+const REQUIRED_COMPONENT_ICONS = ['check', 'search', 'close', 'inbox', 'loader', 'loader-circle', 'settings', 'copy',
   'chevron-down', 'chevron-right', 'chevron-left', 'arrow-down', 'triangle-alert', 'circle-check', 'circle-x', 'globe'];
 const startedAt = 0; // performance.timeOrigin is this document navigation start.
 const shell = document.querySelector('#startup');
@@ -261,6 +261,7 @@ reload.addEventListener('click', () => location.reload());
 
 Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   isMac: () => isMac,
+  isSidePanel: () => isSidePanel,
   isActive: () => state === 'loading' || state === 'ready',
   canCopyAddress(kind, generation, identity, address) {
     // The GPUI callback submits synchronously after this check. Browser writes cannot be cancelled after submission.

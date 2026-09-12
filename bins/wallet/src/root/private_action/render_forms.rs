@@ -95,10 +95,13 @@ impl WalletRoot {
                 ));
 
         if asset.total > asset.max_batched {
-            card = card.child(Alert::warning(
-                send_element_id(key, "spend-capacity-warning"),
-                "Spend capacity is limited by private note fragmentation and POI verification status. One send can spend up to 8 proof chunks.",
-            ).small());
+            card = card.child(
+                ui::private_action::warning(
+                    send_element_id(key, "spend-capacity-warning"),
+                    ui::private_action::spend_capacity_warning(false),
+                )
+                .small(),
+            );
         }
 
         card = card.child(render_delivery_selector(
@@ -106,7 +109,7 @@ impl WalletRoot {
             key,
             DeliveryFormKind::Send,
             form.delivery_mode,
-            form.generating,
+            form.generating || form.gateway_execution.is_some(),
             !self_broadcast_accounts.is_empty(),
             sponsorship_enabled,
         ));
@@ -144,7 +147,7 @@ impl WalletRoot {
                 &trust_filter,
             ) {
                 card = card.child(
-                    Alert::warning(
+                    ui::private_action::warning(
                         delivery_element_id(key, DeliveryFormKind::Send, "fee-token-warning"),
                         warning,
                     )
@@ -171,7 +174,7 @@ impl WalletRoot {
                 form.allow_suspicious_broadcasters,
             ) {
                 card = card.child(
-                    Alert::warning(
+                    ui::private_action::warning(
                         delivery_element_id(key, DeliveryFormKind::Send, "fee-policy-warning"),
                         warning,
                     )
@@ -495,11 +498,21 @@ impl WalletRoot {
                     content_width,
                 ));
 
+        if form.native_top_up_enabled {
+            card = card.child(ui::private_action::warning(
+                unshield_element_id(key, "top-up-linkage"),
+                ui::private_action::NATIVE_TOP_UP_LINKAGE_WARNING,
+            ));
+        }
+
         if asset.total > asset.max_batched {
-            card = card.child(Alert::warning(
-                unshield_element_id(key, "spend-capacity-warning"),
-                "Spend capacity is limited by private note fragmentation and POI verification status.",
-            ).small());
+            card = card.child(
+                ui::private_action::warning(
+                    unshield_element_id(key, "spend-capacity-warning"),
+                    ui::private_action::spend_capacity_warning(true),
+                )
+                .small(),
+            );
         }
 
         card = card.child(render_delivery_selector(
@@ -507,7 +520,7 @@ impl WalletRoot {
             key,
             DeliveryFormKind::Unshield,
             form.delivery_mode,
-            form.generating,
+            form.generating || form.gateway_execution.is_some(),
             !self_broadcast_accounts.is_empty(),
             sponsorship_enabled,
         ));
@@ -546,7 +559,7 @@ impl WalletRoot {
                 &trust_filter,
             ) {
                 card = card.child(
-                    Alert::warning(
+                    ui::private_action::warning(
                         delivery_element_id(key, DeliveryFormKind::Unshield, "fee-token-warning"),
                         warning,
                     )
@@ -573,7 +586,7 @@ impl WalletRoot {
                 form.allow_suspicious_broadcasters,
             ) {
                 card = card.child(
-                    Alert::warning(
+                    ui::private_action::warning(
                         delivery_element_id(key, DeliveryFormKind::Unshield, "fee-policy-warning"),
                         warning,
                     )

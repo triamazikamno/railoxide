@@ -13,13 +13,7 @@ pub(in crate::root) fn private_action_amount_input(
     submit_enabled: bool,
     submit: impl Fn(&mut Window, &mut App) + 'static,
 ) -> gpui::Div {
-    div()
-        .on_action(move |_: &gpui_component::input::Enter, window, cx| {
-            if submit_enabled {
-                submit(window, cx);
-            }
-        })
-        .child(private_action_input(state).disabled(generating))
+    ui::private_action::amount_input(state, generating, submit_enabled, submit)
 }
 
 pub(in crate::root) fn new_prefilled_amount_input(
@@ -560,7 +554,7 @@ impl WalletRoot {
         }
     }
 
-    fn unshield_native_top_up_state(
+    pub(in crate::root) fn unshield_native_top_up_state(
         &self,
         chain_id: u64,
         recipient: Address,
@@ -830,40 +824,14 @@ pub(in crate::root) fn render_private_action_metric(
     width: Pixels,
 ) -> impl IntoElement {
     let value = private_action_metric_display_amount(metric.amount, decimals);
-    div()
-        .id(id)
-        .w(width)
-        .flex_none()
-        .min_w(PRIVATE_ACTION_METRIC_MIN_WIDTH)
-        .px(px(12.0))
-        .py(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .when(!disabled, |this| {
-            this.cursor_pointer()
-                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                .on_click(move |_event, window, cx| {
-                    let amount = metric.amount;
-                    root.update(cx, |root, cx| {
-                        root.set_private_action_metric_amount(kind, key, amount, window, cx);
-                    });
-                })
-        })
-        .child(app_muted_text(metric.label).whitespace_nowrap().flex_none())
-        .child(
-            div()
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(theme::WARNING))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(SharedString::from(value)),
-        )
+    ui::private_action::amount_metric(id, metric.label, value, disabled, move |window, cx| {
+        root.update(cx, |root, cx| {
+            root.set_private_action_metric_amount(kind, key, metric.amount, window, cx);
+        });
+    })
+    .w(width)
+    .flex_none()
+    .min_w(PRIVATE_ACTION_METRIC_MIN_WIDTH)
 }
 
 pub(in crate::root) fn private_action_metric_id_suffix(label: &'static str) -> &'static str {

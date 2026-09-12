@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ruint = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
 qrcodegen = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }

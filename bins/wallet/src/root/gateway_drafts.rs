@@ -14,9 +14,10 @@ use wallet_ops::{
     PublicShieldTransactionProfile, PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS,
     TokenAnchorRateCache, estimate_public_action_gas_cost_with_profile_and_ceiling,
     gateway::{
-        GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftExecution, GatewayDraftFee,
-        GatewayDraftGasQuote, GatewayDraftInput, GatewayDraftKind, GatewayDraftRecipient,
-        GatewayDraftStatus, GatewayDraftView,
+        GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload,
+        GatewayDraftExecution, GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput,
+        GatewayDraftKind, GatewayDraftPayload, GatewayDraftRecipient, GatewayDraftStatus,
+        GatewayDraftView,
     },
     parse_send_amount, public_shield_protocol_fee_amount,
     quote_public_action_gas_fee_bundle_with_profile, resolve_public_ens_recipient,
@@ -35,6 +36,9 @@ use super::public_balances::public_asset_icon_path;
 use super::spend_authorization::SpendAuthorizationIntent;
 use super::{WalletRoot, format_send_amount_input, public_balance_amount_label};
 
+mod private;
+use private::valid_private_input_size;
+
 const ESTIMATE_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_DRAFT_PEERS: usize = 8;
 
@@ -52,15 +56,133 @@ struct DraftRecord {
     estimated_at: Option<Instant>,
     estimation: Option<tokio::task::AbortHandle>,
     execution: Option<GatewayDraftExecution>,
+    picker: Option<private::PrivateDraftPicker>,
 }
 
 #[derive(Clone)]
 enum PreparedDraft {
     Send(Box<PublicSendDraft>),
     Shield(Box<PublicShieldDraft>),
+    Private(Box<private::PreparedPrivateDraft>),
 }
 
 impl GatewayDraftBook {
+    fn create(
+        &mut self,
+        peer_id: &str,
+        request_id: String,
+        input: GatewayDraftPayload,
+        wallet: Arc<DesktopViewSession>,
+        wallet_generation: u64,
+    ) -> bool {
+        if request_id.is_empty() || request_id.len() > 64 || !valid_input_size(&input) {
+            return false;
+        }
+        if let Some(existing) = self.records.get(peer_id) {
+            // A repeated Create cannot replace work or restart an estimate after reconnect.
+            if existing.view.request_id == request_id || existing.execution.is_some() {
+                return false;
+            }
+        } else if self.records.len() >= MAX_DRAFT_PEERS {
+            return false;
+        }
+        if let Some(old) = self.records.remove(peer_id)
+            && let Some(job) = old.estimation
+        {
+            job.abort();
+        }
+        let draft_id = alloy::hex::encode(rand::random::<[u8; 16]>());
+        self.records.insert(
+            peer_id.to_owned(),
+            DraftRecord {
+                view: GatewayDraftView {
+                    peer_id: peer_id.to_owned(),
+                    draft_id,
+                    request_id,
+                    revision: 0,
+                    input,
+                    status: GatewayDraftStatus::Editing,
+                    estimate: None,
+                    private_progress: None,
+                    private_options: None,
+                    gas_quote: None,
+                    recipients: Vec::new(),
+                    step_label: String::new(),
+                    message: String::new(),
+                    warning: false,
+                    can_cancel: true,
+                    can_retry: false,
+                },
+                wallet,
+                wallet_generation,
+                prepared: None,
+                context_binding: None,
+                estimated_at: None,
+                estimation: None,
+                execution: None,
+                picker: None,
+            },
+        );
+        true
+    }
+
+    fn update(
+        &mut self,
+        peer_id: &str,
+        draft_id: &str,
+        revision: u64,
+        input: GatewayDraftPayload,
+        wallet: &Arc<DesktopViewSession>,
+        wallet_generation: u64,
+    ) -> bool {
+        if !valid_input_size(&input) {
+            return false;
+        }
+        let Some(record) = self.records.get_mut(peer_id).filter(|record| {
+            record.view.draft_id == draft_id
+                && record.execution.is_none()
+                && revision > record.view.revision
+                && Arc::ptr_eq(wallet, &record.wallet)
+                && wallet_generation == record.wallet_generation
+                && std::mem::discriminant(&record.view.input) == std::mem::discriminant(&input)
+        }) else {
+            return false;
+        };
+        if let Some(job) = record.estimation.take() {
+            job.abort();
+        }
+        if public_quote_identity(&record.view.input) != public_quote_identity(&input) {
+            record.view.gas_quote = None;
+        }
+        record.picker = None;
+        record.view.input = input;
+        record.view.revision = revision;
+        record.view.estimate = None;
+        record.prepared = None;
+        record.estimated_at = None;
+        true
+    }
+
+    fn dismiss(&mut self, peer_id: &str, draft_id: &str) -> bool {
+        if !self.records.get(peer_id).is_some_and(|record| {
+            record.view.draft_id == draft_id
+                && record.execution.as_ref().is_none_or(|execution| {
+                    matches!(
+                        execution.snapshot().status,
+                        GatewayDraftStatus::Done | GatewayDraftStatus::Failed
+                    )
+                })
+        }) {
+            return false;
+        }
+        self.records.remove(peer_id).is_some_and(|record| {
+            if let Some(job) = record.estimation {
+                job.abort();
+            }
+            true
+        })
+    }
+
     #[cfg(feature = "hardware")]
     pub(super) fn refresh_hardware_session(
         &mut self,
@@ -71,10 +193,11 @@ impl GatewayDraftBook {
         for record in self.records.values_mut() {
             if record.wallet_generation == generation
                 && Arc::ptr_eq(&record.wallet, previous)
-                && record
-                    .execution
-                    .as_ref()
-                    .is_some_and(|execution| execution.generation().is_some())
+                && record.execution.as_ref().is_some_and(|execution| {
+                    execution.generation().is_some()
+                        || (execution.snapshot().private.is_some()
+                            && execution.has_review_approval())
+                })
             {
                 // Only the known hardware-profile refresh may carry running progress to its
                 // replacement view. Unsubmitted drafts keep their original authority binding.
@@ -89,7 +212,8 @@ impl GatewayDraftBook {
             .values()
             .filter_map(|record| record.execution.as_ref())
         {
-            if execution.generation() == Some(generation) {
+            if execution.snapshot().private.is_none() && execution.generation() == Some(generation)
+            {
                 execution.stopped();
             }
         }
@@ -143,8 +267,29 @@ impl GatewayDraftBook {
             })
             .map(|record| {
                 let mut view = record.view.clone();
+                if let GatewayDraftPayload::Private(input) = &record.view.input {
+                    let prepared = match &record.prepared {
+                        Some(PreparedDraft::Private(prepared)) => Some(prepared.as_ref()),
+                        _ => None,
+                    };
+                    view.private_options = (record.execution.is_none()).then(|| {
+                        root.gateway_private_draft_options(input, prepared, record.picker.as_ref())
+                    });
+                }
+                if record.execution.is_none()
+                    && let Some(PreparedDraft::Private(prepared)) = &record.prepared
+                    && (!prepared.is_current(root, &record.view.input)
+                        || record
+                            .estimated_at
+                            .is_none_or(|at| at.elapsed() > ESTIMATE_LIFETIME))
+                {
+                    view.status = GatewayDraftStatus::Editing;
+                    view.message =
+                        "Private funds or fee estimate changed. Refresh the estimate.".into();
+                }
                 if let Some(execution) = &record.execution {
                     let progress = execution.snapshot();
+                    view.private_progress.clone_from(&progress.private);
                     view.status = progress.status;
                     view.step_label = progress.step_label;
                     view.message = progress.message;
@@ -154,6 +299,9 @@ impl GatewayDraftBook {
                         view.status,
                         GatewayDraftStatus::Attention | GatewayDraftStatus::InProgress
                     ) && execution.generation().is_none_or(|generation| {
+                        if let Some(private) = &view.private_progress {
+                            return private.stop || private.stop_waiting;
+                        }
                         generation == root.public_form.action_generation
                             && root.public_form.action_stop_available
                     });
@@ -216,53 +364,15 @@ impl WalletRoot {
         };
         match command {
             GatewayDraftCommand::Create { request_id, input } => {
-                if request_id.is_empty() || request_id.len() > 64 || !valid_input_size(&input) {
+                if !self.gateway.drafts.borrow_mut().create(
+                    peer_id,
+                    request_id,
+                    input,
+                    wallet,
+                    self.active_wallet_generation,
+                ) {
                     return;
                 }
-                let mut book = self.gateway.drafts.borrow_mut();
-                if let Some(existing) = book.records.get(peer_id) {
-                    // A repeated Create cannot replace work or restart an estimate after reconnect.
-                    if existing.view.request_id == request_id || existing.execution.is_some() {
-                        return;
-                    }
-                } else if book.records.len() >= MAX_DRAFT_PEERS {
-                    return;
-                }
-                if let Some(old) = book.records.remove(peer_id)
-                    && let Some(job) = old.estimation
-                {
-                    job.abort();
-                }
-                let draft_id = alloy::hex::encode(rand::random::<[u8; 16]>());
-                book.records.insert(
-                    peer_id.to_owned(),
-                    DraftRecord {
-                        view: GatewayDraftView {
-                            peer_id: peer_id.to_owned(),
-                            draft_id,
-                            request_id,
-                            revision: 0,
-                            input,
-                            status: GatewayDraftStatus::Editing,
-                            estimate: None,
-                            gas_quote: None,
-                            recipients: Vec::new(),
-                            step_label: String::new(),
-                            message: String::new(),
-                            warning: false,
-                            can_cancel: true,
-                            can_retry: false,
-                        },
-                        wallet,
-                        wallet_generation: self.active_wallet_generation,
-                        prepared: None,
-                        context_binding: None,
-                        estimated_at: None,
-                        estimation: None,
-                        execution: None,
-                    },
-                );
-                drop(book);
                 self.estimate_gateway_draft(peer_id, cx);
             }
             GatewayDraftCommand::Update {
@@ -270,34 +380,16 @@ impl WalletRoot {
                 revision,
                 input,
             } => {
-                if !valid_input_size(&input) {
+                if !self.gateway.drafts.borrow_mut().update(
+                    peer_id,
+                    &draft_id,
+                    revision,
+                    input,
+                    &wallet,
+                    self.active_wallet_generation,
+                ) {
                     return;
                 }
-                let mut book = self.gateway.drafts.borrow_mut();
-                let Some(record) = book.records.get_mut(peer_id).filter(|record| {
-                    record.view.draft_id == draft_id
-                        && record.execution.is_none()
-                        && revision > record.view.revision
-                        && Arc::ptr_eq(&wallet, &record.wallet)
-                }) else {
-                    return;
-                };
-                if let Some(job) = record.estimation.take() {
-                    job.abort();
-                }
-                if record.view.input.account != input.account
-                    || record.view.input.chain_id != input.chain_id
-                    || record.view.input.kind != input.kind
-                    || record.view.input.mimic_railway != input.mimic_railway
-                {
-                    record.view.gas_quote = None;
-                }
-                record.view.input = input;
-                record.view.revision = revision;
-                record.view.estimate = None;
-                record.prepared = None;
-                record.estimated_at = None;
-                drop(book);
                 self.estimate_gateway_draft(peer_id, cx);
             }
             GatewayDraftCommand::Submit { draft_id, revision } => {
@@ -314,6 +406,9 @@ impl WalletRoot {
                 };
                 if let Some(execution) = record.execution.clone() {
                     drop(book);
+                    if execution.snapshot().private.is_some() && execution.generation().is_some() {
+                        return; // Private operations use execution-scoped controls.
+                    }
                     if let Some(generation) = execution.generation() {
                         if generation == self.public_form.action_generation
                             && self.public_form.action_stop_available
@@ -327,10 +422,16 @@ impl WalletRoot {
                         let reviewing =
                             execution.snapshot().status == GatewayDraftStatus::Attention;
                         execution.cancel_review();
-                        if reviewing && execution.snapshot().status == GatewayDraftStatus::Failed {
+                        let owns_visible_review = execution.snapshot().private.is_none()
+                            || self.gateway_private_form(&execution).is_some();
+                        if reviewing
+                            && execution.snapshot().status == GatewayDraftStatus::Failed
+                            && owns_visible_review
+                        {
                             // Closing this review also releases the desktop dialog for an explicit retry.
                             window.close_dialog(cx);
                         }
+                        self.release_gateway_private_form(&execution, cx);
                     }
                 } else {
                     if let Some(job) = record.estimation.take() {
@@ -339,21 +440,73 @@ impl WalletRoot {
                     book.records.remove(peer_id);
                 }
             }
-            GatewayDraftCommand::Dismiss { draft_id } => {
+            GatewayDraftCommand::PrivatePicker {
+                draft_id,
+                revision,
+                view_id,
+                open,
+                query,
+            } => {
+                if view_id.is_empty() || view_id.len() > 128 || query.len() > 1024 {
+                    return;
+                }
                 let mut book = self.gateway.drafts.borrow_mut();
-                if book.records.get(peer_id).is_some_and(|record| {
+                let Some(record) = book.records.get_mut(peer_id).filter(|record| {
                     record.view.draft_id == draft_id
-                        && record.execution.as_ref().is_some_and(|execution| {
-                            matches!(
-                                execution.snapshot().status,
-                                GatewayDraftStatus::Done | GatewayDraftStatus::Failed
-                            )
-                        })
-                }) {
-                    book.records.remove(peer_id);
+                        && record.view.revision == revision
+                        && record.execution.is_none()
+                        && matches!(record.view.input, GatewayDraftPayload::Private(_))
+                }) else {
+                    return;
+                };
+                if open {
+                    let query = query.trim().to_ascii_lowercase();
+                    if let Some(picker) = record
+                        .picker
+                        .as_mut()
+                        .filter(|picker| picker.view_id == view_id)
+                    {
+                        picker.query = query;
+                    } else {
+                        record.picker = Some(private::PrivateDraftPicker::new(view_id, query));
+                    }
+                } else if record
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.view_id == view_id)
+                {
+                    record.picker = None;
                 }
             }
+            GatewayDraftCommand::PrivateControl {
+                draft_id,
+                execution_id,
+                control,
+            } => {
+                let execution = self
+                    .gateway
+                    .drafts
+                    .borrow()
+                    .records
+                    .get(peer_id)
+                    .filter(|record| {
+                        record.view.draft_id == draft_id
+                            && record.wallet_generation == self.active_wallet_generation
+                            && self
+                                .view_session
+                                .as_ref()
+                                .is_some_and(|wallet| Arc::ptr_eq(wallet, &record.wallet))
+                    })
+                    .and_then(|record| record.execution.clone());
+                if let Some(execution) = execution {
+                    self.gateway_private_control(&execution, &execution_id, control, cx);
+                }
+            }
+            GatewayDraftCommand::Dismiss { draft_id } => {
+                self.gateway.drafts.borrow_mut().dismiss(peer_id, &draft_id);
+            }
         }
+        self.watch_gateway_drafts(cx);
         self.publish_gateway_desktop_state();
         cx.notify();
     }
@@ -459,12 +612,17 @@ impl WalletRoot {
         })
     }
 
-    fn estimate_gateway_draft(&self, peer_id: &str, cx: &Context<'_, Self>) {
+    fn estimate_gateway_draft(&mut self, peer_id: &str, cx: &mut Context<'_, Self>) {
         let input = self.gateway.drafts.borrow().records[peer_id]
             .view
             .input
             .clone();
-        let context = self.gateway_draft_context(&input);
+        let Some(input) = input.public() else {
+            self.ensure_waku_for_delivery(super::DeliveryMode::PublicBroadcaster, cx);
+            self.estimate_gateway_private_draft(peer_id, cx);
+            return;
+        };
+        let context = self.gateway_draft_context(input);
         let mut book = self.gateway.drafts.borrow_mut();
         let record = book.records.get_mut(peer_id).expect("admitted draft");
         record.view.recipients = self
@@ -527,9 +685,13 @@ impl WalletRoot {
                     return;
                 };
                 record.estimation = None;
-                if root.selected_chain != record.view.input.chain_id
+                if root.selected_chain != record.view.input.chain_id()
                     || root.public_form.selected_account_uuid.as_deref()
-                        != Some(record.view.input.account.as_str())
+                        != record
+                            .view
+                            .input
+                            .public()
+                            .map(|input| input.account.as_str())
                 {
                     record.view.status = GatewayDraftStatus::Editing;
                     record.view.message = "Account or network changed. Open a new draft.".into();
@@ -551,7 +713,8 @@ impl WalletRoot {
                                 GatewayDraftStatus::Editing
                             };
                             record.prepared = prepared;
-                            record.view.estimate = Some(estimate);
+                            record.view.estimate =
+                                Some(GatewayDraftEstimatePayload::Public(estimate));
                         }
                         Err(message) => {
                             record.view.status = GatewayDraftStatus::Editing;
@@ -589,6 +752,11 @@ impl WalletRoot {
         }) else {
             return;
         };
+        let Some(input) = record.view.input.public() else {
+            drop(book);
+            self.submit_gateway_private_draft(peer_id, draft_id, revision, window, cx);
+            return;
+        };
         if self.public_form.sending || self.public_form.shielding || window.has_active_dialog(cx) {
             record.view.message =
                 "Finish or close the current action in the desktop app first.".into();
@@ -602,7 +770,7 @@ impl WalletRoot {
             self.estimate_gateway_draft(peer_id, cx);
             return;
         }
-        match self.gateway_draft_context(&record.view.input) {
+        match self.gateway_draft_context(input) {
             Ok(context) if record.context_binding.as_ref() != Some(&context.binding()) => {
                 drop(book);
                 self.estimate_gateway_draft(peer_id, cx);
@@ -631,6 +799,7 @@ impl WalletRoot {
                     draft.public_account_source == PublicAccountSource::HardwareDerived,
                 )
             }
+            PreparedDraft::Private(_) => return,
             PreparedDraft::Shield(draft) => {
                 draft.gateway_execution = Some(execution);
                 (
@@ -663,14 +832,18 @@ impl WalletRoot {
                     .await;
                 let keep = this
                     .update(cx, |root, cx| {
+                        root.refresh_gateway_private_drafts(cx);
                         root.publish_gateway_desktop_state();
                         let active = root.gateway.drafts.borrow().records.values().any(|record| {
-                            record.execution.as_ref().is_some_and(|execution| {
-                                matches!(
-                                    execution.snapshot().status,
-                                    GatewayDraftStatus::Attention | GatewayDraftStatus::InProgress
-                                )
-                            })
+                            (record.execution.is_none()
+                                && matches!(record.view.input, GatewayDraftPayload::Private(_)))
+                                || record.execution.as_ref().is_some_and(|execution| {
+                                    matches!(
+                                        execution.snapshot().status,
+                                        GatewayDraftStatus::Attention
+                                            | GatewayDraftStatus::InProgress
+                                    )
+                                })
                         });
                         if !active {
                             root.gateway.draft_watch = None;
@@ -696,7 +869,24 @@ fn retire_record(record: &mut DraftRecord) {
     }
 }
 
-fn valid_input_size(input: &GatewayDraftInput) -> bool {
+fn public_quote_identity(
+    input: &GatewayDraftPayload,
+) -> Option<(&str, u64, GatewayDraftKind, bool)> {
+    input.public().map(|input| {
+        (
+            input.account.as_str(),
+            input.chain_id,
+            input.kind,
+            input.mimic_railway,
+        )
+    })
+}
+
+fn valid_input_size(input: &GatewayDraftPayload) -> bool {
+    let input = match input {
+        GatewayDraftPayload::Public(input) => input,
+        GatewayDraftPayload::Private(input) => return valid_private_input_size(input),
+    };
     input.account.len() <= 128
         && input.asset.len() <= 128
         && input.amount.len() <= 100
@@ -1035,6 +1225,156 @@ fn draft_amount(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_wallet() -> (
+        std::path::PathBuf,
+        DesktopVaultStore,
+        Arc<DesktopViewSession>,
+    ) {
+        use wallet_ops::vault::{KdfParams, WalletSource};
+        let path =
+            std::env::temp_dir().join(format!("gateway-drafts-{:032x}", rand::random::<u128>()));
+        let store = DesktopVaultStore::open(path.clone()).unwrap();
+        let password = "synthetic draft test password";
+        store
+            .create_vault_with_params(password, KdfParams::new(1024, 1, 1))
+            .unwrap();
+        let metadata = store
+            .new_wallet_metadata(password, "wallet", 0, WalletSource::Imported, "Wallet")
+            .unwrap();
+        store.import_wallet_mnemonic_with_metadata(password, "wallet", 0, "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", &metadata).unwrap();
+        let wallet = Arc::new(store.load_view_session(password, "wallet").unwrap());
+        (path, store, wallet)
+    }
+
+    #[test]
+    fn selected_private_contact_is_reloaded_and_never_silently_retargeted() {
+        use wallet_ops::gateway::{GatewayPrivateDraftInput, GatewayPrivateDraftKind};
+        let (path, store, wallet) = synthetic_wallet();
+        let entry = store
+            .add_public_address_book_entry_for_session(
+                &wallet,
+                "Synthetic contact",
+                "0x1111111111111111111111111111111111111111",
+            )
+            .unwrap();
+        let mut input = GatewayPrivateDraftInput::default();
+        input.kind = GatewayPrivateDraftKind::Unshield;
+        input.address_book_entry = Some(entry.entry_uuid.clone());
+        input.recipient = entry.address.to_checksum(None);
+        assert_eq!(
+            private::resolve_private_draft_contact(&store, &wallet, &input).unwrap(),
+            input.recipient
+        );
+        let changed = store
+            .update_public_address_book_entry_for_session(
+                &wallet,
+                &entry.entry_uuid,
+                "Renamed contact",
+                "0x2222222222222222222222222222222222222222",
+            )
+            .unwrap();
+        assert!(private::resolve_private_draft_contact(&store, &wallet, &input).is_err());
+        input.recipient = changed.address.to_checksum(None);
+        assert_eq!(
+            private::resolve_private_draft_contact(&store, &wallet, &input).unwrap(),
+            input.recipient
+        );
+        input.address_book_entry = Some("removed-contact".into());
+        assert!(private::resolve_private_draft_contact(&store, &wallet, &input).is_err());
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn private_drafts_share_bounded_peer_slots_and_reject_duplicate_or_stale_edits() {
+        use wallet_ops::gateway::{GatewayPrivateDraftInput, GatewayPrivateDraftKind};
+        let (path, store, wallet) = synthetic_wallet();
+        let private_input = || {
+            let mut input = GatewayPrivateDraftInput::default();
+            input.wallet = "wallet".into();
+            input.chain_id = 1;
+            input.kind = GatewayPrivateDraftKind::PrivateSend;
+            GatewayDraftPayload::Private(input)
+        };
+        let mut book = GatewayDraftBook::default();
+        assert!(book.create("peer", "create".into(), private_input(), wallet.clone(), 1));
+        let id = book.records["peer"].view.draft_id.clone();
+        assert!(!book.create("peer", "create".into(), private_input(), wallet.clone(), 1));
+        assert_eq!(book.records["peer"].view.draft_id, id);
+        assert!(!book.update("other", &id, 1, private_input(), &wallet, 1));
+        assert!(!book.update("peer", &id, 0, private_input(), &wallet, 1));
+        assert!(!book.update("peer", &id, 1, private_input(), &wallet, 2));
+        assert!(book.update("peer", &id, 2, private_input(), &wallet, 1));
+        assert!(!book.update("peer", &id, 1, private_input(), &wallet, 1));
+        let execution = GatewayDraftExecution::private("private-execution".into());
+        assert!(execution.approve_review());
+        assert!(execution.start());
+        execution.bind_generation(1);
+        book.records.get_mut("peer").unwrap().execution = Some(execution.clone());
+        book.stopped(1); // The Public form may have the same generation counter.
+        assert_eq!(execution.snapshot().status, GatewayDraftStatus::InProgress);
+        assert!(!book.update("peer", &id, 3, private_input(), &wallet, 1));
+        assert!(!book.create("peer", "another".into(), private_input(), wallet.clone(), 1));
+        for ix in 1..MAX_DRAFT_PEERS {
+            assert!(book.create(
+                &format!("peer-{ix}"),
+                "create".into(),
+                private_input(),
+                wallet.clone(),
+                1
+            ));
+        }
+        assert!(!book.create(
+            "overflow",
+            "create".into(),
+            private_input(),
+            wallet.clone(),
+            1
+        ));
+        book.reconcile_wallet(Some(&wallet), 2);
+        assert!(book.records.is_empty());
+        drop(book);
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dismiss_retires_editable_drafts_without_removing_live_executions() {
+        use wallet_ops::gateway::GatewayPrivateDraftInput;
+        let (path, store, wallet) = synthetic_wallet();
+        let input = GatewayDraftPayload::Private(GatewayPrivateDraftInput::default());
+        let mut book = GatewayDraftBook::default();
+        assert!(book.create("peer", "first".into(), input.clone(), wallet.clone(), 1));
+        let id = book.records["peer"].view.draft_id.clone();
+        let estimate = tokio::spawn(std::future::pending::<()>());
+        book.records.get_mut("peer").unwrap().estimation = Some(estimate.abort_handle());
+        assert!(!book.dismiss("other-peer", &id));
+        assert!(!book.dismiss("peer", "another-draft"));
+        assert!(!estimate.is_finished());
+        assert!(book.dismiss("peer", &id));
+        assert!(estimate.await.unwrap_err().is_cancelled());
+        assert!(!book.dismiss("peer", &id));
+        assert!(book.create("peer", "next".into(), input, wallet.clone(), 1));
+        let next_id = book.records["peer"].view.draft_id.clone();
+        assert!(!book.dismiss("peer", &id));
+        let execution = GatewayDraftExecution::private("execution".into());
+        book.records.get_mut("peer").unwrap().execution = Some(execution.clone());
+        // The editable view can lag behind the native approval/execution owner.
+        assert!(!book.dismiss("peer", &next_id));
+        assert!(execution.approve_review());
+        assert!(execution.start());
+        assert!(!book.dismiss("peer", &next_id));
+        execution.stopped();
+        assert!(book.dismiss("peer", &next_id));
+        drop(book);
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn max_reserves_the_selected_fee_ceiling_and_token_max_still_requires_native_gas() {

@@ -15414,6 +15414,8 @@ dependencies = [
  "gpui-pre",
  "parking_lot",
  "qrcodegen",
+ "ruint",
+ "serde",
  "tracing",
  "tracing-subscriber",
  "url",

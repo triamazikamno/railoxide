@@ -3,6 +3,7 @@ import { configuration } from './gateway-config.js';
 import { createPageBridge } from './gateway-page-bridge.js';
 
 const ports = new Set();
+const privatePickers = new Map();
 const tabContexts = new Map();
 // Navigation is local to each document; only newly opened views inherit the last choice.
 const homeTabs = new Map();
@@ -120,6 +121,11 @@ chrome.windows.onRemoved.addListener(id => {
   if (notificationWindow?.id === id) notificationWindow = undefined;
 });
 function publishSnapshot(snapshot, authoritative = true) {
+  for (const [port, picker] of privatePickers) {
+    if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
+        !snapshot.public_view?.drafts?.some(draft => draft.draft_id === picker.draft_id && draft.revision === picker.revision &&
+          !['attention', 'in_progress', 'done', 'failed'].includes(draft.status))) privatePickers.delete(port);
+  }
   uiSnapshot = snapshot;
   updateNotification(false, authoritative);
   for (const port of ports) {
@@ -343,8 +349,13 @@ async function receive(session, bytes) {
       if (message.locked && (message.accounts.length ||
           message.pending_connects.some(prompt => prompt.accounts?.length) ||
           message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null)) return;
-      publishSnapshot({ ...message, private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
-        public_view: message.locked ? null : message.public_view,
+      const privateActions = !message.locked && message.private_actions_supported === true;
+      const publicView = message.public_view && { ...message.public_view,
+        ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
+          privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
+      publishSnapshot({ ...message, private_actions_supported: privateActions,
+        private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
+        public_view: message.locked ? null : publicView,
         permissions: message.locked ? [] : (message.permissions ?? []),
         ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
         request_id: request.request_id, url: request.url,
@@ -496,6 +507,15 @@ chrome.runtime.onConnect.addListener(port => {
   port.postMessage(snapshotFor(port));
   port.postMessage(stateMessage());
   port.onDisconnect.addListener(() => {
+    const picker = privatePickers.get(port);
+    privatePickers.delete(port);
+    const session = owner?.candidate;
+    if (picker && session?.established && current(session) && !session.locked && session.generation === picker.generation) {
+      try { command(session, { type: 'public_view', version: 1, generation: session.generation,
+        command: { type: 'draft', command: { action: 'private_picker', draft_id: picker.draft_id,
+          revision: picker.revision, view_id: picker.view_id, open: false, query: '' } } }); }
+      catch { failed(session, 'disconnected', true); }
+    }
     ports.delete(port); // Documents never own the socket.
     tabContexts.delete(port);
     homeTabs.delete(port);
@@ -560,6 +580,27 @@ chrome.runtime.onConnect.addListener(port => {
         const bounded = (value, length) => typeof value === 'string' && value.length <= length;
         if (['create', 'update'].includes(draft.action)) {
           const data = draft.input;
+          const privateInput = ['private_send', 'unshield'].includes(data?.kind);
+          let prepared;
+          if (privateInput) {
+            if (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+                !bounded(data.wallet, 128) || data.wallet !== uiSnapshot.private_view?.selected_wallet ||
+                data.chain_id !== uiSnapshot.private_view?.selected_chain || !bounded(data.asset, 128) ||
+                !bounded(data.fee_token, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
+                !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
+                !['deduct', 'add_on_top'].includes(data.fee_mode) ||
+                !['max', 'allow_out_of_range', 'favorites_only', 'unwrap', 'native_top_up'].every(key => typeof data[key] === 'boolean')) return;
+            const broadcaster = data.broadcaster;
+            if (!broadcaster || !['random', 'specific'].includes(broadcaster.mode) ||
+                (broadcaster.mode === 'specific' && !bounded(broadcaster.id, 1024))) return;
+            if (data.kind === 'private_send' && (data.unwrap || data.native_top_up)) return;
+            prepared = { wallet: data.wallet, chain_id: data.chain_id, kind: data.kind, asset: data.asset,
+              amount: data.amount, max: data.max, recipient: data.recipient, address_book_entry: data.address_book_entry,
+              fee_token: data.fee_token, fee_mode: data.fee_mode,
+              broadcaster: broadcaster.mode === 'random' ? { mode: 'random' } : { mode: 'specific', id: broadcaster.id },
+              allow_out_of_range: data.allow_out_of_range, favorites_only: data.favorites_only,
+              unwrap: data.unwrap, native_top_up: data.native_top_up };
+          } else {
           if (!data || data.account !== uiSnapshot.public_view?.selected_account || data.chain_id !== uiSnapshot.public_view?.selected_chain ||
               !['send', 'shield'].includes(data.kind) || !bounded(data.asset, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
               !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
@@ -567,18 +608,45 @@ chrome.runtime.onConnect.addListener(port => {
           const fee = data.fee;
           if (!fee || !['slow', 'normal', 'fast', 'custom'].includes(fee.mode)) return;
           if (fee.mode === 'custom' && (!bounded(fee.max_fee_gwei, 100) || !bounded(fee.priority_fee_gwei, 100))) return;
-          const prepared = { account: data.account, chain_id: data.chain_id, kind: data.kind, asset: data.asset, amount: data.amount,
+          prepared = { account: data.account, chain_id: data.chain_id, kind: data.kind, asset: data.asset, amount: data.amount,
             recipient: data.recipient, address_book_entry: data.address_book_entry, max: data.max, mimic_railway: data.mimic_railway,
             fee: fee.mode === 'custom' ? { mode: fee.mode, max_fee_gwei: fee.max_fee_gwei, priority_fee_gwei: fee.priority_fee_gwei } : { mode: fee.mode } };
+          }
           if (draft.action === 'create') {
             if (!bounded(draft.request_id, 64) || !draft.request_id) return;
             value = { type: 'draft', command: { action: 'create', request_id: draft.request_id, input: prepared } };
           } else {
-            if (!uiSnapshot.public_view?.drafts?.some(current => current.draft_id === draft.draft_id) || !Number.isSafeInteger(draft.revision) || draft.revision < 0) return;
+            const current = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+            if (!current || !Number.isSafeInteger(draft.revision) || draft.revision < 0 ||
+                privateInput !== ['private_send', 'unshield'].includes(current.input?.kind) ||
+                (privateInput && (draft.revision <= current.revision || ['attention', 'in_progress', 'done', 'failed'].includes(current.status)))) return;
             value = { type: 'draft', command: { action: 'update', draft_id: draft.draft_id, revision: draft.revision, input: prepared } };
           }
+        } else if (['private_picker', 'private_control'].includes(draft.action)) {
+          const currentDraft = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+          if (!currentDraft || uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+              !['private_send', 'unshield'].includes(currentDraft.input?.kind)) return;
+          if (draft.action === 'private_picker') {
+            if (draft.revision !== currentDraft.revision || !bounded(draft.view_id, 128) || !draft.view_id ||
+                typeof draft.open !== 'boolean' || !bounded(draft.query, 1024) ||
+                ['attention', 'in_progress', 'done', 'failed'].includes(currentDraft.status)) return;
+            value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
+              revision: draft.revision, view_id: draft.view_id, open: draft.open, query: draft.query } };
+            if (draft.open) privatePickers.set(port, { generation: session.generation, draft_id: draft.draft_id, revision: draft.revision, view_id: draft.view_id });
+            else if (privatePickers.get(port)?.view_id === draft.view_id) privatePickers.delete(port);
+          } else {
+            const progress = currentDraft.private_progress;
+            if (!progress || draft.execution_id !== progress.execution_id ||
+                !['stop', 'stop_waiting', 'ban', 'favorite'].includes(draft.control) || progress[draft.control] !== true) return;
+            value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
+              execution_id: draft.execution_id, control: draft.control } };
+          }
         } else if (['submit', 'cancel', 'dismiss'].includes(draft.action)) {
-          if (!uiSnapshot.public_view?.drafts?.some(current => current.draft_id === draft.draft_id)) return;
+          const currentDraft = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+          if (!currentDraft) return;
+          if (['private_send', 'unshield'].includes(currentDraft.input?.kind) &&
+              (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+               (draft.action === 'submit' && (draft.revision !== currentDraft.revision || currentDraft.status !== 'ready')))) return;
           const command = { action: draft.action, draft_id: draft.draft_id };
           if (draft.action === 'submit') {
             if (!Number.isSafeInteger(draft.revision) || draft.revision < 0) return;

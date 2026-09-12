@@ -312,34 +312,37 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.as_ref() else {
             return Vec::new();
         };
-        self.wallet_metadata
-            .iter()
-            .filter_map(|metadata| {
-                let address = if metadata.wallet_uuid == view_session.wallet_id() {
-                    view_session.receive_address().ok().or_else(|| {
-                        metadata
-                            .hardware_account
-                            .as_ref()
-                            .and_then(|account| account.receive_address.clone())
-                    })
-                } else if metadata.source.is_hardware_derived() {
-                    return hardware_wallet_recipient_source_from_metadata(metadata);
-                } else {
-                    store
-                        .load_view_session_with_view_session(
-                            view_session.as_ref(),
-                            &metadata.wallet_uuid,
-                        )
-                        .ok()
-                        .and_then(|session| session.receive_address().ok())
-                }?;
-                Some(PrivateWalletRecipientSource {
-                    label: Arc::from(metadata.label.as_str()),
-                    address: Arc::from(address),
-                    active: metadata.status == WalletStatus::Active,
+        crate::root::vault::visible_wallet_metadata(
+            &self.wallet_metadata,
+            self.revealed_passphrase_context_id.as_deref(),
+        )
+        .iter()
+        .filter_map(|metadata| {
+            let address = if metadata.wallet_uuid == view_session.wallet_id() {
+                view_session.receive_address().ok().or_else(|| {
+                    metadata
+                        .hardware_account
+                        .as_ref()
+                        .and_then(|account| account.receive_address.clone())
                 })
+            } else if metadata.source.is_hardware_derived() {
+                return hardware_wallet_recipient_source_from_metadata(metadata);
+            } else {
+                store
+                    .load_view_session_with_view_session(
+                        view_session.as_ref(),
+                        &metadata.wallet_uuid,
+                    )
+                    .ok()
+                    .and_then(|session| session.receive_address().ok())
+            }?;
+            Some(PrivateWalletRecipientSource {
+                label: Arc::from(metadata.label.as_str()),
+                address: Arc::from(address),
+                active: metadata.status == WalletStatus::Active,
             })
-            .collect()
+        })
+        .collect()
     }
 
     pub(in crate::root) fn set_private_action_recipient(

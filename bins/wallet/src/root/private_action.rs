@@ -5,10 +5,9 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Context, ElementId, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
-    rgb,
+    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Pixels, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
@@ -89,9 +88,8 @@ use super::public_action::{
 use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;
 use super::public_broadcaster_cost::{
-    cost_estimate_detail_text, public_broadcaster_cost_status,
-    render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
-    should_render_public_broadcaster_cost_preview,
+    public_broadcaster_cost_status, render_public_broadcaster_cost_estimate,
+    render_public_broadcaster_cost_status, should_render_public_broadcaster_cost_preview,
 };
 use super::spend_authorization::{
     SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
@@ -114,6 +112,8 @@ use super::{
     unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
+mod estimate;
+pub(super) use estimate::{PrivateEstimateInput, PrivateEstimateOutput, PrivateEstimateRequest};
 mod delivery;
 mod form_lifecycle;
 mod generation;

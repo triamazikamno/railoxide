@@ -1,63 +1,62 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+pub(super) use ui::broadcaster_picker::BroadcasterPickerTier;
+pub(super) use ui::broadcaster_picker::{
+    BroadcasterPickerEntry, BroadcasterPickerFeeStatus, BroadcasterPickerGroup,
+    BroadcasterPickerGroupKey, BroadcasterPickerGroupRevision, BroadcasterPickerRow,
+    BroadcasterPickerSelectedCollapse, BroadcasterPickerViewMode,
+    broadcaster_picker_section_divider_before, project_broadcaster_picker_entries,
+    update_broadcaster_picker_group_expansion,
+};
+pub(super) use ui::broadcaster_picker::{
+    broadcaster_picker_group_element_id, render_broadcaster_picker_row,
+};
 
 use crate::assets::CHEVRONS_DOWN_ICON_PATH;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use gpui::{
-    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Pixels, Render,
+    SharedString, Size, Styled, WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Icon, IconName, IndexPath, Sizable, WindowExt,
-    button::{Button, ButtonVariants},
+    Icon, IndexPath, WindowExt,
     input::{InputEvent, InputState},
     list::{ListDelegate, ListItem, ListState},
-    popover::Popover,
     separator::Separator,
-    tooltip::Tooltip,
     window_paddings,
 };
 use railgun_ui::{
     chain_name, format_broadcaster_address_label, format_token_amount, format_usd_micro_value,
 };
+use ui::broadcaster_picker::BroadcasterPickerLayout;
 use ui::controls::{app_muted_text, app_strong_text};
-use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::theme;
 use wallet_ops::{
-    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, DesktopSendPublicBroadcasterEstimateRequest,
-    DesktopUnshieldPublicBroadcasterEstimateRequest, PublicBroadcasterCandidate,
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, PublicBroadcasterCandidate,
     PublicBroadcasterCostEstimate, PublicBroadcasterSelection, broadcaster_fee_amount,
-    buffered_public_broadcaster_fee, estimate_desktop_send_public_broadcaster_cost,
-    estimate_desktop_unshield_public_broadcaster_cost, fee_policy_eligible_public_broadcasters,
-    parse_send_amount, parse_unshield_amount, public_broadcaster_service_gas_price,
-    select_public_broadcaster_with_policy_and_trust, settings::EffectiveTokenRegistry,
+    buffered_public_broadcaster_fee, fee_policy_eligible_public_broadcasters,
+    public_broadcaster_service_gas_price, settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters,
 };
 
 use super::retry::retry_backoff_delay;
 use super::{
-    ChainUtxoState, DeliveryFormKind, DeliveryMode, PRIVATE_ASSET_LIST_WIDTH, UnshieldAssetKey,
-    WalletRoot, dialogs::render_broadcaster_picker_dialog_content, effective_fee_handling_mode,
-    private_action::native_top_up_request_from_plan, token_display_label, token_display_metadata,
+    DeliveryFormKind, DeliveryMode, PRIVATE_ASSET_LIST_WIDTH, UnshieldAssetKey, WalletRoot,
+    dialogs::render_broadcaster_picker_dialog_content,
+    private_action::{PrivateEstimateInput, PrivateEstimateOutput, PrivateEstimateRequest},
+    token_display_label, token_display_metadata,
 };
 
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const BROADCASTER_PICKER_DIALOG_FIXED_CHROME_HEIGHT: Pixels = px(100.0);
-pub(super) const BROADCASTER_PICKER_ENTRY_HEIGHT: Pixels = px(84.0);
 pub(super) const BROADCASTER_PICKER_MIN_LIST_HEIGHT: Pixels = px(120.0);
 pub(super) const BROADCASTER_PICKER_LIST_HORIZONTAL_PADDING: Pixels = px(8.0);
 pub(super) const BROADCASTER_PICKER_LIST_TOP_PADDING: Pixels = px(2.0);
 pub(super) const BROADCASTER_PICKER_LIST_BOTTOM_PADDING: Pixels = px(8.0);
-const BROADCASTER_PICKER_PRIMARY_MIN_WIDTH: Pixels = px(144.0);
-const BROADCASTER_PICKER_FEE_WIDTH: Pixels = px(168.0);
-const BROADCASTER_PICKER_STATUS_WIDTH: Pixels = px(110.0);
-const BROADCASTER_PICKER_STATUS_TOOLTIP_WIDTH: Pixels = px(320.0);
-const BROADCASTER_PICKER_HEADER_HORIZONTAL_PADDING: Pixels = px(21.0);
-const BROADCASTER_PICKER_HEADER_TOP_PADDING: Pixels = px(4.0);
+
 const BROADCASTER_PICKER_ROW_HORIZONTAL_PADDING: Pixels = px(12.0);
-const BROADCASTER_PICKER_GROUP_TOGGLE_SIZE: Pixels = px(18.0);
-const BROADCASTER_PICKER_GROUP_PRIMARY_GAP: Pixels = px(8.0);
+
 const BROADCASTER_PICKER_SECTION_DIVIDER_INSET: Pixels = px(13.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -91,6 +90,7 @@ pub(super) struct BroadcasterPickerScrollIndicator {
     list: Entity<ListState<BroadcasterPickerDelegate>>,
     post_layout_refresh_pending: bool,
     last_viewport_size: Option<Size<Pixels>>,
+    last_rem_size: Option<Pixels>,
 }
 
 impl BroadcasterPickerScrollIndicator {
@@ -104,6 +104,7 @@ impl BroadcasterPickerScrollIndicator {
             list,
             post_layout_refresh_pending: false,
             last_viewport_size: None,
+            last_rem_size: None,
         }
     }
 }
@@ -111,7 +112,9 @@ impl BroadcasterPickerScrollIndicator {
 impl Render for BroadcasterPickerScrollIndicator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let viewport_size = window.viewport_size();
-        let viewport_changed = self.last_viewport_size != Some(viewport_size);
+        let viewport_changed = self.last_viewport_size != Some(viewport_size)
+            || self.last_rem_size != Some(window.rem_size());
+        self.last_rem_size = Some(window.rem_size());
         self.last_viewport_size = Some(viewport_size);
         if self.post_layout_refresh_pending || viewport_changed {
             self.post_layout_refresh_pending = false;
@@ -198,210 +201,11 @@ impl BroadcasterPickerFeeEstimateRetryState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) enum BroadcasterPickerFeeStatus {
-    InRange,
-    NoPremium,
-    LowIncentive,
-    VeryLowIncentive,
-    HighFee,
-    NotAssessed,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BroadcasterPickerSuspiciousFeeDirection {
     BelowRange,
     AboveRange,
     Unrepresentable,
-}
-
-impl BroadcasterPickerFeeStatus {
-    const fn key(self) -> &'static str {
-        match self {
-            Self::InRange => "in-range",
-            Self::NoPremium => "no-premium",
-            Self::LowIncentive => "low-incentive",
-            Self::VeryLowIncentive => "very-low-incentive",
-            Self::HighFee => "high-fee",
-            Self::NotAssessed => "not-assessed",
-        }
-    }
-
-    pub(super) const fn tier(self) -> BroadcasterPickerTier {
-        match self {
-            Self::InRange => BroadcasterPickerTier::Incentivised,
-            Self::NoPremium | Self::LowIncentive => BroadcasterPickerTier::Uncompensated,
-            Self::VeryLowIncentive | Self::HighFee => BroadcasterPickerTier::OutsideRange,
-            Self::NotAssessed => BroadcasterPickerTier::NotAssessed,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) enum BroadcasterPickerTier {
-    Incentivised,
-    Uncompensated,
-    OutsideRange,
-    NotAssessed,
-}
-
-impl BroadcasterPickerTier {
-    pub(super) const fn label(self) -> &'static str {
-        match self {
-            Self::Incentivised => "Incentivised",
-            Self::Uncompensated => "Uncompensated",
-            Self::OutsideRange => "Outside range",
-            Self::NotAssessed => "Not assessed",
-        }
-    }
-
-    pub(super) const fn badge_label(self, show_uncompensated_badge: bool) -> Option<&'static str> {
-        match self {
-            Self::Uncompensated if !show_uncompensated_badge => None,
-            Self::Uncompensated => Some("No fee"),
-            _ => Some(self.label()),
-        }
-    }
-
-    pub(super) const fn is_muted(self) -> bool {
-        !matches!(self, Self::Incentivised)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum BroadcasterPickerViewMode {
-    #[default]
-    Grouped,
-    List,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) enum BroadcasterPickerGroupKey {
-    Tier(BroadcasterPickerTier),
-    Status(BroadcasterPickerFeeStatus),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BroadcasterPickerRow {
-    pub(super) railgun_address: String,
-    pub(super) label: String,
-    pub(super) advertised_fee: U256,
-    pub(super) premium_bps: Option<i128>,
-    pub(super) sort_order: usize,
-    pub(super) estimated_fee_amount: Option<U256>,
-    pub(super) estimated_fee_label: String,
-    pub(super) estimated_fee_usd_micro: Option<U256>,
-    pub(super) estimated_fee_usd_label: Option<String>,
-    pub(super) fee_status: BroadcasterPickerFeeStatus,
-    pub(super) fee_tier: BroadcasterPickerTier,
-    pub(super) show_uncompensated_badge: bool,
-    pub(super) fee_status_detail: String,
-    pub(super) fee_warning: Option<String>,
-    pub(super) favorite: bool,
-    pub(super) selected: bool,
-    pub(super) child_of: Option<BroadcasterPickerGroupKey>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BroadcasterPickerGroupChildRevision {
-    railgun_address: String,
-    label: String,
-    advertised_fee: U256,
-    premium_bps: Option<i128>,
-    estimated_fee_amount: Option<U256>,
-    estimated_fee_label: String,
-    estimated_fee_usd_micro: Option<U256>,
-    estimated_fee_usd_label: Option<String>,
-    fee_status: BroadcasterPickerFeeStatus,
-    fee_tier: BroadcasterPickerTier,
-    show_uncompensated_badge: bool,
-    fee_status_detail: String,
-    fee_warning: Option<String>,
-    favorite: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BroadcasterPickerGroupRevision(Vec<BroadcasterPickerGroupChildRevision>);
-
-impl BroadcasterPickerGroupRevision {
-    fn from_rows(rows: &[BroadcasterPickerRow]) -> Self {
-        Self(
-            rows.iter()
-                .map(|row| BroadcasterPickerGroupChildRevision {
-                    railgun_address: row.railgun_address.clone(),
-                    label: row.label.clone(),
-                    advertised_fee: row.advertised_fee,
-                    premium_bps: row.premium_bps,
-                    estimated_fee_amount: row.estimated_fee_amount,
-                    estimated_fee_label: row.estimated_fee_label.clone(),
-                    estimated_fee_usd_micro: row.estimated_fee_usd_micro,
-                    estimated_fee_usd_label: row.estimated_fee_usd_label.clone(),
-                    fee_status: row.fee_status,
-                    fee_tier: row.fee_tier,
-                    show_uncompensated_badge: row.show_uncompensated_badge,
-                    fee_status_detail: row.fee_status_detail.clone(),
-                    fee_warning: row.fee_warning.clone(),
-                    favorite: row.favorite,
-                })
-                .collect(),
-        )
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BroadcasterPickerSelectedCollapse {
-    selected_address: String,
-    group_revision: BroadcasterPickerGroupRevision,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BroadcasterPickerGroup {
-    pub(super) key: BroadcasterPickerGroupKey,
-    pub(super) label: String,
-    pub(super) count: usize,
-    pub(super) estimated_fee_label: String,
-    pub(super) estimated_fee_usd_label: Option<String>,
-    pub(super) fee_tier: BroadcasterPickerTier,
-    pub(super) detail: String,
-    pub(super) expanded: bool,
-    pub(super) selected_child_address: Option<String>,
-    pub(super) revision: BroadcasterPickerGroupRevision,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum BroadcasterPickerEntry {
-    Group(BroadcasterPickerGroup),
-    Broadcaster(BroadcasterPickerRow),
-}
-
-impl BroadcasterPickerEntry {
-    const fn tier(&self) -> BroadcasterPickerTier {
-        match self {
-            Self::Group(group) => group.fee_tier,
-            Self::Broadcaster(row) => row.fee_tier,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) const fn height() -> Pixels {
-        BROADCASTER_PICKER_ENTRY_HEIGHT
-    }
-}
-
-pub(super) fn broadcaster_picker_section_divider_before(
-    entries: &[BroadcasterPickerEntry],
-    view_mode: BroadcasterPickerViewMode,
-    row: usize,
-) -> bool {
-    if view_mode != BroadcasterPickerViewMode::Grouped || row == 0 {
-        return false;
-    }
-    matches!(
-        entries.get(row),
-        Some(BroadcasterPickerEntry::Group(group))
-            if group.key == BroadcasterPickerGroupKey::Tier(BroadcasterPickerTier::Uncompensated)
-    ) && entries.get(row - 1).map(BroadcasterPickerEntry::tier)
-        == Some(BroadcasterPickerTier::Incentivised)
 }
 
 #[derive(Clone)]
@@ -410,11 +214,6 @@ pub(super) struct BroadcasterPickerFeeEstimateContext {
     fee_amount: U256,
     gas_limit: u64,
     service_gas_price: u128,
-}
-
-enum BroadcasterPickerFeeEstimateRequest {
-    Send(DesktopSendPublicBroadcasterEstimateRequest),
-    Unshield(DesktopUnshieldPublicBroadcasterEstimateRequest),
 }
 
 impl BroadcasterPickerFeeEstimateContext {
@@ -507,299 +306,6 @@ pub(super) fn broadcaster_picker_fee_status_detail(
     }
 }
 
-#[derive(Clone)]
-enum BroadcasterPickerSectionItem {
-    Direct(Box<BroadcasterPickerRow>),
-    Group {
-        key: BroadcasterPickerGroupKey,
-        rows: Vec<BroadcasterPickerRow>,
-    },
-}
-
-impl BroadcasterPickerSectionItem {
-    fn sort_fee(&self) -> U256 {
-        match self {
-            Self::Direct(row) => row.advertised_fee,
-            Self::Group { rows, .. } => rows
-                .iter()
-                .map(|row| row.advertised_fee)
-                .min()
-                .unwrap_or_default(),
-        }
-    }
-
-    fn tie_order(&self) -> usize {
-        match self {
-            Self::Direct(row) => row.sort_order,
-            Self::Group { rows, .. } => rows
-                .iter()
-                .map(|row| row.sort_order)
-                .min()
-                .unwrap_or_default(),
-        }
-    }
-}
-
-pub(super) fn project_broadcaster_picker_entries(
-    rows: &[BroadcasterPickerRow],
-    view_mode: BroadcasterPickerViewMode,
-    query_active: bool,
-    expanded_groups: &BTreeSet<BroadcasterPickerGroupKey>,
-    collapsed_selected_children: &BTreeMap<
-        BroadcasterPickerGroupKey,
-        BroadcasterPickerSelectedCollapse,
-    >,
-) -> Vec<BroadcasterPickerEntry> {
-    let mut sorted_rows = rows.to_vec();
-    sorted_rows.sort_by(|left, right| {
-        left.advertised_fee
-            .cmp(&right.advertised_fee)
-            .then_with(|| left.fee_tier.cmp(&right.fee_tier))
-            .then_with(|| left.sort_order.cmp(&right.sort_order))
-    });
-    if view_mode == BroadcasterPickerViewMode::List {
-        return sorted_rows
-            .into_iter()
-            .map(|mut row| {
-                row.show_uncompensated_badge = row.fee_tier == BroadcasterPickerTier::Uncompensated;
-                BroadcasterPickerEntry::Broadcaster(row)
-            })
-            .collect();
-    }
-
-    let mut entries = Vec::new();
-    for tier in [
-        BroadcasterPickerTier::Incentivised,
-        BroadcasterPickerTier::Uncompensated,
-        BroadcasterPickerTier::OutsideRange,
-        BroadcasterPickerTier::NotAssessed,
-    ] {
-        append_broadcaster_picker_tier(
-            &mut entries,
-            tier,
-            sorted_rows
-                .iter()
-                .filter(|row| row.fee_tier == tier)
-                .cloned()
-                .collect(),
-            query_active,
-            expanded_groups,
-            collapsed_selected_children,
-        );
-    }
-    entries
-}
-
-fn append_broadcaster_picker_tier(
-    entries: &mut Vec<BroadcasterPickerEntry>,
-    tier: BroadcasterPickerTier,
-    rows: Vec<BroadcasterPickerRow>,
-    query_active: bool,
-    expanded_groups: &BTreeSet<BroadcasterPickerGroupKey>,
-    collapsed_selected_children: &BTreeMap<
-        BroadcasterPickerGroupKey,
-        BroadcasterPickerSelectedCollapse,
-    >,
-) {
-    if rows.is_empty() {
-        return;
-    }
-    if query_active {
-        entries.extend(rows.into_iter().map(BroadcasterPickerEntry::Broadcaster));
-        return;
-    }
-
-    let mut items = match tier {
-        BroadcasterPickerTier::Incentivised | BroadcasterPickerTier::NotAssessed => rows
-            .into_iter()
-            .map(|row| BroadcasterPickerSectionItem::Direct(Box::new(row)))
-            .collect(),
-        BroadcasterPickerTier::Uncompensated => {
-            vec![BroadcasterPickerSectionItem::Group {
-                key: BroadcasterPickerGroupKey::Tier(BroadcasterPickerTier::Uncompensated),
-                rows,
-            }]
-        }
-        BroadcasterPickerTier::OutsideRange => grouped_outside_range_items(rows),
-    };
-    items.sort_by(|left, right| {
-        left.sort_fee()
-            .cmp(&right.sort_fee())
-            .then_with(|| left.tie_order().cmp(&right.tie_order()))
-    });
-    for item in items {
-        match item {
-            BroadcasterPickerSectionItem::Direct(row) => {
-                entries.push(BroadcasterPickerEntry::Broadcaster(*row));
-            }
-            BroadcasterPickerSectionItem::Group { key, rows } => append_broadcaster_picker_group(
-                entries,
-                key,
-                rows,
-                expanded_groups,
-                collapsed_selected_children,
-            ),
-        }
-    }
-}
-
-fn grouped_outside_range_items(
-    rows: Vec<BroadcasterPickerRow>,
-) -> Vec<BroadcasterPickerSectionItem> {
-    let mut grouped = BTreeMap::<BroadcasterPickerFeeStatus, Vec<BroadcasterPickerRow>>::new();
-    for row in rows {
-        grouped.entry(row.fee_status).or_default().push(row);
-    }
-    let mut items = Vec::new();
-    for (status, rows) in grouped {
-        if rows.len() >= 2 {
-            items.push(BroadcasterPickerSectionItem::Group {
-                key: BroadcasterPickerGroupKey::Status(status),
-                rows,
-            });
-        } else {
-            items.extend(
-                rows.into_iter()
-                    .map(|row| BroadcasterPickerSectionItem::Direct(Box::new(row))),
-            );
-        }
-    }
-    items
-}
-
-fn append_broadcaster_picker_group(
-    entries: &mut Vec<BroadcasterPickerEntry>,
-    key: BroadcasterPickerGroupKey,
-    rows: Vec<BroadcasterPickerRow>,
-    expanded_groups: &BTreeSet<BroadcasterPickerGroupKey>,
-    collapsed_selected_children: &BTreeMap<
-        BroadcasterPickerGroupKey,
-        BroadcasterPickerSelectedCollapse,
-    >,
-) {
-    let revision = BroadcasterPickerGroupRevision::from_rows(&rows);
-    let selected_child_address = rows
-        .iter()
-        .find(|row| row.selected)
-        .map(|row| row.railgun_address.clone());
-    let selected_collapse_matches = selected_child_address.as_deref().is_some_and(|selected| {
-        collapsed_selected_children
-            .get(&key)
-            .is_some_and(|collapse| {
-                collapse.selected_address == selected && collapse.group_revision == revision
-            })
-    });
-    let expanded = expanded_groups.contains(&key)
-        || (selected_child_address.is_some() && !selected_collapse_matches);
-    let tier = rows[0].fee_tier;
-    let (estimated_fee_label, estimated_fee_usd_label) = group_minimum_estimated_fee_labels(&rows);
-    let label = match key {
-        BroadcasterPickerGroupKey::Tier(BroadcasterPickerTier::Uncompensated)
-            if rows.len() == 1 =>
-        {
-            "1 broadcaster earning no fee".to_string()
-        }
-        BroadcasterPickerGroupKey::Tier(BroadcasterPickerTier::Uncompensated) => {
-            format!("{} broadcasters earning no fee", rows.len())
-        }
-        BroadcasterPickerGroupKey::Status(_) if tier == BroadcasterPickerTier::OutsideRange => {
-            format!("{} broadcasters outside the allowed range", rows.len())
-        }
-        BroadcasterPickerGroupKey::Tier(_) | BroadcasterPickerGroupKey::Status(_) => {
-            format!("{} broadcasters", rows.len())
-        }
-    };
-    let detail = broadcaster_picker_group_detail(key, &rows);
-    entries.push(BroadcasterPickerEntry::Group(BroadcasterPickerGroup {
-        key,
-        label,
-        count: rows.len(),
-        estimated_fee_label,
-        estimated_fee_usd_label,
-        fee_tier: tier,
-        detail,
-        expanded,
-        selected_child_address,
-        revision,
-    }));
-    if expanded {
-        entries.extend(rows.into_iter().map(|mut row| {
-            row.child_of = Some(key);
-            BroadcasterPickerEntry::Broadcaster(row)
-        }));
-    }
-}
-
-fn broadcaster_picker_group_detail(
-    key: BroadcasterPickerGroupKey,
-    rows: &[BroadcasterPickerRow],
-) -> String {
-    let Some(first) = rows.first() else {
-        return "Fee comparison unavailable.".to_string();
-    };
-    match key {
-        BroadcasterPickerGroupKey::Tier(BroadcasterPickerTier::Uncompensated) => {
-            "These broadcasters charge gas cost or less. They earn nothing on your transaction and have no reason to prioritise it."
-                .to_string()
-        }
-        BroadcasterPickerGroupKey::Status(BroadcasterPickerFeeStatus::VeryLowIncentive) => {
-            "These fees are below the allowed range.".to_string()
-        }
-        BroadcasterPickerGroupKey::Status(BroadcasterPickerFeeStatus::HighFee) => {
-            let unavailable = rows
-                .iter()
-                .filter(|row| {
-                    row.premium_bps
-                        .and_then(|premium_bps| premium_bps.checked_add(10_000))
-                        .is_none()
-                })
-                .count();
-            if unavailable == 0 {
-                "These fees are above the allowed range.".to_string()
-            } else if unavailable == rows.len() {
-                "These fees are outside the allowed range, but gas-cost comparisons are unavailable."
-                    .to_string()
-            } else {
-                "These fees are above the allowed range where gas-cost comparisons are available; some comparisons are unavailable."
-                    .to_string()
-            }
-        }
-        BroadcasterPickerGroupKey::Tier(_) | BroadcasterPickerGroupKey::Status(_) => {
-            first.fee_status_detail.clone()
-        }
-    }
-}
-
-pub(super) fn group_minimum_estimated_fee_labels(
-    rows: &[BroadcasterPickerRow],
-) -> (String, Option<String>) {
-    let Some(first) = rows.first() else {
-        return ("Estimate unavailable".to_string(), None);
-    };
-    if let Some(unavailable) = rows.iter().find(|row| row.estimated_fee_amount.is_none()) {
-        return (unavailable.estimated_fee_label.clone(), None);
-    }
-    let token_label = rows
-        .iter()
-        .min_by_key(|row| row.estimated_fee_amount.unwrap_or_default())
-        .map_or_else(
-            || first.estimated_fee_label.clone(),
-            |row| format!("from {}", row.estimated_fee_label),
-        );
-    let usd_label = rows
-        .iter()
-        .map(|row| {
-            Some((
-                row.estimated_fee_usd_micro?,
-                row.estimated_fee_usd_label.as_deref()?,
-            ))
-        })
-        .collect::<Option<Vec<_>>>()
-        .and_then(|values| values.into_iter().min_by_key(|(value, _)| *value))
-        .map(|(_, label)| format!("from {label}"));
-    (token_label, usd_label)
-}
-
 #[derive(Clone, PartialEq)]
 pub(super) struct BroadcasterPickerContent {
     pub(super) entries: Vec<BroadcasterPickerEntry>,
@@ -836,6 +342,7 @@ pub(super) struct BroadcasterPickerDialogSnapshot {
 }
 
 pub(super) struct BroadcasterPickerDelegate {
+    selected_index: Option<IndexPath>,
     root: WeakEntity<WalletRoot>,
     kind: DeliveryFormKind,
     key: UnshieldAssetKey,
@@ -875,6 +382,7 @@ impl BroadcasterPickerDelegate {
             expanded_groups: BTreeSet::new(),
             collapsed_selected_children: BTreeMap::new(),
             pending_content: None,
+            selected_index: None,
             last_live_update: None,
             live_update_scheduled: false,
             live_update_epoch: 0,
@@ -1143,7 +651,7 @@ impl WalletRoot {
         let root = cx.weak_entity();
         let list = cx.new(|cx| {
             ListState::new(BroadcasterPickerDelegate::new(root, kind, key), window, cx)
-                .selectable(false)
+                .selectable(true)
         });
         let scroll_indicator = cx.new(|cx| BroadcasterPickerScrollIndicator::new(list.clone(), cx));
         self.broadcaster_picker = Some(BroadcasterPickerState {
@@ -1318,16 +826,9 @@ impl WalletRoot {
         cx.notify();
 
         let http = self.http.clone();
-        let join = match request {
-            BroadcasterPickerFeeEstimateRequest::Send(request) => self.runtime.spawn(async move {
-                estimate_desktop_send_public_broadcaster_cost(request, &http).await
-            }),
-            BroadcasterPickerFeeEstimateRequest::Unshield(request) => {
-                self.runtime.spawn(async move {
-                    estimate_desktop_unshield_public_broadcaster_cost(request, &http).await
-                })
-            }
-        };
+        let join = self
+            .runtime
+            .spawn(async move { request.estimate(&http).await });
         cx.spawn(async move |this, cx| {
             let context = match join.await {
                 Ok(Ok(estimate)) => Some(BroadcasterPickerFeeEstimateContext::from_estimate(
@@ -1453,148 +954,50 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
         cx: &Context<'_, Self>,
-    ) -> Option<BroadcasterPickerFeeEstimateRequest> {
-        match kind {
-            DeliveryFormKind::Send => self
-                .broadcaster_picker_send_fee_estimate_request(key, cx)
-                .map(BroadcasterPickerFeeEstimateRequest::Send),
-            DeliveryFormKind::Unshield => self
-                .broadcaster_picker_unshield_fee_estimate_request(key, cx)
-                .map(BroadcasterPickerFeeEstimateRequest::Unshield),
-        }
-    }
-
-    fn broadcaster_picker_send_fee_estimate_request(
-        &self,
-        key: UnshieldAssetKey,
-        cx: &Context<'_, Self>,
-    ) -> Option<DesktopSendPublicBroadcasterEstimateRequest> {
-        let form = self.send_forms.get(&key)?;
-        if form.generating || form.delivery_mode != DeliveryMode::PublicBroadcaster {
-            return None;
-        }
-        let asset = form.asset.clone();
-        let amount_raw = form.amount_input.read(cx).value().to_string();
-        let amount = parse_send_amount(amount_raw.as_str(), asset.decimals).ok()?;
-        let ChainUtxoState::Ready { session, .. } = self.chain_states.get(&asset.chain_id)? else {
-            return None;
+    ) -> Option<PrivateEstimateRequest> {
+        let input = match kind {
+            DeliveryFormKind::Send => {
+                let form = self.send_forms.get(&key)?;
+                if form.generating || form.delivery_mode != DeliveryMode::PublicBroadcaster {
+                    return None;
+                }
+                PrivateEstimateInput {
+                    asset: form.asset.clone(),
+                    recipient: String::new(),
+                    amount: form.amount_input.read(cx).value().to_string(),
+                    broadcaster: form.broadcaster_choice.clone(),
+                    fee_token: form.selected_fee_token,
+                    fee_mode: form.fee_mode,
+                    allow_out_of_range: form.allow_suspicious_broadcasters,
+                    favorites_only: form.favorites_only_broadcasters,
+                    output: PrivateEstimateOutput::Send,
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                let form = self.unshield_forms.get(&key)?;
+                if form.generating || form.delivery_mode != DeliveryMode::PublicBroadcaster {
+                    return None;
+                }
+                PrivateEstimateInput {
+                    asset: form.asset.clone(),
+                    recipient: String::new(),
+                    amount: form.amount_input.read(cx).value().to_string(),
+                    broadcaster: form.broadcaster_choice.clone(),
+                    fee_token: form.selected_fee_token,
+                    fee_mode: form.fee_mode,
+                    allow_out_of_range: form.allow_suspicious_broadcasters,
+                    favorites_only: form.favorites_only_broadcasters,
+                    output: PrivateEstimateOutput::Unshield {
+                        unwrap: form.unwrap,
+                        native_top_up: form
+                            .native_top_up_enabled
+                            .then(|| form.native_top_up.clone())
+                            .flatten(),
+                    },
+                }
+            }
         };
-        let fee_token = form.selected_fee_token;
-        let fee_mode = effective_fee_handling_mode(
-            DeliveryFormKind::Send,
-            asset.token,
-            fee_token,
-            form.fee_mode,
-        );
-        let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
-        let candidates = self.current_public_broadcaster_candidates(
-            asset.chain_id,
-            fee_token,
-            false,
-            false,
-            form.favorites_only_broadcasters,
-            policy,
-        );
-        let selection = Self::public_broadcaster_selection(&form.broadcaster_choice);
-        let trust_filter = self.public_broadcaster_trust_filter(form.favorites_only_broadcasters);
-        if select_public_broadcaster_with_policy_and_trust(
-            &candidates,
-            &selection,
-            policy,
-            &trust_filter,
-        )
-        .is_err()
-        {
-            return None;
-        }
-        let recipient = self
-            .view_session
-            .as_ref()
-            .and_then(|view_session| view_session.receive_address().ok())?;
-
-        Some(DesktopSendPublicBroadcasterEstimateRequest {
-            chain_id: asset.chain_id,
-            effective_chain: self.effective_chain_configs.get(&asset.chain_id).cloned(),
-            session: Arc::clone(session),
-            token: asset.token,
-            fee_token,
-            amount,
-            recipient,
-            fee_rows: self.monitor_fee_rows(),
-            selection,
-            fee_mode,
-            fee_policy: policy,
-            trust_filter,
-            anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
-        })
-    }
-
-    fn broadcaster_picker_unshield_fee_estimate_request(
-        &self,
-        key: UnshieldAssetKey,
-        cx: &Context<'_, Self>,
-    ) -> Option<DesktopUnshieldPublicBroadcasterEstimateRequest> {
-        let form = self.unshield_forms.get(&key)?;
-        if form.generating || form.delivery_mode != DeliveryMode::PublicBroadcaster {
-            return None;
-        }
-        let asset = form.asset.clone();
-        let amount_raw = form.amount_input.read(cx).value().to_string();
-        let amount = parse_unshield_amount(amount_raw.as_str(), asset.decimals).ok()?;
-        let ChainUtxoState::Ready { session, .. } = self.chain_states.get(&asset.chain_id)? else {
-            return None;
-        };
-        let fee_token = form.selected_fee_token;
-        let native_top_up_plan = form
-            .native_top_up_enabled
-            .then(|| form.native_top_up.clone())
-            .flatten();
-        let native_top_up = native_top_up_request_from_plan(native_top_up_plan.as_ref());
-        let fee_mode = effective_fee_handling_mode(
-            DeliveryFormKind::Unshield,
-            asset.token,
-            fee_token,
-            form.fee_mode,
-        );
-        let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
-        let candidates = self.current_public_broadcaster_candidates(
-            asset.chain_id,
-            fee_token,
-            form.unwrap,
-            native_top_up.is_some(),
-            form.favorites_only_broadcasters,
-            policy,
-        );
-        let selection = Self::public_broadcaster_selection(&form.broadcaster_choice);
-        let trust_filter = self.public_broadcaster_trust_filter(form.favorites_only_broadcasters);
-        if select_public_broadcaster_with_policy_and_trust(
-            &candidates,
-            &selection,
-            policy,
-            &trust_filter,
-        )
-        .is_err()
-        {
-            return None;
-        }
-
-        Some(DesktopUnshieldPublicBroadcasterEstimateRequest {
-            chain_id: asset.chain_id,
-            effective_chain: self.effective_chain_configs.get(&asset.chain_id).cloned(),
-            session: Arc::clone(session),
-            token: asset.token,
-            fee_token,
-            amount,
-            recipient: Address::ZERO,
-            unwrap: form.unwrap,
-            native_top_up,
-            fee_rows: self.monitor_fee_rows(),
-            selection,
-            fee_mode,
-            fee_policy: policy,
-            trust_filter,
-            anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
-        })
+        self.prepare_private_picker_estimate(input)
     }
 
     pub(super) fn choose_broadcaster_from_picker(
@@ -1750,52 +1153,13 @@ impl WalletRoot {
             BroadcasterChoice::Specific { railgun_address } => Some(railgun_address.clone()),
             BroadcasterChoice::Random => None,
         };
-        let rows = candidates
-            .iter()
-            .enumerate()
-            .map(|(sort_order, candidate)| {
-                let estimated_fee_amount = broadcaster_candidate_estimated_fee_amount(
-                    candidate,
-                    fee_estimate_context.as_ref(),
-                );
-                let estimated_fee_label = estimated_fee_amount.map_or_else(
-                    || estimated_fee_placeholder.to_string(),
-                    |amount| {
-                        format_estimated_fee_amount(
-                            candidate,
-                            amount,
-                            Some(&self.effective_token_registry),
-                        )
-                    },
-                );
-                let estimated_fee_usd_micro = estimated_fee_amount.and_then(|amount| {
-                    self.public_broadcaster_anchor_cache
-                        .cached_token_usd_micro_value(candidate.chain_id, candidate.token, amount)
-                });
-                let fee_status = broadcaster_picker_fee_status(candidate, policy);
-                let fee_tier = fee_status.tier();
-                BroadcasterPickerRow {
-                    railgun_address: candidate.railgun_address.clone(),
-                    label: broadcaster_candidate_label(candidate),
-                    advertised_fee: candidate.fee,
-                    premium_bps: candidate.fee_policy_status.premium_bps(),
-                    sort_order,
-                    estimated_fee_amount,
-                    estimated_fee_label,
-                    estimated_fee_usd_micro,
-                    estimated_fee_usd_label: estimated_fee_usd_micro.map(format_usd_micro_value),
-                    fee_status,
-                    fee_tier,
-                    show_uncompensated_badge: false,
-                    fee_status_detail: broadcaster_picker_fee_status_detail(candidate, policy),
-                    fee_warning: broadcaster_candidate_fee_warning(candidate),
-                    favorite: self.is_favorite_broadcaster(&candidate.railgun_address),
-                    selected: selected_address.as_deref()
-                        == Some(candidate.railgun_address.as_str()),
-                    child_of: None,
-                }
-            })
-            .collect::<Vec<_>>();
+        let rows = self.private_broadcaster_picker_rows(
+            &candidates,
+            policy,
+            fee_estimate_context.as_ref(),
+            selected_address.as_deref(),
+            estimated_fee_placeholder,
+        );
         let entries = project_broadcaster_picker_entries(
             &rows,
             picker.view_mode,
@@ -1825,36 +1189,6 @@ impl WalletRoot {
     }
 }
 
-pub(super) fn update_broadcaster_picker_group_expansion(
-    expanded_groups: &mut BTreeSet<BroadcasterPickerGroupKey>,
-    collapsed_selected_children: &mut BTreeMap<
-        BroadcasterPickerGroupKey,
-        BroadcasterPickerSelectedCollapse,
-    >,
-    key: BroadcasterPickerGroupKey,
-    currently_expanded: bool,
-    selected_child_address: Option<String>,
-    group_revision: BroadcasterPickerGroupRevision,
-) {
-    if currently_expanded {
-        expanded_groups.remove(&key);
-        if let Some(selected_child_address) = selected_child_address {
-            collapsed_selected_children.insert(
-                key,
-                BroadcasterPickerSelectedCollapse {
-                    selected_address: selected_child_address,
-                    group_revision,
-                },
-            );
-        } else {
-            collapsed_selected_children.remove(&key);
-        }
-    } else {
-        collapsed_selected_children.remove(&key);
-        expanded_groups.insert(key);
-    }
-}
-
 pub(super) fn broadcaster_picker_dialog_vertical_geometry(
     viewport_height: Pixels,
 ) -> (Pixels, Pixels) {
@@ -1873,9 +1207,10 @@ impl ListDelegate for BroadcasterPickerDelegate {
     fn render_item(
         &mut self,
         ix: IndexPath,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<Self::Item> {
+        let entry_height = window.rem_size() * 5.25;
         let show_section_divider =
             broadcaster_picker_section_divider_before(&self.entries, self.view_mode, ix.row);
         let entry = self.entries.get(ix.row)?.clone();
@@ -1887,14 +1222,14 @@ impl ListDelegate for BroadcasterPickerDelegate {
                 ListItem::new(SharedString::from(broadcaster_picker_group_element_id(
                     group.key,
                 )))
-                .h(BROADCASTER_PICKER_ENTRY_HEIGHT)
+                .h(entry_height)
                 .px(px(0.0))
                 .py(px(0.0))
-                .disabled(true)
+                .disabled(self.generating)
                 .child(render_broadcaster_picker_entry_content(
                     render_broadcaster_picker_group(&group, root, self.generating),
                     show_section_divider,
-                    BROADCASTER_PICKER_ENTRY_HEIGHT,
+                    entry_height,
                     BROADCASTER_PICKER_SECTION_DIVIDER_INSET,
                 )),
             ),
@@ -1906,7 +1241,7 @@ impl ListDelegate for BroadcasterPickerDelegate {
                         "broadcaster-picker-list-row-{}",
                         stable_broadcaster_element_suffix(&row.railgun_address)
                     )))
-                    .h(BROADCASTER_PICKER_ENTRY_HEIGHT)
+                    .h(entry_height)
                     .px(BROADCASTER_PICKER_ROW_HORIZONTAL_PADDING)
                     .py(px(0.0))
                     .rounded_md()
@@ -1931,9 +1266,9 @@ impl ListDelegate for BroadcasterPickerDelegate {
                         });
                     })
                     .child(render_broadcaster_picker_entry_content(
-                        render_broadcaster_picker_row(&row),
+                        render_broadcaster_picker_row(&row, BroadcasterPickerLayout::Standard),
                         show_section_divider,
-                        BROADCASTER_PICKER_ENTRY_HEIGHT,
+                        entry_height,
                         px(0.0),
                     )),
                 )
@@ -1957,10 +1292,43 @@ impl ListDelegate for BroadcasterPickerDelegate {
 
     fn set_selected_index(
         &mut self,
-        _ix: Option<IndexPath>,
+        ix: Option<IndexPath>,
         _window: &mut Window,
         _cx: &mut Context<'_, ListState<Self>>,
     ) {
+        self.selected_index = ix;
+    }
+
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) {
+        if self.generating {
+            return;
+        }
+        let Some(entry) = self
+            .selected_index
+            .and_then(|ix| self.entries.get(ix.row))
+            .cloned()
+        else {
+            return;
+        };
+        let kind = self.kind;
+        let key = self.key;
+        let _ = self.root.update(cx, |root, cx| match entry {
+            BroadcasterPickerEntry::Broadcaster(row) => {
+                root.choose_broadcaster_from_picker(kind, key, row.railgun_address, window, cx);
+            }
+            BroadcasterPickerEntry::Group(group) => root.toggle_broadcaster_picker_group(
+                group.key,
+                group.expanded,
+                group.selected_child_address,
+                group.revision,
+                cx,
+            ),
+        });
     }
 }
 
@@ -2099,191 +1467,6 @@ pub(super) fn broadcaster_candidate_matches_query(
             .contains(query)
 }
 
-pub(super) fn render_broadcaster_picker_header(
-    root: &Entity<WalletRoot>,
-    query_input: &Entity<InputState>,
-    filtered_count: usize,
-    total_count: usize,
-    fee_status_popover_open: bool,
-) -> gpui::Div {
-    let broadcaster_header = if filtered_count == total_count {
-        format!("Broadcaster ({total_count})")
-    } else {
-        format!("Broadcaster ({filtered_count} of {total_count})")
-    };
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .px(BROADCASTER_PICKER_HEADER_HORIZONTAL_PADDING)
-        .pt(BROADCASTER_PICKER_HEADER_TOP_PADDING)
-        .text_size(px(11.0))
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(
-            div()
-                .flex_1()
-                .min_w(BROADCASTER_PICKER_PRIMARY_MIN_WIDTH)
-                .truncate()
-                .child(broadcaster_header),
-        )
-        .child(
-            div()
-                .flex_shrink(1.0)
-                .min_w(px(0.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .w(BROADCASTER_PICKER_FEE_WIDTH)
-                        .flex_shrink(1.0)
-                        .min_w(px(0.0))
-                        .truncate()
-                        .child("Est. tx fee"),
-                )
-                .child(
-                    div()
-                        .w(BROADCASTER_PICKER_STATUS_WIDTH)
-                        .flex_shrink(1.0)
-                        .min_w(px(0.0))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().flex_1().min_w(px(0.0)).truncate().child("Fee status"))
-                        .child({
-                            let popover_root = root.clone();
-                            let focus_query_input = query_input.clone();
-                            let tooltip_enabled = !fee_status_popover_open;
-                            Popover::new("broadcaster-picker-fee-status-popover")
-                                .open(fee_status_popover_open)
-                                .on_open_change(move |open, window, cx| {
-                                    popover_root.update(cx, |root, cx| {
-                                        root.set_broadcaster_picker_fee_status_popover_open(
-                                            *open, cx,
-                                        );
-                                    });
-                                    if !*open {
-                                        focus_query_input
-                                            .read(cx)
-                                            .focus_handle(cx)
-                                            .focus(window, cx);
-                                    }
-                                })
-                                .trigger(
-                                    Button::new("broadcaster-picker-fee-status-trigger")
-                                        .text()
-                                        .xsmall()
-                                        .compact()
-                                        .child(render_fee_status_info_icon(tooltip_enabled)),
-                                )
-                                .content(|_state, _window, _cx| render_fee_status_popover())
-                        }),
-                ),
-        )
-}
-
-fn render_fee_status_info_icon(tooltip_enabled: bool) -> impl IntoElement {
-    div()
-        .id("broadcaster-picker-fee-status-info")
-        .size(px(14.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::WARNING))
-        .text_color(rgb(theme::WARNING))
-        .text_size(px(9.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-        .child("i")
-        .when(tooltip_enabled, |this| {
-            this.tooltip(|window, cx| {
-                Tooltip::element(|_window, _cx| render_fee_status_popover()).build(window, cx)
-            })
-        })
-}
-
-fn render_fee_status_popover() -> gpui::Div {
-    div()
-        .w(px(360.0))
-        .p(px(12.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .text_size(px(12.0))
-        .text_color(rgb(theme::TEXT))
-        .child(
-            div()
-                .text_color(rgb(theme::WARNING))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child("Fee status"),
-        )
-        .child(div().child(
-            "Est. tx fee includes gas cost and the broadcaster's fee.",
-        ))
-        .child(div().child(
-            "Incentivised broadcasters charge more than gas cost, so submitting earns them something.",
-        ))
-}
-
-fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
-    div()
-        .w_full()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .text_size(APP_TEXT_SIZE)
-        .child(
-            div()
-                .flex_1()
-                .min_w(BROADCASTER_PICKER_PRIMARY_MIN_WIDTH)
-                .when(row.child_of.is_some(), |this| {
-                    this.pl(
-                        BROADCASTER_PICKER_GROUP_TOGGLE_SIZE + BROADCASTER_PICKER_GROUP_PRIMARY_GAP
-                    )
-                })
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .text_color(rgb(if row.fee_tier.is_muted() {
-                    theme::TEXT_SUBTLE
-                } else {
-                    theme::TEXT
-                }))
-                .font_family(APP_MONO_FONT_FAMILY)
-                .font_weight(if row.fee_tier.is_muted() {
-                    gpui::FontWeight::NORMAL
-                } else {
-                    gpui::FontWeight::SEMIBOLD
-                })
-                .child(div().min_w(px(0.0)).truncate().child(row.label.clone()))
-                .children(row.favorite.then(|| {
-                    div()
-                        .flex_shrink(1.0)
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme::WARNING))
-                        .child(Icon::new(IconName::Star).with_size(px(13.0)))
-                })),
-        )
-        .child(
-            div()
-                .flex_shrink(1.0)
-                .min_w(px(0.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(render_broadcaster_picker_fee_cell(row))
-                .child(render_broadcaster_picker_status_cell(row)),
-        )
-}
-
 fn render_broadcaster_picker_section_divider(inset: Pixels) -> impl IntoElement {
     Separator::horizontal()
         .absolute()
@@ -2310,373 +1493,6 @@ fn render_broadcaster_picker_entry_content(
             this.child(render_broadcaster_picker_section_divider(divider_inset))
         })
         .child(content)
-}
-
-fn render_broadcaster_picker_fee_cell(row: &BroadcasterPickerRow) -> impl IntoElement {
-    render_broadcaster_picker_estimated_fee_cell(
-        &row.estimated_fee_label,
-        row.estimated_fee_usd_label.as_deref(),
-        row.fee_tier.is_muted(),
-    )
-}
-
-fn render_broadcaster_picker_estimated_fee_cell(
-    token_label: &str,
-    usd_label: Option<&str>,
-    muted: bool,
-) -> impl IntoElement {
-    let token_label = token_label.to_string();
-    let usd_label = usd_label.map(str::to_string);
-    let (primary_color, secondary_color) = broadcaster_picker_fee_text_colors(muted);
-    div()
-        .w(BROADCASTER_PICKER_FEE_WIDTH)
-        .flex_shrink(1.0)
-        .min_w(px(0.0))
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .gap(px(1.0))
-        .child(
-            div()
-                .w_full()
-                .whitespace_nowrap()
-                .text_color(rgb(primary_color))
-                .font_weight(if muted {
-                    gpui::FontWeight::NORMAL
-                } else {
-                    gpui::FontWeight::SEMIBOLD
-                })
-                .child(usd_label.clone().unwrap_or_else(|| token_label.clone())),
-        )
-        .children(usd_label.as_ref().map(|_| {
-            div()
-                .w_full()
-                .whitespace_nowrap()
-                .text_color(rgb(secondary_color))
-                .text_size(px(11.0))
-                .child(token_label)
-        }))
-}
-
-fn render_broadcaster_picker_status_cell(row: &BroadcasterPickerRow) -> gpui::Div {
-    let id = format!(
-        "broadcaster-picker-status-{}",
-        stable_broadcaster_element_suffix(&row.railgun_address)
-    );
-    render_broadcaster_picker_tier_cell(
-        id,
-        row.fee_tier,
-        row.show_uncompensated_badge,
-        SharedString::from(row.fee_status_detail.clone()),
-    )
-}
-
-fn render_broadcaster_picker_group(
-    group: &BroadcasterPickerGroup,
-    root: WeakEntity<WalletRoot>,
-    disabled: bool,
-) -> impl IntoElement {
-    let group_key = group.key;
-    let expanded = group.expanded;
-    let selected_child_address = group.selected_child_address.clone();
-    let group_revision = group.revision.clone();
-    let uncompensated_detail = SharedString::from(group.detail.clone());
-    div()
-        .id(SharedString::from(format!(
-            "{}-card",
-            broadcaster_picker_group_element_id(group.key)
-        )))
-        .w_full()
-        .h(BROADCASTER_PICKER_ENTRY_HEIGHT - px(4.0))
-        .px(BROADCASTER_PICKER_ROW_HORIZONTAL_PADDING)
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::SURFACE))
-        .text_size(APP_TEXT_SIZE)
-        .when(
-            group.fee_tier == BroadcasterPickerTier::Uncompensated,
-            move |this| {
-                let detail = uncompensated_detail;
-                this.tooltip(move |window, cx| {
-                    let Some(width) = broadcaster_picker_status_tooltip_width(
-                        window.viewport_size().width,
-                        window.rem_size(),
-                    ) else {
-                        return Tooltip::element(|_window, _cx| div())
-                            .m(px(0.0))
-                            .p(px(0.0))
-                            .border_0()
-                            .build(window, cx);
-                    };
-                    let detail = detail.clone();
-                    Tooltip::element(move |_window, _cx| {
-                        render_broadcaster_picker_group_detail_tooltip(detail.clone(), width)
-                    })
-                    .build(window, cx)
-                })
-            },
-        )
-        .when(!disabled, |this| {
-            this.cursor_pointer()
-                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = root.update(cx, |root, cx| {
-                        root.toggle_broadcaster_picker_group(
-                            group_key,
-                            expanded,
-                            selected_child_address.clone(),
-                            group_revision.clone(),
-                            cx,
-                        );
-                    });
-                })
-        })
-        .child(
-            div()
-                .flex_1()
-                .min_w(BROADCASTER_PICKER_PRIMARY_MIN_WIDTH)
-                .flex()
-                .items_center()
-                .gap(BROADCASTER_PICKER_GROUP_PRIMARY_GAP)
-                .child(
-                    div()
-                        .size(BROADCASTER_PICKER_GROUP_TOGGLE_SIZE)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(theme::BORDER))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(
-                            Icon::new(if group.expanded {
-                                IconName::Minus
-                            } else {
-                                IconName::Plus
-                            })
-                            .with_size(px(12.0)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .font_weight(if group.fee_tier.is_muted() {
-                            gpui::FontWeight::NORMAL
-                        } else {
-                            gpui::FontWeight::SEMIBOLD
-                        })
-                        .text_color(rgb(if group.fee_tier.is_muted() {
-                            theme::TEXT_SUBTLE
-                        } else {
-                            theme::TEXT
-                        }))
-                        .child(group.label.clone()),
-                ),
-        )
-        .child(
-            div()
-                .flex_shrink(1.0)
-                .min_w(px(0.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(render_broadcaster_picker_estimated_fee_cell(
-                    &group.estimated_fee_label,
-                    group.estimated_fee_usd_label.as_deref(),
-                    group.fee_tier.is_muted(),
-                ))
-                .child(render_broadcaster_picker_tier_cell(
-                    broadcaster_picker_group_element_id(group.key),
-                    group.fee_tier,
-                    false,
-                    SharedString::from(group.detail.clone()),
-                )),
-        )
-}
-
-fn render_broadcaster_picker_tier_cell(
-    id: impl AsRef<str>,
-    tier: BroadcasterPickerTier,
-    show_uncompensated_badge: bool,
-    detail: SharedString,
-) -> gpui::Div {
-    div()
-        .w(BROADCASTER_PICKER_STATUS_WIDTH)
-        .flex_shrink(1.0)
-        .children(
-            tier.badge_label(show_uncompensated_badge)
-                .map(|label| render_broadcaster_picker_status_badge(id, tier, label, detail)),
-        )
-}
-
-fn render_broadcaster_picker_status_badge(
-    id: impl AsRef<str>,
-    tier: BroadcasterPickerTier,
-    label: &'static str,
-    detail: SharedString,
-) -> impl IntoElement {
-    let color = status_tier_color(tier);
-    let tooltip_revision = broadcaster_picker_status_tooltip_revision(tier, &detail);
-    let tooltip_detail = detail;
-    div()
-        .id(SharedString::from(format!(
-            "{}-badge-{tooltip_revision:016x}",
-            id.as_ref()
-        )))
-        .w(BROADCASTER_PICKER_STATUS_WIDTH)
-        .flex_shrink(1.0)
-        .flex()
-        .overflow_hidden()
-        .items_center()
-        .px(px(6.0))
-        .py(px(4.0))
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(color))
-        .text_color(rgb(color))
-        .text_size(px(10.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .tooltip(move |window, cx| {
-            let Some(tooltip_width) = broadcaster_picker_status_tooltip_width(
-                window.viewport_size().width,
-                window.rem_size(),
-            ) else {
-                return Tooltip::element(|_window, _cx| div())
-                    .m(px(0.0))
-                    .p(px(0.0))
-                    .border_0()
-                    .build(window, cx);
-            };
-            let tooltip_detail = tooltip_detail.clone();
-            Tooltip::element(move |_window, _cx| {
-                render_broadcaster_picker_status_tooltip(
-                    tier,
-                    label,
-                    tooltip_detail.clone(),
-                    tooltip_width,
-                )
-            })
-            .build(window, cx)
-        })
-        .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
-}
-
-fn render_broadcaster_picker_status_tooltip(
-    tier: BroadcasterPickerTier,
-    label: &'static str,
-    detail: SharedString,
-    width: Pixels,
-) -> gpui::Div {
-    let color = status_tier_color(tier);
-    div()
-        .w(width)
-        .py(px(2.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().size(px(7.0)).rounded_full().bg(rgb(color)))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(color))
-                        .child(label),
-                ),
-        )
-        .child(
-            Separator::horizontal()
-                .color(rgb(theme::BORDER_SUBTLE))
-                .my(px(1.0)),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .whitespace_normal()
-                .text_size(px(12.0))
-                .line_height(px(18.0))
-                .text_color(rgb(theme::TEXT))
-                .child(detail),
-        )
-}
-
-fn render_broadcaster_picker_group_detail_tooltip(
-    detail: SharedString,
-    width: Pixels,
-) -> gpui::Div {
-    div()
-        .w(width)
-        .whitespace_normal()
-        .text_size(px(12.0))
-        .line_height(px(18.0))
-        .text_color(rgb(theme::TEXT))
-        .child(detail)
-}
-
-pub(super) fn broadcaster_picker_status_tooltip_width(
-    viewport_width: Pixels,
-    rem_size: Pixels,
-) -> Option<Pixels> {
-    let tooltip_chrome = rem_size * 2.5 + px(2.0);
-    let available_width = viewport_width - tooltip_chrome;
-    (available_width > px(0.0))
-        .then(|| available_width.min(BROADCASTER_PICKER_STATUS_TOOLTIP_WIDTH))
-}
-
-pub(super) fn broadcaster_picker_status_tooltip_revision(
-    tier: BroadcasterPickerTier,
-    detail: &str,
-) -> u64 {
-    let mut revision = 0xcbf29ce484222325_u64;
-    for byte in tier.label().bytes().chain(detail.bytes()) {
-        revision ^= u64::from(byte);
-        revision = revision.wrapping_mul(0x100000001b3);
-    }
-    revision
-}
-
-const fn status_tier_color(tier: BroadcasterPickerTier) -> u32 {
-    match tier {
-        BroadcasterPickerTier::Incentivised => theme::SUCCESS,
-        BroadcasterPickerTier::Uncompensated | BroadcasterPickerTier::NotAssessed => {
-            theme::TEXT_MUTED
-        }
-        BroadcasterPickerTier::OutsideRange => theme::DANGER,
-    }
-}
-
-pub(super) const fn broadcaster_picker_fee_text_colors(muted: bool) -> (u32, u32) {
-    if muted {
-        (theme::TEXT_MUTED, theme::TEXT_SUBTLE)
-    } else {
-        (theme::TEXT, theme::TEXT_MUTED)
-    }
-}
-
-fn broadcaster_picker_group_element_id(key: BroadcasterPickerGroupKey) -> String {
-    match key {
-        BroadcasterPickerGroupKey::Tier(tier) => {
-            format!(
-                "broadcaster-picker-group-tier-{}",
-                tier.label().to_ascii_lowercase().replace(' ', "-")
-            )
-        }
-        BroadcasterPickerGroupKey::Status(status) => {
-            format!("broadcaster-picker-group-status-{}", status.key())
-        }
-    }
 }
 
 pub(super) fn broadcaster_choice_supported_by_candidates(
@@ -2709,4 +1525,106 @@ pub(super) fn should_preserve_estimate_after_broadcaster_policy_change(
             .iter()
             .any(|candidate| candidate.railgun_address == railgun_address)
     })
+}
+
+fn render_broadcaster_picker_group(
+    group: &BroadcasterPickerGroup,
+    root: WeakEntity<WalletRoot>,
+    disabled: bool,
+) -> impl IntoElement {
+    let group = group.clone();
+    let command = group.clone();
+    ui::broadcaster_picker::render_broadcaster_picker_group(
+        group,
+        BroadcasterPickerLayout::Standard,
+        move |_, cx| {
+            let _ = root.update(cx, |root, cx| {
+                root.toggle_broadcaster_picker_group(
+                    command.key,
+                    command.expanded,
+                    command.selected_child_address.clone(),
+                    command.revision.clone(),
+                    cx,
+                );
+            });
+        },
+        disabled,
+    )
+}
+
+pub(super) fn render_broadcaster_picker_header(
+    root: &Entity<WalletRoot>,
+    query_input: &Entity<InputState>,
+    filtered_count: usize,
+    total_count: usize,
+    fee_status_popover_open: bool,
+) -> gpui::Div {
+    let root = root.clone();
+    ui::broadcaster_picker::render_broadcaster_picker_header(
+        BroadcasterPickerLayout::Standard,
+        query_input,
+        filtered_count,
+        total_count,
+        fee_status_popover_open,
+        move |open, cx| {
+            root.update(cx, |root, cx| {
+                root.set_broadcaster_picker_fee_status_popover_open(open, cx);
+            });
+        },
+    )
+}
+
+impl WalletRoot {
+    pub(in crate::root) fn private_broadcaster_picker_rows(
+        &self,
+        candidates: &[PublicBroadcasterCandidate],
+        policy: BroadcasterFeePolicy,
+        fee_estimate_context: Option<&BroadcasterPickerFeeEstimateContext>,
+        selected_address: Option<&str>,
+        estimated_fee_placeholder: &str,
+    ) -> Vec<BroadcasterPickerRow> {
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(sort_order, candidate)| {
+                let estimated_fee_amount =
+                    broadcaster_candidate_estimated_fee_amount(candidate, fee_estimate_context);
+                let estimated_fee_label = estimated_fee_amount.map_or_else(
+                    || estimated_fee_placeholder.to_string(),
+                    |amount| {
+                        format_estimated_fee_amount(
+                            candidate,
+                            amount,
+                            Some(&self.effective_token_registry),
+                        )
+                    },
+                );
+                let estimated_fee_usd_micro = estimated_fee_amount.and_then(|amount| {
+                    self.public_broadcaster_anchor_cache
+                        .cached_token_usd_micro_value(candidate.chain_id, candidate.token, amount)
+                });
+                let fee_status = broadcaster_picker_fee_status(candidate, policy);
+                let fee_tier = fee_status.tier();
+                BroadcasterPickerRow {
+                    railgun_address: candidate.railgun_address.clone(),
+                    label: broadcaster_candidate_label(candidate),
+                    advertised_fee: candidate.fee,
+                    premium_bps: candidate.fee_policy_status.premium_bps(),
+                    sort_order,
+                    estimated_fee_amount,
+                    estimated_fee_label,
+                    estimated_fee_usd_micro,
+                    estimated_fee_usd_label: estimated_fee_usd_micro.map(format_usd_micro_value),
+                    fee_status,
+                    fee_tier,
+                    show_uncompensated_badge: false,
+                    fee_status_detail: broadcaster_picker_fee_status_detail(candidate, policy),
+                    fee_warning: broadcaster_candidate_fee_warning(candidate),
+                    favorite: self.is_favorite_broadcaster(&candidate.railgun_address),
+                    selected: selected_address == Some(candidate.railgun_address.as_str()),
+                    child_of: None,
+                }
+            })
+            .collect::<Vec<_>>()
+    }
 }

@@ -13,7 +13,8 @@ use super::types::{
     SelfBroadcastGasRetryKind,
 };
 use crate::root::public_action::{
-    ProgressFooterAction, PublicActionStepStatus, progress_footer_action,
+    ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
+    progress_dialog_close_behavior, progress_footer_action,
 };
 use crate::root::{DeliveryFormKind, UnshieldAssetKey};
 
@@ -177,6 +178,19 @@ pub(in crate::root) fn private_broadcaster_progress_footer_action(
     progress_footer_action(
         private_broadcaster_progress_stop_available(progress, Instant::now()),
         private_broadcaster_progress_is_terminal(progress),
+    )
+}
+
+pub(in crate::root) fn private_broadcaster_progress_dialog_close_behavior(
+    progress: &PrivateBroadcasterProgressState,
+) -> ProgressDialogCloseBehavior {
+    if progress.gateway_execution.is_some() && private_broadcaster_progress_is_terminal(progress) {
+        // Extension submissions have no desktop form to return to after closing their result.
+        return ProgressDialogCloseBehavior::AllAndClear;
+    }
+    progress_dialog_close_behavior(
+        private_broadcaster_progress_is_successful(progress),
+        progress.stopped,
     )
 }
 
