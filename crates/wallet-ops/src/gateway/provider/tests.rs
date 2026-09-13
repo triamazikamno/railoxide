@@ -685,6 +685,49 @@ fn public_view_commands_preserve_selection_and_scope_permission_edits_to_the_pee
             .public_command(1, peer, 2, private_create())
             .is_some()
     );
+    let self_create = || {
+        let input = crate::gateway::GatewayPrivateDraftInput {
+            delivery: crate::gateway::GatewayPrivateDelivery::SelfBroadcast {
+                delivery: crate::gateway::GatewayPrivateSelfBroadcastInput::SelfBroadcast {
+                    signer: None,
+                    funding: crate::gateway::GatewayPrivateFunding::PublicBalance {},
+                    fee: crate::gateway::GatewayPrivateGasFee::Auto {},
+                },
+            },
+            ..Default::default()
+        };
+        GatewayPublicCommand::Draft {
+            command: Box::new(crate::gateway::GatewayDraftCommand::Create {
+                request_id: "self".into(),
+                input: crate::gateway::GatewayDraftPayload::Private(input),
+            }),
+        }
+    };
+    assert!(provider.public_command(1, peer, 2, self_create()).is_none());
+    let mut supported = provider.wallet.clone();
+    supported.private_self_broadcast_supported = true;
+    provider.update_wallet(supported, 2);
+    assert!(provider.public_command(1, peer, 2, self_create()).is_some());
+    assert!(provider.public_command(1, peer, 1, self_create()).is_none());
+    assert!(
+        provider
+            .public_command(1, other_peer, 2, self_create())
+            .is_none()
+    );
+    assert!(provider.public_command(2, peer, 2, self_create()).is_none());
+    let mut unsupported = provider.wallet.clone();
+    unsupported.private_self_broadcast_supported = false;
+    provider
+        .authority_fallback
+        .as_ref()
+        .unwrap()
+        .send_replace(unsupported);
+    assert!(provider.public_command(1, peer, 2, self_create()).is_none());
+    assert!(
+        provider
+            .public_command(1, peer, 2, private_create())
+            .is_some()
+    );
     let mut unsupported = provider.wallet.clone();
     unsupported.private_actions_supported = false;
     provider

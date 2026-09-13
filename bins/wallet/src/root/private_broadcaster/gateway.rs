@@ -5,6 +5,44 @@ use wallet_ops::gateway::{
     GatewayPrivateDraftControl, GatewayPrivateDraftResult,
 };
 
+pub(in crate::root) fn gateway_self_broadcast_result(
+    progress: &PrivateBroadcasterProgressState,
+) -> Option<(GatewayPrivateDraftResult, Option<String>)> {
+    if let Some(outcome) = &progress.sponsored_self_broadcast_outcome {
+        return Some(match outcome {
+            SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt) => (
+                if receipt.status {
+                    GatewayPrivateDraftResult::Confirmed
+                } else {
+                    GatewayPrivateDraftResult::Reverted
+                },
+                Some(receipt.tx_hash.clone()),
+            ),
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                bundle_was_accepted,
+                ..
+            } => (
+                if *bundle_was_accepted {
+                    GatewayPrivateDraftResult::InclusionUnknown
+                } else {
+                    GatewayPrivateDraftResult::Stopped
+                },
+                None,
+            ),
+        });
+    }
+    progress.self_broadcast_result.as_ref().map(|result| {
+        (
+            match result.tx.receipt() {
+                Some(receipt) if receipt.status => GatewayPrivateDraftResult::Confirmed,
+                Some(_) => GatewayPrivateDraftResult::Reverted,
+                None => GatewayPrivateDraftResult::InclusionUnknown,
+            },
+            Some(result.tx.tx_hash().to_owned()),
+        )
+    })
+}
+
 impl WalletRoot {
     pub(in crate::root) fn publish_gateway_private_progress(&self) {
         let Some(progress) = &self.private_broadcaster_progress else {
@@ -17,7 +55,10 @@ impl WalletRoot {
             return;
         };
         let terminal = private_broadcaster_progress_is_terminal(progress);
-        projection.stop = !terminal && progress.stop_available;
+        projection.stop = private_broadcaster_progress_footer_action(progress)
+            == ProgressFooterAction::Stop
+            && progress.stop_available;
+        projection.stop_retries = projection.stop && progress.sponsored_funding;
         projection.stop_waiting = !terminal
             && !progress.stop_available
             && public_broadcaster_waiting_can_stop(progress, Instant::now());
@@ -50,6 +91,21 @@ impl WalletRoot {
                     wire
                 })
                 .collect();
+        }
+        if progress.flow == PrivateSubmissionProgressFlow::SelfBroadcast {
+            projection.context = self_broadcast_progress_context_rows(progress)
+                .into_iter()
+                .map(|row| {
+                    let mut wire = GatewayPrivateDisplayRow::default();
+                    wire.label = row.label;
+                    wire.value = row.value;
+                    wire.suffix = row.suffix;
+                    wire
+                })
+                .collect();
+            if let Some(attempt) = progress.self_broadcast_attempts.last() {
+                projection.transaction_hash = Some(attempt.tx_hash.clone());
+            }
         }
         let mut status = GatewayDraftStatus::InProgress;
         let mut label = "Preparing transaction".to_owned();
@@ -97,6 +153,17 @@ impl WalletRoot {
                     message = "No broadcaster response. The transaction may still be submitted; check history before creating another transaction.".into();
                 }
             }
+        } else if let Some((result, hash)) = gateway_self_broadcast_result(progress) {
+            projection.result = Some(result);
+            if hash.is_some() {
+                projection.transaction_hash = hash;
+            }
+            (status, label, message) = match result {
+                GatewayPrivateDraftResult::Confirmed => (GatewayDraftStatus::Done, "Confirmed".into(), "The transaction was confirmed on chain.".into()),
+                GatewayPrivateDraftResult::Reverted => (GatewayDraftStatus::Failed, "Reverted".into(), "The transaction reverted on chain. Check the desktop history for details.".into()),
+                GatewayPrivateDraftResult::InclusionUnknown => (GatewayDraftStatus::Failed, "Inclusion unknown".into(), "The transaction may still be included. Its private inputs remain reserved; check history before creating another transaction.".into()),
+                _ => (GatewayDraftStatus::Failed, "Stopped".into(), "Local processing stopped before a relay accepted the bundle.".into()),
+            };
         } else if progress.stopped {
             projection.result = Some(GatewayPrivateDraftResult::Stopped);
             status = GatewayDraftStatus::Failed;
@@ -107,12 +174,21 @@ impl WalletRoot {
             status = GatewayDraftStatus::Failed;
             label = "Failed".into();
             message = error.to_string();
-        } else if let Some(result) = &progress.self_broadcast_result {
-            projection.transaction_hash = Some(result.tx.tx_hash().to_owned());
-            projection.result = Some(GatewayPrivateDraftResult::Submitted);
-            status = GatewayDraftStatus::Done;
-            label = "Submitted".into();
-            message = "Check the desktop app for transaction receipt details.".into();
+        } else if progress::private_self_broadcast_requires_attention(progress) {
+            status = GatewayDraftStatus::Attention;
+            label = "Review gas in the desktop app".into();
+            progress
+                .self_broadcast_action_error
+                .as_deref()
+                .or_else(|| {
+                    progress
+                        .steps
+                        .iter()
+                        .find(|step| step.status == PublicActionStepStatus::Error)
+                        .and_then(|step| step.message.as_deref())
+                })
+                .unwrap_or("This transaction step needs attention in the desktop app.")
+                .clone_into(&mut message);
         }
         projection.favorite = projection.result == Some(GatewayPrivateDraftResult::Submitted)
             && address.is_some_and(|address| {
@@ -122,7 +198,7 @@ impl WalletRoot {
             status,
             label,
             message,
-            status == GatewayDraftStatus::Failed,
+            status == GatewayDraftStatus::Failed || status == GatewayDraftStatus::Attention,
             projection,
         );
     }

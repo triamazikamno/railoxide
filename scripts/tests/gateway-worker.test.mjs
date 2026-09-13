@@ -1173,6 +1173,74 @@ test('private drafts admit only current UI inputs and execution controls and pur
   assert.equal(JSON.stringify(h.ui().port.messages[0]).includes('synthetic-broadcaster'), false);
 });
 
+test('private self-broadcast forwards only scoped delivery inputs and retires them on lock', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const ui = h.ui();
+  const input = { wallet: 'private-wallet', chain_id: 1, kind: 'unshield', asset: 'token', amount: '1', max: false,
+    recipient: 'synthetic-recipient', address_book_entry: null, fee_mode: 'deduct', unwrap: false, native_top_up: false,
+    delivery: { mode: 'self_broadcast', signer: 'synthetic-signer', funding: { mode: 'sponsorship', incentive: { mode: 'custom', percent: '7' } },
+      fee: { mode: 'custom', max_fee_gwei: '2.125', priority_fee_gwei: '0.1' } } };
+  const draft = { draft_id: 'self-draft', revision: 2, input, status: 'ready' };
+  const snapshot = (supported, current = draft) => session.send({ type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+    accounts: [], pending_connects: [], pending_requests: [], private_view_supported: true, private_actions_supported: true,
+    private_self_broadcast_supported: supported, private_view: { selected_wallet: input.wallet, selected_chain: 1 },
+    public_view: { drafts: [current] } });
+  const sent = () => session.socket.sent.map(bytes => {
+    try { return JSON.parse(new TextDecoder().decode(Uint8Array.from(bytes))); } catch { return null; }
+  }).filter(message => message?.type === 'public_view');
+  const command = (command, generation = 1) => ui.request({ type: 'public_view', generation, command: { type: 'draft', command } });
+  await snapshot(false);
+  command({ action: 'create', request_id: 'self-create', input });
+  command({ action: 'submit', draft_id: draft.draft_id, revision: 2 });
+  assert.equal(sent().length, 0, 'older desktops cannot admit self-broadcast');
+  await snapshot(true);
+  const invalid = [
+    { ...input, fee_token: 'token' }, { ...input, broadcaster: { mode: 'random' } },
+    { ...input, allow_out_of_range: false }, { ...input, favorites_only: false },
+    { ...input, wallet: 'other-wallet' }, { ...input, chain_id: 10 },
+  ];
+  for (const path of [[], ['delivery'], ['delivery', 'fee'], ['delivery', 'funding'], ['delivery', 'funding', 'incentive']]) {
+    const altered = structuredClone(input);
+    let target = altered;
+    for (const key of path) target = target[key];
+    target.rpc_url = 'never-forward';
+    invalid.push(altered);
+  }
+  for (const funding of [{ mode: 'public_balance', incentive: { mode: 'standard' } },
+    { mode: 'sponsorship', incentive: { mode: 'standard', percent: '7' } }]) {
+    invalid.push({ ...input, delivery: { ...input.delivery, funding } });
+  }
+  invalid.push({ ...input, delivery: { ...input.delivery, fee: { mode: 'auto', max_fee_gwei: '2' } } });
+  for (const altered of invalid) command({ action: 'create', request_id: 'rejected', input: altered });
+  command({ action: 'update', draft_id: draft.draft_id, revision: 2, input });
+  command({ action: 'submit', draft_id: draft.draft_id, revision: 1 });
+  command({ action: 'create', request_id: 'stale', input }, 0);
+  command({ action: 'private_picker', draft_id: draft.draft_id, revision: 2, view_id: 'invalid', open: true, query: '' });
+  assert.equal(sent().length, 0);
+  command({ action: 'create', request_id: 'self-create', input });
+  assert.deepEqual(sent().at(-1).command.command.input, input);
+  const publicBalance = { ...input, delivery: { mode: 'self_broadcast', signer: null, funding: { mode: 'public_balance' }, fee: { mode: 'auto' } } };
+  command({ action: 'update', draft_id: draft.draft_id, revision: 3, input: publicBalance });
+  assert.deepEqual(sent().at(-1).command.command.input, publicBalance);
+  const page = h.provider(); await flush();
+  page.request({ id: 'self-draft', method: 'public_view', params: { type: 'draft', command: { action: 'create', request_id: 'page', input } } });
+  await flush();
+  assert.equal(sent().length, 2, 'webpages cannot enter the private flow');
+  const execution = { execution_id: 'owned-execution', stop: true, stop_retries: true };
+  await snapshot(true, { ...draft, status: 'in_progress', private_progress: execution });
+  command({ action: 'update', draft_id: draft.draft_id, revision: 3, input: publicBalance });
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: 'stale', control: 'stop' });
+  assert.equal(sent().length, 2);
+  command({ action: 'private_control', draft_id: draft.draft_id, execution_id: execution.execution_id, control: 'stop' });
+  assert.equal(sent().at(-1).command.command.control, 'stop', 'Stop retries delegates the native Stop command');
+  await session.send({ type: 'state', version: 1, generation: 2, locked: true });
+  command({ action: 'submit', draft_id: draft.draft_id, revision: 2 });
+  assert.equal(sent().length, 3);
+  assert.ok(!h.ui().port.messages[0].public_view?.drafts?.length);
+  assert.equal(JSON.stringify(h.data).includes(input.delivery.signer), false);
+});
+
 test('private wallet commands and last-tab navigation stay within the live UI session', async () => {
   const h = await worker({ gatewayCredential: credential() });
   const session = await established(h);

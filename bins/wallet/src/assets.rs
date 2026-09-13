@@ -309,7 +309,6 @@ fn append_embedded_asset_list<T: RustEmbed>(
 pub(crate) enum RailgunActionIcon {
     Send,
     Shield,
-    Dices,
     Square,
     SquareAsterisk,
     Pencil,
@@ -330,7 +329,6 @@ impl IconNamed for RailgunActionIcon {
         match self {
             Self::Send => ARROW_BIG_RIGHT_DASH_ICON_PATH,
             Self::Shield => SHIELD_ICON_PATH,
-            Self::Dices => DICES_ICON_PATH,
             Self::Square => SQUARE_ICON_PATH,
             Self::SquareAsterisk => SQUARE_ASTERISK_ICON_PATH,
             Self::Pencil => PENCIL_ICON_PATH,

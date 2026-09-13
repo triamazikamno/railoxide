@@ -1,14 +1,18 @@
 use super::*;
 use crate::root::private_broadcaster::{
-    cancel_private_broadcaster_progress, private_broadcaster_progress_dialog_close_behavior,
-    private_broadcaster_progress_is_terminal, request_sponsored_session_cancel,
-    spawn_sponsored_abort_watchdog, sponsored_stop_uses_session_command,
+    cancel_private_broadcaster_progress, gateway_self_broadcast_result,
+    private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_is_terminal,
+    request_sponsored_session_cancel, spawn_sponsored_abort_watchdog,
+    sponsored_stop_uses_session_command,
 };
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
     public_action_error_retry_kind, public_action_step_detail_for_context, public_action_step_id,
 };
-use wallet_ops::{DesktopSelfBroadcastResult, SelfBroadcastAttemptInfo, TxReceiptOutput};
+use wallet_ops::{
+    DesktopSelfBroadcastResult, SelfBroadcastAttemptInfo, SponsoredSelfBroadcastSessionOutcome,
+    TxReceiptOutput,
+};
 
 #[tokio::test]
 async fn sponsored_cleanup_aborts_preparation_but_drains_active_session() {
@@ -527,6 +531,25 @@ fn closing_failed_gateway_progress_releases_the_hidden_form_but_hiding_active_wo
     assert_eq!(
         private_broadcaster_progress_dialog_close_behavior(&progress),
         ProgressDialogCloseBehavior::TopOnly,
+    );
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    progress.gateway_execution = Some(wallet_ops::gateway::GatewayDraftExecution::private(
+        "self-retry".into(),
+    ));
+    progress.self_broadcast_command_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+    fail_private_broadcaster_progress_steps_at_stage(
+        &mut progress.steps,
+        TransactionGenerationStage::EstimatingSelfBroadcastGas,
+        "retryable gas failure",
+    );
+    assert_eq!(
+        private_broadcaster_progress_dialog_close_behavior(&progress),
+        ProgressDialogCloseBehavior::TopOnly
+    );
+    progress.self_broadcast_result = Some(test_self_broadcast_result(false));
+    assert_eq!(
+        private_broadcaster_progress_dialog_close_behavior(&progress),
+        ProgressDialogCloseBehavior::AllAndClear
     );
 }
 
@@ -1066,12 +1089,22 @@ fn private_self_broadcast_step_retry_kind_separates_signing_from_gas_and_speed_u
 
 #[test]
 fn private_self_broadcast_success_requires_successful_receipt() {
+    use wallet_ops::gateway::GatewayPrivateDraftResult as ResultKind;
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
     let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    assert!(gateway_self_broadcast_result(&progress).is_none());
     progress.self_broadcast_result = Some(test_self_broadcast_result(true));
     assert!(private_broadcaster_progress_is_successful(&progress));
+    assert_eq!(
+        gateway_self_broadcast_result(&progress),
+        Some((ResultKind::Confirmed, Some("0xabc".into())))
+    );
 
     progress.self_broadcast_result = Some(test_self_broadcast_result(false));
+    assert_eq!(
+        gateway_self_broadcast_result(&progress).unwrap().0,
+        ResultKind::Reverted
+    );
     assert!(!private_broadcaster_progress_is_successful(&progress));
 
     let mut result = test_self_broadcast_result(true);
@@ -1094,6 +1127,10 @@ fn private_self_broadcast_success_requires_successful_receipt() {
         .self_broadcast_attempts
         .clone_from(&result.attempts);
     progress.self_broadcast_result = Some(result);
+    assert_eq!(
+        gateway_self_broadcast_result(&progress),
+        Some((ResultKind::InclusionUnknown, Some("0xunobserved".into())))
+    );
     assert!(!private_broadcaster_progress_is_successful(&progress));
     assert!(private_broadcaster_progress_is_terminal(&progress));
     assert_eq!(
@@ -1122,6 +1159,44 @@ fn private_self_broadcast_success_requires_successful_receipt() {
         "0xunobserved",
     );
     assert!(progress.error.is_none());
+    progress.self_broadcast_result = None;
+    assert!(
+        gateway_self_broadcast_result(&progress).is_none(),
+        "submitted attempts are not confirmation"
+    );
+    for accepted in [false, true] {
+        progress.sponsored_self_broadcast_outcome =
+            Some(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: wallet_ops::SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted: accepted,
+            });
+        assert_eq!(
+            gateway_self_broadcast_result(&progress).unwrap().0,
+            if accepted {
+                ResultKind::InclusionUnknown
+            } else {
+                ResultKind::Stopped
+            }
+        );
+    }
+    for success in [false, true] {
+        progress.sponsored_self_broadcast_outcome =
+            Some(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(
+                test_self_broadcast_result(success)
+                    .tx
+                    .receipt()
+                    .unwrap()
+                    .clone(),
+            ));
+        assert_eq!(
+            gateway_self_broadcast_result(&progress).unwrap().0,
+            if success {
+                ResultKind::Confirmed
+            } else {
+                ResultKind::Reverted
+            }
+        );
+    }
 }
 
 #[test]

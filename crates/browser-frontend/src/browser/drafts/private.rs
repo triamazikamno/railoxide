@@ -1,4 +1,5 @@
 //! Private form composition. Eligibility, exact amounts and estimates come from the desktop.
+mod self_broadcast;
 use super::*;
 use gpui_component::{Selectable as _, tooltip::Tooltip};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +62,7 @@ impl FeeChoice {
 }
 
 pub(super) struct PrivateDraftForm {
+    self_broadcast: self_broadcast::SelfBroadcastForm,
     asset: Entity<SelectState<SearchableVec<FeeChoice>>>,
     asset_choices: Vec<FeeChoice>,
     _asset_subscription: Subscription,
@@ -152,6 +154,7 @@ impl GatewayView {
     pub(in crate::browser) fn open_private_draft(
         &mut self,
         kind: &str,
+        asset: Option<String>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -174,14 +177,15 @@ impl GatewayView {
             .draft
             .as_ref()
             .filter(|draft| draft.input["wallet"] == wallet && draft.input["chain_id"] == chain);
-        let asset = self
-            .private_view
-            .draft_assets()
-            .first()
-            .map_or_else(String::new, |asset| asset.id.clone());
+        let default_asset = asset.clone().unwrap_or_else(|| {
+            self.private_view
+                .draft_assets()
+                .first()
+                .map_or_else(String::new, |asset| asset.id.clone())
+        });
         let mut input = existing.map_or_else(|| json!({
-            "wallet":wallet,"chain_id":chain,"kind":kind,"asset":asset,"amount":"","max":false,
-            "recipient":"","address_book_entry":null,"fee_token":asset,"fee_mode":"deduct",
+            "wallet":wallet,"chain_id":chain,"kind":kind,"asset":default_asset,"amount":"","max":false,
+            "recipient":"","address_book_entry":null,"fee_token":default_asset,"fee_mode":"deduct",
             "broadcaster":{"mode":"random"},"allow_out_of_range":false,"favorites_only":false,
             "unwrap":false,"native_top_up":false
         }), |draft| draft.input.clone());
@@ -192,6 +196,9 @@ impl GatewayView {
             input["native_top_up"] = false.into();
         }
         input["kind"] = kind.into();
+        if let Some(asset) = asset {
+            input["asset"] = asset.into();
+        }
         let request = existing.map_or_else(
             || format!("{}-{}", js_sys::Date::now(), js_sys::Math::random()),
             |draft| draft.request_id.clone(),
@@ -266,6 +273,7 @@ impl GatewayView {
             },
         );
         PrivateDraftForm {
+            self_broadcast: self_broadcast::SelfBroadcastForm::new(input, window, cx),
             asset,
             asset_choices,
             _asset_subscription: asset_subscription,
@@ -310,6 +318,12 @@ impl GatewayView {
             options: draft.private_options.clone(),
             estimate,
         });
+        private.self_broadcast.sync(
+            &form.input,
+            &draft.private_options["self_broadcast"],
+            window,
+            cx,
+        );
         let asset_choices =
             asset_choices_from_options(&draft.private_options).unwrap_or_else(|| {
                 self.private_view
@@ -544,8 +558,25 @@ impl GatewayView {
             .display
             .as_ref()
             .filter(|display| display.matches(&form.input));
-        let options = display.map_or(&empty, |display| &display.options);
+        let options = private
+            .display
+            .as_ref()
+            .filter(|display| {
+                ["wallet", "chain_id", "kind", "asset"]
+                    .iter()
+                    .all(|key| display.input[key] == form.input[key])
+            })
+            .map_or(&empty, |display| &display.options);
         let estimate = display.map_or(&empty, |display| &display.estimate);
+        let selected_asset = private
+            .asset_choices
+            .iter()
+            .find(|choice| choice.asset.id == form.input["asset"]);
+        let max_amount = estimate["max_amount"]
+            .as_str()
+            .filter(|amount| !amount.is_empty())
+            .or_else(|| selected_asset.and_then(|choice| choice.asset.max_amount.as_deref()))
+            .map(str::to_owned);
         let render_warnings = |top_up| {
             options["warnings"]
                 .as_array()
@@ -564,7 +595,9 @@ impl GatewayView {
                 })
         };
         let send_mode = form.input["kind"] == "private_send";
-        let ready = current.is_some_and(|draft| draft.status == "ready");
+        let self_broadcast = form.input["delivery"]["mode"] == "self_broadcast";
+        let ready = current.is_some_and(|draft| draft.status == "ready")
+            && (!self_broadcast || self.private_view.self_broadcast_supported);
         let mut fields = div()
             .id("private-draft-fields")
             .flex_1()
@@ -628,20 +661,21 @@ impl GatewayView {
                                         .as_str()
                                         .map(str::to_owned)
                                         .or_else(|| {
-                                            private
-                                                .asset_choices
-                                                .iter()
-                                                .find(|choice| {
-                                                    choice.asset.id == form.input["asset"]
-                                                })
+                                            selected_asset
                                                 .and_then(|choice| choice.max_amount_label.clone())
                                         }),
                                 )
                                 .on_click(cx.listener(
-                                    |this, _, _, cx| {
+                                    move |this, _, window, cx| {
                                         if let Some(form) = &mut this.draft_form {
                                             form.input["max"] = true.into();
                                             form.input["amount"] = "".into();
+                                            if let Some(amount) = &max_amount {
+                                                form.setting_max = Some(amount.clone());
+                                                form.amount.update(cx, |input, cx| {
+                                                    input.set_value(amount.clone(), window, cx);
+                                                });
+                                            }
                                         }
                                         this.draft_changed(cx);
                                     },
@@ -714,36 +748,63 @@ impl GatewayView {
                     .children(render_warnings(true)),
             );
         }
-        fields = fields.child(ui::private_action::broadcaster_settings(
-            "private-broadcaster-settings",
-            BroadcasterSettings {
-                allow_out_of_range: form.input["allow_out_of_range"] == true,
-                favorites_only: form.input["favorites_only"] == true,
-                random_selected: form.input["broadcaster"]["mode"] == "random",
-                specific_label: options["specific_label"]
-                    .as_str()
-                    .unwrap_or("Choose specific…")
-                    .into(),
-                candidate_count: options["candidate_count"].as_u64().unwrap_or_default() as usize,
-                disabled: false,
-            },
-            ui::private_action::fee_token_control(
-                Select::new(&private.fee).disabled(private.fee_choices.is_empty()),
-            ),
-            None,
-            {
-                let root = cx.entity();
-                move |event, window, cx| {
-                    root.update(cx, |root, cx| root.private_settings(event, window, cx));
-                }
-            },
-        ));
+        if self.private_view.self_broadcast_supported || self_broadcast {
+            use ui::private_action::self_broadcast::{DeliveryChoice, delivery_selector};
+            let root = cx.entity();
+            fields = fields.child(delivery_selector(
+                "private-delivery",
+                if self_broadcast {
+                    DeliveryChoice::SelfBroadcast
+                } else {
+                    DeliveryChoice::Broadcaster
+                },
+                self.private_view.self_broadcast_supported && options["self_broadcast"].is_object(),
+                false,
+                options["self_broadcast"]["show_sponsorship"] != true,
+                false,
+                move |choice, _, cx| {
+                    root.update(cx, |root, cx| root.switch_private_delivery(choice, cx));
+                },
+            ));
+        }
+        if self_broadcast {
+            fields = fields.child(self.render_private_self_broadcast(options, current, cx));
+            if !self.private_view.self_broadcast_supported {
+                fields = fields.child(note("Self-broadcast is unavailable in this desktop version. Choose Public broadcaster to continue.").whitespace_normal());
+            }
+        } else {
+            fields = fields.child(ui::private_action::broadcaster_settings(
+                "private-broadcaster-settings",
+                BroadcasterSettings {
+                    allow_out_of_range: form.input["allow_out_of_range"] == true,
+                    favorites_only: form.input["favorites_only"] == true,
+                    random_selected: form.input["broadcaster"]["mode"] == "random",
+                    specific_label: options["specific_label"]
+                        .as_str()
+                        .unwrap_or("Choose specific…")
+                        .into(),
+                    candidate_count: options["candidate_count"].as_u64().unwrap_or_default()
+                        as usize,
+                    disabled: false,
+                },
+                ui::private_action::fee_token_control(
+                    Select::new(&private.fee).disabled(private.fee_choices.is_empty()),
+                ),
+                None,
+                {
+                    let root = cx.entity();
+                    move |event, window, cx| {
+                        root.update(cx, |root, cx| root.private_settings(event, window, cx));
+                    }
+                },
+            ));
+        }
         if options["show_fee_mode"] == true {
             let root = cx.entity();
             fields = fields.child(ui::private_action::fee_mode_toggle(
                 "private-fee-mode",
                 !send_mode,
-                true,
+                !self_broadcast,
                 form.input["fee_mode"] == "add_on_top",
                 false,
                 move |add, _, cx| {
@@ -758,7 +819,32 @@ impl GatewayView {
             ));
         }
         fields = fields.children(render_warnings(false));
-        if estimate.is_object() {
+        if self_broadcast {
+            if let Ok(display) = serde_json::from_value::<
+                ui::private_action::self_broadcast::FeeDisplay,
+            >(estimate["self_broadcast_fees"].clone())
+            {
+                let root = cx.entity();
+                fields = fields.child(ui::private_action::self_broadcast::estimated_fees(
+                    "private-self-fees",
+                    &display,
+                    text(estimate, "protocol_fee_label"),
+                    private.breakdown_open,
+                    move |open, _, cx| {
+                        root.update(cx, |root, cx| {
+                            if let Some(private) = root
+                                .draft_form
+                                .as_mut()
+                                .and_then(|form| form.private.as_mut())
+                            {
+                                private.breakdown_open = open;
+                            }
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+        } else if estimate.is_object() {
             fields = fields
                 .child(ui::private_action::estimated_outcome(
                     text(estimate, "broadcaster"),
@@ -860,7 +946,9 @@ impl GatewayView {
         let attention = draft.status == "attention";
         let working = draft.status == "in_progress";
         let terminal = matches!(draft.status.as_str(), "done" | "failed");
-        let accent = if draft.status == "failed" {
+        let accent = if progress["result"] == "inclusion_unknown" {
+            cx.theme().warning
+        } else if draft.status == "failed" {
             cx.theme().danger
         } else if draft.warning {
             cx.theme().warning
@@ -986,7 +1074,14 @@ impl GatewayView {
             );
         }
         let controls = [
-            ("stop", OperationControl::Stop),
+            (
+                "stop",
+                if progress["stop_retries"] == true {
+                    OperationControl::StopRetries
+                } else {
+                    OperationControl::Stop
+                },
+            ),
             ("stop_waiting", OperationControl::StopWaiting),
             ("ban", OperationControl::Ban),
             ("favorite", OperationControl::Favorite),
@@ -997,7 +1092,7 @@ impl GatewayView {
         let id = draft.id.clone();
         let execution = text(progress, "execution_id");
         let operation_actions = (!controls.is_empty()).then(|| ui::private_submission::operation_controls("private-operation", controls, move |control, _, _| {
-            let control = match control { OperationControl::Stop => "stop", OperationControl::StopWaiting => "stop_waiting", OperationControl::Ban => "ban", OperationControl::Favorite => "favorite" };
+            let control = match control { OperationControl::Stop | OperationControl::StopRetries => "stop", OperationControl::StopWaiting => "stop_waiting", OperationControl::Ban => "ban", OperationControl::Favorite => "favorite" };
             send(&json!({"action":"private_control","draft_id":id,"execution_id":execution,"control":control}));
         }).min_w_0().justify_center());
         let mut actions = div()

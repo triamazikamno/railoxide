@@ -11,12 +11,14 @@ fn gateway_private_estimate_is_ready(
     execution: Option<&GatewayDraftExecution>,
     estimate_is_current: bool,
     estimated_at: Option<std::time::Instant>,
+    age_limited: bool,
 ) -> bool {
     execution.is_none_or(|execution| {
         // Quote age gates entry into approval. Execution recalculates fees after approval,
         // while an invalidated estimate must still stop submission.
         estimate_is_current
-            && (execution.has_review_approval()
+            && (!age_limited
+                || execution.has_review_approval()
                 || estimated_at.is_some_and(|at| at.elapsed() <= Duration::from_secs(30)))
     })
 }
@@ -81,6 +83,9 @@ impl WalletRoot {
             SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(
                 key,
                 draft.sponsored_authorization_limit,
+                self.send_forms
+                    .get(&key)
+                    .and_then(|form| form.gateway_execution.clone()),
             )
         } else {
             SpendAuthorizationIntent::PrivateSend(
@@ -113,10 +118,24 @@ impl WalletRoot {
         };
         self.ensure_waku_for_delivery(delivery_mode, cx);
         let form = self.send_forms.get(&key)?;
+        let self_broadcast = delivery_mode == DeliveryMode::SelfBroadcast;
+        let estimate_is_current = if self_broadcast {
+            matches!(
+                form.sponsored_funding_estimate,
+                Some(
+                    SponsoredFundingEstimateState::Ready(_)
+                        | SponsoredFundingEstimateState::PublicBalanceReady(_)
+                )
+            ) && self.gateway_self_broadcast_review_current(form.gateway_execution.as_ref(), cx)
+        } else {
+            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
+        };
         if !gateway_private_estimate_is_ready(
             form.gateway_execution.as_ref(),
-            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost,
+            estimate_is_current,
             form.gateway_estimated_at,
+            !(self_broadcast
+                && form.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship),
         ) {
             self.set_send_form_error(
                 key,
@@ -981,6 +1000,9 @@ impl WalletRoot {
             SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(
                 key,
                 draft.sponsored_authorization_limit,
+                self.unshield_forms
+                    .get(&key)
+                    .and_then(|form| form.gateway_execution.clone()),
             )
         } else {
             SpendAuthorizationIntent::PrivateUnshield(
@@ -1014,10 +1036,24 @@ impl WalletRoot {
         };
         self.ensure_waku_for_delivery(delivery_mode, cx);
         let form = self.unshield_forms.get(&key)?;
+        let self_broadcast = delivery_mode == DeliveryMode::SelfBroadcast;
+        let estimate_is_current = if self_broadcast {
+            matches!(
+                form.sponsored_funding_estimate,
+                Some(
+                    SponsoredFundingEstimateState::Ready(_)
+                        | SponsoredFundingEstimateState::PublicBalanceReady(_)
+                )
+            ) && self.gateway_self_broadcast_review_current(form.gateway_execution.as_ref(), cx)
+        } else {
+            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
+        };
         if !gateway_private_estimate_is_ready(
             form.gateway_execution.as_ref(),
-            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost,
+            estimate_is_current,
             form.gateway_estimated_at,
+            !(self_broadcast
+                && form.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship),
         ) {
             self.set_unshield_form_error(
                 key,
@@ -2006,6 +2042,7 @@ mod tests {
             Some(&execution),
             true,
             Some(estimated_at),
+            true,
         ));
         let expired_at = estimated_at
             .checked_sub(Duration::from_mins(1))
@@ -2014,18 +2051,33 @@ mod tests {
             Some(&execution),
             true,
             Some(expired_at),
+            true,
         ));
 
-        assert!(execution.approve_review());
         assert!(gateway_private_estimate_is_ready(
             Some(&execution),
             true,
             Some(expired_at),
+            false
         ));
         assert!(!gateway_private_estimate_is_ready(
             Some(&execution),
             false,
             Some(expired_at),
+            false
+        ));
+        assert!(execution.approve_review());
+        assert!(gateway_private_estimate_is_ready(
+            Some(&execution),
+            true,
+            Some(expired_at),
+            true,
+        ));
+        assert!(!gateway_private_estimate_is_ready(
+            Some(&execution),
+            false,
+            Some(expired_at),
+            true,
         ));
     }
 }

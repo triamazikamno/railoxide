@@ -37,6 +37,7 @@ use super::spend_authorization::SpendAuthorizationIntent;
 use super::{WalletRoot, format_send_amount_input, public_balance_amount_label};
 
 mod private;
+mod self_broadcast;
 use private::valid_private_input_size;
 
 const ESTIMATE_LIFETIME: Duration = Duration::from_secs(30);
@@ -64,6 +65,7 @@ enum PreparedDraft {
     Send(Box<PublicSendDraft>),
     Shield(Box<PublicShieldDraft>),
     Private(Box<private::PreparedPrivateDraft>),
+    PrivateSelfBroadcast(Box<self_broadcast::PreparedSelfBroadcastDraft>),
 }
 
 impl GatewayDraftBook {
@@ -151,7 +153,7 @@ impl GatewayDraftBook {
         if let Some(job) = record.estimation.take() {
             job.abort();
         }
-        if public_quote_identity(&record.view.input) != public_quote_identity(&input) {
+        if quote_identity(&record.view.input) != quote_identity(&input) {
             record.view.gas_quote = None;
         }
         record.picker = None;
@@ -306,6 +308,19 @@ impl GatewayDraftBook {
                             && root.public_form.action_stop_available
                     });
                 }
+                if record.execution.is_none()
+                    && let Some(PreparedDraft::PrivateSelfBroadcast(prepared)) = &record.prepared
+                    && (!prepared.is_current(root, &record.view.input)
+                        || (!prepared.retains_background_estimate()
+                            && record
+                                .estimated_at
+                                .is_none_or(|at| at.elapsed() > ESTIMATE_LIFETIME)))
+                {
+                    view.status = GatewayDraftStatus::Editing;
+                    view.message =
+                        "Private funds or self-broadcast estimate changed. Refresh the estimate."
+                            .into();
+                }
                 view
             })
             .collect();
@@ -455,7 +470,7 @@ impl WalletRoot {
                     record.view.draft_id == draft_id
                         && record.view.revision == revision
                         && record.execution.is_none()
-                        && matches!(record.view.input, GatewayDraftPayload::Private(_))
+                        && matches!(&record.view.input, GatewayDraftPayload::Private(input) if input.delivery.broadcaster().is_some())
                 }) else {
                     return;
                 };
@@ -618,7 +633,10 @@ impl WalletRoot {
             .input
             .clone();
         let Some(input) = input.public() else {
-            self.ensure_waku_for_delivery(super::DeliveryMode::PublicBroadcaster, cx);
+            if matches!(&input, GatewayDraftPayload::Private(input) if input.delivery.broadcaster().is_some())
+            {
+                self.ensure_waku_for_delivery(super::DeliveryMode::PublicBroadcaster, cx);
+            }
             self.estimate_gateway_private_draft(peer_id, cx);
             return;
         };
@@ -799,7 +817,7 @@ impl WalletRoot {
                     draft.public_account_source == PublicAccountSource::HardwareDerived,
                 )
             }
-            PreparedDraft::Private(_) => return,
+            PreparedDraft::Private(_) | PreparedDraft::PrivateSelfBroadcast(_) => return,
             PreparedDraft::Shield(draft) => {
                 draft.gateway_execution = Some(execution);
                 (
@@ -869,17 +887,31 @@ fn retire_record(record: &mut DraftRecord) {
     }
 }
 
-fn public_quote_identity(
-    input: &GatewayDraftPayload,
-) -> Option<(&str, u64, GatewayDraftKind, bool)> {
-    input.public().map(|input| {
-        (
+#[derive(PartialEq, Eq)]
+enum DraftGasQuoteIdentity<'a> {
+    Public(&'a str, u64, GatewayDraftKind, bool),
+    Private(&'a str, u64),
+}
+
+fn quote_identity(input: &GatewayDraftPayload) -> Option<DraftGasQuoteIdentity<'_>> {
+    match input {
+        GatewayDraftPayload::Public(input) => Some(DraftGasQuoteIdentity::Public(
             input.account.as_str(),
             input.chain_id,
             input.kind,
             input.mimic_railway,
-        )
-    })
+        )),
+        GatewayDraftPayload::Private(input) => {
+            input
+                .delivery
+                .broadcaster()
+                .is_none()
+                .then_some(DraftGasQuoteIdentity::Private(
+                    &input.wallet,
+                    input.chain_id,
+                ))
+        }
+    }
 }
 
 fn valid_input_size(input: &GatewayDraftPayload) -> bool {
@@ -1370,6 +1402,75 @@ mod tests {
         assert!(!book.dismiss("peer", &next_id));
         execution.stopped();
         assert!(book.dismiss("peer", &next_id));
+        drop(book);
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn private_gas_quotes_survive_form_edits_but_not_chain_or_delivery_changes() {
+        use wallet_ops::gateway::{
+            GatewayPrivateDelivery, GatewayPrivateDraftInput, GatewayPrivateFunding,
+            GatewayPrivateGasFee, GatewayPrivateSelfBroadcastInput,
+        };
+        let (path, store, wallet) = synthetic_wallet();
+        let mut input = GatewayPrivateDraftInput::default();
+        input.wallet = "wallet".into();
+        input.chain_id = 1;
+        input.delivery = GatewayPrivateDelivery::SelfBroadcast {
+            delivery: GatewayPrivateSelfBroadcastInput::SelfBroadcast {
+                signer: None,
+                funding: GatewayPrivateFunding::PublicBalance {},
+                fee: GatewayPrivateGasFee::Auto {},
+            },
+        };
+        let mut book = GatewayDraftBook::default();
+        assert!(book.create(
+            "peer",
+            "create".into(),
+            GatewayDraftPayload::Private(input.clone()),
+            wallet.clone(),
+            1,
+        ));
+        let id = book.records["peer"].view.draft_id.clone();
+        book.records.get_mut("peer").unwrap().view.gas_quote =
+            Some(GatewayDraftGasQuote::new("2".into(), "0.1".into()));
+        input.amount = "1".into();
+        assert!(book.update(
+            "peer",
+            &id,
+            1,
+            GatewayDraftPayload::Private(input.clone()),
+            &wallet,
+            1
+        ));
+        assert!(book.records["peer"].view.gas_quote.is_some());
+        assert!(book.records["peer"].prepared.is_none());
+
+        input.chain_id = 137;
+        assert!(book.update(
+            "peer",
+            &id,
+            2,
+            GatewayDraftPayload::Private(input.clone()),
+            &wallet,
+            1
+        ));
+        assert!(book.records["peer"].view.gas_quote.is_none());
+
+        book.records.get_mut("peer").unwrap().view.gas_quote =
+            Some(GatewayDraftGasQuote::new("3".into(), "1".into()));
+        input.delivery = GatewayPrivateDraftInput::default().delivery;
+        assert!(book.update(
+            "peer",
+            &id,
+            3,
+            GatewayDraftPayload::Private(input),
+            &wallet,
+            1
+        ));
+        assert!(book.records["peer"].view.gas_quote.is_none());
         drop(book);
         drop(wallet);
         drop(store);

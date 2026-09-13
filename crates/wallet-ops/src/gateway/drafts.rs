@@ -394,6 +394,32 @@ impl GatewayDraftExecution {
         }
     }
 
+    /// A later hardware prompt may be cancelled after the initial review was approved.
+    /// The native dialog owner calls this only for an explicit dismissal, before generation.
+    pub fn cancel_private_authorization(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.started
+            || state.private.is_none()
+            || matches!(
+                state.status,
+                GatewayDraftStatus::Done | GatewayDraftStatus::Failed
+            )
+        {
+            return;
+        }
+        state.cancelled = true;
+        state.review_approved = false;
+        state.status = GatewayDraftStatus::Failed;
+        state.step = "Canceled".into();
+        state.message = "The transaction was not submitted.".into();
+        if let Some(private) = &mut state.private {
+            private.result = Some(super::GatewayPrivateDraftResult::Cancelled);
+        }
+    }
+
     /// Retain the last result after the native owner releases its task and controls.
     pub fn retire_private_owner(&self) {
         let mut state = self
@@ -404,6 +430,7 @@ impl GatewayDraftExecution {
             return;
         };
         private.stop = false;
+        private.stop_retries = false;
         private.stop_waiting = false;
         private.ban = false;
         private.favorite = false;
@@ -636,14 +663,58 @@ mod tests {
             assert!(matches!(parsed, GatewayDraftPayload::Public(_)));
             assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
         }
-        let mut private =
-            serde_json::to_value(super::super::GatewayPrivateDraftInput::default()).unwrap();
+        let mut private = serde_json::json!({
+            "wallet":"private", "chain_id":1, "kind":"private_send", "asset":"token",
+            "amount":"1", "max":false, "recipient":"recipient", "address_book_entry":null,
+            "fee_mode":"deduct", "unwrap":false, "native_top_up":false,
+            "fee_token":"fee-token", "broadcaster":{"mode":"random"},
+            "allow_out_of_range":false, "favorites_only":false
+        });
         for kind in ["private_send", "unshield"] {
             private["kind"] = kind.into();
             let parsed: GatewayDraftPayload = serde_json::from_value(private.clone()).unwrap();
             assert!(matches!(parsed, GatewayDraftPayload::Private(_)));
+            assert_eq!(serde_json::to_value(parsed).unwrap(), private);
             assert!(serde_json::from_value::<GatewayDraftInput>(private.clone()).is_err());
         }
+        let mut self_broadcast = private.clone();
+        for field in [
+            "fee_token",
+            "broadcaster",
+            "allow_out_of_range",
+            "favorites_only",
+        ] {
+            self_broadcast.as_object_mut().unwrap().remove(field);
+        }
+        self_broadcast["delivery"] = serde_json::json!({
+            "mode":"self_broadcast", "signer":"explicit-signer",
+            "funding":{"mode":"sponsorship", "incentive":{"mode":"custom", "percent":"7"}},
+            "fee":{"mode":"custom", "max_fee_gwei":"2.125", "priority_fee_gwei":"0.1"}
+        });
+        let parsed: GatewayDraftPayload = serde_json::from_value(self_broadcast.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), self_broadcast);
+        for field in [
+            "fee_token",
+            "broadcaster",
+            "allow_out_of_range",
+            "favorites_only",
+        ] {
+            let mut mixed = self_broadcast.clone();
+            mixed[field] = private[field].clone();
+            assert!(serde_json::from_value::<GatewayDraftPayload>(mixed).is_err());
+        }
+        for pointer in ["", "/delivery", "/delivery/funding", "/delivery/fee"] {
+            let mut override_input = self_broadcast.clone();
+            override_input.pointer_mut(pointer).unwrap()["rpc_url"] = "http://caller".into();
+            assert!(serde_json::from_value::<GatewayDraftPayload>(override_input).is_err());
+        }
+        let mut mixed_funding = self_broadcast.clone();
+        mixed_funding["delivery"]["funding"]["mode"] = "public_balance".into();
+        assert!(serde_json::from_value::<GatewayDraftPayload>(mixed_funding).is_err());
+        self_broadcast["delivery"]["funding"] = serde_json::json!({"mode":"public_balance"});
+        self_broadcast["delivery"]["fee"] = serde_json::json!({"mode":"auto"});
+        self_broadcast["delivery"]["signer"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<GatewayDraftPayload>(self_broadcast).is_ok());
         private["kind"] = "send".into();
         assert!(serde_json::from_value::<GatewayDraftPayload>(private).is_err());
     }
@@ -666,6 +737,24 @@ mod tests {
         assert!(!duplicate.start());
         execution.finish(false); // The task can finish before queued handoff events are delivered.
         assert!(!execution.snapshot().can_retry);
+
+        let hardware = GatewayDraftExecution::private("hardware-password-approved".into());
+        assert!(hardware.approve_review());
+        hardware.cancel_review(); // The first password dialog closes to open device approval.
+        hardware.cancel_private_authorization();
+        assert!(!hardware.approve_review());
+        assert!(!hardware.start());
+        assert!(hardware.snapshot().can_retry);
+        assert_eq!(
+            hardware.snapshot().private.unwrap().result,
+            Some(super::super::GatewayPrivateDraftResult::Cancelled)
+        );
+
+        let running = GatewayDraftExecution::private("hardware-complete".into());
+        assert!(running.approve_review());
+        assert!(running.start());
+        running.cancel_private_authorization();
+        assert_eq!(running.snapshot().status, GatewayDraftStatus::InProgress);
         duplicate.event(&PublicActionSessionEvent::AttemptHandoff {
             step: PublicActionProgressStep::Send,
         });

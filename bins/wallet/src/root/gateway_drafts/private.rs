@@ -12,9 +12,11 @@ use wallet_ops::{
     FeeHandlingMode, ListUtxosOutput, PublicBroadcasterCostEstimate,
     gateway::{
         GatewayBroadcasterChoice, GatewayPrivateAmountMetric, GatewayPrivateAssetChoice,
-        GatewayPrivateDisplayRow, GatewayPrivateDraftEstimate, GatewayPrivateDraftInput,
-        GatewayPrivateDraftKind, GatewayPrivateDraftOptions, GatewayPrivateDraftPicker,
-        GatewayPrivateFeeMode, GatewayPrivateTopUpOption,
+        GatewayPrivateDelivery, GatewayPrivateDisplayRow, GatewayPrivateDraftEstimate,
+        GatewayPrivateDraftInput, GatewayPrivateDraftKind, GatewayPrivateDraftOptions,
+        GatewayPrivateDraftPicker, GatewayPrivateFeeMode, GatewayPrivateFunding,
+        GatewayPrivateGasFee, GatewayPrivateIncentive, GatewayPrivateSelfBroadcastInput,
+        GatewayPrivateTopUpOption,
     },
 };
 
@@ -107,19 +109,47 @@ impl PreparedPrivateDraft {
 }
 
 pub(super) fn valid_private_input_size(input: &GatewayPrivateDraftInput) -> bool {
-    input.wallet.len() <= 128
+    let delivery_valid = match &input.delivery {
+        GatewayPrivateDelivery::Broadcaster(delivery) => {
+            delivery.fee_token.len() <= 128
+                && match &delivery.broadcaster {
+                    GatewayBroadcasterChoice::Random => true,
+                    GatewayBroadcasterChoice::Specific { id } => id.len() <= 1024,
+                }
+        }
+        GatewayPrivateDelivery::SelfBroadcast {
+            delivery:
+                GatewayPrivateSelfBroadcastInput::SelfBroadcast {
+                    signer,
+                    funding,
+                    fee,
+                },
+        } => {
+            signer.as_ref().is_none_or(|id| id.len() <= 128)
+                && match funding {
+                    GatewayPrivateFunding::Sponsorship {
+                        incentive: GatewayPrivateIncentive::Custom { percent },
+                    } => percent.len() <= 100,
+                    _ => true,
+                }
+                && match fee {
+                    GatewayPrivateGasFee::Auto {} => true,
+                    GatewayPrivateGasFee::Custom {
+                        max_fee_gwei,
+                        priority_fee_gwei,
+                    } => max_fee_gwei.len() <= 100 && priority_fee_gwei.len() <= 100,
+                }
+        }
+    };
+    delivery_valid
+        && input.wallet.len() <= 128
         && input.asset.len() <= 128
-        && input.fee_token.len() <= 128
         && input.amount.len() <= 100
         && input.recipient.len() <= 1024
         && input
             .address_book_entry
             .as_ref()
             .is_none_or(|id| id.len() <= 128)
-        && match &input.broadcaster {
-            GatewayBroadcasterChoice::Random => true,
-            GatewayBroadcasterChoice::Specific { id } => id.len() <= 1024,
-        }
 }
 
 const fn kind(input: &GatewayPrivateDraftInput) -> DeliveryFormKind {
@@ -159,7 +189,7 @@ pub(super) fn resolve_private_draft_contact(
 }
 
 impl WalletRoot {
-    fn private_draft_asset(
+    pub(super) fn private_draft_asset(
         &self,
         input: &GatewayPrivateDraftInput,
     ) -> Result<UnshieldAsset, String> {
@@ -181,7 +211,10 @@ impl WalletRoot {
             .ok_or_else(|| "Choose an available private asset".into())
     }
 
-    fn private_draft_recipient(&self, input: &GatewayPrivateDraftInput) -> Result<String, String> {
+    pub(super) fn private_draft_recipient(
+        &self,
+        input: &GatewayPrivateDraftInput,
+    ) -> Result<String, String> {
         if input.address_book_entry.is_none() {
             return Ok(input.recipient.clone());
         }
@@ -201,8 +234,12 @@ impl WalletRoot {
         input: &GatewayPrivateDraftInput,
         recipient: String,
     ) -> Result<PrivateEstimateInput, String> {
+        let delivery = input
+            .delivery
+            .broadcaster()
+            .ok_or("Choose broadcaster delivery")?;
         let asset = self.private_draft_asset(input)?;
-        let fee_token = input
+        let fee_token = delivery
             .fee_token
             .parse::<Address>()
             .map_err(|_| "Choose a fee token")?;
@@ -212,7 +249,38 @@ impl WalletRoot {
         };
         let fee_mode =
             crate::root::effective_fee_handling_mode(kind(input), asset.token, fee_token, fee_mode);
-        let output = match input.kind {
+        let output = self.private_draft_output(input, &asset, &recipient, fee_mode)?;
+        let amount = if input.max {
+            format_send_amount_input(asset.max_batched, asset.decimals)
+        } else {
+            input.amount.clone()
+        };
+        Ok(PrivateEstimateInput {
+            asset,
+            recipient,
+            amount,
+            fee_token,
+            fee_mode,
+            output,
+            broadcaster: match &delivery.broadcaster {
+                GatewayBroadcasterChoice::Random => BroadcasterChoice::Random,
+                GatewayBroadcasterChoice::Specific { id } => BroadcasterChoice::Specific {
+                    railgun_address: id.clone(),
+                },
+            },
+            allow_out_of_range: delivery.allow_out_of_range,
+            favorites_only: delivery.favorites_only,
+        })
+    }
+
+    pub(super) fn private_draft_output(
+        &self,
+        input: &GatewayPrivateDraftInput,
+        asset: &UnshieldAsset,
+        recipient: &str,
+        fee_mode: FeeHandlingMode,
+    ) -> Result<PrivateEstimateOutput, String> {
+        Ok(match input.kind {
             GatewayPrivateDraftKind::PrivateSend => {
                 if input.unwrap || input.native_top_up {
                     return Err("Native output options are only available for Unshield.".into());
@@ -259,27 +327,6 @@ impl WalletRoot {
                     native_top_up,
                 }
             }
-        };
-        let amount = if input.max {
-            format_send_amount_input(asset.max_batched, asset.decimals)
-        } else {
-            input.amount.clone()
-        };
-        Ok(PrivateEstimateInput {
-            asset,
-            recipient,
-            amount,
-            fee_token,
-            fee_mode,
-            output,
-            broadcaster: match &input.broadcaster {
-                GatewayBroadcasterChoice::Random => BroadcasterChoice::Random,
-                GatewayBroadcasterChoice::Specific { id } => BroadcasterChoice::Specific {
-                    railgun_address: id.clone(),
-                },
-            },
-            allow_out_of_range: input.allow_out_of_range,
-            favorites_only: input.favorites_only,
         })
     }
 
@@ -305,38 +352,27 @@ impl WalletRoot {
                 let mut choice = GatewayPrivateAssetChoice::default();
                 choice.id = asset.token.to_string();
                 choice.label.clone_from(&asset.label);
-                choice.max_amount = format_send_amount_input(asset.max_batched, asset.decimals);
+                let maximum = if input.delivery.broadcaster().is_none()
+                    && input.kind == GatewayPrivateDraftKind::Unshield
+                    && input.fee_mode == GatewayPrivateFeeMode::AddOnTop
+                {
+                    crate::root::unshield_max_entered_amount_for_mode(
+                        asset.max_batched,
+                        FeeHandlingMode::AddToAmount,
+                    )
+                } else {
+                    asset.max_batched
+                };
+                choice.max_amount = format_send_amount_input(maximum, asset.decimals);
                 choice.max_amount_label =
-                    private_action_metric_display_amount(asset.max_batched, asset.decimals);
+                    private_action_metric_display_amount(maximum, asset.decimals);
                 choice.available =
                     private_action_metric_display_amount(asset.poi_verified_total, asset.decimals);
                 choice.icon = icon(&asset.icon_path);
                 choice
             })
             .collect();
-        let policy = self.public_broadcaster_fee_policy(input.allow_out_of_range);
-        options.fee_tokens = self
-            .current_public_broadcaster_fee_token_options(
-                input.chain_id,
-                input.unwrap,
-                input.native_top_up,
-                input.favorites_only,
-                policy,
-            )
-            .iter()
-            .map(|token| {
-                let mut choice = GatewayPrivateAssetChoice::default();
-                choice.id = token.token.to_string();
-                choice.label.clone_from(&token.label);
-                choice.max_amount = format_send_amount_input(token.max_spendable, token.decimals);
-                choice.max_amount_label =
-                    private_action_metric_display_amount(token.max_spendable, token.decimals);
-                choice.available.clone_from(&choice.max_amount_label);
-                choice.broadcaster_count = token.eligible_broadcaster_count;
-                choice.icon = icon(&token.icon_path);
-                choice
-            })
-            .collect();
+        options.self_broadcast = Some(self.gateway_self_broadcast_options(input));
         let Ok(asset) = self.private_draft_asset(input) else {
             return options;
         };
@@ -366,30 +402,20 @@ impl WalletRoot {
                 .warnings
                 .push(ui::private_action::NATIVE_TOP_UP_LINKAGE_WARNING.into());
         }
-        let Ok(fee_token) = input.fee_token.parse::<Address>() else {
-            return options;
+        let fee_token = match input.delivery.broadcaster() {
+            Some(delivery) => match delivery.fee_token.parse::<Address>() {
+                Ok(token) => token,
+                Err(_) => return options,
+            },
+            None => asset.token,
         };
-        let fee_options = self.current_public_broadcaster_fee_token_options(
-            input.chain_id,
-            input.unwrap,
-            input.native_top_up,
-            input.favorites_only,
-            policy,
-        );
-        if let Some(warning) = crate::root::public_broadcaster_fee_token_warning(
-            &self.monitor_fee_rows(),
-            input.chain_id,
-            &fee_options,
-            fee_token,
-            &self.public_broadcaster_trust_filter(input.favorites_only),
-        ) {
-            options.warnings.push(warning.into());
-        }
         options.show_fee_mode = crate::root::public_broadcaster::should_show_fee_mode_toggle(
             kind(input),
             asset.token,
             fee_token,
         );
+        options.show_fee_mode &= input.delivery.broadcaster().is_some()
+            || input.kind == GatewayPrivateDraftKind::Unshield;
         if input.kind == GatewayPrivateDraftKind::Unshield {
             if is_effective_wrapped_native_token(
                 &self.effective_chain_configs,
@@ -405,7 +431,18 @@ impl WalletRoot {
                 })
                 .parse::<Address>();
             let amount = if input.max {
-                Ok(asset.max_batched)
+                Ok(
+                    if input.delivery.broadcaster().is_none()
+                        && input.fee_mode == GatewayPrivateFeeMode::AddOnTop
+                    {
+                        crate::root::unshield_max_entered_amount_for_mode(
+                            asset.max_batched,
+                            FeeHandlingMode::AddToAmount,
+                        )
+                    } else {
+                        asset.max_batched
+                    },
+                )
             } else {
                 wallet_ops::parse_unshield_amount(&input.amount, asset.decimals)
             };
@@ -453,15 +490,57 @@ impl WalletRoot {
                 }
             }
         }
+        let Some(delivery) = input.delivery.broadcaster() else {
+            return options;
+        };
+        let policy = self.public_broadcaster_fee_policy(delivery.allow_out_of_range);
+        options.fee_tokens = self
+            .current_public_broadcaster_fee_token_options(
+                input.chain_id,
+                input.unwrap,
+                input.native_top_up,
+                delivery.favorites_only,
+                policy,
+            )
+            .iter()
+            .map(|token| {
+                let mut choice = GatewayPrivateAssetChoice::default();
+                choice.id = token.token.to_string();
+                choice.label.clone_from(&token.label);
+                choice.max_amount = format_send_amount_input(token.max_spendable, token.decimals);
+                choice.max_amount_label =
+                    private_action_metric_display_amount(token.max_spendable, token.decimals);
+                choice.available.clone_from(&choice.max_amount_label);
+                choice.broadcaster_count = token.eligible_broadcaster_count;
+                choice.icon = icon(&token.icon_path);
+                choice
+            })
+            .collect();
+        let fee_options = self.current_public_broadcaster_fee_token_options(
+            input.chain_id,
+            input.unwrap,
+            input.native_top_up,
+            delivery.favorites_only,
+            policy,
+        );
+        if let Some(warning) = crate::root::public_broadcaster_fee_token_warning(
+            &self.monitor_fee_rows(),
+            input.chain_id,
+            &fee_options,
+            fee_token,
+            &self.public_broadcaster_trust_filter(delivery.favorites_only),
+        ) {
+            options.warnings.push(warning.into());
+        }
         let candidates = self.current_public_broadcaster_candidates(
             input.chain_id,
             fee_token,
             input.unwrap,
             input.native_top_up,
-            input.favorites_only,
+            delivery.favorites_only,
             policy,
         );
-        let choice = match &input.broadcaster {
+        let choice = match &delivery.broadcaster {
             GatewayBroadcasterChoice::Random => BroadcasterChoice::Random,
             GatewayBroadcasterChoice::Specific { id } => BroadcasterChoice::Specific {
                 railgun_address: id.clone(),
@@ -470,11 +549,11 @@ impl WalletRoot {
         if let Some(warning) = crate::root::broadcaster_picker::selected_broadcaster_fee_warning(
             &choice,
             &candidates,
-            input.allow_out_of_range,
+            delivery.allow_out_of_range,
         ) {
             options.warnings.push(warning);
         }
-        let candidates = if input.allow_out_of_range {
+        let candidates = if delivery.allow_out_of_range {
             candidates
         } else {
             wallet_ops::fee_policy_eligible_public_broadcasters(&candidates, policy)
@@ -494,7 +573,7 @@ impl WalletRoot {
                     &prepared.estimate,
                 )
             });
-            let selected = match &input.broadcaster {
+            let selected = match &delivery.broadcaster {
                 GatewayBroadcasterChoice::Specific { id } => Some(id.as_str()),
                 GatewayBroadcasterChoice::Random => None,
             };
@@ -768,10 +847,16 @@ impl WalletRoot {
             return;
         };
         let input = input.clone();
-        record.prepared = None;
+        let retain = matches!(&record.prepared, Some(PreparedDraft::PrivateSelfBroadcast(prepared))
+            if prepared.retains_background_estimate() && prepared.is_current(self, &record.view.input));
+        if !retain {
+            record.prepared = None;
+            record.view.status = GatewayDraftStatus::Estimating;
+        }
         record.estimated_at = Some(Instant::now());
-        record.view.gas_quote = None;
-        record.view.status = GatewayDraftStatus::Estimating;
+        if input.delivery.broadcaster().is_some() {
+            record.view.gas_quote = None;
+        }
         record.view.message.clear();
         let recipients = match input.kind {
             GatewayPrivateDraftKind::PrivateSend => self.private_send_recipient_options(),
@@ -798,17 +883,16 @@ impl WalletRoot {
                 address: option.address.to_string(),
             })
             .collect();
-        let recipient = match self
+        let recipient = self
             .private_draft_recipient(&input)
-            .and_then(|recipient| self.private_draft_asset(&input).map(|_| recipient))
+            .and_then(|recipient| self.private_draft_asset(&input).map(|_| recipient));
+        if input.delivery.broadcaster().is_some()
+            && let Err(error) = &recipient
         {
-            Ok(recipient) => recipient,
-            Err(error) => {
-                record.view.status = GatewayDraftStatus::Editing;
-                record.view.message = error;
-                return;
-            }
-        };
+            record.view.status = GatewayDraftStatus::Editing;
+            record.view.message.clone_from(error);
+            return;
+        }
         let draft_id = record.view.draft_id.clone();
         let revision = record.view.revision;
         let wallet = record.wallet.clone();
@@ -816,6 +900,7 @@ impl WalletRoot {
         let ethereum = self.effective_chain_configs.get(&1).cloned();
         let http = self.http.clone();
         let join = self.runtime.spawn(async move {
+            let recipient = recipient?;
             if input.kind == GatewayPrivateDraftKind::Unshield
                 && !recipient.trim().is_empty()
                 && recipient.trim().parse::<Address>().is_err()
@@ -845,6 +930,13 @@ impl WalletRoot {
                 }) else { return };
                 record.estimation = None;
                 let GatewayDraftPayload::Private(input) = &record.view.input else { return };
+                if input.delivery.broadcaster().is_none() {
+                    drop(book);
+                    let recipient = resolved.map_err(|_| "Recipient resolution was interrupted.".to_owned())
+                        .and_then(std::convert::identity);
+                    root.start_gateway_self_broadcast_estimate(&peer_id, &draft_id, revision, recipient, cx);
+                    return;
+                }
                 let result = resolved.map_err(|_| "Recipient resolution was interrupted.".to_owned())
                     .and_then(std::convert::identity)
                     .and_then(|recipient| root.private_draft_recipient(input).and_then(|_| root.private_draft_inputs(input, recipient)));
@@ -1049,6 +1141,28 @@ impl WalletRoot {
         {
             record.view.message =
                 "Finish or close the current action in the desktop app first.".into();
+            return;
+        }
+        if let Some(PreparedDraft::PrivateSelfBroadcast(prepared)) = &record.prepared {
+            if !prepared.is_current(self, &record.view.input)
+                || (!prepared.retains_background_estimate()
+                    && record
+                        .estimated_at
+                        .is_none_or(|at| at.elapsed() > ESTIMATE_LIFETIME))
+            {
+                record.view.status = GatewayDraftStatus::Editing;
+                drop(book);
+                self.estimate_gateway_private_draft(peer_id, cx);
+                return;
+            }
+            let prepared = prepared.clone();
+            let estimated_at = record.estimated_at;
+            let execution =
+                GatewayDraftExecution::private(alloy::hex::encode(rand::random::<[u8; 16]>()));
+            record.execution = Some(execution.clone());
+            record.picker = None;
+            drop(book);
+            self.begin_gateway_self_broadcast(*prepared, &execution, estimated_at, window, cx);
             return;
         }
         let Some(PreparedDraft::Private(prepared)) = &record.prepared else {

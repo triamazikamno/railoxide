@@ -184,6 +184,9 @@ pub(in crate::root) fn private_broadcaster_progress_footer_action(
 pub(in crate::root) fn private_broadcaster_progress_dialog_close_behavior(
     progress: &PrivateBroadcasterProgressState,
 ) -> ProgressDialogCloseBehavior {
+    if progress.gateway_execution.is_some() && private_self_broadcast_requires_attention(progress) {
+        return ProgressDialogCloseBehavior::TopOnly;
+    }
     if progress.gateway_execution.is_some() && private_broadcaster_progress_is_terminal(progress) {
         // Extension submissions have no desktop form to return to after closing their result.
         return ProgressDialogCloseBehavior::AllAndClear;
@@ -192,6 +195,21 @@ pub(in crate::root) fn private_broadcaster_progress_dialog_close_behavior(
         private_broadcaster_progress_is_successful(progress),
         progress.stopped,
     )
+}
+
+pub(super) fn private_self_broadcast_requires_attention(
+    progress: &PrivateBroadcasterProgressState,
+) -> bool {
+    progress.flow == PrivateSubmissionProgressFlow::SelfBroadcast
+        && progress.self_broadcast_command_tx.is_some()
+        && progress.self_broadcast_result.is_none()
+        && progress.error.is_none()
+        && !progress.stopped
+        && (progress.self_broadcast_action_error.is_some()
+            || progress.steps.iter().any(|step| {
+                step.status == PublicActionStepStatus::Error
+                    && self_broadcast_step_retry_kind(progress, step).is_some()
+            }))
 }
 
 pub(super) fn private_broadcaster_progress_stop_available(

@@ -52,6 +52,7 @@ struct PrivateAsset {
 pub(super) struct PrivateView {
     pub(super) supported: bool,
     pub(super) actions_supported: bool,
+    pub(super) self_broadcast_supported: bool,
     pub(super) selected_wallet: Option<String>,
     selected_wallet_choice: Option<String>,
     receive_address: Option<String>,
@@ -77,6 +78,7 @@ impl PrivateView {
         Self {
             supported: true,
             actions_supported: flag_field(snapshot, "private_actions_supported"),
+            self_broadcast_supported: flag_field(snapshot, "private_self_broadcast_supported"),
             selected_wallet: field(&value, "selected_wallet").as_string(),
             selected_wallet_choice: field(&value, "selected_wallet_choice").as_string(),
             receive_address: field(&value, "receive_address").as_string(),
@@ -363,7 +365,7 @@ impl GatewayView {
                                 .outline()
                                 .flex_1()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_private_draft("private_send", window, cx);
+                                    this.open_private_draft("private_send", None, window, cx);
                                 })),
                         )
                         .child(
@@ -372,7 +374,7 @@ impl GatewayView {
                                 .outline()
                                 .flex_1()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_private_draft("unshield", window, cx);
+                                    this.open_private_draft("unshield", None, window, cx);
                                 })),
                         )
                     })
@@ -403,7 +405,8 @@ impl GatewayView {
             ));
         }
         body = body.children(view.assets.iter().map(|asset| {
-            ui::private_assets::PrivateAssetRow {
+            let asset_id = asset.id.clone();
+            let row = ui::private_assets::PrivateAssetRow {
                 compact: true,
                 label: asset.symbol.clone().into(),
                 icon: asset
@@ -420,7 +423,20 @@ impl GatewayView {
                 pending_outgoing: asset.pending_outgoing.clone().map(Into::into),
                 actions: None,
             }
-            .into_div()
+            .into_div();
+            app_button_base(SharedString::from(format!(
+                "private-send-asset-{}",
+                asset.id
+            )))
+            .disabled(!view.actions_supported)
+            .ghost()
+            .w_full()
+            .h_auto()
+            .accessibility_label(format!("Send {}", asset.symbol))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_private_draft("private_send", Some(asset_id.clone()), window, cx);
+            }))
+            .child(row)
         }));
         body.child(
             div()

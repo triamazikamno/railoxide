@@ -28,7 +28,6 @@ pub enum GatewayBroadcasterChoice {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct GatewayPrivateDraftInput {
     pub wallet: String,
@@ -39,13 +38,84 @@ pub struct GatewayPrivateDraftInput {
     pub max: bool,
     pub recipient: String,
     pub address_book_entry: Option<String>,
-    pub fee_token: String,
     pub fee_mode: GatewayPrivateFeeMode,
+    pub unwrap: bool,
+    pub native_top_up: bool,
+    #[serde(flatten)]
+    pub delivery: GatewayPrivateDelivery,
+}
+
+/// The legacy broadcaster fields keep their flat wire shape. Each delivery rejects
+/// fields belonging to another mode, including endpoint overrides.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum GatewayPrivateDelivery {
+    Broadcaster(GatewayPrivateBroadcasterInput),
+    SelfBroadcast {
+        delivery: GatewayPrivateSelfBroadcastInput,
+    },
+}
+
+impl Default for GatewayPrivateDelivery {
+    fn default() -> Self {
+        Self::Broadcaster(GatewayPrivateBroadcasterInput::default())
+    }
+}
+
+impl GatewayPrivateDelivery {
+    #[must_use]
+    pub const fn broadcaster(&self) -> Option<&GatewayPrivateBroadcasterInput> {
+        match self {
+            Self::Broadcaster(input) => Some(input),
+            Self::SelfBroadcast { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct GatewayPrivateBroadcasterInput {
+    pub fee_token: String,
     pub broadcaster: GatewayBroadcasterChoice,
     pub allow_out_of_range: bool,
     pub favorites_only: bool,
-    pub unwrap: bool,
-    pub native_top_up: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayPrivateSelfBroadcastInput {
+    SelfBroadcast {
+        signer: Option<String>,
+        funding: GatewayPrivateFunding,
+        fee: GatewayPrivateGasFee,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayPrivateFunding {
+    PublicBalance {},
+    Sponsorship { incentive: GatewayPrivateIncentive },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayPrivateIncentive {
+    Economy {},
+    Standard {},
+    Priority {},
+    Custom { percent: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayPrivateGasFee {
+    Auto {},
+    Custom {
+        max_fee_gwei: String,
+        priority_fee_gwei: String,
+    },
 }
 
 #[derive(Clone, Default, Serialize, PartialEq, Eq)]
@@ -72,12 +142,22 @@ pub struct GatewayPrivateDraftEstimate {
     pub network_gas: String,
     pub context: Vec<GatewayPrivateDisplayRow>,
     pub warnings: Vec<String>,
+    /// Formatted presentation from the shared self-broadcast fee model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_broadcast_fees: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_fee_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayPrivateDraftResult {
     Submitted,
+    Confirmed,
+    Reverted,
+    InclusionUnknown,
     Failed,
     TimedOut,
     Stopped,
@@ -93,6 +173,7 @@ pub struct GatewayPrivateDraftProgress {
     pub context: Vec<GatewayPrivateDisplayRow>,
     pub transaction_hash: Option<String>,
     pub stop: bool,
+    pub stop_retries: bool,
     pub stop_waiting: bool,
     pub ban: bool,
     pub favorite: bool,
@@ -139,6 +220,31 @@ pub struct GatewayPrivateDraftOptions {
     pub candidate_count: usize,
     pub specific_label: String,
     pub picker: Option<GatewayPrivateDraftPicker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_broadcast: Option<GatewayPrivateSelfBroadcastOptions>,
+}
+
+#[derive(Clone, Default, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GatewayPrivateSelfBroadcastOptions {
+    pub signers: Vec<GatewayPrivateSignerChoice>,
+    pub default_signer: Option<String>,
+    pub show_sponsorship: bool,
+    pub sponsorship_unavailable: Option<String>,
+    pub signer_error: Option<String>,
+    pub gas_error: Option<String>,
+    pub incentive_error: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GatewayPrivateSignerChoice {
+    pub id: String,
+    pub label: String,
+    pub address_label: String,
+    pub balance_label: String,
+    pub random_candidate: bool,
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, PartialEq, Eq)]

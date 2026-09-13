@@ -26,8 +26,8 @@ use super::public_action::{
 };
 use super::public_broadcaster_cost::{
     PrivateBroadcasterProgressContext, PublicBroadcasterCostDisplay, cost_estimate_detail_text,
-    private_broadcaster_context_row, private_broadcaster_context_row_with_action,
-    render_private_broadcaster_progress_context, render_public_broadcaster_tx_hash_row,
+    private_broadcaster_context_row, render_private_broadcaster_progress_context,
+    render_public_broadcaster_tx_hash_row,
 };
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
@@ -43,6 +43,8 @@ const SPONSORED_CANCEL_ABORT_GRACE: Duration = Duration::from_secs(90);
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 mod gateway;
+#[cfg(test)]
+pub(super) use gateway::gateway_self_broadcast_result;
 mod progress;
 mod types;
 
@@ -579,6 +581,7 @@ impl WalletRoot {
         let kind = progress.kind;
         let key = progress.key;
         let behavior = private_broadcaster_progress_dialog_close_behavior(progress);
+        self.publish_gateway_private_progress();
         match behavior {
             ProgressDialogCloseBehavior::AllAndClear => {
                 match kind {
@@ -1137,7 +1140,9 @@ impl WalletRoot {
                         OperationControl::Ban => {
                             root.add_banned_broadcaster(&address, cx);
                         }
-                        OperationControl::Stop | OperationControl::StopWaiting => {}
+                        OperationControl::Stop
+                        | OperationControl::StopRetries
+                        | OperationControl::StopWaiting => {}
                     });
                 },
             )
@@ -1252,27 +1257,11 @@ fn private_broadcaster_copy_action(id: String, value: String, tooltip: &'static 
         .into_any_element()
 }
 
-fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressState) -> gpui::Div {
-    let recipient = progress.recipient.to_string();
-    let recipient_copy_action = private_broadcaster_copy_action(
-        format!(
-            "private-self-broadcast-recipient-copy-{}",
-            progress.generation_id
-        ),
-        recipient.clone(),
-        "Copy recipient",
-    );
-    let mut context = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(app_strong_text("Transaction context"))
-        .child(private_broadcaster_context_row(
+fn self_broadcast_progress_context_rows(
+    progress: &PrivateBroadcasterProgressState,
+) -> Vec<ui::private_action::DisplayRow> {
+    let mut values = vec![
+        (
             if progress.sponsored_funding {
                 "Transaction signer"
             } else {
@@ -1282,80 +1271,107 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
                 .gas_payer
                 .as_deref()
                 .unwrap_or("Selected Public account")
-                .to_string(),
-        ))
-        .child(private_broadcaster_context_row_with_action(
-            "Recipient",
-            spend_authorization_recipient_display(&recipient),
-            Some(recipient_copy_action),
-        ));
-    if let Some(result) = progress.self_broadcast_result.as_ref() {
-        for (label, value) in self_broadcast_composite_output_rows(progress, result) {
-            context = context.child(private_broadcaster_context_row(label, value));
-        }
-        context = context
-            .child(private_broadcaster_context_row(
+                .to_owned(),
+        ),
+        ("Recipient", progress.recipient.to_string()),
+    ];
+    if let Some(result) = &progress.self_broadcast_result {
+        values.extend(self_broadcast_composite_output_rows(progress, result));
+        values.extend([
+            (
                 "Max fee",
                 format!("{} gwei", format_gwei(result.max_fee_per_gas)),
-            ))
-            .child(private_broadcaster_context_row(
+            ),
+            (
                 "Max tip",
                 format!("{} gwei", format_gwei(result.max_priority_fee_per_gas)),
-            ))
-            .child(private_broadcaster_context_row(
+            ),
+            (
                 "Estimated gas cost",
                 format_native_token_amount_for_display(
                     result.chain_id,
                     result.estimated_native_gas_cost,
                 ),
-            ))
-            .child(private_broadcaster_context_row(
+            ),
+            (
                 "Receipt",
                 match result.tx.receipt() {
                     Some(receipt) if receipt.status => "confirmed",
                     Some(_) => "reverted",
                     None => "inclusion unknown",
                 }
-                .to_string(),
-            ));
+                .into(),
+            ),
+        ]);
         if let Some(receipt) = result.tx.receipt() {
-            context = context.child(private_broadcaster_context_row(
-                "Block",
-                receipt.block_number.to_string(),
-            ));
+            values.push(("Block", receipt.block_number.to_string()));
         }
+    } else if let Some(output) = &progress.recipient_output {
+        values.push(("Recipient receives", output.to_string()));
     }
     if let Some(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt)) =
-        progress.sponsored_self_broadcast_outcome.as_ref()
+        &progress.sponsored_self_broadcast_outcome
     {
-        context = context
-            .child(private_broadcaster_context_row(
+        values.extend([
+            (
                 "Receipt",
                 if receipt.status {
                     "confirmed"
                 } else {
                     "reverted"
                 }
-                .to_owned(),
-            ))
-            .child(private_broadcaster_context_row_with_action(
-                "Transaction hash",
-                receipt.tx_hash.clone(),
-                Some(private_broadcaster_copy_action(
+                .into(),
+            ),
+            ("Transaction hash", receipt.tx_hash.clone()),
+            ("Block", receipt.block_number.to_string()),
+        ]);
+    }
+    values
+        .into_iter()
+        .map(|(label, value)| ui::private_action::DisplayRow {
+            label: label.into(),
+            value,
+            suffix: None,
+        })
+        .collect()
+}
+
+fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressState) -> gpui::Div {
+    let rows = self_broadcast_progress_context_rows(progress)
+        .into_iter()
+        .map(|mut row| {
+            let action = match row.label.as_str() {
+                "Recipient" => {
+                    let action = private_broadcaster_copy_action(
+                        format!(
+                            "private-self-broadcast-recipient-copy-{}",
+                            progress.generation_id
+                        ),
+                        row.value.clone(),
+                        "Copy recipient",
+                    );
+                    row.value = spend_authorization_recipient_display(&row.value);
+                    Some(action)
+                }
+                "Transaction hash" => Some(private_broadcaster_copy_action(
                     format!(
                         "private-self-broadcast-tx-hash-copy-{}",
                         progress.generation_id
                     ),
-                    receipt.tx_hash.clone(),
+                    row.value.clone(),
                     "Copy transaction hash",
                 )),
-            ))
-            .child(private_broadcaster_context_row(
-                "Block",
-                receipt.block_number.to_string(),
-            ));
-    }
-    context
+                _ => None,
+            };
+            (row, action)
+        })
+        .collect();
+    ui::private_submission::transaction_context_with_actions(rows)
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
 }
 
 pub(in crate::root) fn self_broadcast_composite_output_rows(
@@ -1396,16 +1412,15 @@ fn render_private_broadcaster_progress_footer(
         private_broadcaster_progress_stop_available(progress, now),
         private_broadcaster_progress_is_terminal(progress),
     );
-    if progress.flow == PrivateSubmissionProgressFlow::PublicBroadcaster
-        && matches!(action, ProgressFooterAction::Stop)
-    {
+    if matches!(action, ProgressFooterAction::Stop) {
         use ui::private_submission::OperationControl;
-        let control =
-            if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
-                OperationControl::StopWaiting
-            } else {
-                OperationControl::Stop
-            };
+        let control = if progress.sponsored_funding {
+            OperationControl::StopRetries
+        } else if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
+            OperationControl::StopWaiting
+        } else {
+            OperationControl::Stop
+        };
         return ui::private_submission::operation_controls(
             delivery_element_id(progress.key, progress.kind, "progress-controls"),
             [control],

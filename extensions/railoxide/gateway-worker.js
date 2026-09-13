@@ -359,6 +359,7 @@ async function receive(session, bytes) {
         ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
           privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
       publishSnapshot({ ...message, private_actions_supported: privateActions,
+        private_self_broadcast_supported: privateActions && message.private_self_broadcast_supported === true,
         private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
         public_view: message.locked ? null : publicView,
         permissions: message.locked ? [] : (message.permissions ?? []),
@@ -598,20 +599,45 @@ chrome.runtime.onConnect.addListener(port => {
             if (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
                 !bounded(data.wallet, 128) || data.wallet !== uiSnapshot.private_view?.selected_wallet ||
                 data.chain_id !== uiSnapshot.private_view?.selected_chain || !bounded(data.asset, 128) ||
-                !bounded(data.fee_token, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
+                !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
                 !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
                 !['deduct', 'add_on_top'].includes(data.fee_mode) ||
-                !['max', 'allow_out_of_range', 'favorites_only', 'unwrap', 'native_top_up'].every(key => typeof data[key] === 'boolean')) return;
-            const broadcaster = data.broadcaster;
-            if (!broadcaster || !['random', 'specific'].includes(broadcaster.mode) ||
-                (broadcaster.mode === 'specific' && !bounded(broadcaster.id, 1024))) return;
+                !['max', 'unwrap', 'native_top_up'].every(key => typeof data[key] === 'boolean')) return;
             if (data.kind === 'private_send' && (data.unwrap || data.native_top_up)) return;
             prepared = { wallet: data.wallet, chain_id: data.chain_id, kind: data.kind, asset: data.asset,
               amount: data.amount, max: data.max, recipient: data.recipient, address_book_entry: data.address_book_entry,
-              fee_token: data.fee_token, fee_mode: data.fee_mode,
-              broadcaster: broadcaster.mode === 'random' ? { mode: 'random' } : { mode: 'specific', id: broadcaster.id },
-              allow_out_of_range: data.allow_out_of_range, favorites_only: data.favorites_only,
-              unwrap: data.unwrap, native_top_up: data.native_top_up };
+              fee_mode: data.fee_mode, unwrap: data.unwrap, native_top_up: data.native_top_up };
+            if (Object.hasOwn(data, 'delivery')) {
+              const onlyKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+                Object.keys(value).every(key => keys.includes(key));
+              const delivery = data.delivery;
+              if (uiSnapshot.private_self_broadcast_supported !== true ||
+                  !onlyKeys(data, [...Object.keys(prepared), 'delivery']) ||
+                  !onlyKeys(delivery, ['mode', 'signer', 'funding', 'fee']) || delivery.mode !== 'self_broadcast' ||
+                  !(delivery.signer === null || bounded(delivery.signer, 128))) return;
+              const fee = delivery.fee, funding = delivery.funding;
+              if (!fee || !['auto', 'custom'].includes(fee.mode) ||
+                  !onlyKeys(fee, fee.mode === 'custom' ? ['mode', 'max_fee_gwei', 'priority_fee_gwei'] : ['mode']) ||
+                  (fee.mode === 'custom' && (!bounded(fee.max_fee_gwei, 100) || !bounded(fee.priority_fee_gwei, 100)))) return;
+              if (!funding || !['public_balance', 'sponsorship'].includes(funding.mode) ||
+                  !onlyKeys(funding, funding.mode === 'sponsorship' ? ['mode', 'incentive'] : ['mode'])) return;
+              if (funding.mode === 'sponsorship') {
+                const incentive = funding.incentive;
+                if (!incentive || !['economy', 'standard', 'priority', 'custom'].includes(incentive.mode) ||
+                    !onlyKeys(incentive, incentive.mode === 'custom' ? ['mode', 'percent'] : ['mode']) ||
+                    (incentive.mode === 'custom' && !bounded(incentive.percent, 100))) return;
+              }
+              prepared.delivery = { mode: 'self_broadcast', signer: delivery.signer, fee: { ...fee },
+                funding: funding.mode === 'sponsorship' ? { mode: funding.mode, incentive: { ...funding.incentive } } : { mode: funding.mode } };
+            } else {
+              const broadcaster = data.broadcaster;
+              if (!bounded(data.fee_token, 128) || !['allow_out_of_range', 'favorites_only'].every(key => typeof data[key] === 'boolean') ||
+                  !broadcaster || !['random', 'specific'].includes(broadcaster.mode) ||
+                  (broadcaster.mode === 'specific' && !bounded(broadcaster.id, 1024))) return;
+              Object.assign(prepared, { fee_token: data.fee_token,
+                broadcaster: broadcaster.mode === 'random' ? { mode: 'random' } : { mode: 'specific', id: broadcaster.id },
+                allow_out_of_range: data.allow_out_of_range, favorites_only: data.favorites_only });
+            }
           } else {
           if (!data || data.account !== uiSnapshot.public_view?.selected_account || data.chain_id !== uiSnapshot.public_view?.selected_chain ||
               !['send', 'shield'].includes(data.kind) || !bounded(data.asset, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
@@ -639,7 +665,7 @@ chrome.runtime.onConnect.addListener(port => {
           if (!currentDraft || uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
               !['private_send', 'unshield'].includes(currentDraft.input?.kind)) return;
           if (draft.action === 'private_picker') {
-            if (draft.revision !== currentDraft.revision || !bounded(draft.view_id, 128) || !draft.view_id ||
+            if (currentDraft.input?.delivery || draft.revision !== currentDraft.revision || !bounded(draft.view_id, 128) || !draft.view_id ||
                 typeof draft.open !== 'boolean' || !bounded(draft.query, 1024) ||
                 ['attention', 'in_progress', 'done', 'failed'].includes(currentDraft.status)) return;
             value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
@@ -648,7 +674,7 @@ chrome.runtime.onConnect.addListener(port => {
             else if (privatePickers.get(port)?.view_id === draft.view_id) privatePickers.delete(port);
           } else {
             const progress = currentDraft.private_progress;
-            if (!progress || draft.execution_id !== progress.execution_id ||
+            if (!progress || (currentDraft.input?.delivery && uiSnapshot.private_self_broadcast_supported !== true) || draft.execution_id !== progress.execution_id ||
                 !['stop', 'stop_waiting', 'ban', 'favorite'].includes(draft.control) || progress[draft.control] !== true) return;
             value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
               execution_id: draft.execution_id, control: draft.control } };
@@ -658,6 +684,7 @@ chrome.runtime.onConnect.addListener(port => {
           if (!currentDraft) return;
           if (['private_send', 'unshield'].includes(currentDraft.input?.kind) &&
               (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+               (currentDraft.input?.delivery && uiSnapshot.private_self_broadcast_supported !== true) ||
                (draft.action === 'submit' && (draft.revision !== currentDraft.revision || currentDraft.status !== 'ready')))) return;
           const command = { action: draft.action, draft_id: draft.draft_id };
           if (draft.action === 'submit') {

@@ -5,7 +5,7 @@ import { configuration } from './gateway-config.js';
 const isMac = navigator.platform.includes('Mac') || navigator.userAgent.includes('Mac');
 const STARTUP_TIMEOUT_MS = 30_000;
 const REQUIRED_COMPONENT_ICONS = ['check', 'search', 'close', 'inbox', 'loader', 'loader-circle', 'settings', 'copy',
-  'chevron-down', 'chevron-right', 'chevron-left', 'arrow-down', 'triangle-alert', 'circle-check', 'circle-x', 'globe'];
+  'chevron-down', 'chevron-right', 'chevron-left', 'arrow-down', 'triangle-alert', 'circle-check', 'circle-x', 'globe', 'info'];
 const startedAt = 0; // performance.timeOrigin is this document navigation start.
 const shell = document.querySelector('#startup');
 const message = document.querySelector('#startup-message');

@@ -21,10 +21,13 @@ pub use provider::{
 mod private_drafts;
 pub use private_drafts::{
     GatewayBroadcasterChoice, GatewayPrivateAmountMetric, GatewayPrivateAssetChoice,
-    GatewayPrivateDisplayRow, GatewayPrivateDraftControl, GatewayPrivateDraftEstimate,
-    GatewayPrivateDraftInput, GatewayPrivateDraftKind, GatewayPrivateDraftOptions,
-    GatewayPrivateDraftPicker, GatewayPrivateDraftProgress, GatewayPrivateDraftResult,
-    GatewayPrivateFeeMode, GatewayPrivateTopUpOption,
+    GatewayPrivateBroadcasterInput, GatewayPrivateDelivery, GatewayPrivateDisplayRow,
+    GatewayPrivateDraftControl, GatewayPrivateDraftEstimate, GatewayPrivateDraftInput,
+    GatewayPrivateDraftKind, GatewayPrivateDraftOptions, GatewayPrivateDraftPicker,
+    GatewayPrivateDraftProgress, GatewayPrivateDraftResult, GatewayPrivateFeeMode,
+    GatewayPrivateFunding, GatewayPrivateGasFee, GatewayPrivateIncentive,
+    GatewayPrivateSelfBroadcastInput, GatewayPrivateSelfBroadcastOptions,
+    GatewayPrivateSignerChoice, GatewayPrivateTopUpOption,
 };
 mod drafts;
 mod storage;
@@ -253,6 +256,8 @@ pub enum GatewayServerMessage {
         private_view_supported: bool,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         private_actions_supported: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        private_self_broadcast_supported: bool,
         private_view: Option<Box<GatewayPrivateView>>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         wallet_transition: bool,

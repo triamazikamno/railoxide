@@ -499,6 +499,7 @@ impl WalletRoot {
             let mut snapshot = GatewayWalletState {
                 private_view_supported: true,
                 private_actions_supported: unlocked,
+                private_self_broadcast_supported: unlocked,
                 private_view: unlocked.then(|| self.gateway_private_view()),
                 wallet_selection_generation: self.wallet_switch_generation,
                 wallet_transition: matches!(self.vault_state, VaultState::SwitchingWallet),

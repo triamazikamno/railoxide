@@ -1,7 +1,6 @@
 use super::*;
 
-pub(in crate::root) const BLOCK_BUILDER_SPONSORSHIP_LABEL: &str = "Block builder sponsorship";
-pub(in crate::root) const BLOCK_BUILDER_SPONSORSHIP_TOOLTIP: &str = "Allows self-broadcast from an empty or underfunded Public account. A participating block builder funds the account for gas and is atomically reimbursed, with the selected incentive, by a private WETH unshield.";
+pub(in crate::root) use ui::private_action::self_broadcast::SPONSORSHIP_LABEL as BLOCK_BUILDER_SPONSORSHIP_LABEL;
 const SPONSORED_FUNDING_ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +90,7 @@ pub(in crate::root) fn sponsored_estimate_failure_state(
     }
 }
 
-fn sponsored_estimate_from_authorization_limit(
+pub(in crate::root) fn sponsored_estimate_from_authorization_limit(
     chain_id: u64,
     limit: SponsoredAuthorizationLimit,
     expected_fee_per_gas: u128,
@@ -117,20 +116,7 @@ fn sponsored_estimate_from_authorization_limit(
     }))
 }
 
-pub(in crate::root) enum SponsoredFundingEstimateDisplay {
-    PublicBalance(PublicActionFeeDisplay),
-    PublicBalanceError,
-    Ready {
-        expected_sponsorship_cost: String,
-        gas_cost: String,
-        builder_premium: String,
-        primary_unshield_protocol_fee: Option<String>,
-        expected_excess_deposit: String,
-        maximum_spend: String,
-        show_excess_deposit_breakdown: bool,
-    },
-    Error(String),
-}
+pub(in crate::root) use ui::private_action::self_broadcast::FeeDisplay as SponsoredFundingEstimateDisplay;
 
 pub(in crate::root) fn sponsored_excess_deposit_breakdown_visible(
     excess_deposit: U256,
@@ -203,16 +189,14 @@ impl WalletRoot {
                         .collect::<Vec<_>>()
                         .join(" + ")
                 });
-                SponsoredFundingEstimateDisplay::PublicBalance(PublicActionFeeDisplay {
-                    gas_limit: None,
-                    expected_gas_cost: Some(format_gas_cost(gas_cost.expected_cost)),
-                    maximum_gas_cost: Some(format_gas_cost(gas_cost.maximum_cost)),
-                    show_maximum_gas_cost: public_action_maximum_gas_cost_is_significant(
+                SponsoredFundingEstimateDisplay::PublicBalance {
+                    expected_gas_cost: format_gas_cost(gas_cost.expected_cost),
+                    maximum_gas_cost: public_action_maximum_gas_cost_is_significant(
                         gas_cost.expected_cost,
                         gas_cost.maximum_cost,
-                    ),
+                    ).then(|| format_gas_cost(gas_cost.maximum_cost)),
                     protocol_fee,
-                })
+                }
             }
             SponsoredFundingEstimateState::PublicBalanceUnavailable => {
                 SponsoredFundingEstimateDisplay::PublicBalanceError

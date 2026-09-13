@@ -186,10 +186,12 @@ impl DraftForm {
             Some("Amount is too long.")
         } else if text(&self.input, "recipient").len() > 1024 {
             Some("Recipient is too long.")
-        } else if text(&self.input["fee"], "max_fee_gwei").len() > 100
-            || text(&self.input["fee"], "priority_fee_gwei").len() > 100
+        } else if text(draft_fee(&self.input), "max_fee_gwei").len() > 100
+            || text(draft_fee(&self.input), "priority_fee_gwei").len() > 100
         {
             Some("Gas fee is too long.")
+        } else if text(&self.input["delivery"]["funding"]["incentive"], "percent").len() > 100 {
+            Some("Incentive is too long.")
         } else {
             None
         }
@@ -198,6 +200,22 @@ impl DraftForm {
 
 fn text(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_owned()
+}
+
+fn draft_fee(input: &Value) -> &Value {
+    if input["wallet"].is_string() {
+        &input["delivery"]["fee"]
+    } else {
+        &input["fee"]
+    }
+}
+
+fn draft_fee_mut(input: &mut Value) -> &mut Value {
+    if input["wallet"].is_string() {
+        &mut input["delivery"]["fee"]
+    } else {
+        &mut input["fee"]
+    }
 }
 fn send(command: &Value) {
     host_command(
@@ -271,11 +289,21 @@ impl GatewayView {
                     }
                     if draft.revision == form.revision
                         && draft.input == form.input
-                        && draft.estimate["amount"].is_string()
                         && (form.input["asset"] == "native" || form.private.is_some())
                         && form.input["max"] == true
+                        && let Some(amount) = draft.estimate["amount"]
+                            .as_str()
+                            .filter(|amount| !amount.is_empty())
+                            .or_else(|| {
+                                form.private.as_ref()?;
+                                draft.private_options["assets"]
+                                    .as_array()?
+                                    .iter()
+                                    .find(|asset| asset["id"] == form.input["asset"])?["max_amount"]
+                                    .as_str()
+                            })
                     {
-                        let amount = text(&draft.estimate, "amount");
+                        let amount = amount.to_owned();
                         if form.amount.read(cx).value().as_ref() != amount {
                             form.setting_max = Some(amount.clone());
                             form.amount
@@ -300,7 +328,8 @@ impl GatewayView {
                 self.handoff_open = false;
             }
             if draft.status == "done"
-                && !draft.input["wallet"].is_string()
+                && (!draft.input["wallet"].is_string()
+                    || draft.private_progress["result"] == "confirmed")
                 && self.completed_draft.as_ref() != Some(&draft.id)
             {
                 self.completed_draft = Some(draft.id.clone());
@@ -436,12 +465,12 @@ impl GatewayView {
                     cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder("max fee gwei")
-                            .default_value(text(&input["fee"], "max_fee_gwei"))
+                            .default_value(text(draft_fee(&input), "max_fee_gwei"))
                     }),
                     cx.new(|cx| {
                         InputState::new(window, cx)
                             .placeholder("max tip gwei")
-                            .default_value(text(&input["fee"], "priority_fee_gwei"))
+                            .default_value(text(draft_fee(&input), "priority_fee_gwei"))
                     }),
                 )
             },
@@ -523,12 +552,13 @@ impl GatewayView {
                             }
                             _ => {
                                 // Seeding from a quote already updated the canonical input.
-                                if form.input["fee"]["mode"] != "custom"
-                                    || form.input["fee"][field].as_str() == Some(value.as_str())
+                                if draft_fee(&form.input)["mode"] != "custom"
+                                    || draft_fee(&form.input)[field].as_str()
+                                        == Some(value.as_str())
                                 {
                                     return;
                                 }
-                                form.input["fee"][field] = value.into();
+                                draft_fee_mut(&mut form.input)[field] = value.into();
                             }
                         }
                     }
@@ -578,6 +608,8 @@ impl GatewayView {
         let form = self.draft_form.as_ref()?;
         let draft = self.draft.as_ref().filter(|draft| {
             form.id.as_ref() == Some(&draft.id)
+                && form.input["wallet"] == draft.input["wallet"]
+                && form.input["delivery"]["mode"] == draft.input["delivery"]["mode"]
                 && ["account", "chain_id", "kind", "mimic_railway"]
                     .iter()
                     .all(|key| form.input[key] == draft.input[key])
@@ -598,21 +630,26 @@ impl GatewayView {
         let Some(form) = &mut self.draft_form else {
             return;
         };
+        let private = form.input["wallet"].is_string();
+        if private && form.input["delivery"]["mode"] != "self_broadcast" {
+            return;
+        }
+        let auto = if private { "auto" } else { "normal" };
         match event {
             GasFeeEditorEvent::Refresh => {
-                if form.input["fee"]["mode"] != "normal" {
+                if draft_fee(&form.input)["mode"] != auto {
                     return;
                 }
             }
             GasFeeEditorEvent::Mode(GasFeeMode::Auto) => {
-                if form.input["fee"]["mode"] == "normal" {
+                if draft_fee(&form.input)["mode"] == auto {
                     return;
                 }
-                form.input["fee"] = json!({"mode":"normal"});
+                *draft_fee_mut(&mut form.input) = json!({"mode":auto});
             }
             GasFeeEditorEvent::Mode(GasFeeMode::Custom) | GasFeeEditorEvent::Edit(_) => {
                 let edit = matches!(event, GasFeeEditorEvent::Edit(_));
-                if !edit && form.input["fee"]["mode"] == "custom" {
+                if !edit && draft_fee(&form.input)["mode"] == "custom" {
                     return;
                 }
                 if edit
@@ -628,7 +665,7 @@ impl GatewayView {
                         return;
                     }
                 }
-                form.input["fee"] = json!({
+                *draft_fee_mut(&mut form.input) = json!({
                     "mode":"custom",
                     "max_fee_gwei":form.max_fee.read(cx).value().to_string(),
                     "priority_fee_gwei":form.priority_fee.read(cx).value().to_string(),
@@ -812,6 +849,11 @@ impl GatewayView {
         let Some(form) = &self.draft_form else {
             return;
         };
+        if form.input["delivery"]["mode"] == "self_broadcast"
+            && !self.private_view.self_broadcast_supported
+        {
+            return;
+        }
         let Some(draft) = self.draft.as_ref().filter(|draft| {
             draft.status == "ready"
                 && form.id.as_ref() == Some(&draft.id)
@@ -955,7 +997,7 @@ impl GatewayView {
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     if matches!(kind.as_str(), "private_send" | "unshield") {
-                                        this.open_private_draft(&kind, window, cx);
+                                        this.open_private_draft(&kind, None, window, cx);
                                     } else {
                                         this.open_draft(&kind, None, window, cx);
                                     }

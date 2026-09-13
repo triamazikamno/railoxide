@@ -52,6 +52,7 @@ pub struct GatewayWalletState {
     pub public_view: super::GatewayPublicView,
     pub private_view_supported: bool,
     pub private_actions_supported: bool,
+    pub private_self_broadcast_supported: bool,
     pub private_view: Option<super::GatewayPrivateView>,
     /// Fences Home selection dispatch without changing dapp grant ownership.
     pub wallet_selection_generation: u64,
@@ -92,6 +93,7 @@ impl GatewayWalletState {
         self.same_authority(other)
             && self.public_view == other.public_view
             && self.private_actions_supported == other.private_actions_supported
+            && self.private_self_broadcast_supported == other.private_self_broadcast_supported
             && self.private_view_supported == other.private_view_supported
             && self.private_view == other.private_view
             && self.wallet_selection_generation == other.wallet_selection_generation
@@ -1637,6 +1639,7 @@ impl DappProvider {
             public_view,
             private_view_supported: self.wallet.private_view_supported,
             private_actions_supported: self.wallet.private_actions_supported,
+            private_self_broadcast_supported: self.wallet.private_self_broadcast_supported,
             private_view: peer_id.and_then(|_| self.wallet.private_view.clone().map(Box::new)),
             wallet_transition: self.wallet.wallet_transition,
             chains: self

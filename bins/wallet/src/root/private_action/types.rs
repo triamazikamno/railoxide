@@ -21,7 +21,6 @@ pub(in crate::root) const SEND_AUTHORIZATION_FAILED_ERROR: &str =
 #[cfg(test)]
 pub(in crate::root) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster unshield spend: unlock failed";
-pub(in crate::root) const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected gas payer, RPC metadata, and transaction timing to this action.";
 pub(in crate::root) const SELF_BROADCAST_ZERO_GAS_PAYER_WARNING: &str = "Selected gas payer has 0 native balance on this chain. Choose another Public account or fund this account before self-broadcasting.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

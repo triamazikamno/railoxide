@@ -109,13 +109,13 @@ def package(metadata_path):
         shared_icons = stage / 'assets/ui/icons'
         shared_icons.mkdir(parents=True)
         for name in ('shield', 'arrow-big-right-dash', 'book-user', 'wallet', 'pencil', 'refresh-ccw',
-                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye', 'dices'):
+                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye'):
             path = shared_icons / f'{name}.svg'
             shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
             asset_paths.append(path.relative_to(stage / 'assets').as_posix())
         wallet_icons = stage / 'assets/railgun/icons'
         wallet_icons.mkdir(parents=True)
-        for name in ('clock.svg', 'ledger-logo-short-white.svg', 'trezor-symbol-white-rgb.svg'):
+        for name in ('clock.svg', 'dices.svg', 'ledger-logo-short-white.svg', 'trezor-symbol-white-rgb.svg'):
             path = wallet_icons / name
             shutil.copy2(ROOT / 'bins/wallet/assets/icons' / name, path)
             asset_paths.append(path.relative_to(stage / 'assets').as_posix())

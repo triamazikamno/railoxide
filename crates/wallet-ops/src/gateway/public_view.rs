@@ -59,6 +59,16 @@ impl DappProvider {
                 {
                     return None;
                 }
+                let self_broadcast = matches!(draft.as_ref(),
+                    super::super::GatewayDraftCommand::Create { input: super::super::GatewayDraftPayload::Private(input), .. }
+                    | super::super::GatewayDraftCommand::Update { input: super::super::GatewayDraftPayload::Private(input), .. }
+                    if matches!(input.delivery, super::super::GatewayPrivateDelivery::SelfBroadcast { .. }));
+                if self_broadcast
+                    && (!self.wallet.private_self_broadcast_supported
+                        || !self.authority.borrow().private_self_broadcast_supported)
+                {
+                    return None;
+                }
                 return Some(command);
             }
             GatewayPublicCommand::RefreshBalances => {

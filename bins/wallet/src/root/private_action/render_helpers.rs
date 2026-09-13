@@ -166,16 +166,6 @@ pub(in crate::root) fn private_action_info_tooltip_width(
     (available_width > px(0.0)).then(|| available_width.min(PRIVATE_ACTION_INFO_TOOLTIP_MAX_WIDTH))
 }
 
-pub(in crate::root) fn render_private_action_info_icon(
-    id: SharedString,
-    title: &'static str,
-    detail: &'static str,
-) -> impl IntoElement {
-    render_private_action_info_icon_with_body(id, title, move || {
-        div().child(detail).into_any_element()
-    })
-}
-
 pub(in crate::root) fn render_private_action_info_icon_with_body(
     id: SharedString,
     title: &'static str,
@@ -240,66 +230,6 @@ fn render_private_action_tooltip_icon(
             })
             .build(window, cx)
         })
-}
-
-pub(in crate::root) fn private_action_segment_button(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-) -> Button {
-    private_action_segment_button_with_accessory(id, label, selected, None)
-}
-
-pub(in crate::root) fn private_action_segment_button_with_accessory(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-    accessory: Option<gpui::AnyElement>,
-) -> Button {
-    let button = app_button_base(id)
-        .flex_1()
-        .min_w(px(0.0))
-        .selected(selected)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(app_button_label(label))
-                .children(accessory),
-        );
-    if selected { button.primary() } else { button }
-}
-
-pub(in crate::root) fn render_self_broadcast_privacy_icon(id: SharedString) -> gpui::AnyElement {
-    render_private_action_tooltip_icon(
-        id,
-        IconName::TriangleAlert,
-        theme::WARNING,
-        theme::WARNING,
-        "Privacy warning",
-        move || {
-            div()
-                .child(SELF_BROADCAST_PRIVACY_WARNING)
-                .into_any_element()
-        },
-    )
-    .into_any_element()
-}
-
-pub(in crate::root) fn render_self_broadcast_gas_payer_warning_icon(
-    id: SharedString,
-) -> gpui::AnyElement {
-    Button::new(id)
-        .text()
-        .xsmall()
-        .compact()
-        .icon(IconName::TriangleAlert)
-        .text_color(rgb(theme::DANGER))
-        .accessibility_label(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
-        .tooltip(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
-        .into_any_element()
 }
 
 pub(in crate::root) fn render_send_result(

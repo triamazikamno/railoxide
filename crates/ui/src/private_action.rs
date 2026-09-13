@@ -1,4 +1,5 @@
 //! Portable private-action presentation. Callers own amounts, eligibility and commands.
+pub mod self_broadcast;
 use gpui::{
     App, Div, ElementId, IntoElement, ParentElement, SharedString, Styled, Window, div, relative,
     rems, rgb,
@@ -154,9 +155,14 @@ pub fn broadcaster_settings(
     div().child(
         div()
             .id(id)
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_2()
+            .p_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
             .child(
                 // The pinned Switch stores its tooltip but does not render it.
                 div()
@@ -202,7 +208,7 @@ pub fn broadcaster_settings(
                     .child(
                         app_segment_button(
                             "random",
-                            "Random broadcaster",
+                            "Random",
                             settings.random_selected,
                             selector_disabled,
                             None,
