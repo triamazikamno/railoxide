@@ -1,9 +1,10 @@
 ## Install from the desktop app
 
 A desktop build serves the extension only if `target/browser-extension.zip`, or the file named by
-`RAILOXIDE_EXTENSION_BUNDLE`, existed when that build was made. The packaging scripts in this
-repository do not build the extension yet, so run `scripts/build-browser-extension` before
-building a desktop app that should carry it.
+`RAILOXIDE_EXTENSION_BUNDLE`, existed when that build was made. The source installers, macOS
+packager, Flatpak builds, and Nix package build and embed the extension automatically.
+For a manual Cargo build, run `scripts/build-browser-extension` first and set
+`RAILOXIDE_EXTENSION_BUNDLE` to the absolute ZIP path when building the wallet.
 
 1. Open **Browser pairing** in the desktop sidebar and turn on **Enable browser gateway**.
 2. Choose **Install extension…** under **Paired browsers**.

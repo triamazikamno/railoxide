@@ -7,6 +7,8 @@ on:
       - Cargo.toml
       - bins/wallet/**
       - crates/**
+      - extensions/**
+      - scripts/*browser-extension*
       - scripts/build-wallet-flatpak
       - scripts/package-wallet-flatpak-release
       - .github/workflows/flatpak-ci.yml
@@ -19,6 +21,8 @@ on:
       - Cargo.toml
       - bins/wallet/**
       - crates/**
+      - extensions/**
+      - scripts/*browser-extension*
       - scripts/build-wallet-flatpak
       - scripts/package-wallet-flatpak-release
       - .github/workflows/flatpak-ci.yml
@@ -54,6 +58,8 @@ jobs:
             --generator-metadata out/flatpak/generated/generator-metadata
           cp -- bins/wallet/packaging/flatpak/rust-toolchain.yml \
             out/flatpak/generated/rust-toolchain.yml
+          cp -- bins/wallet/packaging/flatpak/wasm-bindgen.yml \
+            out/flatpak/generated/wasm-bindgen.yml
 
       - name: Upload Cargo sources
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -118,8 +124,8 @@ jobs:
           flatpak install --user --noninteractive --assumeyes "out/flatpak/RailOxide-no-hardware-${{ matrix.arch }}.flatpak"
           flatpak run --user "$app_id//stable" --help
           flatpak run --user "$app_id//stable-no-hardware" --help
-          flatpak run --user --command=sh "$app_id//stable" -c 'test ! -e /app/lib/railoxide-rust'
-          flatpak run --user --command=sh "$app_id//stable-no-hardware" -c 'test ! -e /app/lib/railoxide-rust'
+          flatpak run --user --command=sh "$app_id//stable" -c 'test ! -e /app/lib/railoxide-rust && test ! -e /app/lib/railoxide-wasm-bindgen'
+          flatpak run --user --command=sh "$app_id//stable-no-hardware" -c 'test ! -e /app/lib/railoxide-rust && test ! -e /app/lib/railoxide-wasm-bindgen'
 
           hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable")"
           no_hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable-no-hardware")"

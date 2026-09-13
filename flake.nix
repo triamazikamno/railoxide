@@ -18,6 +18,7 @@
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
+          targets = [ "wasm32-unknown-unknown" ];
         };
 
         rustPlatform = pkgs.makeRustPlatform {
@@ -27,6 +28,28 @@
 
         isLinux = pkgs.stdenv.isLinux;
         isDarwin = pkgs.stdenv.isDarwin;
+
+        extensionTools = builtins.fromJSON (builtins.readFile ./scripts/browser-extension-tools.json);
+        bindgenTarget = {
+          x86_64-linux = "x86_64-unknown-linux-musl";
+          aarch64-linux = "aarch64-unknown-linux-musl";
+          x86_64-darwin = "x86_64-apple-darwin";
+          aarch64-darwin = "aarch64-apple-darwin";
+        }.${system};
+        wasmBindgen = pkgs.stdenvNoCC.mkDerivation {
+          pname = "wasm-bindgen-cli";
+          version = extensionTools.version;
+          src = pkgs.fetchurl {
+            url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${extensionTools.version}/wasm-bindgen-${extensionTools.version}-${bindgenTarget}.tar.gz";
+            sha256 = extensionTools.targets.${bindgenTarget};
+          };
+          dontStrip = true;
+          installPhase = ''
+            install -Dm755 wasm-bindgen $out/bin/wasm-bindgen
+            install -Dm644 LICENSE-MIT $out/share/licenses/wasm-bindgen/LICENSE-MIT
+            install -Dm644 LICENSE-APACHE $out/share/licenses/wasm-bindgen/LICENSE-APACHE
+          '';
+        };
 
         walletCargoToml = builtins.fromTOML (builtins.readFile ./bins/wallet/Cargo.toml);
 
@@ -51,14 +74,7 @@
         ];
 
         darwinBuildInputs = with pkgs; [
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-          darwin.apple_sdk.frameworks.ApplicationServices
-          darwin.apple_sdk.frameworks.CoreFoundation
-          darwin.apple_sdk.frameworks.Cocoa
-          darwin.apple_sdk.frameworks.Metal
-          darwin.apple_sdk.frameworks.QuartzCore
-          darwin.apple_sdk.frameworks.IOKit
+          apple-sdk
         ];
 
         nativeBuildInputs = with pkgs; [
@@ -68,7 +84,8 @@
           libclang.lib
           rustPlatform.bindgenHook
           makeWrapper
-        ] ++ (if isLinux then [
+          python3
+        ] ++ [ wasmBindgen ] ++ (if isLinux then [
           wayland-protocols
           libxkbcommon
         ] else []);
@@ -98,8 +115,14 @@
 
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 
+          preBuild = ''
+            CARGO_TOOLCHAIN= CARGO_NET_OFFLINE=true scripts/build-browser-extension
+            export RAILOXIDE_EXTENSION_BUNDLE="$PWD/target/browser-extension.zip"
+          '';
+
           postInstall = ''
             mv $out/bin/wallet $out/bin/railoxide
+            python3 scripts/verify-browser-extension.py $out/bin/railoxide "$RAILOXIDE_EXTENSION_BUNDLE"
           '';
 
           postFixup = pkgs.lib.optionalString isLinux ''
@@ -125,6 +148,8 @@
             pkgs.cmake
             pkgs.clang
             pkgs.libclang.lib
+            pkgs.python3
+            wasmBindgen
           ] ++ (if isLinux then (with pkgs; [
             openssl
             sqlite
@@ -147,6 +172,8 @@
           ]) else if isDarwin then darwinBuildInputs else []);
 
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+
+          CARGO_TOOLCHAIN = "";
 
           shellHook = ''
             echo "RailOxide dev shell"

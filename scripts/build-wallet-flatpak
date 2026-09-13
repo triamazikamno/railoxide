@@ -205,10 +205,14 @@ EOF
 fi
 [[ -z "$generator_metadata_path" ]] || die "--generator-metadata requires --generate-sources"
 rust_toolchain_source="$packaging_dir/rust-toolchain.yml"
+wasm_bindgen_source="$packaging_dir/wasm-bindgen.yml"
 if [[ -n "$cargo_sources" ]]; then
   rust_toolchain_source="$(dirname -- "$cargo_sources")/rust-toolchain.yml"
+  wasm_bindgen_source="$(dirname -- "$cargo_sources")/wasm-bindgen.yml"
   [[ -f "$rust_toolchain_source" && -r "$rust_toolchain_source" ]] \
     || die "Cargo source sibling rust-toolchain.yml must be a readable regular file: $rust_toolchain_source"
+  [[ -f "$wasm_bindgen_source" && -r "$wasm_bindgen_source" ]] \
+    || die "Cargo source sibling wasm-bindgen.yml must be a readable regular file: $wasm_bindgen_source"
 fi
 
 require_command flatpak
@@ -309,6 +313,7 @@ Path(sys.argv[2]).write_text(source, encoding="utf-8")
 PY
 
 cp -- "$rust_toolchain_source" "$rust_toolchain_manifest"
+cp -- "$wasm_bindgen_source" "$temporary_dir/wasm-bindgen.yml"
 
 builder_args=(
   --arch="$arch"

@@ -115,8 +115,11 @@ done
 [[ -n "$output_dir" ]] || die "--output-dir is required"
 [[ -n "$cargo_sources" && -f "$cargo_sources" ]] || die "--cargo-sources must name an existing file"
 rust_toolchain_source="$(dirname -- "$cargo_sources")/rust-toolchain.yml"
+wasm_bindgen_source="$(dirname -- "$cargo_sources")/wasm-bindgen.yml"
 [[ -f "$rust_toolchain_source" && -r "$rust_toolchain_source" ]] \
   || die "Cargo source sibling rust-toolchain.yml must be a readable regular file: $rust_toolchain_source"
+[[ -f "$wasm_bindgen_source" && -r "$wasm_bindgen_source" ]] \
+  || die "Cargo source sibling wasm-bindgen.yml must be a readable regular file: $wasm_bindgen_source"
 [[ -n "$generator_metadata" && -f "$generator_metadata" ]] || die "--generator-metadata must name an existing file"
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || die "--source-commit must be a full lowercase Git SHA"
 [[ -n "$gpg_key_id" ]] || die "--gpg-key-id is required"
@@ -212,7 +215,9 @@ done
 
 cp -- "$cargo_sources" "$provenance_dir/cargo-sources.json"
 cp -- "$rust_toolchain_source" "$provenance_dir/rust-toolchain.yml"
+cp -- "$wasm_bindgen_source" "$provenance_dir/wasm-bindgen.yml"
 rust_toolchain_manifest_sha256="$(sha256sum "$provenance_dir/rust-toolchain.yml" | awk '{print $1}')"
+wasm_bindgen_manifest_sha256="$(sha256sum "$provenance_dir/wasm-bindgen.yml" | awk '{print $1}')"
 printf '%s\n' "$source_commit" >"$provenance_dir/SOURCE-COMMIT"
 generator_commit="$(sed -n 's/^flatpak_cargo_generator_commit=//p' "$generator_metadata")"
 generator_sha256="$(sed -n 's/^flatpak_cargo_generator_sha256=//p' "$generator_metadata")"
@@ -222,6 +227,7 @@ cat >"$provenance_dir/BUILD-INPUTS" <<EOF
 source_commit=$source_commit
 builder_image_digest=$builder_image_digest
 rust_toolchain_manifest_sha256=$rust_toolchain_manifest_sha256
+wasm_bindgen_manifest_sha256=$wasm_bindgen_manifest_sha256
 flatpak_cargo_generator_commit=$generator_commit
 flatpak_cargo_generator_sha256=$generator_sha256
 EOF

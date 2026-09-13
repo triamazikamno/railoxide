@@ -16,19 +16,24 @@ finish-args:
   - --require-version=1.16.0
 modules:
   - rust-toolchain.yml
+  - wasm-bindgen.yml
   - name: railoxide
     buildsystem: simple
     build-options:
-      prepend-path: /app/lib/railoxide-rust/bin
+      prepend-path: /app/lib/railoxide-rust/bin:/app/lib/railoxide-wasm-bindgen/bin
       env:
         CARGO_HOME: /run/build/railoxide/cargo
         CARGO_NET_OFFLINE: "true"
+        CARGO_TOOLCHAIN: ""
+        RAILOXIDE_EXTENSION_BUNDLE: /run/build/railoxide/target/browser-extension.zip
         RAILOXIDE_BUILD_GIT_SHORT_HASH: "@GIT_SHORT_HASH@"
         RAILOXIDE_RELEASE_DATE: "@RELEASE_DATE@"
         RAILOXIDE_RELEASE_TYPE: "@RELEASE_TYPE@"
         RAILOXIDE_RELEASE_VERSION: "@RELEASE_VERSION@"
     build-commands:
+      - scripts/build-browser-extension
       - cargo build --frozen --release -p wallet --features hardware
+      - python3 scripts/verify-browser-extension.py target/release/wallet target/browser-extension.zip
       - install -Dm0755 target/release/wallet ${FLATPAK_DEST}/bin/io.github.triamazikamno.RailOxide
       - install -Dm0644 LICENSE ${FLATPAK_DEST}/share/licenses/io.github.triamazikamno.RailOxide/LICENSE
       - install -Dm0644 bins/wallet/packaging/flatpak/io.github.triamazikamno.RailOxide.desktop ${FLATPAK_DEST}/share/applications/io.github.triamazikamno.RailOxide.desktop

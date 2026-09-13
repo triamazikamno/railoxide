@@ -4,6 +4,13 @@ set -euo pipefail
 browser_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$browser_root"
 
+# An empty toolchain selects a standalone Cargo, as used by Flatpak and Nix.
+cargo_command=("${CARGO_BIN:-cargo}")
+cargo_toolchain="${CARGO_TOOLCHAIN-stable}"
+if [[ -n "$cargo_toolchain" ]]; then
+  cargo_command+=("+$cargo_toolchain")
+fi
+
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo 'Missing wasm-bindgen 0.2.126. See docs/browser-extension.md for the pinned installation command.' >&2
   exit 1
@@ -18,8 +25,8 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # wasm_thread requires the unstable stdarch_wasm_atomic_wait feature on WASM.
-RUSTC_BOOTSTRAP=1 cargo +stable build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked
+RUSTC_BOOTSTRAP=1 "${cargo_command[@]}" build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked
 browser_metadata="$(mktemp)"
 trap 'rm -f -- "$browser_metadata"' EXIT
-cargo +stable metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "$browser_metadata"
+"${cargo_command[@]}" metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "$browser_metadata"
 python3 scripts/package-browser-extension.py "$browser_metadata"

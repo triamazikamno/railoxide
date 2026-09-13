@@ -42,13 +42,16 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 - Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
 - Installs Rust `1.97.1` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
+- Builds and embeds the browser extension before compiling the wallet, and verifies the embedded ZIP.
+- Adds the WASM target to the selected Rust toolchain and prepares Python 3 and exactly wasm-bindgen 0.2.126. A matching helper on `PATH` is reused; otherwise the installer downloads a checksum-pinned upstream binary into the checkout's `target/browser-extension-tools` directory.
 - Prints the exact source commit before building.
 - Refuses to run as root on macOS/Linux.
 - Uses `sudo` only for Ubuntu/Debian system package installation.
 
 ## macOS
 
-The installer checks for Apple Command Line Tools, Rust, and Git.
+The installer checks for Apple Command Line Tools, Rust, Git, and Python 3. If Python 3
+is missing and Homebrew is available, it offers to install Python through Homebrew.
 
 The wallet uses Metal GPU acceleration. Apple Command Line Tools are sufficient; full Xcode is not required.
 
@@ -86,6 +89,8 @@ It also installs a desktop entry and icon under `~/.local/share`.
 ## Windows
 
 The Windows installer uses `winget` to install missing dependencies from [`build-wallet-windows.md`](build-wallet-windows.md), including Git, Rustup, CMake, LLVM, and Visual Studio Build Tools.
+
+Extension builds also require Python 3, which the installer can install through winget.
 
 It builds the x64 MSVC target:
 

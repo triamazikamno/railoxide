@@ -1,0 +1,10 @@
+{
+  "version": "0.2.126",
+  "targets": {
+    "aarch64-apple-darwin": "7df536babe345deb68828148dbdc71179118afdab42d83547c7cebfbf1426bd5",
+    "aarch64-unknown-linux-musl": "2245120254a9f6c9a9adf3601f3d52bb31309219e9ceab7696e74e24885c440a",
+    "x86_64-apple-darwin": "6014dca993c8bf8a6ec10b6fccfbeabf599842d011f58a4abb7669afef784422",
+    "x86_64-pc-windows-msvc": "5a3773c7e69cfb2d865e235e9210de184c8c3af1787720646ec1a8bbe09c6179",
+    "x86_64-unknown-linux-musl": "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d"
+  }
+}

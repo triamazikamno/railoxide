@@ -75,6 +75,8 @@ jobs:
             --generator-metadata out/flatpak/generated/generator-metadata
           cp -- bins/wallet/packaging/flatpak/rust-toolchain.yml \
             out/flatpak/generated/rust-toolchain.yml
+          cp -- bins/wallet/packaging/flatpak/wasm-bindgen.yml \
+            out/flatpak/generated/wasm-bindgen.yml
 
       - name: Upload Cargo sources
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

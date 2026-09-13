@@ -2,6 +2,9 @@
 
 RailOxide publishes two Linux Flatpak variants from the same source and signed update repository.
 
+Both variants include the browser extension. Use **Browser pairing** in the app to
+[download and install it](browser-extension.md#install-from-the-desktop-app).
+
 | Variant | Branch | Hardware feature | Raw USB |
 | --- | --- | --- | --- |
 | Default | `stable` | Enabled | Enabled |

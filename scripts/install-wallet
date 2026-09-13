@@ -23,7 +23,7 @@ RailOxide source installer.
 
 This installer builds RailOxide from source. By default it prompts for the
 source to build and defaults to the latest published GitHub release, including
-pre-releases. It does not install prebuilt binaries.
+pre-releases. The wallet and extension are built locally; build helpers may be downloaded.
 
 Usage:
   install-wallet [options]
@@ -250,6 +250,7 @@ dry_run_plan() {
   printf 'source checkout: %s\n' "$source_dir"
   printf 'system dependencies: %s\n' "$([[ "$install_deps" -eq 1 ]] && printf yes || printf no)"
   printf 'hardware support: %s\n' "$([[ "$hardware" -eq 1 ]] && printf yes || printf no)"
+  printf 'browser extension: build and embed when supported by the selected source; requires Python 3, the WASM target, and pinned wasm-bindgen\n'
   printf 'detected OS: %s\n' "$os_name"
   if [[ "$os_name" == "Darwin" ]]; then
     printf 'would install: ~/Applications/RailOxide.app and %s/bin/railoxide-wallet\n' "$prefix"
@@ -356,6 +357,7 @@ ensure_linux_packages() {
     libxkbcommon-x11-dev
     libzstd-dev
     pipewire
+    python3
     xdg-desktop-portal
   )
 
@@ -529,6 +531,31 @@ current_source_commit() {
   git -C "$source_dir" rev-parse HEAD
 }
 
+ensure_extension_dependencies() {
+  if [[ ! -f "$source_dir/scripts/build-browser-extension" ]]; then
+    log 'selected source predates the browser extension; skipping extension tools'
+    return
+  fi
+  if ! command_exists python3; then
+    [[ "$install_deps" -eq 1 ]] || die 'Python 3 is required for the browser extension; --no-deps was provided'
+    if [[ "$(uname -s)" == Darwin ]] && command_exists brew; then
+      confirm 'Install Python 3 with Homebrew for the browser extension?' || die 'Python 3 is required'
+      run brew install python
+    else
+      die 'install Python 3 and rerun the installer'
+    fi
+  fi
+  command_exists python3 || die 'Python 3 is still unavailable'
+  run rustup target add wasm32-unknown-unknown --toolchain "$toolchain"
+  if ! command_exists wasm-bindgen || [[ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.126' ]]; then
+    [[ "$install_deps" -eq 1 ]] || die 'wasm-bindgen 0.2.126 is required; --no-deps was provided'
+    confirm 'Download the checksum-pinned wasm-bindgen 0.2.126 build helper?' || die 'wasm-bindgen is required'
+    local tools_dir="$source_dir/target/browser-extension-tools"
+    run python3 "$source_dir/scripts/install-browser-extension-tools.py" "$tools_dir"
+    export PATH="$tools_dir/bin:$PATH"
+  fi
+}
+
 base_features() {
   if [[ "$hardware" -eq 1 ]]; then
     printf 'hardware\n'
@@ -537,16 +564,24 @@ base_features() {
   fi
 }
 
-build_linux() {
+build_linux() (
   local features
   features="$(base_features)"
+  if [[ -f "$source_dir/scripts/build-browser-extension" ]]; then
+    run env CARGO_TOOLCHAIN="$toolchain" "$source_dir/scripts/build-browser-extension"
+    export RAILOXIDE_EXTENSION_BUNDLE="$source_dir/target/browser-extension.zip"
+    [[ -s "$RAILOXIDE_EXTENSION_BUNDLE" ]] || die 'extension build did not produce a ZIP'
+  fi
   log 'building RailOxide wallet release binary'
   if [[ -n "$features" ]]; then
     run cargo "+$toolchain" build --release -p wallet --features "$features"
   else
     run cargo "+$toolchain" build --release -p wallet
   fi
-}
+  if [[ -f "$source_dir/scripts/build-browser-extension" ]]; then
+    run python3 "$source_dir/scripts/verify-browser-extension.py" "$source_dir/target/release/wallet" "$RAILOXIDE_EXTENSION_BUNDLE"
+  fi
+)
 
 install_linux_binary() {
   local bin_dir dst src
@@ -643,6 +678,7 @@ main() {
     ensure_source_checkout
     log "building source commit $(current_source_commit)"
     cd "$source_dir"
+    ensure_extension_dependencies
     build_and_install_macos
     smoke_test "$os_name"
     log "installed RailOxide.app to $HOME/Applications/RailOxide.app"
@@ -654,6 +690,7 @@ main() {
     ensure_source_checkout
     log "building source commit $(current_source_commit)"
     cd "$source_dir"
+    ensure_extension_dependencies
     build_linux
     install_linux_binary
     install_linux_desktop_entry
