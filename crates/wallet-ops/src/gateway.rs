@@ -15,8 +15,10 @@ pub use private_view::{
 mod reads;
 pub use provider::{
     GatewayAccountChoice, GatewayApprovalRequest, GatewayChainChoice, GatewayConnectPrompt,
-    GatewayPermissionSummary, GatewayUnlockState, GatewayWalletState, GatewayWalletSwitchRequest,
-    GatewayWalletSwitchTransition,
+    GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError, GatewayNetworkOperation,
+    GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult, GatewayNetworkStatus,
+    GatewayNetworkView, GatewayPermissionSummary, GatewayUnlockState, GatewayWalletState,
+    GatewayWalletSwitchRequest, GatewayWalletSwitchTransition,
 };
 mod private_drafts;
 pub use private_drafts::{
@@ -153,6 +155,12 @@ pub struct GatewayPairingOffer {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayClientMessage {
+    Network {
+        version: u16,
+        generation: u64,
+        context_revision: String,
+        command: GatewayNetworkCommand,
+    },
     PrivateView {
         version: u16,
         generation: u64,
@@ -253,6 +261,12 @@ pub enum GatewayServerMessage {
         locked: bool,
         accounts: Vec<GatewayAccountChoice>,
         public_view: GatewayPublicView,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        network_control_supported: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_view: Option<Box<GatewayNetworkView>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        network_results: Vec<GatewayNetworkResult>,
         private_view_supported: bool,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         private_actions_supported: bool,
@@ -277,6 +291,7 @@ pub enum GatewayProviderOutcome {
 }
 
 enum Command {
+    NetworkResult(GatewayNetworkRequest, GatewayNetworkOutcome),
     Summaries(Box<GatewayWalletState>, u64, Vec<(String, String)>),
     BeginWalletSwitch(
         String,
@@ -324,6 +339,17 @@ pub struct GatewayHandle {
 }
 
 impl GatewayHandle {
+    pub async fn complete_network_request(
+        &self,
+        request: GatewayNetworkRequest,
+        outcome: GatewayNetworkOutcome,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::NetworkResult(request, outcome))
+            .await;
+    }
+
     /// Call inside the desktop-owned Tokio runtime. Storage errors fail closed in snapshots.
     #[must_use]
     pub fn start(

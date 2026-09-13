@@ -274,6 +274,7 @@ impl ListDelegate for PickerList {
 
 impl GatewayView {
     pub(super) fn clear_public_ui(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.network.retire();
         window.close_sheet(cx);
         self.clear_draft_ui();
         self.accounts.clear();

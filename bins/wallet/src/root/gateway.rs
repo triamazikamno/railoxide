@@ -1,8 +1,12 @@
+use super::network::{query_exit_ip_through_tor, reset_tor_state_and_quit};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wallet_ops::gateway::{
+    GatewayNetworkError, GatewayNetworkOperation, GatewayNetworkOutcome, GatewayNetworkRequest,
+};
 
 use alloy::primitives::Address;
 use gpui::{
@@ -215,6 +219,9 @@ impl GatewayUi {
                             return;
                         }
                         match event.kind {
+                            wallet_ops::gateway::GatewayUiEventKind::Network { request } => {
+                                root.apply_gateway_network_command(request, cx);
+                            }
                             wallet_ops::gateway::GatewayUiEventKind::PrivateView { command } => {
                                 root.apply_gateway_private_command(command, window, cx);
                             }
@@ -497,6 +504,7 @@ impl WalletRoot {
             let unlocked =
                 matches!(self.vault_state, VaultState::ViewUnlocked) && self.view_session.is_some();
             let mut snapshot = GatewayWalletState {
+                network_view: unlocked.then(|| self.gateway_network_view()),
                 private_view_supported: true,
                 private_actions_supported: unlocked,
                 private_self_broadcast_supported: unlocked,
@@ -1456,6 +1464,95 @@ fn gateway_permission_menu(
                     revoke_gateway_permission(&revoke_root, permission_id.clone(), window, cx);
                 }),
         )
+}
+
+impl WalletRoot {
+    pub(super) fn publish_gateway_network_state(&self) {
+        let Some(state) = &self.gateway.desktop_state else {
+            return;
+        };
+        let network = self.gateway_network_view();
+        state.send_if_modified(|(wallet, _, _)| {
+            let next = wallet.view.as_ref().map(|_| network);
+            if wallet.network_view == next {
+                return false;
+            }
+            wallet.network_view = next;
+            if let Some(handle) = &self.gateway.handle {
+                handle.set_wallet_authority(wallet.clone());
+            }
+            true
+        });
+    }
+
+    pub(super) fn apply_gateway_network_command(
+        &mut self,
+        request: GatewayNetworkRequest,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !request.is_current(&self.network_context_revision())
+            || self.http.network_mode() != wallet_ops::WalletNetworkMode::Tor
+            || self.view_session.is_none()
+            || *self.root_shutdown.borrow()
+        {
+            return;
+        }
+        let Some(handle) = self.gateway.handle.clone() else {
+            return;
+        };
+        if request.operation() == GatewayNetworkOperation::QueryExitIp {
+            let proxy = self.http.proxy_url.clone();
+            let query = self.runtime.spawn(async move {
+                let Some(proxy) = proxy else {
+                    return GatewayNetworkOutcome::Failed {
+                        error: GatewayNetworkError::Unavailable,
+                    };
+                };
+                match query_exit_ip_through_tor(proxy).await {
+                    Ok(ip) => GatewayNetworkOutcome::ExitIp { ip },
+                    Err(_) => GatewayNetworkOutcome::Failed {
+                        error: GatewayNetworkError::ExitIpFailed,
+                    },
+                }
+            });
+            let runtime = self.runtime.clone();
+            cx.spawn(async move |this, cx| {
+                let outcome = query.await.unwrap_or(GatewayNetworkOutcome::Failed {
+                    error: GatewayNetworkError::ExitIpFailed,
+                });
+                let _ = this.update(cx, |root, _| {
+                    if request.is_current(&root.network_context_revision()) {
+                        runtime.spawn(async move {
+                            handle.complete_network_request(request, outcome).await;
+                        });
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        let outcome = match request.operation() {
+            GatewayNetworkOperation::NewTorSession => self.rotate_tor_session(cx).map_or(
+                GatewayNetworkOutcome::Failed {
+                    error: GatewayNetworkError::NewSessionFailed,
+                },
+                |_| GatewayNetworkOutcome::Done,
+            ),
+            GatewayNetworkOperation::QuitAndReset => {
+                reset_tor_state_and_quit(&self.options.db_path, || cx.quit()).map_or(
+                    GatewayNetworkOutcome::Failed {
+                        error: GatewayNetworkError::ResetFailed,
+                    },
+                    |()| GatewayNetworkOutcome::Done,
+                )
+            }
+            GatewayNetworkOperation::QueryExitIp => unreachable!("query handled above"),
+        };
+        self.runtime.spawn(async move {
+            handle.complete_network_request(request, outcome).await;
+        });
+        cx.notify();
+    }
 }
 
 #[cfg(test)]

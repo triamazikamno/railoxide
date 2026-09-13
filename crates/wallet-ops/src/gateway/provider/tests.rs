@@ -59,7 +59,7 @@ pub(in crate::gateway) fn state(view: &Arc<DesktopViewSession>) -> GatewayWallet
         ..GatewayWalletState::default()
     }
 }
-fn messages(provider: &mut DappProvider) -> Vec<(u64, Value)> {
+pub(in crate::gateway) fn messages(provider: &mut DappProvider) -> Vec<(u64, Value)> {
     let mut output = Vec::new();
     loop {
         let messages = provider.drain();
@@ -106,7 +106,7 @@ fn result(messages: &[(u64, Value)]) -> &Value {
         .unwrap()
         .1
 }
-fn snapshot(messages: &[(u64, Value)]) -> &Value {
+pub(in crate::gateway) fn snapshot(messages: &[(u64, Value)]) -> &Value {
     &messages
         .iter()
         .find(|(_, message)| message["type"] == "ui_snapshot")

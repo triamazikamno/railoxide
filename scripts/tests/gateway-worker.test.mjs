@@ -1307,6 +1307,15 @@ test('clipboard submission checks live host identity before queued frontend snap
     private_view: { selected_wallet: 'wallet', selected_wallet_choice: 'hardware-device:ledger', receive_address: 'private-address', wallets: [{ wallet_id: 'hardware-device:ledger' }] } };
   view.incoming({ type: 'state', status: 'unlocked' });
   view.incoming(snapshot);
+  const networkSnapshot = { ...snapshot, network_control_supported: true, network_view: { context_revision: 'context' },
+    network_popover: { view_id: 'popover', results: [{ operation: 'query_exit_ip', outcome: { status: 'exit_ip', ip: '203.0.113.7' } }] } };
+  view.incoming(networkSnapshot);
+  assert.ok(host.canCopyNetwork(1, 'context', 'popover', '203.0.113.7'));
+  view.incoming({ ...networkSnapshot, network_popover: null });
+  assert.equal(host.canCopyNetwork(1, 'context', 'popover', '203.0.113.7'), false, 'close retires copy before deferred GPUI callbacks');
+  view.incoming({ ...networkSnapshot, network_view: { context_revision: 'replacement' } });
+  assert.equal(host.canCopyNetwork(1, 'context', 'popover', '203.0.113.7'), false);
+  view.incoming(snapshot);
   assert.ok(host.canCopyAddress('private', 1, 'wallet', 'private-address'));
   assert.ok(host.canCopyAddress('public', 1, 'account', 'public-address'));
   for (const args of [['private', 0, 'wallet', 'private-address'], ['private', 1, 'other', 'private-address'], ['private', 1, 'wallet', 'old-address']]) {
@@ -1322,4 +1331,75 @@ test('clipboard submission checks live host identity before queued frontend snap
   view.incoming({ type: 'state', status: 'unlocked' });
   view.disconnected();
   assert.equal(host.canCopyAddress('private', 1, 'wallet', 'private-address'), false);
+});
+
+test('network commands and observations are scoped to live UI popovers for local and remote pairings', async () => {
+  for (const endpoint of ['ws://127.0.0.1:43110/', 'ws://192.0.2.44:43110/']) {
+    const h = await worker({ gatewayCredential: credential(), gatewayPreferences: { endpoint } });
+    const session = await established(h);
+    const popup = h.ui('chrome-extension://test/index.html');
+    const panel = h.ui('chrome-extension://test/index.html?mode=sidepanel');
+    const page = h.provider(); await flush();
+    const sent = () => session.socket.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
+      .filter(message => message.type === 'network');
+    const projection = { context_revision: 'context-a', status: 'tor_ready', detail: '', runtime_warning: false,
+      activity: null, download_rate: null };
+    const base = { type: 'ui_snapshot', version: 1, generation: 1, locked: false,
+      accounts: [], pending_connects: [], pending_requests: [] };
+    const latest = ui => ui.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
+    await session.send(base);
+    popup.request({ type: 'network', generation: 1, command: { action: 'open', context_revision: 'context-a' } });
+    assert.equal(sent().length, 0, 'older desktop does not admit controls');
+    await session.send({ ...base, network_control_supported: true, network_view: projection });
+    for (const ui of [popup, panel]) ui.request({ type: 'network', generation: 1, command: { action: 'open', context_revision: 'context-a' } });
+    assert.equal(sent().length, 2, 'opening views emits no query or recovery');
+    const popupId = latest(popup).network_popover.view_id;
+    const panelId = latest(panel).network_popover.view_id;
+    assert.notEqual(popupId, panelId);
+    const query = (view_id, request_id = 'query') => ({ type: 'network', generation: 1,
+      command: { action: 'run', context_revision: 'context-a', view_id, request_id, operation: 'query_exit_ip' } });
+    panel.request(query(popupId));
+    popup.request({ ...query(popupId), command: { ...query(popupId).command, endpoint: 'https://override.test/' } });
+    page.request({ id: 'network', method: 'network', params: query(popupId).command }); await flush();
+    assert.equal(sent().length, 2);
+    popup.request(query(popupId)); popup.request(query(popupId)); panel.request(query(panelId));
+    assert.equal(sent().length, 4, 'duplicates are suppressed and simultaneous views remain independent');
+    const result = (view_id, ip) => ({ view_id, request_id: 'query', context_revision: 'context-a', operation: 'query_exit_ip', outcome: { status: 'exit_ip', ip } });
+    await session.send({ ...base, network_control_supported: true, network_view: { ...projection, download_rate: 0 },
+      network_results: [result(popupId, '203.0.113.7'), result(panelId, '203.0.113.8')] });
+    assert.equal(latest(popup).network_view.download_rate, 0);
+    assert.equal(latest(popup).network_popover.results[0].outcome.ip, '203.0.113.7');
+    assert.equal(latest(panel).network_popover.results[0].outcome.ip, '203.0.113.8');
+    assert.equal(latest(popup).network_results, undefined, 'another view result is never forwarded');
+    assert.equal(page.port.messages.some(message => message.network_view || message.network_popover), false);
+    assert.equal(JSON.stringify(h.data).includes('203.0.113.'), false, 'results never enter browser storage');
+    for (let i = 1; i < 32; i++) {
+      const request_id = `repeat-${i}`;
+      popup.request(query(popupId, request_id));
+      await session.send({ ...base, network_control_supported: true, network_view: projection,
+        network_results: [{ ...result(popupId, '203.0.113.7'), request_id }] });
+    }
+    const atCapacity = sent().length;
+    popup.request(query(popupId, 'over-capacity'));
+    assert.equal(sent().length, atCapacity, 'the request budget bounds desktop work');
+    assert.equal(latest(popup).network_popover.results[0].outcome.status, 'failed',
+      'exhausting the budget clears loading with feedback instead of hanging');
+    popup.request({ type: 'network', generation: 1, command: { action: 'close', context_revision: 'context-a', view_id: popupId } });
+    assert.equal(latest(popup).network_popover, null);
+    assert.equal(latest(panel).network_popover.view_id, panelId);
+    await session.send({ ...base, network_control_supported: true, network_view: { ...projection, context_revision: 'context-b' }, network_results: [result(popupId, '203.0.113.7')] });
+    assert.notEqual(latest(panel).network_popover.view_id, panelId);
+    assert.equal(latest(panel).network_popover.context_revision, 'context-b');
+    assert.equal(latest(panel).network_popover.results.length, 0);
+    assert.equal(latest(popup).network_popover, null);
+    const before = sent().length;
+    panel.request(query(panelId));
+    assert.equal(sent().length, before, 'retired view cannot operate on replacement context');
+    await session.send({ type: 'state', version: 1, generation: 2, locked: true });
+    assert.equal(latest(panel).network_view, undefined);
+    session.socket.close(); await flush(); await h.alarm();
+    const replacement = h.sockets.at(-1); replacement.open(); replacement.message(2); await flush();
+    assert.equal(replacement.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
+      .some(message => message.type === 'network'), false, 'reconnect does not replay commands');
+  }
 });

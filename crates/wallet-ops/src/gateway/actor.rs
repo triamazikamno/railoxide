@@ -677,6 +677,10 @@ impl Actor {
 
     async fn command(&mut self, command: Command) {
         match command {
+            Command::NetworkResult(request, outcome) => {
+                self.provider.complete_network_request(request, outcome);
+                self.flush_provider();
+            }
             Command::BeginWalletSwitch(id, reply) => {
                 let _ = reply.send(self.provider.begin_wallet_switch(&id));
                 self.flush_provider();
@@ -976,6 +980,26 @@ impl Actor {
                 let command = serde_json::from_slice::<GatewayClientMessage>(&message);
                 Self::trace_extension_command(id, command.as_ref().ok());
                 match command {
+                    Ok(GatewayClientMessage::Network {
+                        version: 1,
+                        generation,
+                        context_revision,
+                        command,
+                    }) => {
+                        if let Some(request) = self.provider.network_command(
+                            id,
+                            session.peer().ok_or(GatewayError::Unavailable)?,
+                            generation,
+                            &context_revision,
+                            command,
+                        ) {
+                            self.emit_ui_event(
+                                id,
+                                generation,
+                                super::GatewayUiEventKind::Network { request },
+                            );
+                        }
+                    }
                     Ok(GatewayClientMessage::PrivateView {
                         version: 1,
                         generation,
@@ -1175,6 +1199,7 @@ impl Actor {
             return;
         };
         let (command, version) = match message {
+            GatewayClientMessage::Network { version, .. } => ("network", version),
             GatewayClientMessage::PrivateView { version, .. } => ("private_view", version),
             GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
             GatewayClientMessage::GetState { version } => ("get_state", version),

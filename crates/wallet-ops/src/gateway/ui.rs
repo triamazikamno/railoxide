@@ -79,6 +79,9 @@ pub struct GatewayPendingRequest {
 
 #[derive(Clone)]
 pub enum GatewayUiEventKind {
+    Network {
+        request: super::GatewayNetworkRequest,
+    },
     SummonDesktop,
     UserActivity,
     PrivateView {
@@ -101,7 +104,8 @@ impl GatewayUiEvent {
     /// GPUI uses its immediate publication, never the asynchronously observed actor snapshot.
     #[must_use]
     pub fn is_current(&self, wallet: &GatewayWalletState, generation: u64) -> bool {
-        self.generation == generation
+        (!matches!(&self.kind, GatewayUiEventKind::Network { request } if !wallet.network_view.as_ref().is_some_and(|view| request.is_current(&view.context_revision))))
+            && self.generation == generation
             && self.wallet.same_authority(wallet)
             && (!matches!(self.kind, GatewayUiEventKind::PrivateView { .. })
                 || self.wallet.wallet_selection_generation == wallet.wallet_selection_generation)

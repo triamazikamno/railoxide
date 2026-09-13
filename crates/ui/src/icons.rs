@@ -15,6 +15,9 @@ const WRENCH_ICON_PATH: &str = "ui/icons/wrench.svg";
 const LOCK_ICON_PATH: &str = "ui/icons/lock.svg";
 const ROBOT_ICON_PATH: &str = "ui/icons/robot.svg";
 const REFRESH_CCW_ICON_PATH: &str = "ui/icons/refresh-ccw.svg";
+const TOR_STATUS_ICON_PATH: &str = "ui/icons/tor-status.svg";
+const ARROW_RIGHT_LEFT_ICON_PATH: &str = "ui/icons/arrow-right-left.svg";
+const ARROW_DOWN_TO_LINE_ICON_PATH: &str = "ui/icons/arrow-down-to-line.svg";
 
 #[must_use]
 pub const fn logs_icon_path() -> &'static str {
@@ -99,4 +102,19 @@ pub const fn robot_icon_path() -> &'static str {
 #[must_use]
 pub const fn refresh_ccw_icon_path() -> &'static str {
     REFRESH_CCW_ICON_PATH
+}
+
+#[must_use]
+pub const fn tor_status_icon_path() -> &'static str {
+    TOR_STATUS_ICON_PATH
+}
+
+#[must_use]
+pub const fn arrow_right_left_icon_path() -> &'static str {
+    ARROW_RIGHT_LEFT_ICON_PATH
+}
+
+#[must_use]
+pub const fn arrow_down_to_line_icon_path() -> &'static str {
+    ARROW_DOWN_TO_LINE_ICON_PATH
 }

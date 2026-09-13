@@ -4,6 +4,7 @@ import { createPageBridge } from './gateway-page-bridge.js';
 
 const ports = new Set();
 const privatePickers = new Map();
+const networkViews = new Map();
 const tabContexts = new Map();
 // Navigation is local to each document; only newly opened views inherit the last choice.
 const homeTabs = new Map();
@@ -123,21 +124,164 @@ function updateNotification(rediscover = false, authoritative = false) {
 chrome.windows.onRemoved.addListener(id => {
   if (notificationWindow?.id === id) notificationWindow = undefined;
 });
+// Only aggregate native observations reach authenticated UI ports. No network data is persisted.
+const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset'];
+const networkErrors = new Set([
+  'Network control is unavailable. Reopen the popover and try again.',
+  'Could not start a new Tor session. Try again.',
+  'Could not query the exit IP through Tor. Try again.',
+  'Could not request the Tor state reset. The wallet remains open.',
+]);
+const boundedNetworkText = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
+const networkInteger = value => Number.isSafeInteger(value) && value >= 0;
+function networkPresentation(message) {
+  const value = message.network_view;
+  if (message.locked || message.network_control_supported !== true || !value ||
+      !boundedNetworkText(value.context_revision, 128) ||
+      !['tor_ready', 'tor_reconnecting', 'tor_degraded', 'proxy', 'direct'].includes(value.status) ||
+      typeof value.detail !== 'string' || value.detail.length > 512 || typeof value.runtime_warning !== 'boolean' ||
+      (value.download_rate != null && !networkInteger(value.download_rate))) return null;
+  let activity = null;
+  if (value.activity != null) {
+    if (!value.status.startsWith('tor_')) return null;
+    const source = value.activity;
+    activity = {};
+    for (const name of ['generation', 'session_duration_ms', 'downloaded_bytes', 'recent_connection_sample_count',
+      'recent_successful_sample_count', 'successful_connections', 'failed_connections']) {
+      if (!networkInteger(source[name])) return null;
+      activity[name] = source[name];
+    }
+    for (const name of ['median_setup_duration_ms', 'last_activity_age_ms']) {
+      if (source[name] != null && !networkInteger(source[name])) return null;
+      activity[name] = source[name] ?? null;
+    }
+  }
+  return { context_revision: value.context_revision, status: value.status, detail: value.detail,
+    runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null };
+}
+function closeNetworkView(port, send = true) {
+  const view = networkViews.get(port);
+  networkViews.delete(port);
+  if (!view) return;
+  for (const pending of view.pending.values()) clearTimeout(pending.timer);
+  const session = owner?.candidate;
+  if (send && session?.established && current(session) && !session.locked && session.generation === view.generation) {
+    try { command(session, { type: 'network', version: 1, generation: view.generation,
+      context_revision: view.context_revision, command: { action: 'close', view_id: view.view_id } }); }
+    catch { failed(session, 'disconnected', true); }
+  }
+}
+function openNetworkView(port, snapshot, session) {
+  const view = { view_id: crypto.randomUUID(), context_revision: snapshot.network_view.context_revision,
+    generation: snapshot.generation, seen: new Set(), pending: new Map(), results: new Map() };
+  networkViews.set(port, view);
+  command(session, { type: 'network', version: 1, generation: view.generation,
+    context_revision: view.context_revision, command: { action: 'open', view_id: view.view_id } });
+}
+function receiveNetworkResults(snapshot) {
+  for (const [port, view] of [...networkViews]) {
+    if (snapshot.locked || !snapshot.network_view || snapshot.generation !== view.generation) {
+      closeNetworkView(port, false); continue;
+    }
+    if (snapshot.network_view.context_revision !== view.context_revision) {
+      closeNetworkView(port, false);
+      const session = owner?.candidate;
+      if (session?.established && current(session) && !session.locked && session.generation === snapshot.generation) {
+        try { openNetworkView(port, snapshot, session); }
+        catch { failed(session, 'disconnected', true); return false; }
+      }
+      continue;
+    }
+    for (const result of (Array.isArray(snapshot.network_results) ? snapshot.network_results : []).slice(0, 48)) {
+      const pending = view.pending.get(result.operation);
+      if (!pending || result.view_id !== view.view_id || result.request_id !== pending.request_id ||
+          result.context_revision !== view.context_revision) continue;
+      const outcome = result.outcome;
+      if (!outcome || !['done', 'exit_ip', 'failed'].includes(outcome.status) ||
+          (outcome.status === 'failed' && !networkErrors.has(outcome.error)) ||
+          (outcome.status === 'exit_ip' && (result.operation !== 'query_exit_ip' || !boundedNetworkText(outcome.ip, 45)))) continue;
+      clearTimeout(pending.timer);
+      view.pending.delete(result.operation);
+      view.results.set(result.operation, { request_id: result.request_id, operation: result.operation,
+        outcome: { status: outcome.status, ...(outcome.status === 'exit_ip' ? { ip: outcome.ip } : {}),
+          ...(outcome.status === 'failed' ? { error: outcome.error } : {}) } });
+    }
+  }
+  return true;
+}
+function networkCommand(port, message) {
+  const session = owner?.candidate;
+  const input = message.command;
+  if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
+      message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
+      !uiSnapshot.network_view || input?.context_revision !== uiSnapshot.network_view.context_revision) return;
+  if (input.action === 'open') {
+    if (Object.keys(input).some(key => !['action', 'context_revision'].includes(key)) || networkViews.has(port) || networkViews.size >= 16) return;
+    try { openNetworkView(port, uiSnapshot, session); }
+    catch { failed(session, 'disconnected', true); return; }
+    port.postMessage(snapshotFor(port));
+    return;
+  }
+  const view = networkViews.get(port);
+  if (!view || input.view_id !== view.view_id || view.context_revision !== input.context_revision) return;
+  if (['close', 'cancel_query'].includes(input.action) && Object.keys(input).some(key => !['action', 'context_revision', 'view_id'].includes(key))) return;
+  if (input.action === 'close') { closeNetworkView(port); port.postMessage(snapshotFor(port)); return; }
+  if (input.action === 'cancel_query') {
+    const pending = view.pending.get('query_exit_ip');
+    if (pending) clearTimeout(pending.timer);
+    view.pending.delete('query_exit_ip'); view.results.delete('query_exit_ip');
+    try { command(session, { type: 'network', version: 1, generation: session.generation,
+      context_revision: view.context_revision, command: { action: 'cancel_query', view_id: view.view_id } }); }
+    catch { failed(session, 'disconnected', true); }
+    return;
+  }
+  if (input.action !== 'run' || !networkOperations.includes(input.operation) ||
+      !uiSnapshot.network_view.status.startsWith('tor_') || !boundedNetworkText(input.request_id, 128) ||
+      Object.keys(input).some(key => !['action', 'context_revision', 'view_id', 'request_id', 'operation'].includes(key)) ||
+      view.seen.has(input.request_id) || view.pending.has(input.operation)) return;
+  if (view.seen.size >= 32) {
+    view.results.set(input.operation, { request_id: input.request_id, operation: input.operation,
+      outcome: { status: 'failed', error: 'Network control is unavailable. Reopen the popover and try again.' } });
+    port.postMessage(snapshotFor(port));
+    return;
+  }
+  view.seen.add(input.request_id);
+  const pending = { request_id: input.request_id, timer: null };
+  view.pending.set(input.operation, pending); view.results.delete(input.operation);
+  pending.timer = setTimeout(() => {
+    if (networkViews.get(port) !== view || view.pending.get(input.operation) !== pending) return;
+    view.pending.delete(input.operation);
+    view.results.set(input.operation, { request_id: input.request_id, operation: input.operation,
+      outcome: { status: 'failed', error: 'Network control is unavailable. Reopen the popover and try again.' } });
+    port.postMessage(snapshotFor(port));
+  }, 30_000);
+  try { command(session, { type: 'network', version: 1, generation: session.generation,
+    context_revision: view.context_revision,
+    command: { action: 'run', view_id: view.view_id, request_id: input.request_id, operation: input.operation } }); }
+  catch { failed(session, 'disconnected', true); return; }
+  port.postMessage(snapshotFor(port));
+}
+
 function publishSnapshot(snapshot, authoritative = true) {
+  if (!receiveNetworkResults(snapshot)) return;
   for (const [port, picker] of privatePickers) {
     if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
         !snapshot.public_view?.drafts?.some(draft => draft.draft_id === picker.draft_id && draft.revision === picker.revision &&
           !['attention', 'in_progress', 'done', 'failed'].includes(draft.status))) privatePickers.delete(port);
   }
-  uiSnapshot = snapshot;
+  // Query replies are retained only by their live originating view.
+  const { network_results, ...presentation } = snapshot;
+  uiSnapshot = presentation;
   updateNotification(false, authoritative);
   for (const port of ports) {
-    try { port.postMessage(snapshotFor(port)); } catch { ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
+    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
   }
 }
 function snapshotFor(port) {
   const tab = uiSnapshot.locked ? null : tabContexts.get(port)?.tab;
-  return { ...uiSnapshot, home_tab: homeTabs.get(port) ?? lastHomeTab, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
+  const network = networkViews.get(port);
+  return { ...uiSnapshot, network_popover: network ? { view_id: network.view_id, context_revision: network.context_revision,
+    results: [...network.results.values()] } : null, home_tab: homeTabs.get(port) ?? lastHomeTab, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
 }
 async function updateTab(port) {
   const context = tabContexts.get(port);
@@ -353,12 +497,13 @@ async function receive(session, bytes) {
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
       if (message.locked && (message.accounts.length ||
           message.pending_connects.some(prompt => prompt.accounts?.length) ||
-          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null)) return;
+          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null || message.network_view != null || message.network_results?.length)) return;
       const privateActions = !message.locked && message.private_actions_supported === true;
       const publicView = message.public_view && { ...message.public_view,
         ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
           privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
-      publishSnapshot({ ...message, private_actions_supported: privateActions,
+      const network = networkPresentation(message);
+      publishSnapshot({ ...message, network_control_supported: network !== null, network_view: network, private_actions_supported: privateActions,
         private_self_broadcast_supported: privateActions && message.private_self_broadcast_supported === true,
         private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
         public_view: message.locked ? null : publicView,
@@ -520,6 +665,7 @@ chrome.runtime.onConnect.addListener(port => {
   port.postMessage(snapshotFor(port));
   port.postMessage(stateMessage());
   port.onDisconnect.addListener(() => {
+    closeNetworkView(port);
     const picker = privatePickers.get(port);
     privatePickers.delete(port);
     const session = owner?.candidate;
@@ -549,6 +695,7 @@ chrome.runtime.onConnect.addListener(port => {
       void updateTab(port);
       return;
     }
+    if (message.type === 'network') { networkCommand(port, message); return; }
     if (message.type === 'home_tab' || message.type === 'private_view') {
       const session = owner?.candidate;
       if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||

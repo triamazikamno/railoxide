@@ -279,6 +279,12 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
     return kind === 'public' && connectSnapshot.public_view?.selected_account === identity &&
       connectSnapshot.accounts?.some(account => account.uuid === identity && account.address === address) === true;
   },
+  canCopyNetwork(generation, revision, viewId, address) {
+    return state === 'ready' && !!uiPort && gatewayStatus === 'unlocked' && !connectSnapshot.locked &&
+      connectSnapshot.generation === generation && connectSnapshot.network_view?.context_revision === revision &&
+      connectSnapshot.network_popover?.view_id === viewId && connectSnapshot.network_popover.results?.some(result =>
+        result.operation === 'query_exit_ip' && result.outcome?.status === 'exit_ip' && result.outcome.ip === address) === true;
+  },
   stage(next) {
     if (state !== 'loading') return;
     phase = next;
@@ -310,7 +316,7 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   },
   command(command, value) {
     if (state !== 'ready' || !uiPort) return;
-    if (command === 'public_view' || command === 'private_view') {
+    if (command === 'public_view' || command === 'private_view' || command === 'network') {
       try {
         uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
           tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });

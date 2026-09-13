@@ -9,6 +9,7 @@ pub mod format;
 pub mod gas_fee;
 pub mod icons;
 pub mod logs;
+pub mod network_status;
 pub mod recipient_picker;
 pub mod style;
 pub mod table;

@@ -23,6 +23,13 @@ use tokio::{task::JoinSet, time::Instant};
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "network.rs"]
+mod network;
+pub use network::{
+    GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError, GatewayNetworkOperation,
+    GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult, GatewayNetworkStatus,
+    GatewayNetworkView,
+};
 #[path = "public_view.rs"]
 mod public_view;
 use crate::dapp_request::DappRequestControl;
@@ -50,6 +57,7 @@ pub struct GatewayUnlockState {
 #[derive(Clone, Default)]
 pub struct GatewayWalletState {
     pub public_view: super::GatewayPublicView,
+    pub network_view: Option<GatewayNetworkView>,
     pub private_view_supported: bool,
     pub private_actions_supported: bool,
     pub private_self_broadcast_supported: bool,
@@ -91,6 +99,7 @@ impl GatewayWalletState {
     #[must_use]
     pub fn same_state(&self, other: &Self) -> bool {
         self.same_authority(other)
+            && self.network_view == other.network_view
             && self.public_view == other.public_view
             && self.private_actions_supported == other.private_actions_supported
             && self.private_self_broadcast_supported == other.private_self_broadcast_supported
@@ -300,6 +309,7 @@ pub(super) struct DappProvider {
     ui_snapshots: HashMap<u64, Value>,
     ui_peers: HashMap<u64, PeerId>,
     ui_errors: HashMap<u64, String>,
+    network_views: network::NetworkViews,
 }
 impl DappProvider {
     pub(super) fn new(store: DesktopVaultStore, generation: u64) -> Self {
@@ -325,12 +335,14 @@ impl DappProvider {
             ui_snapshots: HashMap::new(),
             ui_peers: HashMap::new(),
             ui_errors: HashMap::new(),
+            network_views: network::NetworkViews::default(),
         }
     }
     pub(super) const fn wallet_transition(&self) -> bool {
         self.wallet.wallet_transition
     }
     pub(super) fn retire_sessions(&mut self, live: impl Fn(u64) -> bool) {
+        self.network_views.retire_sessions(&live);
         self.ui_snapshots.retain(|session, _| live(*session));
         self.ui_peers.retain(|session, _| live(*session));
         self.ui_errors.retain(|session, _| live(*session));
@@ -419,6 +431,7 @@ impl DappProvider {
             wallet.private_view = None;
         }
         if wallet.view.is_none() {
+            wallet.network_view = None;
             wallet.public_view = super::GatewayPublicView::default();
             wallet.private_view = None;
             self.ui_errors.clear();
@@ -429,6 +442,7 @@ impl DappProvider {
             wallet.http = None;
             wallet.routes.clear();
         }
+        self.retire_network_context(&wallet);
         if let Some(authority) = &self.authority_fallback {
             authority.send_replace(wallet.clone());
         }
@@ -1640,6 +1654,15 @@ impl DappProvider {
             private_view_supported: self.wallet.private_view_supported,
             private_actions_supported: self.wallet.private_actions_supported,
             private_self_broadcast_supported: self.wallet.private_self_broadcast_supported,
+            network_control_supported: self.wallet.network_view.is_some() && peer_id.is_some(),
+            network_view: peer_id
+                .as_ref()
+                .and_then(|_| self.wallet.network_view.clone().map(Box::new)),
+            network_results: if peer_id.is_some() {
+                self.network_results(session)
+            } else {
+                Vec::new()
+            },
             private_view: peer_id.and_then(|_| self.wallet.private_view.clone().map(Box::new)),
             wallet_transition: self.wallet.wallet_transition,
             chains: self

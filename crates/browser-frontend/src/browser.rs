@@ -1,3 +1,4 @@
+mod network;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -57,6 +58,13 @@ extern "C" {
         kind: &str,
         generation: &JsValue,
         identity: &str,
+        address: &str,
+    ) -> bool;
+    #[wasm_bindgen(js_namespace = railoxideHost, js_name = canCopyNetwork)]
+    fn host_can_copy_network(
+        generation: &JsValue,
+        revision: &str,
+        view_id: &str,
         address: &str,
     ) -> bool;
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = stage)]
@@ -508,6 +516,7 @@ fn version_signature(version: &str) -> String {
 }
 
 struct GatewayView {
+    network: network::NetworkControl,
     code: Entity<OtpState>,
     endpoint: Entity<InputState>,
     status: String,
@@ -643,6 +652,7 @@ impl GatewayView {
                         view.clear_public_ui(window, cx);
                         view.handoff_open = keep_handoff;
                     }
+                    view.network.sync(&snapshot);
                     view.generation = generation;
                     if view.private_sheet.as_ref().is_some_and(|(wallet, chain)| {
                         private.selected_wallet.as_ref() != Some(wallet)
@@ -680,6 +690,7 @@ impl GatewayView {
             cx.observe(&endpoint, |_, _, cx| cx.notify()),
         ];
         Self {
+            network: network::NetworkControl::new(cx),
             code,
             endpoint,
             status: "disconnected".into(),
@@ -789,7 +800,8 @@ impl GatewayView {
                 )
             })
             .when(self.status == "unlocked", |this| {
-                this.child(self.render_sites_button(cx))
+                this.child(self.render_network_button(cx))
+                    .child(self.render_sites_button(cx))
             })
             .child(
                 Button::new("gateway-settings")

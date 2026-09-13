@@ -109,7 +109,8 @@ def package(metadata_path):
         shared_icons = stage / 'assets/ui/icons'
         shared_icons.mkdir(parents=True)
         for name in ('shield', 'arrow-big-right-dash', 'book-user', 'wallet', 'pencil', 'refresh-ccw',
-                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye'):
+                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye',
+                     'tor-status', 'arrow-right-left', 'arrow-down-to-line'):
             path = shared_icons / f'{name}.svg'
             shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
             asset_paths.append(path.relative_to(stage / 'assets').as_posix())
