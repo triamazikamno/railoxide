@@ -2725,7 +2725,7 @@ async fn native_review_read_waits_for_command_capacity_and_delivers_once() {
     for _ in 0..32 {
         handle
             .commands
-            .try_send(Command::Pair(oneshot::channel().0))
+            .try_send(Command::Pair(false, oneshot::channel().0))
             .ok()
             .unwrap();
     }
@@ -2735,10 +2735,10 @@ async fn native_review_read_waits_for_command_capacity_and_delivers_once() {
         RpcRead::from_method_params("eth_blockNumber", json!([]), 1).unwrap(),
     ));
     assert!(futures_util::poll!(&mut read).is_pending());
-    assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+    assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
     assert!(futures_util::poll!(&mut read).is_pending());
     for _ in 0..31 {
-        assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+        assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
     }
     let Command::ApprovalRead(_, _, _, _, reply) = commands.try_recv().unwrap() else {
         panic!("expected the waiting approval read");
@@ -2772,7 +2772,7 @@ async fn native_review_read_cancellation_expiry_and_drop_prevent_late_enqueue() 
         for _ in 0..32 {
             handle
                 .commands
-                .try_send(Command::Pair(oneshot::channel().0))
+                .try_send(Command::Pair(false, oneshot::channel().0))
                 .ok()
                 .unwrap();
         }
@@ -2799,7 +2799,7 @@ async fn native_review_read_cancellation_expiry_and_drop_prevent_late_enqueue() 
         };
         // Capacity becomes available before the cancelled waiter is polled again.
         for _ in 0..32 {
-            assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+            assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
         }
         if let Some((read, expected)) = read {
             assert_eq!(read.await, Err(expected));
@@ -2828,7 +2828,7 @@ async fn native_review_read_queue_and_response_wait_share_original_deadline() {
         for _ in 0..32 {
             handle
                 .commands
-                .try_send(Command::Pair(oneshot::channel().0))
+                .try_send(Command::Pair(false, oneshot::channel().0))
                 .ok()
                 .unwrap();
         }
@@ -2842,7 +2842,7 @@ async fn native_review_read_queue_and_response_wait_share_original_deadline() {
         tokio::time::advance(READ_TIMEOUT.checked_sub(Duration::from_secs(1)).unwrap()).await;
         let reply = if waiting_for_response {
             for _ in 0..32 {
-                assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+                assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
             }
             assert!(futures_util::poll!(&mut read).is_pending());
             let Command::ApprovalRead(_, _, _, command_entered, reply) =
@@ -2858,7 +2858,7 @@ async fn native_review_read_queue_and_response_wait_share_original_deadline() {
         tokio::time::advance(Duration::from_secs(1)).await;
         if !waiting_for_response {
             for _ in 0..32 {
-                assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+                assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
             }
         }
         assert_eq!(
@@ -2902,7 +2902,7 @@ async fn native_completed_decisions_wait_for_command_capacity_without_reexecutio
         for _ in 0..32 {
             handle
                 .commands
-                .try_send(Command::Pair(tokio::sync::oneshot::channel().0))
+                .try_send(Command::Pair(false, tokio::sync::oneshot::channel().0))
                 .ok()
                 .unwrap();
         }
@@ -2924,7 +2924,7 @@ async fn native_completed_decisions_wait_for_command_capacity_without_reexecutio
         };
         assert!(futures_util::poll!(&mut completion).is_pending());
         for _ in 0..32 {
-            assert!(matches!(commands.try_recv().unwrap(), Command::Pair(_)));
+            assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
         }
         assert!(futures_util::poll!(&mut completion).is_pending());
         match commands.try_recv().unwrap() {
@@ -2990,7 +2990,7 @@ async fn native_decision_waits_are_bounded_by_original_control() {
                 for _ in 0..32 {
                     handle
                         .commands
-                        .try_send(Command::Pair(tokio::sync::oneshot::channel().0))
+                        .try_send(Command::Pair(false, tokio::sync::oneshot::channel().0))
                         .ok()
                         .unwrap();
                 }

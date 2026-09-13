@@ -53,6 +53,8 @@ mod listener;
 use listener::GatewayListenerDialog;
 #[path = "gateway_pairing.rs"]
 mod pairing;
+#[path = "gateway_unlock.rs"]
+mod remote_unlock;
 use pairing::GatewayPairingDialog;
 
 /// Extension packaged into this build by `bins/wallet/build.rs`, empty when it was not built.
@@ -65,13 +67,17 @@ const fn install_bundle() -> GatewayInstallBundle {
 
 #[derive(Default)]
 struct GatewayUnlock {
+    remote: Option<Arc<wallet_ops::gateway::GatewayUnlockAttempt>>,
     state: GatewayUnlockState,
     continuation: Option<u64>,
     installing: bool,
 }
 
 impl GatewayUnlock {
-    const fn retire(&mut self) {
+    fn retire(&mut self) {
+        if let Some(remote) = self.remote.take() {
+            remote.cancel();
+        }
         self.state = GatewayUnlockState {
             cohort: self.state.cohort.wrapping_add(1),
             completed: false,
@@ -100,7 +106,16 @@ impl GatewayUnlock {
     }
 
     fn complete(&mut self, continuation: Option<u64>, has_view: bool) {
-        if has_view && self.is_current(continuation) {
+        if has_view
+            && self.is_current(continuation)
+            && self
+                .remote
+                .as_ref()
+                .is_none_or(|remote| remote.is_current())
+        {
+            if let Some(remote) = self.remote.take() {
+                remote.finish(wallet_ops::gateway::GatewayUnlockPhase::Complete);
+            }
             self.state.completed = true;
             self.continuation = None;
             self.installing = false;
@@ -204,7 +219,22 @@ impl GatewayUi {
         let mut ui_events = handle.ui_events();
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                let event = match ui_events.recv().await {
+                let received = tokio::select! {
+                    event = ui_events.recv() => Some(event),
+                    () = cx.background_executor().timer(Duration::from_millis(100)) => None,
+                };
+                if this
+                    .update_in(cx, |root, window, cx| {
+                        root.reconcile_remote_unlock(window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let Some(received) = received else {
+                    continue;
+                };
+                let event = match received {
                     Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -219,6 +249,9 @@ impl GatewayUi {
                             return;
                         }
                         match event.kind {
+                            wallet_ops::gateway::GatewayUiEventKind::Unlock { request } => {
+                                root.apply_gateway_unlock(&request, window, cx);
+                            }
                             wallet_ops::gateway::GatewayUiEventKind::Network { request } => {
                                 root.apply_gateway_network_command(request, cx);
                             }
@@ -887,6 +920,7 @@ impl WalletRoot {
                 peer_id: peer.id,
                 identity: identity_text,
                 disabled,
+                allow_unlock: peer.allow_unlock,
             };
             let revoke_root = root.clone();
             let peer_id = peer.id;
@@ -1325,6 +1359,7 @@ struct GatewayPeerMenuTarget {
     peer_id: PeerId,
     identity: SharedString,
     disabled: bool,
+    allow_unlock: bool,
 }
 
 #[derive(Clone)]
@@ -1398,6 +1433,9 @@ fn gateway_peer_menu(
 ) -> PopupMenu {
     gate_popover_for_menu(&target.root, cx);
     let copy_identity = target.identity.clone();
+    let unlock_root = target.root.clone();
+    let allow_unlock = target.allow_unlock;
+    let unlock_disabled = target.disabled || target.root.read(cx).vault_view_unlock.is_none();
     let revoke_root = target.root.clone();
     let peer_id = target.peer_id;
     menu.min_w(px(180.0))
@@ -1407,6 +1445,36 @@ fn gateway_peer_menu(
                 .on_click(move |_event, window, cx| {
                     copy_to_clipboard_with_toast(copy_identity.clone(), window, cx);
                 }),
+        )
+        .item(
+            PopupMenuItem::element(|_, _| {
+                div()
+                    .id("gateway-peer-allow-unlock")
+                    .flex_1()
+                    .child("Allow unlocking")
+                    .tooltip(|window, cx| {
+                        remote_unlock::unlock_trust_tooltip(window).build(window, cx)
+                    })
+            })
+            .checked(allow_unlock)
+            .disabled(unlock_disabled)
+            .on_click(move |_, window, cx| {
+                unlock_root.update(cx, |root, cx| {
+                    let Some(handle) = root.gateway.handle.clone() else {
+                        return;
+                    };
+                    root.run_gateway_operation(
+                        async move {
+                            handle
+                                .set_peer_allow_unlock(peer_id, !allow_unlock)
+                                .await
+                                .map(|()| None)
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            }),
         )
         .item(PopupMenuItem::separator())
         .item(

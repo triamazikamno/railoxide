@@ -3,13 +3,15 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, IntoElement, ParentElement,
-    Styled, Window, div, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable, Icon, Sizable as _, WindowExt,
     alert::Alert,
     button::ButtonVariants as _,
+    checkbox::Checkbox,
     clipboard::Clipboard,
     dialog::{Cancel, Confirm, DialogFooter},
     input::OtpState,
@@ -24,6 +26,7 @@ use crate::root::WalletRoot;
 pub(super) struct GatewayPairingDialog {
     pub(super) lease: Weak<()>,
     focus: FocusHandle,
+    allow_unlock: bool,
     // Keep this after attempt exhaustion: an already admitted attempt can still commit.
     peers_before_offer: Option<Vec<PeerId>>,
 }
@@ -119,6 +122,48 @@ impl WalletRoot {
             } else {
                 app_muted_text("Listener stopped")
             });
+            let permission_root = root.clone();
+            let permission_identity = identity.clone();
+            body = body.child(
+                div()
+                    .id("pairing-unlock-permission")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Checkbox::new("pairing-allow-unlock")
+                            .label("Allow unlocking")
+                            .checked(
+                                gateway
+                                    .pairing_dialog
+                                    .as_ref()
+                                    .is_some_and(|dialog| dialog.allow_unlock),
+                            )
+                            .disabled(gateway.busy)
+                            .on_click(move |allowed, window, cx| {
+                                permission_root.update(cx, |root, cx| {
+                                    let Some(dialog) =
+                                        root.gateway.pairing_dialog.as_mut().filter(|dialog| {
+                                            dialog.lease.ptr_eq(&permission_identity)
+                                        })
+                                    else {
+                                        return;
+                                    };
+                                    dialog.allow_unlock = *allowed;
+                                    root.retire_gateway_pairing_offer(window, cx);
+                                    root.generate_gateway_pairing_code(
+                                        &permission_identity,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                    .child(app_muted_text(super::remote_unlock::UNLOCK_TRUST_SUMMARY))
+                    .tooltip(|window, cx| {
+                        super::remote_unlock::unlock_trust_tooltip(window).build(window, cx)
+                    }),
+            );
             let generate_root = root.clone();
             let generate_identity = identity.clone();
             let close_root = root.clone();
@@ -185,6 +230,7 @@ impl WalletRoot {
         self.gateway.pairing_dialog = Some(GatewayPairingDialog {
             lease: identity.clone(),
             focus,
+            allow_unlock: false,
             peers_before_offer: None,
         });
         self.generate_gateway_pairing_code(&identity, window, cx);
@@ -215,9 +261,19 @@ impl WalletRoot {
         let Some(handle) = self.gateway.handle.clone() else {
             return;
         };
+        let allow_unlock = self
+            .gateway
+            .pairing_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.allow_unlock);
         self.retire_gateway_pairing_offer(window, cx);
         self.run_gateway_operation(
-            async move { handle.issue_pairing_code().await.map(Some) },
+            async move {
+                handle
+                    .issue_pairing_code_with_unlock(allow_unlock)
+                    .await
+                    .map(Some)
+            },
             window,
             cx,
         );

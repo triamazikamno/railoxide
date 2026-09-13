@@ -67,6 +67,7 @@ impl Outbound {
         let message_kind = match self.delivery.as_ref().map(|delivery| &delivery.message) {
             None => "Handshake",
             Some(GatewayServerMessage::State { .. }) => "State",
+            Some(GatewayServerMessage::UnlockState { .. }) => "UnlockState",
             Some(GatewayServerMessage::Heartbeat { .. }) => "Heartbeat",
             Some(GatewayServerMessage::Unsupported { .. }) => "Unsupported",
             Some(GatewayServerMessage::ProviderState { .. }) => "ProviderState",
@@ -103,6 +104,7 @@ impl Outbound {
 }
 
 struct Challenge {
+    allow_unlock: bool,
     code: PairingCode,
     generation: u64,
     expires: Instant,
@@ -428,6 +430,7 @@ impl ProgressCursor {
 }
 
 struct Actor {
+    unlocks: super::unlock::Unlocks,
     provider: DappProvider,
     db: Arc<DbStore>,
     registry: Registry,
@@ -476,6 +479,7 @@ pub(super) async fn run(
     provider.set_approval_channels(approval_updates, authority, updates.subscribe());
     provider.set_switch_channel(switch_updates);
     let mut actor = Actor {
+        unlocks: super::unlock::Unlocks::default(),
         provider,
         db,
         registry: loaded.unwrap_or_default(),
@@ -604,6 +608,7 @@ impl Actor {
                 .peers
                 .iter()
                 .map(|peer| GatewayPeerSummary {
+                    allow_unlock: peer.allow_unlock,
                     id: PeerId::from_bytes(peer.id),
                     label: peer.label.clone(),
                     paired_at: peer.paired_at,
@@ -699,8 +704,13 @@ impl Actor {
                 self.publish();
                 let _ = reply.send(result);
             }
-            Command::Pair(reply) => {
-                let result = self.issue_code();
+            Command::Pair(allow_unlock, reply) => {
+                let result = self.issue_code(allow_unlock);
+                self.publish();
+                let _ = reply.send(result);
+            }
+            Command::AllowUnlock(peer, allowed, reply) => {
+                let result = self.set_allow_unlock(peer, allowed);
                 self.publish();
                 let _ = reply.send(result);
             }
@@ -789,7 +799,7 @@ impl Actor {
         self.error.map_or(Ok(()), Err)
     }
 
-    fn issue_code(&mut self) -> Result<GatewayPairingOffer, GatewayError> {
+    fn issue_code(&mut self, allow_unlock: bool) -> Result<GatewayPairingOffer, GatewayError> {
         if let Some(error) = self.storage_error {
             return Err(error);
         }
@@ -817,6 +827,7 @@ impl Actor {
             .ok_or(GatewayError::Unavailable)?;
         let code = PairingCode::new(digits).map_err(|_| GatewayError::Unavailable)?;
         self.challenge = Some(Challenge {
+            allow_unlock,
             code,
             generation: self.challenge_generation,
             expires: Instant::now() + CODE_LIFETIME,
@@ -829,6 +840,61 @@ impl Actor {
             code: PairingCode::new(digits).map_err(|_| GatewayError::Unavailable)?,
             expires_in_secs: CODE_LIFETIME.as_secs(),
         })
+    }
+
+    fn set_allow_unlock(&mut self, id: PeerId, allowed: bool) -> Result<(), GatewayError> {
+        if let Some(error) = self.storage_error {
+            return Err(error);
+        }
+        let mut candidate = self.registry.clone();
+        let peer = candidate
+            .peers
+            .iter_mut()
+            .find(|peer| peer.id == id.to_bytes())
+            .ok_or(GatewayError::Unavailable)?;
+        peer.allow_unlock = allowed;
+        candidate.save(&self.db)?;
+        self.registry = candidate;
+        self.activity_dirty = false;
+        self.retire_provider_sessions();
+        self.publish_unlocks();
+        Ok(())
+    }
+
+    fn unlock_allowed(&self, peer: PeerId) -> bool {
+        self.registry
+            .peers
+            .iter()
+            .any(|entry| entry.id == peer.to_bytes() && entry.allow_unlock)
+    }
+
+    fn publish_unlocks(&mut self) {
+        for (id, session) in &mut self.sessions {
+            if !self.unlocks.sent.contains_key(id) {
+                continue;
+            }
+            let Some(peer) = session.peer() else {
+                continue;
+            };
+            let allowed = self
+                .registry
+                .peers
+                .iter()
+                .any(|entry| entry.id == peer.to_bytes() && entry.allow_unlock);
+            let view = self.unlocks.view(*id, allowed);
+            if self.unlocks.sent.get(id) != Some(&view)
+                && session
+                    .application(GatewayServerMessage::UnlockState {
+                        version: 1,
+                        generation: self.generation,
+                        response_to: None,
+                        view: view.clone(),
+                    })
+                    .is_ok()
+            {
+                self.unlocks.sent.insert(*id, view);
+            }
+        }
     }
 
     fn revoke(&mut self, id: PeerId) -> Result<(), GatewayError> {
@@ -913,6 +979,7 @@ impl Actor {
             generation: self.generation,
             wallet_transition: self.provider.wallet_transition(),
             client_info_supported: true,
+            unlock_supported: true,
         }
     }
 
@@ -977,9 +1044,61 @@ impl Actor {
                 })?;
             if let Some(message) = complete {
                 self.record_peer_activity(session.peer().ok_or(GatewayError::Unavailable)?);
+                let message = zeroize::Zeroizing::new(message);
                 let command = serde_json::from_slice::<GatewayClientMessage>(&message);
+                drop(message);
                 Self::trace_extension_command(id, command.as_ref().ok());
                 match command {
+                    Ok(GatewayClientMessage::GetUnlockState { version: 1 }) => {
+                        let view = self.unlocks.view(
+                            id,
+                            self.unlock_allowed(session.peer().ok_or(GatewayError::Unavailable)?),
+                        );
+                        session.application(GatewayServerMessage::UnlockState {
+                            version: 1,
+                            generation: self.generation,
+                            response_to: None,
+                            view: view.clone(),
+                        })?;
+                        self.unlocks.sent.insert(id, view);
+                    }
+                    Ok(GatewayClientMessage::Unlock {
+                        version: 1,
+                        generation,
+                        attempt_id,
+                        command,
+                    }) => {
+                        if attempt_id.is_empty() || attempt_id.len() > 128 {
+                            return Err(GatewayError::Unavailable);
+                        }
+                        let peer = session.peer().ok_or(GatewayError::Unavailable)?;
+                        let allowed = self.unlock_allowed(peer);
+                        let response_to = Some(attempt_id.clone());
+                        if allowed
+                            && generation == self.generation
+                            && self.locked
+                            && let Some(request) =
+                                self.unlocks.command(id, peer, &attempt_id, command)
+                        {
+                            self.emit_ui_event(
+                                id,
+                                generation,
+                                super::GatewayUiEventKind::Unlock { request },
+                            );
+                        }
+                        let view = self
+                            .unlocks
+                            .view(id, allowed)
+                            .response(response_to.as_deref().expect("unlock response owner"));
+                        session.application(GatewayServerMessage::UnlockState {
+                            version: 1,
+                            generation: self.generation,
+                            response_to,
+                            view: view.clone(),
+                        })?;
+                        self.unlocks.sent.insert(id, view);
+                    }
+
                     Ok(GatewayClientMessage::Network {
                         version: 1,
                         generation,
@@ -1162,6 +1281,10 @@ impl Actor {
                 id: protocol.pending_peer_id().to_bytes(),
                 secret: StoredSecret(secret.export_for_storage()),
                 label: None,
+                allow_unlock: self
+                    .challenge
+                    .as_ref()
+                    .is_some_and(|code| code.allow_unlock),
                 paired_at,
                 last_active_at: paired_at,
             });
@@ -1199,6 +1322,8 @@ impl Actor {
             return;
         };
         let (command, version) = match message {
+            GatewayClientMessage::GetUnlockState { version } => ("get_unlock_state", version),
+            GatewayClientMessage::Unlock { version, .. } => ("unlock", version),
             GatewayClientMessage::Network { version, .. } => ("network", version),
             GatewayClientMessage::PrivateView { version, .. } => ("private_view", version),
             GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
@@ -1259,6 +1384,17 @@ impl Actor {
     }
 
     fn retire_provider_sessions(&mut self) {
+        let sessions = &self.sessions;
+        let peers = &self.registry.peers;
+        self.unlocks.retire(|session, peer| {
+            sessions
+                .get(&session)
+                .is_some_and(|session| session.peer() == Some(peer))
+                && peers
+                    .iter()
+                    .any(|entry| entry.id == peer.to_bytes() && entry.allow_unlock)
+        });
+        self.unlocks.sent.retain(|id, _| sessions.contains_key(id));
         self.ui_sessions.retain(|id, live| {
             let current = self
                 .sessions
@@ -1402,6 +1538,7 @@ impl Actor {
             }
         }
         self.retire_provider_sessions();
+        self.publish_unlocks();
         self.provider.tick(now);
         self.flush_provider();
         self.publish();
@@ -1439,6 +1576,7 @@ mod tests {
     fn reservations_include_aborted_attempts_and_expire() {
         let now = Instant::now();
         let mut code = Challenge {
+            allow_unlock: false,
             code: PairingCode::new(*b"000123").unwrap(),
             generation: 1,
             expires: now + CODE_LIFETIME,
@@ -1449,6 +1587,7 @@ mod tests {
         }
         assert!(code.reserve(now).is_none());
         let mut replacement = Challenge {
+            allow_unlock: false,
             code: PairingCode::new(*b"123456").unwrap(),
             generation: 2,
             expires: now + CODE_LIFETIME,
@@ -1589,6 +1728,78 @@ mod integration_tests {
         {
             socket.send(Message::Binary(frame.into())).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn paired_unlock_permission_is_enforced_and_revocation_invalidates_native_work() {
+        async fn unlock_state(socket: &mut Socket, protocol: &mut Connection) -> serde_json::Value {
+            loop {
+                let value = state(socket, protocol).await;
+                if value["type"] == "unlock_state" {
+                    return value;
+                }
+            }
+        }
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("gateway-unlock-{}", alloy::hex::encode(random)));
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root.clone(),
+            })
+            .unwrap(),
+        );
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
+        handle
+            .configure(GatewayConfig {
+                enabled: true,
+                bind_address: Ipv4Addr::LOCALHOST.into(),
+                port: available_port().await,
+            })
+            .await
+            .unwrap();
+        let code = handle.issue_pairing_code_with_unlock(true).await.unwrap();
+        let mut socket = socket(handle.snapshots().borrow().listener_addr.unwrap()).await;
+        let (mut protocol, peer, _) = pair(&mut socket, code.code).await;
+        state(&mut socket, &mut protocol).await;
+        assert!(handle.snapshots().borrow().peers[0].allow_unlock);
+        let mut events = handle.ui_events();
+        handle.set_peer_allow_unlock(peer, false).await.unwrap();
+        application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"denied", "command":{"action":"password", "password":"synthetic password"}})).await;
+        assert_eq!(
+            unlock_state(&mut socket, &mut protocol).await["view"]["allowed"],
+            false
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "unpermitted input never reaches the vault owner"
+        );
+        handle.set_peer_allow_unlock(peer, true).await.unwrap();
+        assert!(Registry::load(&db).unwrap().peers[0].allow_unlock);
+        application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"accepted", "command":{"action":"password", "password":"synthetic password"}})).await;
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let super::super::GatewayUiEventKind::Unlock { request } = event.kind else {
+            panic!("unlock request");
+        };
+        let (_, guard) = request.take().unwrap();
+        guard.finish(super::super::GatewayUnlockPhase::Passphrase);
+        handle.set_peer_allow_unlock(peer, false).await.unwrap();
+        assert!(!guard.is_current());
+        guard.finish(super::super::GatewayUnlockPhase::Complete);
+        assert!(
+            !guard.is_current(),
+            "revoked work cannot regain installation authority"
+        );
+        drop(guard);
+        handle.shutdown().await.unwrap();
+        drop(socket);
+        drop(handle);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn pairing_attempt(address: std::net::SocketAddr, admitted: bool) {
@@ -1936,6 +2147,7 @@ mod integration_tests {
                 id: [id; 16],
                 secret: StoredSecret([id; 32]),
                 label: None,
+                allow_unlock: false,
                 paired_at: initial_timestamp,
                 last_active_at: initial_timestamp,
             });

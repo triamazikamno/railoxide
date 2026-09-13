@@ -2,6 +2,7 @@
 use super::GatewayWalletState;
 use crate::dapp_request::DappRequestControl;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Desktop-formatted public wallet presentation, never a signing capability.
 #[derive(Clone, Default, PartialEq, Eq, Serialize)]
@@ -79,6 +80,9 @@ pub struct GatewayPendingRequest {
 
 #[derive(Clone)]
 pub enum GatewayUiEventKind {
+    Unlock {
+        request: Arc<super::GatewayUnlockRequest>,
+    },
     Network {
         request: super::GatewayNetworkRequest,
     },

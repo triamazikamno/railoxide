@@ -879,7 +879,7 @@ test('host state reports the stored pairing and endpoint pairing waits for a val
     version: '0.1.0' });
   await flush();
   assert.deepEqual(JSON.parse(JSON.stringify(last)), { status: 'locked', endpoint: 'desktop.local', paired: true,
-    takeover: true, metamask: false, view: 'popup', view_notice: '', version: '0.1.0' });
+    takeover: true, metamask: false, view: 'popup', view_notice: '', version: '0.1.0', unlock: { allowed: false } });
   view.disconnected();
   await flush();
   assert.deepEqual([last.status, last.paired], ['disconnected', true], 'a lost port does not forget the stored pairing');
@@ -1297,4 +1297,113 @@ test('network commands and observations are scoped to live UI popovers for local
     assert.equal(replacement.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
       .some(message => message.type === 'network'), false, 'reconnect does not replay commands');
   }
+});
+
+test('bootstrap delivers unlock ownership to the frontend and clears it when authority is lost', async () => {
+  const view = await bootstrapView({ ready: false });
+  const states = [];
+  view.context.railoxideHost.subscribe(state => states.push(structuredClone(state)));
+  await flush();
+  assert.deepEqual(states.at(-1).unlock, { allowed: false });
+  const unlock = { allowed: true, generation: 7, phase: 'password' };
+  view.incoming({ type: 'state', status: 'locked', unlock });
+  await flush();
+  assert.deepEqual(states.at(-1).unlock, unlock, 'permission arrives before the first rendered frame');
+  view.context.railoxideHost.ready();
+  view.incoming({ type: 'state', status: 'locked', unlock: { ...unlock, phase: 'passphrase' } });
+  await flush();
+  assert.equal(states.at(-1).unlock.phase, 'passphrase');
+  view.context.railoxideHost.command('unlock', JSON.stringify({ action: 'passphrase', generation: 7, passphrase: ' synthetic input ' }));
+  assert.equal(view.sent.at(-1).command.generation, 7, 'unlock keeps its own generation instead of the dapp snapshot generation');
+  assert.equal(view.sent.at(-1).command.passphrase, ' synthetic input ');
+  for (const state of [
+    { type: 'state', status: 'locked', unlock: { allowed: false } },
+    { type: 'state', status: 'locked' },
+    { type: 'state', status: 'unlocked' },
+  ]) {
+    view.incoming({ type: 'state', status: 'locked', unlock });
+    view.incoming(state);
+    await flush();
+    assert.deepEqual(states.at(-1).unlock, { allowed: false });
+  }
+  view.incoming({ type: 'state', status: 'locked', unlock });
+  await flush();
+  view.disconnected();
+  await flush();
+  assert.deepEqual(states.at(-1).unlock, { allowed: false });
+});
+
+test('unlock credentials stay on the owning extension UI and exact passphrase input reaches the desktop', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h, true);
+  const wire = () => session.socket.sent.flatMap(bytes => { try { return [JSON.parse(new TextDecoder().decode(new Uint8Array(bytes)))]; } catch { return []; } });
+  const unlocks = () => wire().filter(message => message.type === 'unlock');
+  const ui = h.ui('chrome-extension://test/index.html?mode=sidepanel');
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 1, password: 'not permitted' } });
+  assert.equal(unlocks().length, 0, 'older desktops never receive an unlock command');
+  await session.send({ type: 'state', version: 1, generation: 1, locked: true, unlock_supported: true });
+  assert.equal(wire().filter(message => message.type === 'get_unlock_state').length, 1);
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, view: { allowed: false, attempt_id: null, phase: 'password' } });
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 1, password: 'not permitted' } });
+  assert.equal(unlocks().length, 0);
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, view: { allowed: true, attempt_id: null, phase: 'password' } });
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 0, password: 'stale secret' } });
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 1, password: 'a'.repeat(4097) } });
+  assert.equal(unlocks().length, 0, 'stale and oversized input cannot start work');
+  const website = h.provider();
+  website.request({ type: 'unlock', command: { action: 'password', generation: 1, password: 'page secret' } });
+  assert.equal(unlocks().length, 0, 'website ports cannot invoke extension UI unlock');
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 1, password: ' Vault secret  ' } });
+  const first = unlocks().at(-1);
+  assert.equal(first.command.password, ' Vault secret  ');
+  assert.equal(ui.port.messages.at(-1).unlock.phase, 'busy');
+  h.command({ type: 'unlock', command: { action: 'password', generation: 1, password: 'other UI' } });
+  assert.equal(unlocks().length, 1, 'a second UI cannot replace an attempt awaiting its first response');
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, response_to: first.attempt_id, view: { allowed: true, attempt_id: first.attempt_id, phase: 'busy' } });
+  await session.send({ type: 'state', version: 1, generation: 2, locked: true, unlock_supported: true });
+  await session.send({ type: 'unlock_state', version: 1, generation: 2, view: { allowed: true, attempt_id: first.attempt_id, phase: 'passphrase' } });
+  h.command({ type: 'unlock', command: { action: 'passphrase', generation: 2, passphrase: 'other UI' } });
+  assert.equal(unlocks().length, 1);
+  ui.request({ type: 'unlock', command: { action: 'passphrase', generation: 2, passphrase: ' Secret e\u0301  ' } });
+  assert.equal(unlocks().at(-1).attempt_id, first.attempt_id);
+  assert.equal(unlocks().at(-1).command.passphrase, ' Secret e\u0301  ');
+  await session.send({ type: 'unlock_state', version: 1, generation: 2, response_to: first.attempt_id, view: { allowed: true, attempt_id: first.attempt_id, phase: 'unknown' } });
+  ui.request({ type: 'unlock', command: { action: 'standard', generation: 2 } });
+  assert.equal(unlocks().length, 2, 'an unmatched passphrase cannot silently fall back to the standard wallet');
+  ui.request({ type: 'unlock', command: { action: 'retry', generation: 2 } });
+  assert.equal(unlocks().at(-1).command.action, 'retry');
+  for (const secret of [' Vault secret  ', ' Secret e\u0301  ']) {
+    assert.equal(JSON.stringify(h.data).includes(secret), false);
+    assert.equal(JSON.stringify([...h.states, ...ui.port.messages]).includes(secret), false);
+  }
+});
+
+test('closing or revoking an unlock UI cancels ownership and reconnect never replays secrets', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h, true);
+  await session.send({ type: 'state', version: 1, generation: 1, locked: true, unlock_supported: true });
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, view: { allowed: true, attempt_id: null, phase: 'password' } });
+  const ui = h.ui('chrome-extension://test/index.html?mode=sidepanel');
+  const unlocks = () => session.socket.sent.flatMap(bytes => { try { const message = JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))); return message.type === 'unlock' ? [message] : []; } catch { return []; } });
+  ui.request({ type: 'unlock', command: { action: 'password', generation: 1, password: 'transient secret' } });
+  const first = unlocks().at(-1);
+  ui.port.disconnect();
+  assert.equal(unlocks().at(-1).command.action, 'cancel', 'closing before the first response still cancels');
+  assert.equal(unlocks().at(-1).attempt_id, first.attempt_id);
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, view: { allowed: true, attempt_id: first.attempt_id, phase: 'cancelled' } });
+  h.command({ type: 'unlock', command: { action: 'password', generation: 1, password: 'second secret' } });
+  await session.send({ type: 'unlock_state', version: 1, generation: 1, view: { allowed: false, attempt_id: null, phase: 'password' } });
+  assert.equal(h.states.at(-1).unlock.allowed, false);
+  const count = unlocks().length;
+  h.command({ type: 'unlock', command: { action: 'password', generation: 1, password: 'revoked secret' } });
+  assert.equal(unlocks().length, count);
+  session.socket.close();
+  await h.alarm();
+  const next = h.sockets.at(-1); next.open(); next.message(2); await flush();
+  next.message(new TextEncoder().encode(JSON.stringify({ type: 'state', version: 1, generation: 2, locked: true, unlock_supported: true })).buffer);
+  await flush();
+  const replayed = next.sent.some(bytes => { try { return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))).type === 'unlock'; } catch { return false; } });
+  assert.equal(replayed, false);
+  assert.equal(JSON.stringify(h.data).includes('transient secret'), false);
+  assert.equal(JSON.stringify(h.data).includes('second secret'), false);
 });

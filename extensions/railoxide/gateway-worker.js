@@ -69,6 +69,72 @@ function updateRequestAttention(authoritative = false) {
     if (view === 'popup') await chrome.action.openPopup?.();
   }).catch(() => {}).finally(() => { popupOpening = false; });
 }
+// Passwords and mnemonic passphrases are never retained in worker state or storage.
+let unlockView = { allowed: false, attempt_id: null, phase: 'password' };
+let unlockOwner = null;
+const unlockPhases = new Set(['password', 'busy', 'opening', 'passphrase', 'unknown', 'desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited']);
+const unlockTerminal = phase => ['desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(phase);
+function clearUnlockOwner(cancel = false) {
+  const previous = unlockOwner;
+  unlockOwner = null;
+  clearTimeout(previous?.timer);
+  const session = owner?.candidate;
+  if (cancel && previous && session?.established && current(session)) {
+    try { command(session, { type: 'unlock', version: 1, generation: session.generation,
+      attempt_id: previous.id, command: { action: 'cancel' } }); } catch {}
+  }
+}
+function unlockFor(port) {
+  const session = owner?.candidate;
+  if (!session?.established || !current(session) || status !== 'locked') return { allowed: false };
+  const owned = unlockOwner && unlockOwner.port === port && unlockOwner.id === unlockView.attempt_id;
+  const pending = unlockOwner && unlockOwner.port === port && unlockOwner.waiting;
+  const other = (unlockOwner && unlockOwner.port !== port && (unlockOwner.waiting || !unlockTerminal(unlockView.phase))) ||
+    (unlockView.attempt_id && !owned && !unlockTerminal(unlockView.phase));
+  return { allowed: unlockView.allowed, generation: session.generation,
+    phase: pending ? 'busy' : other ? 'other' : owned || unlockView.phase === 'desktop' ? unlockView.phase : 'password' };
+}
+function unlockCommand(port, input) {
+  const session = owner?.candidate;
+  if (!ports.has(port) || !session?.established || !current(session) || !session.locked ||
+      !unlockView.allowed || !input || input.generation !== session.generation) return;
+  const state = unlockFor(port);
+  let outgoing;
+  if (input.action === 'password') {
+    if (!['password', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(state.phase) || typeof input.password !== 'string' ||
+        !input.password.length || encoder.encode(input.password).length > 4096) return;
+    clearUnlockOwner();
+    unlockOwner = { port, id: crypto.randomUUID(), waiting: true };
+    const attempt = unlockOwner;
+    attempt.timer = setTimeout(() => {
+      if (unlockOwner !== attempt) return;
+      clearUnlockOwner(true);
+      publish(status);
+    }, 300_000);
+    outgoing = { action: 'password', password: input.password };
+  } else {
+    if (input.action === 'cancel' && unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); return; }
+    if (unlockOwner?.port !== port || unlockOwner.id !== unlockView.attempt_id) return;
+    if (input.action === 'passphrase' && state.phase === 'passphrase' && typeof input.passphrase === 'string' &&
+        input.passphrase.length && encoder.encode(input.passphrase).length <= 4096) outgoing = { action: 'passphrase', passphrase: input.passphrase };
+    else if (input.action === 'standard' && state.phase === 'passphrase') outgoing = { action: 'standard' };
+    else if (input.action === 'retry' && state.phase === 'unknown') outgoing = { action: 'retry' };
+    else if (input.action === 'desktop' && ['passphrase', 'unknown'].includes(state.phase)) outgoing = { action: 'desktop' };
+    else return;
+    unlockOwner.waiting = true;
+  }
+  try {
+    command(session, { type: 'unlock', version: 1, generation: session.generation,
+      attempt_id: unlockOwner.id, command: outgoing });
+  } finally {
+    if ('password' in input) input.password = '';
+    if ('passphrase' in input) input.passphrase = '';
+    if (outgoing && 'password' in outgoing) outgoing.password = '';
+    if (outgoing && 'passphrase' in outgoing) outgoing.passphrase = '';
+  }
+  publish(status);
+}
+
 // Only aggregate native observations reach authenticated UI ports. No network data is persisted.
 const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset'];
 const networkErrors = new Set([
@@ -303,18 +369,21 @@ function clearCredentials(discovery) {
   wipe(discovery.record);
   discovery.record = null;
 }
-function stateMessage(reported = status) {
+function stateMessage(reported = status, port) {
   const state = { type: 'state', status: reported, endpoint: configuredEndpoint, paired, ...providerPreferences, view, viewError };
+  state.unlock = unlockFor(port);
   if (extensionVersion) state.version = extensionVersion;
   return state;
 }
 function publish(next) {
   status = next;
   for (const port of ports) {
-    try { port.postMessage(stateMessage()); } catch { ports.delete(port); }
+    try { port.postMessage(stateMessage(status, port)); } catch { ports.delete(port); }
   }
 }
 function retire() {
+  clearUnlockOwner();
+  unlockView = { allowed: false, attempt_id: null, phase: "password" };
   pageBridge.retire();
   purgeSnapshot();
   epoch += 1;
@@ -353,9 +422,10 @@ function command(session, message) {
   if (session.sendFailed) throw new Error('Gateway send failed');
   try {
     const value = typeof message === 'string' ? { type: message, version: 1 } : message;
-    for (const frame of session.client.sealMessage(encoder.encode(JSON.stringify(value)))) {
-      send(session, frame);
-    }
+    const plaintext = encoder.encode(JSON.stringify(value));
+    try {
+      for (const frame of session.client.sealMessage(plaintext)) send(session, frame);
+    } finally { plaintext.fill(0); }
   } catch {
     // Sealing advances record counters. Never continue this session after a partial send,
     // including unregister attempts during teardown.
@@ -437,6 +507,17 @@ async function receive(session, bytes) {
     }
     session.lastReceived = performance.now();
     if (message.type === 'heartbeat') return;
+    if (message.type === 'unlock_state') {
+      const next = message.view;
+      if (message.generation !== session.generation || !next || typeof next.allowed !== 'boolean' ||
+          !unlockPhases.has(next.phase) || (next.attempt_id !== null && (typeof next.attempt_id !== 'string' || next.attempt_id.length > 128))) return;
+      if (unlockOwner && message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
+      if (unlockOwner && next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
+      unlockView = { allowed: next.allowed, attempt_id: next.attempt_id, phase: next.phase };
+      if (!next.allowed) clearUnlockOwner();
+      publish(status);
+      return;
+    }
     if (message.type === 'ui_snapshot') {
       if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
@@ -482,6 +563,14 @@ async function receive(session, bytes) {
     if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
     session.generation = message.generation;
     session.locked = message.locked;
+    if (!message.locked || (generationChanged && unlockTerminal(unlockView.phase))) {
+      clearUnlockOwner();
+      unlockView = { allowed: unlockView.allowed, attempt_id: null, phase: "password" };
+    }
+    if (message.unlock_supported === true && !session.unlockInfoSent) {
+      session.unlockInfoSent = true;
+      command(session, { type: 'get_unlock_state', version: 1 });
+    }
     pageBridge.lockState(message.locked, generationChanged);
     publish(message.locked ? 'locked' : 'unlocked');
   } catch (error) {
@@ -607,8 +696,9 @@ chrome.runtime.onConnect.addListener(port => {
   ports.add(port);
   homeTabs.set(port, lastHomeTab);
   port.postMessage(snapshotFor(port));
-  port.postMessage(stateMessage());
+  port.postMessage(stateMessage(status, port));
   port.onDisconnect.addListener(() => {
+    if (unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); }
     closeNetworkView(port);
     const picker = privatePickers.get(port);
     privatePickers.delete(port);
@@ -637,6 +727,11 @@ chrome.runtime.onConnect.addListener(port => {
     if (message.type === 'tab_context' && Number.isInteger(message.window_id) && message.window_id >= 0) {
       tabContexts.set(port, { windowId: message.window_id, tab: null, revision: 0 });
       void updateTab(port);
+      return;
+    }
+    if (message.type === 'unlock') {
+      try { unlockCommand(port, message.command); } catch {}
+      finally { if (message.command && typeof message.command === 'object') { delete message.command.password; delete message.command.passphrase; } }
       return;
     }
     if (message.type === 'network') { networkCommand(port, message); return; }

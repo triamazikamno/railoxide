@@ -6,6 +6,11 @@ mod errors;
 mod install;
 pub use errors::{GatewayApprovalFailure, LocalProviderFailure, ProviderRpcError};
 mod private_view;
+mod unlock;
+pub use unlock::{
+    GatewayUnlockAttempt, GatewayUnlockCommand, GatewayUnlockGuard, GatewayUnlockPhase,
+    GatewayUnlockRequest, GatewayUnlockSecret, GatewayUnlockView,
+};
 mod provider;
 pub use private_view::{
     GatewayPrivateAsset, GatewayPrivateChainState, GatewayPrivateCommand, GatewayPrivatePending,
@@ -101,6 +106,7 @@ pub enum GatewayError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayPeerSummary {
+    pub allow_unlock: bool,
     pub id: PeerId,
     pub label: Option<String>,
     pub connected_sessions: usize,
@@ -155,6 +161,15 @@ pub struct GatewayPairingOffer {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayClientMessage {
+    GetUnlockState {
+        version: u16,
+    },
+    Unlock {
+        version: u16,
+        generation: u64,
+        attempt_id: String,
+        command: GatewayUnlockCommand,
+    },
     Network {
         version: u16,
         generation: u64,
@@ -221,6 +236,12 @@ pub enum GatewayClientMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayServerMessage {
+    UnlockState {
+        version: u16,
+        generation: u64,
+        response_to: Option<String>,
+        view: GatewayUnlockView,
+    },
     State {
         version: u16,
         locked: bool,
@@ -229,6 +250,7 @@ pub enum GatewayServerMessage {
         wallet_transition: bool,
         /// Tells the browser this desktop accepts `client_info`; older desktops omit it.
         client_info_supported: bool,
+        unlock_supported: bool,
     },
     Heartbeat {
         version: u16,
@@ -299,7 +321,11 @@ enum Command {
     ),
     RejectWalletSwitch(String),
     Configure(GatewayConfig, oneshot::Sender<Result<(), GatewayError>>),
-    Pair(oneshot::Sender<Result<GatewayPairingOffer, GatewayError>>),
+    Pair(
+        bool,
+        oneshot::Sender<Result<GatewayPairingOffer, GatewayError>>,
+    ),
+    AllowUnlock(PeerId, bool, oneshot::Sender<Result<(), GatewayError>>),
     Revoke(PeerId, oneshot::Sender<Result<(), GatewayError>>),
     State(bool, u64, oneshot::Sender<Result<(), GatewayError>>),
     WalletState(
@@ -452,9 +478,29 @@ impl GatewayHandle {
     }
 
     pub async fn issue_pairing_code(&self) -> Result<GatewayPairingOffer, GatewayError> {
+        self.issue_pairing_code_with_unlock(false).await
+    }
+
+    pub async fn issue_pairing_code_with_unlock(
+        &self,
+        allow_unlock: bool,
+    ) -> Result<GatewayPairingOffer, GatewayError> {
         let (tx, rx) = oneshot::channel();
         self.commands
-            .send(Command::Pair(tx))
+            .send(Command::Pair(allow_unlock, tx))
+            .await
+            .map_err(|_| GatewayError::Unavailable)?;
+        rx.await.map_err(|_| GatewayError::Unavailable)?
+    }
+
+    pub async fn set_peer_allow_unlock(
+        &self,
+        peer: PeerId,
+        allowed: bool,
+    ) -> Result<(), GatewayError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::AllowUnlock(peer, allowed, tx))
             .await
             .map_err(|_| GatewayError::Unavailable)?;
         rx.await.map_err(|_| GatewayError::Unavailable)?

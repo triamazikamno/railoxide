@@ -1,4 +1,5 @@
 mod network;
+mod unlock;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -516,6 +517,7 @@ fn version_signature(version: &str) -> String {
 }
 
 struct GatewayView {
+    unlock: unlock::UnlockForm,
     network: network::NetworkControl,
     code: Entity<OtpState>,
     endpoint: Entity<InputState>,
@@ -563,6 +565,7 @@ impl GatewayView {
     fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         public_view::init(cx);
         let focus = cx.focus_handle();
+        let unlock = unlock::UnlockForm::new(window, cx);
         let code = cx.new(|cx| OtpState::new(6, window, cx));
         let endpoint = cx.new(|cx| InputState::new(window, cx).placeholder("127.0.0.1:43110"));
         let handle = window.window_handle();
@@ -601,6 +604,7 @@ impl GatewayView {
                     if status != "unlocked" {
                         view.clear_public_ui(window, cx);
                     }
+                    view.unlock.sync(&state, window, cx);
                     view.status = status;
                     view.configured_endpoint = configured_endpoint;
                     view.paired = paired;
@@ -685,11 +689,13 @@ impl GatewayView {
             });
         });
         host_subscribe_connect(connect_callback.as_ref().unchecked_ref());
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&code, |_, _, cx| cx.notify()),
             cx.observe(&endpoint, |_, _, cx| cx.notify()),
         ];
+        subscriptions.extend(unlock.subscriptions(window, cx));
         Self {
+            unlock,
             network: network::NetworkControl::new(cx),
             code,
             endpoint,
@@ -970,6 +976,9 @@ impl GatewayView {
     }
 
     fn render_locked(&self, cx: &Context<'_, Self>) -> Div {
+        if let Some(unlock) = self.render_unlock(cx) {
+            return unlock.child(summon_desktop_button());
+        }
         div()
             .flex()
             .flex_col()
@@ -1146,7 +1155,7 @@ impl GatewayView {
             )
             .child(render_site(&prompt.url));
         if prompt.needs_unlock {
-            screen = screen.child(
+            screen = screen.child(self.render_unlock(cx).unwrap_or_else(|| {
                 div()
                     .flex_1()
                     .flex()
@@ -1157,8 +1166,8 @@ impl GatewayView {
                     .text_center()
                     .pb_6()
                     .child(app_strong_text("Desktop app is locked"))
-                    .child(note("Unlock it to choose an account.")),
-            );
+                    .child(note("Unlock it to choose an account."))
+            }));
         } else {
             if prompt.wrong_wallet {
                 let switch_request = prompt.request_id.clone();

@@ -54,6 +54,7 @@ pub(super) const fn pending_software_profile_open_timeout_is_current(
 }
 
 struct WalletContextInstallation {
+    remote_unlock: Option<Arc<wallet_ops::gateway::GatewayUnlockAttempt>>,
     gateway_unlock: Option<u64>,
     session: Arc<DesktopViewSession>,
     metadata: Vec<WalletMetadataBundle>,
@@ -544,6 +545,15 @@ impl WalletRoot {
             self.sync_wallet_select(window, cx);
             return;
         }
+        // Keep the originating attempt even if later lifecycle cleanup retires it.
+        let remote_unlock = self.remote_unlock_attempt();
+        if remote_unlock
+            .as_ref()
+            .is_some_and(|attempt| !attempt.is_current())
+        {
+            self.reconcile_remote_unlock(window, cx);
+            return;
+        }
         self.begin_gateway_wallet_installation(session.wallet_id());
         self.gateway.private_selection_message = None;
         self.gateway.private_hardware_selection_pending = false;
@@ -605,6 +615,7 @@ impl WalletRoot {
         cx.notify();
 
         let installation = WalletContextInstallation {
+            remote_unlock,
             gateway_unlock,
             session: Arc::new(session),
             metadata: metadata.to_vec(),
@@ -736,7 +747,15 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if let Some(attempt) = &installation.remote_unlock {
+            if !attempt.finish_if_current(wallet_ops::gateway::GatewayUnlockPhase::Complete) {
+                self.abandon_wallet_replacement_installation(window, cx);
+                return;
+            }
+            self.set_remote_unlock_attempt(None);
+        }
         let WalletContextInstallation {
+            remote_unlock: _,
             gateway_unlock,
             session,
             metadata,
@@ -856,7 +875,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn abandon_wallet_replacement_installation(
+    pub(in crate::root) fn abandon_wallet_replacement_installation(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -1159,7 +1178,7 @@ impl WalletRoot {
         )
     }
 
-    pub(super) fn abandon_pending_software_profile_open(
+    pub(in crate::root) fn abandon_pending_software_profile_open(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,

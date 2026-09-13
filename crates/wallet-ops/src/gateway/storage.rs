@@ -17,6 +17,8 @@ pub(super) struct Peer {
     pub id: [u8; 16],
     pub secret: StoredSecret,
     pub label: Option<String>,
+    #[serde(default)]
+    pub allow_unlock: bool,
     pub paired_at: u64,
     pub last_active_at: u64,
 }
@@ -96,6 +98,7 @@ mod tests {
             id: [1; 16],
             secret: StoredSecret([2; 32]),
             label: None,
+            allow_unlock: false,
             paired_at: 1,
             last_active_at: 1,
         });
@@ -106,5 +109,20 @@ mod tests {
         registry.version = 2;
         registry.peers.push(registry.peers[0].clone());
         assert!(Registry::decode(&serde_json::to_vec(&registry).unwrap()).is_err());
+    }
+    #[test]
+    fn released_pairings_default_unlock_off_and_preserve_explicit_permission() {
+        let released = serde_json::json!({
+            "version": 2,
+            "config": GatewayConfig::default(),
+            "peers": [{"id": vec![1; 16], "secret": vec![2; 32], "label": null, "paired_at": 1, "last_active_at": 1}]
+        });
+        let mut registry = Registry::decode(&serde_json::to_vec(&released).unwrap()).unwrap();
+        assert!(!registry.peers[0].allow_unlock);
+        registry.peers[0].allow_unlock = true;
+        let restored = Registry::decode(&serde_json::to_vec(&registry).unwrap()).unwrap();
+        assert!(restored.peers[0].allow_unlock);
+        assert_eq!(restored.peers[0].id, registry.peers[0].id);
+        assert_eq!(restored.peers[0].secret.0, registry.peers[0].secret.0);
     }
 }

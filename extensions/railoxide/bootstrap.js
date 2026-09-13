@@ -61,6 +61,7 @@ function deliverSnapshot(snapshot) {
 let gatewayStatus = 'disconnected';
 let gatewayEndpoint = '';
 let gatewayPaired = false;
+let gatewayUnlock = { allowed: false };
 // Mirrors the worker's reported manifest version; a worker that never reports one leaves it blank.
 let extensionVersion = '';
 let providerPreferences = { takeover: false, metamask: false };
@@ -174,10 +175,12 @@ let hostEpoch = 0;
 function deliverStatus(next, endpoint = gatewayEndpoint) {
   gatewayEndpoint = endpoint;
   gatewayStatus = next;
+  if (next !== 'locked') gatewayUnlock = { allowed: false };
+  const unlock = gatewayUnlock;
   const callback = stateCallback;
   queueMicrotask(() => {
     if (callback && callback === stateCallback && (state === 'loading' || state === 'ready')) callback({ status: next, endpoint, paired: gatewayPaired,
-      takeover: providerPreferences.takeover, metamask: providerPreferences.metamask, view,
+      takeover: providerPreferences.takeover, metamask: providerPreferences.metamask, view, unlock,
       view_notice: viewNotice || (viewError ? 'Could not save or apply toolbar mode. Try again or reload the extension.' : ''),
       ...(extensionVersion ? { version: extensionVersion } : {}) });
   });
@@ -205,6 +208,9 @@ function attachWorker() {
     if (uiPort === port && message?.type === 'state' && typeof message.status === 'string') {
       providerPreferences = { takeover: message.takeover === true, metamask: message.metamask === true };
       gatewayPaired = message.paired === true;
+      gatewayUnlock = message.unlock?.allowed === true ? {
+        allowed: true, generation: message.unlock.generation, phase: message.unlock.phase,
+      } : { allowed: false };
       extensionVersion = typeof message.version === 'string' ? message.version : '';
       if (message.view === 'popup' || message.view === 'sidepanel') view = message.view;
       if (typeof message.viewError === 'boolean') viewError = message.viewError;
@@ -224,6 +230,7 @@ function attachWorker() {
   sendViewPresence();
 }
 function detachWorker() {
+  gatewayUnlock = { allowed: false };
   cancelViewChange();
   clearPopupOpening();
   hostEpoch += 1;
@@ -316,7 +323,9 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   },
   command(command, value) {
     if (state !== 'ready' || !uiPort) return;
-    if (command === 'public_view' || command === 'private_view' || command === 'network') {
+    if (command === 'unlock') {
+      try { uiPort.postMessage({ type: 'unlock', command: JSON.parse(value) }); } catch {}
+    } else if (command === 'public_view' || command === 'private_view' || command === 'network') {
       try {
         uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
           tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });

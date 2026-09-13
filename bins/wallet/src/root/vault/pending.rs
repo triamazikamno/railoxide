@@ -172,12 +172,30 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.continue_pending_without_passphrase_with_unlock(
+            remember_standard_context,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub(in crate::root) fn continue_pending_without_passphrase_with_unlock(
+        &mut self,
+        remember_standard_context: bool,
+        remote: Option<wallet_ops::gateway::GatewayUnlockGuard>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(mut pending) = self.pending_software_profile_open.take() else {
             return;
         };
         if !pending.is_choosing() {
             self.pending_software_profile_open = Some(pending);
             return;
+        }
+        if remote.is_none() {
+            self.take_over_remote_unlock();
         }
         let Some(store) = self.vault_store.clone() else {
             self.abandon_pending_software_profile_open(window, cx);
@@ -212,17 +230,22 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
-                if !root.pending_software_profile_open_is_current(
-                    operation_generation,
-                    active_wallet_generation,
-                    selected_chain,
-                    base_profile_uuid.as_ref(),
-                ) {
+                if remote.as_ref().is_some_and(|guard| !guard.is_current())
+                    || !root.pending_software_profile_open_is_current(
+                        operation_generation,
+                        active_wallet_generation,
+                        selected_chain,
+                        base_profile_uuid.as_ref(),
+                    )
+                {
                     return;
                 }
                 root.pending_software_profile_open = None;
                 match result {
                     Ok(Ok((session, metadata))) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Opening);
+                        }
                         root.install_verified_software_context(
                             session,
                             &metadata,
@@ -233,10 +256,16 @@ impl WalletRoot {
                         );
                     }
                     Ok(Err(error)) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
                         root.handle_vault_error(&error, cx);
                         root.abandon_pending_software_profile_open(window, cx);
                     }
                     Err(error) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
                         tracing::warn!(%error, "standard software profile open task failed");
                         root.abandon_pending_software_profile_open(window, cx);
                     }
@@ -252,12 +281,25 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.submit_pending_software_passphrase_with_unlock(passphrase, None, window, cx);
+    }
+
+    pub(in crate::root) fn submit_pending_software_passphrase_with_unlock(
+        &mut self,
+        passphrase: Zeroizing<String>,
+        remote: Option<wallet_ops::gateway::GatewayUnlockGuard>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(mut pending) = self.pending_software_profile_open.take() else {
             return;
         };
         if !pending.is_choosing() {
             self.pending_software_profile_open = Some(pending);
             return;
+        }
+        if remote.is_none() {
+            self.take_over_remote_unlock();
         }
         let Some(store) = self.vault_store.clone() else {
             self.abandon_pending_software_profile_open(window, cx);
@@ -308,12 +350,14 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
-                if !root.pending_software_profile_open_is_current(
-                    operation_generation,
-                    active_wallet_generation,
-                    selected_chain,
-                    base_profile_uuid.as_ref(),
-                ) {
+                if remote.as_ref().is_some_and(|guard| !guard.is_current())
+                    || !root.pending_software_profile_open_is_current(
+                        operation_generation,
+                        active_wallet_generation,
+                        selected_chain,
+                        base_profile_uuid.as_ref(),
+                    )
+                {
                     return;
                 }
                 match result {
@@ -334,6 +378,9 @@ impl WalletRoot {
                             return;
                         }
                         root.pending_software_profile_open = None;
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Opening);
+                        }
                         root.install_verified_software_context(
                             session,
                             &metadata,
@@ -344,15 +391,24 @@ impl WalletRoot {
                         );
                     }
                     Ok(Ok(PendingPassphraseTaskResult::Unknown(pending))) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Unknown);
+                        }
                         root.pending_software_profile_open = Some(pending);
                         root.vault_error = None;
                         cx.notify();
                     }
                     Ok(Err(error)) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
                         root.handle_vault_error(&error, cx);
                         root.abandon_pending_software_profile_open(window, cx);
                     }
                     Err(error) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
                         tracing::warn!(%error, "passphrase matching task failed");
                         root.abandon_pending_software_profile_open(window, cx);
                     }
@@ -370,6 +426,7 @@ impl WalletRoot {
             && pending.stage() == PendingSoftwareProfileOpenStage::UnknownDecision
         {
             pending.retry();
+            self.take_over_remote_unlock();
             self.vault_error = None;
             cx.notify();
         }
@@ -384,6 +441,7 @@ impl WalletRoot {
             .as_mut()
             .is_some_and(PendingSoftwareProfileOpen::enter_creation_handoff)
         {
+            self.take_over_remote_unlock();
             self.vault_error = None;
             cx.notify();
         }
