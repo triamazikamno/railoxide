@@ -113,7 +113,6 @@ def package(metadata_path):
             path = shared_icons / f'{name}.svg'
             shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
             asset_paths.append(path.relative_to(stage / 'assets').as_posix())
-        shutil.copy2(ROOT / 'crates/ui/assets/icons/SOURCES.md', shared_icons / 'SOURCES.md')
         wallet_icons = stage / 'assets/railgun/icons'
         wallet_icons.mkdir(parents=True)
         for name in ('clock.svg', 'ledger-logo-short-white.svg', 'trezor-symbol-white-rgb.svg'):

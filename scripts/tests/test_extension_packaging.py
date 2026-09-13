@@ -5,7 +5,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import subprocess
 import sys
@@ -34,7 +34,7 @@ def write_zip(path, content=b'first'):
 
 
 class ExtensionPackagingTests(unittest.TestCase):
-    def test_packager_preserves_utf8_with_a_windows_default_encoding(self):
+    def test_packager_preserves_utf8_and_browser_paths_on_windows(self):
         packager = load_script('package-browser-extension')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -71,18 +71,26 @@ class ExtensionPackagingTests(unittest.TestCase):
                 shutil.copy2(args[-1], stage / f'{name}_bg.wasm')
 
             path_open = Path.open
+            path_relative_to = Path.relative_to
 
             def windows_open(path, mode='r', buffering=-1, encoding=None, errors=None, newline=None):
                 if 'b' not in mode and encoding in (None, 'locale'):
                     encoding = 'cp1252'
                 return path_open(path, mode, buffering, encoding, errors, newline)
 
-            with patch.object(packager, 'ROOT', root), patch.object(packager.subprocess, 'run', side_effect=bindgen), patch.object(Path, 'open', windows_open):
+            def windows_relative_to(path, *args, **kwargs):
+                return PureWindowsPath(path_relative_to(path, *args, **kwargs))
+
+            with patch.object(packager, 'ROOT', root), patch.object(packager.subprocess, 'run', side_effect=bindgen), patch.object(Path, 'open', windows_open), patch.object(Path, 'relative_to', windows_relative_to):
                 packager.package(metadata_path)
 
             with zipfile.ZipFile(root / 'target/browser-extension.zip') as archive:
                 self.assertEqual(archive.read(f'assets/icons/{icon_name}'), icon)
                 self.assertIn(icon_name, archive.read('assets/COMPONENT-SOURCES.md').decode('utf-8'))
+                wallet_assets = json.loads(archive.read('assets/WALLET-ASSETS.json'))
+                self.assertIn('ui/icons/arrow-big-right-dash.svg', wallet_assets)
+                for path in wallet_assets:
+                    self.assertIn(f'assets/{path}', archive.namelist())
 
     def test_embedding_rejects_missing_and_stale_archives(self):
         verifier = load_script('verify-browser-extension')
