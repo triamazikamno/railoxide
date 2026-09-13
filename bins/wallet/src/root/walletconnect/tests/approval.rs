@@ -472,6 +472,7 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
     let accounts = [account.clone()];
     let context = WalletConnectIntentContext {
         chain: &chains[&1],
+        selected_chain_id: 1,
         token_registry: &registry,
         anchor_rates: &rates,
         public_accounts: &accounts,

@@ -334,6 +334,26 @@ impl DappProvider {
                         Err(code),
                     );
                 }
+            } else if !pending.executing
+                && let Some((request, owner)) = &pending.ready
+                && let WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } =
+                    request.parsed
+                && chain_id == request.chain_id
+                && self.authority.borrow().default_chain_id == Some(chain_id)
+            {
+                self.respond_outcome(
+                    pending.session,
+                    &pending.document,
+                    &pending.request_id,
+                    Ok(Value::Null),
+                );
+                if let Some((_, delivery)) = self.outbox.last_mut() {
+                    delivery.approval = Some(ApprovalDelivery {
+                        owner: owner.clone(),
+                        deadline: pending.deadline,
+                        control: request.control.clone(),
+                    });
+                }
             } else {
                 if !pending.acknowledged
                     && let Some((request, owner)) = &pending.ready
@@ -498,6 +518,7 @@ impl DappProvider {
         id: &str,
         result: Result<Value, GatewayApprovalFailure>,
     ) -> Result<(), LocalProviderFailure> {
+        let approving = result.is_ok();
         self.tick(Instant::now());
         let index = self
             .approvals
@@ -549,10 +570,16 @@ impl DappProvider {
         } else {
             result
         };
+        // Desktop follow-up actions require a committed approval, even when we
+        // successfully queued a failure response for the website.
+        let completion = match &result {
+            Err(GatewayApprovalFailure::Local(failure)) if approving => Err(*failure),
+            _ => Ok(()),
+        };
         if pending.acknowledged {
             self.publish_approvals();
             self.invalidate_reads(Instant::now());
-            return Ok(());
+            return completion;
         }
         if let Err(failure) = &result {
             tracing::warn!(
@@ -583,7 +610,7 @@ impl DappProvider {
         }
         self.publish_approvals();
         self.invalidate_reads(Instant::now());
-        Ok(())
+        completion
     }
     fn commit_chain_switch(
         &mut self,

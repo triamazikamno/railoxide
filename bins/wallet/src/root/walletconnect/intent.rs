@@ -26,6 +26,7 @@ pub(super) const WALLETCONNECT_CRITICAL_PARTY_FULL_ADDRESS_MIN_WIDTH: Pixels = p
 #[derive(Clone, Copy)]
 pub(super) struct WalletConnectIntentContext<'a> {
     pub(super) chain: &'a EffectiveChainConfig,
+    pub(super) selected_chain_id: u64,
     pub(super) token_registry: &'a EffectiveTokenRegistry,
     pub(super) anchor_rates: &'a TokenAnchorRateCache,
     pub(super) public_accounts: &'a [PublicAccountMetadata],
@@ -169,10 +170,16 @@ pub(super) struct WalletConnectNativeAmount {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WalletConnectHeroSummary {
     Policy(String),
+    ChainSwitch {
+        from_chain_id: u64,
+        to_chain_id: u64,
+    },
     Amount,
     PersonalMessage(WalletConnectPersonalMessageSummary),
     TypedData(WalletConnectTypedDataSummary),
-    UndecodedCall { selector: Option<[u8; 4]> },
+    UndecodedCall {
+        selector: Option<[u8; 4]>,
+    },
     None,
 }
 
@@ -390,6 +397,7 @@ pub(super) struct WalletConnectPeerProvenance {
 #[derive(Debug)]
 pub(super) struct WalletConnectIntentView<'a> {
     pub(super) action: WalletConnectIntentAction,
+    pub(super) chain_id: u64,
     pub(super) hero: WalletConnectHero,
     pub(super) amount: WalletConnectAmount,
     pub(super) icon: Option<WalletIconSource>,
@@ -408,6 +416,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     context: WalletConnectIntentContext<'_>,
 ) -> WalletConnectIntentView<'a> {
     let selected_account = request.item.account;
+    let mut chain_id = context.chain.chain_id;
     let mut amount = WalletConnectAmount::None;
     let mut icon = None;
     let mut attached_native = None;
@@ -497,11 +506,19 @@ pub(super) fn build_walletconnect_intent<'a>(
                 context.chain.chain_id
             ));
         }
-        WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
+        WalletConnectParsedRequest::WalletSwitchEthereumChain {
+            chain_id: target_chain_id,
+        } => {
             action = WalletConnectIntentAction::ChainSwitch;
-            hero_summary = WalletConnectHeroSummary::Policy(format!(
-                "Permit this website on chain {chain_id}"
-            ));
+            chain_id = *target_chain_id;
+            hero_summary = WalletConnectHeroSummary::ChainSwitch {
+                from_chain_id: if context.selected_chain_id == chain_id {
+                    context.chain.chain_id
+                } else {
+                    context.selected_chain_id
+                },
+                to_chain_id: chain_id,
+            };
         }
     }
 
@@ -514,6 +531,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     let authorization = authorization_projection(action, &hero, &amount);
     WalletConnectIntentView {
         action,
+        chain_id,
         hero,
         amount,
         icon,
@@ -1346,6 +1364,7 @@ fn authorization_projection(
             ));
         }
         WalletConnectHeroSummary::Policy(_)
+        | WalletConnectHeroSummary::ChainSwitch { .. }
         | WalletConnectHeroSummary::TypedData(_)
         | WalletConnectHeroSummary::Amount
         | WalletConnectHeroSummary::UndecodedCall { .. }
@@ -1699,6 +1718,7 @@ mod tests {
     ) -> WalletConnectIntentContext<'a> {
         WalletConnectIntentContext {
             chain,
+            selected_chain_id: chain.chain_id,
             token_registry: registry,
             anchor_rates: rates,
             public_accounts: accounts,
@@ -1738,6 +1758,35 @@ mod tests {
                 expiry_timestamp: Some(1_700_000_300),
             },
             account_source: PublicAccountSource::Imported,
+        }
+    }
+
+    #[test]
+    fn chain_switch_intent_shows_destination_and_network_transition() {
+        let registry = EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let rates = TokenAnchorRateCache::default();
+        for (website_chain_id, selected_chain_id) in [(1, 42161), (42161, 42161), (42161, 1)] {
+            let mut chain = chain(None);
+            chain.chain_id = website_chain_id;
+            let mut request = request_with(
+                WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id: 1 },
+                None,
+            );
+            request.item.chain_id = format!("eip155:{website_chain_id}");
+            let mut context = context(&chain, &registry, &rates, &[], &[]);
+            context.selected_chain_id = selected_chain_id;
+            let intent = build_walletconnect_intent(&request, context);
+
+            assert_eq!(intent.chain_id, 1);
+            assert_eq!(
+                intent.hero.summary,
+                WalletConnectHeroSummary::ChainSwitch {
+                    from_chain_id: 42161,
+                    to_chain_id: 1,
+                }
+            );
         }
     }
 

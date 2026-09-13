@@ -128,6 +128,7 @@ impl WalletRoot {
             }
         };
         let key = request.key.clone();
+        let active_wallet_generation = self.active_wallet_generation;
         self.walletconnect.request_actions.insert(key.clone());
         self.walletconnect.error = None;
         let begin = self
@@ -202,6 +203,14 @@ impl WalletRoot {
                 if !matches!(result, Ok(Ok(()))) {
                     root.walletconnect.error =
                         Some(Arc::from("The browser request is no longer available."));
+                } else if let WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } =
+                    request.parsed
+                    && root.active_wallet_generation == active_wallet_generation
+                    && root.root_replacement_is_allowed()
+                    && root.view_session.is_some()
+                    && root.effective_chain_configs.contains_key(&chain_id)
+                {
+                    root.select_chain(chain_id, window, cx);
                 }
                 root.sync_walletconnect_attention();
                 cx.notify();

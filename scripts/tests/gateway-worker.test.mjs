@@ -20,17 +20,11 @@ function deferred() {
 
 // Run the worker with Chrome, transport and WASM boundaries supplied by the host.
 // The real endpoint configuration policy is used; no worker internals are exported.
-async function worker(initial = {}, initialWindows = [], initialContextsVisible = true) {
+async function worker(initial = {}) {
   const data = structuredClone(initial);
   const sockets = [], clients = [], states = [], timers = new Map();
-  let listener, command, alarm, nextTimer = 0, clockTime = 0, storageHook, createHook, toolbarHook, removed;
-  const windows = structuredClone(initialWindows), created = [], badges = [], popups = [], panelBehaviors = [];
-  let nextWindow = 100, contextsVisible = initialContextsVisible;
-  const closeWindow = id => {
-    const index = windows.findIndex(window => window.id === id);
-    if (index >= 0) windows.splice(index, 1);
-    removed?.(id);
-  };
+  let listener, command, alarm, nextTimer = 0, clockTime = 0, storageHook, toolbarHook;
+  const created = [], badges = [], popups = [], panelBehaviors = [];
   const event = () => {
     const listeners = [];
     return { addListener(callback) { listeners.push(callback); }, fire(value) { for (const callback of listeners) callback(value); } };
@@ -80,22 +74,7 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
       async setPopup(value) { await toolbarHook?.('popup', value); popups.push(value.popup); },
     },
     sidePanel: { async setPanelBehavior(value) { await toolbarHook?.('panel', value); panelBehaviors.push(value.openPanelOnActionClick); } },
-    windows: {
-      async get(id) {
-        const window = windows.find(window => window.id === id);
-        if (!window) throw new Error('window unavailable');
-        return { id, tabs: window.tabs.map(tab => ({ id: tab.id })) };
-      },
-      async create(options) {
-        created.push(options);
-        await createHook?.();
-        const window = { id: ++nextWindow, tabs: [{ id: nextWindow * 10, url: options.url }] };
-        windows.push(window);
-        return { id: window.id, tabs: window.tabs.map(tab => ({ id: tab.id })) };
-      },
-      async remove(id) { closeWindow(id); },
-      onRemoved: { addListener(callback) { removed = callback; } },
-    },
+    windows: { async create(options) { created.push(options); } },
     storage: { local: {
       async setAccessLevel(value) { assert.equal(value.accessLevel, 'TRUSTED_CONTEXTS'); },
       async get(keys) {
@@ -120,12 +99,6 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
     alarms: { create() {}, clear() {}, onAlarm: { addListener(value) { alarm = value; } } },
     runtime: { id: 'test', getURL: value => `chrome-extension://test/${value}`, onConnect: { addListener(value) { listener = value; } },
       getManifest: () => ({ version: '0.1.0' }),
-      async getContexts(filter) {
-        if (!contextsVisible) return [];
-        return windows.flatMap(window => window.tabs
-          .filter(tab => filter.documentUrls.includes(tab.url))
-          .map(tab => ({ documentUrl: tab.url, windowId: window.id, tabId: tab.id })));
-      },
       onStartup: event(), onInstalled: event() },
   };
   vm.runInNewContext(source.replace(/^import .*;\n/gm, ''), {
@@ -137,10 +110,8 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
     postMessage: value => states.push(value), onDisconnect: event(),
     onMessage: { addListener(value) { command = value; } }, disconnect() { assert.fail('trusted port disconnected'); } });
   await flush();
-  return { chrome, data, sockets, clients, states, command, timers, windows, created, badges, closeWindow, popups, panelBehaviors, frames, activeTabs,
+  return { chrome, data, sockets, clients, states, command, timers, created, badges, popups, panelBehaviors, frames, activeTabs,
     toolbarHook(value) { toolbarHook = value; },
-    createHook(value) { createHook = value; },
-    contextsVisible(value) { contextsVisible = value; },
     ui(url = 'chrome-extension://test/index.html?mode=notification', name = 'gateway-ui-v1') {
       let request, disconnected;
       const port = { name, sender: { id: 'test', url }, messages: [],
@@ -444,127 +415,79 @@ async function established(h, locked = false) {
 const pending = id => ({ request_id: id, url: 'https://dapp.test/', needs_unlock: false, summary: 'Desktop review summary' });
 const connectPrompt = (wrong = true) => ({ request_id: 'connect', wrong_wallet: wrong, accounts: [], chains: [{ id: 1, name: 'Ethereum' }] });
 
-test('notifications share connect and request lifecycles across dismissal, redaction and expiry', async () => {
+test('requests open the toolbar popup once and preserve badges and dismissal through redaction', async () => {
   const h = await worker({ gatewayCredential: credential() });
+  const opened = [];
+  h.chrome.action.openPopup = async () => { opened.push(true); };
   const session = await established(h);
   await session.snapshot([], [connectPrompt()]);
-  assert.equal(h.created.length, 1, 'connect prompts open notifications');
+  assert.equal(opened.length, 1);
   assert.equal(h.badges.at(-1), '1');
-  await session.snapshot([pending('one')], [connectPrompt()]);
-  await session.snapshot([pending('one')], [connectPrompt()]);
-  assert.equal(h.created.length, 1);
+  const popup = h.ui('chrome-extension://test/index.html');
+  popup.request({ type: 'popup_presence', ready: true, visible: true });
+  await session.snapshot([pending('switch-chain')], [connectPrompt()]);
+  assert.equal(opened.length, 1, 'requests stay in the visible popup');
   assert.equal(h.badges.at(-1), '2');
-  const notification = h.ui();
-  assert.equal(notification.port.closed, undefined);
-  assert.equal(notification.port.messages[0].pending_requests[0].summary, 'Desktop review summary');
-  h.closeWindow(h.windows[0].id);
-  await session.snapshot([pending('one')]);
-  assert.equal(h.created.length, 1, 'same request must not reopen a dismissed window');
-  await session.snapshot([pending('one'), pending('two')]);
-  assert.equal(h.created.length, 2, 'a new request can reopen the notification');
-  await session.snapshot([]);
-  assert.equal(h.windows.length, 0, 'native expiry closes the owned notification');
-  await session.snapshot([pending('three')]);
+  popup.port.disconnect();
+  await session.snapshot([pending('switch-chain')]);
+  assert.equal(opened.length, 1, 'dismissing the popup does not replay the same request');
   await session.send({ type: 'state', version: 1, generation: 2, locked: true });
-  await session.snapshot([pending('three')], [], 2, true);
-  assert.equal(h.windows.length, 1, 'state redaction preserves the owned notification');
-  assert.equal(h.badges.at(-1), '1', 'locked pending requests remain counted');
-  const snapshot = notification.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
-  assert.equal(snapshot.pending_requests[0].summary, null);
-  assert.equal(snapshot.pending_requests[0].needs_unlock, true);
+  assert.equal(h.badges.at(-1), '1', 'temporary redaction retains the pending count');
+  assert.equal(h.states.filter(message => message.type === 'ui_snapshot').at(-1).pending_requests.length, 0,
+    'state changes immediately purge presentation data');
+  await session.snapshot([pending('switch-chain')], [], 2, true);
+  assert.equal(opened.length, 1, 'locking does not replay an existing request');
+  const redacted = h.states.filter(message => message.type === 'ui_snapshot').at(-1);
+  assert.equal(redacted.pending_requests[0].summary, null);
+  assert.equal(redacted.pending_requests[0].needs_unlock, true);
   const sentBeforeDuplicate = session.socket.sent.length;
   await session.send({ type: 'state', version: 1, generation: 2, locked: true });
-  const duplicate = notification.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
-  assert.deepEqual(duplicate, snapshot, 'duplicate locked state retains the authoritative redacted snapshot');
-  assert.equal(duplicate.generation, 2);
-  assert.equal(h.badges.at(-1), '1', 'duplicate locked state retains the pending badge');
-  assert.equal(h.windows.length, 1, 'duplicate locked state retains the notification');
+  assert.deepEqual(h.states.filter(message => message.type === 'ui_snapshot').at(-1), redacted,
+    'duplicate locked state retains the authoritative redacted snapshot');
   assert.equal(session.socket.sent.length, sentBeforeDuplicate, 'duplicate state emits no user activity');
-  h.closeWindow(h.windows[0].id);
-  const creates = h.created.length;
-  await session.send({ type: 'state', version: 1, generation: 3, locked: true });
-  const redacted = notification.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
-  assert.equal(redacted.pending_requests.length, 0, 'state changes immediately purge presentation data');
-  await session.snapshot([pending('three')], [], 3, true);
-  assert.equal(h.created.length, creates, 'the same request stays dismissed across state redaction');
-  await session.snapshot([pending('three')], [{ ...connectPrompt(), request_id: 'new-connect' }], 3, true);
-  assert.equal(h.created.length, creates + 1, 'a new locked connect prompt opens a redacted notification');
-  h.closeWindow(h.windows[0].id);
-  await session.send({ type: 'state', version: 1, generation: 4, locked: true });
-  await session.snapshot([pending('three')], [{ ...connectPrompt(), request_id: 'new-connect' }], 4, true);
-  assert.equal(h.created.length, creates + 1, 'a dismissed connect stays dismissed across state redaction');
-  await session.snapshot([pending('four')], [], 4, true);
-  assert.equal(h.created.length, creates + 2, 'a new locked request opens a redacted notification');
-  await session.snapshot([], [], 4, true);
-  assert.equal(h.windows.length, 0, 'an authoritative empty snapshot closes the locked notification');
-  h.createHook(() => { throw new Error('window unavailable'); });
-  await session.send({ type: 'state', version: 1, generation: 5, locked: false });
-  await session.snapshot([pending('five')], [], 5);
-  assert.equal(h.windows.length, 0);
-  assert.equal(h.badges.at(-1), '1', 'failed creation retains the pending badge');
-  h.command({ type: 'summon_desktop', generation: 5 });
-  const last = JSON.parse(new TextDecoder().decode(new Uint8Array(session.socket.sent.at(-1))));
-  assert.equal(last.type, 'summon_desktop', 'manual desktop summon remains usable after opening fails');
+  assert.equal(h.badges.at(-1), '1');
+  await session.snapshot([pending('next-switch')], [], 2, true);
+  assert.equal(opened.length, 2, 'a new request can open the popup');
+  await session.snapshot([], [], 2, true);
+  assert.equal(h.badges.at(-1), '');
+  assert.equal(h.created.length, 0, 'requests never create detached windows');
 });
 
-test('notification creation cannot outlive retirement and restart cleanup touches only the exact owned URL', async () => {
-  const other = { id: 1, tabs: [{ id: 10, url: 'chrome-extension://test/index.html?mode=window' }] };
-  const stale = { id: 2, tabs: [{ id: 20, url: 'chrome-extension://test/index.html?mode=notification' }] };
-  const rehomed = { id: 3, tabs: [{ id: 30, url: stale.tabs[0].url }, { id: 31, url: 'https://unrelated.test/' }] };
-  const delayed = await worker({}, [other, stale], false);
-  assert.deepEqual(delayed.windows.map(window => window.id), [1, 2]);
-  delayed.contextsVisible(true);
-  delayed.ui('chrome-extension://test/index.html?mode=window');
-  await flush();
-  assert.deepEqual(delayed.windows.map(window => window.id), [1, 2], 'ordinary UI connections do not rediscover notification windows');
-  delayed.ui();
-  await flush();
-  assert.deepEqual(delayed.windows.map(window => window.id), [1], 'a loaded notification is rediscovered after its context was hidden at worker startup');
-  const h = await worker({ gatewayCredential: credential() }, [other, stale, rehomed]);
-  assert.deepEqual(h.windows.map(window => window.id), [1, 3]);
-  const session = await established(h);
-  const blocked = deferred();
-  h.createHook(() => blocked.promise);
-  await session.snapshot([pending('one')]);
-  await session.snapshot([pending('one')]);
-  assert.equal(h.created.length, 1, 'concurrent snapshots share a single creation');
-  h.command({ type: 'retry' }); await flush();
-  h.contextsVisible(false);
-  blocked.resolve(); await flush();
-  assert.equal(h.windows.length, 3, 'ownership survives create resolving before the document context exists');
-  h.ui('chrome-extension://test/index.html?mode=window');
-  await flush();
-  assert.equal(h.windows.length, 3, 'other UI ports cannot finish notification startup cleanup');
-  h.contextsVisible(true);
-  h.ui();
-  await flush();
-  assert.deepEqual(h.windows.map(window => window.id), [1, 3], 'the loaded notification port finishes retired cleanup without closing other windows');
-  assert.equal(h.badges.at(-1), '');
+test('side panel mode and unavailable popup activation keep requests on the badge', async () => {
+  for (const mode of ['sidepanel', 'rejected', 'unsupported']) {
+    const h = await worker({ gatewayCredential: credential(), gatewayPreferences: { view: mode === 'sidepanel' ? mode : 'popup' } });
+    const opened = [];
+    h.chrome.action.openPopup = async () => { opened.push(true); throw new Error('Browser refused popup'); };
+    if (mode === 'unsupported') delete h.chrome.action.openPopup;
+    const session = await established(h);
+    await session.snapshot([pending('switch-chain')]);
+    await session.snapshot([pending('switch-chain')]);
+    assert.equal(h.badges.at(-1), '1');
+    assert.equal(opened.length, mode === 'rejected' ? 1 : 0, mode);
+    assert.equal(h.created.length, 0, 'a failed activation must never fall back to a detached window');
+    h.command({ type: 'summon_desktop', generation: 1 });
+    const last = JSON.parse(new TextDecoder().decode(new Uint8Array(session.socket.sent.at(-1))));
+    assert.equal(last.type, 'summon_desktop', 'manual review remains available');
+    await session.snapshot([]);
+    assert.equal(h.badges.at(-1), '');
+  }
+});
 
-  const active = await worker({ gatewayCredential: credential() });
-  const activeSession = await established(active);
-  await activeSession.snapshot([pending('move')]);
-  const owned = active.windows[0];
-  const notificationTab = owned.tabs[0];
-  owned.tabs = [{ id: 999, url: 'https://unrelated.test/' }];
-  active.windows.push({ id: 500, tabs: [notificationTab, { id: 998, url: 'https://other.test/' }] });
-  await activeSession.snapshot([]);
-  assert.deepEqual(active.windows.map(window => window.id), [owned.id, 500], 'expiry cannot close unrelated tabs after a user moves the notification');
-  await activeSession.snapshot([pending('navigate')]);
-  const navigated = active.windows.at(-1);
-  navigated.tabs[0].url = 'https://unrelated.test/';
-  await activeSession.snapshot([]);
-  assert.deepEqual(active.windows.map(window => window.id), [owned.id, 500, navigated.id], 'expiry preserves the same tab after it navigates away from the notification');
-  await activeSession.snapshot([pending('after-navigation')]);
-  const replacement = active.windows.at(-1);
-  assert.notEqual(replacement.id, navigated.id, 'a new request opens a notification after the previous tab navigated away');
-  assert.equal(navigated.tabs[0].url, 'https://unrelated.test/');
-  assert.equal(active.windows.includes(navigated), true);
-  // A previously loading notification may finish after its replacement is already live.
-  active.windows.push({ id: 600, tabs: [{ id: 6000, url: stale.tabs[0].url }] });
-  active.ui();
-  await flush();
-  assert.deepEqual(active.windows.map(window => window.id), [owned.id, 500, navigated.id, replacement.id], 'a delayed notification port preserves the current owned window and closes only exact-context duplicates');
+test('concurrent request snapshots share a popup activation attempt', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const blocked = deferred();
+  const opened = [];
+  h.chrome.action.openPopup = () => { opened.push(true); return blocked.promise; };
+  const session = await established(h);
+  await session.snapshot([pending('one')]);
+  await session.snapshot([pending('one'), pending('two')]);
+  assert.equal(opened.length, 1);
+  assert.equal(h.badges.at(-1), '2');
+  h.command({ type: 'retry' }); await flush();
+  blocked.resolve(); await flush();
+  assert.equal(opened.length, 1);
+  assert.equal(h.badges.at(-1), '');
+  assert.equal(h.created.length, 0);
 });
 
 test('desktop switch, summon and activity require the current privileged UI generation', async () => {
@@ -854,34 +777,6 @@ test('toolbar view persists independently of provider preferences and failed cha
   const popupRestart = await worker(restarted.data);
   assert.equal(popupRestart.popups.at(-1), 'index.html');
   assert.equal(popupRestart.panelBehaviors.at(-1), false);
-});
-
-test('only ready visible side panels take over notifications, with no dismissal replay', async () => {
-  const h = await worker({ gatewayCredential: credential(), gatewayPreferences: { view: 'sidepanel' } });
-  const session = await established(h);
-  const panel = h.ui('chrome-extension://test/index.html?mode=sidepanel');
-  panel.request({ type: 'sidepanel_presence', ready: false, visible: true });
-  await session.snapshot([pending('loading')]);
-  assert.equal(h.created.length, 1, 'a saved mode and loading panel do not suppress requests');
-  panel.request({ type: 'sidepanel_presence', ready: true, visible: true });
-  await flush();
-  assert.equal(h.windows.length, 0, 'the ready visible panel closes the owned notification');
-  await session.snapshot([pending('visible')]);
-  assert.equal(h.created.length, 1);
-  assert.equal(h.badges.at(-1), '1');
-  panel.request({ type: 'sidepanel_presence', ready: true, visible: false });
-  await session.snapshot([pending('visible')]);
-  assert.equal(h.created.length, 1, 'hiding does not replay a request already shown');
-  h.command({ type: 'sidepanel_presence', ready: true, visible: true });
-  await session.snapshot([pending('hidden')]);
-  assert.equal(h.created.length, 2, 'ordinary UI cannot spoof visible panel presence');
-  panel.request({ type: 'sidepanel_presence', ready: true, visible: true });
-  await flush();
-  panel.port.disconnect();
-  await session.snapshot([pending('disconnected')]);
-  assert.equal(h.created.length, 3, 'disconnect removes visible presence');
-  const impostor = h.ui('chrome-extension://test/index.html?mode=sidepanel&extra=1');
-  assert.equal(impostor.port.closed, true);
 });
 
 test('side panel readiness, visibility and reconnect report presence without extending inactivity', async () => {

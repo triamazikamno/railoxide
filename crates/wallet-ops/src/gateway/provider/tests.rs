@@ -3097,8 +3097,101 @@ async fn native_broker_completion_preserves_payload_and_revalidates_delivery_own
 }
 
 #[tokio::test]
+async fn chain_switch_skips_approval_only_when_website_and_live_wallet_match() {
+    for (website_chain, published_chain, live_chain, no_op) in [
+        (1, 1, 1, true),
+        (10, 1, 1, false),
+        (1, 1, 10, false),
+        (1, 10, 1, true),
+    ] {
+        let (path, mut provider, view) = fixture();
+        let (_, permission) = authorize(
+            &mut provider,
+            &view,
+            url::Url::parse("http://127.0.0.1:1").unwrap(),
+        );
+        provider
+            .store
+            .grant_gateway_permission(
+                &view,
+                &permission.origin,
+                &permission.public_account_uuid,
+                website_chain,
+            )
+            .unwrap();
+        let mut wallet = provider.wallet.clone();
+        wallet.routes.insert(
+            10,
+            RpcChainRoute::new(10, vec![url::Url::parse("http://127.0.0.1:2").unwrap()]),
+        );
+        wallet.default_chain_id = Some(published_chain);
+        provider.update_wallet(wallet.clone(), 3);
+        messages(&mut provider);
+        // The desktop publishes its selection before the actor receives its snapshot.
+        wallet.default_chain_id = Some(live_chain);
+        provider
+            .authority_fallback
+            .as_ref()
+            .unwrap()
+            .send_replace(wallet);
+        let permissions = provider.store.list_gateway_permissions(&view).unwrap();
+
+        provider
+            .request(
+                1,
+                "doc".into(),
+                "switch".into(),
+                "wallet_switchEthereumChain",
+                json!([{ "chainId": "0x1" }]),
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(provider.approval_updates.borrow().is_empty(), no_op);
+        let output = messages(&mut provider);
+        let response = output
+            .iter()
+            .find(|(_, message)| message["request_id"] == "switch");
+        if no_op {
+            assert_eq!(response.unwrap().1.get("result"), Some(&Value::Null));
+            assert!(response.unwrap().1.get("error").is_none());
+            assert!(
+                output
+                    .iter()
+                    .filter(|(_, message)| message["type"] == "ui_snapshot")
+                    .all(|(_, message)| message["pending_requests"].as_array().unwrap().is_empty())
+            );
+
+            provider
+                .request(
+                    1,
+                    "doc".into(),
+                    "retired".into(),
+                    "wallet_switchEthereumChain",
+                    json!([{ "chainId": "0x1" }]),
+                    Instant::now(),
+                )
+                .unwrap();
+            invalidate_authority(&provider, true);
+            let output = messages(&mut provider);
+            let response = output
+                .iter()
+                .find(|(_, message)| message["request_id"] == "retired")
+                .unwrap();
+            assert_eq!(response.1["error"]["code"], 4100);
+        } else {
+            assert!(response.is_none());
+        }
+        assert!(provider.store.list_gateway_permissions(&view).unwrap() == permissions);
+        drop(provider);
+        drop(view);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_scope() {
-    for decision in ["confirm", "reject", "stale", "unsupported"] {
+    for decision in ["confirm", "same-chain", "reject", "stale", "unsupported"] {
         let (path, mut provider, view) = fixture();
         let (_, original) = authorize(
             &mut provider,
@@ -3110,6 +3203,9 @@ async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_s
             10,
             RpcChainRoute::new(10, vec![url::Url::parse("http://127.0.0.1:2").unwrap()]),
         );
+        if decision == "same-chain" {
+            wallet.default_chain_id = Some(10);
+        }
         provider.update_wallet(wallet, 3);
         messages(&mut provider);
         personal_approval(&mut provider, "old-sign", Instant::now());
@@ -3143,10 +3239,10 @@ async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_s
                 .any(|read| read.owner.request_id == "queued-read"
                     && read.phase == ReadPhase::Queued)
         );
-        let chain = if decision == "unsupported" {
-            "0x89"
-        } else {
-            "0xa"
+        let chain = match decision {
+            "unsupported" => "0x89",
+            "same-chain" => "0x1",
+            _ => "0xa",
         };
         provider
             .request(
@@ -3197,6 +3293,13 @@ async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_s
                     Ok(Value::Null)
                 };
                 provider.complete_approval(&ready.id, outcome).unwrap();
+                if matches!(decision, "confirm" | "same-chain") {
+                    // The desktop selects the approved chain before the browser
+                    // necessarily receives the queued response.
+                    let mut wallet = provider.wallet.clone();
+                    wallet.default_chain_id = Some(if decision == "same-chain" { 1 } else { 10 });
+                    provider.update_wallet(wallet, 3);
+                }
                 let output = messages(&mut provider);
                 let response = output
                     .iter()
@@ -3220,6 +3323,10 @@ async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_s
                             .any(|read| read.owner.request_id == "queued-read")
                     );
                     assert!(provider.jobs.is_empty());
+                } else if decision == "same-chain" {
+                    assert!(output[response].1["result"].is_null());
+                    assert!(output[response].1.get("error").is_none());
+                    assert!(old.control.ensure_current().is_ok());
                 } else {
                     assert_eq!(output[response].1["error"]["code"], 4001);
                 }
@@ -3237,7 +3344,6 @@ async fn native_chain_policy_commits_only_current_confirmation_and_retires_old_s
             stored.owning_private_wallet_uuid,
             original.owning_private_wallet_uuid
         );
-        assert_eq!(provider.wallet.default_chain_id, Some(1));
         drop(provider);
         drop(view);
         std::fs::remove_dir_all(path).unwrap();

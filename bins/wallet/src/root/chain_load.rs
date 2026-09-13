@@ -2793,6 +2793,12 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.chain_select.read(cx).selected_value() != Some(&chain_id) {
+            self.chain_select.update(cx, |select, cx| {
+                select.set_selected_value(&chain_id, window, cx);
+                cx.notify();
+            });
+        }
         if self.selected_chain == chain_id {
             return;
         }

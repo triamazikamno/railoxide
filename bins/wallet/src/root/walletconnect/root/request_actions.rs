@@ -235,8 +235,12 @@ impl WalletRoot {
         let mut content = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
         match &request.parsed {
             WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
-                content = content.child(walletconnect_kv_row("Requested chain", chain_id.to_string()))
-                    .child(app_muted_text("Confirm changing this website's permitted chain. The wallet's selected chain stays unchanged."));
+                let description = if self.selected_chain == *chain_id {
+                    "Switch this website to your wallet's current network."
+                } else {
+                    "Switch the network for this website and your wallet."
+                };
+                content = content.child(app_muted_text(description));
             }
             WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
                 content = content.child(walletconnect_kv_row("Configured chain", chain_id.to_string()))
@@ -271,7 +275,6 @@ impl WalletRoot {
             .child(render_walletconnect_intent_card(
                 &request.key,
                 &intent,
-                &request.item.chain_id,
                 content_width,
             ))
             .child(render_walletconnect_request_provenance(
@@ -529,6 +532,7 @@ impl WalletRoot {
             .ok_or("The request chain is not available in the current wallet settings.")?;
         Ok(WalletConnectIntentContext {
             chain,
+            selected_chain_id: self.selected_chain,
             token_registry: &self.effective_token_registry,
             anchor_rates: &self.public_broadcaster_anchor_cache,
             public_accounts: &self.public_accounts,
@@ -1458,7 +1462,6 @@ fn render_walletconnect_intent_risk(
 fn render_walletconnect_intent_card(
     request_key: &str,
     intent: &WalletConnectIntentView<'_>,
-    chain_id: &str,
     content_width: Pixels,
 ) -> gpui::Div {
     let mut card = div()
@@ -1486,9 +1489,14 @@ fn render_walletconnect_intent_card(
                         .text_size(px(18.0))
                         .whitespace_normal(),
                 )
-                .child(walletconnect_approved_chain_chip(
-                    &approved_chain_display_item(chain_id),
-                )),
+                .when(
+                    intent.action != WalletConnectIntentAction::ChainSwitch,
+                    |this| {
+                        this.child(walletconnect_approved_chain_chip(
+                            &approved_chain_display_item(&format!("eip155:{}", intent.chain_id)),
+                        ))
+                    },
+                ),
         )
         .when_some(render_walletconnect_intent_hero(intent), |this, hero| {
             this.child(hero)
@@ -1625,6 +1633,31 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Opt
         }
         WalletConnectHeroSummary::Policy(detail) => {
             body = body.child(app_muted_text(detail.clone()));
+        }
+        WalletConnectHeroSummary::ChainSwitch {
+            from_chain_id,
+            to_chain_id,
+        } => {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(walletconnect_approved_chain_chip(
+                        &approved_chain_display_item(&format!("eip155:{from_chain_id}")),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(app_muted_text("→"))
+                            .child(walletconnect_approved_chain_chip(
+                                &approved_chain_display_item(&format!("eip155:{to_chain_id}")),
+                            )),
+                    ),
+            );
         }
         WalletConnectHeroSummary::None => {
             body = body.child(app_strong_text("Review request details"));

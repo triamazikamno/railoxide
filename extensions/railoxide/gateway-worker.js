@@ -46,84 +46,29 @@ let retryTimer;
 let storage = Promise.resolve();
 let commandPending = false;
 let uiSnapshot = { type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] };
-const notificationUrl = chrome.runtime.getURL('index.html?mode=notification');
-let notificationWindow;
-let notificationToken = 0;
-let notificationQueue = Promise.resolve();
-let notificationSeen = new Set();
-let notificationDiscovered = false;
-// State messages purge presentation before the authoritative pending snapshot arrives.
-// Retain only identities so redaction neither closes the window nor resets dismissal.
-let notificationPending = [];
-function wantsNotification() {
-  return notificationPending.length > 0 && !walletViewVisible();
-}
-async function removeNotification(window) {
-  const contexts = await chrome.runtime.getContexts({ documentUrls: [notificationUrl] });
-  const current = await chrome.windows.get(window.id, { populate: true }).catch(() => null);
-  // Relinquish ownership if the tab moved; never close its former window's other tabs.
-  if (current?.tabs?.length !== 1 || current.tabs[0].id !== window.tabId) return true;
-  if (!contexts.some(context => context.documentUrl === notificationUrl &&
-      context.windowId === window.id && context.tabId === window.tabId)) return false;
-  return chrome.windows.remove(window.id).then(() => true, () => false);
-}
-function updateNotification(rediscover = false, authoritative = false) {
-  const count = uiSnapshot.pending_connects.length + uiSnapshot.pending_requests.length;
-  void chrome.action.setBadgeText({ text: count ? String(count) : '' }).catch(() => {});
-  if (authoritative) notificationPending = [
+// State messages redact presentation before the authoritative pending snapshot arrives.
+// Retain only request identities so redaction preserves the badge and dismissal.
+let attentionPending = [];
+let attentionSeen = new Set();
+let popupOpening = false;
+function updateRequestAttention(authoritative = false) {
+  if (authoritative) attentionPending = [
     ...uiSnapshot.pending_connects.map(request => `connect:${request.request_id}`),
     ...uiSnapshot.pending_requests.map(request => `request:${request.request_id}`),
   ];
-  const ids = notificationPending;
-  const shouldOpen = wantsNotification() && ids.some(id => !notificationSeen.has(id));
-  notificationSeen = new Set(ids);
-  if (!wantsNotification()) notificationToken += 1;
-  const token = notificationToken;
-  notificationQueue = notificationQueue.then(async () => {
-    if (rediscover || shouldOpen) notificationDiscovered = false;
-    if (!notificationDiscovered) {
-      // Tab URLs are redacted without tabs permission, including our extension's own URLs.
-      const contexts = await chrome.runtime.getContexts({ documentUrls: [notificationUrl] });
-      const matches = [];
-      for (const context of contexts) {
-        if (context.documentUrl !== notificationUrl || !Number.isInteger(context.windowId) || context.windowId < 0 ||
-            !Number.isInteger(context.tabId) || context.tabId < 0 || matches.some(window => window.id === context.windowId)) continue;
-        const window = await chrome.windows.get(context.windowId, { populate: true }).catch(() => null);
-        if (window?.tabs?.length === 1 && window.tabs[0].id === context.tabId) {
-          matches.push({ id: context.windowId, tabId: context.tabId });
-        }
-      }
-      // A new request may replace a handle whose tab navigated away. Never close
-      // that page. A delayed notification port will reconcile any startup duplicate.
-      notificationWindow = matches.find(window => window.id === notificationWindow?.id && window.tabId === notificationWindow?.tabId)
-        ?? matches[0] ?? (shouldOpen ? undefined : notificationWindow);
-      for (const duplicate of matches) {
-        if (duplicate !== notificationWindow) await removeNotification(duplicate);
-      }
-      notificationDiscovered = true;
-    }
-    if (!wantsNotification() || token !== notificationToken) {
-      if (notificationWindow) {
-        const window = notificationWindow;
-        if (await removeNotification(window) && notificationWindow === window) notificationWindow = undefined;
-      }
-      return;
-    }
-    if (!shouldOpen || notificationWindow) return;
-    const window = await chrome.windows.create({ url: notificationUrl, type: 'popup', width: 440, height: 600 });
-    if (window?.id === undefined || window.tabs?.length !== 1 || window.tabs[0].id === undefined) return;
-    const created = { id: window.id, tabId: window.tabs[0].id };
-    // The document context may not exist yet when create resolves. Keep ownership
-    // until a later snapshot or the loaded notification's port can finish cleanup.
-    notificationWindow = created;
-    if (token !== notificationToken || !wantsNotification()) {
-      if (await removeNotification(created) && notificationWindow === created) notificationWindow = undefined;
-    }
-  }).catch(() => {}); // The badge and manual desktop control remain usable.
+  void chrome.action.setBadgeText({ text: attentionPending.length ? String(attentionPending.length) : '' }).catch(() => {});
+  const fresh = attentionPending.filter(id => !attentionSeen.has(id));
+  attentionSeen = new Set(attentionPending);
+  if (!fresh.length || walletViewVisible() || popupOpening) return;
+  const expected = epoch;
+  popupOpening = true;
+  void preferencesReady.then(async () => {
+    if (epoch !== expected || walletViewVisible() || !fresh.some(id => attentionPending.includes(id))) return;
+    // Side panels require an extension user gesture. Async wallet requests keep
+    // their badge instead. Older browsers may also refuse or lack openPopup.
+    if (view === 'popup') await chrome.action.openPopup?.();
+  }).catch(() => {}).finally(() => { popupOpening = false; });
 }
-chrome.windows.onRemoved.addListener(id => {
-  if (notificationWindow?.id === id) notificationWindow = undefined;
-});
 // Only aggregate native observations reach authenticated UI ports. No network data is persisted.
 const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset'];
 const networkErrors = new Set([
@@ -272,7 +217,7 @@ function publishSnapshot(snapshot, authoritative = true) {
   // Query replies are retained only by their live originating view.
   const { network_results, ...presentation } = snapshot;
   uiSnapshot = presentation;
-  updateNotification(false, authoritative);
+  updateRequestAttention(authoritative);
   for (const port of ports) {
     try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
   }
@@ -661,7 +606,6 @@ chrome.runtime.onConnect.addListener(port => {
       !['', '?mode=window', '?mode=notification', '?mode=sidepanel'].includes(url.search) || url.hash) { port.disconnect(); return; }
   ports.add(port);
   homeTabs.set(port, lastHomeTab);
-  if (url.search === '?mode=notification') updateNotification(true);
   port.postMessage(snapshotFor(port));
   port.postMessage(stateMessage());
   port.onDisconnect.addListener(() => {
@@ -678,7 +622,7 @@ chrome.runtime.onConnect.addListener(port => {
     ports.delete(port); // Documents never own the socket.
     tabContexts.delete(port);
     homeTabs.delete(port);
-    if (visibleViews.delete(port)) updateNotification();
+    if (visibleViews.delete(port)) updateRequestAttention();
   });
   port.onMessage.addListener(message => {
     if (!ports.has(port) || !message || typeof message.type !== 'string') return;
@@ -687,7 +631,7 @@ chrome.runtime.onConnect.addListener(port => {
       if (url.search !== expectedSearch || message.ready !== true || typeof message.visible !== 'boolean') return;
       if (message.visible) visibleViews.add(port);
       else visibleViews.delete(port);
-      updateNotification(message.visible);
+      updateRequestAttention();
       return;
     }
     if (message.type === 'tab_context' && Number.isInteger(message.window_id) && message.window_id >= 0) {
