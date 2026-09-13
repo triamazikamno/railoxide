@@ -11,6 +11,9 @@ let lastHomeTab = 'public';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const now = () => BigInt(Math.floor(performance.now()));
+// Hosts without a manifest reader stay paired; views and the desktop simply report no version.
+const manifest = chrome.runtime.getManifest?.();
+const extensionVersion = typeof manifest?.version === 'string' ? manifest.version : '';
 // Protocol MAX_MESSAGE_LEN is 32 MiB. Synchronous fragment sends cannot drain
 // bufferedAmount, so allow one complete message plus framing, with a fixed bound.
 const MAX_BUFFERED_BYTES = 34 * 1024 * 1024;
@@ -212,7 +215,9 @@ function clearCredentials(discovery) {
   discovery.record = null;
 }
 function stateMessage(reported = status) {
-  return { type: 'state', status: reported, endpoint: configuredEndpoint, paired, ...providerPreferences, view, viewError };
+  const state = { type: 'state', status: reported, endpoint: configuredEndpoint, paired, ...providerPreferences, view, viewError };
+  if (extensionVersion) state.version = extensionVersion;
+  return state;
 }
 function publish(next) {
   status = next;
@@ -375,6 +380,13 @@ async function receive(session, bytes) {
       failed(session, 'disconnected');
       return;
     }
+    // State repeats within a session, so the version is reported once and only to a desktop that reads it.
+    if (message.client_info_supported === true && !session.clientInfoSent) {
+      session.clientInfoSent = true;
+      if (extensionVersion) {
+        command(session, { type: 'client_info', version: 1, extension_version: extensionVersion });
+      }
+    }
     const generationChanged = session.generation !== message.generation;
     if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
     session.generation = message.generation;
@@ -388,7 +400,7 @@ async function receive(session, bytes) {
 }
 function attempt(discovery, endpoint) {
   return new Promise(resolve => {
-    const session = { discovery, client: null, socket: null, established: false,
+    const session = { discovery, client: null, socket: null, established: false, clientInfoSent: false,
       generation: -1, locked: null, queued: 0, chain: Promise.resolve(), finish: resolve };
     discovery.candidate = session;
     try {

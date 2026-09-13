@@ -61,6 +61,8 @@ function deliverSnapshot(snapshot) {
 let gatewayStatus = 'disconnected';
 let gatewayEndpoint = '';
 let gatewayPaired = false;
+// Mirrors the worker's reported manifest version; a worker that never reports one leaves it blank.
+let extensionVersion = '';
 let providerPreferences = { takeover: false, metamask: false };
 let view = 'popup';
 let viewError = false;
@@ -176,7 +178,8 @@ function deliverStatus(next, endpoint = gatewayEndpoint) {
   queueMicrotask(() => {
     if (callback && callback === stateCallback && (state === 'loading' || state === 'ready')) callback({ status: next, endpoint, paired: gatewayPaired,
       takeover: providerPreferences.takeover, metamask: providerPreferences.metamask, view,
-      view_notice: viewNotice || (viewError ? 'Could not save or apply toolbar mode. Try again or reload the extension.' : '') });
+      view_notice: viewNotice || (viewError ? 'Could not save or apply toolbar mode. Try again or reload the extension.' : ''),
+      ...(extensionVersion ? { version: extensionVersion } : {}) });
   });
 }
 function attachWorker() {
@@ -202,6 +205,7 @@ function attachWorker() {
     if (uiPort === port && message?.type === 'state' && typeof message.status === 'string') {
       providerPreferences = { takeover: message.takeover === true, metamask: message.metamask === true };
       gatewayPaired = message.paired === true;
+      extensionVersion = typeof message.version === 'string' ? message.version : '';
       if (message.view === 'popup' || message.view === 'sidepanel') view = message.view;
       if (typeof message.viewError === 'boolean') viewError = message.viewError;
       if (message.status === 'disconnected') clearPopupOpening();

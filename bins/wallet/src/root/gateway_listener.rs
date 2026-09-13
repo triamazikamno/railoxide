@@ -20,6 +20,28 @@ use wallet_ops::gateway::{GatewayConfig, GatewayError};
 
 use crate::root::WalletRoot;
 
+/// Addresses of the local IPv4 interfaces with their interface names, sorted
+/// and deduplicated. Loopback and unspecified addresses are left out: callers
+/// present those themselves when they apply.
+pub(super) fn local_ipv4_addresses() -> Result<Vec<(IpAddr, String)>, ()> {
+    let interfaces = if_addrs::get_if_addrs().map_err(|_| ())?;
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    for interface in interfaces {
+        let address = interface.ip();
+        if address.is_ipv6()
+            || address.is_loopback()
+            || address.is_unspecified()
+            || !seen.insert(address)
+        {
+            continue;
+        }
+        addresses.push((address, interface.name));
+    }
+    addresses.sort_by_key(|(address, _)| *address);
+    Ok(addresses)
+}
+
 pub(super) struct GatewayListenerDialog {
     address: Entity<InputState>,
     _address_subscription: gpui::Subscription,
@@ -72,7 +94,11 @@ impl WalletRoot {
                 (IpAddr::V4(Ipv4Addr::UNSPECIFIED), "0.0.0.0 · All IPv4 interfaces".to_owned()),
             ];
             if let Some(Ok(interfaces)) = &state.interfaces {
-                suggestions.extend(interfaces.iter().cloned());
+                suggestions.extend(
+                    interfaces
+                        .iter()
+                        .map(|(address, name)| (*address, format!("{address} · {name}"))),
+                );
             }
             let loading = state.interfaces.is_none();
             let enumeration_failed = matches!(state.interfaces, Some(Err(())));
@@ -179,23 +205,9 @@ impl WalletRoot {
             interfaces: None,
             error: None,
         });
-        let interfaces = cx.background_executor().spawn(async move {
-            let interfaces = if_addrs::get_if_addrs().map_err(|_| ())?;
-            let mut seen = HashSet::from([
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            ]);
-            let mut addresses = Vec::new();
-            for interface in interfaces {
-                let address = interface.ip();
-                if address.is_ipv6() || !seen.insert(address) {
-                    continue;
-                }
-                addresses.push((address, format!("{address} · {}", interface.name)));
-            }
-            addresses.sort_by_key(|(address, _)| *address);
-            Ok(addresses)
-        });
+        let interfaces = cx
+            .background_executor()
+            .spawn(async { local_ipv4_addresses() });
         cx.spawn(async move |this, cx| {
             let interfaces = interfaces.await;
             let _ = this.update(cx, |root, cx| {

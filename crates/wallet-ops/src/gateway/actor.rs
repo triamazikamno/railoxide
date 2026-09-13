@@ -1,6 +1,7 @@
 use super::{
-    Command, GatewayClientMessage, GatewayConfig, GatewayError, GatewayPairingOffer,
-    GatewayPeerSummary, GatewayServerMessage, GatewaySnapshot, PairingCode, PeerId,
+    Command, GatewayClientMessage, GatewayConfig, GatewayError, GatewayInstallBundle,
+    GatewayPairingOffer, GatewayPeerSummary, GatewayServerMessage, GatewaySnapshot, PairingCode,
+    PeerId, install,
     provider::{DappProvider, Delivery, DeliveryStatus, ReadCompletion},
     storage::{MAX_PEERS, Peer, Registry, StoredSecret},
 };
@@ -35,6 +36,8 @@ use tokio_tungstenite::{
 const MAX_CONNECTIONS: usize = 64;
 const MAX_UNAUTHENTICATED: usize = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Response write for the install page and zip; the task holds a pending-upgrade slot meanwhile.
+const INSTALL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CODE_LIFETIME: Duration = Duration::from_mins(2);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const ACTIVITY_FLUSH_INTERVAL: Duration = Duration::from_mins(5);
@@ -436,6 +439,8 @@ struct Actor {
     upgrades: JoinSet<Option<(Socket, Instant)>>,
     sessions: HashMap<u64, Session>,
     next_session: u64,
+    /// Versions reported by paired browsers this process has seen. Never persisted.
+    extension_versions: HashMap<[u8; 16], String>,
     ui_sessions: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     ui_events: tokio::sync::broadcast::Sender<super::GatewayUiEvent>,
     progress: ProgressCursor,
@@ -446,6 +451,7 @@ struct Actor {
     generation: u64,
     started: Instant,
     updates: watch::Sender<GatewaySnapshot>,
+    bundle: GatewayInstallBundle,
 }
 
 pub(super) async fn run(
@@ -458,6 +464,7 @@ pub(super) async fn run(
     authority: watch::Receiver<super::GatewayWalletState>,
     ui_events: tokio::sync::broadcast::Sender<super::GatewayUiEvent>,
     switch_updates: watch::Sender<Vec<Arc<super::GatewayWalletSwitchRequest>>>,
+    bundle: GatewayInstallBundle,
 ) {
     let loaded = Registry::load(&db);
     let storage_error = loaded.as_ref().err().copied();
@@ -480,6 +487,7 @@ pub(super) async fn run(
         upgrades: JoinSet::new(),
         sessions: HashMap::new(),
         next_session: 0,
+        extension_versions: HashMap::new(),
         ui_sessions: HashMap::new(),
         ui_events,
         progress: ProgressCursor::default(),
@@ -493,6 +501,7 @@ pub(super) async fn run(
         generation,
         started: now,
         updates,
+        bundle,
     };
     if storage_error.is_none() && actor.registry.config.enabled {
         actor.bind().await;
@@ -604,6 +613,7 @@ impl Actor {
                         .values()
                         .filter(|session| session.peer().is_some_and(|id| id.to_bytes() == peer.id))
                         .count(),
+                    extension_version: self.extension_versions.get(&peer.id).cloned(),
                 })
                 .collect(),
             locked: self.locked,
@@ -826,6 +836,7 @@ impl Actor {
         candidate.save(&self.db)?;
         self.registry = candidate;
         self.activity_dirty = false;
+        self.extension_versions.remove(&id.to_bytes());
         // This includes handshakes that looked up the old credential but have not confirmed.
         self.sessions.retain(|_, session| {
             session
@@ -850,19 +861,44 @@ impl Actor {
             return;
         }
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let bundle = self.bundle;
         self.upgrades.spawn(async move {
-            let config = WebSocketConfig::default()
-                .read_buffer_size(4096)
-                .write_buffer_size(4096)
-                .max_write_buffer_size(128 * 1024)
-                .max_frame_size(Some(MAX_RECORD_LEN))
-                .max_message_size(Some(MAX_RECORD_LEN))
-                .accept_unmasked_frames(false);
-            timeout_at(deadline, accept_async_with_config(stream, Some(config)))
+            // Browsers reach this port for the install page, so classify before the handshake.
+            let head = timeout_at(deadline, install::peek_head(&stream))
                 .await
-                .ok()?
-                .ok()
-                .map(|socket| (socket, deadline))
+                .ok()?;
+            if head.as_deref().is_some_and(install::is_websocket_upgrade) {
+                let config = WebSocketConfig::default()
+                    .read_buffer_size(4096)
+                    .write_buffer_size(4096)
+                    .max_write_buffer_size(128 * 1024)
+                    .max_frame_size(Some(MAX_RECORD_LEN))
+                    .max_message_size(Some(MAX_RECORD_LEN))
+                    .accept_unmasked_frames(false);
+                return timeout_at(deadline, accept_async_with_config(stream, Some(config)))
+                    .await
+                    .ok()?
+                    .ok()
+                    .map(|socket| (socket, deadline));
+            }
+            // The page names the address the browser actually reached, not the one it asked for.
+            let Ok(local) = stream.local_addr() else {
+                tracing::debug!("gateway install request without local address");
+                return None;
+            };
+            // A v4-mapped client on a dual-stack listener has to read as the IPv4 address it used.
+            let local = SocketAddr::new(local.ip().to_canonical(), local.port());
+            let head = head.unwrap_or_default();
+            let response = install::respond(&head, bundle, local);
+            let served = tokio::time::timeout(
+                INSTALL_RESPONSE_TIMEOUT,
+                install::serve(stream, head.len(), &response),
+            )
+            .await;
+            if !matches!(served, Ok(Ok(()))) {
+                tracing::debug!("gateway install response not delivered");
+            }
+            None
         });
     }
 
@@ -872,6 +908,7 @@ impl Actor {
             locked: self.locked,
             generation: self.generation,
             wallet_transition: self.provider.wallet_transition(),
+            client_info_supported: true,
         }
     }
 
@@ -980,6 +1017,16 @@ impl Actor {
                     }
                     Ok(GatewayClientMessage::GetState { version: 1 }) => {
                         session.application(self.state())?;
+                    }
+                    Ok(GatewayClientMessage::ClientInfo {
+                        version: 1,
+                        extension_version,
+                    }) => {
+                        // Unusable text is dropped rather than shown or answered as unsupported.
+                        if let Some(version) = accepted_extension_version(&extension_version) {
+                            let peer = session.peer().ok_or(GatewayError::Unavailable)?;
+                            self.extension_versions.insert(peer.to_bytes(), version);
+                        }
                     }
                     Ok(GatewayClientMessage::Heartbeat { version: 1 }) => {
                         session.application(GatewayServerMessage::Heartbeat { version: 1 })?;
@@ -1131,6 +1178,7 @@ impl Actor {
             GatewayClientMessage::PrivateView { version, .. } => ("private_view", version),
             GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
             GatewayClientMessage::GetState { version } => ("get_state", version),
+            GatewayClientMessage::ClientInfo { version, .. } => ("client_info", version),
             GatewayClientMessage::Heartbeat { version } => ("heartbeat", version),
             GatewayClientMessage::RegisterDocument { version, .. } => {
                 ("register_document", version)
@@ -1335,6 +1383,22 @@ impl Actor {
     }
 }
 
+/// Keeps a browser-supplied version short and numeric before it reaches the desktop UI.
+fn accepted_extension_version(value: &str) -> Option<String> {
+    if !(1..=32).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let parts: Vec<&str> = value.split('.').collect();
+    if !(1..=4).contains(&parts.len()) || parts.iter().any(|part| part.parse::<u64>().is_err()) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1533,7 +1597,7 @@ mod integration_tests {
         );
         // Finish before the listener's first ten-second token refill.
         tokio::time::timeout(Duration::from_secs(8), async {
-            let handle = GatewayHandle::start(db.clone(), true, 1);
+            let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
             let enabled = GatewayConfig {
                 enabled: true,
                 bind_address: Ipv4Addr::LOCALHOST.into(),
@@ -1576,6 +1640,220 @@ mod integration_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Sends one plain HTTP request on the gateway listener and reads the whole response.
+    async fn install_request(address: std::net::SocketAddr, target: &str) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let request = format!("GET {target} HTTP/1.1\r\nHost: {address}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            response[split + 4..].to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn install_page_and_bundle_are_served_beside_the_transport() {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("gateway-test-{}", u128::from_le_bytes(random)));
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root.clone(),
+            })
+            .unwrap(),
+        );
+        let bundle = GatewayInstallBundle {
+            zip: b"PK-test",
+            version: "9.9.9",
+        };
+        let handle = GatewayHandle::start(db.clone(), true, 1, bundle);
+        handle
+            .configure(GatewayConfig {
+                enabled: true,
+                bind_address: Ipv4Addr::LOCALHOST.into(),
+                port: available_port().await,
+            })
+            .await
+            .unwrap();
+        let address = handle.snapshots().borrow().listener_addr.unwrap();
+
+        let (head, body) = install_request(address, "/install").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(
+            head.contains("Content-Type: text/html; charset=utf-8"),
+            "{head}"
+        );
+        assert!(String::from_utf8(body).unwrap().contains("9.9.9"));
+
+        let (head, body) = install_request(address, "/install/RailOxide-Extension.zip").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(body, b"PK-test");
+
+        // The same listener keeps upgrading protocol clients.
+        let mut connection = socket(address).await;
+        connection.close(None).await.unwrap();
+
+        handle.shutdown().await.unwrap();
+        drop(handle);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reported_extension_versions_reach_the_snapshot_and_ignore_invalid_reports() {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("gateway-test-{}", u128::from_le_bytes(random)));
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root.clone(),
+            })
+            .unwrap(),
+        );
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
+        handle
+            .configure(GatewayConfig {
+                enabled: true,
+                bind_address: Ipv4Addr::LOCALHOST.into(),
+                port: available_port().await,
+            })
+            .await
+            .unwrap();
+        let address = handle.snapshots().borrow().listener_addr.unwrap();
+        let offer = handle.issue_pairing_code().await.unwrap();
+        let mut connection = socket(address).await;
+        let (mut protocol, peer, _secret) = pair(&mut connection, offer.code).await;
+        state(&mut connection, &mut protocol).await;
+        idle_ui_snapshot(&mut connection, &mut protocol, 1, true).await;
+
+        application(
+            &mut connection,
+            &mut protocol,
+            serde_json::json!({"type":"client_info","version":1,"extension_version":"0.0.9"}),
+        )
+        .await;
+        let mut snapshots = handle.snapshots();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            snapshots.wait_for(|snapshot| {
+                snapshot.peers.first().is_some_and(|reported| {
+                    reported.id == peer && reported.extension_version.as_deref() == Some("0.0.9")
+                })
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // An unusable report is dropped: it neither replaces the known version nor retires
+        // the session, so the next command is still answered.
+        application(
+            &mut connection,
+            &mut protocol,
+            serde_json::json!({"type":"client_info","version":1,"extension_version":"abc"}),
+        )
+        .await;
+        application(
+            &mut connection,
+            &mut protocol,
+            serde_json::json!({"type":"heartbeat","version":1}),
+        )
+        .await;
+        assert_eq!(
+            state(&mut connection, &mut protocol).await["type"],
+            "heartbeat"
+        );
+        assert_eq!(
+            snapshots.borrow().peers[0].extension_version.as_deref(),
+            Some("0.0.9")
+        );
+
+        handle.shutdown().await.unwrap();
+        drop(connection);
+        drop(handle);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_fragmented_upgrade_still_handshakes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("gateway-test-{}", u128::from_le_bytes(random)));
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root.clone(),
+            })
+            .unwrap(),
+        );
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
+        handle
+            .configure(GatewayConfig {
+                enabled: true,
+                bind_address: Ipv4Addr::LOCALHOST.into(),
+                port: available_port().await,
+            })
+            .await
+            .unwrap();
+        let address = handle.snapshots().borrow().listener_addr.unwrap();
+
+        // A browser can carry kilobytes of cookies, arriving in pieces; the classifier has to wait
+        // for the whole head and still hand a request this size to the handshake.
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Cookie: {}\r\n\r\n",
+            "a".repeat(9 * 1024)
+        );
+        let request = request.as_bytes();
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let split = request.len() / 2;
+        stream.write_all(&request[..split]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.write_all(&request[split..]).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut byte = [0; 1];
+            while !response.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                response.extend_from_slice(&byte);
+            }
+        })
+        .await
+        .expect("the upgrade response must arrive");
+        let head = String::from_utf8(response).unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some("HTTP/1.1 101 Switching Protocols"),
+            "{head}"
+        );
+
+        drop(stream);
+        handle.shutdown().await.unwrap();
+        drop(handle);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn ipv6_listener_binds_and_persists_selected_address() {
         let mut random = [0; 16];
@@ -1596,7 +1874,7 @@ mod integration_tests {
             port: std::num::NonZeroU16::new(address.port()).unwrap(),
         };
         drop(reserved);
-        let handle = GatewayHandle::start(db.clone(), true, 1);
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
         handle.configure(config).await.unwrap();
         assert_eq!(handle.snapshots().borrow().listener_addr, Some(address));
         let mut connection = socket(address).await;
@@ -1639,7 +1917,7 @@ mod integration_tests {
         }
         registry.save(&db).unwrap();
         let started = Instant::now();
-        let handle = GatewayHandle::start(db.clone(), true, 1);
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
         let mut snapshots = handle.snapshots();
         snapshots
             .wait_for(|snapshot| snapshot.listener_addr.is_some())
@@ -1757,7 +2035,7 @@ mod integration_tests {
         );
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let occupied_port = occupied.local_addr().unwrap().port();
-        let handle = GatewayHandle::start(db.clone(), true, 1);
+        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
         let conflicting = GatewayConfig {
             enabled: true,
             bind_address: Ipv4Addr::LOCALHOST.into(),
@@ -1896,7 +2174,7 @@ mod integration_tests {
             })
             .unwrap(),
         );
-        let restored = GatewayHandle::start(db.clone(), true, 4);
+        let restored = GatewayHandle::start(db.clone(), true, 4, GatewayInstallBundle::default());
         let mut snapshots = restored.snapshots();
         snapshots
             .wait_for(|snapshot| snapshot.listener_addr.is_some())
@@ -1969,7 +2247,7 @@ mod integration_tests {
         // Unknown future storage must not be overwritten by an enable operation.
         let future = br#"{"version":3,"config":{"enabled":true,"bind_address":"127.0.0.1","port":43110},"peers":[]}"#;
         db.put_app_settings_record("gateway-state", future).unwrap();
-        let blocked = GatewayHandle::start(db.clone(), true, 5);
+        let blocked = GatewayHandle::start(db.clone(), true, 5, GatewayInstallBundle::default());
         assert_eq!(
             blocked.configure(config).await,
             Err(GatewayError::InvalidStorage)
@@ -2005,7 +2283,8 @@ mod integration_tests {
                 let store = crate::vault::DesktopVaultStore::from_db(db.clone());
                 let view = initialize(&store);
                 let (endpoint, started, release, server) = held_rpc(remote_error).await;
-                let handle = GatewayHandle::start(db.clone(), true, 1);
+                let handle =
+                    GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
                 let config = GatewayConfig {
                     enabled: true,
                     bind_address: Ipv4Addr::LOCALHOST.into(),

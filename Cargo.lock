@@ -15943,6 +15943,7 @@ dependencies = [
  "hidapi-rusb",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "httparse",
  "libc",
  "libp2p",
  "local-db",

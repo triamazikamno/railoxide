@@ -103,6 +103,7 @@ async fn small_output_finishes_before_the_next_wallet_transition() {
                     generation: 1,
                     locked: false,
                     wallet_transition: false,
+                    client_info_supported: true,
                 })
                 .unwrap();
         }
@@ -143,6 +144,7 @@ async fn small_output_finishes_before_the_next_wallet_transition() {
                 generation: 2,
                 locked: true,
                 wallet_transition: true,
+                client_info_supported: true,
             })
             .unwrap();
         writer
@@ -413,6 +415,7 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
                 locked: false,
                 wallet_transition: false,
                 generation: 2,
+                client_info_supported: true,
             })
             .unwrap();
         provider

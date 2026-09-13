@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -56,6 +57,23 @@ def package_protocol_licenses(metadata, stage):
             target = directory / f'{number:02d}-{path.name}'
             shutil.copy2(path, target)
     (notices / 'SOURCES.md').write_text('\n'.join(index) + '\n')
+
+
+def write_archive(output, files):
+    """Write a deterministic zip beside the staged directory, extension files at the archive root."""
+    archive = output.with_suffix('.zip')
+    if archive.is_symlink():
+        raise RuntimeError('Refusing to replace a symlink at target/browser-extension.zip')
+    with tempfile.TemporaryDirectory(prefix='browser-extension-zip-', dir=archive.parent) as temporary:
+        staged = Path(temporary) / 'bundle.zip'
+        with zipfile.ZipFile(staged, 'w', zipfile.ZIP_DEFLATED) as bundle:
+            for name in sorted(path.relative_to(output).as_posix() for path in files):
+                # A fixed timestamp keeps identical inputs byte-identical across builds.
+                entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                bundle.writestr(entry, (output / name).read_bytes())
+        staged.replace(archive)
+    return archive
 
 
 def package(metadata_path):
@@ -124,7 +142,10 @@ def package(metadata_path):
             shutil.rmtree(output)
         shutil.move(str(stage), output)
     files = [p for p in output.rglob('*') if p.is_file()]
+    archive = write_archive(output, files)
     print(f'Load unpacked: {output}')
+    print(f'Archive: {archive}')
+    print('Rebuild the desktop app to embed the archive. If it was built before the archive existed, touch bins/wallet/build.rs first.')
     print(f'Package: {len(files)} files, {sum(p.stat().st_size for p in files)} bytes')
 
 

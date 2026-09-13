@@ -3,6 +3,7 @@ mod actor;
 mod admission;
 mod balance_reads;
 mod errors;
+mod install;
 pub use errors::{GatewayApprovalFailure, LocalProviderFailure, ProviderRpcError};
 mod private_view;
 mod provider;
@@ -51,6 +52,14 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+/// Browser extension distributed by this build, served over plain HTTP by the gateway listener.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GatewayInstallBundle {
+    /// Zip of the built extension, files at the archive root. Empty when this build has no bundle.
+    pub zip: &'static [u8],
+    pub version: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
@@ -92,6 +101,31 @@ pub struct GatewayPeerSummary {
     pub connected_sessions: usize,
     pub paired_at: u64,
     pub last_active_at: u64,
+    /// Version this browser reported since the desktop started; never persisted.
+    pub extension_version: Option<String>,
+}
+
+/// Offers an update only when this build carries a bundle to install and the reported
+/// dot-separated numeric version parses older than the bundled one. A version neither side
+/// can parse never claims an update, so a browser cannot invent an update prompt with
+/// arbitrary text.
+#[must_use]
+pub fn extension_update_available(reported: &str, bundle: GatewayInstallBundle) -> bool {
+    fn components(version: &str) -> Option<Vec<u64>> {
+        version.split('.').map(|part| part.parse().ok()).collect()
+    }
+    if bundle.zip.is_empty() {
+        return false;
+    }
+    let (Some(reported), Some(bundled)) = (components(reported), components(bundle.version)) else {
+        return false;
+    };
+    let width = reported.len().max(bundled.len());
+    let padded = |mut parts: Vec<u64>| {
+        parts.resize(width, 0);
+        parts
+    };
+    padded(reported) < padded(bundled)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -128,6 +162,10 @@ pub enum GatewayClientMessage {
     },
     GetState {
         version: u16,
+    },
+    ClientInfo {
+        version: u16,
+        extension_version: String,
     },
     Heartbeat {
         version: u16,
@@ -178,6 +216,8 @@ pub enum GatewayServerMessage {
         generation: u64,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         wallet_transition: bool,
+        /// Tells the browser this desktop accepts `client_info`; older desktops omit it.
+        client_info_supported: bool,
     },
     Heartbeat {
         version: u16,
@@ -281,7 +321,12 @@ pub struct GatewayHandle {
 impl GatewayHandle {
     /// Call inside the desktop-owned Tokio runtime. Storage errors fail closed in snapshots.
     #[must_use]
-    pub fn start(db: Arc<DbStore>, locked: bool, generation: u64) -> Self {
+    pub fn start(
+        db: Arc<DbStore>,
+        locked: bool,
+        generation: u64,
+        bundle: GatewayInstallBundle,
+    ) -> Self {
         let (ui_events, _) = tokio::sync::broadcast::channel(16);
         let (commands, receiver) = mpsc::channel(32);
         let (updates, snapshots) = watch::channel(GatewaySnapshot {
@@ -307,6 +352,7 @@ impl GatewayHandle {
             authority_receiver,
             ui_events.clone(),
             switch_updates,
+            bundle,
         ));
         Self {
             commands,
@@ -567,5 +613,38 @@ impl GatewayHandle {
                 }
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_parsable_older_report_offers_an_update() {
+        const fn bundled(version: &'static str) -> GatewayInstallBundle {
+            GatewayInstallBundle {
+                zip: b"PK",
+                version,
+            }
+        }
+        assert!(!extension_update_available("0.1.0", bundled("0.1.0")));
+        assert!(extension_update_available("0.1.0", bundled("0.2.0")));
+        assert!(!extension_update_available("0.2.0", bundled("0.1.9")));
+        // Missing trailing components are zero, so "0.1" and "0.1.0" are the same release.
+        assert!(!extension_update_available("0.1", bundled("0.1.0")));
+        assert!(extension_update_available("0.1", bundled("0.1.1")));
+        assert!(!extension_update_available("0.2", bundled("0.1.9")));
+        assert!(!extension_update_available("abc", bundled("0.1.0")));
+        assert!(!extension_update_available("", bundled("0.1.0")));
+        assert!(!extension_update_available("0.1.0", bundled("unbundled")));
+        // A build carrying no archive has nothing to install, however new its version reads.
+        assert!(!extension_update_available(
+            "0.1.0",
+            GatewayInstallBundle {
+                version: "0.2.0",
+                ..GatewayInstallBundle::default()
+            }
+        ));
     }
 }

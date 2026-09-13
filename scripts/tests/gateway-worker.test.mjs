@@ -119,6 +119,7 @@ async function worker(initial = {}, initialWindows = [], initialContextsVisible 
     permissions: { async contains() { return true; } },
     alarms: { create() {}, clear() {}, onAlarm: { addListener(value) { alarm = value; } } },
     runtime: { id: 'test', getURL: value => `chrome-extension://test/${value}`, onConnect: { addListener(value) { listener = value; } },
+      getManifest: () => ({ version: '0.1.0' }),
       async getContexts(filter) {
         if (!contextsVisible) return [];
         return windows.flatMap(window => window.tabs
@@ -202,6 +203,23 @@ test('desktop restart reconnects when the browser delays WebSocket opening', asy
   const h = await worker({ gatewayCredential: saved });
   const first = h.sockets[0]; first.open(); first.message(2); await flush();
   assert.equal(h.states.at(-1).status, 'paired');
+  const sealed = socket => socket.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))));
+  assert.deepEqual(sealed(first), [{ type: 'get_state', version: 1 }],
+    'authentication asks for state before the desktop has advertised anything');
+  const flaggedState = async () => {
+    first.message(new TextEncoder().encode(JSON.stringify({
+      type: 'state', version: 1, generation: 1, locked: false, client_info_supported: true,
+    })).buffer);
+    await flush();
+  };
+  await flaggedState();
+  assert.deepEqual(sealed(first), [
+    { type: 'get_state', version: 1 },
+    { type: 'client_info', version: 1, extension_version: '0.1.0' },
+  ], 'a desktop that advertises client_info learns the extension version');
+  await flaggedState();
+  assert.equal(sealed(first).filter(message => message.type === 'client_info').length, 1,
+    'repeated state broadcasts report the version only once');
 
   first.close(); await flush();
   await h.advance(1000);
@@ -218,6 +236,15 @@ test('desktop restart reconnects when the browser delays WebSocket opening', asy
   assert.equal(h.clients[1].mode, 'reconnect');
   assert.deepEqual(h.clients[1].copied, [saved.peerId, saved.secret]);
   assert.deepEqual(h.data.gatewayCredential, saved);
+});
+
+test('a desktop that never advertises client_info is never told the extension version', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const { socket } = await established(h);
+  assert.equal(h.states.at(-1).status, 'unlocked');
+  assert.ok(h.states.some(message => message.status === 'paired'));
+  assert.ok(!socket.sent.slice(1).some(bytes =>
+    JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))).type === 'client_info'));
 });
 
 test('opening failure retries the same endpoint without reusing pairing codes', async () => {
@@ -323,6 +350,7 @@ test('pairing with an endpoint saves it before opening that socket', async () =>
   const state = h.states.filter(message => message.type === 'state').at(-1);
   assert.equal(state.status, 'paired');
   assert.equal(state.paired, true);
+  assert.equal(state.version, '0.1.0', 'views read the extension version from the manifest');
 });
 
 test('retry during pending credential storage cannot acknowledge or revive the retired candidate', async () => {
@@ -951,10 +979,12 @@ test('host state reports the stored pairing and endpoint pairing waits for a val
   view.context.railoxideHost.subscribe(state => { last = state; });
   await flush();
   assert.equal(last.paired, false);
-  view.incoming({ type: 'state', status: 'locked', endpoint: 'desktop.local', paired: true, takeover: true });
+  assert.equal('version' in last, false, 'a worker that reports no version omits the key');
+  view.incoming({ type: 'state', status: 'locked', endpoint: 'desktop.local', paired: true, takeover: true,
+    version: '0.1.0' });
   await flush();
   assert.deepEqual(JSON.parse(JSON.stringify(last)), { status: 'locked', endpoint: 'desktop.local', paired: true,
-    takeover: true, metamask: false, view: 'popup', view_notice: '' });
+    takeover: true, metamask: false, view: 'popup', view_notice: '', version: '0.1.0' });
   view.disconnected();
   await flush();
   assert.deepEqual([last.status, last.paired], ['disconnected', true], 'a lost port does not forget the stored pairing');

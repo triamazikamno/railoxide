@@ -30,8 +30,8 @@ use ui::controls::{app_button_base, app_button_label, app_muted_text, app_strong
 use ui::icons;
 use ui::theme::{self, APP_TEXT_SIZE};
 use wallet_ops::gateway::{
-    GatewayConfig, GatewayError, GatewayHandle, GatewayPairingOffer, GatewaySnapshot,
-    GatewayUnlockState, GatewayWalletState, PeerId,
+    GatewayConfig, GatewayError, GatewayHandle, GatewayInstallBundle, GatewayPairingOffer,
+    GatewaySnapshot, GatewayUnlockState, GatewayWalletState, PeerId, extension_update_available,
 };
 
 use crate::assets::RailgunSidebarIcon;
@@ -41,12 +41,23 @@ use super::{SIDEBAR_WIDTH, VaultState, WalletRoot, app_status_tag, rgb_with_alph
 #[path = "gateway_handoff.rs"]
 mod handoff;
 use handoff::{GatewaySwitchContinuation, GatewaySwitchDialog};
+#[path = "gateway_install.rs"]
+mod install;
+use install::GatewayInstallDialog;
 #[path = "gateway_listener.rs"]
 mod listener;
 use listener::GatewayListenerDialog;
 #[path = "gateway_pairing.rs"]
 mod pairing;
 use pairing::GatewayPairingDialog;
+
+/// Extension packaged into this build by `bins/wallet/build.rs`, empty when it was not built.
+const fn install_bundle() -> GatewayInstallBundle {
+    GatewayInstallBundle {
+        zip: include_bytes!(concat!(env!("OUT_DIR"), "/browser-extension.zip")),
+        version: env!("RAILOXIDE_EXTENSION_VERSION"),
+    }
+}
 
 #[derive(Default)]
 struct GatewayUnlock {
@@ -118,6 +129,7 @@ pub(super) struct GatewayUi {
     wallet_switch: RefCell<Option<GatewaySwitchContinuation>>,
     switch_dialog: Option<GatewaySwitchDialog>,
     listener_dialog: Option<GatewayListenerDialog>,
+    install_dialog: Option<GatewayInstallDialog>,
     request_network: RefCell<Option<GatewayWalletState>>,
     handle: Option<GatewayHandle>,
     runtime: tokio::runtime::Handle,
@@ -164,7 +176,7 @@ impl GatewayUi {
     ) -> Self {
         let handle = {
             let _entered = runtime.enter();
-            GatewayHandle::start(store.db(), true, 0)
+            GatewayHandle::start(store.db(), true, 0, install_bundle())
         };
         let mut switch_requests = handle.wallet_switch_requests();
         cx.spawn_in(window, async move |this, cx| {
@@ -303,6 +315,7 @@ impl GatewayUi {
             wallet_switch: RefCell::new(None),
             switch_dialog: None,
             listener_dialog: None,
+            install_dialog: None,
             request_network: RefCell::new(None),
             handle: Some(handle),
             runtime: runtime.clone(),
@@ -682,6 +695,9 @@ impl WalletRoot {
                 let width = (viewport.width - px(56.0)).max(px(0.0)).min(px(300.0));
                 let max_height = (viewport.height * 0.75 - px(56.0)).max(px(0.0));
                 let popover = cx.entity();
+                let install = content_root
+                    .read(cx)
+                    .render_gateway_install_button(&content_root, &popover);
                 div()
                     .w(width)
                     .min_w(px(0.0))
@@ -690,7 +706,14 @@ impl WalletRoot {
                     .gap_3()
                     .text_size(APP_TEXT_SIZE)
                     .text_color(rgb(theme::TEXT))
-                    .child(app_strong_text("Browser pairing"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(app_strong_text("Browser pairing").flex_1().min_w_0())
+                            .child(install),
+                    )
                     .child(content_root.update(cx, |root, cx| {
                         root.render_gateway_controls(&content_root, &popover, max_height, cx)
                             .into_any_element()
@@ -699,6 +722,32 @@ impl WalletRoot {
         div()
             .when(!collapsed, |this| this.w(width).min_w(px(0.0)))
             .child(popover)
+    }
+
+    /// Title-row action: opens the install dialog once a listener address exists.
+    fn render_gateway_install_button(
+        &self,
+        root: &Entity<Self>,
+        popover: &Entity<PopoverState>,
+    ) -> Button {
+        let disabled = self.gateway.busy
+            || self.gateway.handle.is_none()
+            || self.gateway.snapshot.listener_addr.is_none();
+        let install_root = root.clone();
+        let install_popover = popover.clone();
+        Button::new("gateway-install-extension")
+            .small()
+            .outline()
+            .secondary()
+            .icon(Icon::new(RailgunSidebarIcon::BrowserExtensions).small())
+            .label("Install extension…")
+            .disabled(disabled)
+            .on_click(move |_, window, cx| {
+                install_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                install_root.update(cx, |root, cx| {
+                    root.open_gateway_install_dialog(window, cx);
+                });
+            })
     }
 
     fn render_gateway_controls(
@@ -791,9 +840,11 @@ impl WalletRoot {
         let mut peers_content = gateway_section_content().gap_0();
         if self.gateway.snapshot.peers.is_empty() {
             peers_content = peers_content.child(
-                app_muted_text("No paired browsers")
-                    .text_size(px(12.0))
-                    .line_height(px(17.0)),
+                app_muted_text(
+                    "No browsers paired yet. Install the extension, then create a pairing.",
+                )
+                .text_size(px(12.0))
+                .line_height(px(17.0)),
             );
         }
         let now = super::utxo::now_epoch_secs();
@@ -813,6 +864,15 @@ impl WalletRoot {
             };
             let last_active = gateway_peer_age(peer.last_active_at, now);
             let paired = gateway_peer_age(peer.paired_at, now);
+            let mut detail = format!("Last active {last_active} · paired {paired}");
+            if let Some(reported) = peer.extension_version.as_deref() {
+                if extension_update_available(reported, install_bundle()) {
+                    detail.push_str(" · Update available");
+                } else {
+                    detail.push_str(" · v");
+                    detail.push_str(reported);
+                }
+            }
             let menu_target = GatewayPeerMenuTarget {
                 root: root.clone(),
                 peer_id: peer.id,
@@ -877,7 +937,7 @@ impl WalletRoot {
                             ),
                     )
                     .child(
-                        app_muted_text(format!("Last active {last_active} · paired {paired}"))
+                        app_muted_text(detail)
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.0))
@@ -1428,7 +1488,7 @@ mod tests {
             )
             .unwrap();
         let view = Arc::new(store.load_view_session(PASSWORD, "software").unwrap());
-        let handle = GatewayHandle::start(store.db(), true, 0);
+        let handle = GatewayHandle::start(store.db(), true, 0, GatewayInstallBundle::default());
         handle.configure(GatewayConfig::default()).await.unwrap();
         let mut snapshots = handle.snapshots();
         snapshots.borrow_and_update();

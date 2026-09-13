@@ -25,6 +25,7 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     select::{SearchableVec, Select, SelectItem, SelectState},
     tag::Tag,
+    tooltip::Tooltip,
 };
 use ui::{
     controls::{
@@ -501,6 +502,11 @@ fn tag_color(color: u32, alpha: f32) -> gpui::Rgba {
     value
 }
 
+/// Shown on the status pill and copied from the settings menu.
+fn version_signature(version: &str) -> String {
+    format!("RailOxide Gateway {version}")
+}
+
 struct GatewayView {
     code: Entity<OtpState>,
     endpoint: Entity<InputState>,
@@ -512,6 +518,8 @@ struct GatewayView {
     metamask: bool,
     view: String,
     view_notice: String,
+    /// The extension's own manifest version, absent when the worker predates reporting it.
+    version: Option<String>,
     accounts: Vec<ConnectAccount>,
     public_view: PublicView,
     private_view: private_view::PrivateView,
@@ -559,6 +567,9 @@ impl GatewayView {
             let metamask = flag_field(&state, "metamask");
             let selected_view = text_field(&state, "view");
             let view_notice = text_field(&state, "view_notice");
+            let version = field(&state, "version")
+                .as_string()
+                .filter(|value| !value.is_empty());
             // The window is needed to seed the endpoint field from the host's saved value.
             let _ = app.update_window(handle, |_, window, cx| {
                 let _ = view.update(cx, |view, cx| {
@@ -588,6 +599,7 @@ impl GatewayView {
                     view.metamask = metamask;
                     view.view = selected_view;
                     view.view_notice = view_notice;
+                    view.version = version;
                     // Follow the saved endpoint until the user edits the field.
                     let untouched = view.endpoint.read(cx).value().as_ref() == view.seeded_endpoint;
                     if untouched && view.seeded_endpoint != view.configured_endpoint {
@@ -678,6 +690,7 @@ impl GatewayView {
             metamask: false,
             view: "popup".into(),
             view_notice: String::new(),
+            version: None,
             accounts: Vec::new(),
             public_view: PublicView::default(),
             private_view: private_view::PrivateView::default(),
@@ -725,6 +738,10 @@ impl GatewayView {
         let selected_view = self.view.clone();
         let takeover = self.takeover;
         let metamask = self.metamask;
+        let version = self.version.clone();
+        let signature = version
+            .as_deref()
+            .map(|version| SharedString::from(version_signature(version)));
         div()
             .flex()
             .flex_none()
@@ -750,16 +767,25 @@ impl GatewayView {
             }))
             .when(self.status != "unlocked", |this| {
                 this.child(
-                    div().flex().flex_none().child(
-                        Tag::custom(
-                            tag_color(color, 0.12).into(),
-                            rgb(color).into(),
-                            rgb(color).into(),
+                    div()
+                        .id("gateway-transport")
+                        .flex()
+                        .flex_none()
+                        .child(
+                            Tag::custom(
+                                tag_color(color, 0.12).into(),
+                                rgb(color).into(),
+                                rgb(color).into(),
+                            )
+                            .text_sm()
+                            .rounded_full()
+                            .child(label),
                         )
-                        .text_sm()
-                        .rounded_full()
-                        .child(label),
-                    ),
+                        .when_some(signature, |this, signature| {
+                            this.tooltip(move |window, cx| {
+                                Tooltip::new(signature.clone()).build(window, cx)
+                            })
+                        }),
                 )
             })
             .when(self.status == "unlocked", |this| {
@@ -807,6 +833,20 @@ impl GatewayView {
                                         );
                                     }),
                             )
+                            .when_some(version.clone(), |menu, version| {
+                                let copied = SharedString::from(version_signature(&version));
+                                menu.item(PopupMenuItem::separator()).item(
+                                    PopupMenuItem::new(format!("Version {version}")).on_click(
+                                        move |_, window, cx| {
+                                            ui::clipboard::copy_to_clipboard_with_toast(
+                                                copied.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    ),
+                                )
+                            })
                     }),
             )
     }

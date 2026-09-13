@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RailOxide browser extension</title>
+<style>
+  :root {
+    --background:#2b2b2b; --surface:#383838; --input-surface:#3c3c3c; --surface-elevated:#444444;
+    --border:#5f5f5f; --border-subtle:#4f4f4f; --text:#dcdccc; --text-muted:#a8a89a;
+    --text-subtle:#7f7f6f; --primary:#8cd0d3; --primary-fg:#2b2b2b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --background:#f4f4ef; --surface:#ffffff; --input-surface:#eeeee7; --surface-elevated:#e6e6dd;
+      --border:#c3c3b6; --border-subtle:#d9d9cd; --text:#2b2b2b; --text-muted:#5c5c52;
+      --text-subtle:#84847a; --primary:#2c777d; --primary-fg:#ffffff;
+    }
+  }
+  * { box-sizing:border-box; margin:0; }
+  body {
+    background:var(--background); color:var(--text); font-size:14px; line-height:21px;
+    font-family:-apple-system,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+    padding:32px 20px 40px;
+  }
+  main { max-width:680px; margin:0 auto; display:flex; flex-direction:column; gap:24px; }
+  .head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .head h1 { font-size:20px; line-height:26px; font-weight:600; }
+  .head .ver { font-size:12px; color:var(--text-subtle); }
+  .step { display:grid; grid-template-columns:28px 1fr; gap:4px 12px; }
+  .step .n {
+    width:24px; height:24px; border-radius:50%; border:1px solid var(--border);
+    display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--text-muted);
+  }
+  .step h3 { font-size:14px; line-height:24px; font-weight:600; }
+  .step .c { grid-column:2; display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:19px; }
+  .step .c p { color:var(--text-muted); }
+  .step .c ol { padding-left:18px; color:var(--text); display:flex; flex-direction:column; gap:4px; }
+  .step .c ol li span.aside { color:var(--text-muted); }
+  .code {
+    font-family:Menlo,Consolas,"DejaVu Sans Mono",monospace; font-size:12px;
+    background:var(--input-surface); border:1px solid var(--border-subtle); border-radius:4px; padding:1px 6px;
+  }
+  .kbd { display:inline-flex; align-items:center; gap:6px; }
+  .dl { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .btn {
+    display:inline-flex; align-items:center; justify-content:center; gap:6px; height:32px; padding:0 12px;
+    border-radius:6px; border:1px solid var(--primary); background:var(--primary); color:var(--primary-fg);
+    font-size:13px; font-weight:600; white-space:nowrap; text-decoration:none;
+  }
+  .btn svg { width:14px; height:14px; }
+  .hint { font-size:12px; color:var(--text-subtle); }
+  .copy {
+    display:none; align-items:center; height:20px; padding:0 6px; font:inherit; font-size:11px;
+    border-radius:4px; border:1px solid var(--border-subtle); background:var(--surface-elevated);
+    color:var(--text-muted); cursor:pointer;
+  }
+  body.js .copy { display:inline-flex; }
+  .osgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .osgrid div { font-size:12px; line-height:17px; color:var(--text-muted); }
+  .osgrid div b { display:block; color:var(--text); font-weight:500; }
+  .browsers { display:flex; flex-direction:column; gap:8px; }
+  .browsers > input { position:absolute; width:1px; height:1px; opacity:0; }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; }
+  .tabs label {
+    height:26px; padding:0 10px; border-radius:6px; border:1px solid transparent;
+    display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); cursor:pointer;
+  }
+  .tabs label .rec { font-size:11px; color:var(--text-subtle); }
+  /* Outranks the generic `.step .c ol` rule so only the checked browser panel shows. */
+  .step .c ol.panel { display:none; }
+  #tab-brave:checked ~ .tabs label[for="tab-brave"],
+  #tab-chrome:checked ~ .tabs label[for="tab-chrome"],
+  #tab-edge:checked ~ .tabs label[for="tab-edge"] {
+    border-color:var(--border); background:var(--surface-elevated); color:var(--text);
+  }
+  #tab-brave:focus ~ .tabs label[for="tab-brave"],
+  #tab-chrome:focus ~ .tabs label[for="tab-chrome"],
+  #tab-edge:focus ~ .tabs label[for="tab-edge"] { outline:2px solid var(--primary); outline-offset:1px; }
+  #tab-brave:checked ~ #panel-brave,
+  #tab-chrome:checked ~ #panel-chrome,
+  #tab-edge:checked ~ #panel-edge { display:flex; }
+  details { font-size:12px; color:var(--text-muted); }
+  details summary { cursor:pointer; color:var(--text); }
+  details p { padding:8px 0 0; }
+  .pfoot {
+    display:flex; gap:16px; font-size:12px; color:var(--text-subtle);
+    border-top:1px solid var(--border-subtle); padding-top:12px;
+  }
+  /* Outranks the generic `.step .c` rules so the server-chosen mode decides what shows. */
+  .step .c.connect-local, .step .c.connect-local-port, .step .c.connect-remote,
+  .step .c .bundled-only, .step .c .unbundled-only { display:none; }
+  body.local .step .c.connect-local, body.remote .step .c.connect-remote { display:flex; }
+  body.local-port .step .c.connect-local-port { display:flex; }
+  body.bundled .step .c .bundled-only { display:flex; }
+  body.unbundled .step .c .unbundled-only { display:block; }
+</style>
+</head>
+<body class="{{MODE}} {{BUNDLE}}">
+<main>
+  <div class="head"><h1>RailOxide browser extension</h1><span class="ver">version {{VERSION}}</span></div>
+
+  <div class="step"><span class="n">1</span><h3>Download</h3>
+    <div class="c">
+      <div class="dl bundled-only">
+        <a class="btn" href="/install/RailOxide-Extension.zip" download>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+          Download RailOxide-Extension.zip
+        </a>
+        <span class="hint">{{SIZE}}</span>
+      </div>
+      <p class="unbundled-only">This build has no extension bundle. Run <span class="code">scripts/build-browser-extension</span> and rebuild the desktop app.</p>
+    </div></div>
+
+  <div class="step"><span class="n">2</span><h3>Extract</h3>
+    <div class="c">
+      <div class="osgrid">
+        <div><b>macOS</b>Double-click the zip.</div>
+        <div><b>Windows</b>Right-click, Extract All.</div>
+        <div><b>Linux</b>Right-click, Extract Here.</div>
+      </div>
+      <p>You get a folder named <span class="code">RailOxide-Extension</span>.</p>
+    </div></div>
+
+  <div class="step"><span class="n">3</span><h3>Load it in the browser</h3>
+    <div class="c">
+      <div class="browsers">
+        <input type="radio" name="browser" id="tab-brave" checked>
+        <input type="radio" name="browser" id="tab-chrome">
+        <input type="radio" name="browser" id="tab-edge">
+        <div class="tabs">
+          <label for="tab-brave">Brave<span class="rec">· recommended</span></label>
+          <label for="tab-chrome">Chrome</label>
+          <label for="tab-edge">Edge</label>
+        </div>
+        <ol class="panel" id="panel-brave">
+          <li>Open <span class="kbd"><span class="code">brave://extensions</span><button class="copy" type="button">Copy</button></span> <span class="aside">· paste it, links to it don’t work</span></li>
+          <li>Turn on <b>Developer mode</b> <span class="aside">· top right</span></li>
+          <li>Click <b>Load unpacked</b> and choose the <span class="code">RailOxide-Extension</span> folder</li>
+          <li>Pin <b>RailOxide Gateway</b> in the toolbar</li>
+        </ol>
+        <ol class="panel" id="panel-chrome">
+          <li>Open <span class="kbd"><span class="code">chrome://extensions</span><button class="copy" type="button">Copy</button></span> <span class="aside">· paste it, links to it don’t work</span></li>
+          <li>Turn on <b>Developer mode</b> <span class="aside">· top right</span></li>
+          <li>Click <b>Load unpacked</b> and choose the <span class="code">RailOxide-Extension</span> folder</li>
+          <li>Pin <b>RailOxide Gateway</b> in the toolbar</li>
+        </ol>
+        <ol class="panel" id="panel-edge">
+          <li>Open <span class="kbd"><span class="code">edge://extensions</span><button class="copy" type="button">Copy</button></span> <span class="aside">· paste it, links to it don’t work</span></li>
+          <li>Turn on <b>Developer mode</b> <span class="aside">· bottom left</span></li>
+          <li>Click <b>Load unpacked</b> and choose the <span class="code">RailOxide-Extension</span> folder</li>
+          <li>Pin <b>RailOxide Gateway</b> in the toolbar</li>
+        </ol>
+      </div>
+    </div></div>
+
+  <div class="step"><span class="n">4</span><h3>Connect</h3>
+    <div class="c connect-local">
+      <p>Open the extension. It connects to this computer automatically.</p>
+      <p>Create a pairing in the desktop app and enter the code.</p>
+    </div>
+    <div class="c connect-local-port">
+      <p>Open the extension settings and enter the gateway address:</p>
+      <div class="kbd"><span class="code">ws://{{HOST}}/</span><button class="copy" type="button">Copy</button></div>
+      <p>Then create a pairing in the desktop app and enter the code.</p>
+    </div>
+    <div class="c connect-remote">
+      <p>Open the extension settings and enter the gateway address:</p>
+      <div class="kbd"><span class="code">ws://{{HOST}}/</span><button class="copy" type="button">Copy</button></div>
+      <p>Allow the access prompt, then create a pairing in the desktop app and enter the code.</p>
+    </div></div>
+
+  <div class="step"><span class="n" style="border-color:transparent"></span><h3>Updating</h3>
+    <div class="c"><p>Download again, extract over the same folder, then click <b>Reload</b> on the extension card.</p></div></div>
+
+  <details>
+    <summary>Build from source</summary>
+    <p>The RailOxide repository builds this extension from source. See <span class="code">docs/browser-extension.md</span> for the pinned toolchain and the packaging script.</p>
+  </details>
+
+  <div class="pfoot"><span>Served by RailOxide desktop on {{HOST}}</span></div>
+</main>
+<script>
+(function () {
+  document.body.classList.add('js');
+
+  function fallbackCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try { document.execCommand('copy'); } catch (error) { /* nothing else to try */ }
+    document.body.removeChild(area);
+  }
+
+  function confirmCopy(button) {
+    var label = button.textContent;
+    button.textContent = 'Copied';
+    setTimeout(function () { button.textContent = label; }, 1200);
+  }
+
+  var buttons = document.querySelectorAll('.copy');
+  for (var index = 0; index < buttons.length; index += 1) {
+    buttons[index].addEventListener('click', function (event) {
+      var button = event.currentTarget;
+      var source = button.previousElementSibling;
+      if (!source) { return; }
+      var text = source.textContent;
+      // Clipboard access needs a secure context, which a plain http gateway is not.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          function () { confirmCopy(button); },
+          function () { fallbackCopy(text); confirmCopy(button); }
+        );
+      } else {
+        fallbackCopy(text);
+        confirmCopy(button);
+      }
+    });
+  }
+
+  var brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+  var names = brands.map(function (entry) { return entry.brand; }).join(' ');
+  if (/Edg/i.test(names)) {
+    document.getElementById('tab-edge').checked = true;
+  } else if (!navigator.brave && /Chrom/i.test(names)) {
+    document.getElementById('tab-chrome').checked = true;
+  }
+})();
+</script>
+</body>
+</html>
