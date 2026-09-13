@@ -56,7 +56,7 @@ def package_protocol_licenses(metadata, stage):
             # Prefix avoids collisions between nested notices without disclosing local paths.
             target = directory / f'{number:02d}-{path.name}'
             shutil.copy2(path, target)
-    (notices / 'SOURCES.md').write_text('\n'.join(index) + '\n')
+    (notices / 'SOURCES.md').write_text('\n'.join(index) + '\n', encoding='utf-8')
 
 
 def write_archive(output, files):
@@ -77,7 +77,7 @@ def write_archive(output, files):
 
 
 def package(metadata_path):
-    metadata = json.loads(Path(metadata_path).read_text())
+    metadata = json.loads(Path(metadata_path).read_text(encoding='utf-8'))
     packages = [p for p in metadata['packages'] if p['name'] == 'gpui-kit-assets' and p['version'] == '0.6.0']
     if len(packages) != 1:
         raise RuntimeError('Expected exactly one locked gpui-kit-assets 0.6.0 source')
@@ -118,7 +118,7 @@ def package(metadata_path):
             path = wallet_icons / name
             shutil.copy2(ROOT / 'bins/wallet/assets/icons' / name, path)
             asset_paths.append(str(path.relative_to(stage / 'assets')))
-        (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n')
+        (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n', encoding='utf-8')
         icons = package_source / 'assets/icons'
         target_icons = stage / 'assets/icons'
         shutil.copytree(icons, target_icons)
@@ -133,7 +133,7 @@ def package(metadata_path):
         for icon in sorted(target_icons.glob('*.svg')):
             digest = hashlib.sha256(icon.read_bytes()).hexdigest()
             mapping.append(f'- `assets/icons/{icon.name}` SHA-256 `{digest}`')
-        (stage / 'assets/COMPONENT-SOURCES.md').write_text('\n'.join(mapping) + '\n')
+        (stage / 'assets/COMPONENT-SOURCES.md').write_text('\n'.join(mapping) + '\n', encoding='utf-8')
         shutil.copy2(ROOT / 'bins/wallet/assets/icons/SOURCES.md', stage / 'licenses/wallet-icon-SOURCES.md')
         shutil.copy2(ROOT / 'bins/wallet/assets/icons/lucide-icons-LICENSE.txt', stage / 'licenses/lucide-icons-LICENSE.txt')
         if output.is_symlink():

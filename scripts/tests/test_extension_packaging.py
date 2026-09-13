@@ -34,6 +34,56 @@ def write_zip(path, content=b'first'):
 
 
 class ExtensionPackagingTests(unittest.TestCase):
+    def test_packager_preserves_utf8_with_a_windows_default_encoding(self):
+        packager = load_script('package-browser-extension')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for directory in ('extensions/railoxide', 'crates/railgun-ui/assets',
+                              'crates/ui/assets/icons', 'bins/wallet/assets/icons'):
+                shutil.copytree(ROOT / directory, root / directory)
+            shutil.copy2(ROOT / 'LICENSE', root / 'LICENSE')
+            kit = root / 'kit-\u0141'
+            (kit / 'assets/icons').mkdir(parents=True)
+            icon_name = '\u0141.svg'
+            icon = b'<svg/>'
+            (kit / 'assets/icons' / icon_name).write_bytes(icon)
+            wasm_directory = root / 'target/wasm32-unknown-unknown/release'
+            wasm_directory.mkdir(parents=True)
+            for crate in ('browser_frontend', 'dapp_gateway_protocol'):
+                (wasm_directory / f'{crate}.wasm').write_bytes(b'\0asm\1\0\0\0')
+            metadata = {
+                'packages': [
+                    {'id': 'kit', 'name': 'gpui-kit-assets', 'version': '0.6.0',
+                     'manifest_path': str(kit / 'Cargo.toml')},
+                    {'id': 'protocol', 'name': 'dapp-gateway-protocol', 'version': '0.1.0',
+                     'manifest_path': str(root / 'Cargo.toml'), 'license': 'MIT'},
+                ],
+                'resolve': {'nodes': [{'id': 'protocol', 'dependencies': []}]},
+                'workspace_members': ['protocol'],
+                'target_directory': str(root / 'target'),
+            }
+            metadata_path = root / 'metadata.json'
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')
+
+            def bindgen(args, **kwargs):
+                stage = Path(args[args.index('--out-dir') + 1])
+                name = args[args.index('--out-name') + 1]
+                shutil.copy2(args[-1], stage / f'{name}_bg.wasm')
+
+            path_open = Path.open
+
+            def windows_open(path, mode='r', buffering=-1, encoding=None, errors=None, newline=None):
+                if 'b' not in mode and encoding in (None, 'locale'):
+                    encoding = 'cp1252'
+                return path_open(path, mode, buffering, encoding, errors, newline)
+
+            with patch.object(packager, 'ROOT', root), patch.object(packager.subprocess, 'run', side_effect=bindgen), patch.object(Path, 'open', windows_open):
+                packager.package(metadata_path)
+
+            with zipfile.ZipFile(root / 'target/browser-extension.zip') as archive:
+                self.assertEqual(archive.read(f'assets/icons/{icon_name}'), icon)
+                self.assertIn(icon_name, archive.read('assets/COMPONENT-SOURCES.md').decode('utf-8'))
+
     def test_embedding_rejects_missing_and_stale_archives(self):
         verifier = load_script('verify-browser-extension')
         with tempfile.TemporaryDirectory() as temporary:
