@@ -103,21 +103,23 @@ def package(metadata_path):
         wallet_assets = stage / 'assets/railgun-ui'
         shutil.copytree(ROOT / 'crates/railgun-ui/assets', wallet_assets)
         # Keep the source attribution beside the unchanged chain and token bytes.
-        asset_paths = sorted(str(path.relative_to(stage / 'assets')) for path in wallet_assets.rglob('*')
+        # Browser asset keys use forward slashes on every build host.
+        asset_paths = sorted(path.relative_to(stage / 'assets').as_posix() for path in wallet_assets.rglob('*')
                              if path.is_file() and path.suffix in ('.svg', '.png'))
         shared_icons = stage / 'assets/ui/icons'
         shared_icons.mkdir(parents=True)
         for name in ('shield', 'arrow-big-right-dash', 'book-user', 'wallet', 'pencil', 'refresh-ccw',
-                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye'):
+                     'screen-share', 'monitor', 'qr-code', 'shield-keyhole', 'eye', 'dices'):
             path = shared_icons / f'{name}.svg'
             shutil.copy2(ROOT / 'crates/ui/assets/icons' / path.name, path)
-            asset_paths.append(str(path.relative_to(stage / 'assets')))
+            asset_paths.append(path.relative_to(stage / 'assets').as_posix())
+        shutil.copy2(ROOT / 'crates/ui/assets/icons/SOURCES.md', shared_icons / 'SOURCES.md')
         wallet_icons = stage / 'assets/railgun/icons'
         wallet_icons.mkdir(parents=True)
         for name in ('clock.svg', 'ledger-logo-short-white.svg', 'trezor-symbol-white-rgb.svg'):
             path = wallet_icons / name
             shutil.copy2(ROOT / 'bins/wallet/assets/icons' / name, path)
-            asset_paths.append(str(path.relative_to(stage / 'assets')))
+            asset_paths.append(path.relative_to(stage / 'assets').as_posix())
         (stage / 'assets/WALLET-ASSETS.json').write_text(json.dumps(asset_paths) + '\n', encoding='utf-8')
         icons = package_source / 'assets/icons'
         target_icons = stage / 'assets/icons'
