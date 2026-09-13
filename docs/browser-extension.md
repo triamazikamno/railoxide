@@ -12,11 +12,11 @@ building a desktop app that should carry it.
 
 ## Build and load
 
-Use the native development prerequisites, Python 3, `nightly-2026-08-16` with the `wasm32-unknown-unknown` target, and exactly `wasm-bindgen-cli 0.2.126`.
+Use the native development prerequisites, Python 3, the `stable` Rust toolchain at version 1.97.1 or later with the `wasm32-unknown-unknown` target, and exactly `wasm-bindgen-cli 0.2.126`.
 Install missing tools with:
 
 ```sh
-rustup toolchain install nightly-2026-08-16 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
 scripts/build-browser-extension
 ```

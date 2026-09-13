@@ -17,8 +17,9 @@ if [[ $# -gt 0 ]]; then
   exit 1
 fi
 
-cargo +nightly-2026-08-16 build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked
+# wasm_thread requires the unstable stdarch_wasm_atomic_wait feature on WASM.
+RUSTC_BOOTSTRAP=1 cargo +stable build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked
 browser_metadata="$(mktemp)"
 trap 'rm -f -- "$browser_metadata"' EXIT
-cargo +nightly-2026-08-16 metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "$browser_metadata"
+cargo +stable metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "$browser_metadata"
 python3 scripts/package-browser-extension.py "$browser_metadata"
