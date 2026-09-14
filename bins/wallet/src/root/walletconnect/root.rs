@@ -10,20 +10,19 @@ use super::{
         walletconnect_is_transient_relay_error, walletconnect_namespace_account_support,
         walletconnect_pairing_expired, walletconnect_proposal_rejection_reason,
         walletconnect_proposal_requests_required_typed_data,
-        walletconnect_relay_request_was_not_sent, walletconnect_request_approval_admitted,
-        walletconnect_request_expiry_status, walletconnect_request_id_seed,
-        walletconnect_request_key_log_label, walletconnect_session_expired,
-        walletconnect_session_has_expiring_lifecycle, walletconnect_session_uuid,
-        walletconnect_session_visible_in_management, walletconnect_topic_log_label,
-        walletconnect_validate_pending_request_expiry,
+        walletconnect_relay_request_was_not_sent, walletconnect_request_expiry_status,
+        walletconnect_request_id_seed, walletconnect_request_key_log_label,
+        walletconnect_session_expired, walletconnect_session_has_expiring_lifecycle,
+        walletconnect_session_uuid, walletconnect_session_visible_in_management,
+        walletconnect_topic_log_label, walletconnect_validate_pending_request_expiry,
     },
     relay::{
         encode_walletconnect_response_message, execute_walletconnect_approval_relay_steps,
         execute_walletconnect_relay_steps, process_walletconnect_relay_output,
-        publish_walletconnect_session_response, stop_stale_walletconnect_relay_workers,
-        walletconnect_active_sessions, walletconnect_active_sessions_for_relay_client,
-        walletconnect_client_from_identity, walletconnect_relay_target_topics,
-        walletconnect_relay_worker_loop, walletconnect_session_request_failure_from_error,
+        stop_stale_walletconnect_relay_workers, walletconnect_active_sessions,
+        walletconnect_active_sessions_for_relay_client, walletconnect_client_from_identity,
+        walletconnect_relay_target_topics, walletconnect_relay_worker_loop,
+        walletconnect_session_request_failure_from_error,
     },
     render::{
         approved_chain_display_item, format_unix_seconds, render_walletconnect_approval_stepper,
@@ -52,8 +51,12 @@ use super::render::walletconnect_trezor_app_passphrase_input;
 mod attention;
 mod connection;
 mod pairing;
+mod policy;
 mod relay_lifecycle;
 mod request_actions;
 mod request_dialog;
 mod session_dialogs;
 mod toolbar;
+
+#[cfg(test)]
+pub(super) use request_actions::gateway_pending_request;

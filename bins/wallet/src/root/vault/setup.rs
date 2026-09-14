@@ -225,6 +225,17 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let password = Self::read_and_clear_input(&self.unlock_password_input, window, cx);
+        self.unlock_vault_with_password(password, None, window, cx);
+    }
+
+    pub(in crate::root) fn unlock_vault_with_password(
+        &mut self,
+        password: Zeroizing<String>,
+        remote: Option<wallet_ops::gateway::GatewayUnlockGuard>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.unlock_in_progress {
             return;
         }
@@ -232,13 +243,18 @@ impl WalletRoot {
             self.set_vault_error("Wallet vault storage is unavailable", cx);
             return;
         };
-        let password = Self::read_and_clear_input(&self.unlock_password_input, window, cx);
         if password.trim().is_empty() {
             self.set_vault_error("Enter the vault password to continue", cx);
             return;
         }
 
         let store = Arc::clone(store);
+        let gateway_unlock = self.begin_gateway_unlock();
+        self.set_remote_unlock_attempt(
+            remote
+                .as_ref()
+                .map(wallet_ops::gateway::GatewayUnlockGuard::attempt),
+        );
         let remembered_wallet_id = self.ui_state.last_wallet_id.clone();
         let remembered_wallet_kind = self.ui_state.last_wallet_kind;
         let active_wallet_generation = self.active_wallet_generation;
@@ -299,41 +315,77 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.unlock_in_progress = false;
-                if root.active_wallet_generation != active_wallet_generation {
+                if remote.as_ref().is_some_and(|guard| !guard.is_current())
+                    || root.active_wallet_generation != active_wallet_generation
+                {
                     return;
                 }
                 match result {
                     Ok(Ok(unlock)) if unlock.session.is_some() => {
-                        root.install_vault_view_unlock(unlock.vault_view_unlock);
-                        root.enter_view_unlocked(
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Opening);
+                        }
+                        if remote.is_none() {
+                            root.install_vault_view_unlock(unlock.vault_view_unlock);
+                        }
+                        root.install_view_session_for_gateway_unlock(
                             unlock.session.expect("checked above"),
                             &unlock.metadata,
+                            gateway_unlock,
                             window,
                             cx,
                         );
                     }
                     Ok(Ok(unlock)) => {
+                        if let Some(guard) = &remote {
+                            if unlock.pending_software_profile_open.is_some() {
+                                guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Passphrase);
+                            } else {
+                                if !guard.attempt().finish_if_current(
+                                    wallet_ops::gateway::GatewayUnlockPhase::Desktop,
+                                ) {
+                                    return;
+                                }
+                                root.set_remote_unlock_attempt(None);
+                            }
+                        }
                         root.enter_password_metadata_unlocked(
                             &unlock.metadata,
                             unlock.vault_view_unlock,
                             unlock.setup_password,
                             unlock.pending_software_profile_open,
+                            gateway_unlock,
                             window,
                             cx,
                         );
                         #[cfg(feature = "hardware")]
                         if let Some(wallet_id) = unlock.remembered_hardware_wallet_id {
                             root.vault_error = None;
-                            root.open_hardware_profile_unlock_dialog_for_wallet(
-                                wallet_id, window, cx,
+                            root.open_hardware_profile_unlock_dialog_for_wallet_continuing(
+                                wallet_id,
+                                gateway_unlock,
+                                window,
+                                cx,
                             );
                         }
                     }
                     Ok(Err(error)) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
+                        if root.gateway_unlock_is_current(gateway_unlock) {
+                            root.retire_gateway_unlock();
+                        }
                         root.focus_vault_input_on_render = true;
                         root.handle_vault_error(&error, cx);
                     }
                     Err(error) => {
+                        if let Some(guard) = &remote {
+                            guard.finish(wallet_ops::gateway::GatewayUnlockPhase::Failed);
+                        }
+                        if root.gateway_unlock_is_current(gateway_unlock) {
+                            root.retire_gateway_unlock();
+                        }
                         tracing::warn!(%error, "desktop wallet vault unlock task failed");
                         root.focus_vault_input_on_render = true;
                         root.set_vault_error(

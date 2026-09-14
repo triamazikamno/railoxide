@@ -19,6 +19,7 @@ const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
 const BROADCASTER_ICON_PATH: &str = "railgun/icons/robot.svg";
+const BROWSER_EXTENSIONS_ICON_PATH: &str = "railgun/icons/browser-extensions.svg";
 const LOGS_ICON_PATH: &str = "railgun/icons/logs.svg";
 const DICES_ICON_PATH: &str = "railgun/icons/dices.svg";
 const SQUARE_ICON_PATH: &str = "railgun/icons/square.svg";
@@ -43,9 +44,6 @@ const FOLDER_COG_ICON_PATH: &str = "railgun/icons/folder-cog.svg";
 const SPARKLES_ICON_PATH: &str = "railgun/icons/sparkles.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
-const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
-const ARROW_RIGHT_LEFT_ICON_PATH: &str = "railgun/icons/arrow-right-left.svg";
-const ARROW_DOWN_TO_LINE_ICON_PATH: &str = "railgun/icons/arrow-down-to-line.svg";
 const UI_ASSET_PREFIX: &str = "ui/";
 const RAILGUN_UI_ASSET_PREFIX: &str = "railgun-ui/";
 
@@ -63,6 +61,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
     BROADCASTER_ICON_PATH,
+    BROWSER_EXTENSIONS_ICON_PATH,
     LOGS_ICON_PATH,
     DICES_ICON_PATH,
     SQUARE_ICON_PATH,
@@ -87,9 +86,6 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     SPARKLES_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
-    TOR_STATUS_ICON_PATH,
-    ARROW_RIGHT_LEFT_ICON_PATH,
-    ARROW_DOWN_TO_LINE_ICON_PATH,
 ];
 
 const LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/logo.svg");
@@ -104,19 +100,21 @@ const TREZOR_SYMBOL_WHITE_ICON_BYTES: &[u8] =
 const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletconnect.svg");
 const TELEGRAM_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/telegram.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
-    include_bytes!("../assets/icons/arrow-big-right-dash.svg");
-const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
+    include_bytes!("../../../crates/ui/assets/icons/arrow-big-right-dash.svg");
+const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/shield.svg");
 const WALLET_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/wallet.svg");
 const BROADCASTER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/robot.svg");
+const BROWSER_EXTENSIONS_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/browser-extensions.svg");
 const LOGS_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/logs.svg");
 const DICES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/dices.svg");
 const SQUARE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square.svg");
 const SQUARE_ASTERISK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square-asterisk.svg");
-const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pencil.svg");
-const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
+const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/pencil.svg");
+const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
-const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/book-user.svg");
+const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/book-user.svg");
 const LANDMARK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/landmark.svg");
 const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
@@ -132,10 +130,6 @@ const FOLDER_COG_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/folder-cog.
 const SPARKLES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/sparkles.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
-const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.svg");
-const ARROW_RIGHT_LEFT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/arrow-right-left.svg");
-const ARROW_DOWN_TO_LINE_ICON_BYTES: &[u8] =
-    include_bytes!("../assets/icons/arrow-down-to-line.svg");
 
 pub(crate) struct WalletAssets;
 
@@ -303,10 +297,8 @@ fn append_embedded_asset_list<T: RustEmbed>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RailgunActionIcon {
-    Wallet,
     Send,
     Shield,
-    Dices,
     Square,
     SquareAsterisk,
     Pencil,
@@ -325,10 +317,8 @@ pub(crate) enum RailgunActionIcon {
 impl IconNamed for RailgunActionIcon {
     fn path(self) -> SharedString {
         match self {
-            Self::Wallet => WALLET_ICON_PATH,
             Self::Send => ARROW_BIG_RIGHT_DASH_ICON_PATH,
             Self::Shield => SHIELD_ICON_PATH,
-            Self::Dices => DICES_ICON_PATH,
             Self::Square => SQUARE_ICON_PATH,
             Self::SquareAsterisk => SQUARE_ASTERISK_ICON_PATH,
             Self::Pencil => PENCIL_ICON_PATH,
@@ -369,6 +359,7 @@ impl IconNamed for RailgunPublicAccountIcon {
 pub(crate) enum RailgunSidebarIcon {
     Wallet,
     Broadcaster,
+    BrowserExtensions,
     BookUser,
     Landmark,
     Logs,
@@ -379,27 +370,10 @@ impl IconNamed for RailgunSidebarIcon {
         match self {
             Self::Wallet => WALLET_ICON_PATH,
             Self::Broadcaster => BROADCASTER_ICON_PATH,
+            Self::BrowserExtensions => BROWSER_EXTENSIONS_ICON_PATH,
             Self::BookUser => BOOK_USER_ICON_PATH,
             Self::Landmark => LANDMARK_ICON_PATH,
             Self::Logs => LOGS_ICON_PATH,
-        }
-        .into()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RailgunNetworkStatusIcon {
-    Tor,
-    ConnectionSetup,
-    Download,
-}
-
-impl IconNamed for RailgunNetworkStatusIcon {
-    fn path(self) -> SharedString {
-        match self {
-            Self::Tor => TOR_STATUS_ICON_PATH,
-            Self::ConnectionSetup => ARROW_RIGHT_LEFT_ICON_PATH,
-            Self::Download => ARROW_DOWN_TO_LINE_ICON_PATH,
         }
         .into()
     }
@@ -434,6 +408,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
         BROADCASTER_ICON_PATH => Some(BROADCASTER_ICON_BYTES),
+        BROWSER_EXTENSIONS_ICON_PATH => Some(BROWSER_EXTENSIONS_ICON_BYTES),
         LOGS_ICON_PATH => Some(LOGS_ICON_BYTES),
         DICES_ICON_PATH => Some(DICES_ICON_BYTES),
         SQUARE_ICON_PATH => Some(SQUARE_ICON_BYTES),
@@ -458,9 +433,6 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         SPARKLES_ICON_PATH => Some(SPARKLES_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
-        TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),
-        ARROW_RIGHT_LEFT_ICON_PATH => Some(ARROW_RIGHT_LEFT_ICON_BYTES),
-        ARROW_DOWN_TO_LINE_ICON_PATH => Some(ARROW_DOWN_TO_LINE_ICON_BYTES),
         _ => None,
     }
 }
@@ -473,12 +445,14 @@ mod tests {
     fn wallet_assets_embed_shared_icon_sets() {
         let assets = WalletAssets;
 
-        assert!(
-            assets
-                .load("ui/icons/refresh-ccw.svg")
-                .expect("load ui icon")
-                .is_some()
-        );
+        for path in [
+            ui::icons::refresh_ccw_icon_path(),
+            ui::icons::tor_status_icon_path(),
+            ui::icons::arrow_right_left_icon_path(),
+            ui::icons::arrow_down_to_line_icon_path(),
+        ] {
+            assert!(assets.load(path).expect("load ui icon").is_some(), "{path}");
+        }
         assert!(
             assets
                 .load("railgun-ui/chains/ethereum.svg")

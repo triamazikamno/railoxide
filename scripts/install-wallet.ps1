@@ -24,6 +24,8 @@ $SqliteVersion = "3530200"
 $SourceMode = "release"
 $SourceRef = ""
 $ExplicitSource = $false
+$PythonCommand = ""
+$PythonArgs = @()
 
 function Show-Usage {
     @"
@@ -31,7 +33,7 @@ RailOxide Windows source installer.
 
 This installer builds RailOxide from source. By default it prompts for the
 source to build and defaults to the latest published GitHub release, including
-pre-releases. It does not install prebuilt binaries.
+pre-releases. The wallet and extension are built locally; build helpers may be downloaded.
 
 Usage:
   irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
@@ -496,6 +498,79 @@ function Ensure-SqliteForLinking {
     $env:SQLITE3_INCLUDE_DIR = Join-Path $sqliteRoot "sqlite-amalgamation-$SqliteVersion"
 }
 
+function Find-Python {
+    foreach ($name in @("py", "python", "python3")) {
+        if (-not (Test-Command $name)) { continue }
+        $prefixArgs = if ($name -eq "py") { @("-3") } else { @() }
+        try {
+            & $name @prefixArgs -c "import sys; sys.exit(sys.version_info < (3, 9))" 2>$null
+        } catch {
+            continue
+        }
+        if ($LASTEXITCODE -eq 0) {
+            $script:PythonCommand = $name
+            $script:PythonArgs = $prefixArgs
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-ExtensionDependencies {
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir "scripts\build-browser-extension"))) {
+        Write-Step "selected source predates the browser extension; skipping extension tools"
+        return
+    }
+    if (-not (Find-Python)) {
+        if ($NoDeps) { Stop-Install "Python 3 is required for the browser extension; -NoDeps was provided" }
+        if (-not (Confirm-Action "Install Python 3 with winget for the browser extension?")) {
+            Stop-Install "Python 3 is required"
+        }
+        Install-WingetPackage "Python.Python.3.13" "Python 3"
+        Refresh-Path
+        if (-not (Find-Python)) { Stop-Install "Python 3 is still unavailable; reopen PowerShell and rerun" }
+    }
+    Invoke-External "rustup" @("target", "add", "wasm32-unknown-unknown", "--toolchain", $Toolchain)
+    $matchingBindgen = $false
+    if (Test-Command "wasm-bindgen") {
+        $version = & wasm-bindgen --version
+        $matchingBindgen = $LASTEXITCODE -eq 0 -and $version -eq "wasm-bindgen 0.2.126"
+    }
+    if (-not $matchingBindgen) {
+        if ($NoDeps) { Stop-Install "wasm-bindgen 0.2.126 is required; -NoDeps was provided" }
+        if (-not (Confirm-Action "Download the checksum-pinned wasm-bindgen 0.2.126 build helper?")) {
+            Stop-Install "wasm-bindgen is required"
+        }
+        $toolsDir = Join-Path $SourceDir "target\browser-extension-tools"
+        Invoke-External $PythonCommand ($PythonArgs + @((Join-Path $SourceDir "scripts\install-browser-extension-tools.py"), $toolsDir))
+        $env:Path = (Join-Path $toolsDir "bin") + ";" + $env:Path
+    }
+}
+
+function Build-BrowserExtension {
+    $metadataPath = [IO.Path]::GetTempFileName()
+    Push-Location $SourceDir
+    try {
+        $vsDevCmd = Get-VsDevCmdPath
+        $hostArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+        $previousBootstrap = $env:RUSTC_BOOTSTRAP
+        try {
+            # wasm_thread needs stdarch_wasm_atomic_wait only during WASM compilation.
+            $env:RUSTC_BOOTSTRAP = "1"
+            $command = '"{0}" -arch=x64 -host_arch={1} && cargo +{2} build -p browser-frontend -p dapp-gateway-protocol --target wasm32-unknown-unknown --release --locked' -f $vsDevCmd, $hostArch, $Toolchain
+            Invoke-Cmd $command
+        } finally {
+            $env:RUSTC_BOOTSTRAP = $previousBootstrap
+        }
+        # Preserve Cargo's UTF-8 bytes, including Unicode paths, without PowerShell transcoding or a BOM.
+        Invoke-Cmd ('cargo +{0} metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown > "{1}"' -f $Toolchain, $metadataPath)
+        Invoke-External $PythonCommand ($PythonArgs + @("scripts\package-browser-extension.py", $metadataPath))
+    } finally {
+        Pop-Location
+        Remove-Item -LiteralPath $metadataPath -Force
+    }
+}
+
 function Build-Wallet {
     $features = if ($NoHardware) { "" } else { "hardware" }
     $featureText = if ([string]::IsNullOrWhiteSpace($features)) { "none" } else { $features }
@@ -518,7 +593,24 @@ function Build-Wallet {
         if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
     }) -join " "
     $command = '"{0}" -arch=x64 -host_arch={1} && cargo {2}' -f $vsDevCmd, $hostArch, $cargoCommand
-    Invoke-Cmd $command
+    $hasExtension = Test-Path -LiteralPath (Join-Path $SourceDir "scripts\build-browser-extension")
+    $previousBundle = $env:RAILOXIDE_EXTENSION_BUNDLE
+    try {
+        if ($hasExtension) {
+            Build-BrowserExtension
+            $env:RAILOXIDE_EXTENSION_BUNDLE = Join-Path $SourceDir "target\browser-extension.zip"
+            if (-not (Test-Path -LiteralPath $env:RAILOXIDE_EXTENSION_BUNDLE) -or (Get-Item -LiteralPath $env:RAILOXIDE_EXTENSION_BUNDLE).Length -eq 0) {
+                Stop-Install "extension build did not produce a ZIP"
+            }
+        }
+        Invoke-Cmd $command
+        if ($hasExtension) {
+            $walletExe = Join-Path $SourceDir "target\$Target\release\wallet.exe"
+            Invoke-External $PythonCommand ($PythonArgs + @((Join-Path $SourceDir "scripts\verify-browser-extension.py"), $walletExe, $env:RAILOXIDE_EXTENSION_BUNDLE))
+        }
+    } finally {
+        $env:RAILOXIDE_EXTENSION_BUNDLE = $previousBundle
+    }
 }
 
 function Install-WalletFiles {
@@ -600,6 +692,7 @@ function Show-DryRunPlan {
     Write-Host "source checkout: $SourceDir"
     Write-Host "system dependencies: $(-not $NoDeps)"
     Write-Host "hardware support: $(-not $NoHardware)"
+    Write-Host "browser extension: build and embed when supported by the selected source; requires Python 3, the WASM target, and pinned wasm-bindgen"
     Write-Host "Start Menu shortcut: $(-not $NoShortcut)"
 }
 
@@ -641,6 +734,7 @@ function Main {
     Ensure-SourceCheckout
     Write-Step "building source commit $(Get-SourceCommit)"
     Ensure-SqliteForLinking
+    Ensure-ExtensionDependencies
     Build-Wallet
     Install-WalletFiles
     Install-Shortcut

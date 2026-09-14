@@ -846,6 +846,71 @@ fn public_account_for_search_with_uuid(
 }
 
 #[test]
+fn public_account_selection_restores_per_wallet_and_falls_back_when_unavailable() {
+    use crate::root::public_account::restored_public_account_selection;
+
+    let mut accounts: Vec<_> = ["first", "second", "third"]
+        .into_iter()
+        .map(|uuid| public_account_for_search_with_uuid(uuid, None, Address::ZERO))
+        .collect();
+    let ui_state = WalletUiState {
+        last_public_accounts: std::collections::BTreeMap::from([
+            ("wallet-a".to_owned(), "second".to_owned()),
+            ("wallet-b".to_owned(), "third".to_owned()),
+        ]),
+        ..WalletUiState::default()
+    };
+    // Lock and wallet replacement clear the runtime selection. Each unlocked wallet
+    // must recover its own saved choice even when all public accounts are global.
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-b").as_deref(),
+        Some("third")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "new-wallet").as_deref(),
+        Some("first")
+    );
+    // A live selection takes precedence during a reload or transport reconnect.
+    assert_eq!(
+        restored_public_account_selection(&accounts, Some("third"), &ui_state, "wallet-a")
+            .as_deref(),
+        Some("third")
+    );
+
+    accounts[1].status = PublicAccountStatus::Inactive;
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        restored_public_account_selection(&accounts, Some("second"), &ui_state, "wallet-a")
+            .as_deref(),
+        Some("second")
+    );
+    accounts[1].status = PublicAccountStatus::Active;
+    accounts[1].scope = PublicAccountScope::PrivateWallet {
+        wallet_uuid: "wallet-b".to_owned(),
+    };
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    accounts.remove(1);
+    assert_eq!(
+        restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").as_deref(),
+        Some("first")
+    );
+    for account in &mut accounts {
+        account.status = PublicAccountStatus::Inactive;
+    }
+    assert!(restored_public_account_selection(&accounts, None, &ui_state, "wallet-a").is_none());
+}
+
+#[test]
 fn public_account_search_matches_empty_query() {
     let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
 
@@ -1205,6 +1270,8 @@ fn public_balance_snapshot_for_test(chain_id: u64) -> PublicBalanceSnapshot {
         chain_id,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![PublicBalanceEntry {
                 asset: PublicBalanceAsset {
@@ -1228,6 +1295,8 @@ fn public_native_balance_snapshot_for_test(
         accounts: accounts
             .into_iter()
             .map(|(account, amount)| PublicAccountBalance {
+                observed_at: None,
+                observed_block: None,
                 account,
                 balances: vec![PublicBalanceEntry {
                     asset: PublicBalanceAsset {
@@ -1381,6 +1450,8 @@ fn public_account_usd_total_label_sums_priced_balances() {
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![
                 PublicBalanceEntry {
@@ -1425,6 +1496,8 @@ fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,
         accounts: vec![PublicAccountBalance {
+            observed_at: None,
+            observed_block: None,
             account,
             balances: vec![
                 PublicBalanceEntry {
@@ -1457,26 +1530,6 @@ fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
         ),
         None
     );
-}
-
-#[test]
-fn public_balance_merge_preserves_other_account_status_group() {
-    let active = public_balance_snapshot_for_test(1);
-    let mut inactive = public_balance_snapshot_for_test(1);
-    inactive.accounts[0].account.public_account_uuid = "inactive-account".to_string();
-    inactive.accounts[0].account.status = PublicAccountStatus::Inactive;
-
-    let merged =
-        merge_public_balance_snapshot(Some(&active), inactive, PublicAccountStatus::Inactive);
-
-    assert!(merged.accounts.iter().any(|account| {
-        account.account.public_account_uuid == "public-account"
-            && account.account.status == PublicAccountStatus::Active
-    }));
-    assert!(merged.accounts.iter().any(|account| {
-        account.account.public_account_uuid == "inactive-account"
-            && account.account.status == PublicAccountStatus::Inactive
-    }));
 }
 
 #[test]

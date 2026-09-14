@@ -5,9 +5,13 @@ pub const APP_FONT_FAMILY: &str = ".SystemUIFont";
 pub const APP_MONO_FONT_FAMILY: &str = "Menlo";
 #[cfg(target_os = "windows")]
 pub const APP_MONO_FONT_FAMILY: &str = "Consolas";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_family = "wasm")]
+pub const APP_MONO_FONT_FAMILY: &str = "JetBrains Mono";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_family = "wasm")))]
 pub const APP_MONO_FONT_FAMILY: &str = "DejaVu Sans Mono";
 pub const APP_TEXT_SIZE: Pixels = px(14.0);
+/// Relative line height shared by body text and control labels, 21 px at 14 px text.
+pub const APP_TEXT_LINE_HEIGHT: f32 = 1.5;
 pub const ACCOUNT_LABEL_TEXT_SIZE: Pixels = px(20.0);
 pub const ACCOUNT_ADDRESS_TEXT_SIZE: Pixels = px(13.0);
 pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);

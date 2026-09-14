@@ -26,6 +26,7 @@ pub(super) const WALLETCONNECT_CRITICAL_PARTY_FULL_ADDRESS_MIN_WIDTH: Pixels = p
 #[derive(Clone, Copy)]
 pub(super) struct WalletConnectIntentContext<'a> {
     pub(super) chain: &'a EffectiveChainConfig,
+    pub(super) selected_chain_id: u64,
     pub(super) token_registry: &'a EffectiveTokenRegistry,
     pub(super) anchor_rates: &'a TokenAnchorRateCache,
     pub(super) public_accounts: &'a [PublicAccountMetadata],
@@ -46,6 +47,8 @@ pub(super) enum WalletConnectIntentAction {
     TypedDataSign,
     AccountRequest,
     ChainSwitch,
+    ChainAdd,
+    WatchAsset,
 }
 
 impl WalletConnectIntentAction {
@@ -62,6 +65,8 @@ impl WalletConnectIntentAction {
             Self::TypedDataSign => "Sign typed data",
             Self::AccountRequest => "Request account access",
             Self::ChainSwitch => "Switch chain",
+            Self::ChainAdd => "Confirm configured chain",
+            Self::WatchAsset => "Watch token",
         }
     }
 
@@ -164,10 +169,17 @@ pub(super) struct WalletConnectNativeAmount {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WalletConnectHeroSummary {
+    Policy(String),
+    ChainSwitch {
+        from_chain_id: u64,
+        to_chain_id: u64,
+    },
     Amount,
     PersonalMessage(WalletConnectPersonalMessageSummary),
     TypedData(WalletConnectTypedDataSummary),
-    UndecodedCall { selector: Option<[u8; 4]> },
+    UndecodedCall {
+        selector: Option<[u8; 4]>,
+    },
     None,
 }
 
@@ -331,7 +343,9 @@ pub(super) fn walletconnect_moving_usd_micro_value(
         | WalletConnectIntentAction::PersonalSign
         | WalletConnectIntentAction::TypedDataSign
         | WalletConnectIntentAction::AccountRequest
-        | WalletConnectIntentAction::ChainSwitch => None,
+        | WalletConnectIntentAction::ChainSwitch
+        | WalletConnectIntentAction::ChainAdd
+        | WalletConnectIntentAction::WatchAsset => None,
     }
 }
 
@@ -383,6 +397,7 @@ pub(super) struct WalletConnectPeerProvenance {
 #[derive(Debug)]
 pub(super) struct WalletConnectIntentView<'a> {
     pub(super) action: WalletConnectIntentAction,
+    pub(super) chain_id: u64,
     pub(super) hero: WalletConnectHero,
     pub(super) amount: WalletConnectAmount,
     pub(super) icon: Option<WalletIconSource>,
@@ -401,6 +416,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     context: WalletConnectIntentContext<'_>,
 ) -> WalletConnectIntentView<'a> {
     let selected_account = request.item.account;
+    let mut chain_id = context.chain.chain_id;
     let mut amount = WalletConnectAmount::None;
     let mut icon = None;
     let mut attached_native = None;
@@ -477,9 +493,32 @@ pub(super) fn build_walletconnect_intent<'a>(
             action = WalletConnectIntentAction::AccountRequest;
             hero_summary = WalletConnectHeroSummary::None;
         }
-        WalletConnectParsedRequest::WalletSwitchEthereumChain { .. } => {
+        WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
+            action = WalletConnectIntentAction::ChainAdd;
+            hero_summary = WalletConnectHeroSummary::Policy(format!(
+                "Use saved configuration for chain {chain_id}"
+            ));
+        }
+        WalletConnectParsedRequest::WalletWatchAsset { address, .. } => {
+            action = WalletConnectIntentAction::WatchAsset;
+            hero_summary = WalletConnectHeroSummary::Policy(format!(
+                "Token {address} on chain {}",
+                context.chain.chain_id
+            ));
+        }
+        WalletConnectParsedRequest::WalletSwitchEthereumChain {
+            chain_id: target_chain_id,
+        } => {
             action = WalletConnectIntentAction::ChainSwitch;
-            hero_summary = WalletConnectHeroSummary::None;
+            chain_id = *target_chain_id;
+            hero_summary = WalletConnectHeroSummary::ChainSwitch {
+                from_chain_id: if context.selected_chain_id == chain_id {
+                    context.chain.chain_id
+                } else {
+                    context.selected_chain_id
+                },
+                to_chain_id: chain_id,
+            };
         }
     }
 
@@ -492,6 +531,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     let authorization = authorization_projection(action, &hero, &amount);
     WalletConnectIntentView {
         action,
+        chain_id,
         hero,
         amount,
         icon,
@@ -502,21 +542,22 @@ pub(super) fn build_walletconnect_intent<'a>(
         transaction,
         raw_request: &request.item.raw_details,
         authorization,
-        provenance: walletconnect_peer_provenance(&request.session.peer_metadata),
+        provenance: walletconnect_peer_provenance(
+            &request.binding.peer_name,
+            &request.binding.peer_url,
+        ),
     }
 }
 
-fn walletconnect_peer_provenance(
-    metadata: &wallet_ops::vault::WalletConnectPeerMetadata,
-) -> WalletConnectPeerProvenance {
-    let site = reqwest::Url::parse(&metadata.url)
+fn walletconnect_peer_provenance(name: &str, url: &str) -> WalletConnectPeerProvenance {
+    let site = reqwest::Url::parse(url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| "Unknown peer site".to_owned());
     WalletConnectPeerProvenance {
         site,
-        dapp_name: sanitize_walletconnect_dapp_name(&metadata.name),
+        dapp_name: sanitize_walletconnect_dapp_name(name),
     }
 }
 
@@ -1322,7 +1363,9 @@ fn authorization_projection(
                 |preview| format!("Personal message: {preview:?}"),
             ));
         }
-        WalletConnectHeroSummary::TypedData(_)
+        WalletConnectHeroSummary::Policy(_)
+        | WalletConnectHeroSummary::ChainSwitch { .. }
+        | WalletConnectHeroSummary::TypedData(_)
         | WalletConnectHeroSummary::Amount
         | WalletConnectHeroSummary::UndecodedCall { .. }
         | WalletConnectHeroSummary::None => {}
@@ -1333,6 +1376,7 @@ fn authorization_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::root::dapp_request::{DappRequestBinding, DappSessionIdentity};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -1342,7 +1386,6 @@ mod tests {
     };
     use wallet_ops::vault::{
         PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletConnectPeerMetadata,
-        WalletConnectSessionKeys, WalletConnectSessionLifecycleState, WalletConnectSessionRecord,
     };
 
     #[test]
@@ -1614,7 +1657,7 @@ mod tests {
             url: "HTTPS://Example.COM:443/path".to_owned(),
             icons: Vec::new(),
         };
-        let projection = walletconnect_peer_provenance(&metadata);
+        let projection = walletconnect_peer_provenance(&metadata.name, &metadata.url);
         assert_eq!(projection.site, "example.com");
         let dapp_name = projection.dapp_name.expect("sanitized dapp name");
         assert!(!dapp_name.contains('\u{202e}'));
@@ -1626,7 +1669,7 @@ mod tests {
             url: "not a url".to_owned(),
             icons: Vec::new(),
         };
-        let projection = walletconnect_peer_provenance(&empty);
+        let projection = walletconnect_peer_provenance(&empty.name, &empty.url);
         assert_eq!(projection.site, "Unknown peer site");
         assert_eq!(projection.dapp_name, None);
     }
@@ -1675,6 +1718,7 @@ mod tests {
     ) -> WalletConnectIntentContext<'a> {
         WalletConnectIntentContext {
             chain,
+            selected_chain_id: chain.chain_id,
             token_registry: registry,
             anchor_rates: rates,
             public_accounts: accounts,
@@ -1689,32 +1733,18 @@ mod tests {
         let account = Address::from([0x11; 20]);
         let method = parsed.method();
         WalletConnectRequestUi {
+            request_control: None,
+            rpc_reads: None,
             key: "session-topic:7".to_owned(),
             review_token: 1,
-            session: WalletConnectSessionRecord {
-                session_uuid: "session-uuid".to_owned(),
-                pairing_topic: "pairing-topic".to_owned(),
-                session_topic: "session-topic".to_owned(),
-                relay_protocol: "irn".to_owned(),
-                relay_client_id: "relay-client".to_owned(),
-                peer_metadata: WalletConnectPeerMetadata {
-                    name: "Aave".to_owned(),
-                    description: String::new(),
-                    url: "https://app.aave.com".to_owned(),
-                    icons: Vec::new(),
-                },
-                approved_namespaces: BTreeMap::new(),
-                selected_public_account_uuid: "public-account".to_owned(),
-                selected_public_account_scope: PublicAccountScope::Global,
+            binding: DappRequestBinding {
+                public_account_uuid: "public-account".to_owned(),
+                public_account_scope: PublicAccountScope::Global,
                 owning_private_wallet_uuid: None,
-                keys: WalletConnectSessionKeys {
-                    sym_key: [1; 32],
-                    responder_private_key: [2; 32],
-                    responder_public_key: [3; 32],
-                },
-                expiry_timestamp: 1_700_000_300,
-                lifecycle_state: WalletConnectSessionLifecycleState::Active,
+                peer_name: "Aave".to_owned(),
+                peer_url: "https://app.aave.com".to_owned(),
             },
+            session_identity: DappSessionIdentity::walletconnect("session-uuid".to_owned()),
             parsed,
             item: WalletConnectPendingRequest {
                 id: 7,
@@ -1728,6 +1758,35 @@ mod tests {
                 expiry_timestamp: Some(1_700_000_300),
             },
             account_source: PublicAccountSource::Imported,
+        }
+    }
+
+    #[test]
+    fn chain_switch_intent_shows_destination_and_network_transition() {
+        let registry = EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let rates = TokenAnchorRateCache::default();
+        for (website_chain_id, selected_chain_id) in [(1, 42161), (42161, 42161), (42161, 1)] {
+            let mut chain = chain(None);
+            chain.chain_id = website_chain_id;
+            let mut request = request_with(
+                WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id: 1 },
+                None,
+            );
+            request.item.chain_id = format!("eip155:{website_chain_id}");
+            let mut context = context(&chain, &registry, &rates, &[], &[]);
+            context.selected_chain_id = selected_chain_id;
+            let intent = build_walletconnect_intent(&request, context);
+
+            assert_eq!(intent.chain_id, 1);
+            assert_eq!(
+                intent.hero.summary,
+                WalletConnectHeroSummary::ChainSwitch {
+                    from_chain_id: 42161,
+                    to_chain_id: 1,
+                }
+            );
         }
     }
 

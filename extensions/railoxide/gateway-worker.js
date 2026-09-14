@@ -1,0 +1,1034 @@
+import init, { GatewayClient } from './dapp_gateway_protocol.js';
+import { configuration } from './gateway-config.js';
+import { createPageBridge } from './gateway-page-bridge.js';
+
+const ports = new Set();
+const privatePickers = new Map();
+const networkViews = new Map();
+const tabContexts = new Map();
+// Navigation is local to each document; only newly opened views inherit the last choice.
+const homeTabs = new Map();
+let lastHomeTab = 'public';
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const now = () => BigInt(Math.floor(performance.now()));
+// Hosts without a manifest reader stay paired; views and the desktop simply report no version.
+const manifest = chrome.runtime.getManifest?.();
+const extensionVersion = typeof manifest?.version === 'string' ? manifest.version : '';
+// Protocol MAX_MESSAGE_LEN is 32 MiB. Synchronous fragment sends cannot drain
+// bufferedAmount, so allow one complete message plus framing, with a fixed bound.
+const MAX_BUFFERED_BYTES = 34 * 1024 * 1024;
+// Chromium can delay opening by up to five seconds after failed WebSockets.
+// Allow that backoff to finish instead of cancelling another healthy attempt.
+const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
+let epoch = 0;
+let owner;
+let status = 'disconnected';
+let configuredEndpoint = '';
+let providerPreferences = { takeover: false, metamask: false };
+let view = 'popup';
+let viewError = false;
+let paired = false;
+const visibleViews = new Set();
+function walletViewVisible() {
+  return [...visibleViews].some(port => ports.has(port));
+}
+async function applyView(value) {
+  await chrome.action.setPopup({ popup: value === 'sidepanel' ? '' : 'index.html' });
+  await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: value === 'sidepanel' });
+}
+const pageBridge = createPageBridge({ chrome, crypto, send: command,
+  session: () => owner?.candidate?.established && current(owner.candidate) ? owner.candidate : null,
+  preferences: () => preferencesReady.then(() => providerPreferences),
+});
+let backoff = 1;
+let retryTimer;
+let storage = Promise.resolve();
+let commandPending = false;
+let uiSnapshot = { type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] };
+// State messages redact presentation before the authoritative pending snapshot arrives.
+// Retain only request identities so redaction preserves the badge and dismissal.
+let attentionPending = [];
+let attentionSeen = new Set();
+let popupOpening = false;
+function updateRequestAttention(authoritative = false) {
+  if (authoritative) attentionPending = [
+    ...uiSnapshot.pending_connects.map(request => `connect:${request.request_id}`),
+    ...uiSnapshot.pending_requests.map(request => `request:${request.request_id}`),
+  ];
+  void chrome.action.setBadgeText({ text: attentionPending.length ? String(attentionPending.length) : '' }).catch(() => {});
+  const fresh = attentionPending.filter(id => !attentionSeen.has(id));
+  attentionSeen = new Set(attentionPending);
+  if (!fresh.length || walletViewVisible() || popupOpening) return;
+  const expected = epoch;
+  popupOpening = true;
+  void preferencesReady.then(async () => {
+    if (epoch !== expected || walletViewVisible() || !fresh.some(id => attentionPending.includes(id))) return;
+    // Side panels require an extension user gesture. Async wallet requests keep
+    // their badge instead. Older browsers may also refuse or lack openPopup.
+    if (view === 'popup') await chrome.action.openPopup?.();
+  }).catch(() => {}).finally(() => { popupOpening = false; });
+}
+// Passwords and mnemonic passphrases are never retained in worker state or storage.
+let unlockView = { allowed: false, attempt_id: null, phase: 'password' };
+let unlockOwner = null;
+const unlockPhases = new Set(['password', 'busy', 'opening', 'passphrase', 'unknown', 'desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited']);
+const unlockTerminal = phase => ['desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(phase);
+function clearUnlockOwner(cancel = false) {
+  const previous = unlockOwner;
+  unlockOwner = null;
+  clearTimeout(previous?.timer);
+  const session = owner?.candidate;
+  if (cancel && previous && session?.established && current(session)) {
+    try { command(session, { type: 'unlock', version: 1, generation: session.generation,
+      attempt_id: previous.id, command: { action: 'cancel' } }); } catch {}
+  }
+}
+function unlockFor(port) {
+  const session = owner?.candidate;
+  if (!session?.established || !current(session) || status !== 'locked') return { allowed: false };
+  const owned = unlockOwner && unlockOwner.port === port && unlockOwner.id === unlockView.attempt_id;
+  const pending = unlockOwner && unlockOwner.port === port && unlockOwner.waiting;
+  const other = (unlockOwner && unlockOwner.port !== port && (unlockOwner.waiting || !unlockTerminal(unlockView.phase))) ||
+    (unlockView.attempt_id && !owned && !unlockTerminal(unlockView.phase));
+  return { allowed: unlockView.allowed, generation: session.generation,
+    phase: pending ? 'busy' : other ? 'other' : owned || unlockView.phase === 'desktop' ? unlockView.phase : 'password' };
+}
+function unlockCommand(port, input) {
+  const session = owner?.candidate;
+  if (!ports.has(port) || !session?.established || !current(session) || !session.locked ||
+      !unlockView.allowed || !input || input.generation !== session.generation) return;
+  const state = unlockFor(port);
+  let outgoing;
+  if (input.action === 'password') {
+    if (!['password', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(state.phase) || typeof input.password !== 'string' ||
+        !input.password.length || encoder.encode(input.password).length > 4096) return;
+    clearUnlockOwner();
+    unlockOwner = { port, id: crypto.randomUUID(), waiting: true };
+    const attempt = unlockOwner;
+    attempt.timer = setTimeout(() => {
+      if (unlockOwner !== attempt) return;
+      clearUnlockOwner(true);
+      publish(status);
+    }, 300_000);
+    outgoing = { action: 'password', password: input.password };
+  } else {
+    if (input.action === 'cancel' && unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); return; }
+    if (unlockOwner?.port !== port || unlockOwner.id !== unlockView.attempt_id) return;
+    if (input.action === 'passphrase' && state.phase === 'passphrase' && typeof input.passphrase === 'string' &&
+        input.passphrase.length && encoder.encode(input.passphrase).length <= 4096) outgoing = { action: 'passphrase', passphrase: input.passphrase };
+    else if (input.action === 'standard' && state.phase === 'passphrase') outgoing = { action: 'standard' };
+    else if (input.action === 'retry' && state.phase === 'unknown') outgoing = { action: 'retry' };
+    else if (input.action === 'desktop' && ['passphrase', 'unknown'].includes(state.phase)) outgoing = { action: 'desktop' };
+    else return;
+    unlockOwner.waiting = true;
+  }
+  try {
+    command(session, { type: 'unlock', version: 1, generation: session.generation,
+      attempt_id: unlockOwner.id, command: outgoing });
+  } finally {
+    if ('password' in input) input.password = '';
+    if ('passphrase' in input) input.passphrase = '';
+    if (outgoing && 'password' in outgoing) outgoing.password = '';
+    if (outgoing && 'passphrase' in outgoing) outgoing.passphrase = '';
+  }
+  publish(status);
+}
+
+// Only aggregate native observations reach authenticated UI ports. No network data is persisted.
+const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset'];
+const networkErrors = new Set([
+  'Network control is unavailable. Reopen the popover and try again.',
+  'Could not start a new Tor session. Try again.',
+  'Could not query the exit IP through Tor. Try again.',
+  'Could not request the Tor state reset. The wallet remains open.',
+]);
+const boundedNetworkText = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
+const networkInteger = value => Number.isSafeInteger(value) && value >= 0;
+function networkPresentation(message) {
+  const value = message.network_view;
+  if (message.locked || message.network_control_supported !== true || !value ||
+      !boundedNetworkText(value.context_revision, 128) ||
+      !['tor_ready', 'tor_reconnecting', 'tor_degraded', 'proxy', 'direct'].includes(value.status) ||
+      typeof value.detail !== 'string' || value.detail.length > 512 || typeof value.runtime_warning !== 'boolean' ||
+      (value.download_rate != null && !networkInteger(value.download_rate))) return null;
+  let activity = null;
+  if (value.activity != null) {
+    if (!value.status.startsWith('tor_')) return null;
+    const source = value.activity;
+    activity = {};
+    for (const name of ['generation', 'session_duration_ms', 'downloaded_bytes', 'recent_connection_sample_count',
+      'recent_successful_sample_count', 'successful_connections', 'failed_connections']) {
+      if (!networkInteger(source[name])) return null;
+      activity[name] = source[name];
+    }
+    for (const name of ['median_setup_duration_ms', 'last_activity_age_ms']) {
+      if (source[name] != null && !networkInteger(source[name])) return null;
+      activity[name] = source[name] ?? null;
+    }
+  }
+  return { context_revision: value.context_revision, status: value.status, detail: value.detail,
+    runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null };
+}
+function closeNetworkView(port, send = true) {
+  const view = networkViews.get(port);
+  networkViews.delete(port);
+  if (!view) return;
+  for (const pending of view.pending.values()) clearTimeout(pending.timer);
+  const session = owner?.candidate;
+  if (send && session?.established && current(session) && !session.locked && session.generation === view.generation) {
+    try { command(session, { type: 'network', version: 1, generation: view.generation,
+      context_revision: view.context_revision, command: { action: 'close', view_id: view.view_id } }); }
+    catch { failed(session, 'disconnected', true); }
+  }
+}
+function openNetworkView(port, snapshot, session) {
+  const view = { view_id: crypto.randomUUID(), context_revision: snapshot.network_view.context_revision,
+    generation: snapshot.generation, seen: new Set(), pending: new Map(), results: new Map() };
+  networkViews.set(port, view);
+  command(session, { type: 'network', version: 1, generation: view.generation,
+    context_revision: view.context_revision, command: { action: 'open', view_id: view.view_id } });
+}
+function receiveNetworkResults(snapshot) {
+  for (const [port, view] of [...networkViews]) {
+    if (snapshot.locked || !snapshot.network_view || snapshot.generation !== view.generation) {
+      closeNetworkView(port, false); continue;
+    }
+    if (snapshot.network_view.context_revision !== view.context_revision) {
+      closeNetworkView(port, false);
+      const session = owner?.candidate;
+      if (session?.established && current(session) && !session.locked && session.generation === snapshot.generation) {
+        try { openNetworkView(port, snapshot, session); }
+        catch { failed(session, 'disconnected', true); return false; }
+      }
+      continue;
+    }
+    for (const result of (Array.isArray(snapshot.network_results) ? snapshot.network_results : []).slice(0, 48)) {
+      const pending = view.pending.get(result.operation);
+      if (!pending || result.view_id !== view.view_id || result.request_id !== pending.request_id ||
+          result.context_revision !== view.context_revision) continue;
+      const outcome = result.outcome;
+      if (!outcome || !['done', 'exit_ip', 'failed'].includes(outcome.status) ||
+          (outcome.status === 'failed' && !networkErrors.has(outcome.error)) ||
+          (outcome.status === 'exit_ip' && (result.operation !== 'query_exit_ip' || !boundedNetworkText(outcome.ip, 45)))) continue;
+      clearTimeout(pending.timer);
+      view.pending.delete(result.operation);
+      view.results.set(result.operation, { request_id: result.request_id, operation: result.operation,
+        outcome: { status: outcome.status, ...(outcome.status === 'exit_ip' ? { ip: outcome.ip } : {}),
+          ...(outcome.status === 'failed' ? { error: outcome.error } : {}) } });
+    }
+  }
+  return true;
+}
+function networkCommand(port, message) {
+  const session = owner?.candidate;
+  const input = message.command;
+  if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
+      message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
+      !uiSnapshot.network_view || input?.context_revision !== uiSnapshot.network_view.context_revision) return;
+  if (input.action === 'open') {
+    if (Object.keys(input).some(key => !['action', 'context_revision'].includes(key)) || networkViews.has(port) || networkViews.size >= 16) return;
+    try { openNetworkView(port, uiSnapshot, session); }
+    catch { failed(session, 'disconnected', true); return; }
+    port.postMessage(snapshotFor(port));
+    return;
+  }
+  const view = networkViews.get(port);
+  if (!view || input.view_id !== view.view_id || view.context_revision !== input.context_revision) return;
+  if (['close', 'cancel_query'].includes(input.action) && Object.keys(input).some(key => !['action', 'context_revision', 'view_id'].includes(key))) return;
+  if (input.action === 'close') { closeNetworkView(port); port.postMessage(snapshotFor(port)); return; }
+  if (input.action === 'cancel_query') {
+    const pending = view.pending.get('query_exit_ip');
+    if (pending) clearTimeout(pending.timer);
+    view.pending.delete('query_exit_ip'); view.results.delete('query_exit_ip');
+    try { command(session, { type: 'network', version: 1, generation: session.generation,
+      context_revision: view.context_revision, command: { action: 'cancel_query', view_id: view.view_id } }); }
+    catch { failed(session, 'disconnected', true); }
+    return;
+  }
+  if (input.action !== 'run' || !networkOperations.includes(input.operation) ||
+      !uiSnapshot.network_view.status.startsWith('tor_') || !boundedNetworkText(input.request_id, 128) ||
+      Object.keys(input).some(key => !['action', 'context_revision', 'view_id', 'request_id', 'operation'].includes(key)) ||
+      view.seen.has(input.request_id) || view.pending.has(input.operation)) return;
+  if (view.seen.size >= 32) {
+    view.results.set(input.operation, { request_id: input.request_id, operation: input.operation,
+      outcome: { status: 'failed', error: 'Network control is unavailable. Reopen the popover and try again.' } });
+    port.postMessage(snapshotFor(port));
+    return;
+  }
+  view.seen.add(input.request_id);
+  const pending = { request_id: input.request_id, timer: null };
+  view.pending.set(input.operation, pending); view.results.delete(input.operation);
+  pending.timer = setTimeout(() => {
+    if (networkViews.get(port) !== view || view.pending.get(input.operation) !== pending) return;
+    view.pending.delete(input.operation);
+    view.results.set(input.operation, { request_id: input.request_id, operation: input.operation,
+      outcome: { status: 'failed', error: 'Network control is unavailable. Reopen the popover and try again.' } });
+    port.postMessage(snapshotFor(port));
+  }, 30_000);
+  try { command(session, { type: 'network', version: 1, generation: session.generation,
+    context_revision: view.context_revision,
+    command: { action: 'run', view_id: view.view_id, request_id: input.request_id, operation: input.operation } }); }
+  catch { failed(session, 'disconnected', true); return; }
+  port.postMessage(snapshotFor(port));
+}
+
+function publishSnapshot(snapshot, authoritative = true) {
+  if (!receiveNetworkResults(snapshot)) return;
+  for (const [port, picker] of privatePickers) {
+    if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
+        !snapshot.public_view?.drafts?.some(draft => draft.draft_id === picker.draft_id && draft.revision === picker.revision &&
+          !['attention', 'in_progress', 'done', 'failed'].includes(draft.status))) privatePickers.delete(port);
+  }
+  // Query replies are retained only by their live originating view.
+  const { network_results, ...presentation } = snapshot;
+  uiSnapshot = presentation;
+  updateRequestAttention(authoritative);
+  for (const port of ports) {
+    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
+  }
+}
+function snapshotFor(port) {
+  const tab = uiSnapshot.locked ? null : tabContexts.get(port)?.tab;
+  const network = networkViews.get(port);
+  return { ...uiSnapshot, network_popover: network ? { view_id: network.view_id, context_revision: network.context_revision,
+    results: [...network.results.values()] } : null, home_tab: homeTabs.get(port) ?? lastHomeTab, current_tab_origin: tab ? `${tab.origin}/` : null, current_tab_token: tab?.token ?? null };
+}
+async function updateTab(port) {
+  const context = tabContexts.get(port);
+  if (!context) return;
+  const revision = ++context.revision;
+  context.tab = null;
+  port.postMessage(snapshotFor(port));
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId: context.windowId });
+    if (!Number.isInteger(tab?.id)) return;
+    const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
+    if (tabContexts.get(port) !== context || context.revision !== revision ||
+        frame?.documentLifecycle !== 'active' || !frame.documentId) return;
+    const url = new URL(frame.url);
+    if (!['http:', 'https:'].includes(url.protocol)) return;
+    context.tab = { id: tab.id, documentId: frame.documentId, origin: url.origin, token: crypto.randomUUID() };
+    port.postMessage(snapshotFor(port));
+  } catch { /* A closed tab or a browser page has no connect action. */ }
+}
+function updateTabs() {
+  for (const port of tabContexts.keys()) void updateTab(port);
+}
+chrome.tabs?.onActivated?.addListener(updateTabs);
+chrome.webNavigation.onCommitted.addListener(event => { if (event.frameId === 0) updateTabs(); });
+chrome.tabs?.onRemoved?.addListener(updateTabs);
+function purgeSnapshot(authoritative = true, walletTransition = false) {
+  publishSnapshot({ wallet_transition: walletTransition, type: 'ui_snapshot', version: 1, generation: 0, locked: true, accounts: [], pending_connects: [], pending_requests: [] }, authoritative);
+}
+const ready = Promise.all([
+  chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
+  init({ module_or_path: chrome.runtime.getURL('dapp_gateway_protocol_bg.wasm') }),
+]);
+const preferencesReady = ready.then(() => stored(async () => {
+  const saved = await chrome.storage.local.get('gatewayPreferences');
+  lastHomeTab = saved.gatewayPreferences?.home_tab === 'private' ? 'private' : 'public';
+  for (const port of ports) homeTabs.set(port, lastHomeTab);
+  publishSnapshot(uiSnapshot, false);
+  providerPreferences = { takeover: saved.gatewayPreferences?.takeover === true, metamask: saved.gatewayPreferences?.metamask === true };
+  const savedView = saved.gatewayPreferences?.view === 'sidepanel' ? 'sidepanel' : 'popup';
+  try {
+    await applyView(savedView);
+    view = savedView;
+  } catch { viewError = true; }
+  publish(status);
+}));
+void preferencesReady.catch(() => { viewError = true; publish(status); });
+// Queue storage operations across owners. A new owner's load cannot race an old write.
+function stored(action) {
+  const result = storage.then(action);
+  storage = result.catch(() => {});
+  return result;
+}
+function current(session) {
+  const discovery = session.discovery ?? session;
+  return owner === discovery && discovery.epoch === epoch &&
+    (!session.discovery || discovery.candidate === session);
+}
+function dispose(session, result = 'cancelled') {
+  if (!session) return;
+  if (session.discovery.candidate === session) session.discovery.candidate = null;
+  clearTimeout(session.openDeadline);
+  clearTimeout(session.deadline);
+  clearInterval(session.heartbeat);
+  clearInterval(session.assembly);
+  session.finish(result); // Settle discovery even when receive is awaiting storage.
+  session.client?.close();
+  session.client?.free();
+  session.client = null;
+  session.socket?.close();
+}
+function clearCredentials(discovery) {
+  discovery.code?.fill(0);
+  discovery.code = null;
+  wipe(discovery.record);
+  discovery.record = null;
+}
+function stateMessage(reported = status, port) {
+  const state = { type: 'state', status: reported, endpoint: configuredEndpoint, paired, ...providerPreferences, view, viewError };
+  state.unlock = unlockFor(port);
+  if (extensionVersion) state.version = extensionVersion;
+  return state;
+}
+function publish(next) {
+  status = next;
+  for (const port of ports) {
+    try { port.postMessage(stateMessage(status, port)); } catch { ports.delete(port); }
+  }
+}
+function retire() {
+  clearUnlockOwner();
+  unlockView = { allowed: false, attempt_id: null, phase: "password" };
+  pageBridge.retire();
+  purgeSnapshot();
+  epoch += 1;
+  clearTimeout(retryTimer);
+  if (owner) {
+    clearCredentials(owner);
+    dispose(owner.candidate);
+    owner = null;
+  }
+  publish('disconnected'); // Purge all wallet-derived state on every session change.
+}
+function scheduleRetry() {
+  const expected = epoch;
+  const delay = backoff;
+  backoff = Math.min(backoff * 2, 30);
+  retryTimer = setTimeout(() => { if (epoch === expected) void connect(); }, delay * 1000);
+  // Survives worker termination. Chrome 120 supports the 30-second minimum.
+  void chrome.alarms.create('gateway-reconnect', { delayInMinutes: 0.5 });
+}
+function failed(session, reason, retry = false) {
+  if (!current(session)) return;
+  if (session.discovery && !session.established) {
+    dispose(session, reason);
+    return;
+  }
+  retire();
+  publish(reason);
+  if (retry) scheduleRetry();
+}
+function send(session, bytes) {
+  if (!current(session) || session.sendFailed || session.socket.readyState !== WebSocket.OPEN ||
+      session.socket.bufferedAmount + bytes.length > MAX_BUFFERED_BYTES) throw new Error('Gateway send failed');
+  session.socket.send(bytes);
+}
+function command(session, message) {
+  if (session.sendFailed) throw new Error('Gateway send failed');
+  try {
+    const value = typeof message === 'string' ? { type: message, version: 1 } : message;
+    const plaintext = encoder.encode(JSON.stringify(value));
+    try {
+      for (const frame of session.client.sealMessage(plaintext)) send(session, frame);
+    } finally { plaintext.fill(0); }
+  } catch {
+    // Sealing advances record counters. Never continue this session after a partial send,
+    // including unregister attempts during teardown.
+    session.sendFailed = true;
+    failed(session, 'disconnected', true);
+    throw new Error('Gateway send failed');
+  }
+}
+function isCredential(record) {
+  const bytes = (value, size) => Array.isArray(value) && value.length === size &&
+    value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255);
+  return record && record.version === 1 && bytes(record.peerId, 16) && bytes(record.secret, 32);
+}
+function wipe(record) {
+  record?.peerId?.fill?.(0);
+  record?.secret?.fill?.(0);
+}
+async function receive(session, bytes) {
+  if (!current(session)) return;
+  try {
+    if (!session.client.isAuthenticated()) {
+      const response = session.client.receiveHandshake(bytes);
+      if (response.length) send(session, response);
+      if (session.client.lastEvent() === 1) {
+        const peerId = session.client.pendingPeerId();
+        const secret = session.client.exportPendingCredentialForStorage();
+        const record = { version: 1, peerId: Array.from(peerId), secret: Array.from(secret) };
+        try {
+          await stored(async () => {
+            if (!current(session)) return;
+            await chrome.storage.local.set({ gatewayCredential: record });
+            paired = true;
+          });
+        } catch {
+          if (current(session)) failed(session.discovery, 'storage_failed');
+          return;
+        } finally {
+          peerId.fill(0);
+          secret.fill(0);
+          wipe(record);
+        }
+        if (!current(session)) return;
+        send(session, session.client.acknowledgeCredential());
+      }
+      if (session.client.isAuthenticated()) {
+        clearTimeout(session.deadline);
+        backoff = 1;
+        void chrome.alarms.create('gateway-reconnect', { periodInMinutes: 0.5 });
+        command(session, 'get_state');
+        publish('paired');
+        session.lastReceived = performance.now();
+        session.heartbeat = setInterval(() => {
+          if (!current(session)) return;
+          if (performance.now() - session.lastReceived > 60000) {
+            failed(session, 'disconnected', true);
+            return;
+          }
+          try { command(session, 'heartbeat'); } catch { failed(session, 'disconnected', true); }
+        }, 20000);
+        session.established = true;
+        pageBridge.authenticated();
+        clearCredentials(session.discovery);
+        session.finish('authenticated');
+        session.assembly = setInterval(() => {
+          if (!current(session)) return;
+          try { session.client.expireAssembly(now()); } catch { failed(session, 'disconnected', true); }
+        }, 1000);
+      }
+      return;
+    }
+    const plain = session.client.receiveFrame(bytes, now());
+    if (!plain) return;
+    let message;
+    try { message = JSON.parse(decoder.decode(plain)); } finally { plain.fill(0); }
+    if (!current(session)) return;
+    if (message.version !== 1 || message.type === 'unsupported') {
+      failed(session, 'version_failed');
+      return;
+    }
+    session.lastReceived = performance.now();
+    if (message.type === 'heartbeat') return;
+    if (message.type === 'unlock_state') {
+      const next = message.view;
+      if (message.generation !== session.generation || !next || typeof next.allowed !== 'boolean' ||
+          !unlockPhases.has(next.phase) || (next.attempt_id !== null && (typeof next.attempt_id !== 'string' || next.attempt_id.length > 128))) return;
+      if (unlockOwner && message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
+      if (unlockOwner && next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
+      unlockView = { allowed: next.allowed, attempt_id: next.attempt_id, phase: next.phase };
+      if (!next.allowed) clearUnlockOwner();
+      publish(status);
+      return;
+    }
+    if (message.type === 'ui_snapshot') {
+      if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
+          !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
+      if (message.locked && (message.accounts.length ||
+          message.pending_connects.some(prompt => prompt.accounts?.length) ||
+          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null || message.network_view != null || message.network_results?.length)) return;
+      const privateActions = !message.locked && message.private_actions_supported === true;
+      const publicView = message.public_view && { ...message.public_view,
+        ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
+          privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
+      const network = networkPresentation(message);
+      publishSnapshot({ ...message, network_control_supported: network !== null, network_view: network, private_actions_supported: privateActions,
+        private_self_broadcast_supported: privateActions && message.private_self_broadcast_supported === true,
+        private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
+        public_view: message.locked ? null : publicView,
+        permissions: message.locked ? [] : (message.permissions ?? []),
+        ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
+        request_id: request.request_id, url: request.url,
+        needs_unlock: message.locked || request.needs_unlock,
+        summary: message.locked || request.needs_unlock ? null : request.summary,
+      })) });
+      return;
+    }
+    if (message.type === 'provider_state' || message.type === 'provider_response') {
+      pageBridge.receive(session, message);
+      return;
+    }
+    if (message.type !== 'state' || typeof message.locked !== 'boolean' ||
+        !Number.isSafeInteger(message.generation) || message.generation < 0 ||
+        message.generation < session.generation ||
+        (message.generation === session.generation && session.locked !== message.locked)) {
+      failed(session, 'disconnected');
+      return;
+    }
+    // State repeats within a session, so the version is reported once and only to a desktop that reads it.
+    if (message.client_info_supported === true && !session.clientInfoSent) {
+      session.clientInfoSent = true;
+      if (extensionVersion) {
+        command(session, { type: 'client_info', version: 1, extension_version: extensionVersion });
+      }
+    }
+    const generationChanged = session.generation !== message.generation;
+    if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
+    session.generation = message.generation;
+    session.locked = message.locked;
+    if (!message.locked || (generationChanged && unlockTerminal(unlockView.phase))) {
+      clearUnlockOwner();
+      unlockView = { allowed: unlockView.allowed, attempt_id: null, phase: "password" };
+    }
+    if (message.unlock_supported === true && !session.unlockInfoSent) {
+      session.unlockInfoSent = true;
+      command(session, { type: 'get_unlock_state', version: 1 });
+    }
+    pageBridge.lockState(message.locked, generationChanged);
+    publish(message.locked ? 'locked' : 'unlocked');
+  } catch (error) {
+    // WASM exposes fixed errors. Never stringify a library error or received payload.
+    failed(session, error === 'Incompatible gateway protocol version' ? 'version_failed' : 'auth_failed');
+  } finally { bytes.fill(0); }
+}
+function attempt(discovery, endpoint) {
+  return new Promise(resolve => {
+    const session = { discovery, client: null, socket: null, established: false, clientInfoSent: false,
+      generation: -1, locked: null, queued: 0, chain: Promise.resolve(), finish: resolve };
+    discovery.candidate = session;
+    try {
+      const socket = new WebSocket(endpoint);
+      session.socket = socket;
+      socket.binaryType = 'arraybuffer';
+      session.openDeadline = setTimeout(() => {
+        if (current(session)) failed(session, 'disconnected');
+      }, WEBSOCKET_OPEN_TIMEOUT_MS);
+      socket.onopen = () => {
+        if (!current(session)) return;
+        clearTimeout(session.openDeadline);
+        try {
+          if (discovery.code) {
+            const code = discovery.code.slice();
+            try { session.client = GatewayClient.pair(code); } finally { code.fill(0); }
+          } else {
+            const peer = new Uint8Array(discovery.record.peerId);
+            const secret = new Uint8Array(discovery.record.secret);
+            try { session.client = GatewayClient.reconnect(peer, secret); }
+            finally { peer.fill(0); secret.fill(0); }
+          }
+          session.deadline = setTimeout(() => {
+            if (current(session)) failed(session, 'auth_failed');
+          }, 10000);
+          send(session, session.client.initialHello());
+        } catch { failed(session, 'auth_failed'); }
+      };
+      socket.onerror = socket.onclose = () => {
+        if (current(session)) failed(session, session.established ? 'disconnected' :
+          session.client ? 'auth_failed' : 'disconnected', session.established);
+      };
+      socket.onmessage = event => {
+        if (!current(session)) return;
+        if (!session.client || !(event.data instanceof ArrayBuffer) || event.data.byteLength > 65535 ||
+            (!session.client.isAuthenticated() && event.data.byteLength > 1024) || ++session.queued > 64) {
+          failed(session, 'auth_failed');
+          return;
+        }
+        const bytes = new Uint8Array(event.data);
+        session.chain = session.chain.then(() => receive(session, bytes)).finally(() => { bytes.fill(0); session.queued -= 1; });
+      };
+    } catch { failed(session, 'disconnected'); }
+  });
+}
+async function connect(code = null) {
+  retire();
+  const discovery = { epoch, code, record: null, candidate: null };
+  owner = discovery;
+  publish('connecting');
+  let record;
+  try {
+    let saved;
+    try {
+      await ready;
+      if (!current(discovery)) return;
+      saved = await stored(() => current(discovery) ?
+        chrome.storage.local.get(['gatewayCredential', 'gatewayPreferences']) : {});
+    } catch { failed(discovery, 'storage_failed'); return; }
+    record = saved.gatewayCredential;
+    paired = isCredential(record) === true; // A missing record must report a boolean.
+    if (!current(discovery)) return;
+    discovery.record = record;
+    let config;
+    try {
+      config = configuration(saved.gatewayPreferences?.endpoint ?? '');
+      configuredEndpoint = config.value;
+      providerPreferences = { takeover: saved.gatewayPreferences?.takeover === true, metamask: saved.gatewayPreferences?.metamask === true };
+      publish('connecting');
+      if (config.permission && !await chrome.permissions.contains({ origins: [config.permission] })) {
+        failed(discovery, 'config_failed');
+        return;
+      }
+    } catch { failed(discovery, 'config_failed'); return; }
+    if (!current(discovery)) return;
+    if (!code && !isCredential(record)) { failed(discovery, 'disconnected'); return; }
+    const result = await attempt(discovery, config.endpoint);
+    if (!current(discovery) || result === 'authenticated') return;
+    failed(discovery, result, !code && result === 'disconnected');
+  } catch { failed(discovery, 'disconnected', !code); }
+  finally { wipe(record); clearCredentials(discovery); }
+}
+// Saving an endpoint retires the session; pairing codes wait for the saved value.
+function saveEndpoint(config, code = null) {
+  commandPending = true;
+  retire();
+  const expected = epoch;
+  void (async () => {
+    await ready;
+    if (epoch !== expected) return;
+    if (config.permission && !await chrome.permissions.contains({ origins: [config.permission] })) {
+      if (epoch === expected) publish('config_failed');
+      return;
+    }
+    await stored(async () => {
+      if (epoch !== expected) return;
+      const saved = await chrome.storage.local.get('gatewayPreferences');
+      if (epoch === expected) await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, endpoint: config.value } });
+    });
+    commandPending = false;
+    if (epoch === expected) void connect(code);
+  })().catch(() => { if (epoch === expected) publish('storage_failed'); }).finally(() => { if (epoch === expected) commandPending = false; });
+}
+
+chrome.runtime.onConnect.addListener(port => {
+  if (pageBridge.connect(port)) return;
+  const sender = port.sender;
+  let url;
+  try { url = new URL(sender?.url); } catch { port.disconnect(); return; }
+  if (port.name !== 'gateway-ui-v1' || sender?.id !== chrome.runtime.id ||
+      url.protocol !== 'chrome-extension:' || url.hostname !== chrome.runtime.id || url.pathname !== '/index.html' ||
+      !['', '?mode=window', '?mode=notification', '?mode=sidepanel'].includes(url.search) || url.hash) { port.disconnect(); return; }
+  ports.add(port);
+  homeTabs.set(port, lastHomeTab);
+  port.postMessage(snapshotFor(port));
+  port.postMessage(stateMessage(status, port));
+  port.onDisconnect.addListener(() => {
+    if (unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); }
+    closeNetworkView(port);
+    const picker = privatePickers.get(port);
+    privatePickers.delete(port);
+    const session = owner?.candidate;
+    if (picker && session?.established && current(session) && !session.locked && session.generation === picker.generation) {
+      try { command(session, { type: 'public_view', version: 1, generation: session.generation,
+        command: { type: 'draft', command: { action: 'private_picker', draft_id: picker.draft_id,
+          revision: picker.revision, view_id: picker.view_id, open: false, query: '' } } }); }
+      catch { failed(session, 'disconnected', true); }
+    }
+    ports.delete(port); // Documents never own the socket.
+    tabContexts.delete(port);
+    homeTabs.delete(port);
+    if (visibleViews.delete(port)) updateRequestAttention();
+  });
+  port.onMessage.addListener(message => {
+    if (!ports.has(port) || !message || typeof message.type !== 'string') return;
+    if (message.type === 'sidepanel_presence' || message.type === 'popup_presence') {
+      const expectedSearch = message.type === 'sidepanel_presence' ? '?mode=sidepanel' : '';
+      if (url.search !== expectedSearch || message.ready !== true || typeof message.visible !== 'boolean') return;
+      if (message.visible) visibleViews.add(port);
+      else visibleViews.delete(port);
+      updateRequestAttention();
+      return;
+    }
+    if (message.type === 'tab_context' && Number.isInteger(message.window_id) && message.window_id >= 0) {
+      tabContexts.set(port, { windowId: message.window_id, tab: null, revision: 0 });
+      void updateTab(port);
+      return;
+    }
+    if (message.type === 'unlock') {
+      try { unlockCommand(port, message.command); } catch {}
+      finally { if (message.command && typeof message.command === 'object') { delete message.command.password; delete message.command.passphrase; } }
+      return;
+    }
+    if (message.type === 'network') { networkCommand(port, message); return; }
+    if (message.type === 'home_tab' || message.type === 'private_view') {
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
+          message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
+          uiSnapshot.private_view_supported !== true) return;
+      if (message.type === 'home_tab') {
+        if (!['private', 'public'].includes(message.value)) return;
+        lastHomeTab = message.value;
+        homeTabs.set(port, message.value);
+        port.postMessage(snapshotFor(port));
+        const homeTab = message.value;
+        void stored(async () => {
+          const saved = await chrome.storage.local.get('gatewayPreferences');
+          await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, home_tab: homeTab } });
+        }).catch(() => publish('storage_failed'));
+      } else {
+        const input = message.command;
+        if (input?.type !== 'select_wallet' || typeof input.wallet_id !== 'string' ||
+            !uiSnapshot.private_view?.wallets?.some(wallet => wallet.wallet_id === input.wallet_id)) return;
+        try { command(session, { type: 'private_view', version: 1, generation: session.generation,
+          command: { type: 'select_wallet', wallet_id: input.wallet_id } }); }
+        catch { failed(session, 'disconnected', true); }
+      }
+      return;
+    }
+    if (message.type === 'public_view') {
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || session.locked ||
+          message.generation !== session.generation || uiSnapshot.generation !== session.generation) return;
+      const input = message.command;
+      if (!input || typeof input.type !== 'string') return;
+      let value;
+      if (input.type === 'select_account' && uiSnapshot.accounts.some(account => account.uuid === input.public_account_uuid)) {
+        value = { type: input.type, public_account_uuid: input.public_account_uuid };
+      } else if (input.type === 'select_chain' && uiSnapshot.chains?.some(chain => chain.id === input.chain_id)) {
+        value = { type: input.type, chain_id: input.chain_id };
+      } else if (input.type === 'refresh_balances') {
+        value = { type: input.type };
+      } else if (input.type === 'draft') {
+        const draft = input.command;
+        if (!draft || typeof draft.action !== 'string') return;
+        const bounded = (value, length) => typeof value === 'string' && value.length <= length;
+        if (['create', 'update'].includes(draft.action)) {
+          const data = draft.input;
+          const privateInput = ['private_send', 'unshield'].includes(data?.kind);
+          let prepared;
+          if (privateInput) {
+            if (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+                !bounded(data.wallet, 128) || data.wallet !== uiSnapshot.private_view?.selected_wallet ||
+                data.chain_id !== uiSnapshot.private_view?.selected_chain || !bounded(data.asset, 128) ||
+                !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
+                !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
+                !['deduct', 'add_on_top'].includes(data.fee_mode) ||
+                !['max', 'unwrap', 'native_top_up'].every(key => typeof data[key] === 'boolean')) return;
+            if (data.kind === 'private_send' && (data.unwrap || data.native_top_up)) return;
+            prepared = { wallet: data.wallet, chain_id: data.chain_id, kind: data.kind, asset: data.asset,
+              amount: data.amount, max: data.max, recipient: data.recipient, address_book_entry: data.address_book_entry,
+              fee_mode: data.fee_mode, unwrap: data.unwrap, native_top_up: data.native_top_up };
+            if (Object.hasOwn(data, 'delivery')) {
+              const onlyKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+                Object.keys(value).every(key => keys.includes(key));
+              const delivery = data.delivery;
+              if (uiSnapshot.private_self_broadcast_supported !== true ||
+                  !onlyKeys(data, [...Object.keys(prepared), 'delivery']) ||
+                  !onlyKeys(delivery, ['mode', 'signer', 'funding', 'fee']) || delivery.mode !== 'self_broadcast' ||
+                  !(delivery.signer === null || bounded(delivery.signer, 128))) return;
+              const fee = delivery.fee, funding = delivery.funding;
+              if (!fee || !['auto', 'custom'].includes(fee.mode) ||
+                  !onlyKeys(fee, fee.mode === 'custom' ? ['mode', 'max_fee_gwei', 'priority_fee_gwei'] : ['mode']) ||
+                  (fee.mode === 'custom' && (!bounded(fee.max_fee_gwei, 100) || !bounded(fee.priority_fee_gwei, 100)))) return;
+              if (!funding || !['public_balance', 'sponsorship'].includes(funding.mode) ||
+                  !onlyKeys(funding, funding.mode === 'sponsorship' ? ['mode', 'incentive'] : ['mode'])) return;
+              if (funding.mode === 'sponsorship') {
+                const incentive = funding.incentive;
+                if (!incentive || !['economy', 'standard', 'priority', 'custom'].includes(incentive.mode) ||
+                    !onlyKeys(incentive, incentive.mode === 'custom' ? ['mode', 'percent'] : ['mode']) ||
+                    (incentive.mode === 'custom' && !bounded(incentive.percent, 100))) return;
+              }
+              prepared.delivery = { mode: 'self_broadcast', signer: delivery.signer, fee: { ...fee },
+                funding: funding.mode === 'sponsorship' ? { mode: funding.mode, incentive: { ...funding.incentive } } : { mode: funding.mode } };
+            } else {
+              const broadcaster = data.broadcaster;
+              if (!bounded(data.fee_token, 128) || !['allow_out_of_range', 'favorites_only'].every(key => typeof data[key] === 'boolean') ||
+                  !broadcaster || !['random', 'specific'].includes(broadcaster.mode) ||
+                  (broadcaster.mode === 'specific' && !bounded(broadcaster.id, 1024))) return;
+              Object.assign(prepared, { fee_token: data.fee_token,
+                broadcaster: broadcaster.mode === 'random' ? { mode: 'random' } : { mode: 'specific', id: broadcaster.id },
+                allow_out_of_range: data.allow_out_of_range, favorites_only: data.favorites_only });
+            }
+          } else {
+          if (!data || data.account !== uiSnapshot.public_view?.selected_account || data.chain_id !== uiSnapshot.public_view?.selected_chain ||
+              !['send', 'shield'].includes(data.kind) || !bounded(data.asset, 128) || !bounded(data.amount, 100) || !bounded(data.recipient, 1024) ||
+              !(data.address_book_entry === null || bounded(data.address_book_entry, 128)) ||
+              typeof data.max !== 'boolean' || typeof data.mimic_railway !== 'boolean') return;
+          const fee = data.fee;
+          if (!fee || !['slow', 'normal', 'fast', 'custom'].includes(fee.mode)) return;
+          if (fee.mode === 'custom' && (!bounded(fee.max_fee_gwei, 100) || !bounded(fee.priority_fee_gwei, 100))) return;
+          prepared = { account: data.account, chain_id: data.chain_id, kind: data.kind, asset: data.asset, amount: data.amount,
+            recipient: data.recipient, address_book_entry: data.address_book_entry, max: data.max, mimic_railway: data.mimic_railway,
+            fee: fee.mode === 'custom' ? { mode: fee.mode, max_fee_gwei: fee.max_fee_gwei, priority_fee_gwei: fee.priority_fee_gwei } : { mode: fee.mode } };
+          }
+          if (draft.action === 'create') {
+            if (!bounded(draft.request_id, 64) || !draft.request_id) return;
+            value = { type: 'draft', command: { action: 'create', request_id: draft.request_id, input: prepared } };
+          } else {
+            const current = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+            if (!current || !Number.isSafeInteger(draft.revision) || draft.revision < 0 ||
+                privateInput !== ['private_send', 'unshield'].includes(current.input?.kind) ||
+                (privateInput && (draft.revision <= current.revision || ['attention', 'in_progress', 'done', 'failed'].includes(current.status)))) return;
+            value = { type: 'draft', command: { action: 'update', draft_id: draft.draft_id, revision: draft.revision, input: prepared } };
+          }
+        } else if (['private_picker', 'private_control'].includes(draft.action)) {
+          const currentDraft = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+          if (!currentDraft || uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+              !['private_send', 'unshield'].includes(currentDraft.input?.kind)) return;
+          if (draft.action === 'private_picker') {
+            if (currentDraft.input?.delivery || draft.revision !== currentDraft.revision || !bounded(draft.view_id, 128) || !draft.view_id ||
+                typeof draft.open !== 'boolean' || !bounded(draft.query, 1024) ||
+                ['attention', 'in_progress', 'done', 'failed'].includes(currentDraft.status)) return;
+            value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
+              revision: draft.revision, view_id: draft.view_id, open: draft.open, query: draft.query } };
+            if (draft.open) privatePickers.set(port, { generation: session.generation, draft_id: draft.draft_id, revision: draft.revision, view_id: draft.view_id });
+            else if (privatePickers.get(port)?.view_id === draft.view_id) privatePickers.delete(port);
+          } else {
+            const progress = currentDraft.private_progress;
+            if (!progress || (currentDraft.input?.delivery && uiSnapshot.private_self_broadcast_supported !== true) || draft.execution_id !== progress.execution_id ||
+                !['stop', 'stop_waiting', 'ban', 'favorite'].includes(draft.control) || progress[draft.control] !== true) return;
+            value = { type: 'draft', command: { action: draft.action, draft_id: draft.draft_id,
+              execution_id: draft.execution_id, control: draft.control } };
+          }
+        } else if (['submit', 'cancel', 'dismiss'].includes(draft.action)) {
+          const currentDraft = uiSnapshot.public_view?.drafts?.find(current => current.draft_id === draft.draft_id);
+          if (!currentDraft) return;
+          if (['private_send', 'unshield'].includes(currentDraft.input?.kind) &&
+              (uiSnapshot.locked || uiSnapshot.private_actions_supported !== true ||
+               (currentDraft.input?.delivery && uiSnapshot.private_self_broadcast_supported !== true) ||
+               (draft.action === 'submit' && (draft.revision !== currentDraft.revision || currentDraft.status !== 'ready')))) return;
+          const command = { action: draft.action, draft_id: draft.draft_id };
+          if (draft.action === 'submit') {
+            if (!Number.isSafeInteger(draft.revision) || draft.revision < 0) return;
+            command.revision = draft.revision;
+          }
+          value = { type: 'draft', command };
+        }
+      } else if (['revoke_permission', 'reissue_permission'].includes(input.type) &&
+          uiSnapshot.permissions?.some(permission => permission.permission_id === input.permission_id)) {
+        value = { type: input.type, permission_id: input.permission_id };
+        if (input.type === 'reissue_permission') {
+          if (!uiSnapshot.accounts.some(account => account.uuid === input.public_account_uuid)) return;
+          value.public_account_uuid = input.public_account_uuid;
+        }
+      } else if (input.type === 'connect_tab') {
+        const context = tabContexts.get(port);
+        const tab = context?.tab;
+        if (!tab || tab.token !== message.tab_token) return;
+        const generation = session.generation;
+        const stillCurrent = () => ports.has(port) && tabContexts.get(port) === context && context.tab === tab &&
+          current(session) && session.generation === generation && !session.locked;
+        void chrome.tabs.query({ active: true, windowId: context.windowId }).then(([active]) => {
+          if (active?.id !== tab.id || !stillCurrent()) return false;
+          return pageBridge.connectTab(tab.id, tab.documentId, tab.origin, stillCurrent);
+        }).then(sent => {
+          if (!sent && stillCurrent()) {
+            port.postMessage({ ...snapshotFor(port), ui_error: 'This tab is not ready to connect. Reload the page and try again.' });
+          }
+        }).catch(() => {});
+        return;
+      }
+      if (value) {
+        try { command(session, { type: 'public_view', version: 1, generation: session.generation, command: value }); }
+        catch { failed(session, 'disconnected', true); }
+      }
+      return;
+    }
+    const viewRequest = message.type === 'preferences' && message.key === 'view' && ['popup', 'sidepanel'].includes(message.value);
+    const replyView = (success, opened) => {
+      if (!Number.isSafeInteger(message.request_id) || !ports.has(port)) return;
+      try { port.postMessage({ type: 'view_result', request_id: message.request_id, success, ...(opened === undefined ? {} : { opened }) }); } catch { /* The requesting view closed. */ }
+    };
+    if (commandPending) {
+      if (viewRequest) replyView(false);
+      return;
+    }
+    if (viewRequest) {
+      commandPending = true;
+      let success = false;
+      const handoff = message.handoff_window_id !== undefined;
+      let opened = handoff ? false : undefined;
+      void preferencesReady.then(() => stored(async () => {
+        const previous = view;
+        try {
+          const saved = await chrome.storage.local.get('gatewayPreferences');
+          await applyView(message.value);
+          await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, view: message.value } });
+          view = message.value;
+          viewError = false;
+          success = true;
+        } catch {
+          await applyView(previous).catch(() => {});
+          viewError = true;
+        }
+        publish(status);
+      })).then(async () => {
+        if (!success || !handoff || !ports.has(port) || url.search !== '?mode=sidepanel' ||
+            message.value !== 'popup' || !Number.isSafeInteger(message.request_id) || message.request_id <= 0 ||
+            !Number.isSafeInteger(message.handoff_window_id) || message.handoff_window_id <= 0 ||
+            typeof chrome.sidePanel?.close !== 'function' || typeof chrome.action.openPopup !== 'function') return;
+        try {
+          await chrome.sidePanel.close({ windowId: message.handoff_window_id });
+          // Closing destroys the requesting document. The worker must finish the handoff.
+          await chrome.action.openPopup({ windowId: message.handoff_window_id });
+          opened = true;
+        } catch { /* The saved mode remains available through the toolbar. */ }
+      }).catch(() => { viewError = true; publish(status); }).finally(() => { commandPending = false; replyView(success, opened); });
+      return;
+    }
+    if (['request_wallet_switch', 'summon_desktop', 'user_activity'].includes(message.type)) {
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || message.generation !== session.generation ||
+          uiSnapshot.generation !== session.generation) return;
+      const value = { type: message.type, version: 1, generation: session.generation };
+      if (message.type === 'request_wallet_switch') {
+        const prompt = uiSnapshot.pending_connects.find(prompt => prompt.request_id === message.request_id);
+        if (!prompt?.wrong_wallet) return;
+        value.request_id = prompt.request_id;
+      }
+      try { command(session, value); } catch { failed(session, 'disconnected', true); }
+      return;
+    }
+    if (message.type === 'resolve_connect') {
+      console.log('[RailOxide gateway] gateway connection approval received');
+      const session = owner?.candidate;
+      if (!session?.established || !current(session) || uiSnapshot.generation !== session.generation) {
+        console.log('[RailOxide gateway] gateway connection approval ignored: inactive session');
+        return;
+      }
+      const prompt = uiSnapshot.pending_connects.find(value => value.request_id === message.request_id);
+      if (!prompt || (message.public_account_uuid !== null && (session.locked ||
+          !prompt.accounts.some(account => account.uuid === message.public_account_uuid) ||
+          !prompt.chains.some(chain => chain.id === message.chain_id)))) {
+        console.log('[RailOxide gateway] gateway connection approval ignored: unavailable prompt or selection');
+        return;
+      }
+      console.log('[RailOxide gateway] gateway connection approval accepted');
+      try {
+        command(session, { type: 'resolve_connect', version: 1, request_id: prompt.request_id,
+          public_account_uuid: message.public_account_uuid, chain_id: message.chain_id });
+        console.log('[RailOxide gateway] gateway connection approval sent');
+      } catch {
+        console.log('[RailOxide gateway] gateway connection approval send failed');
+        failed(session, 'disconnected', true);
+      }
+      return;
+    }
+    if (message.type === 'retry') { void connect(); return; }
+    if (message.type === 'unpair') {
+      commandPending = true;
+      paired = false; // The forgotten credential can never authenticate another session.
+      retire();
+      void chrome.alarms.clear('gateway-reconnect'); // Nothing left to reconnect with.
+      void (async () => {
+        await ready;
+        await stored(() => chrome.storage.local.remove('gatewayCredential'));
+        publish(status);
+      })().catch(() => publish('storage_failed')).finally(() => { commandPending = false; });
+      return;
+    }
+    if (message.type === 'pair' && typeof message.code === 'string' && /^\d{6}$/.test(message.code)) {
+      if (message.endpoint === undefined) { void connect(encoder.encode(message.code)); return; }
+      let config;
+      try { config = configuration(message.endpoint); } catch { port.postMessage(stateMessage('config_failed')); return; }
+      saveEndpoint(config, encoder.encode(message.code));
+      return;
+    }
+    if (message.type === 'preferences' && ['takeover', 'metamask'].includes(message.key) && typeof message.value === 'boolean') {
+      commandPending = true;
+      void ready.then(() => stored(async () => {
+        const saved = await chrome.storage.local.get('gatewayPreferences');
+        const preferences = { ...saved.gatewayPreferences, [message.key]: message.value };
+        await chrome.storage.local.set({ gatewayPreferences: preferences });
+        providerPreferences = { takeover: preferences.takeover === true, metamask: preferences.metamask === true };
+        publish(status);
+      })).catch(() => publish('storage_failed')).finally(() => { commandPending = false; });
+      return;
+    }
+    if (message.type !== 'configure') return;
+    let config;
+    try { config = configuration(message.endpoint); } catch { port.postMessage(stateMessage('config_failed')); return; }
+    saveEndpoint(config);
+  });
+});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'gateway-reconnect' && !owner && !commandPending && status === 'disconnected') void connect();
+});
+chrome.runtime.onStartup.addListener(() => { if (!owner) void connect(); });
+chrome.runtime.onInstalled.addListener(() => { if (!owner) void connect(); });
+void connect();

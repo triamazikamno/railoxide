@@ -6,6 +6,11 @@ on:
       - scripts/install-wallet
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
+      - scripts/*browser-extension*
+      - scripts/tests/*extension*
+      - extensions/**
+      - flake.nix
+      - flake.lock
       - docs/install-from-source.md
       - README.md
       - .github/workflows/install-wallet.yml
@@ -16,6 +21,11 @@ on:
       - scripts/install-wallet
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
+      - scripts/*browser-extension*
+      - scripts/tests/*extension*
+      - extensions/**
+      - flake.nix
+      - flake.lock
       - docs/install-from-source.md
       - README.md
       - .github/workflows/install-wallet.yml
@@ -24,6 +34,22 @@ permissions:
   contents: read
 
 jobs:
+  nix-evaluation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Evaluate Nix packages for all supported systems
+        run: >-
+          docker run --rm --volume "$PWD:/source:ro"
+          nixos/nix@sha256:4411619b45575be9fb47063c0878e2d9ef86988678b23c01bf3dd1b967d753fc
+          nix --extra-experimental-features 'nix-command flakes'
+          eval --no-write-lock-file --json 'path:/source#packages'
+          --apply 'packages: builtins.mapAttrs (system: p: p.default.drvPath) packages'
+
   smoke:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -43,6 +69,9 @@ jobs:
 
       - name: Check macOS packaging syntax
         run: bash -n scripts/package-wallet-macos
+
+      - name: Check extension packaging
+        run: python3 -m unittest discover -s scripts/tests -p "test_extension_packaging.py" -v
 
       - name: Show installer help
         run: scripts/install-wallet --help
@@ -128,6 +157,14 @@ jobs:
             $errors | Format-List | Out-String | Write-Error
             exit 1
           }
+
+      - name: Check Windows extension packaging
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/extension-packaging.ps1
+
+      - name: Check extension helper integrity
+        shell: pwsh
+        run: python -m unittest discover -s scripts/tests -p "test_extension_packaging.py" -v
 
       - name: Show Windows installer help
         shell: pwsh

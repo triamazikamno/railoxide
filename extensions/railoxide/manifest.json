@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "RailOxide Gateway",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAveWXH3MCIcmngZkJy1K/WNeXN3VeCnQC8xvicIZktpMlif4LSiQDQSdORidG2lgh3sYX+qof6FBegyIR2NT2iYJm1KalvEJ0+UOxFRvSGWXSUTCFq6HEF+Nq3G9E9yUlX9AZFy/+Md1IdtPTfgPUYZysy6kidy9mYAF9mjtTMV0CVkNpJ5cRCAnocoWzubkZ054Yk2VTcLcpssL48IxkJmQUdHosF+msg3kQ8uA1P+ZADSJEfFW1z4ZcGwomeerfdI93YZPFJDtbLRFjSu0zSnepWm8JL9gflOGKHNA5lUUH/uCvfN6c1GLeMjdgrTZJkqi9oa6xU296eTuka08tCQIDAQAB",
+  "description": "RailOxide desktop gateway and EIP-1193 provider.",
+  "action": {
+    "default_title": "RailOxide Gateway",
+    "default_popup": "index.html"
+  },
+  "side_panel": {
+    "default_path": "index.html?mode=sidepanel"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' ws: wss:; style-src 'self'; img-src 'self'; font-src 'self'"
+  },
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "gateway-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "alarms",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "gateway-provider.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN",
+      "match_origin_as_fallback": true
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "gateway-content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "ISOLATED",
+      "match_origin_as_fallback": true
+    }
+  ]
+}

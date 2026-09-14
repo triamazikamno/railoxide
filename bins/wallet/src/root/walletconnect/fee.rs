@@ -9,13 +9,14 @@ use wallet_ops::{
     PublicShieldTransactionProfile, PublicTransactionIntent, SelfBroadcastGasFeeQuote,
     WalletConnectDecodedCallKind, WalletConnectParsedRequest, WalletConnectReviewedFee,
     WalletConnectReviewedTransaction, project_public_action_fee,
-    public_native_action_gas_units_from_walletconnect_intent, quote_public_action_gas_fee,
-    resolve_public_action_gas_fee, simulate_public_advanced_transaction_with_fee,
+    public_native_action_gas_units_from_walletconnect_intent,
+    quote_public_action_gas_fee_with_reads, resolve_public_action_gas_fee,
+    simulate_public_advanced_transaction_with_fee_and_reads,
 };
 
 use super::helpers::{
     current_unix_seconds, parse_caip2_chain_id, walletconnect_await_before_request_expiry,
-    walletconnect_duration_until_expiry, walletconnect_request_approval_admitted,
+    walletconnect_duration_until_expiry,
 };
 use super::requests::transaction_request_from_walletconnect;
 use super::{WalletConnectRequestUi, WalletRoot};
@@ -219,7 +220,7 @@ impl WalletConnectFeeState {
             request_generation,
             dialog_generation,
             editor_generation,
-            expiry_timestamp: request.item.expiry_timestamp,
+            expiry_timestamp: request.timeout_timestamp(),
             status: WalletConnectFeeStatus::Fetching,
             error: None,
             retry_attempt: 0,
@@ -435,11 +436,19 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
     effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
     http: HttpContext,
     expiry_timestamp: Option<u64>,
+    rpc_reads: Option<wallet_ops::DappRpcReadClient>,
+    request_control: Option<wallet_ops::dapp_request::DappRequestControl>,
 ) -> Result<PublicActionGasFeeQuote, String> {
     const MAX_ATTEMPTS_WITHOUT_EXPIRY: u8 = 4;
     let mut attempt = 0;
     let network_mode = http.network_mode();
     loop {
+        if request_control
+            .as_ref()
+            .is_some_and(|control| control.ensure_current().is_err())
+        {
+            return Err("Dapp approval is no longer current".to_owned());
+        }
         let remaining = expiry_timestamp.and_then(walletconnect_duration_until_expiry);
         if expiry_timestamp.is_some() && remaining.is_none() {
             tracing::debug!(
@@ -456,27 +465,58 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
             attempt,
             "WalletConnect fee quote attempt started"
         );
-        let result = match remaining {
-            Some(remaining) => {
-                if let Ok(result) = tokio::time::timeout(
-                    remaining,
-                    quote_public_action_gas_fee(chain_id, effective_chain.as_ref(), &http),
-                )
-                .await
-                {
-                    result
-                } else {
-                    tracing::debug!(
+        let quote = async {
+            match remaining {
+                Some(remaining) => {
+                    if let Ok(result) = tokio::time::timeout(
+                        remaining,
+                        quote_public_action_gas_fee_with_reads(
+                            chain_id,
+                            effective_chain.as_ref(),
+                            &http,
+                            rpc_reads.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        result
+                    } else {
+                        tracing::debug!(
+                            chain_id,
+                            network_mode = %network_mode,
+                            attempt,
+                            "WalletConnect fee quote exhausted at request expiry"
+                        );
+                        Err(eyre::eyre!(
+                            "WalletConnect request expired while fetching fee quote"
+                        ))
+                    }
+                }
+                None => {
+                    quote_public_action_gas_fee_with_reads(
                         chain_id,
-                        network_mode = %network_mode,
-                        attempt,
-                        "WalletConnect fee quote exhausted at request expiry"
-                    );
-                    return Err("WalletConnect request expired while fetching fee quote".to_owned());
+                        effective_chain.as_ref(),
+                        &http,
+                        rpc_reads.as_ref(),
+                    )
+                    .await
                 }
             }
-            None => quote_public_action_gas_fee(chain_id, effective_chain.as_ref(), &http).await,
         };
+        let result = if let Some(control) = &request_control {
+            tokio::select! {
+                result = quote => result,
+                () = control.cancelled() => return Err("Dapp approval is no longer current".to_owned()),
+            }
+        } else {
+            quote.await
+        };
+        if request_control
+            .as_ref()
+            .is_some_and(|control| control.ensure_current().is_err())
+        {
+            return Err("Dapp approval is no longer current".to_owned());
+        }
         match result {
             Ok(quote) => {
                 tracing::debug!(
@@ -488,7 +528,20 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
                 return Ok(quote);
             }
             Err(error)
-                if expiry_timestamp.is_none() && attempt + 1 >= MAX_ATTEMPTS_WITHOUT_EXPIRY =>
+                if matches!(
+                    error.downcast_ref::<wallet_ops::RpcBrokerError>(),
+                    Some(
+                        wallet_ops::RpcBrokerError::OriginRejected
+                            | wallet_ops::RpcBrokerError::Shutdown
+                    )
+                ) =>
+            {
+                return Err(error.to_string());
+            }
+            Err(error)
+                if expiry_timestamp.is_none()
+                    && request_control.is_none()
+                    && attempt + 1 >= MAX_ATTEMPTS_WITHOUT_EXPIRY =>
             {
                 tracing::debug!(
                     chain_id,
@@ -516,7 +569,14 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
                     delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     "WalletConnect fee quote failed; backing off before retry"
                 );
-                tokio::time::sleep(wait).await;
+                if let Some(control) = &request_control {
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {},
+                        () = control.cancelled() => return Err("Dapp approval is no longer current".to_owned()),
+                    }
+                } else {
+                    tokio::time::sleep(wait).await;
+                }
                 if expiry_timestamp.is_some()
                     && walletconnect_duration_until_expiry(expiry_timestamp.unwrap()).is_none()
                 {
@@ -539,9 +599,19 @@ pub(super) async fn simulate_walletconnect_transaction(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    rpc_reads: Option<&wallet_ops::DappRpcReadClient>,
 ) -> WalletConnectSimulationResult {
-    match simulate_public_advanced_transaction_with_fee(request, quote, resolved, http).await {
+    match simulate_public_advanced_transaction_with_fee_and_reads(
+        request, quote, resolved, http, rpc_reads,
+    )
+    .await
+    {
         Ok(estimate) => WalletConnectSimulationResult::Complete(estimate),
+        Err(PublicAdvancedTransactionSimulationError::RpcRead(_)) => {
+            WalletConnectSimulationResult::Error(WalletConnectSimulationError::Unavailable(
+                Arc::from("RPC read is unavailable."),
+            ))
+        }
         Err(PublicAdvancedTransactionSimulationError::Reverted(error)) => {
             WalletConnectSimulationResult::Error(WalletConnectSimulationError::Reverted(Arc::from(
                 error,
@@ -561,6 +631,9 @@ impl WalletRoot {
         request: &WalletConnectRequestUi,
         cx: &Context<'_, Self>,
     ) -> Result<WalletConnectReviewedFeeProjection, String> {
+        if !request.is_current() {
+            return Err("Dapp approval is no longer current".to_owned());
+        }
         let payload_fingerprint = walletconnect_request_payload_fingerprint(request)?;
         let selection = self.walletconnect.walletconnect_gas_fee.selection(cx)?;
         let state = self
@@ -644,10 +717,7 @@ impl WalletRoot {
             || reviewed.review_token != request.review_token
             || !self.walletconnect.request_dialog_open
             || self.walletconnect.request_dialog_key.as_deref() != Some(request.key.as_str())
-            || !walletconnect_request_approval_admitted(
-                request.item.expiry_timestamp,
-                current_unix_seconds(),
-            )
+            || !request.approval_admitted(current_unix_seconds())
         {
             return Err(
                 "WalletConnect fee review is stale; review the current request again.".to_owned(),
@@ -738,6 +808,7 @@ impl WalletRoot {
     }
 
     pub(super) fn discard_walletconnect_fee_for_request_replacement(&mut self) {
+        self.walletconnect.walletconnect_fee_quote_task = None;
         self.walletconnect.walletconnect_fee_state = None;
         self.walletconnect.walletconnect_gas_fee.refresh_id = self
             .walletconnect
@@ -825,6 +896,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.walletconnect.walletconnect_fee_quote_task = None;
         self.walletconnect
             .walletconnect_gas_fee
             .reset_for_request(window, cx);
@@ -925,6 +997,8 @@ impl WalletRoot {
     }
 
     fn walletconnect_fee_state_changed_by_editor(&mut self, cx: &Context<'_, Self>) {
+        self.walletconnect.walletconnect_fee_quote_task = None;
+        self.walletconnect.walletconnect_gas_fee.refreshing = false;
         let Some(state) = self.walletconnect.walletconnect_fee_state.as_mut() else {
             return;
         };
@@ -983,7 +1057,11 @@ impl WalletRoot {
         request_key: Arc<str>,
         cx: &Context<'_, Self>,
     ) {
-        if !self.walletconnect.request_dialog_open
+        if self
+            .walletconnect
+            .request_actions
+            .contains(request_key.as_ref())
+            || !self.walletconnect.request_dialog_open
             || self.walletconnect.request_dialog_key.as_deref() != Some(request_key.as_ref())
             || self
                 .walletconnect
@@ -1008,7 +1086,10 @@ impl WalletRoot {
             return;
         }
         let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
-        let expiry_timestamp = request.item.expiry_timestamp;
+        if !request.is_current() {
+            return;
+        }
+        let expiry_timestamp = request.timeout_timestamp();
         let http = self.http.clone();
         let network_mode = http.network_mode();
         let refresh_id = self
@@ -1030,12 +1111,14 @@ impl WalletRoot {
         let payload_fingerprint = state.payload_fingerprint;
         let request_generation = state.request_generation;
         let retry_attempt = state.retry_attempt;
-        cx.spawn(async move |this, cx| {
+        self.walletconnect.walletconnect_fee_quote_task = Some(cx.spawn(async move |this, cx| {
             let result = quote_walletconnect_fee_with_retry(
                 chain_id,
                 effective_chain,
                 http,
                 expiry_timestamp,
+                request.rpc_reads.clone(),
+                request.request_control.clone(),
             )
             .await;
             let _ = this.update(cx, |root, cx| {
@@ -1044,8 +1127,9 @@ impl WalletRoot {
                     .pending_requests
                     .get(request_key.as_ref())
                     .is_some_and(|request| {
-                        request.review_token == review_token
-                            && request.item.expiry_timestamp
+                        request.is_current()
+                            && request.review_token == review_token
+                            && request.timeout_timestamp()
                                 == root
                                     .walletconnect
                                     .walletconnect_fee_state
@@ -1116,8 +1200,7 @@ impl WalletRoot {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
     pub(super) fn retry_walletconnect_fee(&mut self, request_key: &str, cx: &Context<'_, Self>) {
@@ -1162,10 +1245,7 @@ impl WalletRoot {
             return;
         };
         if !walletconnect_request_can_simulate(&request)
-            || !walletconnect_request_approval_admitted(
-                request.item.expiry_timestamp,
-                current_unix_seconds(),
-            )
+            || !request.approval_admitted(current_unix_seconds())
         {
             return;
         }
@@ -1248,8 +1328,19 @@ impl WalletRoot {
         let request_key = Arc::<str>::from(request_key);
         cx.spawn(async move |this, cx| {
             let result = walletconnect_await_before_request_expiry(
-                request.item.expiry_timestamp,
-                simulate_walletconnect_transaction(estimate_request, quote, resolved, &http),
+                request.timeout_timestamp(),
+                async {
+                    if !request.is_current() {
+                        return WalletConnectSimulationResult::Error(WalletConnectSimulationError::Unavailable(Arc::from("Dapp approval is no longer current")));
+                    }
+                    let simulation = simulate_walletconnect_transaction(estimate_request, quote, resolved, &http, request.rpc_reads.as_ref());
+                    if let Some(control) = &request.request_control {
+                        tokio::select! {
+                            result = simulation => result,
+                            () = control.cancelled() => WalletConnectSimulationResult::Error(WalletConnectSimulationError::Unavailable(Arc::from("Dapp approval is no longer current"))),
+                        }
+                    } else { simulation.await }
+                },
             )
             .await
             .unwrap_or_else(|_| {
@@ -1267,8 +1358,8 @@ impl WalletRoot {
                         .pending_requests
                         .get(request_key.as_ref())
                         .is_some_and(|request| {
-                            request.review_token == review_token
-                                && request.item.expiry_timestamp
+                            request.is_current() && request.review_token == review_token
+                                && request.timeout_timestamp()
                                     == root
                                         .walletconnect
                                         .walletconnect_fee_state
@@ -1352,6 +1443,88 @@ mod tests {
     use super::*;
     use alloy::primitives::Address;
     use wallet_ops::WalletConnectEvmTransaction;
+
+    #[tokio::test]
+    async fn gateway_fee_quote_discards_a_delayed_read_after_owner_invalidation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let reads = wallet_ops::DappRpcReadClient::new({
+            let entered = entered.clone();
+            let released = released.clone();
+            move |_, _| {
+                let entered = entered.clone();
+                let released = released.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    released.notified().await;
+                    Ok(serde_json::json!("0x3b9aca00"))
+                })
+            }
+        });
+        let control = wallet_ops::dapp_request::DappRequestControl::new(
+            tokio::time::Instant::now() + std::time::Duration::from_mins(5),
+            || Ok(()),
+        );
+        let http = wallet_ops::build_http_client(None).unwrap();
+        let task = tokio::spawn(quote_walletconnect_fee_with_retry(
+            1,
+            None,
+            http,
+            None,
+            Some(reads),
+            Some(control.clone()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        control.invalidate(&wallet_ops::RpcBrokerError::OriginRejected);
+        released.notify_one();
+        assert!(
+            task.await.unwrap().is_err(),
+            "a successful stale read must not become a fee quote"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_fee_quote_stops_retrying_when_read_owner_retires_before_control() {
+        for error in [
+            wallet_ops::RpcBrokerError::OriginRejected,
+            wallet_ops::RpcBrokerError::Shutdown,
+        ] {
+            let read_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reads = wallet_ops::DappRpcReadClient::new({
+                let read_started = read_started.clone();
+                move |_, _| {
+                    read_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let error = error.clone();
+                    Box::pin(async move { Err(error) })
+                }
+            });
+            let control = wallet_ops::dapp_request::DappRequestControl::new(
+                tokio::time::Instant::now() + std::time::Duration::from_mins(5),
+                || Ok(()),
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                quote_walletconnect_fee_with_retry(
+                    1,
+                    None,
+                    wallet_ops::build_http_client(None).unwrap(),
+                    None,
+                    Some(reads),
+                    Some(control.clone()),
+                ),
+            )
+            .await
+            .expect("a retired read owner must stop fee retries before the first backoff");
+            assert!(read_started.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(result.is_err());
+            assert!(
+                control.ensure_current().is_ok(),
+                "response delivery still owns the control"
+            );
+        }
+    }
 
     fn test_fee_state() -> WalletConnectFeeState {
         WalletConnectFeeState {

@@ -10,11 +10,11 @@ use gpui_component::input::{
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonGroup, ButtonVariants},
     select::{SearchableVec, SelectDelegate, SelectItem},
 };
 
-use crate::theme::{self, APP_TEXT_SIZE};
+use crate::theme::{self, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 
 /// Searchable items whose custom rows fill the menu width.
 ///
@@ -85,6 +85,26 @@ pub fn app_input(state: &Entity<InputState>) -> Input {
         .bg(rgb(theme::SURFACE))
 }
 
+/// Recipient field shared by Unshield and browser Send, with integrated trailing actions.
+#[must_use]
+pub fn recipient_input(state: &Entity<InputState>, actions: impl IntoElement) -> Input {
+    app_input(state)
+        .px_3()
+        .aria_label("Recipient")
+        .suffix(actions)
+}
+
+#[must_use]
+pub fn recipient_book_button(id: impl Into<ElementId>) -> Button {
+    app_button_base(id)
+        .icon(Icon::empty().path("ui/icons/book-user.svg"))
+        .outline()
+        .small()
+        .compact()
+        .accessibility_label("Select recipient")
+        .tooltip("Select recipient")
+}
+
 #[must_use]
 pub fn app_masked_input(state: &Entity<InputState>, disabled: bool) -> Div {
     div()
@@ -131,8 +151,72 @@ pub fn app_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> B
 }
 
 #[must_use]
+pub fn amount_max_button(id: impl Into<ElementId>, amount: Option<String>) -> Button {
+    app_button(
+        id,
+        amount.map_or_else(|| "Max".to_owned(), |amount| format!("Max: {amount}")),
+    )
+    .link()
+    .xsmall()
+    .compact()
+}
+
+#[must_use]
 pub fn app_button_base(id: impl Into<ElementId>) -> Button {
     Button::new(id).secondary()
+}
+
+/// Shared Public action mode control. The caller owns the selected mode.
+#[must_use]
+pub fn public_action_mode_group(
+    id: impl Into<ElementId>,
+    shield_selected: bool,
+    disabled: bool,
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> ButtonGroup {
+    action_mode_group(
+        id,
+        shield_selected,
+        disabled,
+        [
+            ("shield", "Shield", "ui/icons/shield.svg"),
+            ("send", "Send", "ui/icons/arrow-big-right-dash.svg"),
+        ],
+        on_change,
+    )
+}
+
+/// Two action modes with the same selection and keyboard behavior on both surfaces.
+#[must_use]
+pub fn action_mode_group(
+    id: impl Into<ElementId>,
+    first_selected: bool,
+    disabled: bool,
+    choices: [(&'static str, &'static str, &'static str); 2],
+    on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> ButtonGroup {
+    let on_change = std::rc::Rc::new(on_change);
+    let segment = |id, label, icon, shield| {
+        let on_change = on_change.clone();
+        let selected = shield == first_selected;
+        app_button(id, label)
+            .flex_1()
+            .min_w_0()
+            .icon(Icon::empty().path(icon).small())
+            .selected(selected)
+            .when(selected, ButtonVariants::primary)
+            .on_click(move |_, window, cx| on_change(&shield, window, cx))
+    };
+    ButtonGroup::new(id)
+        .w_full()
+        .outline()
+        .disabled(disabled)
+        .child(segment(choices[0].0, choices[0].1, choices[0].2, true))
+        .child(
+            segment(choices[1].0, choices[1].1, choices[1].2, false)
+                // The selected segment owns the shared one-pixel border, as on desktop.
+                .when(!first_selected, |button| button.border_l_1().ml(-px(1.0))),
+        )
 }
 
 #[must_use]
@@ -183,16 +267,21 @@ pub fn app_inline_control_row(label: impl Into<SharedString>, control: impl Into
         .child(div().flex_none().child(control))
 }
 
+/// Inherits the control's font size while keeping shared proportional leading.
 #[must_use]
 pub fn app_button_label(label: impl Into<SharedString>) -> Div {
-    app_text(label).flex_none()
+    div()
+        .flex_none()
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .child(label.into())
 }
 
+/// Body text owns its font size and line height; control labels inherit their size.
 #[must_use]
 pub fn app_text(label: impl Into<SharedString>) -> Div {
     div()
         .text_size(APP_TEXT_SIZE)
-        .line_height(relative(1.0))
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
         .child(label.into())
 }
 

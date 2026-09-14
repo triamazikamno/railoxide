@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -22,8 +23,9 @@ use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
-    PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot, SponsoredSelfBroadcastCommand,
-    TokenAnchorRateCache, TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
+    PoiReadSource, ProverCacheBuildProgress, PublicBalanceCache, PublicBalanceSnapshot,
+    SponsoredSelfBroadcastCommand, TokenAnchorRateCache, TokenAnchorRefreshHandle,
+    WakuDeliveryClient, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -45,8 +47,13 @@ mod broadcaster_picker;
 mod broadcaster_preferences;
 mod broadcaster_view;
 mod chain_load;
+mod dapp_request;
 mod dialogs;
 mod gas_fee;
+mod gateway;
+mod gateway_drafts;
+mod gateway_private_view;
+mod gateway_public_view;
 mod governance;
 mod governance_action;
 mod key_export;
@@ -64,6 +71,7 @@ mod public_action;
 mod public_balances;
 mod public_broadcaster;
 mod public_broadcaster_cost;
+mod public_transactions;
 mod retry;
 mod settings;
 mod shell;
@@ -156,14 +164,12 @@ use wallet_header::{ChainSelectItem, WalletSelectItem};
 
 #[cfg(test)]
 use broadcaster_picker::{
-    BroadcasterChoice, BroadcasterPickerEntry, BroadcasterPickerFeeEstimateRetryState,
-    BroadcasterPickerFeeStatus, BroadcasterPickerGroupKey, BroadcasterPickerRow,
+    BroadcasterChoice, BroadcasterPickerFeeEstimateRetryState, BroadcasterPickerFeeStatus,
     BroadcasterPickerTier, BroadcasterPickerViewMode,
     broadcaster_candidate_estimated_fee_amount_for_estimate,
     broadcaster_choice_supported_by_candidates, broadcaster_picker_fee_status,
-    broadcaster_picker_fee_status_detail, broadcaster_picker_fee_text_colors,
-    broadcaster_picker_scroll_hint_visible, group_minimum_estimated_fee_labels,
-    project_broadcaster_picker_entries, should_preserve_estimate_after_broadcaster_policy_change,
+    broadcaster_picker_fee_status_detail, broadcaster_picker_scroll_hint_visible,
+    should_preserve_estimate_after_broadcaster_policy_change,
 };
 #[cfg(test)]
 use chain_load::{
@@ -238,9 +244,7 @@ use public_action::{
     public_action_step_uses_stop_marker, public_action_uses_railway_authorization_ceiling,
 };
 #[cfg(test)]
-use public_balances::{
-    merge_public_balance_snapshot, public_asset_icon_path, public_balance_usd_label,
-};
+use public_balances::{public_asset_icon_path, public_balance_usd_label};
 #[cfg(test)]
 use public_broadcaster::{
     fee_token_option_has_eligible_broadcaster, public_broadcaster_fee_token_options_from_snapshot,
@@ -402,11 +406,14 @@ pub(crate) struct WalletRoot {
     #[cfg(feature = "hardware")]
     trezor_passphrase_mode_focus: FocusHandle,
     http: HttpContext,
+    network_context_id: String,
     network_health: WalletNetworkHealth,
     tor_bridge_activity: Option<wallet_ops::TorBridgeActivitySnapshot>,
     tor_download_rate: Option<u64>,
     root_shutdown: watch::Sender<bool>,
+    gateway: gateway::GatewayUi,
     network_status_popover_open: bool,
+    network_status_focus: gpui::FocusHandle,
     network_status_error: Option<Arc<str>>,
     tor_exit_ip_query: TorExitIpQueryState,
     tor_exit_ip_query_generation: u64,
@@ -443,6 +450,7 @@ pub(crate) struct WalletRoot {
     selected_wallet_id: Option<Arc<str>>,
     active_wallet_generation: u64,
     wallet_switch_generation: u64,
+    wallet_switch_loading_generation: Option<u64>,
     wallet_switch_delayed: bool,
     selected_chain: u64,
     ui_state: WalletUiState,
@@ -450,6 +458,7 @@ pub(crate) struct WalletRoot {
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
     private_pending_status_dialog_open: bool,
+    private_asset_presentation_cache: RefCell<private_assets::PrivateAssetPresentationCache>,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
     poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
@@ -479,13 +488,15 @@ pub(crate) struct WalletRoot {
     address_book_label_input: Entity<InputState>,
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
+    public_balance_cache: PublicBalanceCache,
+    public_transaction_tracker: wallet_ops::PublicTransactionTracker,
+    public_transaction_submissions: public_transactions::PublicTransactionSubmissions,
+    public_transaction_cleanup: Option<public_transactions::PublicTransactionCleanup>,
     public_balance_snapshot: Option<Arc<PublicBalanceSnapshot>>,
     public_balance_error: Option<Arc<str>>,
     public_balance_refreshing: bool,
-    public_balance_generation: u64,
     public_inactive_balance_error: Option<Arc<str>>,
     public_inactive_balance_refreshing: bool,
-    public_inactive_balance_generation: u64,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
@@ -715,6 +726,7 @@ fn complete_waku_worker_generation(
 
 impl Drop for WalletRoot {
     fn drop(&mut self) {
+        self.begin_public_transaction_shutdown();
         self.pending_software_profile_open = None;
         self.pending_software_profile_open_operation_generation = self
             .pending_software_profile_open_operation_generation
@@ -732,6 +744,11 @@ impl Drop for WalletRoot {
             let _ = command_tx.send(SponsoredSelfBroadcastCommand::Shutdown);
         }
         self.stop_waku();
+        if let Some(gateway) = self.gateway.take_shutdown_handle() {
+            self.runtime.spawn(async move {
+                let _ = gateway.shutdown().await;
+            });
+        }
         let _ = self.root_shutdown.send(true);
         if !self.wallet_sync_lifecycle_shutdown_started {
             let cleanup = self.wallet_sync_lifecycle.invalidate();
@@ -1015,6 +1032,7 @@ impl WalletRoot {
 impl WalletRoot {
     fn new(
         options: WalletAppOptions,
+        public_transaction_tracker: wallet_ops::PublicTransactionTracker,
         http: HttpContext,
         vault_store: Arc<DesktopVaultStore>,
         chain_ids: &[u64],
@@ -1065,6 +1083,7 @@ impl WalletRoot {
             maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
         let public_sync_cache_resetting =
             maintenance_blocks_public_sync(maintenance_controller.read(cx).reset());
+        let gateway = gateway::GatewayUi::start(vault_store.as_ref(), &runtime, window, cx);
         let vault_store = Some(vault_store);
         let (settings_editor, settings_error) = match vault_store.as_ref() {
             Some(store) => {
@@ -1364,11 +1383,14 @@ impl WalletRoot {
             #[cfg(feature = "hardware")]
             trezor_passphrase_mode_focus,
             http,
+            network_context_id: format!("{:032x}", rand::random::<u128>()),
             network_health,
             tor_bridge_activity,
             tor_download_rate: None,
             root_shutdown,
+            gateway,
             network_status_popover_open: false,
+            network_status_focus: cx.focus_handle(),
             network_status_error: None,
             tor_exit_ip_query: TorExitIpQueryState::Idle,
             tor_exit_ip_query_generation: 0,
@@ -1405,12 +1427,14 @@ impl WalletRoot {
             selected_wallet_id: None,
             active_wallet_generation: 0,
             wallet_switch_generation: 0,
+            wallet_switch_loading_generation: None,
             wallet_switch_delayed: false,
             ui_state,
             chain_select: chain_select.clone(),
             chain_states,
             pending_ppoi_validation_toast: None,
             private_pending_status_dialog_open: false,
+            private_asset_presentation_cache: RefCell::default(),
             poi_artifact_cache_progress: BTreeMap::new(),
             poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),
@@ -1444,13 +1468,16 @@ impl WalletRoot {
             address_book_label_input,
             address_book_save_error: None,
             public_form,
+            public_balance_cache: PublicBalanceCache::default(),
+            public_transaction_tracker,
+            public_transaction_submissions:
+                public_transactions::PublicTransactionSubmissions::default(),
+            public_transaction_cleanup: None,
             public_balance_snapshot: None,
             public_balance_error: None,
             public_balance_refreshing: false,
-            public_balance_generation: 0,
             public_inactive_balance_error: None,
             public_inactive_balance_refreshing: false,
-            public_inactive_balance_generation: 0,
             send_forms: BTreeMap::new(),
             private_action_form: None,
             send_generation_seq: 0,
@@ -1870,7 +1897,13 @@ impl WalletRoot {
         .detach();
         cx.spawn(async move |this, cx| {
             while anchor_refresh_rx.changed().await.is_ok() {
-                if this.update(cx, |_root, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |root, cx| {
+                        root.publish_gateway_desktop_state();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1931,6 +1964,14 @@ impl WalletRoot {
             },
         )
         .detach();
+        // Owner notifications include private snapshots, progress, metadata, and device outcomes.
+        // Publication does not notify this entity; the gateway coalesces unchanged presentation.
+        cx.observe_self(|root, _cx| {
+            if root.gateway_has_connected_browser() {
+                root.publish_gateway_desktop_state();
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1947,7 +1988,8 @@ impl WalletRoot {
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());
                         }
-                        if root.private_pending_status_dialog_open
+                        if (root.private_pending_status_dialog_open
+                            || root.gateway_has_connected_browser())
                             && root.private_pending_status_has_shield_timer()
                         {
                             cx.notify();
@@ -2003,6 +2045,7 @@ impl WalletRoot {
         .detach();
         root.spawn_network_health_monitor(cx);
         root.spawn_tor_bridge_activity_sampler(cx);
+        root.watch_public_transactions(cx);
         root
     }
 }

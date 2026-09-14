@@ -336,6 +336,9 @@ impl PassphraseOpenUi {
             return;
         }
 
+        if is_pending && root_stage.is_none() {
+            self.operation_active = true;
+        }
         if let Some(root_stage) = root_stage {
             let stage = pending_ui_stage(root_stage);
             let stage_changed = self.stage != stage;

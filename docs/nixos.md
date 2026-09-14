@@ -1,6 +1,7 @@
 This guide covers installing the RailOxide desktop wallet using [Nix](https://nixos.org/) and the provided flake.
 
 The flake supports x86_64-linux, aarch64-linux, x86_64-darwin, and aarch64-darwin.
+The package builds and embeds the browser extension automatically.
 
 ## Imperative Install
 
@@ -55,7 +56,7 @@ home-manager switch --flake .
 
 ## Development Shell
 
-The flake provides a development shell with the Rust toolchain and all build dependencies:
+The flake provides a development shell with the Rust toolchain, its WASM target, Python 3, and the pinned wasm-bindgen helper:
 
 ```bash
 nix develop
@@ -64,7 +65,8 @@ nix develop
 This drops you into a shell with `rustc`, `cargo`, `clang`, and all required system libraries. You can then build from source as usual:
 
 ```bash
-cargo build --release -p wallet
+scripts/build-browser-extension
+RAILOXIDE_EXTENSION_BUNDLE="$PWD/target/browser-extension.zip" cargo build --release -p wallet
 ```
 
 ## Runtime Notes

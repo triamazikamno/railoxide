@@ -21,7 +21,6 @@ pub(in crate::root) const SEND_AUTHORIZATION_FAILED_ERROR: &str =
 #[cfg(test)]
 pub(in crate::root) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster unshield spend: unlock failed";
-pub(in crate::root) const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected gas payer, RPC metadata, and transaction timing to this action.";
 pub(in crate::root) const SELF_BROADCAST_ZERO_GAS_PAYER_WARNING: &str = "Selected gas payer has 0 native balance on this chain. Choose another Public account or fund this account before self-broadcasting.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,6 +55,7 @@ pub(in crate::root) enum DeliveryFormKind {
 }
 
 pub(in crate::root) struct PrivateActionFormState {
+    pub(in crate::root) focus: gpui::FocusHandle,
     pub(in crate::root) kind: DeliveryFormKind,
     pub(in crate::root) key: UnshieldAssetKey,
 }
@@ -539,6 +539,8 @@ pub(in crate::root) fn private_amount_label(
 }
 
 pub(in crate::root) struct UnshieldFormState {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
+    pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
     pub(in crate::root) recipient_value: Arc<str>,
@@ -584,6 +586,8 @@ pub(in crate::root) struct UnshieldFormState {
 }
 
 pub(in crate::root) struct SendFormState {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
+    pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
     pub(in crate::root) recipient_value: Arc<str>,

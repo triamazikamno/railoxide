@@ -306,6 +306,25 @@ fn u128_to_trezor(value: u128) -> Vec<u8> {
     bytes[value.leading_zeros() as usize / 8..].to_vec()
 }
 
+fn u256_to_trezor(value: U256) -> Vec<u8> {
+    let bytes = value.to_be_bytes::<32>();
+    bytes[value.leading_zeros() / 8..].to_vec()
+}
+
+pub(super) fn trezor_signature_to_alloy(
+    signature: trezor_client::client::Signature,
+) -> Result<Signature, HardwareDerivationError> {
+    let parity =
+        normalize_v(signature.v).ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+            "Trezor signature has invalid recovery id",
+        ))?;
+    Ok(Signature::new(
+        U256::from_be_bytes(signature.r),
+        U256::from_be_bytes(signature.s),
+        parity,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::consensus::TxEip1559;
@@ -336,23 +355,4 @@ mod tests {
         assert_eq!(request.data, input);
         assert_eq!(request.value, vec![7]);
     }
-}
-
-fn u256_to_trezor(value: U256) -> Vec<u8> {
-    let bytes = value.to_be_bytes::<32>();
-    bytes[value.leading_zeros() / 8..].to_vec()
-}
-
-pub(super) fn trezor_signature_to_alloy(
-    signature: trezor_client::client::Signature,
-) -> Result<Signature, HardwareDerivationError> {
-    let parity =
-        normalize_v(signature.v).ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
-            "Trezor signature has invalid recovery id",
-        ))?;
-    Ok(Signature::new(
-        U256::from_be_bytes(signature.r),
-        U256::from_be_bytes(signature.s),
-        parity,
-    ))
 }

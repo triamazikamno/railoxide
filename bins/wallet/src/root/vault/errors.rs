@@ -20,6 +20,7 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::VaultNotFound => "vault_not_found",
         VaultError::UnlockFailed => "unlock_failed",
         VaultError::InvalidSpendGrant => "invalid_spend_grant",
+        VaultError::InvalidGatewayPermission => "invalid_gateway_permission",
         VaultError::SoftwareSeedSessionBindingMismatch => "software_seed_session_binding_mismatch",
         VaultError::SoftwareSeedSessionRequired => "software_seed_session_required",
         VaultError::InvalidSoftwareSeedLength => "invalid_software_seed_length",

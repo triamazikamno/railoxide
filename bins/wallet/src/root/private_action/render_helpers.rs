@@ -4,25 +4,16 @@ pub(in crate::root) fn private_action_asset_title_select(
     asset_select: &Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
     disabled: bool,
 ) -> gpui::Div {
-    div().w(px(170.0)).h(px(32.0)).child(
-        Select::new(asset_select)
-            .w_full()
-            .h(px(32.0))
-            .placeholder("Select asset")
-            .menu_width(px(220.0))
-            .disabled(disabled),
-    )
+    div()
+        .w(gpui::rems(10.625))
+        .child(ui::private_action::asset_select(asset_select, disabled))
 }
 
 pub(in crate::root) fn private_action_asset_select_row(
     label: &str,
     icon_path: Option<WalletIconSource>,
 ) -> gpui::Div {
-    div().flex().items_center().gap_2().child(token_label_row(
-        SharedString::from(label.to_owned()),
-        icon_path,
-        px(16.0),
-    ))
+    ui::private_action::asset_row(label.to_owned(), icon_path.map(Into::into))
 }
 
 pub(in crate::root) fn render_fee_token_selector(
@@ -38,41 +29,31 @@ pub(in crate::root) fn render_fee_token_selector(
         .find(|option| option.token == selected_fee_token)
         .cloned();
     let options = options.to_vec();
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(
-            div()
-                .min_w(px(0.0))
-                .child(app_muted_text("Transaction fee token")),
-        )
-        .child(
-            Popover::new(delivery_element_id(key, kind, "fee-token-selector"))
-                .trigger(
-                    Button::new(delivery_element_id(key, kind, "fee-token-selector-trigger"))
-                        .outline()
-                        .child(fee_token_selector_trigger_row(
-                            selected_option.as_ref(),
-                            selected_fee_token,
-                        ))
-                        .dropdown_caret(true)
-                        .disabled(generating || options.is_empty()),
-                )
-                .content(move |_state, window, cx| {
-                    let popover = cx.entity();
-                    render_fee_token_selector_menu(
-                        &root,
-                        &popover,
-                        key,
-                        kind,
-                        &options,
+    ui::private_action::fee_token_control(
+        Popover::new(delivery_element_id(key, kind, "fee-token-selector"))
+            .trigger(
+                Button::new(delivery_element_id(key, kind, "fee-token-selector-trigger"))
+                    .outline()
+                    .child(fee_token_selector_trigger_row(
+                        selected_option.as_ref(),
                         selected_fee_token,
-                        window,
-                    )
-                }),
-        )
+                    ))
+                    .dropdown_caret(true)
+                    .disabled(generating || options.is_empty()),
+            )
+            .content(move |_state, window, cx| {
+                let popover = cx.entity();
+                render_fee_token_selector_menu(
+                    &root,
+                    &popover,
+                    key,
+                    kind,
+                    &options,
+                    selected_fee_token,
+                    window,
+                )
+            }),
+    )
 }
 
 pub(in crate::root) fn render_fee_token_selector_menu(
@@ -95,33 +76,16 @@ pub(in crate::root) fn render_fee_token_selector_menu(
             let token = option.token;
             let selected = token == selected_fee_token;
             let disabled = option.eligible_broadcaster_count == 0;
-            div()
-                .id(fee_token_element_id(key, kind, token))
+            app_button_base(fee_token_element_id(key, kind, token))
                 .w_full()
-                .p(px(8.0))
-                .rounded_sm()
-                .text_color(rgb(if selected {
-                    theme::PRIMARY_FOREGROUND
-                } else {
-                    theme::TEXT
-                }))
-                .opacity(if disabled { 0.5 } else { 1.0 })
-                .when(selected, |this| this.bg(rgb(theme::PRIMARY)))
-                .when(!disabled && !selected, |this| {
-                    this.cursor_pointer()
-                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                })
-                .when(!disabled, |this| {
-                    this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        cx.stop_propagation();
-                        popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        selector_root.update(cx, |root, cx| match kind {
-                            DeliveryFormKind::Send => root.set_send_fee_token(key, token, cx),
-                            DeliveryFormKind::Unshield => {
-                                root.set_unshield_fee_token(key, token, cx);
-                            }
-                        });
-                    })
+                .selected(selected)
+                .disabled(disabled)
+                .on_click(move |_, window, cx| {
+                    popover.update(cx, |state, cx| state.dismiss(window, cx));
+                    selector_root.update(cx, |root, cx| match kind {
+                        DeliveryFormKind::Send => root.set_send_fee_token(key, token, cx),
+                        DeliveryFormKind::Unshield => root.set_unshield_fee_token(key, token, cx),
+                    });
                 })
                 .child(fee_token_option_label_row(option, px(18.0)))
         }))
@@ -134,16 +98,6 @@ pub(in crate::root) fn fee_token_element_id(
 ) -> SharedString {
     let action = format!("fee-token-{}", token.to_checksum(None));
     delivery_element_id(key, kind, &action)
-}
-
-pub(in crate::root) fn fee_token_option_button_label(
-    option: &PublicBroadcasterFeeTokenOption,
-) -> String {
-    format!(
-        "{} · {}",
-        option.label,
-        broadcaster_count_label(option.eligible_broadcaster_count)
-    )
 }
 
 pub(in crate::root) fn fee_token_selector_trigger_row(
@@ -164,21 +118,13 @@ pub(in crate::root) fn fee_token_selector_trigger_row(
 
 pub(in crate::root) fn fee_token_option_label_row(
     option: &PublicBroadcasterFeeTokenOption,
-    icon_size: Pixels,
+    _icon_size: Pixels,
 ) -> gpui::Div {
-    token_label_row(
-        SharedString::from(fee_token_option_button_label(option)),
-        option.icon_path.clone(),
-        icon_size,
+    ui::private_action::fee_token_row(
+        &option.label,
+        option.icon_path.clone().map(Into::into),
+        option.eligible_broadcaster_count,
     )
-}
-
-pub(in crate::root) fn broadcaster_count_label(count: usize) -> String {
-    match count {
-        0 => "no broadcasters".to_string(),
-        1 => "1 broadcaster".to_string(),
-        count => format!("{count} broadcasters"),
-    }
 }
 
 pub(in crate::root) fn render_fee_mode_toggle(
@@ -189,85 +135,23 @@ pub(in crate::root) fn render_fee_mode_toggle(
     mode: FeeHandlingMode,
     generating: bool,
 ) -> gpui::Div {
-    let selector_root = root;
-    let (deduct_tooltip, add_tooltip) = match (kind, delivery_mode) {
-        (DeliveryFormKind::Send, _) => (
-            "Use the entered amount as the token spend. Recipient receives less after the broadcaster fee.",
-            "Recipient receives the entered amount. The wallet adds the broadcaster fee on top.",
-        ),
-        (DeliveryFormKind::Unshield, DeliveryMode::PublicBroadcaster) => (
-            "Use the entered amount as the token spend. Recipient receives less after the RAILGUN fee, and after broadcaster fee if paid in this token.",
-            "Recipient receives the entered amount. The wallet adds the RAILGUN fee, and broadcaster fee if paid in this token.",
-        ),
-        (DeliveryFormKind::Unshield, _) => (
-            "Use the entered amount as the token spend. Recipient receives less after the RAILGUN fee.",
-            "Recipient receives the entered amount. The wallet adds the RAILGUN fee on top.",
-        ),
-    };
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(div().min_w(px(0.0)).child(app_muted_text("Fees")))
-        .child(
-            div().flex_none().child(
-                ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
-                    .outline()
-                    .compact()
-                    .disabled(generating)
-                    .child(fee_mode_segment_button(
-                        delivery_element_id(key, kind, "fee-mode-deduct"),
-                        delivery_element_id(key, kind, "fee-mode-deduct-info"),
-                        "Deduct",
-                        deduct_tooltip,
-                        mode == FeeHandlingMode::DeductFromAmount,
-                        generating,
-                    ))
-                    .child(fee_mode_segment_button(
-                        delivery_element_id(key, kind, "fee-mode-add"),
-                        delivery_element_id(key, kind, "fee-mode-add-info"),
-                        "Add on top",
-                        add_tooltip,
-                        mode == FeeHandlingMode::AddToAmount,
-                        generating,
-                    ))
-                    .on_click(move |selected, window, cx| {
-                        let Some(index) = selected.first() else {
-                            return;
-                        };
-                        let mode = if *index == 0 {
-                            FeeHandlingMode::DeductFromAmount
-                        } else {
-                            FeeHandlingMode::AddToAmount
-                        };
-                        selector_root.update(cx, |root, cx| match kind {
-                            DeliveryFormKind::Send => {
-                                root.set_send_fee_mode(key, mode, window, cx);
-                            }
-                            DeliveryFormKind::Unshield => {
-                                root.set_unshield_fee_mode(key, mode, window, cx);
-                            }
-                        });
-                    }),
-            ),
-        )
-}
-
-pub(in crate::root) fn fee_mode_segment_button(
-    id: SharedString,
-    info_id: SharedString,
-    label: &'static str,
-    tooltip: &'static str,
-    selected: bool,
-    disabled: bool,
-) -> Button {
-    app_segment_button(
-        id,
-        label,
-        selected,
-        disabled,
-        Some(render_private_action_info_icon(info_id, label, tooltip).into_any_element()),
+    ui::private_action::fee_mode_toggle(
+        delivery_element_id(key, kind, "fee-mode-toggle"),
+        kind == DeliveryFormKind::Unshield,
+        delivery_mode == DeliveryMode::PublicBroadcaster,
+        mode == FeeHandlingMode::AddToAmount,
+        generating,
+        move |add, window, cx| {
+            let mode = if add {
+                FeeHandlingMode::AddToAmount
+            } else {
+                FeeHandlingMode::DeductFromAmount
+            };
+            root.update(cx, |root, cx| match kind {
+                DeliveryFormKind::Send => root.set_send_fee_mode(key, mode, window, cx),
+                DeliveryFormKind::Unshield => root.set_unshield_fee_mode(key, mode, window, cx),
+            });
+        },
     )
 }
 
@@ -280,16 +164,6 @@ pub(in crate::root) fn private_action_info_tooltip_width(
     let tooltip_chrome = rem_size * 2.5 + px(2.0);
     let available_width = viewport_width - tooltip_chrome;
     (available_width > px(0.0)).then(|| available_width.min(PRIVATE_ACTION_INFO_TOOLTIP_MAX_WIDTH))
-}
-
-pub(in crate::root) fn render_private_action_info_icon(
-    id: SharedString,
-    title: &'static str,
-    detail: &'static str,
-) -> impl IntoElement {
-    render_private_action_info_icon_with_body(id, title, move || {
-        div().child(detail).into_any_element()
-    })
 }
 
 pub(in crate::root) fn render_private_action_info_icon_with_body(
@@ -356,66 +230,6 @@ fn render_private_action_tooltip_icon(
             })
             .build(window, cx)
         })
-}
-
-pub(in crate::root) fn private_action_segment_button(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-) -> Button {
-    private_action_segment_button_with_accessory(id, label, selected, None)
-}
-
-pub(in crate::root) fn private_action_segment_button_with_accessory(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-    accessory: Option<gpui::AnyElement>,
-) -> Button {
-    let button = app_button_base(id)
-        .flex_1()
-        .min_w(px(0.0))
-        .selected(selected)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(app_button_label(label))
-                .children(accessory),
-        );
-    if selected { button.primary() } else { button }
-}
-
-pub(in crate::root) fn render_self_broadcast_privacy_icon(id: SharedString) -> gpui::AnyElement {
-    render_private_action_tooltip_icon(
-        id,
-        IconName::TriangleAlert,
-        theme::WARNING,
-        theme::WARNING,
-        "Privacy warning",
-        move || {
-            div()
-                .child(SELF_BROADCAST_PRIVACY_WARNING)
-                .into_any_element()
-        },
-    )
-    .into_any_element()
-}
-
-pub(in crate::root) fn render_self_broadcast_gas_payer_warning_icon(
-    id: SharedString,
-) -> gpui::AnyElement {
-    Button::new(id)
-        .text()
-        .xsmall()
-        .compact()
-        .icon(IconName::TriangleAlert)
-        .text_color(rgb(theme::DANGER))
-        .accessibility_label(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
-        .tooltip(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
-        .into_any_element()
 }
 
 pub(in crate::root) fn render_send_result(
@@ -516,7 +330,6 @@ pub(in crate::root) fn render_unshield_native_top_up_control(
     registry: Option<&EffectiveTokenRegistry>,
 ) -> gpui::Div {
     if let Some(plan) = plan {
-        let toggle_root = root.clone();
         let label = format!(
             "Also send {} for gas",
             native_token_display_label(key.chain_id)
@@ -529,56 +342,18 @@ pub(in crate::root) fn render_unshield_native_top_up_control(
             plan.wrapped_native_amount,
             registry,
         );
-        return div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p(px(10.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(if enabled {
-                theme::WARNING
-            } else {
-                theme::BORDER
-            }))
-            .bg(rgb(theme::SURFACE_ELEVATED))
-            .when(!generating, |this| {
-                this.cursor_pointer().on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    cx.stop_propagation();
-                    toggle_root.update(cx, |root, cx| {
-                        root.set_unshield_native_top_up_enabled(key, !enabled, cx);
-                    });
-                })
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_strong_text(label))
-                            .child(cost_estimate_detail_text(format!(
-                                "Recipient receives {native_amount}; funded from private {source_amount}.",
-                            ))),
-                    )
-                    .child(render_switch(
-                        unshield_element_id(key, "native-top-up-toggle"),
-                        enabled,
-                        generating,
-                        theme::WARNING,
-                        move |checked, _window, cx| {
-                            root.update(cx, |root, cx| {
-                                root.set_unshield_native_top_up_enabled(key, checked, cx);
-                            });
-                        },
-                    )),
-            );
+        return ui::private_action::native_top_up_control(
+            unshield_element_id(key, "native-top-up-toggle"),
+            label,
+            format!("Recipient receives {native_amount}; funded from private {source_amount}."),
+            enabled,
+            generating,
+            move |checked, _window, cx| {
+                root.update(cx, |root, cx| {
+                    root.set_unshield_native_top_up_enabled(key, *checked, cx);
+                });
+            },
+        );
     }
 
     div()

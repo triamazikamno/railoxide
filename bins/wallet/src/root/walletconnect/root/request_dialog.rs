@@ -8,6 +8,22 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self
+            .walletconnect
+            .request_dialog_key
+            .as_deref()
+            .is_some_and(|key| {
+                key.starts_with("gateway:")
+                    && !self.walletconnect.pending_requests.contains_key(key)
+                    && !self
+                        .walletconnect
+                        .completed_request_dialogs
+                        .contains_key(key)
+            })
+        {
+            self.clear_walletconnect_request_dialog_state(window, cx);
+            window.close_all_dialogs(cx);
+        }
         let active_dialog = window.has_active_dialog(cx);
         if self.walletconnect.request_dialog_open && !active_dialog {
             let stale_request_key = self
@@ -130,7 +146,7 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(walletconnect_title_row("WalletConnect request"))
+                .title(app_strong_text("Dapp request"))
                 // A footer otherwise gives Enter a default confirm-and-close path.
                 .on_ok(|_, _, _| false)
                 .footer(
@@ -255,7 +271,7 @@ impl WalletRoot {
             });
         let Some(request_key) = self.walletconnect.request_dialog_key.as_deref() else {
             return content.child(app_muted_text(
-                "This WalletConnect request was already resolved or is no longer available.",
+                "This dapp request was already resolved or is no longer available.",
             ));
         };
         if let Some(completed) = self
@@ -276,7 +292,7 @@ impl WalletRoot {
                 content.child(self.render_walletconnect_request(root, request, content_width))
             }
             None => content.child(app_muted_text(
-                "This WalletConnect request was already resolved or is no longer available.",
+                "This dapp request was already resolved or is no longer available.",
             )),
         }
     }

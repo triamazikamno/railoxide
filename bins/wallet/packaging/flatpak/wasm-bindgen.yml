@@ -1,0 +1,24 @@
+name: wasm-bindgen
+buildsystem: simple
+build-options:
+  strip: false
+  no-debuginfo: true
+build-commands:
+  - install -Dm0755 wasm-bindgen /app/lib/railoxide-wasm-bindgen/bin/wasm-bindgen
+  - install -Dm0644 LICENSE-MIT /app/lib/railoxide-wasm-bindgen/licenses/LICENSE-MIT
+  - install -Dm0644 LICENSE-APACHE /app/lib/railoxide-wasm-bindgen/licenses/LICENSE-APACHE
+sources:
+  - type: archive
+    only-arches:
+      - x86_64
+    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-x86_64-unknown-linux-musl.tar.gz
+    sha256: 064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d
+    strip-components: 1
+  - type: archive
+    only-arches:
+      - aarch64
+    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-aarch64-unknown-linux-musl.tar.gz
+    sha256: 2245120254a9f6c9a9adf3601f3d52bb31309219e9ceab7696e74e24885c440a
+    strip-components: 1
+cleanup:
+  - /lib/railoxide-wasm-bindgen

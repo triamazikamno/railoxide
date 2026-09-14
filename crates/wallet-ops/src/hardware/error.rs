@@ -4,6 +4,8 @@ use super::types::HardwareAppVersion;
 
 #[derive(Debug, Error)]
 pub enum HardwareDerivationError {
+    #[error(transparent)]
+    RequestAuthority(#[from] crate::RpcBrokerError),
     #[error("invalid hardware derivation descriptor: {0}")]
     InvalidDescriptor(&'static str),
     #[error("invalid BIP32 derivation path segment: {0}")]
@@ -57,6 +59,30 @@ pub enum HardwareDerivationError {
 }
 
 impl HardwareDerivationError {
+    #[must_use]
+    #[cfg(not(feature = "hardware"))]
+    pub const fn is_user_rejected(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    #[cfg(feature = "hardware")]
+    pub fn is_user_rejected(&self) -> bool {
+        match self {
+            #[cfg(feature = "hardware")]
+            Self::LedgerStatus { status, .. } => matches!(*status, 0x6982 | 0x6985),
+            #[cfg(feature = "hardware")]
+            Self::TrezorPinEntryCancelled => true,
+            #[cfg(feature = "hardware")]
+            Self::Trezor(trezor_client::Error::FailureResponse(failure)) => matches!(
+                failure.code(),
+                trezor_client::protos::failure::FailureType::Failure_ActionCancelled
+                    | trezor_client::protos::failure::FailureType::Failure_PinCancelled
+            ),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub const fn is_early_device_readiness_error(&self) -> bool {
         match self {

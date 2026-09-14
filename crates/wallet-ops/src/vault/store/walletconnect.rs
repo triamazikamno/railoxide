@@ -3,9 +3,10 @@ use super::{
     PublicAccountStatus, VaultError, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
     WALLETCONNECT_SESSION_PREFIX, WalletConnectRelayIdentity,
     WalletConnectSessionAccountResolution, WalletConnectSessionLifecycleState,
-    WalletConnectSessionRecord, fill, sort_walletconnect_sessions,
-    walletconnect_relay_identity_record_entry, walletconnect_relay_identity_record_key,
-    walletconnect_session_record_entry, walletconnect_session_record_key,
+    WalletConnectSessionRecord, fill, public_account_metadata_record_key,
+    sort_walletconnect_sessions, walletconnect_relay_identity_record_entry,
+    walletconnect_relay_identity_record_key, walletconnect_session_record_entry,
+    walletconnect_session_record_key,
 };
 
 impl DesktopVaultStore {
@@ -156,17 +157,37 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         session: &WalletConnectSessionRecord,
     ) -> Result<WalletConnectSessionAccountResolution, VaultError> {
-        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
-        let Some(account) = accounts
-            .into_iter()
-            .find(|account| account.public_account_uuid == session.selected_public_account_uuid)
-        else {
+        self.resolve_dapp_session_account(
+            view_session,
+            &session.selected_public_account_uuid,
+            &session.selected_public_account_scope,
+            session.owning_private_wallet_uuid.as_deref(),
+        )
+    }
+
+    /// Resolve public account metadata using a matching vault view capability.
+    ///
+    /// Callers must supply a `DesktopViewSession` for this vault and check that
+    /// its unlock and active wallet generation remain current before using the result.
+    pub fn resolve_dapp_session_account(
+        &self,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+        public_account_scope: &PublicAccountScope,
+        owning_private_wallet_uuid: Option<&str>,
+    ) -> Result<WalletConnectSessionAccountResolution, VaultError> {
+        let key = public_account_metadata_record_key(public_account_uuid);
+        let Some(record) = self.encrypted_record_optional(&key)? else {
             return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
         };
+        let mut account = view_session
+            .view
+            .decrypt_public_account_metadata(public_account_uuid, &record)?;
+        if account.public_account_uuid != public_account_uuid {
+            public_account_uuid.clone_into(&mut account.public_account_uuid);
+        }
 
-        if account.status != PublicAccountStatus::Active
-            || account.scope != session.selected_public_account_scope
-        {
+        if account.status != PublicAccountStatus::Active || &account.scope != public_account_scope {
             return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
         }
 
@@ -175,7 +196,7 @@ impl DesktopVaultStore {
                 Ok(WalletConnectSessionAccountResolution::Usable(account))
             }
             PublicAccountScope::PrivateWallet { wallet_uuid } => {
-                if session.owning_private_wallet_uuid.as_deref() != Some(wallet_uuid.as_str()) {
+                if owning_private_wallet_uuid != Some(wallet_uuid.as_str()) {
                     return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
                 }
                 if wallet_uuid == view_session.wallet_id() {

@@ -63,6 +63,7 @@ pub(in crate::root) struct PrivateBroadcasterClosedActiveProgress {
 }
 
 pub(in crate::root) struct PrivateBroadcasterProgressState {
+    pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     pub(in crate::root) flow: PrivateSubmissionProgressFlow,
     pub(in crate::root) kind: DeliveryFormKind,
     pub(in crate::root) key: UnshieldAssetKey,

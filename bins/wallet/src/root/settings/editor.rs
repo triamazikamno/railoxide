@@ -136,6 +136,44 @@ impl WalletSettingsEditor {
         }
     }
 
+    pub(in crate::root) fn add_dapp_token(
+        &mut self,
+        token: wallet_ops::settings::CustomTokenSettings,
+        control: &wallet_ops::dapp_request::DappRequestControl,
+        cx: &mut Context<'_, Self>,
+    ) -> Result<wallet_ops::settings::EffectiveTokenRegistry, String> {
+        if self.is_dirty() {
+            return Err("Save or discard your settings changes before adding a token.".to_owned());
+        }
+        if !self.maintenance_controller.read(cx).is_idle() {
+            return Err("Wait for maintenance to finish before adding a token.".to_owned());
+        }
+        let address = token
+            .token_address
+            .parse()
+            .map_err(|_| "Token metadata is unavailable.".to_owned())?;
+        let existing = wallet_ops::settings::build_effective_token_registry(&self.saved)
+            .map_err(|_| "Saved token settings are unavailable.".to_owned())?;
+        if existing.get(token.chain_id, &address).is_some() {
+            return Ok(existing);
+        }
+        let mut settings = self.saved.clone();
+        settings.tokens.custom_tokens.push(token);
+        let registry = wallet_ops::settings::build_effective_token_registry(&settings)
+            .map_err(|_| "Token metadata could not be added to settings.".to_owned())?;
+        control
+            .ensure_current()
+            .map_err(|_| "This request is no longer available.".to_owned())?;
+        save_wallet_settings(self.vault_store.db().as_ref(), &settings)
+            .map_err(|_| "Token settings could not be saved.".to_owned())?;
+        self.saved = settings.clone();
+        self.draft = settings;
+        self.sync_fields_from_draft();
+        self.refresh_validation();
+        cx.notify();
+        Ok(registry)
+    }
+
     pub(in crate::root) fn save_draft(&mut self, cx: &mut Context<'_, Self>) -> bool {
         if !self.maintenance_controller.read(cx).is_idle() {
             self.status = Some(Arc::from(

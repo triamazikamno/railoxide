@@ -183,3 +183,109 @@ mod tests {
         assert_eq!(format_relative_age(Duration::MAX), "99+y ago");
     }
 }
+
+#[derive(Clone, Copy)]
+enum ByteScale {
+    Decimal,
+    Binary,
+}
+
+impl ByteScale {
+    const fn base(self) -> u64 {
+        match self {
+            Self::Decimal => 1_000,
+            Self::Binary => 1_024,
+        }
+    }
+
+    const fn unit(self, index: usize) -> &'static str {
+        match (self, index) {
+            (Self::Decimal | Self::Binary, 0) => "B",
+            (Self::Decimal, 1) => "kB",
+            (Self::Decimal, 2) => "MB",
+            (Self::Decimal, 3) => "GB",
+            (Self::Decimal, 4) => "TB",
+            (Self::Decimal, 5) => "PB",
+            (Self::Decimal, _) => "EB",
+            (Self::Binary, 1) => "KiB",
+            (Self::Binary, 2) => "MiB",
+            (Self::Binary, 3) => "GiB",
+            (Self::Binary, 4) => "TiB",
+            (Self::Binary, 5) => "PiB",
+            (Self::Binary, _) => "EiB",
+        }
+    }
+
+    const fn max_unit() -> usize {
+        6
+    }
+}
+
+struct ScaledBytes {
+    value: f64,
+    whole_value: u64,
+    unit_index: usize,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn scale_bytes(bytes: u64, scale: ByteScale) -> ScaledBytes {
+    let base = scale.base();
+    let max_unit = ByteScale::max_unit();
+    let mut unit_factor: u64 = 1;
+    let mut unit_index = 0;
+    while bytes >= unit_factor.saturating_mul(base) && unit_index < max_unit {
+        unit_factor *= base;
+        unit_index += 1;
+    }
+    let mut value = bytes as f64 / unit_factor as f64;
+    if matches!(scale, ByteScale::Decimal)
+        && unit_index > 0
+        && value >= 999.95
+        && unit_index < max_unit
+    {
+        unit_factor *= base;
+        unit_index += 1;
+        value = bytes as f64 / unit_factor as f64;
+    }
+    ScaledBytes {
+        value,
+        whole_value: bytes / unit_factor,
+        unit_index,
+    }
+}
+
+#[must_use]
+pub fn format_decimal_bytes(bytes: u64) -> String {
+    let scaled = scale_bytes(bytes, ByteScale::Decimal);
+    if scaled.unit_index == 0 {
+        format!("{bytes} B")
+    } else {
+        format!(
+            "{:.1} {}",
+            scaled.value,
+            ByteScale::Decimal.unit(scaled.unit_index)
+        )
+    }
+}
+
+#[must_use]
+pub fn format_decimal_byte_rate(rate: Option<u64>) -> String {
+    rate.map_or_else(
+        || "--".to_owned(),
+        |rate| format!("{}/s", format_decimal_bytes(rate)),
+    )
+}
+
+#[must_use]
+pub fn format_binary_bytes(bytes: u64) -> String {
+    let scaled = scale_bytes(bytes, ByteScale::Binary);
+    if scaled.unit_index == 0 {
+        format!("{bytes} B")
+    } else {
+        format!(
+            "{} {}",
+            scaled.whole_value,
+            ByteScale::Binary.unit(scaled.unit_index)
+        )
+    }
+}

@@ -91,13 +91,20 @@ impl WalletRoot {
     #[cfg(feature = "hardware")]
     fn dismiss_hardware_profile_unlock_dialog(
         &mut self,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.gateway.private_hardware_selection_pending {
+            self.gateway.private_hardware_selection_pending = false;
+            self.gateway.private_selection_message = Some("Wallet selection cancelled.");
+        }
+        self.abandon_gateway_unlock_dialog(gateway_unlock);
         self.next_hardware_profile_action_generation();
         self.manage_wallets.finish_hardware_delete_unlock_dialog();
         dismiss_hardware_profile_unlock_state(&mut self.hardware_profile_unlock);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 
@@ -520,6 +527,24 @@ impl WalletRoot {
         self.open_hardware_profile_unlock_dialog_for_wallet_purpose(
             wallet_id,
             HardwareProfileUnlockPurpose::Open,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    pub(in crate::root) fn open_hardware_profile_unlock_dialog_for_wallet_continuing(
+        &mut self,
+        wallet_id: Arc<str>,
+        gateway_unlock: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.open_hardware_profile_unlock_dialog_for_wallet_purpose(
+            wallet_id,
+            HardwareProfileUnlockPurpose::Open,
+            gateway_unlock,
             window,
             cx,
         );
@@ -535,6 +560,7 @@ impl WalletRoot {
         self.open_hardware_profile_unlock_dialog_for_wallet_purpose(
             wallet_id,
             HardwareProfileUnlockPurpose::Delete,
+            None,
             window,
             cx,
         );
@@ -545,6 +571,7 @@ impl WalletRoot {
         &mut self,
         wallet_id: Arc<str>,
         purpose: HardwareProfileUnlockPurpose,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -560,7 +587,14 @@ impl WalletRoot {
             self.set_vault_error("Selected wallet is not hardware-derived", cx);
             return;
         };
-        self.open_hardware_profile_unlock_dialog(Some(wallet_id), device_kind, purpose, window, cx);
+        self.open_hardware_profile_unlock_dialog(
+            Some(wallet_id),
+            device_kind,
+            purpose,
+            gateway_unlock,
+            window,
+            cx,
+        );
     }
 
     #[cfg(feature = "hardware")]
@@ -569,9 +603,16 @@ impl WalletRoot {
         wallet_id: Option<Arc<str>>,
         device_kind: HardwareDeviceKind,
         purpose: HardwareProfileUnlockPurpose,
+        gateway_unlock: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if purpose != HardwareProfileUnlockPurpose::Open {
+            self.retire_gateway_unlock();
+        } else if !self.gateway_unlock_is_current(gateway_unlock) {
+            let _ = self.begin_gateway_unlock();
+        }
+        let gateway_unlock = self.gateway_unlock_continuation();
         window.close_all_dialogs(cx);
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         self.next_hardware_profile_action_generation();
@@ -605,7 +646,7 @@ impl WalletRoot {
                 .title(app_strong_text(format!("{device_label} wallet")))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
-                        root.dismiss_hardware_profile_unlock_dialog(window, cx);
+                        root.dismiss_hardware_profile_unlock_dialog(gateway_unlock, window, cx);
                     });
                 })
                 .child(
@@ -663,7 +704,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.open_hardware_profile_unlock_dialog(None, device_kind, purpose, window, cx);
+        self.open_hardware_profile_unlock_dialog(None, device_kind, purpose, None, window, cx);
     }
 
     #[cfg(feature = "hardware")]

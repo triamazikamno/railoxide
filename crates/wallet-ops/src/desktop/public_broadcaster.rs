@@ -447,6 +447,30 @@ pub struct DesktopSponsoredSelfBroadcastResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfBroadcastTxOutcome {
+    Receipt(TxReceiptOutput),
+    InclusionUnobserved { tx_hash: String },
+}
+
+impl SelfBroadcastTxOutcome {
+    #[must_use]
+    pub const fn receipt(&self) -> Option<&TxReceiptOutput> {
+        match self {
+            Self::Receipt(receipt) => Some(receipt),
+            Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn tx_hash(&self) -> &str {
+        match self {
+            Self::Receipt(receipt) => &receipt.tx_hash,
+            Self::InclusionUnobserved { tx_hash } => tx_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopSelfBroadcastResult {
     pub chain_id: u64,
     pub public_account_uuid: String,
@@ -457,7 +481,7 @@ pub struct DesktopSelfBroadcastResult {
     pub max_priority_fee_per_gas: u128,
     pub estimated_native_gas_cost: U256,
     pub live_native_balance: U256,
-    pub tx: TxReceiptOutput,
+    pub tx: SelfBroadcastTxOutcome,
     pub attempts: Vec<SelfBroadcastAttemptInfo>,
     pub native_top_up: Option<DesktopNativeTopUpPlan>,
 }
@@ -588,16 +612,10 @@ pub(super) struct SelfBroadcastPreflight {
 }
 
 pub(super) struct SubmittedSelfBroadcastAttempt {
-    pub(super) tx_hash: FixedBytes<32>,
     pub(super) info: SelfBroadcastAttemptInfo,
     pub(super) rpc_gas_price: u128,
     pub(super) estimated_native_gas_cost: U256,
     pub(super) live_native_balance: U256,
-}
-
-pub(super) struct SelfBroadcastSentTx {
-    pub(super) tx_hash: FixedBytes<32>,
-    pub(super) tx_hash_string: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

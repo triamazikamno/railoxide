@@ -866,7 +866,9 @@ pub(super) async fn process_walletconnect_relay_output(
                         dapp = request.item.dapp_name.as_str(),
                         "received walletconnect request"
                     );
-                    result.pending_requests.push(*request);
+                    result
+                        .pending_requests
+                        .push((*request, WalletConnectRequestRoute::from_session(session)));
                 }
                 Ok(SessionMessageOutcome::Respond {
                     topic,
@@ -1140,6 +1142,17 @@ pub(super) fn process_walletconnect_session_request_message(
             });
         }
     };
+    let parsed = if method == "personal_sign" {
+        wallet_ops::walletconnect::parse_dapp_request_for_account(
+            request_id,
+            method,
+            method_params,
+            selected_account.address,
+        )
+        .map_err(|error| walletconnect_session_request_failure_from_error(&error))?
+    } else {
+        parsed
+    };
     let account_source = selected_account.source;
     let selected_account_support =
         walletconnect_namespace_account_support(&selected_account, Some(view_session));
@@ -1167,9 +1180,12 @@ pub(super) fn process_walletconnect_session_request_message(
         );
         return Ok(SessionMessageOutcome::Pending(Box::new(
             WalletConnectRequestUi {
+                request_control: None,
+                rpc_reads: None,
                 key: walletconnect_request_key(&message.topic, request_id),
                 review_token: walletconnect_request_id_seed(),
-                session: session.clone(),
+                binding: DappRequestBinding::from_walletconnect_session(session),
+                session_identity: DappSessionIdentity::walletconnect(session.session_uuid.clone()),
                 parsed,
                 item,
                 account_source,
@@ -1200,7 +1216,9 @@ pub(super) fn process_walletconnect_session_request_message(
         WalletConnectParsedRequest::PersonalSign { .. }
         | WalletConnectParsedRequest::EthSendTransaction { .. }
         | WalletConnectParsedRequest::EthSignTypedData { .. }
-        | WalletConnectParsedRequest::EthSignTypedDataV4 { .. } => Value::Null,
+        | WalletConnectParsedRequest::EthSignTypedDataV4 { .. }
+        | WalletConnectParsedRequest::WalletAddEthereumChain { .. }
+        | WalletConnectParsedRequest::WalletWatchAsset { .. } => Value::Null,
     };
     tracing::debug!(
         target: "wallet::root::walletconnect",

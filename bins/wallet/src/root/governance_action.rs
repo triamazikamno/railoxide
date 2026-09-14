@@ -743,6 +743,15 @@ impl WalletRoot {
         #[cfg(not(feature = "hardware"))]
         let trezor_pin_matrix_provider = None;
         let chain_id = context.chain_id;
+        let transaction_tracking =
+            match self.public_transaction_tracking_context(chain_id, &actor_uuid) {
+                Ok(context) => context,
+                Err(error) => {
+                    self.governance.action_flow.error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            };
         let active_wallet_id = self.selected_wallet_id.clone();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -802,6 +811,7 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             progress_rx,
+            None,
             cx,
         );
         Self::spawn_public_action_session_event_listener(
@@ -809,10 +819,12 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             event_rx,
+            None,
             cx,
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let public_send = PublicSendRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
             view_session,
@@ -840,9 +852,9 @@ impl WalletRoot {
         };
         let http = self.http.clone();
         let submitted_target = target;
-        let join = self.runtime.spawn(async move {
+        let join = self.spawn_public_transaction_submission(async move {
             if let Some(workflow) = workflow {
-                wallet_ops::submit_governance_workflow_with_progress(
+                Box::pin(wallet_ops::submit_governance_workflow_with_progress(
                     GovernanceWorkflowRequest {
                         initial: request,
                         workflow,
@@ -851,7 +863,7 @@ impl WalletRoot {
                     move |update| {
                         let _ = progress_tx.send(update);
                     },
-                )
+                ))
                 .await
                 .map(|result| result.transactions)
             } else {
@@ -862,7 +874,7 @@ impl WalletRoot {
                 .map(|result| vec![result])
             }
         });
-        self.public_form.action_task_abort_handle = Some(join.abort_handle());
+        self.public_form.action_task_abort_handle = join.abort_handle();
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {

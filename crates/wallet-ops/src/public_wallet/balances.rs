@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
+use alloy::eips::{BlockId, BlockNumHash, BlockNumberOrTag};
+use alloy::network::{AnyRpcBlock, primitives::HeaderResponse};
 use alloy::primitives::{Address, Bytes, U256};
+use alloy::rpc::types::{TransactionInput, TransactionRequest};
+use alloy::serde::WithOtherFields;
 use alloy::sol_types::SolCall;
 use eyre::{Result, eyre};
 use railgun_ui::known_tokens_for_chain;
@@ -71,22 +75,30 @@ pub(super) fn plan_public_balance_calls(
     chain_id: u64,
     accounts: &[PublicAccountMetadata],
     token_registry: Option<&EffectiveTokenRegistry>,
-) -> Vec<PlannedPublicBalanceCall> {
+    block: BlockId,
+) -> Result<Vec<PlannedPublicBalanceCall>> {
     let assets = public_balance_assets_for_chain_with_registry(chain_id, token_registry);
     let mut calls = Vec::with_capacity(accounts.len().saturating_mul(assets.len()));
     for account in accounts {
         for asset in &assets {
             let read = match asset.id {
-                PublicAssetId::Native => RpcRead::get_balance(account.address),
-                PublicAssetId::Erc20(token) => RpcRead::eth_call(
-                    token,
-                    PublicErc20::balanceOfCall {
-                        account: account.address,
-                    }
-                    .abi_encode()
-                    .into(),
+                PublicAssetId::Native => Ok(RpcRead::get_balance_at(account.address, block)),
+                PublicAssetId::Erc20(token) => RpcRead::from_rpc(
+                    WithOtherFields::new(TransactionRequest {
+                        to: Some(token.into()),
+                        input: TransactionInput::maybe_both(Some(Bytes::from(
+                            PublicErc20::balanceOfCall {
+                                account: account.address,
+                            }
+                            .abi_encode(),
+                        ))),
+                        ..TransactionRequest::default()
+                    }),
+                    block,
+                    None,
+                    chain_id,
                 ),
-            };
+            }?;
             calls.push(PlannedPublicBalanceCall {
                 public_account_uuid: account.public_account_uuid.clone(),
                 asset: asset.clone(),
@@ -94,7 +106,7 @@ pub(super) fn plan_public_balance_calls(
             });
         }
     }
-    calls
+    Ok(calls)
 }
 
 pub async fn refresh_public_balances(
@@ -104,14 +116,65 @@ pub async fn refresh_public_balances(
     token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
 ) -> Result<PublicBalanceSnapshot> {
+    refresh_public_balances_at_least(
+        chain_id,
+        accounts,
+        effective_chain,
+        token_registry,
+        http,
+        None,
+    )
+    .await
+}
+
+pub async fn refresh_public_balances_at_least(
+    chain_id: u64,
+    accounts: &[PublicAccountMetadata],
+    effective_chain: Option<&EffectiveChainConfig>,
+    token_registry: Option<&EffectiveTokenRegistry>,
+    http: &HttpContext,
+    minimum: Option<BlockNumHash>,
+) -> Result<PublicBalanceSnapshot> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let planned_calls = plan_public_balance_calls(chain_id, accounts, token_registry);
-    if planned_calls.is_empty() {
+    if accounts.is_empty()
+        || public_balance_assets_for_chain_with_registry(chain_id, token_registry).is_empty()
+    {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
-
     let route = RpcRoute::from(chain.rpc_route);
+    let head_read = RpcRead::get_block_by_number(BlockNumberOrTag::Latest, false);
+    let head_results = http
+        .rpc_broker()
+        .submit(RpcSubmission::new(
+            route.clone(),
+            vec![head_read],
+            WalletRpcOrigin::PublicWallet.into(),
+        ))
+        .await
+        .map_err(|_| eyre!("public balance canonical head unavailable"))?;
+    let head: AnyRpcBlock = head_results
+        .first()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|result| serde_json::from_value(result.expose_value().clone()).ok())
+        .ok_or_else(|| eyre!("public balance canonical head unavailable"))?;
+    let observed_block = head.header.num_hash();
+    if minimum.is_some_and(|minimum| {
+        observed_block.number < minimum.number
+            || (observed_block.number == minimum.number && observed_block.hash != minimum.hash)
+    }) {
+        return Err(eyre!(
+            "public balance canonical head does not satisfy minimum block"
+        ));
+    }
+    let planned_calls = plan_public_balance_calls(
+        chain_id,
+        accounts,
+        token_registry,
+        BlockId::hash_canonical(observed_block.hash),
+    )?;
     let reads = planned_calls.iter().map(|call| call.read.clone()).collect();
+    // This shared submission starts the observation for every account in the batch.
+    let observed_at = Instant::now();
     let results = http
         .rpc_broker()
         .submit(RpcSubmission::new(
@@ -153,6 +216,8 @@ pub async fn refresh_public_balances(
                     .and_then(|value| decode_public_balance(&call.asset.id, value))
             })
             .collect(),
+        observed_at,
+        observed_block,
     ))
 }
 
@@ -171,7 +236,16 @@ pub(super) fn public_balance_snapshot_from_results(
     accounts: &[PublicAccountMetadata],
     planned_calls: &[PlannedPublicBalanceCall],
     results: Vec<Option<U256>>,
+    observed_at: Instant,
+    observed_block: BlockNumHash,
 ) -> PublicBalanceSnapshot {
+    let expected_counts =
+        planned_calls
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, call| {
+                *counts.entry(&call.public_account_uuid).or_default() += 1;
+                counts
+            });
     let mut by_account: BTreeMap<String, Vec<PublicBalanceEntry>> = BTreeMap::new();
     for (call, result) in planned_calls.iter().zip(results) {
         by_account
@@ -192,11 +266,22 @@ pub(super) fn public_balance_snapshot_from_results(
         accounts: accounts
             .iter()
             .cloned()
-            .map(|account| PublicAccountBalance {
-                balances: by_account
+            .map(|account| {
+                let balances = by_account
                     .remove(&account.public_account_uuid)
-                    .unwrap_or_default(),
-                account,
+                    .unwrap_or_default();
+                let complete = !balances.is_empty()
+                    && expected_counts.get(account.public_account_uuid.as_str())
+                        == Some(&balances.len())
+                    && balances
+                        .iter()
+                        .all(|balance| balance.amount.amount().is_some());
+                PublicAccountBalance {
+                    balances,
+                    account,
+                    observed_at: complete.then_some(observed_at),
+                    observed_block: complete.then_some(observed_block),
+                }
             })
             .collect(),
     }
@@ -215,12 +300,14 @@ fn empty_public_balance_snapshot(
             .map(|account| PublicAccountBalance {
                 account,
                 balances: Vec::new(),
+                observed_at: None,
+                observed_block: None,
             })
             .collect(),
     }
 }
 
-fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
+pub(crate) fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
     let symbol = match chain_id {
         1 | 42161 => "ETH",
         56 => "BNB",

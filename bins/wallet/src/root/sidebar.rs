@@ -13,26 +13,25 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
-use ui::format::format_compact_latency;
-use ui::theme;
-use wallet_ops::{ProverCacheBuildProgress, WalletNetworkHealthState, WalletNetworkMode};
-
-use crate::assets::{
-    LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, RailgunSocialIcon,
-    SIDEBAR_WORDMARK_PATH,
+use ui::network_status::{
+    NetworkStatusTrigger, TorExitIpQueryState, network_status_pill, network_status_popover_content,
+    network_status_scroll,
 };
+use ui::theme;
+use wallet_ops::ProverCacheBuildProgress;
 
-use super::network::{network_health_color, render_network_status_popover_content};
+use crate::assets::{LOGO_ICON_PATH, RailgunSidebarIcon, RailgunSocialIcon, SIDEBAR_WORDMARK_PATH};
+
 use super::shell::{
     COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, RAILOXIDE_REPOSITORY_URL, TELEGRAM_URL,
     wallet_build_label,
 };
-use super::ui_helpers::format_decimal_byte_rate;
 use super::{
     SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
 };
 
-const SIDEBAR_FOOTER_HORIZONTAL_INSET: Pixels = px(12.0);
+pub(super) const SIDEBAR_FOOTER_HORIZONTAL_INSET: Pixels = px(12.0);
+pub(super) const SIDEBAR_STATUS_PILL_HEIGHT: Pixels = px(42.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Activity {
@@ -59,6 +58,7 @@ impl WalletRoot {
         let settings_root = root.clone();
         let logs_root = root.clone();
         let network_root = root.clone();
+        let gateway_root = root.clone();
         let cache_root = root.clone();
         let public_broadcaster_count = self.sidebar_public_broadcaster_count;
         let public_broadcaster_color =
@@ -196,6 +196,7 @@ impl WalletRoot {
                             ))
                         },
                     )
+                    .child(self.render_gateway_status_pill(&gateway_root, collapsed))
                     .child(self.render_network_status_pill(&network_root, collapsed))
                     .child(
                         SidebarMenu::new()
@@ -241,38 +242,24 @@ impl WalletRoot {
     }
 
     fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {
-        let health = self.network_health.clone();
-        let color = network_health_color(&health);
-        let label = health.label();
-        let tor_metrics_visible = health.mode == WalletNetworkMode::Tor;
-        let tor_reconnecting = health.mode == WalletNetworkMode::Tor
-            && health.state == WalletNetworkHealthState::Reconnecting;
-        let expanded_tor = !collapsed && tor_metrics_visible;
-        let activity = self.tor_bridge_activity.clone();
+        let status = self.network_status_presentation();
+        let expanded_tor = !collapsed && status.kind().is_tor();
+        let activity = self.network_activity_presentation();
         let download_rate = self.tor_download_rate;
-        let setup = activity
-            .as_ref()
-            .and_then(|snapshot| snapshot.median_setup_duration);
-        let setup_label = setup.map_or_else(|| "--".to_owned(), format_compact_latency);
         let popover_root = root.clone();
         let content_root = root.clone();
         let network_status_error = self.network_status_error.clone();
         let tor_exit_ip_query = self.tor_exit_ip_query.clone();
         let tor_state_reset_confirming = self.tor_state_reset_confirming;
 
-        let trigger = Button::new("wallet-network-status-pill-trigger")
-            .accessibility_label("Network status")
-            .text()
-            .tab_stop(false)
-            .child(Self::render_network_status_chip(
-                collapsed,
-                color,
-                label,
-                &setup_label,
-                download_rate,
-                tor_metrics_visible,
-                tor_reconnecting,
-            ));
+        let trigger = network_status_pill(
+            "wallet-network-status-pill-trigger",
+            collapsed,
+            &status,
+            activity.as_ref(),
+            download_rate,
+            SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET,
+        );
 
         let trigger = if expanded_tor {
             trigger
@@ -286,24 +273,45 @@ impl WalletRoot {
         };
 
         let popover = Popover::new("wallet-network-status-popover")
+            .p_0()
             .anchor(Anchor::BottomLeft)
             .open(self.network_status_popover_open)
-            .on_open_change(move |open, _window, cx| {
+            .on_open_change(move |open, window, cx| {
                 popover_root.update(cx, |root, cx| {
                     root.set_network_status_popover_open(*open, cx);
+                    if !open {
+                        root.network_status_focus.focus(window, cx);
+                    }
                 });
             })
-            .trigger(trigger)
-            .content(move |_state, _window, _cx| {
-                render_network_status_popover_content(
-                    content_root.clone(),
-                    &health,
-                    color,
-                    network_status_error.clone(),
-                    tor_exit_ip_query.clone(),
-                    tor_state_reset_confirming,
-                    activity.as_ref(),
-                    download_rate,
+            .trigger(NetworkStatusTrigger::new(
+                trigger,
+                &self.network_status_focus,
+                &status,
+            ))
+            .content(move |_state, window, _cx| {
+                let root = content_root.clone();
+                let copy = match tor_exit_ip_query {
+                    TorExitIpQueryState::Success(ip) => Some(
+                        clipboard_with_toast("wallet-network-exit-ip-copy", ip.to_string())
+                            .into_any_element(),
+                    ),
+                    _ => None,
+                };
+                network_status_scroll(
+                    network_status_popover_content(
+                        &status,
+                        network_status_error.clone(),
+                        tor_exit_ip_query.clone(),
+                        tor_state_reset_confirming,
+                        activity.as_ref(),
+                        download_rate,
+                        move |intent, _window, cx| {
+                            root.update(cx, |root, cx| root.network_status_intent(intent, cx));
+                        },
+                        copy,
+                    ),
+                    window,
                 )
             });
 
@@ -318,164 +326,6 @@ impl WalletRoot {
         } else {
             popover.into_any_element()
         }
-    }
-
-    fn render_network_status_chip(
-        collapsed: bool,
-        color: u32,
-        label: &'static str,
-        setup_label: &str,
-        rate: Option<u64>,
-        tor_metrics_visible: bool,
-        tor_reconnecting: bool,
-    ) -> gpui::AnyElement {
-        if collapsed {
-            return div()
-                .id("wallet-network-status-pill-collapsed")
-                .h(px(32.0))
-                .px_2()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(color))
-                .bg(rgb_with_alpha(color, 0.08))
-                .text_color(rgb(color))
-                .cursor_pointer()
-                .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
-                .child(
-                    Icon::new(RailgunNetworkStatusIcon::Tor)
-                        .small()
-                        .text_color(rgb(color)),
-                )
-                .into_any_element();
-        }
-
-        if !tor_metrics_visible {
-            return div()
-                .id("wallet-network-status-pill")
-                .h_7()
-                .px_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(color))
-                .bg(rgb_with_alpha(color, 0.08))
-                .text_color(rgb(color))
-                .cursor_pointer()
-                .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
-                .child(
-                    Icon::new(RailgunNetworkStatusIcon::Tor)
-                        .small()
-                        .text_color(rgb(color)),
-                )
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .line_height(gpui::relative(1.0))
-                        .text_color(rgb(color))
-                        .child(label),
-                )
-                .into_any_element();
-        }
-
-        let displayed_label = if tor_reconnecting { "Tor" } else { label };
-
-        div()
-            .id("wallet-network-status-pill")
-            .h_auto()
-            .w(SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET)
-            .p_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(color))
-            .bg(rgb_with_alpha(color, 0.08))
-            .text_color(rgb(color))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(RailgunNetworkStatusIcon::Tor)
-                            .small()
-                            .flex_none()
-                            .text_color(rgb(color)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .when(!tor_reconnecting, gpui::Styled::flex_1)
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .line_height(px(16.0))
-                                    .text_color(rgb(color))
-                                    .child(displayed_label),
-                            )
-                            .children(tor_reconnecting.then(|| {
-                                div().flex_none().child(
-                                    Spinner::new()
-                                        .icon(IconName::LoaderCircle)
-                                        .color(rgb(color).into())
-                                        .with_size(px(12.0)),
-                                )
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(2.0))
-                    .text_size(px(11.0))
-                    .line_height(gpui::relative(1.0))
-                    .text_color(rgb(color))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .whitespace_nowrap()
-                            .child(
-                                Icon::new(RailgunNetworkStatusIcon::ConnectionSetup)
-                                    .with_size(px(9.0)),
-                            )
-                            .child(setup_label.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .whitespace_nowrap()
-                            .child(Icon::new(RailgunNetworkStatusIcon::Download).with_size(px(9.0)))
-                            .child(format_decimal_byte_rate(rate)),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn render_prover_cache_build_pill(

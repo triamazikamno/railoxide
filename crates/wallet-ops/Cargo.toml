@@ -18,7 +18,8 @@ name = "hardware_derivation_probe"
 required-features = ["hardware"]
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers", "json-rpc"] }
+alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers", "json-rpc", "ens"] }
+ens-normalize-rs = { workspace = true }
 alloy-signer = { workspace = true }
 arti-client = { workspace = true, features = ["onion-service-client"] }
 argon2 = { workspace = true }
@@ -30,6 +31,7 @@ chacha20poly1305 = { workspace = true }
 cid = "0.11"
 coins-bip32 = "0.13"
 coins-ledger = { workspace = true, optional = true }
+dapp-gateway-protocol = { path = "../dapp-gateway-protocol" }
 ed25519-dalek = { workspace = true }
 eyre = { workspace = true }
 getrandom = { workspace = true }
@@ -47,7 +49,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util"] }
+httparse = "1"
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 tor-rtcompat = { workspace = true }
 trezor-client = { workspace = true, optional = true }
 tracing = { workspace = true }

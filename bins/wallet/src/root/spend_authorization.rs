@@ -155,10 +155,26 @@ impl SpendAuthorizationCache {
 
 #[derive(Clone)]
 pub(super) enum SpendAuthorizationIntent {
-    PrivateSend(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
-    PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
-    PrivateUnshield(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
-    PrivateUnshieldSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
+    PrivateSend(
+        UnshieldAssetKey,
+        Option<SponsoredAuthorizationLimit>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
+    PrivateSendSelfBroadcastGasPassword(
+        UnshieldAssetKey,
+        Option<SponsoredAuthorizationLimit>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
+    PrivateUnshield(
+        UnshieldAssetKey,
+        Option<SponsoredAuthorizationLimit>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
+    PrivateUnshieldSelfBroadcastGasPassword(
+        UnshieldAssetKey,
+        Option<SponsoredAuthorizationLimit>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
     BlockedShieldRefund(BlockedShieldRescueUtxoId),
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend(Box<PublicSendDraft>),
@@ -172,6 +188,60 @@ pub(super) enum SpendAuthorizationIntent {
 }
 
 impl SpendAuthorizationIntent {
+    fn gateway_execution(&self) -> Option<&wallet_ops::gateway::GatewayDraftExecution> {
+        match self {
+            Self::PrivateSend(_, _, execution)
+            | Self::PrivateUnshield(_, _, execution)
+            | Self::PrivateSendSelfBroadcastGasPassword(_, _, execution)
+            | Self::PrivateUnshieldSelfBroadcastGasPassword(_, _, execution) => execution.as_ref(),
+            Self::PublicSend(draft) => draft.gateway_execution.as_ref(),
+            Self::PublicShield(draft) => draft.gateway_execution.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn private_attention(&self, step: &str, message: &str) {
+        if let Some(execution) = self.gateway_execution()
+            && let Some(progress) = execution.snapshot().private
+        {
+            execution.update_private(
+                wallet_ops::gateway::GatewayDraftStatus::Attention,
+                step.into(),
+                message.into(),
+                false,
+                progress,
+            );
+        }
+    }
+
+    fn private_review_current(&self, root: &WalletRoot) -> bool {
+        let current = match self {
+            Self::PrivateSend(key, _, _) | Self::PrivateSendSelfBroadcastGasPassword(key, _, _) => {
+                root.send_forms
+                    .get(key)
+                    .map(|form| form.gateway_execution.as_ref())
+            }
+            Self::PrivateUnshield(key, _, _)
+            | Self::PrivateUnshieldSelfBroadcastGasPassword(key, _, _) => root
+                .unshield_forms
+                .get(key)
+                .map(|form| form.gateway_execution.as_ref()),
+            _ => return true,
+        };
+        match (self.gateway_execution(), current) {
+            (None, Some(None)) => true,
+            (Some(expected), Some(Some(current))) => expected.same_execution(current),
+            _ => false,
+        }
+    }
+
+    fn approve_gateway_review(&self, root: &WalletRoot) -> bool {
+        self.private_review_current(root)
+            && self
+                .gateway_execution()
+                .is_none_or(wallet_ops::gateway::GatewayDraftExecution::approve_review)
+    }
+
     const fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
@@ -188,16 +258,47 @@ pub(super) enum HardwareSpendAuthorizationCompletion {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     },
     PrivateUnshieldSelfBroadcast {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     },
     BlockedShieldRefund {
         utxo_id: BlockedShieldRescueUtxoId,
         vault_password: Zeroizing<String>,
     },
+}
+
+impl HardwareSpendAuthorizationCompletion {
+    fn private_intent(&self) -> Option<SpendAuthorizationIntent> {
+        match self {
+            Self::Continue(intent) => Some(intent.clone()),
+            Self::PrivateSendSelfBroadcast {
+                key,
+                authorization_limit,
+                execution,
+                ..
+            } => Some(SpendAuthorizationIntent::PrivateSend(
+                *key,
+                *authorization_limit,
+                execution.clone(),
+            )),
+            Self::PrivateUnshieldSelfBroadcast {
+                key,
+                authorization_limit,
+                execution,
+                ..
+            } => Some(SpendAuthorizationIntent::PrivateUnshield(
+                *key,
+                *authorization_limit,
+                execution.clone(),
+            )),
+            Self::BlockedShieldRefund { .. } => None,
+        }
+    }
 }
 
 #[cfg(feature = "hardware")]
@@ -380,6 +481,7 @@ struct HardwareSpendAuthorizationDialogContent {
     device_label: &'static str,
     pending: bool,
     cancelled: bool,
+    completed: bool,
     payload_open: bool,
     error: Option<Arc<str>>,
 }
@@ -399,13 +501,26 @@ impl HardwareSpendAuthorizationDialogContent {
             device_label,
             pending: false,
             cancelled: false,
+            completed: false,
             payload_open: false,
             error: None,
         }
     }
 
     fn cancel(&mut self, cx: &mut Context<'_, Self>) {
+        if self.completed {
+            return;
+        }
         self.cancelled = true;
+        if let Some(intent) = self.completion.private_intent() {
+            self.root.update(cx, |root, cx| {
+                if let Some(execution) = intent.gateway_execution() {
+                    execution.cancel_private_authorization();
+                    root.release_gateway_private_form(execution, cx);
+                }
+                root.cancel_spend_authorization(&intent, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -453,6 +568,10 @@ impl HardwareSpendAuthorizationDialogContent {
                             match result {
                                 Ok(Ok((authorization, hardware_session))) => {
                                     let root = dialog.root.clone();
+                                    if completion.private_intent().is_some_and(|intent| !intent.approve_gateway_review(root.read(cx))) {
+                                        return;
+                                    }
+                                    dialog.completed = true;
                                     window.close_dialog(cx);
                                     root.update(cx, |root, cx| {
                                         root.refresh_active_hardware_profile_session(
@@ -472,6 +591,7 @@ impl HardwareSpendAuthorizationDialogContent {
                                                  key,
                                                  vault_password,
                                                  authorization_limit,
+                                                 execution,
                                              } => {
                                                 root.generate_send_calldata_authorized_with_gas_password(
                                                     key,
@@ -481,11 +601,15 @@ impl HardwareSpendAuthorizationDialogContent {
                                                      window,
                                                     cx,
                                                 );
+                                                if let Some(execution) = execution {
+                                                    root.reject_gateway_private_authorization(&execution, cx);
+                                                }
                                             }
                                              HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
                                                  key,
                                                  vault_password,
                                                  authorization_limit,
+                                                 execution,
                                              } => {
                                                 root.generate_unshield_calldata_authorized_with_gas_password(
                                                     key,
@@ -495,6 +619,9 @@ impl HardwareSpendAuthorizationDialogContent {
                                                      window,
                                                     cx,
                                                 );
+                                                if let Some(execution) = execution {
+                                                    root.reject_gateway_private_authorization(&execution, cx);
+                                                }
                                             }
                                             HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
                                                 utxo_id,
@@ -684,7 +811,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                             .flex_none()
                             .on_click(move |_event, window, cx| {
                                 cancel_root.update(cx, |root, cx| {
-                                    root.cancel_governance_authorization(&cancel_intent, cx);
+                                    root.cancel_spend_authorization(&cancel_intent, cx);
                                 });
                                 window.close_dialog(cx);
                             }),
@@ -1054,7 +1181,16 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let summary = if intent.gateway_execution().is_some() {
+            summary.requiring_explicit_review()
+        } else {
+            summary
+        };
         if intent.uses_private_wallet() && self.selected_wallet_source().is_hardware_derived() {
+            intent.private_attention(
+                "Approve on your hardware wallet",
+                "Use the desktop app to approve this private spend on your device.",
+            );
             self.clear_spend_authorization(cx);
             self.open_hardware_spend_authorization_dialog(
                 HardwareSpendAuthorizationCompletion::Continue(intent),
@@ -1069,6 +1205,9 @@ impl WalletRoot {
         {
             match self.desktop_spend_authorization(password) {
                 Ok(authorization) => {
+                    if !intent.approve_gateway_review(self) {
+                        return;
+                    }
                     self.continue_authorized_spend(intent, authorization, window, cx);
                 }
                 Err(message) => self.set_vault_error(message, cx),
@@ -1076,6 +1215,10 @@ impl WalletRoot {
             return;
         }
 
+        intent.private_attention(
+            "Authorize in the desktop app",
+            "Enter your vault password in the desktop app to continue.",
+        );
         self.open_spend_authorization_dialog(intent, summary, window, cx);
     }
 
@@ -1116,7 +1259,7 @@ impl WalletRoot {
                 .title(app_strong_text(dialog_title.clone()))
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
-                        root.cancel_governance_authorization(&close_intent, cx);
+                        root.cancel_spend_authorization(&close_intent, cx);
                     });
                 })
                 .child(div().w(content_width).child(content.clone()))
@@ -1162,7 +1305,7 @@ impl WalletRoot {
                         close_root.update(cx, |root, cx| {
                             root.clear_trezor_app_passphrase_input(window, cx);
                             if !handed_off.get() {
-                                root.cancel_governance_authorization(&close_intent, cx);
+                                root.cancel_spend_authorization(&close_intent, cx);
                             }
                         });
                     }
@@ -1172,6 +1315,7 @@ impl WalletRoot {
                     let handed_off = handed_off.clone();
                     move |_event, window, cx| {
                         let intent = intent.clone();
+                        if !intent.approve_gateway_review(submit_root.read(cx)) { return true; }
                         handed_off.set(true);
                         submit_root.update(cx, |root, cx| {
                             root.continue_authorized_spend(
@@ -1365,6 +1509,18 @@ impl WalletRoot {
         None
     }
 
+    fn cancel_spend_authorization(
+        &mut self,
+        intent: &SpendAuthorizationIntent,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(execution) = intent.gateway_execution() {
+            execution.cancel_review();
+            self.release_gateway_private_form(execution, cx);
+        }
+        self.cancel_governance_authorization(intent, cx);
+    }
+
     pub(super) fn finish_spend_authorization(
         &mut self,
         intent: SpendAuthorizationIntent,
@@ -1380,6 +1536,10 @@ impl WalletRoot {
                 return;
             }
         };
+        if !intent.approve_gateway_review(self) {
+            window.close_dialog(cx);
+            return;
+        }
         self.spend_authorization_lifetime = lifetime;
         self.spend_authorization_cache = SpendAuthorizationCache::new(
             password,
@@ -1468,8 +1628,11 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !intent.private_review_current(self) {
+            return;
+        }
         match intent {
-            SpendAuthorizationIntent::PrivateSend(key, authorization_limit) => {
+            SpendAuthorizationIntent::PrivateSend(key, authorization_limit, execution) => {
                 self.generate_send_calldata_authorized(
                     key,
                     authorization,
@@ -1477,10 +1640,14 @@ impl WalletRoot {
                     window,
                     cx,
                 );
+                if let Some(execution) = execution {
+                    self.reject_gateway_private_authorization(&execution, cx);
+                }
             }
             SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(
                 key,
                 authorization_limit,
+                execution,
             ) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
@@ -1494,11 +1661,12 @@ impl WalletRoot {
                     key,
                     password,
                     authorization_limit,
+                    execution,
                     window,
                     cx,
                 );
             }
-            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit) => {
+            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit, execution) => {
                 self.generate_unshield_calldata_authorized(
                     key,
                     authorization,
@@ -1506,10 +1674,14 @@ impl WalletRoot {
                     window,
                     cx,
                 );
+                if let Some(execution) = execution {
+                    self.reject_gateway_private_authorization(&execution, cx);
+                }
             }
             SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(
                 key,
                 authorization_limit,
+                execution,
             ) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
@@ -1523,6 +1695,7 @@ impl WalletRoot {
                     key,
                     password,
                     authorization_limit,
+                    execution,
                     window,
                     cx,
                 );
@@ -1616,9 +1789,14 @@ impl WalletRoot {
         if view_session.hardware_profile_session().is_none() {
             return;
         }
-        self.view_session = Some(Arc::new(
-            view_session.clone_with_hardware_profile_session(hardware_session),
-        ));
+        let refreshed =
+            Arc::new(view_session.clone_with_hardware_profile_session(hardware_session));
+        self.gateway.drafts.borrow_mut().refresh_hardware_session(
+            view_session,
+            &refreshed,
+            self.active_wallet_generation,
+        );
+        self.view_session = Some(refreshed);
         cx.notify();
     }
 
@@ -1627,10 +1805,14 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(mut draft) = self.send_spend_draft(key, cx) else {
+            if let Some(execution) = execution {
+                self.reject_gateway_private_authorization(&execution, cx);
+            }
             return;
         };
         draft.sponsored_authorization_limit = authorization_limit;
@@ -1639,6 +1821,7 @@ impl WalletRoot {
                 key,
                 vault_password,
                 authorization_limit,
+                execution,
             },
             super::private_action::private_send_authorization_summary(&draft),
             window,
@@ -1651,10 +1834,14 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(mut draft) = self.unshield_spend_draft(key, cx) else {
+            if let Some(execution) = execution {
+                self.reject_gateway_private_authorization(&execution, cx);
+            }
             return;
         };
         draft.sponsored_authorization_limit = authorization_limit;
@@ -1663,6 +1850,7 @@ impl WalletRoot {
                 key,
                 vault_password,
                 authorization_limit,
+                execution,
             },
             super::private_action::private_unshield_authorization_summary(&draft),
             window,

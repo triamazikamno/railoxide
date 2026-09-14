@@ -222,6 +222,7 @@ async fn root_replacement_barrier_waits_for_both_workers_before_clearing_monitor
         sync_cleanup,
         Some(waku_completion),
         ProposalCleanup::empty(),
+        None,
         monitor_state.clone(),
         event_tx,
     );
@@ -298,6 +299,7 @@ async fn worker_error_epilogue_publishes_quiescence_and_preserves_error() {
         sync_cleanup,
         Some(waku_completion),
         ProposalCleanup::empty(),
+        None,
         monitor_state.clone(),
         event_tx,
     );
@@ -342,6 +344,7 @@ async fn panicking_worker_releases_waku_quiescence_and_clears_monitor() {
         sync_cleanup,
         Some(waku_completion),
         ProposalCleanup::empty(),
+        None,
         monitor_state.clone(),
         event_tx,
     );
@@ -401,6 +404,7 @@ async fn root_replacement_barrier_rejects_closed_waku_quiescence_latch() {
         sync_cleanup,
         Some(waku_completion),
         ProposalCleanup::empty(),
+        None,
         monitor_state.clone(),
         event_tx,
     );
@@ -435,6 +439,7 @@ async fn root_replacement_barrier_preserves_sync_cleanup_failure_after_waku_quie
         sync_cleanup,
         Some(waku_completion),
         ProposalCleanup::empty(),
+        None,
         monitor_state.clone(),
         event_tx,
     );

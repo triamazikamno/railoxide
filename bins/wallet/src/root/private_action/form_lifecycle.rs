@@ -6,7 +6,11 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
-        self.send_forms.remove(&key);
+        if let Some(form) = self.send_forms.remove(&key)
+            && let Some(execution) = form.gateway_execution
+        {
+            execution.cancel_review();
+        }
         if self
             .private_action_form
             .as_ref()
@@ -30,7 +34,11 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
-        self.unshield_forms.remove(&key);
+        if let Some(form) = self.unshield_forms.remove(&key)
+            && let Some(execution) = form.gateway_execution
+        {
+            execution.cancel_review();
+        }
         if self
             .private_action_form
             .as_ref()
@@ -101,7 +109,13 @@ impl WalletRoot {
                         DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
                     });
                 })
-                .child(child)
+                .child(
+                    div()
+                        .when_some(content.private_action_form.as_ref(), |this, form| {
+                            this.track_focus(&form.focus)
+                        })
+                        .child(child),
+                )
         });
     }
 
@@ -158,10 +172,42 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
+        self.initialize_send_form(asset, window, cx);
+        let focus_recipient_input = self.send_forms[&key].recipient_input.clone();
+        self.private_action_form = Some(PrivateActionFormState {
+            focus: cx.focus_handle(),
+            kind: DeliveryFormKind::Send,
+            key,
+        });
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        Self::open_private_action_dialog(DeliveryFormKind::Send, key, "Send", window, cx);
+        cx.defer_in(window, move |root, window, cx| {
+            if root
+                .private_action_form
+                .as_ref()
+                .is_some_and(|form| form.kind == DeliveryFormKind::Send && form.key == key)
+                && window.has_active_dialog(cx)
+            {
+                focus_recipient_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::root) fn initialize_send_form(
+        &mut self,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
         let amount_input = new_prefilled_amount_input(amount, window, cx);
         let recipient_input = new_text_input(window, cx, "0zk recipient");
-        let focus_recipient_input = recipient_input.clone();
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
             DeliveryFormKind::Send,
             key.chain_id,
@@ -185,6 +231,9 @@ impl WalletRoot {
             move |this, input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     if let Some(form) = this.send_forms.get_mut(&key) {
+                        if form.recipient_value.as_ref() == input.read(cx).value().as_ref() {
+                            return;
+                        }
                         form.recipient_value = Arc::from(input.read(cx).value().as_ref());
                     }
                     this.update_recipient_suggestions_for_input_change(
@@ -309,6 +358,8 @@ impl WalletRoot {
         self.send_forms.insert(
             key,
             SendFormState {
+                gateway_execution: None,
+                gateway_estimated_at: None,
                 asset,
                 recipient_input,
                 recipient_value: Arc::from(""),
@@ -348,27 +399,6 @@ impl WalletRoot {
                 result: None,
             },
         );
-        self.private_action_form = Some(PrivateActionFormState {
-            kind: DeliveryFormKind::Send,
-            key,
-        });
-        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
-        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
-        Self::open_private_action_dialog(DeliveryFormKind::Send, key, "Send", window, cx);
-        cx.defer_in(window, move |root, window, cx| {
-            if root
-                .private_action_form
-                .as_ref()
-                .is_some_and(|form| form.kind == DeliveryFormKind::Send && form.key == key)
-                && window.has_active_dialog(cx)
-            {
-                focus_recipient_input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .focus(window, cx);
-            }
-        });
-        cx.notify();
     }
 
     pub(in crate::root) fn clear_send_form_text_edit_state(
@@ -750,7 +780,7 @@ impl WalletRoot {
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.delivery_mode == mode {
+        if form.generating || form.delivery_mode == mode || form.gateway_execution.is_some() {
             return;
         }
         let old_max = send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
@@ -1489,10 +1519,43 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
+        self.initialize_unshield_form(asset, window, cx);
+        let focus_recipient_input = self.unshield_forms[&key].recipient_input.clone();
+        self.private_action_form = Some(PrivateActionFormState {
+            focus: cx.focus_handle(),
+            kind: DeliveryFormKind::Unshield,
+            key,
+        });
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
+        Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
+        cx.defer_in(window, move |root, window, cx| {
+            if root
+                .private_action_form
+                .as_ref()
+                .is_some_and(|form| form.kind == DeliveryFormKind::Unshield && form.key == key)
+                && window.has_active_dialog(cx)
+            {
+                focus_recipient_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::root) fn initialize_unshield_form(
+        &mut self,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let amount_input = new_prefilled_amount_input(amount, window, cx);
         let recipient_input = new_text_input(window, cx, "0x recipient");
-        let focus_recipient_input = recipient_input.clone();
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
             DeliveryFormKind::Unshield,
             key.chain_id,
@@ -1516,6 +1579,9 @@ impl WalletRoot {
             move |this, input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     if let Some(form) = this.unshield_forms.get_mut(&key) {
+                        if form.recipient_value.as_ref() == input.read(cx).value().as_ref() {
+                            return;
+                        }
                         form.recipient_value = Arc::from(input.read(cx).value().as_ref());
                     }
                     this.clear_unshield_form_text_edit_state(key, cx);
@@ -1659,6 +1725,8 @@ impl WalletRoot {
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
+                gateway_execution: None,
+                gateway_estimated_at: None,
                 asset,
                 recipient_input,
                 recipient_value: Arc::from(""),
@@ -1701,28 +1769,6 @@ impl WalletRoot {
                 result: None,
             },
         );
-        self.private_action_form = Some(PrivateActionFormState {
-            kind: DeliveryFormKind::Unshield,
-            key,
-        });
-        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
-        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
-        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
-        Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
-        cx.defer_in(window, move |root, window, cx| {
-            if root
-                .private_action_form
-                .as_ref()
-                .is_some_and(|form| form.kind == DeliveryFormKind::Unshield && form.key == key)
-                && window.has_active_dialog(cx)
-            {
-                focus_recipient_input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .focus(window, cx);
-            }
-        });
-        cx.notify();
     }
 
     pub(in crate::root) fn set_unshield_unwrap(
@@ -1844,7 +1890,7 @@ impl WalletRoot {
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.delivery_mode == mode {
+        if form.generating || form.delivery_mode == mode || form.gateway_execution.is_some() {
             return;
         }
         let old_max = unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);

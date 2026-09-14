@@ -49,7 +49,7 @@ pub use core::*;
 pub use crypto::*;
 pub use models::*;
 pub use records::*;
-pub use store::SoftwareContextMatch;
+pub use store::{GatewayPermission, SoftwareContextMatch};
 pub use unlock::*;
 
 #[cfg(test)]

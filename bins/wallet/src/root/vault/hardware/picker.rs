@@ -450,6 +450,7 @@ impl WalletRoot {
         self.wallet_metadata =
             visible_wallet_metadata(metadata, self.revealed_passphrase_context_id.as_deref());
         self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
+        self.advance_gateway_hardware_wallet_switch(&profile, metadata);
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
         self.sync_wallet_select(window, cx);
@@ -561,6 +562,7 @@ impl WalletRoot {
         self.hardware_profile_unlock.approval_prompt =
             hardware_profile_approval_prompt_for_account(&row.account);
         self.hardware_profile_unlock.error = None;
+        let gateway_unlock = self.gateway_unlock_continuation();
         let profile_generation = self.next_hardware_profile_action_generation();
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_hardware_profile_progress_listener(profile_generation, progress_rx, window, cx);
@@ -588,7 +590,7 @@ impl WalletRoot {
                     Ok(Ok((session, metadata))) => {
                         root.manage_wallets
                             .mark_hardware_delete_target_opened(session.wallet_id());
-                        root.install_view_session(session, &metadata, window, cx);
+                        root.install_view_session_for_gateway_unlock(session, &metadata, gateway_unlock, window, cx);
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
                         root.handle_hardware_profile_vault_error(&error);

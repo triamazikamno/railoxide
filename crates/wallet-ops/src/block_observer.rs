@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use alloy::consensus::BlockHeader as _;
+use alloy::eips::BlockNumHash;
 use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
 use alloy::network::{BlockResponse as _, ReceiptResponse as _, TransactionResponse as _};
 use alloy::primitives::{Address, B256, FixedBytes};
@@ -9,6 +10,7 @@ use alloy::providers::Provider as _;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
 
+use crate::public_wallet::{PublicTransactionFamily, PublicTransactionTrackingContext};
 use crate::{RpcBroker, TxReceiptOutput};
 
 const MAX_BLOCKS_PER_POLL: u64 = 8;
@@ -58,6 +60,7 @@ pub(crate) struct BlockObserver {
     active_provider: Option<usize>,
     rpc_broker: Arc<RpcBroker>,
     chain_id: u64,
+    tracking: Option<PublicTransactionFamily>,
 }
 
 impl BlockObserver {
@@ -77,16 +80,54 @@ impl BlockObserver {
             active_provider: None,
             rpc_broker,
             chain_id,
+            tracking: None,
         };
         observer.establish_baseline().await?;
         Ok(observer)
     }
 
+    /// Attach captured ownership after establishing the pre-handoff baseline.
+    pub(crate) fn with_tracking(mut self, context: &PublicTransactionTrackingContext) -> Self {
+        let tracking = context.start_family();
+        for hash in self.registered.keys() {
+            tracking.register(*hash);
+        }
+        self.tracking = Some(tracking);
+        self
+    }
+
     pub(crate) fn register(&mut self, tx_hash: FixedBytes<32>, attempt_id: usize) {
+        if let Some(tracking) = &self.tracking {
+            tracking.register(tx_hash);
+        }
         self.registered.insert(tx_hash, attempt_id);
     }
 
+    pub(crate) fn needs_observation(&self) -> bool {
+        !self.registered.is_empty()
+            && self
+                .tracking
+                .as_ref()
+                .is_some_and(|tracking| !tracking.is_included())
+    }
+
+    pub(crate) fn discovery_exhausted(&self) {
+        if let Some(tracking) = &self.tracking {
+            tracking.discovery_exhausted();
+        }
+    }
+
     pub(crate) async fn poll(&mut self) -> Result<BlockObservation> {
+        let result = self.poll_inner().await;
+        if result.is_err()
+            && let Some(tracking) = &self.tracking
+        {
+            tracking.unavailable();
+        }
+        result
+    }
+
+    async fn poll_inner(&mut self) -> Result<BlockObservation> {
         if self.registered.is_empty() {
             return Ok(BlockObservation {
                 receipt: None,
@@ -104,10 +145,17 @@ impl BlockObserver {
 
         let mut lagging = false;
         let mut saw_unsupported_receipts = false;
+        let mut saw_failed_provider = false;
         for provider in providers {
             match self.poll_provider(&provider).await {
                 Ok(observation) => {
                     self.active_provider = Some(provider.index);
+                    if observation.receipt.is_none()
+                        && observation.head.is_some()
+                        && let Some(tracking) = &self.tracking
+                    {
+                        tracking.recovered();
+                    }
                     // Inclusion invalidates rather than notifies: an equal head does not evict,
                     // and this endpoint may lead the one that served a cached latest read.
                     if observation.receipt.is_some() {
@@ -123,6 +171,7 @@ impl BlockObserver {
                     self.unsupported_receipts.insert(provider.index);
                 }
                 Err(ProviderPollFailure::Failed) => {
+                    saw_failed_provider = true;
                     self.query_rpc_pool.mark_bad_provider(&provider);
                     let rpc = crate::http::redact_url_for_display(&provider.url);
                     tracing::warn!(%rpc, "block-scoped query RPC observation failed");
@@ -130,6 +179,11 @@ impl BlockObserver {
             }
         }
 
+        if (saw_unsupported_receipts || saw_failed_provider)
+            && let Some(tracking) = &self.tracking
+        {
+            tracking.unavailable();
+        }
         if lagging {
             return Ok(BlockObservation {
                 receipt: None,
@@ -221,17 +275,25 @@ impl BlockObserver {
             let matching_hashes = transactions
                 .iter()
                 .copied()
-                .filter(|hash| self.registered.contains_key(hash))
+                .enumerate()
+                .filter(|(_, hash)| self.registered.contains_key(hash))
                 .collect::<Vec<_>>();
             if matching_hashes.len() > 1 {
                 return Err(ProviderPollFailure::Failed);
             }
-            if let Some(tx_hash) = matching_hashes.first().copied() {
+            if let Some((transaction_index, tx_hash)) = matching_hashes.first().copied() {
                 if self.unsupported_receipts.contains(&provider.index) {
                     return Err(ProviderPollFailure::UnsupportedReceipts);
                 }
                 return match fetch_receipt(provider, identity, &transactions, tx_hash).await {
                     ReceiptFetch::Valid(receipt) => {
+                        if let Some(tracking) = &self.tracking {
+                            tracking.included(
+                                tx_hash,
+                                BlockNumHash::new(identity.number, identity.hash),
+                                transaction_index as u64,
+                            );
+                        }
                         self.record(identity);
                         self.next_block = number.saturating_add(1);
                         Ok(BlockObservation {
@@ -260,6 +322,9 @@ impl BlockObserver {
         &mut self,
         provider: &ProviderHandle,
     ) -> std::result::Result<(), ProviderPollFailure> {
+        if let Some(tracking) = &self.tracking {
+            tracking.pending();
+        }
         if self.history.len() < 2 {
             return Err(ProviderPollFailure::Failed);
         }
@@ -649,9 +714,11 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
             .await
             .expect("establish observer baseline");
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let mut observer = observer.with_tracking(&context);
         observer.register(tx_hash, 3);
         let observation = observer.poll().await.expect("observe containing block");
         let (_, output) = observation.receipt.expect("matching receipt");
@@ -659,10 +726,122 @@ mod tests {
         assert!(output.status);
         assert_eq!(output.block_number, 2);
         assert_eq!(output.gas_used, 21_000);
+        drop(observer);
+        assert_eq!(
+            tracker.lookup(1, tx_hash),
+            crate::PublicTransactionLookup::Included {
+                block: BlockNumHash::new(2, block_hash),
+                transaction_index: 0,
+            }
+        );
         task.join().expect("RPC fixture task");
         let requests = request_rx.try_iter().collect::<Vec<_>>();
         assert_eq!(requests[0]["method"], "eth_blockNumber");
         assert_no_exact_hash_methods(&requests);
+    }
+
+    #[tokio::test]
+    async fn canceled_managed_owner_transfers_its_existing_observation_cursor() {
+        let hash = B256::repeat_byte(0x63);
+        let block_2 = B256::repeat_byte(2);
+        let block_3 = B256::repeat_byte(3);
+        let heads = Arc::new(AtomicUsize::new(0));
+        let (url, request_rx, task) =
+            spawn_rpc_script(7, move |request| match request["method"].as_str() {
+                Some("eth_blockNumber") => {
+                    Ok(quantity(heads.fetch_add(1, Ordering::SeqCst) as u64 + 1))
+                }
+                Some("eth_getBlockByNumber") if request["params"][0] == "0x2" => {
+                    Ok(block(2, block_2, B256::repeat_byte(1), &[]))
+                }
+                Some("eth_getBlockByNumber") => {
+                    assert_eq!(request["params"], json!(["0x3", false]));
+                    Ok(block(3, block_3, block_2, &[json!(hash)]))
+                }
+                Some("eth_getBlockReceipts") => Ok(json!([receipt(hash, 3, block_3, 1)])),
+                method => panic!("unexpected RPC method {method:?}"),
+            });
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let observer = BlockObserver::establish(test_pool(url), 2, test_broker(), 1)
+            .await
+            .unwrap();
+        let mut guard =
+            crate::public_wallet::PublicTransactionObservationGuard::new(observer, Some(&context))
+                .unwrap();
+        guard.register(hash, 0);
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            assert!(guard.poll().await.unwrap().receipt.is_none());
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        waiting.await.unwrap();
+        let mut changes = tracker.subscribe();
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    tracker.lookup(1, hash),
+                    crate::PublicTransactionLookup::Included { .. }
+                ) {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("retained observer uses original baseline and cursor");
+        tracker.shutdown().await;
+        assert_eq!(
+            tracker.lookup(1, hash),
+            crate::PublicTransactionLookup::Included {
+                block: BlockNumHash::new(3, block_3),
+                transaction_index: 0,
+            }
+        );
+        task.join().expect("RPC fixture task");
+        assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn tracker_shutdown_drains_handoffs_and_rejects_late_broadcast_owners() {
+        let (url, request_rx, task) = spawn_rpc_script(2, |request| {
+            assert_eq!(request["method"], "eth_blockNumber");
+            Ok(quantity(1))
+        });
+        let pool = test_pool(url);
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+            .await
+            .unwrap();
+        let mut guard = context.admit_observer(observer).unwrap();
+        let first = B256::repeat_byte(0x61);
+        guard.observer_mut().register(first, 0);
+        let observer = BlockObserver::establish(pool, 2, test_broker(), 1)
+            .await
+            .unwrap();
+        let mut late = context.admit_observer(observer).unwrap();
+        let second = B256::repeat_byte(0x62);
+        late.observer_mut().register(second, 0);
+        guard.ensure_open().unwrap();
+        guard.handoff().unwrap();
+        // No yield between handoff and close: shutdown must also drain unpolled jobs.
+        tracker.close();
+        assert!(late.ensure_open().is_err());
+        assert!(late.handoff().is_err());
+        tracker.shutdown().await;
+        assert_eq!(
+            tracker.lookup(1, first),
+            crate::PublicTransactionLookup::Unavailable
+        );
+        assert_eq!(
+            tracker.lookup(1, second),
+            crate::PublicTransactionLookup::Unavailable
+        );
+        task.join().expect("RPC fixture task");
+        assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -764,9 +943,11 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
             .await
             .expect("establish observer baseline");
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let mut observer = observer.with_tracking(&context);
         observer.register(original, 0);
         assert!(
             observer
@@ -782,6 +963,17 @@ mod tests {
         assert_eq!(winner, 1);
         assert_eq!(output.tx_hash, replacement.to_string());
         assert!(!output.status);
+        assert_eq!(
+            tracker.lookup(1, original),
+            crate::PublicTransactionLookup::Unavailable
+        );
+        assert_eq!(
+            tracker.lookup(1, replacement),
+            crate::PublicTransactionLookup::Included {
+                block: BlockNumHash::new(3, block_3),
+                transaction_index: 0,
+            }
+        );
         task.join().expect("RPC fixture task");
         assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
     }
@@ -862,11 +1054,17 @@ mod tests {
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let mut observer = observer.with_tracking(&context);
         let error = observer
             .poll()
             .await
             .expect_err("reject bad receipt identity");
         assert!(error.to_string().contains("block observation"));
+        assert_eq!(
+            tracker.lookup(1, tx_hash),
+            crate::PublicTransactionLookup::Unavailable
+        );
         task.join().expect("RPC fixture task");
         assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
     }

@@ -462,6 +462,15 @@ impl WalletRoot {
             tracing::warn!("blocked Shield refund requested without origin public account");
             return;
         };
+        let transaction_tracking = match self
+            .public_transaction_tracking_context(self.selected_chain, &public_account_uuid)
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.set_vault_error(error, cx);
+                return;
+            }
+        };
         self.blocked_shield_refunds_in_flight.insert(utxo_id);
         self.sync_utxo_table(cx);
         let http = self.http.clone();
@@ -476,6 +485,7 @@ impl WalletRoot {
         Self::watch_blocked_shield_refund_events(utxo_id, event_rx, window, cx);
         Self::show_blocked_shield_refund_progress_dialog(utxo_id, window, cx);
         let request = BlockedShieldRescueSelfBroadcastRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id: self.selected_chain,
             effective_chain: self
                 .effective_chain_configs
@@ -496,7 +506,7 @@ impl WalletRoot {
             command_rx: None,
             event_tx: Some(event_tx),
         };
-        let submit = self.runtime.spawn(async move {
+        let submit = self.spawn_public_transaction_submission(async move {
             wallet_ops::submit_blocked_shield_rescue_self_broadcast(request, &http).await
         });
         cx.spawn(async move |this, cx| {

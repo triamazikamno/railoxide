@@ -9,10 +9,11 @@ use crate::vault::{
     WalletConnectSessionAccountResolution,
 };
 use crate::walletconnect::{
-    WalletConnectDecodedCallKind, WalletConnectDecodedTransaction, WalletConnectError,
-    WalletConnectNamespaceAccountSupport, WalletConnectParsedRequest,
+    DappRequestValidationError, WalletConnectDecodedCallKind, WalletConnectDecodedTransaction,
+    WalletConnectError, WalletConnectNamespaceAccountSupport, WalletConnectParsedRequest,
     WalletConnectPendingRequestQueue, approve_walletconnect_session,
-    approve_walletconnect_session_with_account_support, parse_walletconnect_session_request,
+    approve_walletconnect_session_with_account_support, parse_dapp_request_for_account,
+    parse_walletconnect_session_request, validate_dapp_request_account,
     validate_walletconnect_session_request,
     validate_walletconnect_session_request_with_account_support,
 };
@@ -28,19 +29,59 @@ fn parses_supported_requests_and_rejects_unsafe_methods() {
         parse_walletconnect_session_request(1, "eth_accounts", &json!([])).unwrap(),
         WalletConnectParsedRequest::EthAccounts
     ));
-    assert!(matches!(
-        parse_walletconnect_session_request(
-            2,
-            "personal_sign",
-            &json!(["0x68656c6c6f", "0x1111111111111111111111111111111111111111"]),
-        )
-        .unwrap(),
-        WalletConnectParsedRequest::PersonalSign { .. }
-    ));
+    let account = address!("1111111111111111111111111111111111111111");
+    for params in [
+        json!(["0x68656C6c6f", account]),
+        json!([account, "0x68656C6c6f"]),
+    ] {
+        assert_eq!(
+            parse_walletconnect_session_request(2, "personal_sign", &params).unwrap(),
+            WalletConnectParsedRequest::PersonalSign {
+                message: "0x68656C6c6f".to_owned(),
+                account,
+            }
+        );
+    }
     assert!(matches!(
         parse_walletconnect_session_request(3, "eth_sign", &json!([])),
         Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_sign"
     ));
+}
+
+#[test]
+fn personal_sign_uses_approved_account_to_resolve_address_sized_messages() {
+    let (_, account) = approved_request_session(&["personal_sign"]);
+    let support = WalletConnectNamespaceAccountSupport::for_account_source(account.source);
+    let message = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb";
+    for params in [
+        json!([message, account.address]),
+        json!([account.address, message]),
+    ] {
+        let request =
+            parse_dapp_request_for_account(2, "personal_sign", &params, account.address).unwrap();
+        assert_eq!(
+            request,
+            WalletConnectParsedRequest::PersonalSign {
+                message: message.to_owned(),
+                account: account.address,
+            }
+        );
+        assert_eq!(
+            validate_dapp_request_account(&request, &account, 1, support),
+            Ok(())
+        );
+    }
+    let foreign = address!("2222222222222222222222222222222222222222");
+    let params = json!([foreign, message]);
+    let canonical = parse_walletconnect_session_request(2, "personal_sign", &params).unwrap();
+    assert_eq!(canonical.account(), Some(message.parse().unwrap()));
+    let request =
+        parse_dapp_request_for_account(2, "personal_sign", &params, account.address).unwrap();
+    assert_eq!(request, canonical);
+    assert_eq!(
+        validate_dapp_request_account(&request, &account, 1, support),
+        Err(DappRequestValidationError::AccountMismatch)
+    );
 }
 
 #[test]
@@ -70,10 +111,7 @@ fn parses_unsuffixed_typed_data_with_exact_identity_and_rejects_v3() {
         &json!([account.to_string(), payload.to_string()]),
     )
     .expect("unsuffixed JSON-text typed-data request");
-    assert!(matches!(
-        json_request,
-        WalletConnectParsedRequest::EthSignTypedData { .. }
-    ));
+    assert_eq!(json_request, object_request);
 
     assert!(matches!(
         parse_walletconnect_session_request(6, "eth_signTypedData_v3", &json!([])),
@@ -168,24 +206,15 @@ fn unsuffixed_typed_data_rejects_malformed_account_and_chain_inputs() {
 fn rejects_malformed_personal_sign_hex_before_approval() {
     let account = address!("1111111111111111111111111111111111111111");
 
-    assert!(matches!(
-        parse_walletconnect_session_request(
-            32,
-            "personal_sign",
-            &json!(["0xzz", account.to_string()]),
-        ),
-        Err(WalletConnectError::MalformedParams(message))
-            if message.contains("valid hex")
-    ));
-    assert!(matches!(
-        parse_walletconnect_session_request(
-            33,
-            "personal_sign",
-            &json!(["0x123", account.to_string()]),
-        ),
-        Err(WalletConnectError::MalformedParams(message))
-            if message.contains("valid hex")
-    ));
+    for message in ["0xzz", "0x123"] {
+        for params in [json!([message, account]), json!([account, message])] {
+            assert!(matches!(
+                parse_walletconnect_session_request(32, "personal_sign", &params),
+                Err(WalletConnectError::MalformedParams(message))
+                    if message.contains("valid hex")
+            ));
+        }
+    }
     assert!(matches!(
         parse_walletconnect_session_request(
             34,
@@ -986,4 +1015,44 @@ fn pending_queue_removes_expired_requests() {
 
     assert_eq!(expired.len(), 1);
     assert!(queue.get(13).is_none());
+}
+
+#[test]
+fn gateway_policy_parsing_does_not_enable_walletconnect_methods() {
+    let account = alloy::primitives::Address::ZERO;
+    let raw = json!([{ "chainId": "0x1", "unknown": { "rpcUrls": ["https://ignored.invalid"] } }]);
+    let parsed = crate::walletconnect::parse_dapp_request_for_account(
+        1,
+        "wallet_addEthereumChain",
+        &raw,
+        account,
+    )
+    .unwrap();
+    assert!(
+        matches!(&parsed, WalletConnectParsedRequest::WalletAddEthereumChain { chain_id: 1, raw: retained } if retained == &raw)
+    );
+    assert!(parse_walletconnect_session_request(1, "wallet_addEthereumChain", &raw).is_err());
+    let watch = json!({ "type": "ERC20", "options": { "address": account.to_string(), "image": "https://ignored.invalid", "decimals": "untrusted" }, "unknown": 7 });
+    let parsed = crate::walletconnect::parse_dapp_request_for_account(
+        1,
+        "wallet_watchAsset",
+        &watch,
+        account,
+    )
+    .unwrap();
+    assert!(
+        matches!(parsed, WalletConnectParsedRequest::WalletWatchAsset { raw, .. } if raw == watch)
+    );
+    assert!(parse_walletconnect_session_request(1, "wallet_watchAsset", &watch).is_err());
+    let switch = parse_walletconnect_session_request(
+        1,
+        "wallet_switchEthereumChain",
+        &json!([{ "chainId": "0x1" }]),
+    )
+    .unwrap();
+    assert!(
+        switch
+            .pending_approval(1, "topic", "dapp", "eip155:1", account, None)
+            .is_none()
+    );
 }

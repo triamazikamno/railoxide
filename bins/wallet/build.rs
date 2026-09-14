@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BUILD_GIT_SHORT_HASH: &str = "RAILOXIDE_BUILD_GIT_SHORT_HASH";
+const EXTENSION_BUNDLE: &str = "RAILOXIDE_EXTENSION_BUNDLE";
 
 fn main() {
     println!("cargo::rerun-if-env-changed={BUILD_GIT_SHORT_HASH}");
@@ -13,6 +14,56 @@ fn main() {
         .or_else(git_short_hash)
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo::rustc-env=RAILOXIDE_GIT_SHORT_HASH={short_hash}");
+
+    embed_extension_bundle();
+}
+
+/// Embeds the packaged browser extension so the gateway can serve it.
+fn embed_extension_bundle() {
+    println!("cargo::rerun-if-env-changed={EXTENSION_BUNDLE}");
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
+    let bundle = env::var_os(EXTENSION_BUNDLE).map_or_else(
+        || manifest_dir.join("../../target/browser-extension.zip"),
+        PathBuf::from,
+    );
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+    let embedded = out_dir.join("browser-extension.zip");
+    let copied = if bundle.is_file() {
+        // Registering a missing path would rerun this script, and rebuild the crate, every time.
+        println!("cargo::rerun-if-changed={}", bundle.display());
+        fs::copy(&bundle, &embedded).map(|_| ())
+    } else {
+        fs::write(&embedded, [])
+    };
+    copied.unwrap_or_else(|error| panic!("failed to stage {}: {error}", embedded.display()));
+
+    let manifest = manifest_dir.join("../../extensions/railoxide/manifest.json");
+    println!("cargo::rerun-if-changed={}", manifest.display());
+    let version = extension_version(&manifest);
+    println!("cargo::rustc-env=RAILOXIDE_EXTENSION_VERSION={version}");
+}
+
+fn extension_version(manifest: &Path) -> String {
+    let text = fs::read_to_string(manifest)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
+    let version = text
+        .split_once("\"version\": \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or_else(
+            || panic!("{} must declare \"version\"", manifest.display()),
+            |(version, _)| version,
+        );
+
+    assert!(
+        !version.is_empty()
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.'),
+        "{} declares an unsupported version {version}",
+        manifest.display()
+    );
+    version.to_owned()
 }
 
 fn injected_git_short_hash() -> Option<String> {

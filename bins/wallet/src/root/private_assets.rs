@@ -4,14 +4,14 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, Styled,
-    Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt, button::ButtonVariants,
     scroll::ScrollableElement,
 };
 use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
-use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme::{self};
 use wallet_ops::{
     ListUtxosOutput, TokenAnchorRateCache, TokenTotal, UtxoPpoiState, WalletPpoiWorkflowStatus,
@@ -31,8 +31,8 @@ use super::utxo::{
     shield_poi_wait_display, shield_poi_wait_time_display, short_hash,
 };
 use super::{
-    ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, centered_message,
-    count_label, dialog_max_height, parse_address, rgb_with_alpha, secondary_dialog_content_width,
+    ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, count_label,
+    dialog_max_height, parse_address, rgb_with_alpha, secondary_dialog_content_width,
     token_display_metadata,
 };
 
@@ -57,6 +57,30 @@ pub(super) struct FormattedTokenTotal {
     pub(super) pending_outgoing_total: Option<U256>,
     pub(super) decimals: Option<u8>,
     pub(super) icon_path: Option<WalletIconSource>,
+}
+
+#[derive(Default)]
+pub(super) struct PrivateAssetPresentationCache {
+    current: Option<CachedPrivateAssets>,
+}
+
+struct CachedPrivateAssets {
+    wallet_generation: u64,
+    snapshot: Arc<ListUtxosOutput>,
+    registry: EffectiveTokenRegistry,
+    rates_revision: u64,
+    presentation: Arc<PrivateAssetPresentation>,
+}
+
+pub(super) struct PrivateAssetPresentation {
+    pub(super) rows: Vec<FormattedTokenTotal>,
+    pub(super) total: Option<String>,
+}
+
+impl PrivateAssetPresentationCache {
+    pub(super) fn clear(&mut self) {
+        self.current = None;
+    }
 }
 
 #[derive(Clone)]
@@ -610,6 +634,49 @@ pub(super) fn build_send_asset(
 }
 
 impl WalletRoot {
+    pub(super) fn private_asset_presentation(
+        &self,
+        snapshot: &Arc<ListUtxosOutput>,
+    ) -> Arc<PrivateAssetPresentation> {
+        let rates_revision = *self
+            .public_broadcaster_anchor_cache
+            .subscribe_refreshes()
+            .borrow();
+        let mut cache = self.private_asset_presentation_cache.borrow_mut();
+        if let Some(current) = &cache.current
+            && current.wallet_generation == self.active_wallet_generation
+            && Arc::ptr_eq(&current.snapshot, snapshot)
+            && current.registry == self.effective_token_registry
+            && current.rates_revision == rates_revision
+        {
+            return Arc::clone(&current.presentation);
+        }
+        let rows = format_private_asset_rows_from_snapshot(
+            snapshot,
+            Some(&self.effective_token_registry),
+            Some(&self.public_broadcaster_anchor_cache),
+        );
+        let total = total_private_balance_usd_amount(&rows);
+        let presentation = Arc::new(PrivateAssetPresentation { rows, total });
+        cache.current = Some(CachedPrivateAssets {
+            wallet_generation: self.active_wallet_generation,
+            snapshot: Arc::clone(snapshot),
+            registry: self.effective_token_registry.clone(),
+            rates_revision,
+            presentation: Arc::clone(&presentation),
+        });
+        presentation
+    }
+
+    pub(super) fn gateway_private_pending(
+        &self,
+        snapshot: &ListUtxosOutput,
+        assets: &[FormattedTokenTotal],
+    ) -> Option<wallet_ops::gateway::GatewayPrivatePending> {
+        self.private_pending_summary_from_snapshot(snapshot, assets)
+            .map(|summary| private_pending_presentation(&summary))
+    }
+
     fn open_private_receive_address_dialog(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(address) = self
             .view_session
@@ -625,6 +692,8 @@ impl WalletRoot {
         let content_width = secondary_dialog_content_width(dialog_width);
         let address_text = SharedString::from(address);
         let copy_id = SharedString::from("wallet-private-receive-address-copy");
+        let root = cx.entity().downgrade();
+        let generation = self.active_wallet_generation;
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
@@ -636,20 +705,36 @@ impl WalletRoot {
                     None,
                     copy_id.clone(),
                     content_width,
+                    {
+                        let root = root.clone();
+                        move |window, cx| {
+                            let address = root.upgrade().and_then(|root| {
+                                let root = root.read(cx);
+                                (root.active_wallet_generation == generation)
+                                    .then(|| root.view_session.as_ref()?.receive_address().ok())
+                                    .flatten()
+                            });
+                            if let Some(address) = address {
+                                ui::clipboard::copy_to_clipboard_with_toast(address, window, cx);
+                            }
+                        }
+                    },
                 ))
         });
     }
 
     pub(super) fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
         if self.view_session.is_none() {
-            return centered_message("Choose a wallet to continue").into_any_element();
+            return ui::private_assets::private_message("Choose a wallet to continue", None)
+                .into_any_element();
         }
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error { message, .. }) => self
                 .render_chain_error_body(root, message.as_ref())
                 .into_any_element(),
             Some(ChainUtxoState::Loading { progress }) => {
-                centered_message(loading_summary(*progress)).into_any_element()
+                ui::private_assets::private_message(loading_summary(*progress), None)
+                    .into_any_element()
             }
             Some(
                 state @ ChainUtxoState::Syncing {
@@ -671,7 +756,8 @@ impl WalletRoot {
                     None,
                 ),
             Some(ChainUtxoState::Idle) | None => {
-                centered_message("Select a chain to load private balances").into_any_element()
+                ui::private_assets::private_message("Select a chain to load private balances", None)
+                    .into_any_element()
             }
         }
     }
@@ -679,17 +765,14 @@ impl WalletRoot {
     fn render_private_asset_snapshot(
         &self,
         root: &Entity<Self>,
-        snapshot: &ListUtxosOutput,
+        snapshot: &Arc<ListUtxosOutput>,
         actions_available: bool,
         syncing: bool,
         progress: Option<wallet_ops::SyncProgressUpdate>,
     ) -> gpui::AnyElement {
-        let assets = format_private_asset_rows_from_snapshot(
-            snapshot,
-            Some(&self.effective_token_registry),
-            Some(&self.public_broadcaster_anchor_cache),
-        );
-        let total_balance = total_private_balance_usd_amount(&assets);
+        let presentation = self.private_asset_presentation(snapshot);
+        let assets = &presentation.rows;
+        let total_balance = presentation.total.clone();
         let receive_available = self
             .view_session
             .as_ref()
@@ -701,7 +784,7 @@ impl WalletRoot {
         let unshield_asset = assets
             .iter()
             .find_map(|asset| build_unshield_asset(snapshot, asset));
-        let pending_summary = self.private_pending_summary_from_snapshot(snapshot, &assets);
+        let pending_summary = self.private_pending_summary_from_snapshot(snapshot, assets);
         if assets.is_empty() {
             let message = if syncing {
                 loading_summary(progress)
@@ -713,7 +796,7 @@ impl WalletRoot {
                     Self::render_private_empty_state(root.clone(), message, receive_available)
                         .into_any_element()
                 } else {
-                    centered_message(message).into_any_element()
+                    ui::private_assets::private_message(message, None).into_any_element()
                 };
                 return div()
                     .size_full()
@@ -737,7 +820,7 @@ impl WalletRoot {
                 return Self::render_private_empty_state(root.clone(), message, receive_available)
                     .into_any_element();
             }
-            return centered_message(message).into_any_element();
+            return ui::private_assets::private_message(message, None).into_any_element();
         }
         let has_total_balance = total_balance.is_some();
 
@@ -775,7 +858,7 @@ impl WalletRoot {
                     .when_some(pending_summary, |column, summary| {
                         column.child(Self::render_private_pending_status_card(root, &summary))
                     })
-                    .children(assets.into_iter().enumerate().map(|(ix, asset)| {
+                    .children(assets.iter().cloned().enumerate().map(|(ix, asset)| {
                         Self::render_private_asset_row(
                             root.clone(),
                             ix,
@@ -795,24 +878,17 @@ impl WalletRoot {
         message: String,
         receive_available: bool,
     ) -> gpui::Div {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_3()
-                    .child(app_muted_text(message))
-                    .child(Self::render_private_receive_button(
-                        root,
-                        "wallet-private-empty-receive",
-                        receive_available,
-                    )),
-            )
+        ui::private_assets::private_message(
+            message,
+            Some(
+                Self::render_private_receive_button(
+                    root,
+                    "wallet-private-empty-receive",
+                    receive_available,
+                )
+                .into_any_element(),
+            ),
+        )
     }
 
     fn render_private_receive_action(root: Entity<Self>, receive_available: bool) -> gpui::Div {
@@ -887,12 +963,8 @@ impl WalletRoot {
 
     fn current_private_pending_summary(&self) -> Option<PrivatePendingSummary> {
         let snapshot = self.chain_states.get(&self.selected_chain)?.snapshot()?;
-        let assets = format_private_asset_rows_from_snapshot(
-            snapshot,
-            Some(&self.effective_token_registry),
-            Some(&self.public_broadcaster_anchor_cache),
-        );
-        self.private_pending_summary_from_snapshot(snapshot, &assets)
+        let presentation = self.private_asset_presentation(snapshot);
+        self.private_pending_summary_from_snapshot(snapshot, &presentation.rows)
     }
 
     fn private_pending_summary_from_snapshot(
@@ -928,21 +1000,18 @@ impl WalletRoot {
             return false;
         };
         let waits = pending_shield_waits_by_token(snapshot, now_epoch_secs());
-        format_private_asset_rows_from_snapshot(
-            snapshot,
-            Some(&self.effective_token_registry),
-            Some(&self.public_broadcaster_anchor_cache),
-        )
-        .iter()
-        .filter(|asset| should_show_pending_poi_amount(asset.pending_poi_total))
-        .any(|asset| {
-            asset
-                .token
-                .and_then(|token| waits.get(&token).copied())
-                .is_some_and(|wait| {
-                    pending_shield_wait_matches_total(wait, asset.pending_poi_total)
-                })
-        })
+        self.private_asset_presentation(snapshot)
+            .rows
+            .iter()
+            .filter(|asset| should_show_pending_poi_amount(asset.pending_poi_total))
+            .any(|asset| {
+                asset
+                    .token
+                    .and_then(|token| waits.get(&token).copied())
+                    .is_some_and(|wait| {
+                        pending_shield_wait_matches_total(wait, asset.pending_poi_total)
+                    })
+            })
     }
 
     fn render_private_pending_status_card(
@@ -950,57 +1019,19 @@ impl WalletRoot {
         summary: &PrivatePendingSummary,
     ) -> gpui::Div {
         let details_root = root.clone();
-        let detail = private_pending_summary_detail(summary);
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb_with_alpha(theme::WARNING, 0.08))
-            .p(px(14.0))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        Icon::new(RailgunActionIcon::Clock)
-                            .small()
-                            .text_color(rgb(theme::WARNING)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_strong_text(private_pending_summary_title(summary)))
-                            .when_some(detail, |column, detail| {
-                                column.child(
-                                    app_muted_text(detail)
-                                        .line_height(px(18.0))
-                                        .whitespace_normal(),
-                                )
-                            }),
-                    )
-                    .child(
-                        app_button_base("wallet-private-pending-details")
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .child("Details")
-                            .on_click(move |_event, window, cx| {
-                                details_root.update(cx, |root, cx| {
-                                    root.open_private_pending_status_dialog(window, cx);
-                                });
-                            }),
-                    ),
-            )
+        ui::private_assets::private_pending_status(
+            private_pending_summary_title(summary),
+            private_pending_summary_detail(summary).map(Into::into),
+            app_button("wallet-private-pending-details", "Details")
+                .ghost()
+                .xsmall()
+                .compact()
+                .on_click(move |_event, window, cx| {
+                    details_root.update(cx, |root, cx| {
+                        root.open_private_pending_status_dialog(window, cx);
+                    });
+                }),
+        )
     }
 
     fn render_private_pending_status_dialog_content(
@@ -1040,39 +1071,26 @@ impl WalletRoot {
                     summary.poi_refreshing,
                 ))
             })
-            .when(!summary.pending_incoming_assets.is_empty(), |this| {
-                this.child(private_pending_detail_section(
-                    "Pending incoming",
-                    pending_asset_count_label(summary.pending_incoming_assets.len()),
-                    "Waiting for the network to confirm.",
-                    &summary.pending_incoming_assets,
-                    "+",
-                    theme::WARNING,
-                    RailgunActionIcon::Clock,
-                ))
-            })
-            .when(!summary.pending_outgoing_assets.is_empty(), |this| {
-                this.child(private_pending_detail_section(
-                    "Pending outgoing",
-                    pending_asset_count_label(summary.pending_outgoing_assets.len()),
-                    "Waiting for the network to confirm.",
-                    &summary.pending_outgoing_assets,
-                    "-",
-                    theme::WARNING,
-                    RailgunActionIcon::Clock,
-                ))
-            })
-            .when(!summary.pending_poi_assets.is_empty(), |this| {
-                this.child(private_pending_detail_section(
-                    "Not yet spendable",
-                    pending_asset_count_label(summary.pending_poi_assets.len()),
-                    "These need Private Proof of Innocence (PPOI) verification before they can be spent. It usually completes on its own.",
-                    &summary.pending_poi_assets,
-                    "",
-                    theme::WARNING,
-                    RailgunActionIcon::Clock,
-                ))
-            })
+            .child(ui::private_assets::private_pending_details(
+                private_pending_presentation(summary)
+                    .categories
+                    .into_iter()
+                    .map(|category| ui::private_assets::PrivatePendingCategory {
+                        title: category.title.into(),
+                        count: category.count.into(),
+                        detail: category.detail.into(),
+                        assets: category
+                            .assets
+                            .into_iter()
+                            .map(|asset| ui::private_assets::PrivatePendingAmount {
+                                label: asset.label.into(),
+                                amount: asset.amount.into(),
+                                shield_wait: asset.shield_wait.map(Into::into),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ))
             .when(show_recovery, |this| {
                 this.child(private_pending_retry_section(
                     recoverable,
@@ -1131,86 +1149,63 @@ impl WalletRoot {
         let can_send = actions_available && send_asset.is_some();
         let can_unshield = actions_available && unshield_asset.is_some();
 
-        div()
-            .w_full()
-            .min_h(px(210.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_4()
-            .px(px(24.0))
-            .py(px(34.0))
-            .child(
-                div()
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .text_size(theme::ASSET_SYMBOL_TEXT_SIZE)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Total private balance"),
-            )
-            .child(
-                div()
-                    .text_color(rgb(theme::WARNING))
-                    .text_size(px(44.0))
-                    .line_height(px(48.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(SharedString::from(total_balance)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(Self::render_private_receive_button(
-                        receive_root,
-                        "wallet-private-hero-receive",
-                        receive_available,
-                    ))
-                    .child(
-                        app_button("wallet-private-hero-send", "Send")
-                            .child(Icon::new(RailgunActionIcon::Send).small())
-                            .outline()
-                            .when(can_send, |button| button.bg(rgb(theme::SURFACE)))
-                            .disabled(!can_send)
-                            .tooltip(private_send_action_tooltip(
-                                can_send,
-                                actions_available,
-                                syncing,
-                                "No sendable private asset available",
-                            ))
-                            .on_click(move |_event, window, cx| {
-                                let Some(asset) = send_asset.clone() else {
-                                    return;
-                                };
-                                send_root.update(cx, |root, cx| {
-                                    root.open_send_form(asset, window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        app_button("wallet-private-hero-unshield", "Unshield")
-                            .child(Icon::new(IconName::Globe).small())
-                            .outline()
-                            .when(can_unshield, |button| button.bg(rgb(theme::SURFACE)))
-                            .disabled(!can_unshield)
-                            .tooltip(private_unshield_action_tooltip(
-                                can_unshield,
-                                actions_available,
-                                syncing,
-                                "No unshieldable private asset available",
-                            ))
-                            .on_click(move |_event, window, cx| {
-                                let Some(asset) = unshield_asset.clone() else {
-                                    return;
-                                };
-                                unshield_root.update(cx, |root, cx| {
-                                    root.open_unshield_form(asset, window, cx);
-                                });
-                            }),
-                    ),
-            )
+        ui::private_assets::private_balance(
+            total_balance,
+            false,
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(Self::render_private_receive_button(
+                    receive_root,
+                    "wallet-private-hero-receive",
+                    receive_available,
+                ))
+                .child(
+                    app_button("wallet-private-hero-send", "Send")
+                        .child(Icon::new(RailgunActionIcon::Send).small())
+                        .outline()
+                        .when(can_send, |button| button.bg(rgb(theme::SURFACE)))
+                        .disabled(!can_send)
+                        .tooltip(private_send_action_tooltip(
+                            can_send,
+                            actions_available,
+                            syncing,
+                            "No sendable private asset available",
+                        ))
+                        .on_click(move |_event, window, cx| {
+                            let Some(asset) = send_asset.clone() else {
+                                return;
+                            };
+                            send_root.update(cx, |root, cx| {
+                                root.open_send_form(asset, window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    app_button("wallet-private-hero-unshield", "Unshield")
+                        .child(Icon::new(IconName::Globe).small())
+                        .outline()
+                        .when(can_unshield, |button| button.bg(rgb(theme::SURFACE)))
+                        .disabled(!can_unshield)
+                        .tooltip(private_unshield_action_tooltip(
+                            can_unshield,
+                            actions_available,
+                            syncing,
+                            "No unshieldable private asset available",
+                        ))
+                        .on_click(move |_event, window, cx| {
+                            let Some(asset) = unshield_asset.clone() else {
+                                return;
+                            };
+                            unshield_root.update(cx, |root, cx| {
+                                root.open_unshield_form(asset, window, cx);
+                            });
+                        }),
+                ),
+        )
     }
 
     fn render_private_asset_row(
@@ -1251,33 +1246,17 @@ impl WalletRoot {
         let send_root = root.clone();
         let unshield_root = root;
 
-        div()
-            .group(row_group.clone())
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_4()
-            .p(px(16.0))
-            .rounded_lg()
-            .bg(rgb(theme::SURFACE))
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .text_size(theme::ASSET_SYMBOL_TEXT_SIZE)
-                    .text_color(rgb(theme::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(private_asset_label_row(
-                        SharedString::from(asset.label.clone()),
-                        asset.icon_path,
-                    )),
-            )
-            .child(
-                div()
+        ui::private_assets::PrivateAssetRow {
+            compact: false,
+            label: asset_label.into(),
+            icon: asset.icon_path.map(Into::into),
+            primary: primary_amount.into(),
+            secondary: secondary_amount.map(Into::into),
+            pending_verification: show_pending_poi.then(|| pending_poi_amount.into()),
+            pending_incoming: show_pending_incoming.then(|| pending_incoming_amount.into()),
+            pending_outgoing: show_pending_outgoing.then(|| pending_outgoing_amount.into()),
+            actions: Some(
+                (div()
                     .group(row_group.clone())
                     .flex()
                     .items_center()
@@ -1324,70 +1303,13 @@ impl WalletRoot {
                                 root.open_unshield_form(asset, window, cx);
                             });
                         }),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w(px(150.0))
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .child(
-                        div()
-                            .text_color(rgb(theme::WARNING))
-                            .text_size(theme::BALANCE_TEXT_SIZE)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(SharedString::from(primary_amount)),
-                    )
-                    .when_some(secondary_amount, |column, secondary_amount| {
-                        column.child(
-                            app_muted_text(secondary_amount)
-                                .whitespace_nowrap()
-                                .text_align(gpui::TextAlign::Right),
-                        )
-                    })
-                    .when(show_pending_poi, |column| {
-                        column.child(private_asset_pending_label(format!(
-                            "{pending_poi_amount} {asset_label} not yet spendable"
-                        )))
-                    })
-                    .when(show_pending_incoming, |column| {
-                        column.child(private_asset_pending_label(format!(
-                            "+{pending_incoming_amount} {asset_label} arriving"
-                        )))
-                    })
-                    .when(show_pending_outgoing, |column| {
-                        column.child(private_asset_pending_label(format!(
-                            "-{pending_outgoing_amount} {asset_label} leaving"
-                        )))
-                    }),
-            )
+                    ))
+                .into_any_element(),
+            ),
+        }
+        .into_div()
+        .group(SharedString::from(format!("wallet-private-asset-row-{ix}")))
     }
-}
-
-fn private_asset_label_row(label: SharedString, icon_path: Option<WalletIconSource>) -> gpui::Div {
-    let mut row = div().flex().items_center().gap_2();
-    if let Some(path) = icon_path {
-        row = row.child(img(path).size(px(32.0)).rounded_full().flex_none());
-    }
-    row.child(label)
-}
-
-fn private_asset_pending_label(label: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_end()
-        .gap_1()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .text_size(px(12.0))
-        .child(Icon::new(RailgunActionIcon::Clock).xsmall())
-        .child(
-            app_muted_text(label)
-                .text_size(px(12.0))
-                .whitespace_nowrap()
-                .text_align(gpui::TextAlign::Right),
-        )
 }
 
 pub(super) fn retry_poi_label(count: usize, retrying: bool) -> String {
@@ -1407,39 +1329,6 @@ fn private_pending_status_empty(content_width: Pixels) -> gpui::Div {
         .line_height(px(19.0))
         .text_color(rgb(theme::TEXT_MUTED))
         .child("Nothing needs attention right now.")
-}
-
-fn private_pending_detail_section(
-    title: &'static str,
-    count_label: String,
-    detail: &'static str,
-    assets: &[PrivatePendingAssetLine],
-    prefix: &'static str,
-    accent_color: u32,
-    icon: RailgunActionIcon,
-) -> gpui::Div {
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(private_pending_section_header(
-            title,
-            count_label,
-            accent_color,
-            icon,
-        ))
-        .child(
-            app_muted_text(detail)
-                .text_size(px(12.0))
-                .line_height(px(17.0))
-                .whitespace_normal(),
-        )
-        .children(
-            assets
-                .iter()
-                .map(|asset| private_pending_asset_amount_row(asset, prefix)),
-        );
-    private_pending_section_card(accent_color, content)
 }
 
 fn private_ppoi_workflow_section(status: WalletPpoiWorkflowStatus, refreshing: bool) -> gpui::Div {
@@ -1635,68 +1524,76 @@ fn blocked_shield_status_label(row: &UtxoDisplayRow) -> String {
         .unwrap_or_else(|| "Refund unavailable".to_string())
 }
 
-fn private_pending_asset_amount_row(
-    asset: &PrivatePendingAssetLine,
-    prefix: &'static str,
-) -> gpui::Div {
-    let shield_wait = asset.shield_wait.and_then(|wait| {
-        shield_poi_wait_time_display(wait.latest_source_block_timestamp, now_epoch_secs())
-            .map(|display| (wait, display))
-    });
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .text_size(px(12.0))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .truncate()
-                        .text_color(rgb(theme::TEXT))
-                        .child(SharedString::from(asset.label.clone())),
-                )
-                .when_some(shield_wait, |this, (wait, display)| {
-                    let label = if wait.has_delayed && wait.output_count == 1 {
-                        "Shield · taking longer than usual".to_string()
-                    } else if wait.has_delayed {
-                        format!(
-                            "{} Shields · some taking longer than usual",
-                            wait.output_count
-                        )
-                    } else if wait.output_count == 1 {
-                        format!("Shield · ready in {}", display.label)
-                    } else {
-                        format!(
-                            "{} Shields · ready in up to {}",
-                            wait.output_count, display.label
-                        )
-                    };
-                    this.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(rgb(theme::WARNING))
-                            .child(Icon::new(RailgunActionIcon::Clock).xsmall())
-                            .child(SharedString::from(label)),
-                    )
-                }),
+fn private_pending_shield_wait_label(wait: Option<PrivatePendingShieldWait>) -> Option<String> {
+    let wait = wait?;
+    let display =
+        shield_poi_wait_time_display(wait.latest_source_block_timestamp, now_epoch_secs())?;
+    Some(if wait.has_delayed && wait.output_count == 1 {
+        "Shield · taking longer than usual".to_string()
+    } else if wait.has_delayed {
+        format!(
+            "{} Shields · some taking longer than usual",
+            wait.output_count
         )
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(format!("{prefix}{}", asset.amount))),
+    } else if wait.output_count == 1 {
+        format!("Shield · ready in {}", display.label)
+    } else {
+        format!(
+            "{} Shields · ready in up to {}",
+            wait.output_count, display.label
         )
+    })
+}
+
+pub(super) fn private_pending_presentation(
+    summary: &PrivatePendingSummary,
+) -> wallet_ops::gateway::GatewayPrivatePending {
+    use wallet_ops::gateway::{
+        GatewayPrivatePending, GatewayPrivatePendingAmount, GatewayPrivatePendingCategory,
+    };
+    let mut pending = GatewayPrivatePending::default();
+    pending.title = private_pending_summary_title(summary);
+    pending.detail = private_pending_summary_detail(summary).map(str::to_owned);
+    for (title, detail, assets, prefix) in [
+        (
+            "Pending incoming",
+            "Waiting for the network to confirm.",
+            &summary.pending_incoming_assets,
+            "+",
+        ),
+        (
+            "Pending outgoing",
+            "Waiting for the network to confirm.",
+            &summary.pending_outgoing_assets,
+            "-",
+        ),
+        (
+            "Not yet spendable",
+            "These need Private Proof of Innocence (PPOI) verification before they can be spent. It usually completes on its own.",
+            &summary.pending_poi_assets,
+            "",
+        ),
+    ] {
+        if assets.is_empty() {
+            continue;
+        }
+        let mut category = GatewayPrivatePendingCategory::default();
+        category.title = title.into();
+        category.count = pending_asset_count_label(assets.len());
+        category.detail = detail.into();
+        category.assets = assets
+            .iter()
+            .map(|asset| {
+                let mut row = GatewayPrivatePendingAmount::default();
+                row.label.clone_from(&asset.label);
+                row.amount = format!("{prefix}{}", asset.amount);
+                row.shield_wait = private_pending_shield_wait_label(asset.shield_wait);
+                row
+            })
+            .collect();
+        pending.categories.push(category);
+    }
+    pending
 }
 
 fn private_pending_retry_section(recoverable: usize, states: &[UtxoPpoiState]) -> gpui::Div {

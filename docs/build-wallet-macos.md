@@ -115,11 +115,19 @@ scripts/render-wallet-heap-profile \
 
 ## Package a macOS app
 
-Run the packaging script to build the wallet with hardware support and create a macOS app and DMG. The script ad-hoc signs the app by default:
+The packaging script builds and embeds the browser extension, then builds the wallet
+with hardware support and creates a macOS app and DMG. The script ad-hoc signs the app
+by default. Prepare Python 3, the WASM target, and the pinned wasm-bindgen helper first:
 
 ```bash
+rustup target add wasm32-unknown-unknown
+python3 scripts/install-browser-extension-tools.py target/browser-extension-tools
+export PATH="$PWD/target/browser-extension-tools/bin:$PATH"
 scripts/package-wallet-macos
 ```
+
+The source installer performs this setup automatically. If selecting a different
+compiler with `CARGO_TOOLCHAIN`, install the WASM target for that toolchain as well.
 
 The packaged app and DMG are written to:
 

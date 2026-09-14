@@ -62,6 +62,7 @@ pub async fn submit_public_send_with_progress(
         &mut command_rx,
         request.event_tx.as_ref(),
         http,
+        request.transaction_tracking.as_ref(),
         &mut progress,
     )
     .await?;
@@ -85,6 +86,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     command_rx: &mut Option<PublicActionCommandReceiver>,
     event_tx: Option<&PublicActionSessionEventSender>,
     http: &HttpContext,
+    transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<crate::TxReceiptOutput> {
     validate_public_transaction_intent(intent)?;
@@ -110,6 +112,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         query_rpc_pool,
         chain.finality_depth,
         http,
+        transaction_tracking,
         chain_id,
         from_address,
         &chain.gas,
@@ -375,6 +378,7 @@ pub async fn submit_public_shield_with_progress(
             query_rpc_pool.clone(),
             chain.finality_depth,
             http,
+            request.transaction_tracking.as_ref(),
             request.chain_id,
             from_address,
             &chain.gas,
@@ -434,6 +438,7 @@ pub async fn submit_public_shield_with_progress(
         query_rpc_pool,
         chain.finality_depth,
         http,
+        request.transaction_tracking.as_ref(),
         request.chain_id,
         from_address,
         &chain.gas,

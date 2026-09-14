@@ -229,7 +229,7 @@ fn walletconnect_completed_transaction_result_keeps_copyable_tx_hash() {
     assert_eq!(completed.submitted_tx_hash.as_deref(), Some("0xabcdef"));
     assert_eq!(
         completed.message.as_ref(),
-        "Transaction submitted and WalletConnect response published."
+        "Transaction submitted and response sent to the dapp."
     );
 }
 

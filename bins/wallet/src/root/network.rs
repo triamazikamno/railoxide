@@ -1,52 +1,24 @@
 use std::collections::VecDeque;
-use std::fmt::Display;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::WrapErr;
-use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    Styled, div, prelude::FluentBuilder as _, px, rgb,
-};
-use gpui_component::{Disableable, Icon, Sizable, alert::Alert, button::ButtonVariants};
+use gpui::Context;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
-use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_muted_text, app_strong_text};
-use ui::format::{format_compact_duration, format_compact_latency, format_relative_age};
-use ui::theme::{self, APP_TEXT_SIZE};
+pub(super) use ui::network_status::TorExitIpQueryState;
+use ui::network_status::{NetworkActivity, NetworkStatus, NetworkStatusIntent, NetworkStatusKind};
+use wallet_ops::gateway::{GatewayNetworkError, GatewayNetworkView};
 use wallet_ops::{
     HttpContext, TorBridgeActivitySnapshot, WalletNetworkHealth, WalletNetworkHealthCause,
     WalletNetworkHealthState, WalletNetworkMode, request_tor_state_reset,
 };
 
-use crate::assets::RailgunNetworkStatusIcon;
-
-use super::ui_helpers::{format_decimal_byte_rate, format_decimal_bytes};
 use super::{
     NETWORK_HEALTH_REFRESH_INTERVAL, TOR_EXIT_IP_QUERY_TIMEOUT, TOR_EXIT_IP_QUERY_URL,
-    TOR_HEALTH_RETRY_TIMEOUT, WalletRoot, format_report_chain, rgb_with_alpha,
+    TOR_HEALTH_RETRY_TIMEOUT, WalletRoot,
 };
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) enum TorExitIpQueryState {
-    #[default]
-    Idle,
-    Querying,
-    Success(IpAddr),
-    Error(Arc<str>),
-}
-
-pub(super) const fn network_health_color(health: &WalletNetworkHealth) -> u32 {
-    match (health.mode, health.state) {
-        (WalletNetworkMode::Tor, WalletNetworkHealthState::Ready) => theme::SUCCESS,
-        (WalletNetworkMode::Tor, WalletNetworkHealthState::Reconnecting) => theme::WARNING,
-        (WalletNetworkMode::Tor, WalletNetworkHealthState::Degraded) => theme::DANGER,
-        (WalletNetworkMode::Proxy, _) => theme::PRIMARY,
-        (WalletNetworkMode::Direct, _) => theme::TEXT_MUTED,
-    }
-}
 
 const TOR_ACTIVITY_RATE_WINDOW: Duration = Duration::from_secs(5);
 const TOR_ACTIVITY_INTERVAL_LIMIT: usize = 8;
@@ -176,88 +148,6 @@ impl TorBridgeActivitySampler {
     }
 }
 
-fn format_optional_number<T: Display>(value: Option<T>) -> String {
-    value.map_or_else(|| "--".to_owned(), |value| value.to_string())
-}
-
-fn format_recent_reliability(successful: Option<usize>, attempts: Option<usize>) -> String {
-    let (Some(successful), Some(attempts)) = (successful, attempts) else {
-        return "--".to_owned();
-    };
-    if attempts == 0 {
-        return "--".to_owned();
-    }
-
-    let tenths = successful
-        .saturating_mul(1_000)
-        .saturating_add(attempts / 2)
-        / attempts;
-    let whole = tenths / 10;
-    let fractional = tenths % 10;
-    if fractional == 0 {
-        format!("{whole}%")
-    } else {
-        format!("{whole}.{fractional}%")
-    }
-}
-
-fn tor_activity_stat_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .justify_between()
-        .gap_3()
-        .child(app_muted_text(label).flex_none())
-        .child(
-            app_strong_text(value)
-                .min_w(px(0.0))
-                .flex_1()
-                .text_align(gpui::TextAlign::Right)
-                .whitespace_normal(),
-        )
-}
-
-fn tor_activity_connections_row(successful: Option<u64>, failed: Option<u64>) -> gpui::Div {
-    let has_activity = successful.is_some();
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .justify_between()
-        .gap_3()
-        .child(app_muted_text("Connections (succeeded / failed)").flex_none())
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap_1()
-                .whitespace_nowrap()
-                .child(
-                    app_strong_text(format_optional_number(successful))
-                        .text_color(rgb(if has_activity {
-                            theme::SUCCESS
-                        } else {
-                            theme::TEXT_MUTED
-                        }))
-                        .flex_none(),
-                )
-                .child(app_muted_text("/").flex_none())
-                .child(
-                    app_strong_text(format_optional_number(failed))
-                        .text_color(rgb(if has_activity {
-                            theme::DANGER
-                        } else {
-                            theme::TEXT_MUTED
-                        }))
-                        .flex_none(),
-                ),
-        )
-}
-
 const fn next_tor_exit_ip_query_generation(current: u64) -> u64 {
     current.saturating_add(1)
 }
@@ -271,6 +161,81 @@ const fn tor_exit_ip_query_completion_is_current(
 }
 
 impl WalletRoot {
+    pub(super) fn network_context_revision(&self) -> String {
+        format!(
+            "{}:{}",
+            self.network_context_id,
+            self.http.tor_session_generation()
+        )
+    }
+
+    pub(super) fn gateway_network_view(&self) -> GatewayNetworkView {
+        GatewayNetworkView::new(
+            self.network_context_revision(),
+            &self.network_health,
+            self.tor_bridge_activity.as_ref(),
+            self.tor_download_rate,
+        )
+    }
+
+    pub(super) fn network_status_presentation(&self) -> NetworkStatus {
+        let kind = match (self.network_health.mode, self.network_health.state) {
+            (WalletNetworkMode::Tor, WalletNetworkHealthState::Ready) => {
+                NetworkStatusKind::TorReady
+            }
+            (WalletNetworkMode::Tor, WalletNetworkHealthState::Reconnecting) => {
+                NetworkStatusKind::TorReconnecting
+            }
+            (WalletNetworkMode::Tor, WalletNetworkHealthState::Degraded) => {
+                NetworkStatusKind::TorDegraded
+            }
+            (WalletNetworkMode::Proxy, _) => NetworkStatusKind::Proxy,
+            (WalletNetworkMode::Direct, _) => NetworkStatusKind::Direct,
+        };
+        NetworkStatus::new(
+            kind,
+            self.network_health.detail.to_string(),
+            matches!(
+                self.network_health.cause,
+                WalletNetworkHealthCause::TorRuntimeSlow
+                    | WalletNetworkHealthCause::TorRuntimeUnreliable
+            ),
+        )
+    }
+
+    pub(super) fn network_activity_presentation(&self) -> Option<NetworkActivity> {
+        self.tor_bridge_activity.as_ref().map(|snapshot| {
+            let mut activity = NetworkActivity::default();
+            activity.generation = snapshot.generation;
+            activity.session_duration = snapshot.session_duration;
+            activity.downloaded_bytes = snapshot.downloaded_bytes;
+            activity.recent_connection_sample_count = snapshot.recent_connection_sample_count;
+            activity.recent_successful_sample_count = snapshot.recent_successful_sample_count;
+            activity.successful_connections = snapshot.successful_connections;
+            activity.failed_connections = snapshot.failed_connections;
+            activity.median_setup_duration = snapshot.median_setup_duration;
+            activity.last_activity_age = snapshot.last_activity_age;
+            activity
+        })
+    }
+
+    pub(super) fn network_status_intent(
+        &mut self,
+        intent: NetworkStatusIntent,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.network_status_popover_open {
+            return;
+        }
+        match intent {
+            NetworkStatusIntent::NewTorSession => self.start_new_tor_session(cx),
+            NetworkStatusIntent::QueryExitIp => self.query_tor_exit_ip(cx),
+            NetworkStatusIntent::BeginReset => self.begin_tor_state_reset_confirmation(cx),
+            NetworkStatusIntent::CancelReset => self.cancel_tor_state_reset_confirmation(cx),
+            NetworkStatusIntent::QuitAndReset => self.quit_and_reset_tor_state(cx),
+        }
+    }
+
     pub(super) fn spawn_network_health_monitor(&self, cx: &Context<'_, Self>) {
         if self.http.network_mode() != WalletNetworkMode::Tor {
             return;
@@ -290,8 +255,12 @@ impl WalletRoot {
                         continue;
                     }
                 }
+                let generation = http.tor_session_generation();
                 let health = http.network_health();
                 let Ok(should_retry) = this.update(cx, |root, cx| {
+                    if root.http.tor_session_generation() != generation {
+                        return false;
+                    }
                     let should_retry = health.cause == WalletNetworkHealthCause::TorBootstrap;
                     root.set_network_health(health, cx);
                     should_retry
@@ -309,9 +278,14 @@ impl WalletRoot {
                             continue;
                         }
                     }
+                    let generation = http.tor_session_generation();
                     let health = http.network_health();
                     if this
-                        .update(cx, |root, cx| root.set_network_health(health, cx))
+                        .update(cx, |root, cx| {
+                            if root.http.tor_session_generation() == generation {
+                                root.set_network_health(health, cx);
+                            }
+                        })
                         .is_err()
                     {
                         break;
@@ -352,6 +326,7 @@ impl WalletRoot {
                         if root.tor_bridge_activity != snapshot || root.tor_download_rate != rate {
                             root.tor_bridge_activity = snapshot;
                             root.tor_download_rate = rate;
+                            root.publish_gateway_network_state();
                             cx.notify();
                         }
                     })
@@ -367,6 +342,7 @@ impl WalletRoot {
     fn set_network_health(&mut self, health: WalletNetworkHealth, cx: &mut Context<'_, Self>) {
         if self.network_health != health {
             self.network_health = health;
+            self.publish_gateway_network_state();
             cx.notify();
         }
     }
@@ -389,29 +365,31 @@ impl WalletRoot {
         }
     }
 
+    pub(super) fn rotate_tor_session(&mut self, cx: &mut Context<'_, Self>) -> eyre::Result<u64> {
+        let generation = self.http.start_new_tor_session()?;
+        self.network_health = self.http.network_health();
+        self.tor_bridge_activity = self.http.tor_bridge_activity_snapshot();
+        self.tor_download_rate = None;
+        self.invalidate_tor_exit_ip_query();
+        self.tor_state_reset_confirming = false;
+        let waku_refreshed = super::refresh_active_waku(self.waku_runtime.as_ref());
+        let walletconnect_refreshed =
+            self.restart_walletconnect_relay_workers_for_network_session(cx);
+        tracing::info!(
+            tor_session_generation = generation,
+            waku_refreshed,
+            walletconnect_refreshed,
+            "started new Tor session"
+        );
+        self.publish_gateway_network_state();
+        Ok(generation)
+    }
+
     fn start_new_tor_session(&mut self, cx: &mut Context<'_, Self>) {
-        match self.http.start_new_tor_session() {
-            Ok(generation) => {
-                self.network_health = self.http.network_health();
-                self.tor_bridge_activity = self.http.tor_bridge_activity_snapshot();
-                self.tor_download_rate = None;
-                self.invalidate_tor_exit_ip_query();
-                let waku_refreshed = super::refresh_active_waku(self.waku_runtime.as_ref());
-                let walletconnect_refreshed =
-                    self.restart_walletconnect_relay_workers_for_network_session(cx);
-                tracing::info!(
-                    tor_session_generation = generation,
-                    waku_refreshed,
-                    walletconnect_refreshed,
-                    "started new Tor session"
-                );
-                self.network_status_error = None;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to start new Tor session");
-                self.network_status_error = Some(Arc::from(format_report_chain(&error)));
-            }
-        }
+        self.network_status_error = self
+            .rotate_tor_session(cx)
+            .err()
+            .map(|_| Arc::from(GatewayNetworkError::NewSessionFailed.message()));
         cx.notify();
     }
 
@@ -448,12 +426,9 @@ impl WalletRoot {
         cx.spawn(async move |this, cx| {
             let state = match query.await {
                 Ok(Ok(ip)) => TorExitIpQueryState::Success(ip),
-                Ok(Err(error)) => {
-                    TorExitIpQueryState::Error(Arc::from(format_report_chain(&error)))
-                }
-                Err(error) => TorExitIpQueryState::Error(Arc::from(format!(
-                    "Exit IP query task failed: {error}"
-                ))),
+                Ok(Err(_)) | Err(_) => TorExitIpQueryState::Error(Arc::from(
+                    GatewayNetworkError::ExitIpFailed.message(),
+                )),
             };
             let _ = this.update(cx, |root, cx| {
                 if tor_exit_ip_query_completion_is_current(
@@ -482,320 +457,24 @@ impl WalletRoot {
     }
 
     fn quit_and_reset_tor_state(&mut self, cx: &mut Context<'_, Self>) {
-        match request_tor_state_reset(&self.options.db_path) {
-            Ok(marker_path) => {
-                tracing::warn!(
-                    marker_path = %marker_path.display(),
-                    "requested Tor state reset on next wallet startup; quitting wallet"
-                );
-                cx.quit();
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to request Tor state reset");
-                self.network_status_error = Some(Arc::from(format_report_chain(&error)));
-                self.tor_state_reset_confirming = false;
-                cx.notify();
-            }
+        if !self.tor_state_reset_confirming {
+            return;
+        }
+        if reset_tor_state_and_quit(&self.options.db_path, || cx.quit()).is_err() {
+            self.network_status_error = Some(Arc::from(GatewayNetworkError::ResetFailed.message()));
+            self.tor_state_reset_confirming = false;
+            cx.notify();
         }
     }
 }
 
-pub(super) fn render_network_status_popover_content(
-    root: Entity<WalletRoot>,
-    health: &WalletNetworkHealth,
-    color: u32,
-    error: Option<Arc<str>>,
-    exit_ip_query: TorExitIpQueryState,
-    reset_confirming: bool,
-    activity: Option<&wallet_ops::TorBridgeActivitySnapshot>,
-    download_rate: Option<u64>,
-) -> gpui::Div {
-    let session_root = root.clone();
-    let query_root = root.clone();
-    let reset_root = root.clone();
-    let cancel_reset_root = root.clone();
-    let confirm_reset_root = root;
-    let exit_ip_querying = matches!(exit_ip_query, TorExitIpQueryState::Querying);
-    let generation = activity.map(|snapshot| snapshot.generation);
-    let session_duration = activity.map(|snapshot| snapshot.session_duration);
-    let downloaded_bytes = activity.map(|snapshot| snapshot.downloaded_bytes);
-    let recent_connection_sample_count =
-        activity.map(|snapshot| snapshot.recent_connection_sample_count);
-    let recent_successful_sample_count =
-        activity.map(|snapshot| snapshot.recent_successful_sample_count);
-    let successful_connections = activity.map(|snapshot| snapshot.successful_connections);
-    let failed_connections = activity.map(|snapshot| snapshot.failed_connections);
-    let median_setup_duration = activity.and_then(|snapshot| snapshot.median_setup_duration);
-    let latency_label =
-        median_setup_duration.map_or_else(|| "--".to_owned(), format_compact_latency);
-    let last_activity_age = activity.and_then(|snapshot| snapshot.last_activity_age);
-    div()
-        .w(px(300.0))
-        .flex()
-        .flex_col()
-        .gap_3()
-        .text_size(APP_TEXT_SIZE)
-        .text_color(rgb(theme::TEXT))
-        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-            cx.stop_propagation();
-        })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    Icon::new(RailgunNetworkStatusIcon::Tor)
-                        .small()
-                        .text_color(rgb(color)),
-                )
-                .child(
-                    app_strong_text(health.label())
-                        .text_size(px(14.0))
-                        .text_color(rgb(color)),
-                ),
-        )
-        .when(health.mode != WalletNetworkMode::Tor, |this| {
-            this.child(
-                div()
-                    .text_size(px(12.0))
-                    .line_height(px(18.0))
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child(health.detail.to_string()),
-            )
-        })
-        .when_some(error, |this, error| {
-            this.child(Alert::error("wallet-network-status-error", error.to_string()).small())
-        })
-        .when(health.mode == WalletNetworkMode::Tor, |this| {
-            this.when(
-                matches!(
-                    health.cause,
-                    WalletNetworkHealthCause::TorRuntimeSlow
-                        | WalletNetworkHealthCause::TorRuntimeUnreliable
-                ),
-                |this| {
-                    this.child(
-                        Alert::warning(
-                            "wallet-network-runtime-warning",
-                            "Tor is degraded. Try a new Tor session to reconnect.",
-                        )
-                        .small(),
-                    )
-                },
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(tor_activity_stat_row(
-                                "Session ID",
-                                generation.map_or_else(|| "--".to_owned(), |generation| {
-                                    format!("#{generation}")
-                                }),
-                            ))
-                            .child(tor_activity_stat_row(
-                                "Session duration",
-                                session_duration
-                                    .map_or_else(|| "--".to_owned(), format_compact_duration),
-                            ))
-                            .child(tor_activity_stat_row(
-                                "Download rate",
-                                format_decimal_byte_rate(download_rate),
-                            ))
-                            .child(tor_activity_stat_row(
-                                "Downloaded this session",
-                                downloaded_bytes.map_or_else(|| "--".to_owned(), format_decimal_bytes),
-                            ))
-                            .child(tor_activity_stat_row("Latency", latency_label))
-                            .child(tor_activity_stat_row(
-                                "Recent reliability",
-                                format_recent_reliability(
-                                    recent_successful_sample_count,
-                                    recent_connection_sample_count,
-                                ),
-                            ))
-                            .child(tor_activity_connections_row(
-                                successful_connections,
-                                failed_connections,
-                            ))
-                            .child(tor_activity_stat_row(
-                                "Last activity",
-                                last_activity_age
-                                    .map_or_else(|| "--".to_owned(), format_relative_age),
-                            )),
-                    )
-                    .child(
-                        app_button("wallet-network-new-tor-session", "New Tor session")
-                            .w_full()
-                            .primary()
-                            .outline()
-                            .small()
-                            .on_click(move |_event, _window, cx| {
-                                cx.stop_propagation();
-                                session_root.update(cx, |root, cx| {
-                                    root.start_new_tor_session(cx);
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(rgb(theme::BORDER_SUBTLE))
-                    .pt_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .line_height(px(17.0))
-                            .text_color(rgb(theme::TEXT_SUBTLE))
-                            .child(
-                                "Contacts https://check.torproject.org/api/ip through Tor.",
-                            ),
-                    )
-                    .child(
-                        app_button(
-                            "wallet-network-query-exit-ip",
-                            if exit_ip_querying {
-                                "Querying..."
-                            } else {
-                                "Query exit IP"
-                            },
-                        )
-                        .w_full()
-                        .outline()
-                        .small()
-                        .loading(exit_ip_querying)
-                        .disabled(exit_ip_querying)
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            query_root.update(cx, |root, cx| {
-                                root.query_tor_exit_ip(cx);
-                            });
-                        }),
-                    )
-                    .when(!matches!(exit_ip_query, TorExitIpQueryState::Idle), |this| {
-                        this.child(match exit_ip_query {
-                            TorExitIpQueryState::Idle => div().into_any_element(),
-                            TorExitIpQueryState::Querying => div()
-                                .text_size(px(12.0))
-                                .line_height(px(17.0))
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .child("Querying exit IP through Tor...")
-                                .into_any_element(),
-                            TorExitIpQueryState::Success(ip) => div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_size(px(12.0))
-                                .line_height(px(17.0))
-                                .text_color(rgb(theme::SUCCESS))
-                                .child(format!("Exit IP: {ip}"))
-                                .child(clipboard_with_toast(
-                                    "wallet-network-exit-ip-copy",
-                                    ip.to_string(),
-                                ))
-                                .into_any_element(),
-                            TorExitIpQueryState::Error(error) => div()
-                                .text_size(px(12.0))
-                                .line_height(px(17.0))
-                                .text_color(rgb(theme::DANGER))
-                                .child(error.to_string())
-                                .into_any_element(),
-                        })
-                    }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .when(!reset_confirming, |this| {
-                        this.border_t_1()
-                            .border_color(rgb(theme::BORDER_SUBTLE))
-                            .pt_3()
-                    })
-                    .when(reset_confirming, |this| {
-                        this.rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme::DANGER))
-                            .bg(rgb_with_alpha(theme::DANGER, 0.08))
-                            .p(px(10.0))
-                    })
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .line_height(px(17.0))
-                            .text_color(rgb(if reset_confirming {
-                                theme::DANGER
-                            } else {
-                                theme::TEXT_SUBTLE
-                            }))
-                            .child(if reset_confirming {
-                                "The wallet closes now and rebuilds its Tor connections when you reopen it. Only Tor's cached data is cleared."
-                            } else {
-                                "Clears Tor's cached relay data and reconnects from scratch on next launch. Your wallet, keys, and transactions are untouched."
-                            }),
-                    )
-                    .when(!reset_confirming, |this| {
-                        this.child(
-                            app_button("wallet-network-reset-tor-state", "Reset Tor state")
-                                .w_full()
-                                .outline()
-                                .small()
-                                .danger()
-                                .on_click(move |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                    reset_root.update(cx, |root, cx| {
-                                        root.begin_tor_state_reset_confirmation(cx);
-                                    });
-                                }),
-                        )
-                    })
-                    .when(reset_confirming, |this| {
-                        this.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    app_button("wallet-network-cancel-tor-reset", "Cancel")
-                                        .outline()
-                                        .small()
-                                        .on_click(move |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                            cancel_reset_root.update(cx, |root, cx| {
-                                                root.cancel_tor_state_reset_confirmation(cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    app_button("wallet-network-confirm-tor-reset", "Quit and reset")
-                                        .small()
-                                        .danger()
-                                        .on_click(move |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                            confirm_reset_root.update(cx, |root, cx| {
-                                                root.quit_and_reset_tor_state(cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                    }),
-            )
-        })
+pub(super) fn reset_tor_state_and_quit(
+    path: &std::path::Path,
+    quit: impl FnOnce(),
+) -> eyre::Result<()> {
+    request_tor_state_reset(path)?;
+    quit();
+    Ok(())
 }
 
 async fn wallet_root_shutdown_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
@@ -885,6 +564,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_quits_only_after_the_marker_is_written() {
+        let path =
+            std::env::temp_dir().join(format!("network-reset-{:032x}", rand::random::<u128>()));
+        let quits = std::cell::Cell::new(0);
+        std::fs::write(&path, b"blocked directory").unwrap();
+        assert!(reset_tor_state_and_quit(&path, || quits.set(quits.get() + 1)).is_err());
+        assert_eq!(quits.get(), 0);
+        std::fs::remove_file(&path).unwrap();
+        reset_tor_state_and_quit(&path, || {
+            assert_eq!(std::fs::read_dir(&path).unwrap().count(), 1);
+            quits.set(quits.get() + 1);
+        })
+        .unwrap();
+        assert_eq!(quits.get(), 1);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn download_rate_sampler_reports_first_sample_and_idle_zero() {
         let mut sampler = TorBridgeActivitySampler::new();
         let start = Instant::now();
@@ -898,15 +595,6 @@ mod tests {
             ),
             Some(0)
         );
-    }
-
-    #[test]
-    fn recent_reliability_formatter_handles_missing_zero_and_rounded_percentages() {
-        assert_eq!(format_recent_reliability(None, None), "--");
-        assert_eq!(format_recent_reliability(Some(1), Some(0)), "--");
-        assert_eq!(format_recent_reliability(Some(0), Some(64)), "0%");
-        assert_eq!(format_recent_reliability(Some(63), Some(64)), "98.4%");
-        assert_eq!(format_recent_reliability(Some(64), Some(64)), "100%");
     }
 
     #[test]

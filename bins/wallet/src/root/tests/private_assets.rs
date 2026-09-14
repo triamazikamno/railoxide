@@ -25,6 +25,12 @@ fn effective_token_registry_formats_private_and_public_assets() {
     assert_eq!(rows[0].label, "TST");
     assert_eq!(rows[0].amount, "1.23");
     assert_eq!(rows[0].decimals, Some(4));
+    let browser = crate::root::gateway_private_view::private_asset_presentation(&rows[0]);
+    assert_eq!(browser.amount, "1.23");
+    assert!(browser.usd.is_none());
+    assert!(browser.icon.is_none());
+    assert!(browser.pending_verification.is_none());
+    assert!(!serde_json::to_string(&browser).unwrap().contains(icon));
     assert_eq!(
         rows[0]
             .icon_path
@@ -64,6 +70,11 @@ fn private_asset_rows_use_totals_formatting() {
     assert_eq!(rows[0].pending_poi_total, Some(uint!(234_567_U256)));
     assert!(should_show_pending_poi_amount(rows[0].pending_poi_total));
     assert!(rows[0].icon_path.is_some());
+    let browser = crate::root::gateway_private_view::private_asset_presentation(&rows[0]);
+    assert_eq!(browser.pending_verification.as_deref(), Some("0.23457"));
+    assert!(browser.pending_incoming.is_none());
+    assert!(browser.pending_outgoing.is_none());
+    assert!(browser.icon.as_ref().unwrap().starts_with("railgun-ui/"));
 }
 
 #[test]
@@ -109,6 +120,25 @@ fn pending_shield_waits_group_by_token_and_use_latest_source() {
         *wait,
         Some(uint!(3_000_000_U256))
     ));
+    let mut receive_snapshot = snapshot;
+    receive_snapshot.utxos.truncate(2);
+    receive_snapshot.utxo_count = 2;
+    receive_snapshot.unspent_count = 2;
+    for output in &mut receive_snapshot.utxos {
+        output.source_block_timestamp = crate::root::utxo::now_epoch_secs().saturating_sub(90);
+    }
+    receive_snapshot.totals = vec![wallet_ops::TokenTotal {
+        token: token.to_checksum(None),
+        total: "2000000".into(),
+        poi_verified_total: "0".into(),
+    }];
+    let assets = format_private_asset_rows_from_snapshot(&receive_snapshot, None, None);
+    let summary =
+        private_pending_summary(&assets, &receive_snapshot, Vec::new(), false, None).unwrap();
+    let presentation = crate::root::private_assets::private_pending_presentation(&summary);
+    assert_eq!(presentation.categories.len(), 1);
+    assert_eq!(presentation.categories[0].title, "Not yet spendable");
+    assert!(presentation.categories[0].assets[0].shield_wait.is_some());
 }
 
 #[test]
@@ -446,6 +476,14 @@ fn private_pending_banner_collapses_pending_states_to_one_line() {
         "1 asset not yet spendable"
     );
     assert_eq!(private_pending_summary_detail(&incoming_summary), None);
+    let incoming_view =
+        crate::root::private_assets::private_pending_presentation(&incoming_summary);
+    assert_eq!(incoming_view.categories.len(), 1);
+    assert_eq!(incoming_view.categories[0].title, "Pending incoming");
+    assert_eq!(
+        incoming_view.categories[0].assets[0].amount,
+        format!("+{}", incoming_assets[0].pending_incoming_amount)
+    );
 
     let mut outgoing = unshield_utxo_output(token, 5, 0, 1);
     outgoing.pending_spent = true;
@@ -478,6 +516,14 @@ fn private_pending_banner_collapses_pending_states_to_one_line() {
         "1 asset awaiting confirmation"
     );
     assert_eq!(private_pending_summary_detail(&outgoing_summary), None);
+    let outgoing_view =
+        crate::root::private_assets::private_pending_presentation(&outgoing_summary);
+    assert_eq!(outgoing_view.categories.len(), 1);
+    assert_eq!(outgoing_view.categories[0].title, "Pending outgoing");
+    assert_eq!(
+        outgoing_view.categories[0].assets[0].amount,
+        format!("-{}", outgoing_assets[0].pending_outgoing_amount)
+    );
 }
 
 #[test]

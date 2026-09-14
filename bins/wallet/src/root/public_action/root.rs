@@ -170,42 +170,21 @@ impl WalletRoot {
             app_muted_text(format!("From {}", short_address(&account.address)))
                 .font_family(APP_MONO_FONT_FAMILY)
         }))
-        .child(
-            ButtonGroup::new("wallet-public-action-mode-toggle")
-                .w_full()
-                .outline()
-                .disabled(submitting)
-                .child(public_action_segment_button(
-                    "wallet-public-action-mode-shield".into(),
-                    "Shield",
-                    Icon::new(RailgunActionIcon::Shield),
-                    mode == PublicActionMode::Shield,
-                ))
-                .child(
-                    public_action_segment_button(
-                        "wallet-public-action-mode-send".into(),
-                        "Send",
-                        Icon::new(RailgunActionIcon::Send),
-                        mode == PublicActionMode::Send,
-                    )
-                    .when(mode == PublicActionMode::Send, |button| {
-                        button.border_l_1().ml(-px(1.0))
-                    }),
-                )
-                .on_click(move |selected, window, cx| {
-                    let Some(index) = selected.first() else {
-                        return;
-                    };
-                    let mode = if *index == 0 {
-                        PublicActionMode::Shield
-                    } else {
-                        PublicActionMode::Send
-                    };
-                    mode_root.update(cx, |root, cx| {
-                        root.set_public_action_mode(mode, window, cx);
-                    });
-                }),
-        );
+        .child(ui::controls::public_action_mode_group(
+            "wallet-public-action-mode-toggle",
+            mode == PublicActionMode::Shield,
+            submitting,
+            move |shield, window, cx| {
+                let mode = if *shield {
+                    PublicActionMode::Shield
+                } else {
+                    PublicActionMode::Send
+                };
+                mode_root.update(cx, |root, cx| {
+                    root.set_public_action_mode(mode, window, cx);
+                });
+            },
+        ));
 
         match mode {
             PublicActionMode::Shield => {
@@ -1170,10 +1149,14 @@ impl WalletRoot {
         chain_id: u64,
         active_wallet_id: Option<Arc<str>>,
         mut progress_rx: mpsc::UnboundedReceiver<PublicActionProgressUpdate>,
+        gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
         cx: &Context<'_, Self>,
     ) {
         cx.spawn(async move |this, cx| {
             while let Some(update) = progress_rx.recv().await {
+                if let Some(execution) = &gateway_execution {
+                    execution.progress(&update);
+                }
                 let _ = this.update(cx, |root, cx| {
                     if root.selected_wallet_id != active_wallet_id
                         || root.selected_chain != chain_id
@@ -1192,10 +1175,14 @@ impl WalletRoot {
         chain_id: u64,
         active_wallet_id: Option<Arc<str>>,
         mut event_rx: mpsc::UnboundedReceiver<PublicActionSessionEvent>,
+        gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
         cx: &Context<'_, Self>,
     ) {
         cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.recv().await {
+                if let Some(execution) = &gateway_execution {
+                    execution.event(&event);
+                }
                 let _ = this.update(cx, |root, cx| {
                     if root.selected_wallet_id != active_wallet_id
                         || root.selected_chain != chain_id
@@ -1361,6 +1348,7 @@ impl WalletRoot {
     pub(in crate::root) fn stop_public_action_progress(&mut self, cx: &mut Context<'_, Self>) {
         if public_action_progress_footer_action(
             self.public_form.action_stop_available,
+            self.public_form.action_command_tx.is_some(),
             &self.public_form.action_progress,
         ) != ProgressFooterAction::Stop
         {
@@ -1375,6 +1363,10 @@ impl WalletRoot {
         self.public_form.action_fee_authorization_review = None;
         self.public_form.action_stop_available = false;
         self.public_form.action_stopped = true;
+        self.gateway
+            .drafts
+            .borrow()
+            .stopped(self.public_form.action_generation);
         match self.public_form.action_progress_mode {
             PublicActionMode::Shield => self.public_form.shielding = false,
             PublicActionMode::Send => self.public_form.sending = false,
@@ -1519,6 +1511,7 @@ impl WalletRoot {
             root.clone(),
             public_action_progress_footer_action(
                 self.public_form.action_stop_available,
+                self.public_form.action_command_tx.is_some(),
                 &self.public_form.action_progress,
             ),
         ));
@@ -1829,73 +1822,19 @@ impl WalletRoot {
                 protocol_fee: None,
             };
         };
-        let gas_cost = self.public_action_estimated_gas_cost(mode, asset, cx);
-        let format_gas_cost = |native_gas_cost| {
-            let token_value =
-                format_native_token_amount_for_display(self.selected_chain, native_gas_cost);
-            let usd_micro_value = self
-                .public_broadcaster_anchor_cache
-                .cached_native_usd_micro_value(self.selected_chain, native_gas_cost);
-            format_value_with_usd_label(
-                token_value,
-                native_gas_cost,
-                Some(18),
-                usd_micro_value,
-                false,
-            )
-        };
-        let expected_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.expected_cost));
-        let maximum_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.maximum_cost));
-        let show_maximum_gas_cost = gas_cost.is_some_and(|cost| {
-            public_action_maximum_gas_cost_is_significant(cost.expected_cost, cost.maximum_cost)
-        });
-        let protocol_fee = if mode == PublicActionMode::Shield {
-            amount.map(|amount| {
-                let fee_amount = public_shield_protocol_fee_amount(amount);
-                let token_value = match asset {
-                    PublicAssetId::Native => {
-                        format_native_token_amount_for_display(self.selected_chain, fee_amount)
-                    }
-                    PublicAssetId::Erc20(token) => format_token_amount_for_display(
-                        self.selected_chain,
-                        token,
-                        fee_amount,
-                        Some(&self.effective_token_registry),
-                    ),
-                };
-                let usd_micro_value = match asset {
-                    PublicAssetId::Native => self
-                        .public_broadcaster_anchor_cache
-                        .cached_native_usd_micro_value(self.selected_chain, fee_amount),
-                    PublicAssetId::Erc20(token) => self
-                        .public_broadcaster_anchor_cache
-                        .cached_token_usd_micro_value(self.selected_chain, token, fee_amount),
-                };
-                format_value_with_usd_label(
-                    token_value,
-                    fee_amount,
-                    public_asset_decimals(
-                        self.selected_chain,
-                        asset,
-                        Some(&self.effective_token_registry),
-                    ),
-                    usd_micro_value,
-                    false,
-                )
-            })
-        } else {
-            None
-        };
-        PublicActionFeeDisplay {
-            gas_limit: (mode == PublicActionMode::Shield
+        PublicActionFeeDisplay::from_estimate(
+            self.selected_chain,
+            self.public_action_estimated_gas_cost(mode, asset, cx),
+            (mode == PublicActionMode::Shield
                 && asset == PublicAssetId::Native
                 && self.public_form.mimic_railway_shield)
                 .then_some(6_000_000),
-            expected_gas_cost,
-            maximum_gas_cost,
-            show_maximum_gas_cost,
-            protocol_fee,
-        }
+            (mode == PublicActionMode::Shield)
+                .then(|| amount.map(|amount| (asset, public_shield_protocol_fee_amount(amount))))
+                .flatten(),
+            &self.effective_token_registry,
+            &self.public_broadcaster_anchor_cache,
+        )
     }
 
     fn public_action_estimated_gas_cost(
@@ -2180,6 +2119,7 @@ impl WalletRoot {
                 )
             };
         Some(PublicSendDraft {
+            gateway_execution: None,
             chain_id,
             asset,
             asset_label,
@@ -2211,9 +2151,29 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.sending {
+            if let Some(execution) = &draft.gateway_execution {
+                execution.finish(false);
+            }
             return;
         }
+        if let Some(execution) = &draft.gateway_execution {
+            if self.selected_chain != draft.chain_id
+                || self.public_form.selected_account_uuid.as_deref()
+                    != Some(draft.public_account_uuid.as_ref())
+                || !self
+                    .view_session
+                    .as_ref()
+                    .is_some_and(|wallet| Arc::ptr_eq(wallet, &draft.view_session))
+            {
+                execution.finish(false);
+                return;
+            }
+            if !execution.start() {
+                return;
+            }
+        }
         let PublicSendDraft {
+            gateway_execution,
             chain_id,
             asset,
             asset_label,
@@ -2226,6 +2186,18 @@ impl WalletRoot {
             gas_fee,
             ..
         } = draft;
+        let transaction_tracking =
+            match self.public_transaction_tracking_context(chain_id, &public_account_uuid) {
+                Ok(context) => context,
+                Err(error) => {
+                    if let Some(execution) = &gateway_execution {
+                        execution.finish(false);
+                    }
+                    self.public_form.send_error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
             self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
@@ -2262,12 +2234,16 @@ impl WalletRoot {
             initial_gas_fee,
             advanced_submission,
         );
+        if let Some(execution) = &gateway_execution {
+            execution.bind_generation(generation);
+        }
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(
             generation,
             chain_id,
             active_wallet_id.clone(),
             progress_rx,
+            gateway_execution.clone(),
             cx,
         );
         Self::spawn_public_action_session_event_listener(
@@ -2275,10 +2251,12 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             event_rx,
+            gateway_execution.clone(),
             cx,
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicSendRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
             view_session,
@@ -2300,15 +2278,18 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.runtime.spawn(async move {
+        let join = self.spawn_public_transaction_submission(async move {
             submit_public_send_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await
         });
-        self.public_form.action_task_abort_handle = Some(join.abort_handle());
+        self.public_form.action_task_abort_handle = join.abort_handle();
         cx.spawn(async move |this, cx| {
             let result = join.await;
+            if let Some(execution) = &gateway_execution {
+                execution.finish(matches!(&result, Ok(Ok(_))));
+            }
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
                     return;
@@ -2500,6 +2481,7 @@ impl WalletRoot {
             return None;
         }
         Some(PublicShieldDraft {
+            gateway_execution: None,
             chain_id,
             asset,
             asset_label,
@@ -2531,9 +2513,29 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.shielding {
+            if let Some(execution) = &draft.gateway_execution {
+                execution.finish(false);
+            }
             return;
         }
+        if let Some(execution) = &draft.gateway_execution {
+            if self.selected_chain != draft.chain_id
+                || self.public_form.selected_account_uuid.as_deref()
+                    != Some(draft.public_account_uuid.as_ref())
+                || !self
+                    .view_session
+                    .as_ref()
+                    .is_some_and(|wallet| Arc::ptr_eq(wallet, &draft.view_session))
+            {
+                execution.finish(false);
+                return;
+            }
+            if !execution.start() {
+                return;
+            }
+        }
         let PublicShieldDraft {
+            gateway_execution,
             chain_id,
             asset,
             asset_label,
@@ -2548,6 +2550,18 @@ impl WalletRoot {
             authorized_fee_ceiling,
             ..
         } = draft;
+        let transaction_tracking =
+            match self.public_transaction_tracking_context(chain_id, &public_account_uuid) {
+                Ok(context) => context,
+                Err(error) => {
+                    if let Some(execution) = &gateway_execution {
+                        execution.finish(false);
+                    }
+                    self.public_form.shield_error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
             self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
@@ -2583,12 +2597,16 @@ impl WalletRoot {
             initial_gas_fee,
             false,
         );
+        if let Some(execution) = &gateway_execution {
+            execution.bind_generation(generation);
+        }
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(
             generation,
             chain_id,
             active_wallet_id.clone(),
             progress_rx,
+            gateway_execution.clone(),
             cx,
         );
         Self::spawn_public_action_session_event_listener(
@@ -2596,10 +2614,12 @@ impl WalletRoot {
             chain_id,
             active_wallet_id.clone(),
             event_rx,
+            gateway_execution.clone(),
             cx,
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicShieldRequest {
+            transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
             view_session,
@@ -2619,15 +2639,18 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.runtime.spawn(async move {
+        let join = self.spawn_public_transaction_submission(async move {
             submit_public_shield_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await
         });
-        self.public_form.action_task_abort_handle = Some(join.abort_handle());
+        self.public_form.action_task_abort_handle = join.abort_handle();
         cx.spawn(async move |this, cx| {
             let result = join.await;
+            if let Some(execution) = &gateway_execution {
+                execution.finish(matches!(&result, Ok(Ok(_))));
+            }
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
                     return;

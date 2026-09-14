@@ -21,7 +21,8 @@ use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
     HttpContext, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
-    self_broadcast_replacement_bumped_fee, self_broadcast_send_raw_transaction_to_rpc_pool,
+    self_broadcast_replacement_bumped_fee,
+    self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
 
 pub(super) struct PublicActionStepOutcome {
@@ -80,7 +81,7 @@ impl std::fmt::Display for PublicActionPreflightError {
 impl std::error::Error for PublicActionPreflightError {}
 
 impl PublicActionPreflightError {
-    fn into_report(self) -> eyre::Report {
+    pub(super) fn into_report(self) -> eyre::Report {
         match self {
             Self::FeeAuthorizationRequired { message, .. } => eyre!("{}", message),
             Self::Other(error) => error,
@@ -88,17 +89,13 @@ impl PublicActionPreflightError {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct SubmittedPublicActionAttempt {
-    tx_hash: FixedBytes<32>,
+    pub(super) tx_hash: FixedBytes<32>,
     pub(super) info: PublicActionAttemptInfo,
     rpc_gas_price: u128,
     estimated_native_gas_cost: U256,
     live_native_balance: U256,
-}
-
-struct PublicActionSentTx {
-    tx_hash: FixedBytes<32>,
-    tx_hash_string: String,
 }
 
 pub(super) async fn submit_public_action_step_session(
@@ -111,6 +108,7 @@ pub(super) async fn submit_public_action_step_session(
     query_rpc_pool: Arc<QueryRpcPool>,
     finality_depth: u64,
     http: &HttpContext,
+    transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
     chain_id: u64,
     from_address: Address,
     gas: &EffectiveChainGasSettings,
@@ -216,19 +214,26 @@ pub(super) async fn submit_public_action_step_session(
         nonce = Some(preflight.nonce);
 
         if observer.is_none() {
+            let established = BlockObserver::establish(
+                Arc::clone(&query_rpc_pool),
+                finality_depth,
+                http.rpc_broker(),
+                chain_id,
+            )
+            .await?;
             observer = Some(
-                BlockObserver::establish(
-                    Arc::clone(&query_rpc_pool),
-                    finality_depth,
-                    http.rpc_broker(),
-                    chain_id,
-                )
-                .await?,
+                crate::public_wallet::PublicTransactionObservationGuard::new(
+                    established,
+                    transaction_tracking,
+                )?,
             );
         }
 
+        if let Some(context) = transaction_tracking {
+            context.ensure_open()?;
+        }
         emit_public_action_event(event_tx, PublicActionSessionEvent::AttemptHandoff { step });
-        let attempt = match submit_public_action_attempt(
+        let result = submit_public_action_attempt(
             step,
             preflight,
             query_rpc_pool.as_ref(),
@@ -237,10 +242,29 @@ pub(super) async fn submit_public_action_step_session(
             label,
             event_tx,
             None,
+            true,
+            &mut |attempt| {
+                if let Some(context) = transaction_tracking {
+                    context.ensure_open()?;
+                }
+                retain_public_action_attempt(
+                    observer
+                        .as_mut()
+                        .expect("public action observer established"),
+                    &mut submitted_attempts,
+                    attempt,
+                );
+                Ok(())
+            },
         )
-        .await
-        {
-            Ok(attempt) => attempt,
+        .await;
+        match result {
+            Ok(attempt) => progress(public_action_progress_update(
+                step,
+                PublicActionProgressStatus::Pending,
+                Some(attempt.info.tx_hash),
+                None,
+            )),
             Err(
                 PublicActionAttemptError::Signing(error) | PublicActionAttemptError::Sending(error),
             ) => {
@@ -255,32 +279,22 @@ pub(super) async fn submit_public_action_step_session(
                     event_tx,
                     PublicActionSessionEvent::StepFailed { step, message },
                 );
-                let Some(command) = recv_public_action_command(command_rx).await else {
-                    return Err(error);
-                };
-                ensure_public_action_command_gas_fee_authorized(
-                    authorized_gas_fee,
-                    command.gas_fee,
-                )?;
-                railway_auto = false;
-                next_gas_fee = command.gas_fee;
-                continue;
+                // A failed raw-send response can still mean the transaction was accepted.
+                // Keep observing every handed-off attempt while accepting explicit replacements.
+                if submitted_attempts.is_empty() {
+                    let Some(command) = recv_public_action_command(command_rx).await else {
+                        return Err(error);
+                    };
+                    ensure_public_action_command_gas_fee_authorized(
+                        authorized_gas_fee,
+                        command.gas_fee,
+                    )?;
+                    railway_auto = false;
+                    next_gas_fee = command.gas_fee;
+                    continue;
+                }
             }
-        };
-        progress(public_action_progress_update(
-            step,
-            PublicActionProgressStatus::Pending,
-            Some(attempt.info.tx_hash.clone()),
-            None,
-        ));
-        let attempt_id = submitted_attempts.len();
-        let tx_hash = attempt.tx_hash;
-        submitted_attempts.push(attempt);
-        observer
-            .as_mut()
-            .expect("public action observer established")
-            .register(tx_hash, attempt_id);
-
+        }
         loop {
             let receipt = if command_rx.is_some() {
                 tokio::select! {
@@ -349,6 +363,9 @@ pub(super) async fn submit_public_action_step_session(
                                 continue;
                             }
                         };
+                        if let Some(context) = transaction_tracking {
+                            context.ensure_open()?;
+                        }
                         emit_public_action_event(
                             event_tx,
                             PublicActionSessionEvent::AttemptHandoff { step },
@@ -362,6 +379,18 @@ pub(super) async fn submit_public_action_step_session(
                             label,
                             event_tx,
                             None,
+                            true,
+                            &mut |attempt| {
+                                if let Some(context) = transaction_tracking {
+                                    context.ensure_open()?;
+                                }
+                                retain_public_action_attempt(
+                                    observer.as_mut().expect("public action observer established"),
+                                    &mut submitted_attempts,
+                                    attempt,
+                                );
+                                Ok(())
+                            },
                         )
                         .await
                         {
@@ -372,13 +401,6 @@ pub(super) async fn submit_public_action_step_session(
                                     Some(attempt.info.tx_hash.clone()),
                                     None,
                                 ));
-                                let attempt_id = submitted_attempts.len();
-                                let tx_hash = attempt.tx_hash;
-                                submitted_attempts.push(attempt);
-                                observer
-                                    .as_mut()
-                                    .expect("public action observer established")
-                                    .register(tx_hash, attempt_id);
                             }
                             Err(error) => emit_public_action_event(
                                 event_tx,
@@ -459,6 +481,16 @@ pub(super) async fn submit_public_action_step_session(
     }
 }
 
+fn retain_public_action_attempt(
+    observer: &mut BlockObserver,
+    attempts: &mut Vec<SubmittedPublicActionAttempt>,
+    attempt: &SubmittedPublicActionAttempt,
+) {
+    let attempt_id = attempts.len();
+    attempts.push(attempt.clone());
+    observer.register(attempt.tx_hash, attempt_id);
+}
+
 fn public_action_winner_gas_fee(
     attempts: &[SubmittedPublicActionAttempt],
     winner_index: usize,
@@ -522,8 +554,11 @@ pub(super) async fn submit_public_action_attempt(
     label: &str,
     event_tx: Option<&PublicActionSessionEventSender>,
     expiry_timestamp: Option<u64>,
+    log_transaction_details: bool,
+    before_broadcast: &mut (impl FnMut(&SubmittedPublicActionAttempt) -> Result<()> + Send),
 ) -> Result<SubmittedPublicActionAttempt, PublicActionAttemptError> {
-    let sent = sign_send_public_action_transaction(
+    let mut handed_off_attempt = None;
+    sign_send_public_action_transaction(
         query_rpc_pool,
         network_mode,
         signer,
@@ -531,29 +566,36 @@ pub(super) async fn submit_public_action_attempt(
         label,
         event_tx,
         expiry_timestamp,
+        log_transaction_details,
+        &mut |tx_hash| {
+            let attempt = SubmittedPublicActionAttempt {
+                tx_hash,
+                info: PublicActionAttemptInfo {
+                    tx_hash: alloy::hex::encode_prefixed(tx_hash),
+                    nonce: preflight.nonce,
+                    gas_limit: preflight.gas_limit,
+                    max_fee_per_gas: preflight.max_fee_per_gas,
+                    max_priority_fee_per_gas: preflight.max_priority_fee_per_gas,
+                },
+                rpc_gas_price: preflight.rpc_gas_price,
+                estimated_native_gas_cost: preflight.estimated_native_gas_cost,
+                live_native_balance: preflight.live_native_balance,
+            };
+            before_broadcast(&attempt)?;
+            handed_off_attempt = Some(attempt);
+            Ok(())
+        },
     )
     .await?;
-    let info = PublicActionAttemptInfo {
-        tx_hash: sent.tx_hash_string,
-        nonce: preflight.nonce,
-        gas_limit: preflight.gas_limit,
-        max_fee_per_gas: preflight.max_fee_per_gas,
-        max_priority_fee_per_gas: preflight.max_priority_fee_per_gas,
-    };
+    let attempt = handed_off_attempt.expect("successful broadcast has a registered attempt");
     emit_public_action_event(
         event_tx,
         PublicActionSessionEvent::AttemptSubmitted {
             step,
-            attempt: info.clone(),
+            attempt: attempt.info.clone(),
         },
     );
-    Ok(SubmittedPublicActionAttempt {
-        tx_hash: sent.tx_hash,
-        info,
-        rpc_gas_price: preflight.rpc_gas_price,
-        estimated_native_gas_cost: preflight.estimated_native_gas_cost,
-        live_native_balance: preflight.live_native_balance,
-    })
+    Ok(attempt)
 }
 
 pub(super) enum PublicActionAttemptError {
@@ -562,6 +604,12 @@ pub(super) enum PublicActionAttemptError {
 }
 
 impl PublicActionAttemptError {
+    pub(super) fn into_report(self) -> eyre::Report {
+        match self {
+            Self::Signing(error) | Self::Sending(error) => error,
+        }
+    }
+
     pub(super) fn message(&self) -> String {
         match self {
             Self::Signing(error) | Self::Sending(error) => report_chain_string(error),
@@ -622,17 +670,72 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
+    public_action_preflight_from_rpc_pool_with_mode_and_reads(
+        query_rpc_pool,
+        network_mode,
+        chain_id,
+        from,
+        base_tx_req,
+        gas_fee,
+        gas,
+        profile,
+        gas_limit_strategy,
+        authorized_gas_limit,
+        nonce,
+        gas_limit,
+        mode,
+        authorized_fee_ceiling,
+        railway_auto,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+    from: Address,
+    base_tx_req: TransactionRequest,
+    gas_fee: PublicActionGasFeeSelection,
+    gas: &EffectiveChainGasSettings,
+    profile: PublicShieldTransactionProfile,
+    gas_limit_strategy: PublicActionGasLimitStrategy,
+    authorized_gas_limit: Option<u64>,
+    nonce: Option<u64>,
+    gas_limit: Option<u64>,
+    mode: PublicActionPreflightMode,
+    authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
+    railway_auto: bool,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
+    if rpc_reads.is_some() && profile != PublicShieldTransactionProfile::Railoxide {
+        return Err(eyre!("admitted dapp reads require the Railoxide transaction profile").into());
+    }
     let quote = if mode.needs_fee_quote(gas_fee)
         && (profile != PublicShieldTransactionProfile::Railway || railway_auto)
     {
         Some(
-            super::gas::public_action_gas_fee_quote_from_rpc_pool_with_profile(
-                query_rpc_pool,
-                network_mode,
-                chain_id,
-                profile,
-            )
-            .await
+            match rpc_reads {
+                Some(reads) => {
+                    crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
+                        query_rpc_pool,
+                        network_mode,
+                        super::gas::public_action_tip_fallback(chain_id),
+                        Some((reads, chain_id)),
+                    )
+                    .await
+                }
+                None => {
+                    super::gas::public_action_gas_fee_quote_from_rpc_pool_with_profile(
+                        query_rpc_pool,
+                        network_mode,
+                        chain_id,
+                        profile,
+                    )
+                    .await
+                }
+            }
             .wrap_err("fetch public action gas price")?,
         )
     } else {
@@ -658,6 +761,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
             gas_limit,
             authorized_fee_ceiling,
             railway_auto,
+            rpc_reads,
         )
         .await
         {
@@ -666,7 +770,16 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
                 return Err(error);
             }
             Err(PublicActionPreflightError::Other(error)) => {
-                tracing::warn!(%error, "public action preflight failed");
+                if rpc_reads.is_some() {
+                    if error
+                        .downcast_ref::<crate::rpc_broker::RpcBrokerError>()
+                        .is_some_and(super::stops_dapp_read_retries)
+                    {
+                        return Err(PublicActionPreflightError::Other(error));
+                    }
+                } else {
+                    tracing::warn!(%error, "public action preflight failed");
+                }
                 last_error = Some(error);
             }
         }
@@ -697,6 +810,7 @@ async fn public_action_preflight(
     gas_limit: Option<u64>,
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
+    rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
     let provider = &provider_handle.provider;
     let resolved = resolve_public_action_gas_fee(chain_id, profile, gas_fee, quote)?;
@@ -720,10 +834,17 @@ async fn public_action_preflight(
     let nonce = if let Some(nonce) = nonce {
         nonce
     } else {
-        provider
-            .get_transaction_count(from)
-            .await
-            .wrap_err("fetch public action nonce")?
+        match rpc_reads {
+            Some(reads) => reads
+                .get_transaction_count(provider_handle.url.clone().into(), chain_id, from)
+                .await
+                .map_err(eyre::Report::new),
+            None => provider
+                .get_transaction_count(from)
+                .await
+                .map_err(eyre::Report::new),
+        }
+        .wrap_err("fetch public action nonce")?
     };
     let tx_req = if profile.uses_legacy_envelope(chain_id) {
         public_action_legacy_transaction_request(
@@ -755,10 +876,10 @@ async fn public_action_preflight(
         }
     });
     let gas_limit = if let Some(authorized_gas_limit) = authorized_gas_limit {
-        let estimated_gas = provider
-            .estimate_gas(tx_req.clone())
-            .await
-            .wrap_err("re-estimate authorized advanced public transaction gas")?;
+        let estimated_gas =
+            public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
+                .await
+                .wrap_err("re-estimate authorized advanced public transaction gas")?;
         ensure_advanced_gas_estimate_authorized(estimated_gas, authorized_gas_limit)?;
         authorized_gas_limit
     } else if let Some(gas_limit) = gas_limit {
@@ -766,14 +887,14 @@ async fn public_action_preflight(
     } else {
         match gas_limit_strategy {
             PublicActionGasLimitStrategy::RailwayNativeFixed => 6_000_000,
-            PublicActionGasLimitStrategy::ChainBuffer => provider
-                .estimate_gas(tx_req.clone())
-                .await
-                .wrap_err("estimate public action gas")?
-                .saturating_add(gas.gas_limit_buffer),
+            PublicActionGasLimitStrategy::ChainBuffer => {
+                public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
+                    .await
+                    .wrap_err("estimate public action gas")?
+                    .saturating_add(gas.gas_limit_buffer)
+            }
             PublicActionGasLimitStrategy::RailwayEstimate120 => super::gas::railway_gas_limit(
-                provider
-                    .estimate_gas(tx_req.clone())
+                public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
                     .await
                     .wrap_err("estimate public action gas")?,
             ),
@@ -781,10 +902,14 @@ async fn public_action_preflight(
     };
     let estimated_native_gas_cost =
         public_action_native_exposure(tx_req.value.unwrap_or_default(), gas_limit, max_fee_per_gas);
-    let live_native_balance = provider
-        .get_balance(from)
-        .await
-        .wrap_err("fetch public action native balance")?;
+    let live_native_balance = match rpc_reads {
+        Some(reads) => reads
+            .get_balance(provider_handle.url.clone().into(), chain_id, from)
+            .await
+            .map_err(eyre::Report::new),
+        None => provider.get_balance(from).await.map_err(eyre::Report::new),
+    }
+    .wrap_err("fetch public action native balance")?;
     if live_native_balance < estimated_native_gas_cost {
         let action = if authorized_gas_limit.is_some() {
             "advanced public transaction"
@@ -805,6 +930,25 @@ async fn public_action_preflight(
         estimated_native_gas_cost,
         live_native_balance,
     })
+}
+
+async fn public_action_estimate_gas(
+    provider: &ProviderHandle,
+    chain_id: u64,
+    tx: &TransactionRequest,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> Result<u64> {
+    match rpc_reads {
+        Some(reads) => reads
+            .estimate_gas(provider.url.clone().into(), chain_id, tx)
+            .await
+            .map_err(eyre::Report::new),
+        None => provider
+            .provider
+            .estimate_gas(tx.clone())
+            .await
+            .map_err(eyre::Report::new),
+    }
 }
 
 pub(super) fn public_action_eip1559_transaction_request(
@@ -931,14 +1075,18 @@ async fn sign_send_public_action_transaction(
     label: &str,
     event_tx: Option<&PublicActionSessionEventSender>,
     expiry_timestamp: Option<u64>,
-) -> Result<PublicActionSentTx, PublicActionAttemptError> {
-    tracing::info!(
-        from = %tx_req.from.unwrap_or_default(),
-        to = ?tx_req.to,
-        gas = ?tx_req.gas,
-        label,
-        "signing and sending public action transaction",
-    );
+    log_transaction_details: bool,
+    before_broadcast: &mut (impl FnMut(FixedBytes<32>) -> Result<()> + Send),
+) -> Result<(), PublicActionAttemptError> {
+    if log_transaction_details {
+        tracing::info!(
+            from = %tx_req.from.unwrap_or_default(),
+            to = ?tx_req.to,
+            gas = ?tx_req.gas,
+            label,
+            "signing and sending public action transaction",
+        );
+    }
     let signed_tx = signer
         .sign_transaction_request(tx_req, label)
         .await
@@ -946,24 +1094,45 @@ async fn sign_send_public_action_transaction(
     emit_refreshed_public_action_hardware_session(event_tx, signer);
     // Stop/abort requested during synchronous hardware approval is observed here before RPC broadcast.
     public_action_before_raw_broadcast_checkpoint().await;
+    broadcast_signed_public_action_transaction(
+        query_rpc_pool,
+        network_mode,
+        signed_tx,
+        label,
+        expiry_timestamp,
+        log_transaction_details,
+        before_broadcast,
+    )
+    .await
+}
+
+async fn broadcast_signed_public_action_transaction(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    signed_tx: Vec<u8>,
+    label: &str,
+    expiry_timestamp: Option<u64>,
+    log_transaction_details: bool,
+    before_broadcast: &mut (impl FnMut(FixedBytes<32>) -> Result<()> + Send),
+) -> Result<(), PublicActionAttemptError> {
     ensure_public_action_broadcast_not_expired(expiry_timestamp, label)
         .map_err(PublicActionAttemptError::Sending)?;
     let tx_hash = keccak256(&signed_tx);
-    let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
+    before_broadcast(tx_hash).map_err(PublicActionAttemptError::Sending)?;
+    let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
         query_rpc_pool,
         network_mode,
         signed_tx,
         tx_hash,
+        log_transaction_details,
     )
     .await
     .wrap_err_with(|| format!("{label}: send"))
     .map_err(PublicActionAttemptError::Sending)?;
-    let tx_hash_string = alloy::hex::encode_prefixed(tx_hash);
-    tracing::info!(%tx_hash, providers = provider_handles.len(), label, "sent public action transaction");
-    Ok(PublicActionSentTx {
-        tx_hash,
-        tx_hash_string,
-    })
+    if log_transaction_details {
+        tracing::info!(%tx_hash, providers = provider_handles.len(), label, "sent public action transaction");
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_public_action_broadcast_not_expired(
@@ -1039,5 +1208,115 @@ pub(super) const fn public_action_progress_update(
         status,
         tx_hash,
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PublicTransactionLookup;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn broadcast_handoff_retains_ambiguous_attempt_before_replacement() {
+        let (tracker, context) = crate::public_wallet::test_tracking_context();
+        let observed_tracker = tracker.clone();
+        let original = vec![1_u8];
+        let replacement = vec![2_u8];
+        let original_hash = keccak256(&original);
+        let replacement_hash = keccak256(&replacement);
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request| {
+                if request["method"] == "eth_blockNumber" {
+                    return json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"});
+                }
+                assert_eq!(request["method"], "eth_sendRawTransaction");
+                let bytes = alloy::hex::decode(request["params"][0].as_str().unwrap()).unwrap();
+                let hash = keccak256(bytes);
+                assert_eq!(
+                    observed_tracker.lookup(1, hash),
+                    PublicTransactionLookup::Pending
+                );
+                if hash == original_hash {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+                        "code": -32000, "message": "submission outcome unavailable"
+                    }})
+                } else {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": hash})
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let http = HttpContext::direct_for_tests();
+        let pool = crate::query_rpc_pool_with_http_client(vec![endpoint.clone()], &http);
+        let mut observer = BlockObserver::establish(pool, 1, http.rpc_broker(), 1)
+            .await
+            .unwrap()
+            .with_tracking(&context);
+        let mut attempts = Vec::new();
+        for (signed, fee, expiry) in [
+            (original.clone(), 10, Some(0)),
+            (original, 10, None),
+            (replacement, 20, None),
+        ] {
+            let pool = crate::query_rpc_pool_with_http_client(vec![endpoint.clone()], &http);
+            let result = broadcast_signed_public_action_transaction(
+                &pool,
+                http.network_mode(),
+                signed,
+                "test broadcast",
+                expiry,
+                true,
+                &mut |tx_hash| {
+                    retain_public_action_attempt(
+                        &mut observer,
+                        &mut attempts,
+                        &SubmittedPublicActionAttempt {
+                            tx_hash,
+                            info: PublicActionAttemptInfo {
+                                tx_hash: alloy::hex::encode_prefixed(tx_hash),
+                                nonce: 7,
+                                gas_limit: 21_000,
+                                max_fee_per_gas: fee,
+                                max_priority_fee_per_gas: fee / 2,
+                            },
+                            rpc_gas_price: fee,
+                            estimated_native_gas_cost: U256::ZERO,
+                            live_native_balance: U256::ZERO,
+                        },
+                    );
+                    Ok(())
+                },
+            )
+            .await;
+            if expiry.is_some() {
+                assert!(matches!(result, Err(PublicActionAttemptError::Sending(_))));
+                assert!(attempts.is_empty());
+                assert_eq!(
+                    tracker.lookup(1, original_hash),
+                    PublicTransactionLookup::Untracked
+                );
+            } else if fee == 10 {
+                assert!(matches!(result, Err(PublicActionAttemptError::Sending(_))));
+                assert_eq!(attempts.len(), 1);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].tx_hash, original_hash);
+        assert_eq!(attempts[1].tx_hash, replacement_hash);
+        for (winner, fee) in [(0, 10), (1, 20)] {
+            assert_eq!(
+                public_action_winner_gas_fee(&attempts, winner),
+                PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: fee,
+                    max_priority_fee_per_gas: fee / 2,
+                },
+            );
+        }
+        server.abort();
     }
 }

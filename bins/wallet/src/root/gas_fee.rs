@@ -1,38 +1,27 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, ParentElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, Sizable, Size, StyleSized,
-    button::{Button, ButtonGroup, ButtonVariants},
+    Disableable,
     input::{InputEvent, InputState},
 };
-use ui::controls::{app_inline_control_row, app_input, app_muted_text, app_segment_button};
+use ui::controls::{app_input, app_muted_text};
 use ui::theme;
 use wallet_ops::{SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection};
 
-use crate::assets::RailgunActionIcon;
-
 use super::{
-    DeliveryFormKind, UnshieldAssetKey, WalletRoot, app_refresh_button, labeled_field,
-    private_action::private_action_input, public_action::PublicActionMode,
+    DeliveryFormKind, UnshieldAssetKey, WalletRoot, labeled_field, public_action::PublicActionMode,
 };
 
 const GWEI_WEI: u128 = 1_000_000_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Eip1559GasFeeMode {
-    Auto,
-    Custom,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Eip1559GasFeeEditTarget {
-    MaxFee,
-    MaxTip,
-}
+pub(super) use ui::gas_fee::{
+    GasFeeEditTarget as Eip1559GasFeeEditTarget, GasFeeMode as Eip1559GasFeeMode,
+};
+use ui::gas_fee::{GasFeeEditor, GasFeeEditorEvent};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Eip1559GasFeeTarget {
@@ -340,60 +329,46 @@ pub(super) fn render_eip1559_gas_fee_editor(
     state: &Eip1559GasFeeEditorState,
     disabled: bool,
 ) -> gpui::Div {
-    let mode_root = root.clone();
-    let refresh_root = root.clone();
-    let auto_selected = state.mode == Eip1559GasFeeMode::Auto;
-    let custom_selected = state.mode == Eip1559GasFeeMode::Custom;
     let target_id = gas_fee_target_id(target);
-    let mode_target = target.clone();
-
+    let target = target.clone();
     div()
         .flex()
         .flex_col()
         .gap_2()
-        .child(app_inline_control_row(
-            "Gas fee",
-            ButtonGroup::new(SharedString::from(format!(
-                "wallet-eip1559-gas-mode-{target_id}"
-            )))
-            .outline()
-            .compact()
-            .disabled(disabled)
-            .child(app_segment_button(
-                SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
-                "Auto",
-                auto_selected,
-                disabled,
-                Some(render_auto_refresh_button(
-                    refresh_root,
-                    SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
-                    target.clone(),
-                    auto_selected && state.refreshing,
-                    auto_selected && !disabled && !state.refreshing,
-                )),
-            ))
-            .child(app_segment_button(
-                SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
-                "Custom",
-                custom_selected,
-                disabled,
-                None,
-            ))
-            .on_click(move |selected, window, cx| {
-                let Some(index) = selected.first() else {
-                    return;
-                };
-                let mode = if *index == 0 {
-                    Eip1559GasFeeMode::Auto
-                } else {
-                    Eip1559GasFeeMode::Custom
-                };
-                mode_root.update(cx, |root, cx| {
-                    root.set_eip1559_gas_fee_mode(mode_target.clone(), mode, window, cx);
-                });
-            }),
-        ))
-        .child(render_gas_fee_inputs(root, target, state, disabled))
+        .child(
+            GasFeeEditor::new(
+                format!("wallet-eip1559-gas-{target_id}"),
+                &state.max_fee_input,
+                &state.max_priority_fee_input,
+                move |event, window, cx| {
+                    root.update(cx, |root, cx| match *event {
+                        GasFeeEditorEvent::Mode(mode) => {
+                            root.set_eip1559_gas_fee_mode(target.clone(), mode, window, cx);
+                        }
+                        GasFeeEditorEvent::Refresh => {
+                            root.refresh_eip1559_gas_fee_quote(target.clone(), cx);
+                        }
+                        GasFeeEditorEvent::Edit(field) => {
+                            root.customize_eip1559_gas_fee_from_auto(
+                                target.clone(),
+                                field,
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                },
+            )
+            .mode(state.mode)
+            .quote(state.quote.map(|quote| {
+                (
+                    format_gwei(quote.suggested_max_fee_per_gas),
+                    format_gwei(quote.suggested_max_priority_fee_per_gas),
+                )
+            }))
+            .refreshing(state.refreshing)
+            .disabled(disabled),
+        )
         .when_some(state.error.as_ref(), |this, error| {
             this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
         })
@@ -405,149 +380,6 @@ pub(super) fn render_eip1559_gas_fee_editor(
             };
             this.child(app_muted_text(error.to_string()).text_color(rgb(color)))
         })
-}
-
-fn render_auto_refresh_button(
-    root: Entity<WalletRoot>,
-    id: SharedString,
-    target: Eip1559GasFeeTarget,
-    refreshing: bool,
-    enabled: bool,
-) -> gpui::AnyElement {
-    app_refresh_button(
-        id,
-        "Refresh gas price hint",
-        refreshing,
-        enabled,
-        move |_window, cx| {
-            root.update(cx, |root, cx| {
-                root.refresh_eip1559_gas_fee_quote(target.clone(), cx);
-            });
-        },
-    )
-    .opacity(if enabled || refreshing { 1.0 } else { 0.45 })
-    .into_any_element()
-}
-
-fn render_gas_fee_inputs(
-    root: Entity<WalletRoot>,
-    target: &Eip1559GasFeeTarget,
-    state: &Eip1559GasFeeEditorState,
-    disabled: bool,
-) -> gpui::Div {
-    let auto_selected = state.mode == Eip1559GasFeeMode::Auto;
-    let edit_enabled = !disabled && state.quote.is_some();
-    let auto_max_fee = state.quote.map_or_else(
-        || SharedString::from("unavailable"),
-        |quote| SharedString::from(format_gwei(quote.suggested_max_fee_per_gas)),
-    );
-    let auto_max_tip = state.quote.map_or_else(
-        || SharedString::from("unavailable"),
-        |quote| SharedString::from(format_gwei(quote.suggested_max_priority_fee_per_gas)),
-    );
-    let target_id = gas_fee_target_id(target);
-    div()
-        .flex()
-        .flex_wrap()
-        .items_end()
-        .gap_3()
-        .child(render_gas_fee_input_slot(
-            "Max fee (gwei)",
-            if auto_selected {
-                render_auto_gas_fee_value(
-                    auto_max_fee,
-                    Some(render_auto_gas_fee_edit_button(
-                        root.clone(),
-                        SharedString::from(format!("wallet-eip1559-gas-edit-max-fee-{target_id}")),
-                        target.clone(),
-                        Eip1559GasFeeEditTarget::MaxFee,
-                        edit_enabled,
-                    )),
-                )
-                .into_any_element()
-            } else {
-                private_action_input(&state.max_fee_input)
-                    .text_color(rgb(theme::TEXT))
-                    .disabled(disabled)
-                    .into_any_element()
-            },
-        ))
-        .child(render_gas_fee_input_slot(
-            "Max tip (gwei)",
-            if auto_selected {
-                render_auto_gas_fee_value(
-                    auto_max_tip,
-                    Some(render_auto_gas_fee_edit_button(
-                        root,
-                        SharedString::from(format!("wallet-eip1559-gas-edit-max-tip-{target_id}")),
-                        target.clone(),
-                        Eip1559GasFeeEditTarget::MaxTip,
-                        edit_enabled,
-                    )),
-                )
-                .into_any_element()
-            } else {
-                private_action_input(&state.max_priority_fee_input)
-                    .text_color(rgb(theme::TEXT))
-                    .disabled(disabled)
-                    .into_any_element()
-            },
-        ))
-}
-
-fn render_gas_fee_input_slot(label: &'static str, input: gpui::AnyElement) -> gpui::Div {
-    labeled_field(label, input).flex_1().min_w(px(150.0))
-}
-
-fn render_auto_gas_fee_value(
-    value: impl Into<SharedString>,
-    accessory: Option<gpui::AnyElement>,
-) -> gpui::Div {
-    div()
-        .w_full()
-        .input_h(Size::Medium)
-        .px(px(12.0))
-        .py(px(8.0))
-        .flex()
-        .items_center()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .text_size(theme::APP_TEXT_SIZE)
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(value.into())
-        .child(div().flex_1())
-        .children(accessory)
-}
-
-fn render_auto_gas_fee_edit_button(
-    root: Entity<WalletRoot>,
-    id: SharedString,
-    gas_target: Eip1559GasFeeTarget,
-    edit_target: Eip1559GasFeeEditTarget,
-    enabled: bool,
-) -> gpui::AnyElement {
-    Button::new(id)
-        .icon(Icon::new(RailgunActionIcon::Pencil))
-        .ghost()
-        .xsmall()
-        .compact()
-        .accessibility_label("Customize gas fee")
-        .tooltip("Customize gas fee")
-        .disabled(!enabled)
-        .on_click(move |_event, window, cx| {
-            cx.stop_propagation();
-            root.update(cx, |root, cx| {
-                root.customize_eip1559_gas_fee_from_auto(
-                    gas_target.clone(),
-                    edit_target,
-                    window,
-                    cx,
-                );
-            });
-        })
-        .into_any_element()
 }
 
 fn gas_fee_target_id(target: &Eip1559GasFeeTarget) -> String {

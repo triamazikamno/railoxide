@@ -1,0 +1,27 @@
+[package]
+name = "browser-frontend"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+alloy = { workspace = true }
+railgun-ui = { path = "../railgun-ui" }
+serde_json = { workspace = true }
+gpui = { workspace = true }
+gpui-kit = { workspace = true }
+gpui-component = { workspace = true }
+gpui-kit-assets = { workspace = true }
+js-sys = "=0.3.103"
+ui = { path = "../ui" }
+wasm-bindgen = "=0.2.126"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

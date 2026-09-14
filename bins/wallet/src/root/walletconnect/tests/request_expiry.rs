@@ -137,10 +137,11 @@ async fn expired_approval_task_publishes_expired_response() {
     ));
     let mut request =
         test_walletconnect_request("session-topic:expired", Some(current_unix_seconds()));
-    request.session.selected_public_account_uuid = "public-account".to_owned();
+    request.binding.public_account_uuid = "public-account".to_owned();
     let request_id = request.item.id;
-    let session_topic = request.session.session_topic.clone();
-    let sym_key = request.session.keys.sym_key;
+    let session = test_walletconnect_session("session-topic");
+    let session_topic = session.session_topic.clone();
+    let sym_key = session.keys.sym_key;
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let context = WalletConnectClientContext {
         worker: WalletConnectRelayWorkerHandle {
@@ -149,6 +150,8 @@ async fn expired_approval_task_publishes_expired_response() {
             command_tx,
         },
     };
+    let response_sender = WalletConnectRequestRoute::from_session(&session)
+        .response_sender(context.worker, request_id);
     let http = wallet_ops::build_http_client(None).expect("direct http context");
 
     let task_store = Arc::clone(&store);
@@ -163,9 +166,10 @@ async fn expired_approval_task_publishes_expired_response() {
             None,
             None,
             None,
-            context,
+            response_sender,
             http,
             false,
+            None,
             None,
             None,
         ))

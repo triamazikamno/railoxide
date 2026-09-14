@@ -8,7 +8,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
+    Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,

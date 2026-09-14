@@ -21,7 +21,8 @@ mod scheduler;
 #[cfg(test)]
 pub(crate) mod tests;
 pub use broker::RpcBroker;
-pub(crate) use model::total_failure;
+pub(crate) use model::RpcBrokerViewCalls;
+pub(crate) use model::{BalanceRead, TransactionHashRead, total_failure};
 pub use model::{
     FailureClass, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute, RpcOrigin, RpcOriginError,
     RpcRead, RpcReadValidationError, RpcRemoteError, RpcResult, RpcRevert, RpcRoute, RpcSubmission,

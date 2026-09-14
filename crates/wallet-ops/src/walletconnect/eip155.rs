@@ -17,6 +17,10 @@ pub enum WalletConnectSupportedMethod {
     EthSignTypedData,
     EthSignTypedDataV4,
     WalletSwitchEthereumChain,
+    /// Native gateway policy; excluded from `WalletConnect` parsing and namespaces.
+    WalletAddEthereumChain,
+    /// Native gateway policy; excluded from `WalletConnect` parsing and namespaces.
+    WalletWatchAsset,
 }
 
 impl WalletConnectSupportedMethod {
@@ -29,6 +33,8 @@ impl WalletConnectSupportedMethod {
             Self::EthSendTransaction => "eth_sendTransaction",
             Self::EthSignTypedData => "eth_signTypedData",
             Self::EthSignTypedDataV4 => "eth_signTypedData_v4",
+            Self::WalletAddEthereumChain => "wallet_addEthereumChain",
+            Self::WalletWatchAsset => "wallet_watchAsset",
             Self::WalletSwitchEthereumChain => "wallet_switchEthereumChain",
         }
     }

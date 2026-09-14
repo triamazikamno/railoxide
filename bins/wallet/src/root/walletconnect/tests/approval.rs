@@ -232,8 +232,8 @@ fn walletconnect_hash_fallback_mode_uses_request_session_account() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.account_source = PublicAccountSource::HardwareDerived;
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
-    request.session.selected_public_account_uuid = "hardware-account-a".to_owned();
-    request.session.selected_public_account_scope = PublicAccountScope::Global;
+    request.binding.public_account_uuid = "hardware-account-a".to_owned();
+    request.binding.public_account_scope = PublicAccountScope::Global;
     let other_account = PublicAccountMetadata {
         public_account_uuid: "selected-account-b".to_owned(),
         address: alloy::primitives::Address::from([0x22; 20]),
@@ -436,5 +436,245 @@ fn personal_sign_message_bytes_decode_only_explicit_hex_prefix() {
     assert_eq!(
         walletconnect_personal_message_bytes("deadbeef"),
         b"deadbeef"
+    );
+}
+
+#[test]
+fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
+    use super::super::intent::{WalletConnectIntentContext, build_walletconnect_intent};
+    use wallet_ops::dapp_request::DappRequestControl;
+    use wallet_ops::gateway::GatewayApprovalRequest;
+    use wallet_ops::settings::{
+        EffectiveTokenRegistry, WalletSettings, build_effective_chain_configs,
+    };
+    use wallet_ops::vault::GatewayPermission;
+
+    let account = PublicAccountMetadata {
+        public_account_uuid: "approved-account".to_owned(),
+        address: alloy::primitives::Address::from([0x11; 20]),
+        label: None,
+        source: PublicAccountSource::Imported,
+        scope: PublicAccountScope::Global,
+        derivation_index: None,
+        hardware_descriptor: None,
+        status: PublicAccountStatus::Active,
+        display_order: 0,
+    };
+    let origin =
+        wallet_ops::RpcOrigin::dapp("paired-browser", "https://example.com/path?q=1#fragment")
+            .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
+    let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+    let registry = EffectiveTokenRegistry {
+        tokens: BTreeMap::new(),
+    };
+    let rates = TokenAnchorRateCache::new();
+    let accounts = [account.clone()];
+    let context = WalletConnectIntentContext {
+        chain: &chains[&1],
+        selected_chain_id: 1,
+        token_registry: &registry,
+        anchor_rates: &rates,
+        public_accounts: &accounts,
+        public_address_book: &[],
+    };
+    let typed_data = json!({
+        "types": {"EIP712Domain": [{"name":"chainId","type":"uint256"}], "Message": [{"name":"contents","type":"string"}]},
+        "domain": {"chainId": 1}, "primaryType": "Message", "message": {"contents": "Approve this message"}
+    });
+    for (method, params) in [
+        ("personal_sign", json!(["0x68656c6c6f", account.address])),
+        ("eth_signTypedData_v4", json!([account.address, typed_data])),
+    ] {
+        let parsed = wallet_ops::walletconnect::parse_dapp_request_for_account(
+            0,
+            method,
+            &params,
+            account.address,
+        )
+        .unwrap();
+        let control = DappRequestControl::new(deadline, || Ok(()));
+        let approval = GatewayApprovalRequest {
+            id: format!("opaque-{method}"),
+            deadline,
+            origin: origin.clone(),
+            permission: GatewayPermission {
+                permission_id: "grant".to_owned(),
+                origin: origin.clone(),
+                public_account_uuid: account.public_account_uuid.clone(),
+                public_account_scope: account.scope.clone(),
+                owning_private_wallet_uuid: None,
+                chain_id: 1,
+            },
+            account: account.clone(),
+            chain_id: 1,
+            parsed: parsed.clone(),
+            control: control.clone(),
+        };
+        let reads = || {
+            wallet_ops::DappRpcReadClient::new(|_, _| {
+                Box::pin(async { panic!("intent rendering must not read RPC") })
+            })
+        };
+        let request = super::super::root::gateway_pending_request(&approval, reads()).unwrap();
+        let mut legacy =
+            test_walletconnect_request("session-topic:7", request.item.expiry_timestamp);
+        legacy.parsed = parsed.clone();
+        legacy.item = parsed
+            .pending_approval(
+                7,
+                "session-topic",
+                "Example",
+                "eip155:1",
+                account.address,
+                request.item.expiry_timestamp,
+            )
+            .unwrap();
+        let native_intent = build_walletconnect_intent(&request, context);
+        let legacy_intent = build_walletconnect_intent(&legacy, context);
+        assert_eq!(native_intent.action, legacy_intent.action);
+        assert_eq!(native_intent.hero, legacy_intent.hero);
+        assert_eq!(native_intent.risks, legacy_intent.risks);
+        assert_eq!(request.item.raw_details, legacy.item.raw_details);
+        assert_eq!(
+            request.binding.public_account_uuid,
+            account.public_account_uuid
+        );
+        let support = WalletConnectNamespaceAccountSupport::for_account_source(account.source);
+        assert!(
+            wallet_ops::walletconnect::validate_dapp_request_account(
+                &request.parsed,
+                &account,
+                1,
+                support
+            )
+            .is_ok()
+        );
+        let mut changed_account = account.clone();
+        changed_account.address = alloy::primitives::Address::from([0x22; 20]);
+        assert_eq!(
+            wallet_ops::walletconnect::validate_dapp_request_account(
+                &request.parsed,
+                &changed_account,
+                1,
+                support
+            ),
+            Err(wallet_ops::walletconnect::DappRequestValidationError::AccountMismatch)
+        );
+        assert_eq!(
+            request.binding.peer_url,
+            "https://example.com/path?q=1#fragment"
+        );
+        assert_eq!(request.binding.peer_name, "paired-browser");
+        assert!(
+            request
+                .session_identity
+                .walletconnect_session_id()
+                .is_none()
+        );
+        assert!(
+            request.approval_admitted(u64::MAX),
+            "wall clock must not expire native authority"
+        );
+        let queued = BTreeMap::from([(request.key.clone(), request.clone())]);
+        assert!(!walletconnect_request_should_queue(
+            &queued,
+            &BTreeSet::new(),
+            &request.key
+        ));
+        control.invalidate(&wallet_ops::RpcBrokerError::OriginRejected);
+        assert!(!request.is_current());
+        assert!(super::super::root::gateway_pending_request(&approval, reads()).is_none());
+        assert_eq!(
+            expired_walletconnect_request_keys(&queued, &BTreeSet::new(), 0),
+            vec![request.key]
+        );
+    }
+}
+
+#[test]
+fn gateway_errors_use_typed_failures_and_ignore_remote_rejection_text() {
+    use wallet_ops::gateway::{GatewayApprovalFailure, LocalProviderFailure};
+    let mut request = test_walletconnect_request("gateway:opaque", None);
+    request.parsed = parse_walletconnect_session_request(
+        0,
+        "eth_sendTransaction",
+        &json!([{"from": request.item.account, "to": request.item.account}]),
+    )
+    .unwrap();
+    assert_eq!(
+        gateway_approval_error(&request, &eyre::eyre!("User rejected: upstream said 4001")),
+        GatewayApprovalFailure::Local(LocalProviderFailure::TransactionRejected)
+    );
+    assert_eq!(
+        gateway_approval_error(
+            &request,
+            &eyre::Report::new(wallet_ops::RpcBrokerError::OriginRejected)
+        ),
+        GatewayApprovalFailure::Broker(wallet_ops::RpcBrokerError::OriginRejected)
+    );
+    assert_eq!(
+        gateway_approval_error(
+            &request,
+            &eyre::Report::new(
+                wallet_ops::hardware::HardwareDerivationError::RequestAuthority(
+                    wallet_ops::RpcBrokerError::OriginRejected
+                )
+            )
+            .wrap_err("hardware signing")
+        ),
+        GatewayApprovalFailure::Broker(wallet_ops::RpcBrokerError::OriginRejected)
+    );
+    assert_eq!(
+        gateway_approval_error(
+            &request,
+            &eyre::Report::new(wallet_ops::vault::VaultError::UnlockFailed)
+        ),
+        GatewayApprovalFailure::Local(LocalProviderFailure::Unauthorized)
+    );
+    let remote = wallet_ops::RpcBrokerError::Remote(wallet_ops::RpcRemoteError::from(
+        serde_json::from_value::<
+            alloy::serde::WithOtherFields<alloy::rpc::json_rpc::ErrorPayload<serde_json::Value>>,
+        >(json!({"code": 4001, "message": "remote rejection",
+            "data": {"details": [1, false]}, "extension": "preserved"}))
+        .unwrap(),
+    ));
+    assert_eq!(
+        gateway_approval_error(
+            &request,
+            &eyre::Report::new(remote.clone()).wrap_err("nonce preflight")
+        ),
+        GatewayApprovalFailure::Broker(remote)
+    );
+    let unsupported = gateway_approval_error(
+        &request,
+        &eyre::Report::new(WalletConnectError::UnsupportedMethod(
+            "eth_signTypedData_v4".into(),
+        ))
+        .wrap_err("hardware capability"),
+    );
+    assert_eq!(
+        unsupported,
+        GatewayApprovalFailure::Local(LocalProviderFailure::Unsupported)
+    );
+    if let GatewayApprovalFailure::Local(failure) = unsupported {
+        assert_eq!(
+            wallet_ops::gateway::ProviderRpcError::local(failure).expose_value()["code"],
+            4200
+        );
+    }
+    #[cfg(feature = "hardware")]
+    assert_eq!(
+        gateway_approval_error(
+            &request,
+            &eyre::Report::new(
+                wallet_ops::hardware::HardwareDerivationError::LedgerStatus {
+                    operation: "sign",
+                    status: 0x6985,
+                    message: "Device rejected request",
+                }
+            )
+        ),
+        GatewayApprovalFailure::Local(LocalProviderFailure::UserRejected)
     );
 }

@@ -1948,6 +1948,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
     .await?;
     let outcome = submit_prepared_sponsored_self_broadcast(
         DesktopPreparedSponsoredSelfBroadcastRequest {
+            transaction_tracking: request.transaction_tracking,
             chain_id: request.chain_id,
             effective_chain: request.effective_chain,
             view_session: request.view_session,
@@ -1998,6 +1999,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
     .await?;
     let outcome = submit_prepared_sponsored_self_broadcast(
         DesktopPreparedSponsoredSelfBroadcastRequest {
+            transaction_tracking: request.transaction_tracking,
             chain_id: request.chain_id,
             effective_chain: request.effective_chain,
             view_session: request.view_session,
@@ -2532,6 +2534,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
     }
     let pending_spent_inputs = prepared.plan.input_utxos();
     let mut result = submit_self_broadcast_plan(
+        request.transaction_tracking.as_ref(),
         request.chain_id,
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
@@ -2584,6 +2587,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
     submit_self_broadcast_plan(
+        request.transaction_tracking.as_ref(),
         request.chain_id,
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
@@ -2650,6 +2654,7 @@ pub async fn submit_desktop_send_self_broadcast(
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
     submit_self_broadcast_plan(
+        request.transaction_tracking.as_ref(),
         request.chain_id,
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use gpui_component::{
     Icon, IconName, Sizable, WindowExt,
@@ -19,9 +19,7 @@ use ui::{icons, theme};
 use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSource};
 
-use crate::assets::{
-    LEDGER_LOGO_SHORT_WHITE_ICON_PATH, RailgunActionIcon, TREZOR_SYMBOL_WHITE_ICON_PATH,
-};
+use crate::assets::RailgunActionIcon;
 use crate::root::ui_helpers::dialog_footer;
 
 use super::key_export::WALLET_EXPORT_MENU_LABEL;
@@ -411,7 +409,7 @@ impl WalletRoot {
 
     #[cfg(feature = "hardware")]
     #[allow(clippy::unused_self)]
-    fn active_hardware_profile_metadata(
+    pub(super) fn active_hardware_profile_metadata(
         &self,
         wallet: &WalletMetadataBundle,
     ) -> Option<&HardwareProfileMetadata> {
@@ -429,7 +427,7 @@ impl WalletRoot {
 
     #[cfg(not(feature = "hardware"))]
     #[allow(clippy::unused_self)]
-    const fn active_hardware_profile_metadata(
+    pub(super) const fn active_hardware_profile_metadata(
         &self,
         wallet: &WalletMetadataBundle,
     ) -> Option<&HardwareProfileMetadata> {
@@ -439,54 +437,20 @@ impl WalletRoot {
 }
 
 fn chain_label_row(chain_id: u64) -> impl IntoElement {
-    let label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
-    let mut row = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_color(rgb(theme::TEXT))
-        .text_size(APP_TEXT_SIZE);
-    if let Some(path) = chain_icon_asset_path(chain_id) {
-        row = row.child(img(path).size(px(16.0)).flex_none());
-    }
-    row.child(SharedString::from(label))
+    ui::wallet_identity::chain_label_row(
+        chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned),
+        chain_icon_asset_path(chain_id),
+    )
 }
 
 fn wallet_label_row(label: SharedString, device_kind: Option<HardwareDeviceKind>) -> gpui::Div {
-    let row = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_color(rgb(theme::TEXT))
-        .text_size(APP_TEXT_SIZE)
-        .child(wallet_label_icon(device_kind));
-
-    row.child(label)
-}
-
-fn wallet_label_icon(device_kind: Option<HardwareDeviceKind>) -> impl IntoElement {
-    let icon = match device_kind {
-        Some(HardwareDeviceKind::Ledger) => img(LEDGER_LOGO_SHORT_WHITE_ICON_PATH)
-            .h(px(19.0))
-            .flex_none()
-            .into_any_element(),
-        Some(HardwareDeviceKind::Trezor) => img(TREZOR_SYMBOL_WHITE_ICON_PATH)
-            .h(px(22.0))
-            .flex_none()
-            .into_any_element(),
-        _ => img(icons::wallet_icon_path())
-            .size(px(22.0))
-            .flex_none()
-            .into_any_element(),
-    };
-
-    div()
-        .size(px(22.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(icon)
+    ui::wallet_identity::wallet_label_row(
+        label,
+        device_kind.map(|kind| match kind {
+            HardwareDeviceKind::Ledger => "ledger",
+            HardwareDeviceKind::Trezor => "trezor",
+        }),
+    )
 }
 
 fn render_hardware_wallet_chip(info: HardwareWalletDisplayInfo) -> impl IntoElement {

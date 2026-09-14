@@ -77,6 +77,8 @@ pub enum VaultError {
     UnlockFailed,
     #[error("spend grant is invalid")]
     InvalidSpendGrant,
+    #[error("invalid gateway permission")]
+    InvalidGatewayPermission,
     #[error("software seed session binding mismatch")]
     SoftwareSeedSessionBindingMismatch,
     #[error("protected software seed session is required")]
@@ -241,6 +243,7 @@ pub enum RecordKind {
     WalletConnectRelayIdentity,
     WalletConnectSession,
     SoftwareContextSeed,
+    GatewayPermission,
 }
 
 impl RecordKind {
@@ -270,6 +273,7 @@ impl RecordKind {
             Self::WalletConnectRelayIdentity => "walletconnect-relay-identity",
             Self::WalletConnectSession => "walletconnect-session",
             Self::SoftwareContextSeed => "software-context-seed",
+            Self::GatewayPermission => "gateway-permission",
         }
     }
 

@@ -311,9 +311,11 @@ pub(in crate::root) fn render_public_action_step_marker(
             PublicActionStepStatus::Done => {
                 Icon::new(IconName::CircleCheck).small().into_any_element()
             }
-            PublicActionStepStatus::Error => Icon::new(IconName::TriangleAlert)
-                .small()
-                .into_any_element(),
+            PublicActionStepStatus::Error | PublicActionStepStatus::Warning => {
+                Icon::new(IconName::TriangleAlert)
+                    .small()
+                    .into_any_element()
+            }
             PublicActionStepStatus::Stopped => Icon::new(RailgunActionIcon::Square)
                 .small()
                 .into_any_element(),
@@ -350,7 +352,7 @@ pub(in crate::root) fn render_public_action_step_hash(
 pub(in crate::root) const fn public_action_step_color(status: PublicActionStepStatus) -> u32 {
     match status {
         PublicActionStepStatus::NotStarted => theme::TEXT,
-        PublicActionStepStatus::Pending => theme::WARNING,
+        PublicActionStepStatus::Pending | PublicActionStepStatus::Warning => theme::WARNING,
         PublicActionStepStatus::Done => theme::SUCCESS,
         PublicActionStepStatus::Error | PublicActionStepStatus::Stopped => theme::DANGER,
     }

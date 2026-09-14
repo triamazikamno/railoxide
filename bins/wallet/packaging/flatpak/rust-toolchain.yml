@@ -5,6 +5,7 @@ build-options:
   no-debuginfo: true
 build-commands:
   - rust-toolchain/install.sh --prefix=/app/lib/railoxide-rust --disable-ldconfig --without=rust-docs --without=rust-docs-json-preview
+  - rust-wasm-std/install.sh --prefix=/app/lib/railoxide-rust --disable-ldconfig
 sources:
   - type: archive
     only-arches:
@@ -12,6 +13,11 @@ sources:
     url: https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
     sha256: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
     dest: rust-toolchain
+    strip-components: 1
+  - type: archive
+    url: https://static.rust-lang.org/dist/2026-07-16/rust-std-1.97.1-wasm32-unknown-unknown.tar.xz
+    sha256: fa0edb6e9f34faae5735554d62d50875eded839dc707d0f1c01467a918d8453b
+    dest: rust-wasm-std
     strip-components: 1
   - type: archive
     only-arches:

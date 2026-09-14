@@ -167,8 +167,35 @@ impl RpcOperation {
         }
     }
 
+    pub(super) const fn method(&self) -> &'static str {
+        match self {
+            Self::EthCall { .. } => "eth_call",
+            Self::GetBalance { .. } => "eth_getBalance",
+            Self::BlockNumber => "eth_blockNumber",
+            Self::GetCode(..) => "eth_getCode",
+            Self::GetStorageAt(..) => "eth_getStorageAt",
+            Self::GetTransactionCount(..) => "eth_getTransactionCount",
+            Self::GetBlockByHash(..) => "eth_getBlockByHash",
+            Self::GetBlockByNumber(..) => "eth_getBlockByNumber",
+            Self::GetBlockTransactionCountByHash(..) => "eth_getBlockTransactionCountByHash",
+            Self::GetBlockTransactionCountByNumber(..) => "eth_getBlockTransactionCountByNumber",
+            Self::GetTransactionByHash(..) => "eth_getTransactionByHash",
+            Self::GetTransactionReceipt(..) => "eth_getTransactionReceipt",
+            Self::GetTransactionByBlockHashAndIndex(..) => "eth_getTransactionByBlockHashAndIndex",
+            Self::GetTransactionByBlockNumberAndIndex(..) => {
+                "eth_getTransactionByBlockNumberAndIndex"
+            }
+            Self::GetBlockReceipts(..) => "eth_getBlockReceipts",
+            Self::GetLogs(..) => "eth_getLogs",
+            Self::GasPrice => "eth_gasPrice",
+            Self::MaxPriorityFeePerGas => "eth_maxPriorityFeePerGas",
+            Self::FeeHistory(..) => "eth_feeHistory",
+            Self::EstimateGas(..) => "eth_estimateGas",
+        }
+    }
+
     pub(super) fn wire(&self) -> (&'static str, Value, bool) {
-        let (method, params) = match self {
+        let params = match self {
             Self::EthCall {
                 request,
                 state_overrides,
@@ -177,59 +204,35 @@ impl RpcOperation {
                 let params = EthCallParams::<AnyNetwork>::new((**request).clone())
                     .with_block(*block)
                     .with_overrides_opt(state_overrides.clone());
-                (
-                    "eth_call",
-                    serde_json::to_value(params).expect("Alloy eth_call params serialize"),
-                )
+                serde_json::to_value(params).expect("Alloy eth_call params serialize")
             }
-            Self::GetBalance { account, block } => ("eth_getBalance", json!([account, block])),
-            Self::BlockNumber => ("eth_blockNumber", json!([])),
-            Self::GetCode(address, block) => ("eth_getCode", json!([address, block])),
-            Self::GetStorageAt(address, slot, block) => {
-                ("eth_getStorageAt", json!([address, slot, block]))
+            Self::GetBalance { account, block } => json!([account, block]),
+            Self::BlockNumber | Self::GasPrice | Self::MaxPriorityFeePerGas => json!([]),
+            Self::GetCode(address, block) | Self::GetTransactionCount(address, block) => {
+                json!([address, block])
             }
-            Self::GetTransactionCount(address, block) => {
-                ("eth_getTransactionCount", json!([address, block]))
-            }
-            Self::GetBlockByHash(hash, full) => ("eth_getBlockByHash", json!([hash, full])),
-            Self::GetBlockByNumber(block, full) => ("eth_getBlockByNumber", json!([block, full])),
-            Self::GetBlockTransactionCountByHash(hash) => {
-                ("eth_getBlockTransactionCountByHash", json!([hash]))
-            }
-            Self::GetBlockTransactionCountByNumber(block) => {
-                ("eth_getBlockTransactionCountByNumber", json!([block]))
-            }
-            Self::GetTransactionByHash(hash) => ("eth_getTransactionByHash", json!([hash])),
-            Self::GetTransactionReceipt(hash) => ("eth_getTransactionReceipt", json!([hash])),
-            Self::GetTransactionByBlockHashAndIndex(hash, index) => (
-                "eth_getTransactionByBlockHashAndIndex",
-                json!([hash, index]),
-            ),
-            Self::GetTransactionByBlockNumberAndIndex(block, index) => (
-                "eth_getTransactionByBlockNumberAndIndex",
-                json!([block, index]),
-            ),
-            Self::GetBlockReceipts(block) => ("eth_getBlockReceipts", json!([block])),
-            Self::GetLogs(filter, _) => ("eth_getLogs", json!([filter])),
-            Self::GasPrice => ("eth_gasPrice", json!([])),
-            Self::MaxPriorityFeePerGas => ("eth_maxPriorityFeePerGas", json!([])),
-            Self::FeeHistory(count, newest, percentiles) => (
-                "eth_feeHistory",
-                match percentiles {
-                    Some(percentiles) => json!([count, newest, percentiles]),
-                    None => json!([count, newest]),
-                },
-            ),
-            Self::EstimateGas(request, block) => (
-                "eth_estimateGas",
-                match block {
-                    Some(block) => json!([request.as_ref(), block]),
-                    None => json!([request.as_ref()]),
-                },
-            ),
+            Self::GetStorageAt(address, slot, block) => json!([address, slot, block]),
+            Self::GetBlockByHash(hash, full) => json!([hash, full]),
+            Self::GetBlockByNumber(block, full) => json!([block, full]),
+            Self::GetBlockTransactionCountByHash(hash)
+            | Self::GetTransactionByHash(hash)
+            | Self::GetTransactionReceipt(hash) => json!([hash]),
+            Self::GetBlockTransactionCountByNumber(block) => json!([block]),
+            Self::GetTransactionByBlockHashAndIndex(hash, index) => json!([hash, index]),
+            Self::GetTransactionByBlockNumberAndIndex(block, index) => json!([block, index]),
+            Self::GetBlockReceipts(block) => json!([block]),
+            Self::GetLogs(filter, _) => json!([filter]),
+            Self::FeeHistory(count, newest, percentiles) => match percentiles {
+                Some(percentiles) => json!([count, newest, percentiles]),
+                None => json!([count, newest]),
+            },
+            Self::EstimateGas(request, block) => match block {
+                Some(block) => json!([request.as_ref(), block]),
+                None => json!([request.as_ref()]),
+            },
         };
         (
-            method,
+            self.method(),
             params,
             matches!(self, Self::EthCall { .. } | Self::EstimateGas(..)),
         )

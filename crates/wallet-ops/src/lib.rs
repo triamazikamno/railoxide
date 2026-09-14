@@ -96,7 +96,9 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 mod amounts;
 mod anchors;
 mod block_observer;
+pub mod dapp_request;
 mod desktop;
+pub mod gateway;
 mod governance;
 mod governance_actions;
 mod governance_documents;
@@ -203,8 +205,8 @@ pub(crate) use native_topup::{
 pub(crate) use protocol_fee::{FEE_BASIS_POINTS_DENOMINATOR, railgun_protocol_fee_amount};
 pub use protocol_fee::{RAILGUN_PROTOCOL_FEE_BPS, format_protocol_fee_percentage};
 pub use public_wallet::{
-    HardwareTrezorPinMatrixProvider, PUBLIC_NATIVE_UNWRAP_GAS_UNITS, PublicAccountBalance,
-    PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
+    DappRpcReadClient, HardwareTrezorPinMatrixProvider, PUBLIC_NATIVE_UNWRAP_GAS_UNITS,
+    PublicAccountBalance, PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
     PublicActionCommandReceiver, PublicActionCommandSender, PublicActionFeeProjection,
     PublicActionFeeSource, PublicActionGasFeeMode, PublicActionGasFeeQuote,
     PublicActionGasFeeQuoteBundle, PublicActionGasFeeSelection, PublicActionKind,
@@ -213,9 +215,12 @@ pub use public_wallet::{
     PublicActionStepFeePolicy, PublicAdvancedTransactionAuthorization,
     PublicAdvancedTransactionEstimate, PublicAdvancedTransactionEstimateRequest,
     PublicAdvancedTransactionSimulationError, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceAsset, PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest, PublicShieldTransactionProfile,
-    PublicTransactionIntent, WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicBalanceAsset, PublicBalanceCache, PublicBalanceEntry, PublicBalanceRefreshCompletion,
+    PublicBalanceRefreshCoordinator, PublicBalanceRefreshTicket, PublicBalanceScope,
+    PublicBalanceSnapshot, PublicSendRequest, PublicSendResult, PublicShieldRequest,
+    PublicShieldTransactionProfile, PublicTransactionIntent, PublicTransactionLookup,
+    PublicTransactionTracker, PublicTransactionTrackingContext,
+    WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectReviewedFee, WalletConnectReviewedTransaction,
@@ -233,9 +238,11 @@ pub use public_wallet::{
     public_native_action_gas_units, public_native_action_gas_units_from_walletconnect_intent,
     public_shield_protocol_fee_amount, public_walletconnect_operation_gas_limit,
     quote_public_action_gas_fee, quote_public_action_gas_fee_bundle_with_profile,
-    quote_public_action_gas_fee_with_profile, refresh_public_balances,
-    resolve_public_action_gas_fee, sanitize_walletconnect_transaction_request,
-    simulate_public_advanced_transaction_with_fee, submit_public_send,
+    quote_public_action_gas_fee_with_profile, quote_public_action_gas_fee_with_reads,
+    refresh_public_balances, refresh_public_balances_at_least, resolve_public_action_gas_fee,
+    resolve_public_ens_recipient, sanitize_walletconnect_transaction_request,
+    simulate_public_advanced_transaction_with_fee,
+    simulate_public_advanced_transaction_with_fee_and_reads, submit_public_send,
     submit_public_send_with_progress, submit_public_shield, submit_public_shield_with_progress,
     submit_walletconnect_send_transaction, validate_walletconnect_reviewed_transaction,
     walletconnect_hardware_typed_data_hash_fallback_confirmation_session,

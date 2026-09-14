@@ -492,6 +492,9 @@ pub async fn simulate_governance_action(
     )
     .await
     .map_err(|error| match error {
+        PublicAdvancedTransactionSimulationError::RpcRead(_) => {
+            GovernanceActionError::Simulation("RPC read is unavailable.".to_owned())
+        }
         PublicAdvancedTransactionSimulationError::Reverted(reason)
         | PublicAdvancedTransactionSimulationError::Unavailable(reason) => {
             GovernanceActionError::Simulation(reason)
@@ -650,6 +653,7 @@ pub async fn submit_governance_action_with_progress(
         &mut command_rx,
         request.public_send.event_tx.as_ref(),
         http,
+        request.public_send.transaction_tracking.as_ref(),
         &mut progress,
     )
     .await?;
@@ -770,6 +774,7 @@ pub async fn submit_governance_workflow_with_progress(
         &mut command_rx,
         event_tx,
         http,
+        initial.public_send.transaction_tracking.as_ref(),
         &mut progress,
     )
     .await?;
@@ -853,6 +858,7 @@ pub async fn submit_governance_workflow_with_progress(
         &mut command_rx,
         event_tx,
         http,
+        initial.public_send.transaction_tracking.as_ref(),
         &mut progress,
     )
     .await?;

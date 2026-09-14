@@ -102,13 +102,26 @@ enum LedgerEip712BaseType {
     Bytes,
 }
 
-pub struct LedgerHardwareDerivationClient;
+pub struct LedgerHardwareDerivationClient {
+    request_control: Option<crate::dapp_request::DappRequestControl>,
+}
 
 impl LedgerHardwareDerivationClient {
+    #[must_use]
+    pub(crate) fn with_request_control(
+        mut self,
+        control: Option<crate::dapp_request::DappRequestControl>,
+    ) -> Self {
+        self.request_control = control;
+        self
+    }
+
     pub async fn connect() -> Result<Self, HardwareDerivationError> {
         let _guard = LEDGER_IO_LOCK.lock().await;
         ledger_hid_preflight()?;
-        Ok(Self)
+        Ok(Self {
+            request_control: None,
+        })
     }
 
     pub async fn ethereum_app_version(
@@ -315,9 +328,8 @@ impl LedgerHardwareDerivationClient {
                 data: APDUData::new(&apdu.data),
                 response_len: None,
             };
-            let answer = ledger_exchange(&command)
-                .await
-                .map_err(|error| ledger_exchange_error(error, operation))?;
+            let answer =
+                ledger_signing_exchange(&command, self.request_control.as_ref(), operation).await?;
             ledger_ensure_success(&answer, operation)?;
             if apdu.ins == 0x0c {
                 signature_response = Some(answer);
@@ -348,9 +360,8 @@ impl LedgerHardwareDerivationClient {
                 data: APDUData::new(&apdu.data),
                 response_len: None,
             };
-            let answer = ledger_exchange(&command)
-                .await
-                .map_err(|error| ledger_exchange_error(error, operation))?;
+            let answer =
+                ledger_signing_exchange(&command, self.request_control.as_ref(), operation).await?;
             if let Err(error) = ledger_ensure_success(&answer, operation) {
                 if let Some(mode) = ledger_eip712_clear_failure_downgrade_mode(
                     &error,
@@ -396,9 +407,8 @@ impl LedgerHardwareDerivationClient {
         let mut answer = None;
         for chunk in payload.chunks(chunk_size) {
             command.data = APDUData::new(chunk);
-            let response = ledger_exchange(&command)
-                .await
-                .map_err(|error| ledger_exchange_error(error, operation))?;
+            let response =
+                ledger_signing_exchange(&command, self.request_control.as_ref(), operation).await?;
             ledger_ensure_success(&response, operation)?;
             answer = Some(response);
             command.p1 = 0x80;
@@ -988,6 +998,55 @@ const fn ledger_hid_device_matches(vendor_id: u16, usage_page: u16) -> bool {
     }
 }
 
+async fn ledger_signing_exchange(
+    command: &APDUCommand,
+    control: Option<&crate::dapp_request::DappRequestControl>,
+    operation: &'static str,
+) -> Result<APDUAnswer, HardwareDerivationError> {
+    let command = command.clone();
+    ledger_signing_dispatch(
+        control.cloned(),
+        move || {
+            let api = HidApi::new()
+                .map_err(NativeTransportError::Hid)
+                .map_err(LedgerError::from)
+                .map_err(|error| ledger_exchange_error(error, operation))?;
+            let device = first_ledger(&api)
+                .map_err(LedgerError::from)
+                .map_err(|error| ledger_exchange_error(error, operation))?;
+            Ok((api, device))
+        },
+        move |(_api, device)| {
+            let data = ledger_write_read_apdu(&device, &command)
+                .map_err(LedgerError::from)
+                .map_err(|error| ledger_exchange_error(error, operation))?;
+            APDUAnswer::from_answer(data).map_err(|error| ledger_exchange_error(error, operation))
+        },
+    )
+    .await
+}
+
+// Admission belongs inside blocking dispatch, after opening the device. Both queues can wait.
+async fn ledger_signing_dispatch<Device, Response>(
+    control: Option<crate::dapp_request::DappRequestControl>,
+    open: impl FnOnce() -> Result<Device, HardwareDerivationError> + Send + 'static,
+    exchange: impl FnOnce(Device) -> Result<Response, HardwareDerivationError> + Send + 'static,
+) -> Result<Response, HardwareDerivationError>
+where
+    Response: Send + 'static,
+{
+    let _guard = LEDGER_IO_LOCK.lock().await;
+    task::spawn_blocking(move || {
+        let device = open()?;
+        if let Some(control) = control {
+            control.ensure_current()?;
+        }
+        exchange(device)
+    })
+    .await
+    .map_err(|_| HardwareDerivationError::Ledger(LedgerError::BackendGone))?
+}
+
 async fn ledger_exchange(command: &APDUCommand) -> Result<APDUAnswer, LedgerError> {
     let _guard = LEDGER_IO_LOCK.lock().await;
     let command = command.clone();
@@ -1264,6 +1323,94 @@ impl HardwareDerivationClient for LedgerHardwareDerivationClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn signing_dispatch_rechecks_after_queueing_and_device_preparation() {
+        use crate::{RpcBrokerError, dapp_request::DappRequestControl};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::time::{Instant, timeout};
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let control = DappRequestControl::new(Instant::now() + Duration::from_secs(30), || Ok(()));
+        let lock = LEDGER_IO_LOCK.lock().await;
+        let queued = ledger_signing_dispatch(Some(control.clone()), || Ok(()), {
+            let writes = writes.clone();
+            move |()| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        tokio::pin!(queued);
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        control.invalidate(&RpcBrokerError::OriginRejected);
+        drop(lock);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), queued).await.unwrap(),
+            Err(HardwareDerivationError::RequestAuthority(
+                RpcBrokerError::OriginRejected
+            ))
+        ));
+
+        let control = DappRequestControl::new(Instant::now() + Duration::from_secs(30), || Ok(()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let preparing = tokio::spawn(ledger_signing_dispatch(
+            Some(control.clone()),
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            },
+            {
+                let writes = writes.clone();
+                move |()| {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+        timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        control.invalidate(&RpcBrokerError::Shutdown);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), preparing)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(HardwareDerivationError::RequestAuthority(
+                RpcBrokerError::Shutdown
+            ))
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+
+        // A later signing APDU or fallback attempt must re-enter admission after preparation.
+        let control = DappRequestControl::new(Instant::now() + Duration::from_secs(30), || Ok(()));
+        ledger_signing_dispatch(Some(control.clone()), || Ok(()), |()| Ok(()))
+            .await
+            .unwrap();
+        control.invalidate(&RpcBrokerError::OriginRejected);
+        let result = ledger_signing_dispatch(Some(control), || Ok(()), {
+            let writes = writes.clone();
+            move |()| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            classify_ledger_eip712_clear_failure(&error, &ledger_sign_apdu(), false),
+            LedgerEip712ClearFailureKind::Other
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
 
     fn answer_with_status(status: u16) -> APDUAnswer {
         APDUAnswer::from_answer(status.to_be_bytes().to_vec()).expect("status answer")

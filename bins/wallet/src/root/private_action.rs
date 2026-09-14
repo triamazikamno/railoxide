@@ -5,20 +5,17 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Bounds, Context, ElementId, Entity, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, RenderOnce,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Pixels, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
     alert::Alert,
-    button::{Button, ButtonGroup, ButtonVariants},
-    collapsible::Collapsible,
-    input::{Escape as InputEscape, Input, InputEvent, InputState, Position},
+    button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState, Position},
     popover::Popover,
-    scroll::ScrollableElement,
-    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tooltip::Tooltip,
 };
@@ -26,10 +23,9 @@ use railgun_ui::{format_token_amount, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::controls::{
-    FullWidthSelectItems, app_button, app_button_base, app_button_label, app_inline_control_row,
-    app_input, app_muted_text, app_segment_button, app_strong_text,
+    FullWidthSelectItems, app_button, app_button_base, app_input, app_muted_text, app_strong_text,
 };
-use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     BroadcasterFeePolicy, DesktopNativeTopUpPlan, DesktopNativeTopUpRequest,
     DesktopPrivateSpendAuthorization, DesktopSelfBroadcastCostEstimate, DesktopSelfBroadcastResult,
@@ -84,15 +80,12 @@ use super::private_broadcaster::{
     render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
 };
 use super::public_account::public_account_display_label;
-use super::public_action::{
-    PublicActionFeeDisplay, public_action_protocol_fee_label, render_public_action_fee_estimate,
-};
+use super::public_action::public_action_protocol_fee_label;
 use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;
 use super::public_broadcaster_cost::{
-    cost_estimate_detail_text, public_broadcaster_cost_status,
-    render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
-    should_render_public_broadcaster_cost_preview,
+    public_broadcaster_cost_status, render_public_broadcaster_cost_estimate,
+    render_public_broadcaster_cost_status, should_render_public_broadcaster_cost_preview,
 };
 use super::spend_authorization::{
     SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
@@ -115,6 +108,8 @@ use super::{
     unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
+mod estimate;
+pub(super) use estimate::{PrivateEstimateInput, PrivateEstimateOutput, PrivateEstimateRequest};
 mod delivery;
 mod form_lifecycle;
 mod generation;

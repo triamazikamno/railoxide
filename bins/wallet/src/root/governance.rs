@@ -27,7 +27,8 @@ use gpui_component::{
 use railgun_ui::{format_usd_micro_value, governance_contracts, short_address};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
+    app_text,
 };
 use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
@@ -4128,7 +4129,8 @@ impl TableDelegate for StakeTableDelegate {
                 .text()
                 .xsmall()
                 .child(
-                    app_muted_text(format!("#{}", compact_stake_id_preview(row.id)))
+                    app_button_label(format!("#{}", compact_stake_id_preview(row.id)))
+                        .text_color(rgb(theme::TEXT_MUTED))
                         .font_family(APP_MONO_FONT_FAMILY),
                 )
                 .on_key_down(move |event: &KeyDownEvent, _window, cx| {

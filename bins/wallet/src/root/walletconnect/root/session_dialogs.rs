@@ -377,7 +377,9 @@ impl WalletRoot {
             );
             self.walletconnect.sessions.clear();
             self.walletconnect.approval_handoff_sessions.clear();
+            self.walletconnect.invalidate_gateway_pending_requests();
             self.walletconnect.pending_requests.clear();
+            self.walletconnect.request_routes.clear();
             self.walletconnect.request_disclosure_states.clear();
             self.walletconnect.dismissed_request_dialog_keys.clear();
             self.walletconnect.request_dialog_refresh_active = false;
@@ -623,7 +625,8 @@ impl WalletRoot {
                     .remove(&session_uuid);
                 root.walletconnect.subscriptions.remove(&topic);
                 root.walletconnect.retain_pending_requests(|_, request| {
-                    request.session.session_uuid != session_uuid
+                    request.session_identity.walletconnect_session_id()
+                        != Some(session_uuid.as_str())
                 });
                 if let Err(error) = store.delete_walletconnect_session(&session_uuid) {
                     root.walletconnect.error = Some(Arc::from(format!(
