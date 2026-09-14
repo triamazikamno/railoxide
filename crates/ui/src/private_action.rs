@@ -173,6 +173,7 @@ pub fn broadcaster_settings(
                     })
                     .child(
                         Switch::new("out-of-range")
+                            .small()
                             .label("Allow out-of-range fees")
                             .checked(settings.allow_out_of_range)
                             .disabled(disabled)
@@ -190,6 +191,7 @@ pub fn broadcaster_settings(
                     })
                     .child(
                         Switch::new("favorites-only")
+                            .small()
                             .label("Favorites only")
                             .checked(settings.favorites_only)
                             .disabled(disabled)
@@ -536,7 +538,7 @@ pub fn transaction_fee_breakdown(
                                         .min_w_0()
                                         .text_align(gpui::TextAlign::Right)
                                         .whitespace_normal()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .font_weight(gpui::FontWeight::MEDIUM)
                                         .child(total),
                                 )
                                 .child(

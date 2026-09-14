@@ -1023,7 +1023,7 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Active"))
+            .child(app_strong_text("Active"))
             .children(rows)
     }
 
@@ -1052,7 +1052,7 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Hidden"))
+            .child(app_strong_text("Hidden"))
             .children(content)
     }
 
@@ -1310,10 +1310,6 @@ fn cx_listener_for_drop(
     }
 }
 
-fn section_title(label: &'static str) -> gpui::Div {
-    app_strong_text(label).font_weight(FontWeight::SEMIBOLD)
-}
-
 fn wallet_management_icon_button(
     id: impl Into<ElementId>,
     icon: impl Into<Icon>,
@@ -1338,7 +1334,7 @@ fn wallet_label_content(wallet: &WalletMetadataBundle, current: bool) -> gpui::D
             .children(current.then(|| {
                 app_muted_text("Current")
                     .text_color(rgb(theme::PRIMARY))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
             })),
     );
     content = content.child(

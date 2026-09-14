@@ -1,6 +1,6 @@
 use gpui::{
-    Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, Window, div, px, rgb,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
+    div, px, rgb,
 };
 use gpui_component::{
     Icon, Sizable,
@@ -127,11 +127,7 @@ impl WalletRoot {
                     .size_5()
                     .text_color(rgb(theme::PRIMARY)),
             )
-            .child(
-                app_strong_text("Broadcasters")
-                    .text_size(px(20.0))
-                    .font_weight(FontWeight::SEMIBOLD),
-            )
+            .child(app_strong_text("Broadcasters").text_size(px(20.0)))
     }
 
     fn render_broadcaster_tabs(&self, root: &Entity<Self>) -> impl IntoElement {

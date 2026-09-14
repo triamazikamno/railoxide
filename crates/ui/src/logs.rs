@@ -602,7 +602,7 @@ impl LogsPane {
             .items_center()
             .px(LOG_CELL_PADDING_X)
             .text_color(rgb(theme::TEXT_MUTED))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .font_weight(gpui::FontWeight::MEDIUM)
             .overflow_hidden()
             .whitespace_nowrap()
             .child(SharedString::from(label));
@@ -625,7 +625,7 @@ impl LogsPane {
             .items_center()
             .px(LOG_CELL_PADDING_X)
             .text_color(rgb(theme::TEXT_MUTED))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .font_weight(gpui::FontWeight::MEDIUM)
             .overflow_hidden()
             .whitespace_nowrap()
             .child(SharedString::from(label))

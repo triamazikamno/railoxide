@@ -1723,7 +1723,7 @@ fn render_walletconnect_address_row(
         .child(
             app_muted_text(role)
                 .text_size(px(11.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(theme::TEXT_SUBTLE)),
         )
         .child(

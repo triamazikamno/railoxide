@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use gpui::{
-    App, Context, ElementId, Entity, Focusable, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+    App, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
 };
 use gpui_component::{
     Icon, Sizable, WindowExt,
@@ -290,9 +290,7 @@ impl WalletRoot {
                                                     .text_color(rgb(theme::PRIMARY)),
                                             )
                                             .child(
-                                                app_strong_text("Address book")
-                                                    .text_size(px(20.0))
-                                                    .font_weight(FontWeight::SEMIBOLD),
+                                                app_strong_text("Address book").text_size(px(20.0)),
                                             ),
                                     ),
                             )
@@ -813,11 +811,7 @@ fn address_book_section_shell(
             .flex()
             .items_center()
             .gap_2()
-            .child(
-                app_strong_text(kind.section_label())
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD),
-            )
+            .child(app_strong_text(kind.section_label()).text_size(px(13.0)))
             .child(app_status_tag(count_label, theme::PRIMARY)),
     )
 }

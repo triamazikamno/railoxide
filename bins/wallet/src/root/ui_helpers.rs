@@ -1,6 +1,6 @@
 use gpui::{
-    App, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, Styled,
-    Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, Sizable,
@@ -249,6 +249,7 @@ pub(super) fn copyable_mono_field(
                 .border_1()
                 .border_color(rgb(theme::BORDER))
                 .font_family(APP_FONT_FAMILY)
+                .font_weight(FontWeight::LIGHT)
                 .text_size(APP_TEXT_SIZE)
                 .text_color(rgb(theme::TEXT))
                 .child(SharedString::from(value.clone())),

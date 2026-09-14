@@ -1030,7 +1030,7 @@ impl WalletRoot {
                                     .child(
                                         app_button_label("Paired browsers")
                                             .text_color(rgb(theme::TEXT))
-                                            .font_weight(FontWeight::SEMIBOLD),
+                                            .font_weight(FontWeight::MEDIUM),
                                     )
                                     .when(peer_count > 0, |this| {
                                         this.child(
@@ -1228,7 +1228,7 @@ impl WalletRoot {
                             .child(
                                 app_button_label("Dapp permissions")
                                     .text_color(rgb(theme::TEXT))
-                                    .font_weight(FontWeight::SEMIBOLD),
+                                    .font_weight(FontWeight::MEDIUM),
                             )
                             .when(permission_count > 0, |this| {
                                 this.child(

@@ -1368,7 +1368,7 @@ fn wallet_status_bar(
                 div()
                     .min_w(px(170.0))
                     .text_color(rgb(theme::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(labels.title)),
             )
         })
@@ -1383,7 +1383,7 @@ fn wallet_status_bar(
                 div()
                     .w(px(42.0))
                     .text_color(rgb(theme::INFO))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(format!("{}%", labels.percent))),
             )
         })

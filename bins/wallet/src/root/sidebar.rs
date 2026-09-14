@@ -401,7 +401,7 @@ impl WalletRoot {
                     .min_w_0()
                     .truncate()
                     .text_size(px(13.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .line_height(gpui::relative(1.0))
                     .text_color(rgb(color))
                     .child("Building prover cache"),
@@ -452,7 +452,7 @@ impl WalletRoot {
                     )
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(theme::INFO))
                             .child(progress.stage.label()),
                     ),
@@ -472,7 +472,7 @@ impl WalletRoot {
                         div()
                             .w(px(42.0))
                             .text_color(rgb(theme::INFO))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .child(SharedString::from(format!("{percent}%"))),
                     ),
             )

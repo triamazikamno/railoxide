@@ -1,6 +1,7 @@
 use crate::root::ui_helpers::dialog_footer;
 
 use super::*;
+use gpui::FontWeight;
 use ui::recipient_picker::{RecipientPicker, RecipientPickerEvent, RecipientSuggestion};
 pub(in crate::root) use ui::recipient_picker::{
     RecipientSuggestionDirection,
@@ -732,6 +733,7 @@ impl WalletRoot {
                             .rounded_sm()
                             .bg(rgb(theme::SURFACE))
                             .font_family(APP_FONT_FAMILY)
+                            .font_weight(FontWeight::LIGHT)
                             .text_size(APP_TEXT_SIZE)
                             .child(SharedString::from(recipient.to_owned())),
                     ),

@@ -358,7 +358,7 @@ fn network_status_chip(
                     .min_w(px(0.0))
                     .truncate()
                     .text_size(gpui::rems(13.0 / 16.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
                     .text_color(rgb(color))
                     .child(label),
@@ -410,7 +410,7 @@ fn network_status_chip(
                                 .min_w_0()
                                 .truncate()
                                 .text_size(gpui::rems(13.0 / 16.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
                                 .text_color(rgb(color))
                                 .child(displayed_label),

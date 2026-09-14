@@ -870,7 +870,7 @@ pub(in crate::root) fn render_unshield_generating_status(
                 .child(
                     div()
                         .text_color(rgb(theme::TEXT))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .child(stage.label()),
                 )
                 .child(app_muted_text(stage.detail())),

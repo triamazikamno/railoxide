@@ -54,12 +54,7 @@ fn render_mimic_railway_tooltip_section(
         .flex()
         .flex_col()
         .gap_1()
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(theme::TEXT))
-                .child(heading),
-        )
+        .child(app_strong_text(heading))
         .children(bullets.map(render_mimic_railway_tooltip_bullet))
 }
 

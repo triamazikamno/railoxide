@@ -272,6 +272,8 @@ pub fn app_inline_control_row(label: impl Into<SharedString>, control: impl Into
 pub fn app_button_label(label: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
+        .font_weight(FontWeight::LIGHT)
+        .text_size(APP_TEXT_SIZE)
         .line_height(relative(APP_TEXT_LINE_HEIGHT))
         .child(label.into())
 }
@@ -294,7 +296,7 @@ pub fn app_muted_text(label: impl Into<SharedString>) -> Div {
 pub fn app_strong_text(label: impl Into<SharedString>) -> Div {
     app_text(label)
         .text_color(rgb(theme::TEXT))
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(FontWeight::MEDIUM)
 }
 
 #[cfg(test)]

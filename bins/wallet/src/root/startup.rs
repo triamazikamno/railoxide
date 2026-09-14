@@ -793,7 +793,7 @@ impl WalletStartupRoot {
                             .gap_1()
                             .child(
                                 div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(accent))
                                     .child(stage),
                             )
@@ -833,7 +833,7 @@ impl WalletStartupRoot {
                         div()
                             .w(px(42.0))
                             .text_color(rgb(accent))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .child(SharedString::from(format!("{percent}%"))),
                     ),
             )

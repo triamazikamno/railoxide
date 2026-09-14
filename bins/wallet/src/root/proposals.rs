@@ -2576,7 +2576,6 @@ fn proposal_row_title(title: Option<ProposalRowTitle>) -> gpui::Div {
             .min_w(px(0.0))
             .text_size(px(15.0))
             .line_height(px(18.0))
-            .font_weight(FontWeight::SEMIBOLD)
             .truncate(),
         Some(ProposalRowTitle::Available(_) | ProposalRowTitle::Unavailable) => {
             app_muted_text("Document unavailable")
@@ -2776,12 +2775,11 @@ fn proposal_detail_title(proposal: &ResolvedProposal) -> gpui::Div {
         Some(document) if document.available && !document.title.is_empty() => {
             app_strong_text(document.title.clone())
                 .text_size(px(22.0))
-                .font_weight(FontWeight::SEMIBOLD)
                 .whitespace_normal()
         }
-        Some(_) => app_strong_text(format!("Proposal #{}", proposal.proposal.index))
-            .text_size(px(22.0))
-            .font_weight(FontWeight::SEMIBOLD),
+        Some(_) => {
+            app_strong_text(format!("Proposal #{}", proposal.proposal.index)).text_size(px(22.0))
+        }
     }
 }
 
@@ -3355,7 +3353,7 @@ fn render_proposal_participation_card(
                     .child(
                         app_text(format_compact_rail_amount_with_unit(history_amount))
                             .text_size(px(16.0))
-                            .font_weight(FontWeight::SEMIBOLD),
+                            .font_weight(FontWeight::MEDIUM),
                     )
                     .child(
                         div()
@@ -3403,9 +3401,7 @@ fn render_proposal_participation_card(
                     format!("{total_accounts} {account_word} · {total_used_accounts} {action_word}")
                 }
             };
-            let amount_text = app_text(amount)
-                .text_size(px(16.0))
-                .font_weight(FontWeight::SEMIBOLD);
+            let amount_text = app_strong_text(amount).text_size(px(16.0));
             let amount_text = if state == ProposalCapacitySummaryState::Exhausted {
                 amount_text.text_color(rgb(theme::WARNING))
             } else {
@@ -5699,11 +5695,7 @@ fn render_proposal_decoded_preview(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(
-                    app_strong_text(preview.verb.clone())
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD),
-                )
+                .child(app_strong_text(preview.verb.clone()).text_size(px(12.0)))
                 .child(div().flex_1().min_w(px(0.0)))
                 .child(
                     div()
@@ -5833,13 +5825,13 @@ fn render_proposal_decoded_preview(
                                 .font_family(APP_MONO_FONT_FAMILY)
                                 .text_size(px(12.0))
                                 .line_height(px(12.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(theme::TEXT_SUBTLE)),
                         )
                         .child(
                             app_text(railgun_ui::short_address(address))
                                 .font_family(APP_MONO_FONT_FAMILY)
-                                .font_weight(FontWeight::NORMAL)
+                                .font_weight(FontWeight::LIGHT)
                                 .text_size(px(12.0))
                                 .line_height(px(12.0)),
                         );
@@ -5912,7 +5904,7 @@ fn render_proposal_decoded_preview(
                                 .font_family(APP_MONO_FONT_FAMILY)
                                 .text_size(px(12.0))
                                 .line_height(px(12.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(theme::TEXT_SUBTLE)),
                         )
                         .child(rendered_value);

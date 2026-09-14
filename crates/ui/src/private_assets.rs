@@ -39,7 +39,7 @@ pub fn private_balance(
                 .text_color(rgb(theme::WARNING))
                 .text_size(px(44.0))
                 .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .child(total.into()),
         )
         .child(actions)

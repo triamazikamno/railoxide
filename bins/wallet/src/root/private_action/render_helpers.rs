@@ -222,7 +222,7 @@ fn render_private_action_tooltip_icon(
                     .text_color(rgb(theme::TEXT))
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(title_color))
                             .child(title),
                     )

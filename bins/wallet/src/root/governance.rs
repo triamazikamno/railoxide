@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, B256, U256};
 use futures_util::{StreamExt, future::BoxFuture};
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
@@ -3676,11 +3676,7 @@ impl WalletRoot {
                             .text_color(rgb(theme::PRIMARY)),
                     )
                     .when(!compact_header, |this| {
-                        this.child(
-                            app_strong_text("Governance")
-                                .text_size(px(20.0))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        )
+                        this.child(app_strong_text("Governance").text_size(px(20.0)))
                     })
                     .child(self.render_wallet_selector())
                     .child(

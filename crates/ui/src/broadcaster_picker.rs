@@ -621,9 +621,9 @@ pub fn render_broadcaster_picker_row(
                 }))
                 .font_family(APP_MONO_FONT_FAMILY)
                 .font_weight(if row.fee_tier.is_muted() {
-                    gpui::FontWeight::NORMAL
+                    gpui::FontWeight::LIGHT
                 } else {
-                    gpui::FontWeight::SEMIBOLD
+                    gpui::FontWeight::MEDIUM
                 })
                 .child(div().flex_1().min_w_0().truncate().child(label))
                 .children(row.favorite.then(|| {
@@ -697,9 +697,9 @@ fn render_broadcaster_picker_estimated_fee_cell(
                 .truncate()
                 .text_color(rgb(primary_color))
                 .font_weight(if muted {
-                    gpui::FontWeight::NORMAL
+                    gpui::FontWeight::LIGHT
                 } else {
-                    gpui::FontWeight::SEMIBOLD
+                    gpui::FontWeight::MEDIUM
                 })
                 .child(usd_label.clone().unwrap_or_else(|| token_label.clone())),
         )
@@ -785,7 +785,7 @@ fn render_broadcaster_picker_status_badge(
         .border_color(rgb(color))
         .text_color(rgb(color))
         .text_size(rems(0.625))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_weight(gpui::FontWeight::MEDIUM)
         .when(layout == BroadcasterPickerLayout::Compact, |this| {
             this.w_auto()
                 .max_w_full()
@@ -847,7 +847,7 @@ fn render_broadcaster_picker_status_tooltip(
                 .child(
                     div()
                         .text_size(rems(0.75))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(color))
                         .child(label),
                 ),
@@ -1045,9 +1045,9 @@ pub fn render_broadcaster_picker_group(
                             .min_w(rems(0.0))
                             .truncate()
                             .font_weight(if group.fee_tier.is_muted() {
-                                gpui::FontWeight::NORMAL
+                                gpui::FontWeight::LIGHT
                             } else {
-                                gpui::FontWeight::SEMIBOLD
+                                gpui::FontWeight::MEDIUM
                             })
                             .text_color(rgb(if group.fee_tier.is_muted() {
                                 theme::TEXT_SUBTLE
@@ -1224,7 +1224,7 @@ fn render_fee_status_info_icon(tooltip_enabled: bool) -> impl IntoElement {
         .border_color(rgb(theme::WARNING))
         .text_color(rgb(theme::WARNING))
         .text_size(rems(0.5625))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_weight(gpui::FontWeight::MEDIUM)
         .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
         .child("i")
         .when(tooltip_enabled, |this| {
@@ -1250,7 +1250,7 @@ fn render_fee_status_popover(window: &Window) -> gpui::Div {
         .child(
             div()
                 .text_color(rgb(theme::WARNING))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .child("Fee status"),
         )
         .child(div().child(

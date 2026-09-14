@@ -36,7 +36,7 @@ pub(in crate::root) fn settings_section_header_element(
     title_row = title_row.child(
         div()
             .font_family(APP_MONO_FONT_FAMILY)
-            .font_weight(FontWeight::SEMIBOLD)
+            .font_weight(FontWeight::MEDIUM)
             .text_size(px(12.0))
             .line_height(px(16.0))
             .text_color(rgb(theme::TEXT_MUTED))
@@ -343,7 +343,7 @@ pub(in crate::root) fn settings_dialog_subsection_label(
 ) -> gpui::Div {
     div()
         .font_family(APP_MONO_FONT_FAMILY)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(FontWeight::MEDIUM)
         .text_size(px(12.0))
         .line_height(px(16.0))
         .text_color(rgb(theme::TEXT_MUTED))
@@ -391,7 +391,7 @@ pub(in crate::root) fn render_token_entry_summary(entry: &DisplayTokenEntry) -> 
                 .child(
                     div()
                         .font_family(APP_MONO_FONT_FAMILY)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::MEDIUM)
                         .text_size(px(13.0))
                         .line_height(px(18.0))
                         .text_color(rgb(theme::TEXT))
@@ -451,7 +451,7 @@ pub(in crate::root) fn render_price_anchor_entry_summary(
                 .child(
                     div()
                         .font_family(APP_MONO_FONT_FAMILY)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::MEDIUM)
                         .text_size(px(13.0))
                         .line_height(px(18.0))
                         .text_color(rgb(theme::TEXT))
@@ -579,7 +579,7 @@ pub(in crate::root) fn settings_token_chain_header(chain_id: u64) -> gpui::Div {
         .pt(px(10.0))
         .pb(px(4.0))
         .font_family(APP_MONO_FONT_FAMILY)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(FontWeight::MEDIUM)
         .text_size(px(11.0))
         .line_height(px(14.0))
         .text_color(rgb(theme::TEXT_SUBTLE));

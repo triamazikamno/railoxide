@@ -1634,7 +1634,7 @@ impl WalletRoot {
                     .gap_2()
                     .text_size(px(12.0))
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(format!(
                         "{} · {count}",
                         title.to_ascii_uppercase()
@@ -2091,7 +2091,7 @@ impl WalletRoot {
                     .flex_col()
                     .items_end()
                     .text_color(rgb(theme::WARNING))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(amount_label))
                     .when_some(usd_label, |column, usd_label| {
                         column.child(

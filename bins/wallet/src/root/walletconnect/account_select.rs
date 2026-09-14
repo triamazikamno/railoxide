@@ -128,7 +128,7 @@ pub(super) fn walletconnect_account_select_row(
                     div()
                         .truncate()
                         .text_color(rgb(theme::TEXT))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .child(SharedString::from(if include_details {
                             item.label.to_string()
                         } else {

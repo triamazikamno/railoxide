@@ -7,13 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
-use gpui::ObjectFit;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, Point, Render, SharedString, StatefulInteractiveElement, Styled,
     StyledImage as _, Window, WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _,
     px, rgb, size,
 };
+use gpui::{FontWeight, ObjectFit};
 use gpui_component::{
     Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     badge::Badge,
@@ -339,6 +339,7 @@ impl Render for WalletRoot {
             .bg(rgb(theme::SURFACE_ELEVATED))
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
+            .font_weight(FontWeight::LIGHT)
             .text_size(APP_TEXT_SIZE)
             .child(self.render_sidebar(
                 root.clone(),
@@ -384,6 +385,7 @@ pub(super) fn render_wallet_window_frame(
         .bg(rgb(theme::SURFACE_ELEVATED))
         .text_color(rgb(theme::TEXT))
         .font_family(APP_FONT_FAMILY)
+        .font_weight(FontWeight::LIGHT)
         .text_size(APP_TEXT_SIZE)
         .when(should_render_wallet_title_bar(window), |this| {
             this.child(render_wallet_title_bar(titlebar_color))
@@ -414,7 +416,7 @@ fn render_wallet_title_bar(titlebar_color: u32) -> TitleBar {
                     div()
                         .text_color(rgb(theme::TEXT))
                         .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .child("RailOxide"),
                 ),
         )
@@ -1163,7 +1165,7 @@ impl WalletRoot {
                         div()
                             .ml(px(8.0))
                             .text_color(rgb(theme::TEXT))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .child("Logs"),
                     )
                     .child(div().flex_1())
@@ -1215,7 +1217,7 @@ fn status_presence_text(label: impl Into<SharedString>, status: PresenceStatus) 
                 .min_w_0()
                 .truncate()
                 .text_size(px(12.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .child(label.into()),
         )
 }
@@ -1309,7 +1311,7 @@ impl Render for BalancesStatusHoverCard {
                     .child(status_presence_dot(status).flex_none())
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(color))
                             .child(balances_hover_heading(status, labels.as_ref(), issue)),
                     ),
@@ -1417,7 +1419,7 @@ impl Render for PpoiStatusHoverCard {
                             .gap_1()
                             .child(
                                 div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(color))
                                     .truncate()
                                     .child(ppoi_hover_heading(
@@ -1546,13 +1548,13 @@ fn render_ppoi_artifact_progress_section(
                 .gap_3()
                 .child(
                     div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(color))
                         .child(ppoi_artifact_phase_label(progress.phase)),
                 )
                 .child(
                     div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(color))
                         .child(format!("{percent}%")),
                 ),
@@ -1649,7 +1651,7 @@ fn render_ppoi_artifact_error_section(
         .gap_2()
         .child(
             div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(color))
                 .child("Last refresh failed"),
         )
@@ -1719,7 +1721,7 @@ fn render_status_hover_note_base(
         .gap_1()
         .child(
             div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(color))
                 .child(title.to_string()),
         )
@@ -1801,7 +1803,7 @@ fn render_balance_sync_progress_section(
                 .child(
                     div()
                         .w(px(42.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(theme::WARNING))
                         .child(format!("{}%", labels.percent)),
                 ),
@@ -1853,7 +1855,7 @@ fn render_balance_sync_tip_section(sync_tip: WalletSyncTip, now_secs: u64) -> gp
         .gap_2()
         .child(
             div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(theme::TEXT))
                 .child("Chain position"),
         )
@@ -2181,7 +2183,7 @@ fn render_ppoi_list_progress_section(progress: &PoiArtifactCacheProgress) -> gpu
                 .gap_3()
                 .child(
                     div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(theme::TEXT))
                         .child("POI lists"),
                 )
