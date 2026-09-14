@@ -100,6 +100,11 @@ def package(metadata_path):
                 '--out-dir', str(stage), '--out-name', crate, str(compiled),
             ], check=True)
         package_protocol_licenses(metadata, stage)
+        branding = stage / 'assets/branding'
+        branding.mkdir(parents=True)
+        for size in (16, 32, 48, 128):
+            path = branding / f'{size}x{size}.png'
+            shutil.copy2(ROOT / 'bins/wallet/packaging/icons/png' / f'logo-{path.name}', path)
         wallet_assets = stage / 'assets/railgun-ui'
         shutil.copytree(ROOT / 'crates/railgun-ui/assets', wallet_assets)
         # Keep the source attribution beside the unchanged chain and token bytes.

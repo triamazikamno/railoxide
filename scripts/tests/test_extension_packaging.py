@@ -39,7 +39,8 @@ class ExtensionPackagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for directory in ('extensions/railoxide', 'crates/railgun-ui/assets',
-                              'crates/ui/assets/icons', 'bins/wallet/assets/icons'):
+                              'crates/ui/assets/icons', 'bins/wallet/assets/icons',
+                              'bins/wallet/packaging/icons/png'):
                 shutil.copytree(ROOT / directory, root / directory)
             shutil.copy2(ROOT / 'LICENSE', root / 'LICENSE')
             kit = root / 'kit-\u0141'
@@ -85,6 +86,11 @@ class ExtensionPackagingTests(unittest.TestCase):
                 packager.package(metadata_path)
 
             with zipfile.ZipFile(root / 'target/browser-extension.zip') as archive:
+                manifest = json.loads(archive.read('manifest.json'))
+                for icons in (manifest['icons'], manifest['action']['default_icon']):
+                    for path in icons.values():
+                        source = ROOT / 'bins/wallet/packaging/icons/png' / f'logo-{Path(path).name}'
+                        self.assertEqual(archive.read(path), source.read_bytes())
                 self.assertEqual(archive.read(f'assets/icons/{icon_name}'), icon)
                 self.assertIn(icon_name, archive.read('assets/COMPONENT-SOURCES.md').decode('utf-8'))
                 wallet_assets = json.loads(archive.read('assets/WALLET-ASSETS.json'))

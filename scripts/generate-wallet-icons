@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 icon_root="$repo_root/bins/wallet/packaging/icons"
 source_svg="$icon_root/railoxide-icon.svg"
+logo_svg="$repo_root/bins/wallet/assets/icons/logo.svg"
 png_dir="$icon_root/png"
 macos_dir="$icon_root/macos"
 windows_dir="$icon_root/windows"
@@ -29,6 +30,21 @@ for size in "${sizes[@]}"; do
     --height "$size" \
     --output "$png_dir/${size}x${size}.png" \
     "$source_svg"
+done
+
+# Enlarge the bare logo within the transparent square for toolbar legibility.
+for size in 16 32 48 128; do
+  render_size=$((size * 9 / 8))
+  offset=$(((render_size - size) / 2))
+  rsvg-convert \
+    --width "$render_size" \
+    --height "$render_size" \
+    --page-width "$size" \
+    --page-height "$size" \
+    --left="-$offset" \
+    --top="-$offset" \
+    --output "$png_dir/logo-${size}x${size}.png" \
+    "$logo_svg"
 done
 
 cp "$png_dir/16x16.png" "$iconset_dir/icon_16x16.png"
