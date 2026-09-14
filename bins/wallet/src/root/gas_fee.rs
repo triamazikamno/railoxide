@@ -32,6 +32,7 @@ pub(super) enum Eip1559GasFeeTarget {
     Public {
         mode: PublicActionMode,
     },
+    Governance,
     WalletConnect {
         request_key: Arc<str>,
     },
@@ -133,7 +134,7 @@ impl GasRetryInputs {
 }
 
 impl Eip1559GasFeeEditorState {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<'_, WalletRoot>) -> Self {
+    pub(super) fn new<T>(window: &mut Window, cx: &mut Context<'_, T>) -> Self {
         Self {
             mode: Eip1559GasFeeMode::Auto,
             max_fee_input: cx.new(|cx| InputState::new(window, cx).placeholder("max fee gwei")),
@@ -273,6 +274,9 @@ impl WalletRoot {
             Eip1559GasFeeTarget::Public { mode: action_mode } => {
                 self.set_public_action_gas_fee_mode(action_mode, mode, window, cx);
             }
+            Eip1559GasFeeTarget::Governance => {
+                self.set_governance_gas_fee_mode(mode, window, cx);
+            }
             Eip1559GasFeeTarget::WalletConnect { request_key } => {
                 self.set_walletconnect_gas_fee_mode(&request_key, mode, window, cx);
             }
@@ -290,6 +294,9 @@ impl WalletRoot {
             }
             Eip1559GasFeeTarget::Public { mode } => {
                 self.refresh_public_action_gas_fee_quote(mode, cx);
+            }
+            Eip1559GasFeeTarget::Governance => {
+                self.refresh_governance_gas_fee_quote(cx);
             }
             Eip1559GasFeeTarget::WalletConnect { request_key } => {
                 self.refresh_walletconnect_gas_fee_quote(request_key, cx);
@@ -310,6 +317,9 @@ impl WalletRoot {
             }
             Eip1559GasFeeTarget::Public { mode } => {
                 self.customize_public_action_gas_fee_from_auto(mode, edit_target, window, cx);
+            }
+            Eip1559GasFeeTarget::Governance => {
+                self.customize_governance_gas_fee_from_auto(edit_target, window, cx);
             }
             Eip1559GasFeeTarget::WalletConnect { request_key } => {
                 self.customize_walletconnect_gas_fee_from_auto(
@@ -395,6 +405,7 @@ fn gas_fee_target_id(target: &Eip1559GasFeeTarget) -> String {
         Eip1559GasFeeTarget::Public { mode } => {
             format!("public-{}", public_action_mode_id(*mode))
         }
+        Eip1559GasFeeTarget::Governance => "governance-rewards".to_owned(),
         Eip1559GasFeeTarget::WalletConnect { request_key } => {
             format!("walletconnect-{request_key}")
         }

@@ -152,10 +152,10 @@ pub use governance_actions::{
     GovernanceContractKind, GovernancePreflight, GovernanceProgress, GovernanceProgressStatus,
     GovernanceProgressStep, GovernanceResolvedAction, GovernanceSubmissionRequest,
     GovernanceWorkflow, GovernanceWorkflowRequest, GovernanceWorkflowResult,
-    estimate_governance_action, governance_estimate_request, simulate_governance_action,
-    submit_governance_action_with_progress, submit_governance_workflow_with_progress,
-    validate_governance_authorization, validate_governance_submission,
-    validate_governance_workflow,
+    estimate_governance_action, estimate_reward_claim_baseline, governance_estimate_request,
+    simulate_governance_action, submit_governance_action_with_progress,
+    submit_governance_workflow_with_progress, validate_governance_authorization,
+    validate_governance_submission, validate_governance_workflow,
 };
 pub use governance_documents::{GovernanceDocument, resolve_governance_document};
 pub use governance_staking_actions::{

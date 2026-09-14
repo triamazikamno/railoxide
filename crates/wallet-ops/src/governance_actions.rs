@@ -52,6 +52,46 @@ sol! {
     }
 }
 
+/// Estimate the shared snapshot work of a claim without paying out any tokens.
+///
+/// This is only a gas probe. Normal reward intents still require positive, nonempty rewards,
+/// and the empty call is never returned as a draft or authorization.
+pub async fn estimate_reward_claim_baseline(
+    chain_id: u64,
+    actor: Address,
+    evidence: &crate::RewardBatchEvidence,
+    effective_chain: Option<&EffectiveChainConfig>,
+    http: &HttpContext,
+) -> Result<PublicAdvancedTransactionEstimate> {
+    let contract = governance_contracts(chain_id)
+        .ok_or_else(|| eyre!("Reward contracts unavailable"))?
+        .governor_rewards;
+    let data = GovernanceRewardsActions::claimCall {
+        tokens: Vec::new(),
+        account: actor,
+        startingInterval: evidence.starting_interval,
+        endingInterval: evidence.ending_interval,
+        hints: evidence.hints.clone(),
+    }
+    .abi_encode();
+    crate::estimate_public_advanced_transaction(
+        PublicAdvancedTransactionEstimateRequest {
+            chain_id,
+            effective_chain: effective_chain.cloned(),
+            from: actor,
+            intent: PublicTransactionIntent::Raw {
+                to: Some(contract),
+                value: U256::ZERO,
+                data: data.into(),
+            },
+            gas_fee: PublicActionGasFeeSelection::Auto,
+            access_list: None,
+        },
+        http,
+    )
+    .await
+}
+
 /// Every write exposed by Governance.  There is intentionally no proposal execution variant:
 /// arbitrary proposal actions are inspection data, not wallet-owned transaction intents.
 #[derive(Clone, Debug, Eq, PartialEq)]

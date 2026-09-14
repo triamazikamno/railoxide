@@ -1362,9 +1362,6 @@ fn governance_authorization_summary(
         GovernanceActionIntent::Undelegate { .. } => "undelegate",
         GovernanceActionIntent::Unlock { .. } => "unlock",
         GovernanceActionIntent::PrincipalClaim { .. } => "claim principal",
-        GovernanceActionIntent::RewardClaim { reward_tokens, .. } if reward_tokens.len() > 1 => {
-            "claim all rewards"
-        }
         GovernanceActionIntent::RewardClaim { .. } => "claim rewards",
     };
     let amount_token = match &draft.resolved.intent {

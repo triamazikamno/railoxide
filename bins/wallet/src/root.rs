@@ -1454,6 +1454,7 @@ impl WalletRoot {
                 governance_participant_picker,
                 governance_proposal_action_amount_input,
                 governance_staking_delegate_input,
+                Eip1559GasFeeEditorState::new(window, cx),
             ),
             proposals: ProposalsState::new(initial_chain_id),
             proposal_detail_focus: cx.focus_handle(),
@@ -1566,6 +1567,20 @@ impl WalletRoot {
             cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
+                }
+            })
+            .detach();
+        }
+        for input in [
+            root.governance.reward_gas_fee.max_fee_input.clone(),
+            root.governance
+                .reward_gas_fee
+                .max_priority_fee_input
+                .clone(),
+        ] {
+            cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.governance_gas_fee_changed(cx);
                 }
             })
             .detach();
