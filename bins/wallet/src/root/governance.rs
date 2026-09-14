@@ -6,15 +6,17 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, B256, U256};
 use futures_util::{StreamExt, future::BoxFuture};
 use gpui::{
-    App, AppContext as _, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, prelude::FluentBuilder as _, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable, FontWeight, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     combobox::{Combobox, ComboboxEvent, ComboboxState},
+    description_list::{DescriptionItem, DescriptionList},
     input::InputState,
     popover::Popover,
     scroll::{ScrollableElement, Scrollbar},
@@ -47,6 +49,10 @@ use wallet_ops::{
     plan_undelegate, plan_unlock,
 };
 
+use super::gas_fee::{
+    Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode, Eip1559GasFeeTarget,
+    render_eip1559_gas_fee_editor,
+};
 use super::governance_action::{
     GovernanceContinuation, GovernanceDraftRecipe, GovernanceRefreshTarget, GovernanceSpendDraft,
     GovernanceStakingReviewProjection, ProposalActionKind, ProposalActionSelection,
@@ -60,7 +66,7 @@ use super::tokens::{
 };
 use super::ui_helpers::token_label_row;
 use super::{WalletRoot, app_refresh_button, app_status_tag};
-use crate::assets::{PIGGY_BANK_ICON_PATH, RailgunSidebarIcon, USERS_ICON_PATH};
+use crate::assets::{PIGGY_BANK_ICON_PATH, RailgunSidebarIcon, USERS_ICON_PATH, WalletIconSource};
 
 const GOVERNANCE_HEADER_HEIGHT: gpui::Pixels = px(52.0);
 const GOVERNANCE_COMPACT_HEADER_BREAKPOINT: gpui::Pixels = px(1100.0);
@@ -84,6 +90,14 @@ const STAKING_OVERVIEW_ROW_HEIGHT: gpui::Pixels = px(40.0);
 const STAKING_TABLE_SCROLLBAR_WIDTH: gpui::Pixels = px(16.0);
 const STAKING_REWARD_EVIDENCE_CONCURRENCY: usize = 4;
 const STAKING_REWARD_EVIDENCE_TTL: Duration = Duration::from_hours(1);
+/// Rapid clicks in the claim selection form cost one estimate, not one per click.
+const REWARD_SELECTION_ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(300);
+const REWARD_SELECTION_DIALOG_WIDTH: gpui::Pixels = px(520.0);
+const STAKING_ACTION_DIALOG_WIDTH: gpui::Pixels = px(440.0);
+const REWARD_SELECTION_CHECKBOX_WIDTH: gpui::Pixels = px(20.0);
+const REWARD_SELECTION_ASSET_WIDTH: gpui::Pixels = px(100.0);
+const REWARD_SELECTION_FEE_WIDTH: gpui::Pixels = px(92.0);
+const REWARD_SELECTION_NET_WIDTH: gpui::Pixels = px(80.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RewardIntervalCountdown {
@@ -301,34 +315,19 @@ pub(super) async fn build_staking_action_draft(
                     Some(review),
                 )
             }
-            StakingActionKind::RewardClaim { token } => {
+            StakingActionKind::RewardClaimSelected { tokens } => {
+                if tokens.is_empty() {
+                    return Err("Select at least one reward to claim".to_owned());
+                }
+                if tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(
+                        "Selected reward tokens must be unique and ascending by address".to_owned(),
+                    );
+                }
                 let (plan, step, evidence) = plan_reward_claim_draft(
                     chain_id,
                     actor,
-                    Some(token),
-                    effective_chain.as_ref(),
-                    &http,
-                    reward_evidence_mode.clone(),
-                )
-                .await?;
-                (
-                    contracts.governor_rewards,
-                    GovernanceContractKind::GovernorRewards,
-                    plan.fingerprint,
-                    step.intent,
-                    None,
-                    Some(GovernanceContinuation::Reward {
-                        progress: wallet_ops::RewardClaimProgress::new(plan),
-                        evidence,
-                    }),
-                    None,
-                )
-            }
-            StakingActionKind::RewardClaimAll => {
-                let (plan, step, evidence) = plan_reward_claim_draft(
-                    chain_id,
-                    actor,
-                    None,
+                    &tokens,
                     effective_chain.as_ref(),
                     &http,
                     reward_evidence_mode,
@@ -371,10 +370,11 @@ pub(super) async fn build_staking_action_draft(
     .await
 }
 
+/// Plan a claim for `requested_tokens`, which must already be non-empty and ascending by address.
 async fn plan_reward_claim_draft(
     chain_id: u64,
     actor: Address,
-    token: Option<Address>,
+    requested_tokens: &[Address],
     effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     http: &wallet_ops::HttpContext,
     reward_evidence_mode: RewardEvidenceMode,
@@ -386,81 +386,37 @@ async fn plan_reward_claim_draft(
     ),
     String,
 > {
-    let mut tokens = governance_contracts(chain_id)
-        .ok_or_else(|| "Reward contracts unavailable".to_owned())?
-        .reward_tokens
-        .iter()
-        .map(|entry| entry.token)
-        .collect::<Vec<_>>();
-    tokens.sort();
-    let requested_tokens = token.map_or_else(|| tokens.clone(), |token| vec![token]);
-    let evidence = match reward_evidence_mode {
-        RewardEvidenceMode::CachedInitial { evidence } => {
-            if evidence.reward_tokens != requested_tokens {
+    let (evidence, reviewed_steps) = match reward_evidence_mode {
+        RewardEvidenceMode::CachedInitial { evidence, steps } => {
+            if evidence.reward_tokens.as_slice() != requested_tokens {
                 return Err(
                     "Cached reward evidence token set changed; refresh before reviewing again"
                         .to_owned(),
                 );
             }
-            evidence
+            (*evidence, steps.filter(|steps| !steps.is_empty()))
         }
-        RewardEvidenceMode::Fresh => {
-            let metadata =
-                fetch_interval_metadata(chain_id, &requested_tokens, effective_chain, http)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "Reward metadata unavailable".to_owned())?;
-            let snapshots = fetch_account_snapshots(
+        RewardEvidenceMode::Fresh => (
+            fetch_reward_selection_evidence(
                 chain_id,
                 actor,
+                requested_tokens,
                 effective_chain,
                 http,
-                wallet_ops::MulticallChunkSize::default(),
             )
-            .await
-            .map_err(|error| error.to_string())?;
-            if let Some(token) = token {
-                let evidence = fetch_reward_evidence(
-                    chain_id,
-                    actor,
-                    token,
-                    &metadata,
-                    &snapshots,
-                    effective_chain,
-                    http,
-                    wallet_ops::MulticallChunkSize::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "No unclaimed reward is available".to_owned())?;
-                wallet_ops::RewardBatchEvidence {
-                    reward_tokens: vec![token],
-                    starting_interval: evidence.starting_interval,
-                    ending_interval: evidence.ending_interval,
-                    staking_intervals: evidence.staking_intervals,
-                    hints: evidence.hints,
-                    claimed_intervals: vec![evidence.claimed_intervals],
-                    expected_amounts: vec![evidence.amount],
-                }
-            } else {
-                fetch_reward_batch_evidence(
-                    chain_id,
-                    actor,
-                    &requested_tokens,
-                    &metadata,
-                    &snapshots,
-                    effective_chain,
-                    http,
-                    wallet_ops::MulticallChunkSize::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "No unclaimed reward is available".to_owned())?
-            }
+            .await?,
+            None,
+        ),
+    };
+    // The selection form planned these steps against this same evidence, so the split does not
+    // have to be estimated again; `plan_reward_claim_batch` still validates them below.
+    let steps = match reviewed_steps {
+        Some(steps) => steps,
+        None => {
+            plan_reward_steps_for_evidence(chain_id, actor, &evidence, effective_chain, http)
+                .await?
         }
     };
-    let steps =
-        plan_reward_steps_for_evidence(chain_id, actor, &evidence, effective_chain, http).await?;
     let plan = wallet_ops::plan_reward_claim_batch(chain_id, actor, actor, true, &evidence, &steps)
         .map_err(|error| error.to_string())?;
     let step = plan
@@ -471,6 +427,59 @@ async fn plan_reward_claim_draft(
     Ok((plan, step, evidence))
 }
 
+/// Read fresh shared-range evidence for `requested_tokens`, which must already be non-empty and
+/// ascending by address. One token reads the single-token path and is widened to a batch shape.
+async fn fetch_reward_selection_evidence(
+    chain_id: u64,
+    actor: Address,
+    requested_tokens: &[Address],
+    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    http: &wallet_ops::HttpContext,
+) -> Result<wallet_ops::RewardBatchEvidence, String> {
+    let metadata = fetch_interval_metadata(chain_id, requested_tokens, effective_chain, http)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Reward metadata unavailable".to_owned())?;
+    let snapshots = fetch_account_snapshots(
+        chain_id,
+        actor,
+        effective_chain,
+        http,
+        wallet_ops::MulticallChunkSize::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let [token] = requested_tokens[..] {
+        let evidence = fetch_reward_evidence(
+            chain_id,
+            actor,
+            token,
+            &metadata,
+            &snapshots,
+            effective_chain,
+            http,
+            wallet_ops::MulticallChunkSize::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "No unclaimed reward is available".to_owned())?;
+        return Ok(evidence.into());
+    }
+    fetch_reward_batch_evidence(
+        chain_id,
+        actor,
+        requested_tokens,
+        &metadata,
+        &snapshots,
+        effective_chain,
+        http,
+        wallet_ops::MulticallChunkSize::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "No unclaimed reward is available".to_owned())
+}
+
 async fn plan_reward_steps_for_evidence(
     chain_id: u64,
     actor: Address,
@@ -478,36 +487,46 @@ async fn plan_reward_steps_for_evidence(
     effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     http: &wallet_ops::HttpContext,
 ) -> Result<Vec<wallet_ops::RewardClaimStep>, String> {
+    plan_reward_steps_with_fee(chain_id, actor, evidence, effective_chain, http)
+        .await
+        .map(|(steps, _)| steps)
+}
+
+/// Plan the claim steps for this evidence and report the fee per gas the estimates were priced
+/// at, which is what the selection form multiplies by the planned gas.
+async fn plan_reward_steps_with_fee(
+    chain_id: u64,
+    actor: Address,
+    evidence: &wallet_ops::RewardBatchEvidence,
+    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    http: &wallet_ops::HttpContext,
+) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
     let gas_ceiling = wallet_ops::fetch_latest_block_gas_limit(chain_id, effective_chain, http)
         .await
         .map_err(|error| error.to_string())?;
     let contract = contracts_for_reward(chain_id)?;
-    let aggregate_action = GovernanceActionIntent::RewardClaim {
-        reward_tokens: evidence.reward_tokens.clone(),
-        starting_interval: evidence.starting_interval,
-        ending_interval: evidence.ending_interval,
-        snapshot_hints: evidence.hints.clone(),
-        expected_amounts: evidence.expected_amounts.clone(),
-    };
     if let Ok(estimate) = estimate_reward_intent(
         chain_id,
         actor,
         contract,
-        aggregate_action,
+        evidence.to_claim_intent(),
         effective_chain,
         http,
     )
     .await
         && estimate.gas_limit <= gas_ceiling
     {
-        return Ok(vec![wallet_ops::RewardClaimStep {
-            starting_interval: evidence.starting_interval,
-            ending_interval: evidence.ending_interval,
-            reward_tokens: evidence.reward_tokens.clone(),
-            subtotal: U256::ZERO,
-            expected_amounts: evidence.expected_amounts.clone(),
-            estimated_gas: estimate.gas_limit,
-        }]);
+        return Ok((
+            vec![wallet_ops::RewardClaimStep {
+                starting_interval: evidence.starting_interval,
+                ending_interval: evidence.ending_interval,
+                reward_tokens: evidence.reward_tokens.clone(),
+                subtotal: U256::ZERO,
+                expected_amounts: evidence.expected_amounts.clone(),
+                estimated_gas: estimate.raw_gas_limit,
+            }],
+            estimate.expected_fee_per_gas,
+        ));
     }
     exact_reward_steps(
         chain_id,
@@ -518,6 +537,157 @@ async fn plan_reward_steps_for_evidence(
         http,
     )
     .await
+}
+
+/// Estimate the selection and its one-token alternatives against one shared evidence range.
+async fn estimate_reward_selection(
+    chain_id: u64,
+    actor: Address,
+    tokens: &[Address],
+    available: wallet_ops::RewardBatchEvidence,
+    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    http: &wallet_ops::HttpContext,
+) -> Result<RewardSelectionEstimate, Arc<str>> {
+    let evidence = (!tokens.is_empty())
+        .then(|| available.project(tokens))
+        .transpose()
+        .map_err(|error| Arc::from(error.to_string()))?;
+    let baseline = if tokens.len() <= 1 {
+        wallet_ops::estimate_reward_claim_baseline(
+            chain_id,
+            actor,
+            &available,
+            effective_chain,
+            http,
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+    let (steps, expected_fee_per_gas) = match &evidence {
+        Some(evidence) => {
+            plan_reward_steps_with_fee(chain_id, actor, evidence, effective_chain, http)
+                .await
+                .map_err(Arc::from)?
+        }
+        None => (
+            Vec::new(),
+            baseline
+                .as_ref()
+                .map_or(0, |estimate| estimate.expected_fee_per_gas),
+        ),
+    };
+    let selected_gas =
+        reward_selection_gas(&steps).ok_or_else(|| Arc::from("Estimated claim gas overflowed"))?;
+    let comparison_gas = if tokens.is_empty() {
+        baseline.as_ref().map(|estimate| estimate.raw_gas_limit)
+    } else {
+        Some(selected_gas)
+    };
+    let comparisons = available.reward_tokens.iter().copied().map(|token| {
+        let available = &available;
+        let baseline = baseline.as_ref();
+        async move {
+            let mut alternative = tokens.to_vec();
+            let selected = match alternative.binary_search(&token) {
+                Ok(index) => {
+                    alternative.remove(index);
+                    true
+                }
+                Err(index) => {
+                    alternative.insert(index, token);
+                    false
+                }
+            };
+            let alternative_gas = if alternative.is_empty() {
+                baseline.map(|estimate| estimate.raw_gas_limit)
+            } else if let Ok(evidence) = available.project(&alternative) {
+                plan_reward_steps_with_fee(chain_id, actor, &evidence, effective_chain, http)
+                    .await
+                    .ok()
+                    .and_then(|(steps, _)| reward_selection_gas(&steps))
+            } else {
+                None
+            };
+            let added = comparison_gas
+                .zip(alternative_gas)
+                .and_then(|(current, alternative)| {
+                    reward_claim_added_gas(selected, current, alternative)
+                });
+            (token, added)
+        }
+    });
+    let added_gas = futures_util::stream::iter(comparisons)
+        .buffer_unordered(STAKING_REWARD_EVIDENCE_CONCURRENCY)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+    let shared_gas = reward_claim_shared_gas(tokens, comparison_gas, &added_gas);
+    Ok(RewardSelectionEstimate {
+        evidence,
+        steps,
+        expected_fee_per_gas,
+        added_gas,
+        shared_gas,
+    })
+}
+
+fn reward_selection_gas(steps: &[wallet_ops::RewardClaimStep]) -> Option<u64> {
+    steps
+        .iter()
+        .try_fold(0_u64, |total, step| total.checked_add(step.estimated_gas))
+}
+
+const fn reward_claim_added_gas(selected: bool, current: u64, alternative: u64) -> Option<u64> {
+    if selected {
+        current.checked_sub(alternative)
+    } else {
+        alternative.checked_sub(current)
+    }
+}
+
+fn reward_claim_shared_gas(
+    selected: &[Address],
+    total_gas: Option<u64>,
+    added_gas: &BTreeMap<Address, Option<u64>>,
+) -> Option<u64> {
+    selected.iter().try_fold(total_gas?, |remaining, token| {
+        remaining.checked_sub((*added_gas.get(token)?)?)
+    })
+}
+
+/// The estimated cost of one planned claim selection at the fee per gas its steps were estimated
+/// at. It fails closed rather than showing a wrapped number.
+fn reward_selection_cost(steps: &[wallet_ops::RewardClaimStep], fee_per_gas: u128) -> Option<U256> {
+    let gas = reward_selection_gas(steps)?;
+    U256::from(gas).checked_mul(U256::from(fee_per_gas))
+}
+
+/// Reprice cached gas with the current quote; retain the estimate's price until a quote arrives.
+fn reward_claim_fee_per_gas(
+    selection: PublicActionGasFeeSelection,
+    quote: Option<wallet_ops::SelfBroadcastGasFeeQuote>,
+    auto_fee_per_gas: u128,
+) -> u128 {
+    match selection {
+        PublicActionGasFeeSelection::Auto => quote.map_or(auto_fee_per_gas, |quote| {
+            wallet_ops::expected_eip1559_fee_per_gas(
+                quote,
+                quote.suggested_max_fee_per_gas,
+                quote.suggested_max_priority_fee_per_gas,
+            )
+        }),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => quote.map_or(max_fee_per_gas, |quote| {
+            wallet_ops::expected_eip1559_fee_per_gas(
+                quote,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            )
+        }),
+    }
 }
 
 fn contracts_for_reward(chain_id: u64) -> Result<Address, String> {
@@ -568,7 +738,7 @@ async fn exact_reward_steps(
     gas_ceiling: u64,
     effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     http: &wallet_ops::HttpContext,
-) -> Result<Vec<wallet_ops::RewardClaimStep>, String> {
+) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
     let amounts = wallet_ops::fetch_reward_batch_interval_amounts(
         chain_id,
         actor,
@@ -591,6 +761,7 @@ async fn exact_reward_steps(
     let contract = contracts_for_reward(chain_id)?;
     let mut pending = vec![(0_usize, amounts.len())];
     let mut accepted = Vec::new();
+    let mut expected_fee_per_gas = 0_u128;
     while let Some((start, end)) = pending.pop() {
         let mut expected_amounts = vec![U256::ZERO; evidence.reward_tokens.len()];
         for amount in &amounts[start..end] {
@@ -613,13 +784,14 @@ async fn exact_reward_steps(
         match estimate_reward_intent(chain_id, actor, contract, action, effective_chain, http).await
         {
             Ok(estimate) if estimate.gas_limit <= gas_ceiling => {
+                expected_fee_per_gas = estimate.expected_fee_per_gas;
                 accepted.push(wallet_ops::RewardClaimStep {
                     starting_interval: amounts[start].interval,
                     ending_interval: amounts[end - 1].interval,
                     reward_tokens: evidence.reward_tokens.clone(),
                     subtotal: U256::ZERO,
                     expected_amounts,
-                    estimated_gas: estimate.gas_limit,
+                    estimated_gas: estimate.raw_gas_limit,
                 });
             }
             Ok(_) | Err(_) => {
@@ -654,7 +826,7 @@ async fn exact_reward_steps(
     {
         return Err("Reward ranges do not cover the reviewed evidence".to_owned());
     }
-    Ok(accepted)
+    Ok((accepted, expected_fee_per_gas))
 }
 
 async fn fresh_stake_position(
@@ -704,8 +876,36 @@ struct BulkRewardReadiness {
 pub(super) enum RewardEvidenceMode {
     Fresh,
     CachedInitial {
-        evidence: wallet_ops::RewardBatchEvidence,
+        evidence: Box<wallet_ops::RewardBatchEvidence>,
+        /// Steps already planned against this evidence by the selection form. Preflight validates
+        /// them again and plans fresh ones when they are absent.
+        steps: Option<Vec<wallet_ops::RewardClaimStep>>,
     },
+}
+
+/// Pick the evidence preflight starts from for a claim selection: the estimate the form already
+/// planned for exactly these tokens, otherwise the cached dashboard evidence, otherwise a fresh
+/// read.
+fn reward_evidence_mode_for_selection(
+    estimate: Option<&RewardSelectionEstimateState>,
+    tokens: &[Address],
+    cached: Option<wallet_ops::RewardBatchEvidence>,
+) -> RewardEvidenceMode {
+    if let Some(RewardSelectionEstimateState::Estimated(estimate)) = estimate
+        && let Some(evidence) = &estimate.evidence
+        && evidence.reward_tokens.as_slice() == tokens
+    {
+        return RewardEvidenceMode::CachedInitial {
+            evidence: Box::new(evidence.clone()),
+            steps: Some(estimate.steps.clone()),
+        };
+    }
+    cached.map_or(RewardEvidenceMode::Fresh, |evidence| {
+        RewardEvidenceMode::CachedInitial {
+            evidence: Box::new(evidence),
+            steps: None,
+        }
+    })
 }
 
 enum StakingRewardRefreshResult {
@@ -963,6 +1163,114 @@ fn reward_usd_total(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RewardFeePresentation {
+    Pending,
+    Estimated(RewardFeeEstimate),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RewardFeeEstimate {
+    /// Fee text without the leading estimate marker, in USD when the native token is priced and
+    /// in native units otherwise.
+    label: String,
+    /// Micro-USD value of the estimated fee when the native token has a cached rate.
+    usd: Option<U256>,
+    /// Whether the added fee exceeds the reward's value.
+    below_fee: bool,
+}
+
+fn reward_is_below_fee(reward_usd: RewardUsdState, fee_usd: Option<U256>) -> bool {
+    matches!(
+        (fee_usd, reward_usd),
+        (Some(fee_usd), RewardUsdState::Value(reward_usd)) if fee_usd > reward_usd
+    )
+}
+
+fn reward_cost_presentation(
+    chain_id: u64,
+    cost: U256,
+    reward_usd: RewardUsdState,
+    anchor_cache: &TokenAnchorRateCache,
+) -> RewardFeeEstimate {
+    let usd = anchor_cache.cached_native_usd_micro_value(chain_id, cost);
+    let label = usd.map_or_else(
+        || super::tokens::format_native_token_amount_for_display(chain_id, cost),
+        format_usd_micro_value,
+    );
+    RewardFeeEstimate {
+        label,
+        usd,
+        below_fee: reward_is_below_fee(reward_usd, usd),
+    }
+}
+
+fn reward_added_fee_presentation(
+    chain_id: u64,
+    estimate: &RewardSelectionEstimate,
+    token: Address,
+    fee_per_gas: u128,
+    reward_usd: RewardUsdState,
+    anchor_cache: &TokenAnchorRateCache,
+) -> RewardFeePresentation {
+    estimate.added_gas.get(&token).copied().flatten().map_or(
+        RewardFeePresentation::Unavailable,
+        |gas| {
+            RewardFeePresentation::Estimated(reward_cost_presentation(
+                chain_id,
+                U256::from(gas) * U256::from(fee_per_gas),
+                reward_usd,
+                anchor_cache,
+            ))
+        },
+    )
+}
+
+/// Select positive rewards unless their priced added fee exceeds their value. An unavailable
+/// or unpriced fee is no evidence of a loss.
+fn default_reward_claim_selection_for(
+    state: &StakingReadState,
+    chain_id: u64,
+    uuid: &str,
+    tokens: &[Address],
+    estimate: &RewardSelectionEstimate,
+    quote: Option<wallet_ops::SelfBroadcastGasFeeQuote>,
+    anchor_cache: &TokenAnchorRateCache,
+) -> Vec<Address> {
+    let fee_per_gas = reward_claim_fee_per_gas(
+        PublicActionGasFeeSelection::Auto,
+        quote,
+        estimate.expected_fee_per_gas,
+    );
+    let mut selected = tokens
+        .iter()
+        .copied()
+        .filter(|&token| {
+            let reward_usd = reward_usd_state(
+                chain_id,
+                token,
+                state.resolved_reward(uuid, token),
+                anchor_cache,
+            );
+            let fee_usd = estimate
+                .added_gas
+                .get(&token)
+                .copied()
+                .flatten()
+                .and_then(|gas| {
+                    anchor_cache.cached_native_usd_micro_value(
+                        chain_id,
+                        U256::from(gas) * U256::from(fee_per_gas),
+                    )
+                });
+            !reward_is_below_fee(reward_usd, fee_usd)
+        })
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    selected
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) enum StakingRefreshStatus {
     #[default]
@@ -1149,6 +1457,18 @@ impl StakingReadState {
         true
     }
 
+    /// Evidence behind a current positive row, used to build the claim selection.
+    pub(super) fn positive_reward_evidence(
+        &self,
+        uuid: &str,
+        token: Address,
+    ) -> Option<&RewardEvidence> {
+        match self.resolved_reward(uuid, token)? {
+            RewardView::Positive { evidence, .. } => Some(evidence),
+            RewardView::Zero | RewardView::Unavailable(_) => None,
+        }
+    }
+
     pub(super) fn apply_bulk_reward(
         &mut self,
         key: &GovernanceContextKey,
@@ -1184,6 +1504,15 @@ impl StakingReadState {
         true
     }
 
+    /// The row this read produced for an account and token, or `None` while it is still loading.
+    pub(super) fn resolved_reward(&self, uuid: &str, token: Address) -> Option<&RewardView> {
+        let reward_key = (uuid.to_owned(), token);
+        self.current_reward_keys
+            .contains(&reward_key)
+            .then(|| self.rewards.get(&reward_key))
+            .flatten()
+    }
+
     pub(super) const fn global_action_ready(&self) -> bool {
         self.global_ready
     }
@@ -1198,22 +1527,20 @@ impl StakingReadState {
     }
 
     pub(super) fn reward_action_ready(&self, uuid: &str, token: Address) -> bool {
-        self.global_ready
-            && self.current_reward_keys.contains(&(uuid.to_owned(), token))
-            && matches!(
-                self.rewards.get(&(uuid.to_owned(), token)),
-                Some(RewardView::Positive { .. })
-            )
+        self.global_ready && self.positive_reward_evidence(uuid, token).is_some()
     }
 
-    pub(super) fn reward_claim_all_ready(&self, uuid: &str, tokens: &[Address]) -> bool {
+    /// Whether any resolved reward row of this account is positive, which is what the account's
+    /// claim selection needs before it can be opened with nothing selected yet.
+    pub(super) fn account_has_positive_reward(&self, uuid: &str) -> bool {
         self.global_ready
-            && !tokens.is_empty()
-            && self.current_bulk_reward_keys.contains(uuid)
-            && self
-                .bulk_reward_readiness
-                .get(uuid)
-                .is_some_and(|readiness| readiness.tokens == tokens && readiness.ready)
+            && self.current_reward_keys.iter().any(|reward_key| {
+                reward_key.0 == uuid
+                    && matches!(
+                        self.rewards.get(reward_key),
+                        Some(RewardView::Positive { .. })
+                    )
+            })
     }
 
     pub(super) fn cached_reward_evidence_at(
@@ -1253,15 +1580,7 @@ impl StakingReadState {
             if evidence.token != token {
                 return None;
             }
-            return Some(wallet_ops::RewardBatchEvidence {
-                reward_tokens: vec![token],
-                starting_interval: evidence.starting_interval,
-                ending_interval: evidence.ending_interval,
-                staking_intervals: evidence.staking_intervals.clone(),
-                hints: evidence.hints.clone(),
-                claimed_intervals: vec![evidence.claimed_intervals.clone()],
-                expected_amounts: vec![evidence.amount],
-            });
+            return Some(evidence.as_ref().into());
         }
         if !self.current_bulk_reward_keys.contains(uuid) {
             return None;
@@ -1270,17 +1589,18 @@ impl StakingReadState {
         if now
             .checked_duration_since(*captured_at)
             .is_none_or(|age| age > STAKING_REWARD_EVIDENCE_TTL)
-            || evidence.reward_tokens != tokens
-            || evidence.expected_amounts.len() != tokens.len()
-            || evidence.expected_amounts.iter().all(U256::is_zero)
             || !self
                 .bulk_reward_readiness
                 .get(uuid)
-                .is_some_and(|readiness| readiness.tokens == tokens && readiness.ready)
+                .is_some_and(|readiness| {
+                    readiness.tokens == evidence.reward_tokens && readiness.ready
+                })
         {
             return None;
         }
-        Some(evidence.clone())
+        // The cached read covers the configured token set; a claim carries the selection only.
+        let projected = evidence.project(tokens).ok()?;
+        (!projected.expected_amounts.iter().all(U256::is_zero)).then_some(projected)
     }
 
     pub(super) fn action_selection_ready(&self, selection: &StakingActionSelection) -> bool {
@@ -1301,17 +1621,13 @@ impl StakingReadState {
             return false;
         }
         let uuid = participant.uuid.as_str();
-        match selection.kind {
+        match &selection.kind {
             StakingActionKind::Stake => true,
-            StakingActionKind::RewardClaim { token } => self.reward_action_ready(uuid, token),
-            StakingActionKind::RewardClaimAll => {
-                let mut tokens = governance_contracts(key.chain_id)
-                    .map_or(&[][..], |contracts| contracts.reward_tokens)
-                    .iter()
-                    .map(|token| token.token)
-                    .collect::<Vec<_>>();
-                tokens.sort();
-                self.reward_claim_all_ready(uuid, &tokens)
+            StakingActionKind::RewardClaimSelected { tokens } => {
+                self.account_has_positive_reward(uuid)
+                    && tokens
+                        .iter()
+                        .all(|&token| self.reward_action_ready(uuid, token))
             }
             StakingActionKind::Delegate { .. }
             | StakingActionKind::Undelegate { .. }
@@ -1461,6 +1777,7 @@ pub(super) struct GovernanceState {
     pub proposal_action_amount_input: Entity<InputState>,
     pub action_flow: GovernanceActionFlowState,
     pub staking_delegate_input: Entity<InputState>,
+    pub reward_gas_fee: Eip1559GasFeeEditorState,
     pub compact_position_details: Option<(String, U256)>,
     pub participant_picker: Entity<ParticipantPickerState>,
     participant_picker_wallet: Option<String>,
@@ -1474,6 +1791,7 @@ impl GovernanceState {
         participant_picker: Entity<ParticipantPickerState>,
         proposal_action_amount_input: Entity<InputState>,
         staking_delegate_input: Entity<InputState>,
+        reward_gas_fee: Eip1559GasFeeEditorState,
     ) -> Self {
         Self {
             tab: GovernanceTab::default(),
@@ -1482,6 +1800,7 @@ impl GovernanceState {
             proposal_action_amount_input,
             action_flow: GovernanceActionFlowState::default(),
             staking_delegate_input,
+            reward_gas_fee,
             compact_position_details: None,
             participant_picker,
             participant_picker_wallet: None,
@@ -1524,6 +1843,8 @@ impl GovernanceState {
 
     pub(super) fn invalidate_action(&mut self) {
         self.action_flow.invalidate();
+        self.reward_gas_fee.refresh_id = self.reward_gas_fee.refresh_id.wrapping_add(1);
+        self.reward_gas_fee.refreshing = false;
     }
 
     fn clear_stale_position_details(&mut self) {
@@ -1548,6 +1869,25 @@ pub(super) enum GovernanceActionSelection {
     Staking(StakingActionSelection),
 }
 
+/// What the claim selection form knows about the cost of the exact selected call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RewardSelectionEstimateState {
+    Pending,
+    Estimated(Box<RewardSelectionEstimate>),
+    Unavailable(Arc<str>),
+}
+
+/// The planned selected claim: the evidence it was planned from, the steps it splits into, and
+/// the fee those steps were estimated at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RewardSelectionEstimate {
+    pub evidence: Option<wallet_ops::RewardBatchEvidence>,
+    pub steps: Vec<wallet_ops::RewardClaimStep>,
+    pub expected_fee_per_gas: u128,
+    pub added_gas: BTreeMap<Address, Option<u64>>,
+    pub shared_gas: Option<u64>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct GovernanceActionFlowState {
     pub selection: Option<GovernanceActionSelection>,
@@ -1556,12 +1896,105 @@ pub(super) struct GovernanceActionFlowState {
     pub pending: bool,
     pub error: Option<Arc<str>>,
     pub generation: u64,
+    pub reward_selection_estimate: Option<RewardSelectionEstimateState>,
+    pub reward_selection_generation: u64,
+    pub seed_reward_selection: bool,
 }
 
 impl GovernanceActionFlowState {
     pub(super) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.recipe = None;
+        self.reward_selection_estimate = None;
+        self.seed_reward_selection = false;
+        // Bumped rather than reset so an estimate still in flight can never match a later one.
+        self.reward_selection_generation = self.reward_selection_generation.wrapping_add(1);
+    }
+
+    /// The live claim selection, when the open action is one.
+    pub(super) fn reward_claim_selection_tokens(&self) -> Option<&[Address]> {
+        match &self.staking_selection()?.kind {
+            StakingActionKind::RewardClaimSelected { tokens } => Some(tokens),
+            StakingActionKind::Stake
+            | StakingActionKind::Delegate { .. }
+            | StakingActionKind::Undelegate { .. }
+            | StakingActionKind::Unlock { .. }
+            | StakingActionKind::PrincipalClaim { .. } => None,
+        }
+    }
+
+    /// Add or drop one token in the open claim selection, keeping it unique and ascending by
+    /// address. Returns whether a claim selection was open to change.
+    pub(super) fn set_reward_claim_selection_token(
+        &mut self,
+        token: Address,
+        selected: bool,
+    ) -> bool {
+        let Some(tokens) = self.reward_claim_selection_tokens_mut() else {
+            return false;
+        };
+        match (tokens.binary_search(&token), selected) {
+            (Err(index), true) => tokens.insert(index, token),
+            (Ok(index), false) => {
+                tokens.remove(index);
+            }
+            (Ok(_), true) | (Err(_), false) => {}
+        }
+        true
+    }
+
+    /// Replace the open claim selection, keeping it unique and ascending by address.
+    pub(super) fn set_reward_claim_selection_all(&mut self, mut selected: Vec<Address>) -> bool {
+        let Some(tokens) = self.reward_claim_selection_tokens_mut() else {
+            return false;
+        };
+        selected.sort_unstable();
+        selected.dedup();
+        *tokens = selected;
+        true
+    }
+
+    fn reward_claim_selection_tokens_mut(&mut self) -> Option<&mut Vec<Address>> {
+        match self.selection.as_mut()? {
+            GovernanceActionSelection::Staking(StakingActionSelection {
+                kind: StakingActionKind::RewardClaimSelected { tokens },
+                ..
+            }) => Some(tokens),
+            GovernanceActionSelection::Staking(_) | GovernanceActionSelection::Proposal(_) => None,
+        }
+    }
+
+    /// Start a selection estimate: drop the prepared recipe and draft, clear the error, and mark
+    /// the estimate pending, including the baseline for an empty selection. Returns the generation its result must
+    /// carry to be stored.
+    pub(super) fn begin_reward_selection_estimate(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.recipe = None;
+        self.draft = None;
+        self.error = None;
+        self.reward_selection_generation = self.reward_selection_generation.wrapping_add(1);
+        self.reward_selection_estimate = self
+            .reward_claim_selection_tokens()
+            .is_some()
+            .then_some(RewardSelectionEstimateState::Pending);
+        self.reward_selection_generation
+    }
+
+    /// Store a selection estimate result, dropping one whose selection has already moved on.
+    pub(super) fn apply_reward_selection_estimate(
+        &mut self,
+        generation: u64,
+        result: Result<RewardSelectionEstimate, Arc<str>>,
+    ) -> bool {
+        if self.reward_selection_generation != generation {
+            return false;
+        }
+        self.reward_selection_estimate = Some(
+            result.map_or_else(RewardSelectionEstimateState::Unavailable, |estimate| {
+                RewardSelectionEstimateState::Estimated(Box::new(estimate))
+            }),
+        );
+        true
     }
 
     pub(super) fn set_proposal_selection(&mut self, selection: ProposalActionSelection) {
@@ -1621,34 +2054,45 @@ impl GovernanceActionFlowState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum StakingActionKind {
     Stake,
-    Delegate { stake_id: U256 },
-    Undelegate { stake_id: U256 },
-    Unlock { stake_id: U256 },
-    PrincipalClaim { stake_id: U256 },
-    RewardClaim { token: Address },
-    RewardClaimAll,
+    Delegate {
+        stake_id: U256,
+    },
+    Undelegate {
+        stake_id: U256,
+    },
+    Unlock {
+        stake_id: U256,
+    },
+    PrincipalClaim {
+        stake_id: U256,
+    },
+    /// The live selection of positive reward tokens, ascending by numeric address. It may be
+    /// empty while the selection form is open; review and the draft builder reject that.
+    RewardClaimSelected {
+        tokens: Vec<Address>,
+    },
 }
 
 impl StakingActionKind {
-    const fn stake_id(self) -> Option<U256> {
+    const fn stake_id(&self) -> Option<U256> {
         match self {
             Self::Delegate { stake_id }
             | Self::Undelegate { stake_id }
             | Self::Unlock { stake_id }
-            | Self::PrincipalClaim { stake_id } => Some(stake_id),
+            | Self::PrincipalClaim { stake_id } => Some(*stake_id),
             _ => None,
         }
     }
 
-    const fn is_compose_action(self) -> bool {
+    const fn is_compose_action(&self) -> bool {
         matches!(self, Self::Stake | Self::Delegate { .. })
     }
 
-    const fn is_reward_action(self) -> bool {
-        matches!(self, Self::RewardClaim { .. } | Self::RewardClaimAll)
+    const fn is_reward_action(&self) -> bool {
+        matches!(self, Self::RewardClaimSelected { .. })
     }
 }
 
@@ -1659,42 +2103,14 @@ pub(super) struct StakingActionSelection {
     pub kind: StakingActionKind,
 }
 
-pub(super) const fn staking_action_title(kind: StakingActionKind) -> &'static str {
+pub(super) const fn staking_action_title(kind: &StakingActionKind) -> &'static str {
     match kind {
         StakingActionKind::Stake => "Stake RAIL",
         StakingActionKind::Delegate { .. } => "Delegate stake",
         StakingActionKind::Undelegate { .. } => "Undelegate stake",
         StakingActionKind::Unlock { .. } => "Unlock stake",
         StakingActionKind::PrincipalClaim { .. } => "Claim principal",
-        StakingActionKind::RewardClaim { .. } => "Claim rewards",
-        StakingActionKind::RewardClaimAll => "Claim all rewards",
-    }
-}
-
-fn staking_action_dialog_title(
-    kind: StakingActionKind,
-    chain_id: u64,
-    registry: &wallet_ops::settings::EffectiveTokenRegistry,
-) -> String {
-    match kind {
-        StakingActionKind::RewardClaim { token } => {
-            let symbol = token_display_metadata(Some(registry), chain_id, &token)
-                .map(|metadata| metadata.symbol)
-                .or_else(|| {
-                    governance_contracts(chain_id).and_then(|contracts| {
-                        contracts
-                            .reward_tokens
-                            .iter()
-                            .find(|entry| entry.token == token)
-                            .map(|entry| entry.symbol.to_owned())
-                    })
-                });
-            symbol.map_or_else(
-                || staking_action_title(kind).to_owned(),
-                |symbol| format!("Claim {symbol} rewards"),
-            )
-        }
-        _ => staking_action_title(kind).to_owned(),
+        StakingActionKind::RewardClaimSelected { .. } => "Claim rewards",
     }
 }
 
@@ -1852,6 +2268,20 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         self.governance.invalidate_action();
+        let dialog_title = staking_action_title(&kind);
+        let focus_input = match &kind {
+            StakingActionKind::Stake => Some(self.governance.proposal_action_amount_input.clone()),
+            StakingActionKind::Delegate { .. } => {
+                Some(self.governance.staking_delegate_input.clone())
+            }
+            _ => None,
+        };
+        let selects_rewards = matches!(kind, StakingActionKind::RewardClaimSelected { .. });
+        let reviews_immediately = !selects_rewards
+            && !matches!(
+                kind,
+                StakingActionKind::Delegate { .. } | StakingActionKind::Stake
+            );
         let selection = StakingActionSelection {
             actor_uuid: actor_uuid.to_owned(),
             actor,
@@ -1861,6 +2291,10 @@ impl WalletRoot {
         self.governance.action_flow.draft = None;
         self.governance.action_flow.error = None;
         self.governance.action_flow.pending = false;
+        if selects_rewards {
+            self.governance.action_flow.seed_reward_selection = true;
+            self.governance.reward_gas_fee.reset_for_request(window, cx);
+        }
         self.governance
             .proposal_action_amount_input
             .update(cx, |input, cx| {
@@ -1874,18 +2308,20 @@ impl WalletRoot {
                 cx.notify();
             });
         let root = cx.entity();
-        let dialog_width = (window.viewport_size().width * 0.92).min(px(440.0));
+        let dialog_width = (window.viewport_size().width * 0.92).min(if selects_rewards {
+            REWARD_SELECTION_DIALOG_WIDTH
+        } else {
+            STAKING_ACTION_DIALOG_WIDTH
+        });
         let dialog_max_height = super::dialog_max_height(window);
         let content_width = super::secondary_dialog_content_width(dialog_width);
-        let dialog_title =
-            staking_action_dialog_title(kind, self.selected_chain, &self.effective_token_registry);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(app_strong_text(dialog_title.clone()))
+                .title(app_strong_text(dialog_title))
                 .on_ok(|_, _, _| false)
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
@@ -1898,25 +2334,294 @@ impl WalletRoot {
                     cx,
                 ))
         });
-        let focus_input = match kind {
-            StakingActionKind::Stake => Some(self.governance.proposal_action_amount_input.clone()),
-            StakingActionKind::Delegate { .. } => {
-                Some(self.governance.staking_delegate_input.clone())
-            }
-            _ => None,
-        };
         if let Some(focus_input) = focus_input {
             cx.defer_in(window, move |_root, window, cx| {
                 focus_input.read(cx).focus_handle(cx).focus(window, cx);
             });
         }
-        if !matches!(
-            kind,
-            StakingActionKind::Delegate { .. } | StakingActionKind::Stake
-        ) {
+        if reviews_immediately {
             self.review_staking_action(window, cx);
+        } else if selects_rewards {
+            self.refresh_governance_gas_fee_quote(cx);
+            self.start_reward_selection_estimate(Duration::ZERO, cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn governance_gas_fee_changed(&mut self, cx: &mut Context<'_, Self>) {
+        if self.governance.action_flow.pending
+            || self
+                .governance
+                .action_flow
+                .reward_claim_selection_tokens()
+                .is_none()
+        {
+            return;
+        }
+        self.governance.reward_gas_fee.error = self
+            .governance
+            .reward_gas_fee
+            .selection(cx)
+            .err()
+            .map(Arc::from);
+        self.governance.action_flow.error = None;
+        // The form derives costs from cached gas. Price edits leave the plan and selection intact.
+        cx.notify();
+    }
+
+    pub(super) fn set_governance_gas_fee_mode(
+        &mut self,
+        mode: Eip1559GasFeeMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.governance.action_flow.pending
+            || self
+                .governance
+                .action_flow
+                .reward_claim_selection_tokens()
+                .is_none()
+            || self.governance.reward_gas_fee.mode == mode
+        {
+            return;
+        }
+        let gas_fee = &mut self.governance.reward_gas_fee;
+        if mode == Eip1559GasFeeMode::Custom {
+            gas_fee.seed_custom_from_auto_if_empty(window, cx);
+        }
+        gas_fee.mode = mode;
+        self.governance_gas_fee_changed(cx);
+    }
+
+    pub(super) fn customize_governance_gas_fee_from_auto(
+        &mut self,
+        target: Eip1559GasFeeEditTarget,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.governance.action_flow.pending
+            || self
+                .governance
+                .action_flow
+                .reward_claim_selection_tokens()
+                .is_none()
+        {
+            return;
+        }
+        let gas_fee = &mut self.governance.reward_gas_fee;
+        if !gas_fee.overwrite_custom_from_auto(window, cx) {
+            return;
+        }
+        let focus_input = match target {
+            Eip1559GasFeeEditTarget::MaxFee => gas_fee.max_fee_input.clone(),
+            Eip1559GasFeeEditTarget::MaxTip => gas_fee.max_priority_fee_input.clone(),
+        };
+        gas_fee.mode = Eip1559GasFeeMode::Custom;
+        self.governance_gas_fee_changed(cx);
+        focus_input.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    pub(super) fn refresh_governance_gas_fee_quote(&mut self, cx: &mut Context<'_, Self>) {
+        if self.governance.action_flow.pending
+            || self
+                .governance
+                .action_flow
+                .reward_claim_selection_tokens()
+                .is_none()
+            || self.governance.reward_gas_fee.refreshing
+        {
+            return;
+        }
+        let context_key = self.governance_context_key();
+        let gas_fee = &mut self.governance.reward_gas_fee;
+        gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
+        gas_fee.refreshing = true;
+        gas_fee.quote_error = None;
+        let refresh_id = gas_fee.refresh_id;
+        let chain_id = self.selected_chain;
+        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let http = self.http.clone();
+        cx.spawn(async move |this, cx| {
+            let result = wallet_ops::quote_public_action_gas_fee_bundle_with_profile(
+                chain_id,
+                effective_chain.as_ref(),
+                wallet_ops::PublicShieldTransactionProfile::Railoxide,
+                &http,
+            )
+            .await;
+            let _ = this.update(cx, |root, cx| {
+                if root.governance.reward_gas_fee.refresh_id != refresh_id
+                    || root.governance_context_key() != context_key
+                {
+                    return;
+                }
+                let gas_fee = &mut root.governance.reward_gas_fee;
+                gas_fee.refreshing = false;
+                match result {
+                    Ok(bundle) => gas_fee.quote = Some(bundle.standard),
+                    Err(_) => {
+                        gas_fee.quote_error = Some(Arc::from(if gas_fee.quote.is_some() {
+                            "Gas quote refresh failed; using the last successful quote."
+                        } else {
+                            "Gas quote is unavailable."
+                        }));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Add or drop one reward in the open claim selection and re-estimate the selected call.
+    pub(super) fn set_reward_claim_selection_token(
+        &mut self,
+        token: Address,
+        selected: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self
+            .governance
+            .action_flow
+            .set_reward_claim_selection_token(token, selected)
+        {
+            return;
+        }
+        self.governance.action_flow.seed_reward_selection = false;
+        self.start_reward_selection_estimate(REWARD_SELECTION_ESTIMATE_DEBOUNCE, cx);
+        cx.notify();
+    }
+
+    /// Replace the open claim selection and re-estimate the selected call.
+    pub(super) fn set_reward_claim_selection_all(
+        &mut self,
+        tokens: Vec<Address>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self
+            .governance
+            .action_flow
+            .set_reward_claim_selection_all(tokens)
+        {
+            return;
+        }
+        self.governance.action_flow.seed_reward_selection = false;
+        self.start_reward_selection_estimate(REWARD_SELECTION_ESTIMATE_DEBOUNCE, cx);
+        cx.notify();
+    }
+
+    /// Plan and price the exact selected claim. A result is stored only while the selection it
+    /// was requested for is still the open one.
+    fn start_reward_selection_estimate(&mut self, debounce: Duration, cx: &Context<'_, Self>) {
+        let generation = self
+            .governance
+            .action_flow
+            .begin_reward_selection_estimate();
+        let Some(selection) = self.governance.action_flow.staking_selection().cloned() else {
+            return;
+        };
+        let StakingActionKind::RewardClaimSelected { tokens } = selection.kind else {
+            return;
+        };
+        let chain_id = self.selected_chain;
+        let context_key = self.governance_context_key();
+        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let http = self.http.clone();
+        let actor = selection.actor;
+        let actor_uuid = selection.actor_uuid;
+        let mut available_tokens = governance_contracts(chain_id)
+            .map_or(&[][..], |contracts| contracts.reward_tokens)
+            .iter()
+            .filter(|entry| {
+                self.governance
+                    .staking
+                    .positive_reward_evidence(&actor_uuid, entry.token)
+                    .is_some()
+            })
+            .map(|entry| entry.token)
+            .collect::<Vec<_>>();
+        available_tokens.sort_unstable();
+        cx.spawn(async move |this, cx| {
+            if !debounce.is_zero() {
+                cx.background_executor().timer(debounce).await;
+            }
+            let current = this.update(cx, |root, _cx| {
+                (root.governance.action_flow.reward_selection_generation == generation
+                    && root.governance.action_flow.reward_claim_selection_tokens()
+                        == Some(tokens.as_slice()))
+                .then(|| {
+                    root.governance.staking.cached_reward_evidence_at(
+                        &context_key,
+                        &actor_uuid,
+                        actor,
+                        &available_tokens,
+                        Instant::now(),
+                    )
+                })
+            });
+            let Ok(Some(cached)) = current else {
+                return;
+            };
+            let available = match cached {
+                Some(evidence) => Ok(evidence),
+                None => fetch_reward_selection_evidence(
+                    chain_id,
+                    actor,
+                    &available_tokens,
+                    effective_chain.as_ref(),
+                    &http,
+                )
+                .await
+                .map_err(Arc::from),
+            };
+            let result = match available {
+                Ok(available) => {
+                    estimate_reward_selection(
+                        chain_id,
+                        actor,
+                        &tokens,
+                        available,
+                        effective_chain.as_ref(),
+                        &http,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |root, cx| {
+                if root
+                    .governance
+                    .action_flow
+                    .apply_reward_selection_estimate(generation, result)
+                {
+                    if root.governance.action_flow.seed_reward_selection {
+                        root.governance.action_flow.seed_reward_selection = false;
+                        if let Some(RewardSelectionEstimateState::Estimated(estimate)) =
+                            &root.governance.action_flow.reward_selection_estimate
+                        {
+                            let selected = default_reward_claim_selection_for(
+                                &root.governance.staking,
+                                chain_id,
+                                &actor_uuid,
+                                &available_tokens,
+                                estimate,
+                                root.governance.reward_gas_fee.quote,
+                                &root.public_broadcaster_anchor_cache,
+                            );
+                            if selected != tokens {
+                                root.governance
+                                    .action_flow
+                                    .set_reward_claim_selection_all(selected);
+                                root.start_reward_selection_estimate(Duration::ZERO, cx);
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_staking_action_dialog_content(
@@ -2032,41 +2737,45 @@ impl WalletRoot {
                     .get(chain_id, &contracts.governance_token)
             })
             .map(|token| token.decimals);
-        let reward_evidence_mode = match selection.kind {
-            StakingActionKind::RewardClaim { token } => self
-                .governance
-                .staking
-                .cached_reward_evidence_at(
-                    &context_key,
-                    &selection.actor_uuid,
-                    selection.actor,
-                    &[token],
-                    Instant::now(),
-                )
-                .map_or(RewardEvidenceMode::Fresh, |evidence| {
-                    RewardEvidenceMode::CachedInitial { evidence }
-                }),
-            StakingActionKind::RewardClaimAll => {
-                let mut tokens = governance_contracts(chain_id)
-                    .map_or(&[][..], |contracts| contracts.reward_tokens)
-                    .iter()
-                    .map(|token| token.token)
-                    .collect::<Vec<_>>();
-                tokens.sort();
-                self.governance
-                    .staking
-                    .cached_reward_evidence_at(
+        let reward_evidence_mode = match &selection.kind {
+            StakingActionKind::RewardClaimSelected { tokens } => {
+                if tokens.is_empty() {
+                    self.governance.action_flow.error =
+                        Some(Arc::from("Select at least one reward to claim"));
+                    cx.notify();
+                    return;
+                }
+                reward_evidence_mode_for_selection(
+                    self.governance
+                        .action_flow
+                        .reward_selection_estimate
+                        .as_ref(),
+                    tokens,
+                    self.governance.staking.cached_reward_evidence_at(
                         &context_key,
                         &selection.actor_uuid,
                         selection.actor,
-                        &tokens,
+                        tokens,
                         Instant::now(),
-                    )
-                    .map_or(RewardEvidenceMode::Fresh, |evidence| {
-                        RewardEvidenceMode::CachedInitial { evidence }
-                    })
+                    ),
+                )
             }
             _ => RewardEvidenceMode::Fresh,
+        };
+        let gas_fee_selection = if matches!(
+            selection.kind,
+            StakingActionKind::RewardClaimSelected { .. }
+        ) {
+            match self.governance.reward_gas_fee.selection(cx) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.governance.reward_gas_fee.error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            PublicActionGasFeeSelection::Auto
         };
         let generation = self.governance.action_flow.generation.wrapping_add(1);
         self.governance.action_flow.generation = generation;
@@ -2095,7 +2804,7 @@ impl WalletRoot {
                 effective_chain.clone(),
                 http.clone(),
                 reward_evidence_mode,
-                PublicActionGasFeeSelection::Auto,
+                gas_fee_selection,
             )
             .await;
             let _ = this.update_in(cx, |root, window, cx| {
@@ -3492,14 +4201,12 @@ impl WalletRoot {
                         .child(app_muted_text("Nothing to claim yet.").text_size(px(12.0))),
                 );
             } else {
-                let positive_token_count = reward_tokens
+                let positive_reward_tokens = reward_token_addresses
                     .iter()
-                    .filter(|token| {
-                        let key = (uuid.clone(), token.token);
-                        state.current_reward_keys.contains(&key)
-                            && matches!(state.rewards.get(&key), Some(RewardView::Positive { .. }))
-                    })
-                    .count();
+                    .copied()
+                    .filter(|&token| state.positive_reward_evidence(&uuid, token).is_some())
+                    .collect::<Vec<_>>();
+                let positive_token_count = positive_reward_tokens.len();
                 let total_unclaimed = match reward_usd_total(
                     self.selected_chain,
                     &uuid,
@@ -3514,53 +4221,50 @@ impl WalletRoot {
                         format!("{} unclaimed", format_usd_micro_value(value))
                     }
                 };
-                let claim_all_ready = positive_token_count >= 2
-                    && state.reward_claim_all_ready(&uuid, &reward_token_addresses)
+                let claim_selection = StakingActionSelection {
+                    actor_uuid: uuid.clone(),
+                    actor: account.address,
+                    kind: StakingActionKind::RewardClaimSelected {
+                        tokens: positive_reward_tokens.clone(),
+                    },
+                };
+                let claim_ready = positive_token_count >= 1
+                    && state.action_selection_ready(&claim_selection)
                     && !inactive
                     && self.governance.action_flow.selection.is_none();
-                let claim_all_root = root.clone();
-                let claim_all_uuid = uuid.clone();
-                let claim_all_actor = account.address;
-                let claim_all_button =
-                    app_button_base(staking_control_id(&uuid, "reward-claim-all", "account"))
+                let claim_root = root.clone();
+                let claim_uuid = uuid.clone();
+                let claim_actor = account.address;
+                let claim_tokens = positive_reward_tokens;
+                let claim_button =
+                    app_button_base(staking_control_id(&uuid, "reward-claim", "account"))
                         .primary()
                         .small()
-                        .child("Claim all")
+                        .child("Claim…")
                         .on_click(move |_event, window, cx| {
-                            claim_all_root.update(cx, |root, cx| {
+                            let tokens = claim_tokens.clone();
+                            claim_root.update(cx, |root, cx| {
                                 root.open_staking_action(
-                                    claim_all_uuid.as_str(),
-                                    claim_all_actor,
-                                    StakingActionKind::RewardClaimAll,
+                                    claim_uuid.as_str(),
+                                    claim_actor,
+                                    StakingActionKind::RewardClaimSelected { tokens },
                                     window,
                                     cx,
                                 );
                             });
                         });
                 let reward_rows = reward_tokens.iter().filter_map(|token| {
-                    let reward_key = (uuid.clone(), token.token);
-                    let reward = state.rewards.get(&reward_key);
-                    let resolved_reward = state
-                        .current_reward_keys
-                        .contains(&reward_key)
-                        .then_some(reward)
-                        .flatten();
+                    let resolved_reward = state.resolved_reward(&uuid, token.token);
                     if matches!(resolved_reward, Some(RewardView::Zero)) {
                         return None;
                     }
                     Some(render_reward_row(
                         self.selected_chain,
-                        account.address,
-                        &uuid,
-                        inactive,
                         token.symbol,
                         token.token,
                         resolved_reward,
-                        resolved_reward,
                         &self.effective_token_registry,
-                        state.reward_action_ready(&uuid, token.token),
                         &self.public_broadcaster_anchor_cache,
-                        root.clone(),
                     ))
                 });
                 let reward_header = div()
@@ -3577,14 +4281,14 @@ impl WalletRoot {
                             .child(app_strong_text("Rewards").text_size(px(12.0)))
                             .child(app_muted_text(total_unclaimed).text_size(px(11.0))),
                     )
-                    .when(claim_all_ready, |this| {
+                    .when(claim_ready, |this| {
                         this.child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .flex()
                                 .justify_end()
-                                .child(claim_all_button),
+                                .child(claim_button),
                         )
                     });
                 card = card.child(
@@ -4343,7 +5047,7 @@ impl TableDelegate for StakeTableDelegate {
                                 root.open_staking_action(
                                     actor_uuid.as_str(),
                                     actor,
-                                    kind,
+                                    kind.clone(),
                                     window,
                                     cx,
                                 );
@@ -4381,17 +5085,11 @@ impl TableDelegate for StakeTableDelegate {
 
 fn render_reward_row(
     chain_id: u64,
-    actor: Address,
-    actor_uuid: &str,
-    inactive: bool,
     symbol: &str,
     token: Address,
     reward: Option<&RewardView>,
-    resolved_reward: Option<&RewardView>,
     registry: &wallet_ops::settings::EffectiveTokenRegistry,
-    reward_action_ready: bool,
     anchor_cache: &TokenAnchorRateCache,
-    root: Entity<WalletRoot>,
 ) -> gpui::Div {
     let metadata = token_display_metadata(Some(registry), chain_id, &token);
     let display_symbol = metadata
@@ -4399,29 +5097,16 @@ fn render_reward_row(
         .map_or_else(|| symbol.to_owned(), |info| info.symbol.clone());
     let icon_path = metadata.and_then(|info| info.icon_path);
     let display_amount = |amount| format_reward_amount(chain_id, token, amount, registry);
-    let (amount, detail, available) = match reward {
-        None => (
-            "Loading...".to_owned(),
-            "Calculation pending".to_owned(),
-            false,
-        ),
+    let (amount, detail) = match reward {
+        None => ("Loading...".to_owned(), "Calculation pending".to_owned()),
         Some(RewardView::Zero) => (
             display_amount(U256::ZERO),
             "No completed unclaimed intervals".to_owned(),
-            false,
         ),
-        Some(RewardView::Positive { amount, .. }) => (display_amount(*amount), String::new(), true),
-        Some(RewardView::Unavailable(error)) => {
-            ("Unavailable".to_owned(), error.to_string(), false)
-        }
+        Some(RewardView::Positive { amount, .. }) => (display_amount(*amount), String::new()),
+        Some(RewardView::Unavailable(error)) => ("Unavailable".to_owned(), error.to_string()),
     };
-    let usd_label = reward_usd_label(chain_id, token, resolved_reward, anchor_cache);
-    let claim_root = root;
-    let actor_uuid = actor_uuid.to_owned();
-    let claim_button = app_button_base(staking_control_id(&actor_uuid, "reward-claim", token))
-        .outline()
-        .small()
-        .disabled(!available || inactive || !reward_action_ready);
+    let usd_label = reward_usd_label(chain_id, token, reward, anchor_cache);
     div()
         .flex()
         .flex_wrap()
@@ -4460,26 +5145,6 @@ fn render_reward_row(
                     column.child(app_muted_text(detail).truncate())
                 }),
         )
-        .child(
-            div()
-                .ml_auto()
-                .flex_none()
-                .child(
-                    claim_button
-                        .child("Claim")
-                        .on_click(move |_event, window, cx| {
-                            claim_root.update(cx, |root, cx| {
-                                root.open_staking_action(
-                                    actor_uuid.as_str(),
-                                    actor,
-                                    StakingActionKind::RewardClaim { token },
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }),
-                ),
-        )
 }
 
 pub(super) fn unlock_period_label(seconds: U256) -> String {
@@ -4498,6 +5163,572 @@ pub(super) fn unlock_period_label(seconds: U256) -> String {
     )
 }
 
+/// One positive reward row of the claim selection form, with everything the row, the totals, and
+/// the default selection read.
+struct RewardSelectionRow {
+    token: Address,
+    symbol: String,
+    icon_path: Option<WalletIconSource>,
+    amount: String,
+    usd: RewardUsdState,
+    fee: RewardFeePresentation,
+    gas: Option<u64>,
+    selected: bool,
+}
+
+/// Gas in the compact form the fee sub-lines use.
+fn compact_gas(gas: u64) -> String {
+    format!("{}k", gas.saturating_add(500) / 1_000)
+}
+
+/// The estimate's fee per gas in gwei, to one decimal.
+fn gwei_label(fee_per_gas: u128) -> String {
+    let whole = fee_per_gas / 1_000_000_000;
+    if whole >= 10 {
+        return format!("{whole} gwei");
+    }
+    let hundredths = fee_per_gas % 1_000_000_000 / 10_000_000;
+    format!("{whole}.{hundredths:02} gwei")
+}
+
+/// The gas sub-line under the selection fee: the single call, or the split and its per-step gas.
+fn reward_selection_gas_summary(
+    steps: &[wallet_ops::RewardClaimStep],
+    fee_per_gas: u128,
+) -> String {
+    if let [step] = steps {
+        return format!(
+            "{} gas · {}",
+            compact_gas(step.estimated_gas),
+            gwei_label(fee_per_gas)
+        );
+    }
+    format!(
+        "{} transactions · {} gas",
+        steps.len(),
+        steps
+            .iter()
+            .map(|step| compact_gas(step.estimated_gas))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    )
+}
+
+/// Reward value minus claim fee, and whether the fee was the larger of the two.
+fn reward_net_label(reward_usd: U256, fee_usd: U256) -> (String, bool) {
+    if fee_usd > reward_usd {
+        (
+            format!("-{}", format_usd_micro_value(fee_usd - reward_usd)),
+            true,
+        )
+    } else {
+        (format_usd_micro_value(reward_usd - fee_usd), false)
+    }
+}
+
+/// The claim selection form: the account's positive rewards with their fee and net value, the
+/// totals for the exact selected call, and Review into the existing preflight.
+fn render_reward_claim_selection_form(
+    root: &Entity<WalletRoot>,
+    wallet: &WalletRoot,
+    selection: &StakingActionSelection,
+    tokens: &[Address],
+    content_width: gpui::Pixels,
+    cx: &App,
+) -> gpui::Div {
+    let chain_id = wallet.selected_chain;
+    let uuid = selection.actor_uuid.as_str();
+    let state = &wallet.governance.staking;
+    let anchor_cache = &wallet.public_broadcaster_anchor_cache;
+    let action_flow = &wallet.governance.action_flow;
+    let registry = &wallet.effective_token_registry;
+    let gas_fee = &wallet.governance.reward_gas_fee;
+    let gas_selection = gas_fee.selection(cx);
+    let estimate = action_flow.reward_selection_estimate.as_ref();
+    let estimated = match estimate {
+        Some(RewardSelectionEstimateState::Estimated(estimate)) => Some(estimate),
+        _ => None,
+    };
+    let selected_fee_per_gas =
+        estimated
+            .zip(gas_selection.as_ref().ok())
+            .map(|(estimate, selection)| {
+                reward_claim_fee_per_gas(*selection, gas_fee.quote, estimate.expected_fee_per_gas)
+            });
+    let rows = governance_contracts(chain_id)
+        .map_or(&[][..], |contracts| contracts.reward_tokens)
+        .iter()
+        .filter_map(|entry| {
+            let token = entry.token;
+            let resolved = state.resolved_reward(uuid, token);
+            let Some(RewardView::Positive { amount, .. }) = resolved else {
+                return None;
+            };
+            let metadata = token_display_metadata(Some(registry), chain_id, &token);
+            let usd = reward_usd_state(chain_id, token, resolved, anchor_cache);
+            let fee = match (estimated, selected_fee_per_gas) {
+                (Some(estimate), Some(price)) => reward_added_fee_presentation(
+                    chain_id,
+                    estimate,
+                    token,
+                    price,
+                    usd,
+                    anchor_cache,
+                ),
+                _ if gas_selection.is_ok()
+                    && matches!(estimate, Some(RewardSelectionEstimateState::Pending)) =>
+                {
+                    RewardFeePresentation::Pending
+                }
+                _ => RewardFeePresentation::Unavailable,
+            };
+            Some(RewardSelectionRow {
+                token,
+                symbol: metadata
+                    .as_ref()
+                    .map_or_else(|| entry.symbol.to_owned(), |info| info.symbol.clone()),
+                icon_path: metadata.and_then(|info| info.icon_path),
+                amount: format_reward_amount(chain_id, token, *amount, registry),
+                usd,
+                fee,
+                gas: estimated
+                    .and_then(|estimate| estimate.added_gas.get(&token).copied().flatten()),
+                selected: tokens.contains(&token),
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_count = rows.iter().filter(|row| row.selected).count();
+    let all_selected = !rows.is_empty() && selected_count == rows.len();
+    let selected_usd = rows
+        .iter()
+        .filter(|row| row.selected)
+        .try_fold(U256::ZERO, |total, row| match row.usd {
+            RewardUsdState::Value(value) => total.checked_add(value),
+            RewardUsdState::Loading | RewardUsdState::Unavailable => None,
+        });
+    let selected_value = format!(
+        "{selected_count} of {} · {}",
+        rows.len(),
+        if selected_count == 0 {
+            "—".to_owned()
+        } else {
+            selected_usd.map_or_else(|| "USD unavailable".to_owned(), format_usd_micro_value)
+        }
+    );
+    let selected_cost = estimated
+        .zip(selected_fee_per_gas)
+        .and_then(|(estimate, price)| reward_selection_cost(&estimate.steps, price))
+        .filter(|_| !tokens.is_empty());
+    let fee_usd = selected_cost
+        .and_then(|cost| anchor_cache.cached_native_usd_micro_value(chain_id, cost))
+        .filter(|_| selected_count > 0);
+    let header_root = root.clone();
+    let header_tokens = rows.iter().map(|row| row.token).collect::<Vec<_>>();
+    let mut list = div()
+        .flex()
+        .flex_col()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::SURFACE_ELEVATED))
+                .child(
+                    div().w(REWARD_SELECTION_CHECKBOX_WIDTH).flex_none().child(
+                        Checkbox::new("governance-reward-select-all")
+                            .checked(all_selected)
+                            .on_click(move |checked: &bool, _window, cx| {
+                                let tokens = if *checked {
+                                    header_tokens.clone()
+                                } else {
+                                    Vec::new()
+                                };
+                                header_root.update(cx, |root, cx| {
+                                    root.set_reward_claim_selection_all(tokens, cx);
+                                });
+                            }),
+                    ),
+                )
+                .child(
+                    app_muted_text("Asset")
+                        .text_size(px(11.0))
+                        .w(REWARD_SELECTION_ASSET_WIDTH)
+                        .flex_none(),
+                )
+                .child(
+                    app_muted_text("Unclaimed")
+                        .text_size(px(11.0))
+                        .flex_1()
+                        .min_w(px(0.0)),
+                )
+                .child(
+                    app_muted_text("Added fee")
+                        .text_size(px(11.0))
+                        .w(REWARD_SELECTION_FEE_WIDTH)
+                        .flex_none()
+                        .text_right(),
+                )
+                .child(
+                    app_muted_text("Net")
+                        .text_size(px(11.0))
+                        .w(REWARD_SELECTION_NET_WIDTH)
+                        .flex_none()
+                        .text_right(),
+                ),
+        );
+    for row in rows {
+        let toggle_root = root.clone();
+        let token = row.token;
+        let selected = row.selected;
+        let (row_fee_usd, below_fee) = match &row.fee {
+            RewardFeePresentation::Estimated(fee) => (fee.usd, fee.below_fee),
+            RewardFeePresentation::Pending | RewardFeePresentation::Unavailable => (None, false),
+        };
+        let dimmed = below_fee && !selected;
+        let fee_cell = match row.fee {
+            RewardFeePresentation::Pending => div()
+                .w(REWARD_SELECTION_FEE_WIDTH)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_1()
+                .child(Spinner::new().small())
+                .child(
+                    app_muted_text("estimating…")
+                        .text_size(px(11.0))
+                        .whitespace_nowrap(),
+                ),
+            RewardFeePresentation::Estimated(fee) => div()
+                .w(REWARD_SELECTION_FEE_WIDTH)
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(app_text(format!("≈ {}", fee.label)).whitespace_nowrap())
+                .children(row.gas.map(|gas| {
+                    app_muted_text(format!("{} gas", compact_gas(gas)))
+                        .text_size(px(11.0))
+                        .whitespace_nowrap()
+                })),
+            RewardFeePresentation::Unavailable => div()
+                .w(REWARD_SELECTION_FEE_WIDTH)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    app_muted_text("unavailable")
+                        .text_size(px(11.0))
+                        .whitespace_nowrap(),
+                ),
+        };
+        let net_cell = match (row.usd, row_fee_usd) {
+            (RewardUsdState::Value(reward_usd), Some(row_fee_usd)) => {
+                let (label, negative) = reward_net_label(reward_usd, row_fee_usd);
+                app_text(label)
+                    .whitespace_nowrap()
+                    .when(negative, |value| value.text_color(rgb(theme::DANGER)))
+            }
+            _ => app_muted_text("—"),
+        };
+        list = list.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_2()
+                .border_t_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .when(dimmed, |row| row.opacity(0.6))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(REWARD_SELECTION_CHECKBOX_WIDTH)
+                                .flex_none()
+                                .child(
+                                    Checkbox::new(staking_control_id(
+                                        uuid,
+                                        "reward-select",
+                                        token,
+                                    ))
+                                    .checked(selected)
+                                    .on_click(move |checked: &bool, _window, cx| {
+                                        let checked = *checked;
+                                        toggle_root.update(cx, |root, cx| {
+                                            root.set_reward_claim_selection_token(
+                                                token, checked, cx,
+                                            );
+                                        });
+                                    }),
+                                ),
+                        )
+                        .child(
+                            token_label_row(
+                                SharedString::from(row.symbol),
+                                row.icon_path,
+                                px(16.0),
+                            )
+                            .w(REWARD_SELECTION_ASSET_WIDTH)
+                            .flex_none()
+                            .truncate(),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(app_strong_text(row.amount).whitespace_nowrap())
+                                .child(
+                                    app_muted_text(match row.usd {
+                                        RewardUsdState::Value(value) => {
+                                            format_usd_micro_value(value)
+                                        }
+                                        RewardUsdState::Loading | RewardUsdState::Unavailable => {
+                                            "USD unavailable".to_owned()
+                                        }
+                                    })
+                                    .text_size(px(11.0))
+                                    .whitespace_nowrap(),
+                                ),
+                        )
+                        .child(fee_cell)
+                        .child(
+                            div()
+                                .w(REWARD_SELECTION_NET_WIDTH)
+                                .flex_none()
+                                .flex()
+                                .justify_end()
+                                .child(net_cell),
+                        ),
+                )
+                .when(below_fee, |row| {
+                    row.child(
+                        app_muted_text(
+                            "Added fee exceeds the reward. Rewards keep accruing and can be claimed later.",
+                        )
+                        .text_size(px(11.0))
+                        .whitespace_normal(),
+                    )
+                }),
+        );
+    }
+    let split_notice = estimated.filter(|estimate| estimate.steps.len() > 1).map(|estimate| {
+        let intervals = estimate
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.ending_interval.checked_sub(evidence.starting_interval))
+            .and_then(|span| span.checked_add(U256::ONE));
+        Alert::warning(
+            "governance-reward-selection-split",
+            intervals.map_or_else(
+                || {
+                    format!(
+                        "This claim does not fit one block. It will be sent as {} transactions, each needing its own signature.",
+                        estimate.steps.len()
+                    )
+                },
+                |intervals| {
+                    format!(
+                        "This claim covers {intervals} intervals and does not fit one block. It will be sent as {} transactions, each needing its own signature.",
+                        estimate.steps.len()
+                    )
+                },
+            ),
+        )
+        .small()
+    });
+    let fee_value = match (estimate, selected_fee_per_gas, selected_cost) {
+        _ if tokens.is_empty() => app_muted_text("—").into_any_element(),
+        (None, _, _) => app_muted_text("—").into_any_element(),
+        (Some(RewardSelectionEstimateState::Pending), _, _) => div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(Spinner::new().small())
+            .child(app_muted_text("estimating…"))
+            .into_any_element(),
+        (Some(RewardSelectionEstimateState::Unavailable(reason)), _, _) => div()
+            .flex()
+            .flex_col()
+            .child(app_text("unavailable"))
+            .child(
+                app_muted_text(reason.to_string())
+                    .text_size(px(11.0))
+                    .whitespace_normal(),
+            )
+            .into_any_element(),
+        (Some(RewardSelectionEstimateState::Estimated(estimate)), Some(price), Some(cost)) => div()
+            .flex()
+            .items_baseline()
+            .justify_end()
+            .gap_1p5()
+            .child(
+                app_muted_text(reward_selection_gas_summary(&estimate.steps, price))
+                    .text_size(px(11.0))
+                    .whitespace_nowrap(),
+            )
+            .child(
+                app_text(format!(
+                    "≈ {}",
+                    fee_usd.map_or_else(
+                        || super::tokens::format_native_token_amount_for_display(chain_id, cost),
+                        format_usd_micro_value
+                    )
+                ))
+                .whitespace_nowrap(),
+            )
+            .into_any_element(),
+        (Some(RewardSelectionEstimateState::Estimated(_)), _, _) => {
+            app_muted_text("unavailable").into_any_element()
+        }
+    };
+    let net_value = match (selected_usd, fee_usd) {
+        (Some(reward_usd), Some(fee_usd)) => {
+            let (label, negative) = reward_net_label(reward_usd, fee_usd);
+            app_strong_text(format!("≈ {label}"))
+                .when(negative, |value| value.text_color(rgb(theme::DANGER)))
+                .into_any_element()
+        }
+        _ => app_muted_text("—").into_any_element(),
+    };
+    let shared_fee = estimated
+        .zip(selected_fee_per_gas)
+        .and_then(|(estimate, price)| {
+            estimate.shared_gas.map(|gas| {
+                let fee = reward_cost_presentation(
+                    chain_id,
+                    U256::from(gas) * U256::from(price),
+                    RewardUsdState::Unavailable,
+                    anchor_cache,
+                );
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(app_muted_text(format!("{} gas", compact_gas(gas))).text_size(px(11.0)))
+                    .child(app_text(format!("≈ {}", fee.label)))
+                    .into_any_element()
+            })
+        })
+        .unwrap_or_else(|| {
+            app_muted_text(
+                if matches!(estimate, Some(RewardSelectionEstimateState::Pending)) {
+                    "Estimating…"
+                } else {
+                    "Unavailable"
+                },
+            )
+            .into_any_element()
+        });
+    // Totals read as label left, value right, like the authorization summary rows in the mockup.
+    let totals_value = |value: AnyElement| {
+        div()
+            .w_full()
+            .flex()
+            .justify_end()
+            .text_right()
+            .child(value)
+            .into_any_element()
+    };
+    let review_root = root.clone();
+    let cancel_root = root.clone();
+    let pending = action_flow.pending;
+    let review_ready = !tokens.is_empty() && selected_cost.is_some() && !pending;
+    div()
+        .w(content_width)
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(list)
+        .child(render_eip1559_gas_fee_editor(
+            root.clone(),
+            &Eip1559GasFeeTarget::Governance,
+            gas_fee,
+            pending,
+        ))
+        .children(split_notice)
+        .child(
+            DescriptionList::horizontal()
+                .bordered(false)
+                .columns(1)
+                .label_width(px(120.0))
+                .child(
+                    DescriptionItem::new(app_muted_text("Selected").into_any_element())
+                        .value(totals_value(app_text(selected_value).into_any_element())),
+                )
+                .child(
+                    DescriptionItem::new(app_muted_text("Shared fee").into_any_element())
+                        .value(totals_value(shared_fee)),
+                )
+                .child(
+                    DescriptionItem::new(app_muted_text("Estimated fee").into_any_element())
+                        .value(totals_value(fee_value)),
+                )
+                .separator()
+                .child(
+                    DescriptionItem::new(app_strong_text("Net").into_any_element())
+                        .value(totals_value(net_value)),
+                ),
+        )
+        .children(action_flow.error.as_ref().map(|error| {
+            Alert::error("governance-staking-action-error", error.to_string()).small()
+        }))
+        .child(if pending {
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .py(px(8.0))
+                .child(Spinner::new().small())
+                .child(
+                    app_muted_text("Refreshing rewards and estimating the exact call…")
+                        .text_size(px(12.0)),
+                )
+        } else {
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    app_button_base("governance-staking-action-cancel")
+                        .ghost()
+                        .small()
+                        .child("Cancel")
+                        .on_click(move |_event, window, cx| {
+                            cancel_root.update(cx, WalletRoot::close_staking_action);
+                            window.close_dialog(cx);
+                        }),
+                )
+                .child(
+                    app_button_base("governance-staking-action-review")
+                        .primary()
+                        .small()
+                        .disabled(!review_ready)
+                        .child("Review")
+                        .on_click(move |_event, window, cx| {
+                            review_root.update(cx, |root, cx| {
+                                root.review_staking_action(window, cx);
+                            });
+                        }),
+                )
+        })
+}
+
 fn render_staking_action_form(
     root: &Entity<WalletRoot>,
     wallet: &WalletRoot,
@@ -4506,6 +5737,16 @@ fn render_staking_action_form(
 ) -> Option<gpui::Div> {
     let selection = wallet.governance.action_flow.staking_selection()?;
     let selection_ready = wallet.governance.staking.action_selection_ready(selection);
+    if let StakingActionKind::RewardClaimSelected { tokens } = &selection.kind {
+        return Some(render_reward_claim_selection_form(
+            root,
+            wallet,
+            selection,
+            tokens,
+            content_width,
+            cx,
+        ));
+    }
     if !selection.kind.is_compose_action() {
         let pending = wallet.governance.action_flow.pending;
         let error = wallet.governance.action_flow.error.as_ref();
@@ -4920,6 +6161,7 @@ mod tests {
                                 picker,
                                 cx.new(|cx| InputState::new(window, cx)),
                                 cx.new(|cx| InputState::new(window, cx)),
+                                Eip1559GasFeeEditorState::new(window, cx),
                             ),
                             accounts,
                             saved,
@@ -6001,6 +7243,432 @@ mod tests {
         );
     }
 
+    fn zero_staking_metrics() -> StakingGlobalMetrics {
+        StakingGlobalMetrics {
+            total_staked: U256::ZERO,
+            total_voting_power: U256::ZERO,
+            deploy_time: U256::ZERO,
+            snapshot_interval: U256::ONE,
+            current_interval: U256::ZERO,
+            stake_locktime: U256::ZERO,
+            chain_time: U256::ZERO,
+        }
+    }
+
+    #[test]
+    fn cached_bulk_reward_evidence_is_projected_onto_the_selected_subset() {
+        let address = Address::from([1; 20]);
+        let first = Address::from([2; 20]);
+        let second = Address::from([3; 20]);
+        let third = Address::from([4; 20]);
+        let key = key("wallet", 1, "a", address);
+        let mut state = StakingReadState::default();
+        let generation = state.begin(key.clone());
+        assert!(state.apply_global(&key, generation, Ok(zero_staking_metrics())));
+        assert!(state.apply_bulk_reward(
+            &key,
+            generation,
+            "a".into(),
+            vec![first, second, third],
+            &Ok(Some(wallet_ops::RewardBatchEvidence {
+                reward_tokens: vec![first, second, third],
+                starting_interval: U256::ZERO,
+                ending_interval: U256::ONE,
+                staking_intervals: vec![U256::ZERO, U256::ONE],
+                hints: vec![U256::ZERO, U256::ONE],
+                claimed_intervals: vec![Vec::new(), vec![U256::ONE], Vec::new()],
+                expected_amounts: vec![U256::from(5), U256::ZERO, U256::ZERO],
+            })),
+        ));
+        let now = Instant::now();
+
+        let projected = state
+            .cached_reward_evidence_at(&key, "a", address, &[first, third], now)
+            .expect("cached evidence projected onto the selection");
+        assert_eq!(projected.reward_tokens, vec![first, third]);
+        assert_eq!(projected.expected_amounts, vec![U256::from(5), U256::ZERO]);
+        assert_eq!(
+            projected.claimed_intervals,
+            vec![Vec::<U256>::new(), Vec::<U256>::new()]
+        );
+        assert_eq!(projected.starting_interval, U256::ZERO);
+        assert_eq!(projected.ending_interval, U256::ONE);
+        assert_eq!(projected.hints, vec![U256::ZERO, U256::ONE]);
+        assert!(
+            state
+                .cached_reward_evidence_at(&key, "a", address, &[second, third], now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reward_cost_presentation_prices_and_flags_below_fee_rows() {
+        let chain = 1;
+        let cache = TokenAnchorRateCache::new();
+        let gas_cost = U256::from(10).pow(U256::from(15));
+        let unpriced_native = reward_cost_presentation(
+            chain,
+            gas_cost,
+            RewardUsdState::Value(U256::from(1_000)),
+            &cache,
+        );
+        assert_eq!(unpriced_native.usd, None);
+        assert_eq!(
+            unpriced_native.label,
+            crate::root::tokens::format_native_token_amount_for_display(chain, gas_cost)
+        );
+        assert!(!unpriced_native.below_fee);
+
+        cache.store_native_usd_rate(chain, U256::from(2_000) * U256::from(10).pow(U256::from(6)));
+        let fee_usd = cache
+            .cached_native_usd_micro_value(chain, gas_cost)
+            .expect("native fee is priced");
+        let below = reward_cost_presentation(
+            chain,
+            gas_cost,
+            RewardUsdState::Value(fee_usd - U256::ONE),
+            &cache,
+        );
+        assert_eq!(below.usd, Some(fee_usd));
+        assert_eq!(below.label, format_usd_micro_value(fee_usd));
+        assert!(below.below_fee);
+        assert!(
+            !reward_cost_presentation(chain, gas_cost, RewardUsdState::Value(fee_usd), &cache)
+                .below_fee
+        );
+        assert!(
+            !reward_cost_presentation(chain, gas_cost, RewardUsdState::Unavailable, &cache)
+                .below_fee
+        );
+    }
+
+    #[test]
+    fn default_claim_selection_uses_marginal_fees_instead_of_standalone_costs() {
+        let chain = 1;
+        let address = Address::from([1; 20]);
+        let covered = Address::from([2; 20]);
+        let below = Address::from([3; 20]);
+        let cache = TokenAnchorRateCache::new();
+        cache.store_native_usd_rate(chain, U256::from(2_000) * U256::from(10).pow(U256::from(6)));
+        cache.store_rate(chain, covered, U256::from(10).pow(U256::from(18)));
+        cache.store_rate(chain, below, U256::from(10).pow(U256::from(18)));
+        let key = key("wallet", chain, "a", address);
+        let mut state = StakingReadState::default();
+        let generation = state.begin(key.clone());
+        assert!(state.apply_global(&key, generation, Ok(zero_staking_metrics())));
+        // A whole native token of reward covers the fee; a ten-thousandth of one does not.
+        for (token, amount) in [
+            (covered, U256::from(10).pow(U256::from(18))),
+            (below, U256::from(10).pow(U256::from(14))),
+        ] {
+            assert!(state.apply_reward(
+                &key,
+                generation,
+                "a".into(),
+                token,
+                Ok(Some(RewardEvidence {
+                    token,
+                    starting_interval: U256::ZERO,
+                    ending_interval: U256::ZERO,
+                    staking_intervals: vec![U256::ZERO],
+                    hints: vec![U256::ZERO],
+                    claimed_intervals: Vec::new(),
+                    amount,
+                })),
+            ));
+        }
+
+        let mut estimate = RewardSelectionEstimate {
+            evidence: None,
+            steps: Vec::new(),
+            expected_fee_per_gas: 1_000_000_000,
+            added_gas: BTreeMap::new(),
+            shared_gas: Some(500_000),
+        };
+        // The small reward cannot cover its standalone fee, but covers its added batch fee.
+        for (covered_gas, below_gas, expected) in [
+            (Some(50_000), Some(50_000), vec![covered, below]),
+            (Some(50_000), Some(200_000), vec![covered]),
+            (Some(50_000), None, vec![covered, below]),
+            (Some(2_000_000_000), Some(200_000), vec![]),
+            (None, None, vec![covered, below]),
+        ] {
+            estimate.added_gas = BTreeMap::from([(covered, covered_gas), (below, below_gas)]);
+            assert_eq!(
+                default_reward_claim_selection_for(
+                    &state,
+                    chain,
+                    "a",
+                    &[below, covered],
+                    &estimate,
+                    None,
+                    &cache
+                ),
+                expected,
+                "added gas: covered={covered_gas:?}, below={below_gas:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reward_claim_costs_reprice_cached_gas_with_the_current_quote() {
+        let step = |estimated_gas| wallet_ops::RewardClaimStep {
+            reward_tokens: Vec::new(),
+            starting_interval: U256::ZERO,
+            ending_interval: U256::ZERO,
+            subtotal: U256::ZERO,
+            expected_amounts: Vec::new(),
+            estimated_gas,
+        };
+
+        let steps = [step(120_000), step(90_000)];
+        let quote = wallet_ops::SelfBroadcastGasFeeQuote {
+            rpc_gas_price: 8,
+            current_base_fee_per_gas: Some(8),
+            suggested_max_fee_per_gas: 20,
+            suggested_max_priority_fee_per_gas: 2,
+        };
+        let custom = PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 20,
+            max_priority_fee_per_gas: 2,
+        };
+        // Auto must use the refreshed quote, just like the displayed gas controls.
+        let auto_price =
+            reward_claim_fee_per_gas(PublicActionGasFeeSelection::Auto, Some(quote), 3);
+        assert_eq!(
+            reward_selection_cost(&steps, auto_price),
+            Some(U256::from(2_310_000))
+        );
+        let custom_price = reward_claim_fee_per_gas(custom, Some(quote), 3);
+        assert_eq!(
+            reward_selection_cost(&steps, custom_price),
+            Some(
+                U256::from(210_000)
+                    * U256::from(wallet_ops::expected_eip1559_fee_per_gas(quote, 20, 2))
+            )
+        );
+        assert_eq!(custom_price, auto_price);
+        // Without a quote the maximum fee is the conservative estimate, using the same gas.
+        assert_eq!(
+            reward_selection_cost(&steps, reward_claim_fee_per_gas(custom, None, 3)),
+            Some(U256::from(4_200_000))
+        );
+        assert_eq!(reward_selection_cost(&[step(u64::MAX), step(1)], 1), None);
+    }
+
+    #[test]
+    fn reward_claim_marginals_exclude_shared_work_and_reconcile_the_selected_batch() {
+        let first = Address::from([1; 20]);
+        let second = Address::from([2; 20]);
+        let empty = 520_000;
+        let first_alone = 1_272_000;
+        let second_alone = 1_274_000;
+        let combined = 1_746_000;
+        let added_first = reward_claim_added_gas(true, combined, second_alone);
+        let added_second = reward_claim_added_gas(false, first_alone, combined);
+        assert_eq!(added_first, Some(472_000));
+        assert_eq!(added_second, Some(474_000));
+        let mut added = BTreeMap::from([(first, added_first), (second, added_second)]);
+        let shared = reward_claim_shared_gas(&[first, second], Some(combined), &added).unwrap();
+        assert_eq!(shared, 800_000);
+        assert_eq!(
+            shared + added_first.unwrap() + added_second.unwrap(),
+            combined
+        );
+        assert_eq!(
+            reward_claim_shared_gas(&[], Some(empty), &added),
+            Some(empty)
+        );
+        added.insert(first, reward_claim_added_gas(true, first_alone, empty));
+        assert_eq!(
+            reward_claim_shared_gas(&[first], Some(first_alone), &added),
+            Some(empty)
+        );
+        // A failed or inconsistent comparison is unavailable, never a fake zero fee.
+        added.insert(first, None);
+        assert_eq!(
+            reward_claim_shared_gas(&[first], Some(first_alone), &added),
+            None
+        );
+        assert_eq!(reward_claim_added_gas(true, first_alone, combined), None);
+        assert_eq!(reward_claim_added_gas(false, combined, first_alone), None);
+    }
+
+    #[gpui::test]
+    fn reward_gas_editor_validates_custom_inputs_and_resets_for_next_claim(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.add_empty_window().update(|window, app| {
+            let editor = app.new(|cx| Eip1559GasFeeEditorState::new(window, cx));
+            editor.update(app, |editor, cx| {
+                editor.mode = Eip1559GasFeeMode::Custom;
+                editor
+                    .max_fee_input
+                    .update(cx, |input, cx| input.set_value("2", window, cx));
+                editor
+                    .max_priority_fee_input
+                    .update(cx, |input, cx| input.set_value("3", window, cx));
+                assert!(editor.selection(cx).is_err());
+                editor
+                    .max_priority_fee_input
+                    .update(cx, |input, cx| input.set_value("1", window, cx));
+                assert_eq!(
+                    editor.selection(cx),
+                    Ok(PublicActionGasFeeSelection::Custom {
+                        max_fee_per_gas: 2_000_000_000,
+                        max_priority_fee_per_gas: 1_000_000_000,
+                    })
+                );
+                editor.refreshing = true;
+                let stale_refresh = editor.refresh_id;
+                editor.reset_for_request(window, cx);
+                assert_eq!(editor.selection(cx), Ok(PublicActionGasFeeSelection::Auto));
+                assert_ne!(editor.refresh_id, stale_refresh);
+                assert!(!editor.refreshing);
+                // Switching back to Custom cannot silently reuse the previous claim's caps.
+                editor.mode = Eip1559GasFeeMode::Custom;
+                assert!(editor.selection(cx).is_err());
+            });
+        });
+    }
+
+    fn reward_claim_flow(kind: StakingActionKind) -> GovernanceActionFlowState {
+        let mut flow = GovernanceActionFlowState::default();
+        flow.set_staking_selection(StakingActionSelection {
+            actor_uuid: String::from("a"),
+            actor: Address::from([1; 20]),
+            kind,
+        });
+        flow
+    }
+
+    #[test]
+    fn reward_claim_selection_toggles_stay_unique_and_ascending() {
+        let first = Address::from([2; 20]);
+        let second = Address::from([3; 20]);
+        let third = Address::from([4; 20]);
+        let mut flow = reward_claim_flow(StakingActionKind::RewardClaimSelected {
+            tokens: vec![second],
+        });
+
+        assert!(flow.set_reward_claim_selection_token(third, true));
+        assert!(flow.set_reward_claim_selection_token(first, true));
+        assert!(flow.set_reward_claim_selection_token(first, true));
+        assert_eq!(
+            flow.reward_claim_selection_tokens(),
+            Some(&[first, second, third][..])
+        );
+        assert!(flow.set_reward_claim_selection_token(second, false));
+        assert!(flow.set_reward_claim_selection_token(second, false));
+        assert_eq!(
+            flow.reward_claim_selection_tokens(),
+            Some(&[first, third][..])
+        );
+        assert!(flow.set_reward_claim_selection_all(vec![third, first, third]));
+        assert_eq!(
+            flow.reward_claim_selection_tokens(),
+            Some(&[first, third][..])
+        );
+
+        let mut stake_flow = reward_claim_flow(StakingActionKind::Stake);
+        assert!(!stake_flow.set_reward_claim_selection_token(second, true));
+        assert_eq!(stake_flow.reward_claim_selection_tokens(), None);
+    }
+
+    #[test]
+    fn stale_reward_selection_estimates_are_discarded() {
+        let token = Address::from([2; 20]);
+        let mut flow = reward_claim_flow(StakingActionKind::RewardClaimSelected {
+            tokens: vec![token],
+        });
+
+        let generation = flow.begin_reward_selection_estimate();
+        assert_eq!(
+            flow.reward_selection_estimate,
+            Some(RewardSelectionEstimateState::Pending)
+        );
+        assert!(
+            !flow.apply_reward_selection_estimate(
+                generation.wrapping_sub(1),
+                Err(Arc::from("stale")),
+            )
+        );
+        assert_eq!(
+            flow.reward_selection_estimate,
+            Some(RewardSelectionEstimateState::Pending)
+        );
+        assert!(flow.apply_reward_selection_estimate(generation, Err(Arc::from("unavailable"))));
+        assert_eq!(
+            flow.reward_selection_estimate,
+            Some(RewardSelectionEstimateState::Unavailable(Arc::from(
+                "unavailable"
+            )))
+        );
+
+        assert!(flow.set_reward_claim_selection_token(token, false));
+        let emptied = flow.begin_reward_selection_estimate();
+        assert_ne!(emptied, generation);
+        assert_eq!(
+            flow.reward_selection_estimate,
+            Some(RewardSelectionEstimateState::Pending)
+        );
+        assert!(!flow.apply_reward_selection_estimate(generation, Err(Arc::from("old selection"))));
+    }
+
+    #[test]
+    fn reward_evidence_mode_prefers_the_reviewed_selection_estimate() {
+        let first = Address::from([2; 20]);
+        let second = Address::from([3; 20]);
+        let evidence = |tokens: Vec<Address>| wallet_ops::RewardBatchEvidence {
+            expected_amounts: vec![U256::ONE; tokens.len()],
+            claimed_intervals: vec![Vec::new(); tokens.len()],
+            reward_tokens: tokens,
+            starting_interval: U256::ZERO,
+            ending_interval: U256::ZERO,
+            staking_intervals: vec![U256::ZERO],
+            hints: vec![U256::ZERO],
+        };
+        let estimate = RewardSelectionEstimateState::Estimated(Box::new(RewardSelectionEstimate {
+            evidence: Some(evidence(vec![first])),
+            steps: vec![wallet_ops::RewardClaimStep {
+                reward_tokens: vec![first],
+                starting_interval: U256::ZERO,
+                ending_interval: U256::ZERO,
+                subtotal: U256::ZERO,
+                expected_amounts: vec![U256::ONE],
+                estimated_gas: 120_000,
+            }],
+            expected_fee_per_gas: 1,
+            added_gas: BTreeMap::new(),
+            shared_gas: None,
+        }));
+
+        assert!(matches!(
+            reward_evidence_mode_for_selection(Some(&estimate), &[first], None),
+            RewardEvidenceMode::CachedInitial {
+                steps: Some(steps),
+                ..
+            } if steps.len() == 1
+        ));
+        assert!(matches!(
+            reward_evidence_mode_for_selection(
+                Some(&estimate),
+                &[first, second],
+                Some(evidence(vec![first, second])),
+            ),
+            RewardEvidenceMode::CachedInitial { steps: None, .. }
+        ));
+        assert!(matches!(
+            reward_evidence_mode_for_selection(
+                Some(&RewardSelectionEstimateState::Pending),
+                &[first],
+                None,
+            ),
+            RewardEvidenceMode::Fresh
+        ));
+    }
+
     #[test]
     fn scoped_successes_survive_account_and_asset_failures() {
         let address = Address::from([1; 20]);
@@ -6122,16 +7790,26 @@ mod tests {
         assert!(!state.account_action_ready("a"));
         assert!(!state.account_action_ready("pending"));
         assert!(state.reward_action_ready("good", token));
-        assert!(state.reward_claim_all_ready("good", &[token, token_two]));
         assert!(state.reward_action_ready("a", token));
-        assert!(!state.reward_claim_all_ready("a", &[token, token_two]));
         assert!(!state.reward_action_ready("pending", token));
-        assert!(!state.reward_claim_all_ready("pending", &[token, token_two]));
-        assert!(state.action_selection_ready(&StakingActionSelection {
-            actor_uuid: String::from("good"),
-            actor: address,
-            kind: StakingActionKind::RewardClaim { token },
-        }));
+        let claim_selection =
+            |uuid: &str, actor: Address, tokens: Vec<Address>| StakingActionSelection {
+                actor_uuid: uuid.to_owned(),
+                actor,
+                kind: StakingActionKind::RewardClaimSelected { tokens },
+            };
+        assert!(state.action_selection_ready(&claim_selection("good", address, vec![token])));
+        assert!(state.action_selection_ready(&claim_selection("good", address, Vec::new())));
+        assert!(!state.action_selection_ready(&claim_selection(
+            "good",
+            address,
+            vec![token, token_two]
+        )));
+        assert!(!state.action_selection_ready(&claim_selection(
+            "pending",
+            Address::from([8; 20]),
+            Vec::new()
+        )));
         assert!(!state.action_selection_ready(&StakingActionSelection {
             actor_uuid: String::from("a"),
             actor: address,
@@ -6146,12 +7824,14 @@ mod tests {
             token_two,
             Err(Arc::from("second asset failed")),
         ));
-        assert!(state.reward_claim_all_ready("good", &[token, token_two]));
-        assert!(!state.reward_claim_all_ready("good", &[token_two, token]));
+        assert!(state.action_selection_ready(&claim_selection("good", address, vec![token])));
+        assert!(!state.action_selection_ready(&claim_selection("good", address, vec![token_two])));
         assert!(!state.action_selection_ready(&StakingActionSelection {
             actor_uuid: String::from("good"),
             actor: Address::from([9; 20]),
-            kind: StakingActionKind::RewardClaim { token },
+            kind: StakingActionKind::RewardClaimSelected {
+                tokens: vec![token]
+            },
         }));
 
         let next_generation = state.begin(key.clone());
@@ -6177,7 +7857,7 @@ mod tests {
                 expected_amounts: vec![U256::from(1), U256::ZERO],
             })),
         ));
-        assert!(!state.reward_claim_all_ready("good", &[token, token_two]));
+        assert!(!state.action_selection_ready(&claim_selection("good", address, vec![token])));
 
         assert!(state.apply_global(
             &key,

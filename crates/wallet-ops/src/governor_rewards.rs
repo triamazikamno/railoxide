@@ -78,6 +78,76 @@ pub struct RewardBatchEvidence {
     pub expected_amounts: Vec<U256>,
 }
 
+impl From<RewardEvidence> for RewardBatchEvidence {
+    fn from(evidence: RewardEvidence) -> Self {
+        Self {
+            reward_tokens: vec![evidence.token],
+            starting_interval: evidence.starting_interval,
+            ending_interval: evidence.ending_interval,
+            staking_intervals: evidence.staking_intervals,
+            hints: evidence.hints,
+            claimed_intervals: vec![evidence.claimed_intervals],
+            expected_amounts: vec![evidence.amount],
+        }
+    }
+}
+
+impl From<&RewardEvidence> for RewardBatchEvidence {
+    fn from(evidence: &RewardEvidence) -> Self {
+        evidence.clone().into()
+    }
+}
+
+impl RewardBatchEvidence {
+    /// Build the aggregate claim intent from this evidence, retaining verification metadata here.
+    #[must_use]
+    pub fn to_claim_intent(&self) -> crate::GovernanceActionIntent {
+        crate::GovernanceActionIntent::RewardClaim {
+            reward_tokens: self.reward_tokens.clone(),
+            starting_interval: self.starting_interval,
+            ending_interval: self.ending_interval,
+            snapshot_hints: self.hints.clone(),
+            expected_amounts: self.expected_amounts.clone(),
+        }
+    }
+
+    /// Narrow evidence read for one token set onto a subset of its tokens. The shared interval
+    /// range, staking intervals, and snapshot hints stay exactly as read, because they do not
+    /// depend on which tokens the claim call carries; only the per-token columns are selected.
+    pub fn project(&self, tokens: &[Address]) -> Result<Self> {
+        if tokens.is_empty() || tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(eyre!(
+                "reward token addresses must be strictly ascending and unique"
+            ));
+        }
+        if self.claimed_intervals.len() != self.reward_tokens.len()
+            || self.expected_amounts.len() != self.reward_tokens.len()
+        {
+            return Err(eyre!("reward evidence columns do not match its token set"));
+        }
+        let mut claimed_intervals = Vec::with_capacity(tokens.len());
+        let mut expected_amounts = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let index = self
+                .reward_tokens
+                .iter()
+                .position(|candidate| candidate == token)
+                .ok_or_else(|| eyre!("reward evidence does not cover token {token}"))?;
+            claimed_intervals.push(self.claimed_intervals[index].clone());
+            expected_amounts.push(self.expected_amounts[index]);
+        }
+        Ok(Self {
+            reward_tokens: tokens.to_vec(),
+            starting_interval: self.starting_interval,
+            ending_interval: self.ending_interval,
+            staking_intervals: self.staking_intervals.clone(),
+            hints: self.hints.clone(),
+            claimed_intervals,
+            expected_amounts,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewardBatchAuthorizationState {
     pub claimed_intervals: Vec<Vec<U256>>,
@@ -256,9 +326,29 @@ pub fn decode_claimed_flag(bytes: &[u8]) -> Result<bool> {
     Ok(claimed)
 }
 
-/// Select a reviewed reward range. `claimed` must contain one entry for each interval beginning at
-/// zero; claimed entries are retained as evidence but contribute zero to the displayed contract
-/// subtotal. A zero endpoint has no completed interval and therefore no evidence.
+/// Staking snapshots record voting power before a change. An initial run of zero-power snapshots
+/// proves that every staking interval through its final snapshot is ineligible, inclusively.
+/// Reward interval `r` samples staking interval `r * multiplier`. Later zero-power snapshots must
+/// not skip earlier eligibility. Without an initial zero snapshot, retain interval zero.
+fn reward_starting_interval(snapshots: &[AccountSnapshot], multiplier: U256) -> Result<U256> {
+    snapshot_hint(snapshots, U256::ZERO)?;
+    let Some(last_zero) = snapshots
+        .iter()
+        .take_while(|snapshot| snapshot.voting_power.is_zero())
+        .last()
+    else {
+        return Ok(U256::ZERO);
+    };
+    last_zero
+        .interval
+        .checked_div(multiplier)
+        .and_then(|interval| interval.checked_add(U256::ONE))
+        .ok_or_else(|| eyre!("reward starting interval conversion is invalid"))
+}
+
+/// Select a reviewed reward range. `claimed` must contain one entry for each interval from the
+/// snapshot-derived lower bound up to, but excluding, `next_earmark`. Claimed entries are retained
+/// as evidence but contribute zero to the displayed contract subtotal.
 pub fn reward_evidence(
     token: Address,
     next_earmark: U256,
@@ -267,11 +357,12 @@ pub fn reward_evidence(
     multiplier: U256,
     amount: U256,
 ) -> Result<Option<RewardEvidence>> {
-    if next_earmark.is_zero() {
+    let lower_bound = reward_starting_interval(snapshots, multiplier)?;
+    if next_earmark <= lower_bound {
         return Ok(None);
     }
     let ending_interval = next_earmark - U256::from(1_u8);
-    let expected_count = usize::try_from(next_earmark)
+    let expected_count = usize::try_from(next_earmark - lower_bound)
         .map_err(|_| eyre!("reward endpoint exceeds platform limits"))?;
     if claimed.len() != expected_count {
         return Err(eyre!(
@@ -283,7 +374,7 @@ pub fn reward_evidence(
     let mut first_unclaimed = None;
     let mut claimed_intervals = Vec::new();
     for (expected, &(interval, is_claimed)) in claimed.iter().enumerate() {
-        let expected = U256::from(expected);
+        let expected = lower_bound + U256::from(expected);
         if interval != expected {
             return Err(eyre!("claimed intervals are not contiguous"));
         }
@@ -636,6 +727,7 @@ pub async fn fetch_reward_evidence_multi(
             })
             .collect());
     };
+    let lower_bound = reward_starting_interval(snapshots, metadata.multiplier)?;
     let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let route = RpcRoute::from(chain_route);
     let mut claimed: Vec<Option<Vec<Option<bool>>>> = Vec::with_capacity(tokens.len());
@@ -647,26 +739,26 @@ pub async fn fetch_reward_evidence_multi(
             claimed.push(None);
             continue;
         };
-        let Ok(count) = usize::try_from(next) else {
+        let Ok(count) = usize::try_from(next.saturating_sub(lower_bound)) else {
             errors[token_index] = Some("reward interval count exceeds platform limits".into());
             claimed.push(None);
             continue;
         };
         claimed.push(Some(vec![None; count]));
-        for interval in 0..count {
-            calls.push((token_index, token, interval));
+        for offset in 0..count {
+            calls.push((token_index, token, offset));
         }
     }
     for chunk in calls.chunks(chunk_size.get()) {
         let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
-            .map(|&(_, token, interval)| {
+            .map(|&(_, token, offset)| {
                 (
                     contracts.governor_rewards,
                     GovernorRewards::getClaimedCall {
                         account,
                         token,
-                        interval: U256::from(interval),
+                        interval: lower_bound + U256::from(offset),
                     }
                     .abi_encode()
                     .into(),
@@ -683,13 +775,13 @@ pub async fn fetch_reward_evidence_multi(
             .await
         {
             Ok(values) => {
-                for (&(token_index, _, interval), value) in chunk.iter().zip(values) {
+                for (&(token_index, _, offset), value) in chunk.iter().zip(values) {
                     match value {
                         Ok(flag) => {
                             match claimed
                                 .get_mut(token_index)
                                 .and_then(Option::as_mut)
-                                .and_then(|flags| flags.get_mut(interval))
+                                .and_then(|flags| flags.get_mut(offset))
                             {
                                 Some(slot) => *slot = Some(flag),
                                 None if errors[token_index].is_none() => {
@@ -736,7 +828,7 @@ pub async fn fetch_reward_evidence_multi(
         let Some(flags) = flags
             .iter()
             .enumerate()
-            .map(|(i, flag)| flag.map(|flag| (U256::from(i), flag)))
+            .map(|(offset, flag)| flag.map(|flag| (lower_bound + U256::from(offset), flag)))
             .collect::<Option<Vec<_>>>()
         else {
             errors[token_index] = Some("claimed flag result is missing".into());
@@ -855,7 +947,11 @@ pub async fn fetch_reward_batch_evidence(
         .min()
         .and_then(|next| next.checked_sub(U256::from(1_u8)))
         .ok_or_else(|| eyre!("reward endpoint is invalid"))?;
-    let count = usize::try_from(ending_interval)
+    let lower_bound = reward_starting_interval(snapshots, metadata.multiplier)?;
+    if lower_bound > ending_interval {
+        return Ok(None);
+    }
+    let count = usize::try_from(ending_interval - lower_bound)
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| eyre!("reward interval range exceeds platform limits"))?;
@@ -866,19 +962,19 @@ pub async fn fetch_reward_batch_evidence(
         .iter()
         .enumerate()
         .flat_map(|(token_index, &token)| {
-            (0..count).map(move |interval| (token_index, token, interval))
+            (0..count).map(move |offset| (token_index, token, offset))
         })
         .collect::<Vec<_>>();
     for chunk in calls.chunks(chunk_size.get()) {
         let calldata: Vec<(Address, Bytes)> = chunk
             .iter()
-            .map(|&(_, token, interval)| {
+            .map(|&(_, token, offset)| {
                 (
                     contracts.governor_rewards,
                     GovernorRewards::getClaimedCall {
                         account,
                         token,
-                        interval: U256::from(interval),
+                        interval: lower_bound + U256::from(offset),
                     }
                     .abi_encode()
                     .into(),
@@ -893,8 +989,8 @@ pub async fn fetch_reward_batch_evidence(
                 WalletRpcOrigin::GovernorRewards.into(),
             )
             .await?;
-        for (&(token_index, _, interval), value) in chunk.iter().zip(values) {
-            claimed[token_index][interval] =
+        for (&(token_index, _, offset), value) in chunk.iter().zip(values) {
+            claimed[token_index][offset] =
                 Some(value.map_err(|error| eyre!("claimed flag call failed: {error:?}"))?);
         }
     }
@@ -910,10 +1006,9 @@ pub async fn fetch_reward_batch_evidence(
     let starting_interval = claimed
         .iter()
         .filter_map(|flags| {
-            flags
-                .iter()
-                .enumerate()
-                .find_map(|(index, &is_claimed)| (!is_claimed).then_some(U256::from(index)))
+            flags.iter().enumerate().find_map(|(offset, &is_claimed)| {
+                (!is_claimed).then_some(lower_bound + U256::from(offset))
+            })
         })
         .min();
     let Some(starting_interval) = starting_interval else {
@@ -976,9 +1071,9 @@ pub async fn fetch_reward_batch_evidence(
             flags
                 .iter()
                 .enumerate()
-                .filter_map(|(index, &is_claimed)| {
-                    (is_claimed && U256::from(index) >= starting_interval)
-                        .then_some(U256::from(index))
+                .filter_map(|(offset, &is_claimed)| {
+                    let interval = lower_bound + U256::from(offset);
+                    (is_claimed && interval >= starting_interval).then_some(interval)
                 })
                 .collect()
         })
@@ -1360,45 +1455,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn batch_evidence_projects_columns_onto_a_token_subset() {
+        let first = Address::from([1; 20]);
+        let second = Address::from([2; 20]);
+        let third = Address::from([3; 20]);
+        let evidence = RewardBatchEvidence {
+            reward_tokens: vec![first, second, third],
+            starting_interval: U256::from(2),
+            ending_interval: U256::from(3),
+            staking_intervals: vec![U256::from(7), U256::from(8)],
+            hints: vec![U256::ZERO, U256::ONE],
+            claimed_intervals: vec![vec![U256::from(2)], Vec::new(), vec![U256::from(3)]],
+            expected_amounts: vec![U256::from(10), U256::from(20), U256::from(30)],
+        };
+
+        let projected = evidence.project(&[first, third]).unwrap();
+        assert_eq!(projected.reward_tokens, vec![first, third]);
+        assert_eq!(
+            projected.expected_amounts,
+            vec![U256::from(10), U256::from(30)]
+        );
+        assert_eq!(
+            projected.claimed_intervals,
+            vec![vec![U256::from(2)], vec![U256::from(3)]]
+        );
+        assert_eq!(projected.starting_interval, evidence.starting_interval);
+        assert_eq!(projected.ending_interval, evidence.ending_interval);
+        assert_eq!(projected.staking_intervals, evidence.staking_intervals);
+        assert_eq!(projected.hints, evidence.hints);
+        assert_eq!(evidence.project(&evidence.reward_tokens).unwrap(), evidence);
+        assert!(evidence.project(&[first, Address::from([4; 20])]).is_err());
+        assert!(evidence.project(&[]).is_err());
+        assert!(evidence.project(&[third, first]).is_err());
+    }
+
+    #[test]
     fn evidence_excludes_claimed_and_unearmarked_ranges() {
         let snapshots = vec![
             AccountSnapshot {
-                interval: U256::ZERO,
+                interval: U256::from(1390),
                 voting_power: U256::ZERO,
             },
             AccountSnapshot {
-                interval: U256::from(4),
+                interval: U256::from(1400),
+                voting_power: U256::ZERO,
+            },
+            AccountSnapshot {
+                interval: U256::from(1442),
+                voting_power: U256::from(12),
+            },
+            AccountSnapshot {
+                interval: U256::from(1500),
                 voting_power: U256::ZERO,
             },
         ];
         let evidence = reward_evidence(
             Address::ZERO,
-            U256::from(3),
+            U256::from(105),
             &[
-                (U256::ZERO, false),
-                (U256::from(1), true),
-                (U256::from(2), false),
+                (U256::from(101), true),
+                (U256::from(102), false),
+                (U256::from(103), true),
+                (U256::from(104), false),
             ],
             &snapshots,
-            U256::from(2),
+            U256::from(14),
             U256::ZERO,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(evidence.starting_interval, U256::ZERO);
-        assert_eq!(evidence.ending_interval, U256::from(2));
-        assert_eq!(evidence.claimed_intervals, vec![U256::from(1)]);
+        assert_eq!(evidence.starting_interval, U256::from(102));
+        assert_eq!(evidence.ending_interval, U256::from(104));
+        assert_eq!(evidence.claimed_intervals, vec![U256::from(103)]);
         assert_eq!(
             evidence.staking_intervals,
-            vec![U256::ZERO, U256::from(2), U256::from(4)]
+            vec![U256::from(1428), U256::from(1442), U256::from(1456)]
         );
+        assert_eq!(
+            evidence.hints,
+            vec![U256::from(2), U256::from(2), U256::from(3)]
+        );
+        for next in [0, 100, 101] {
+            assert!(
+                reward_evidence(
+                    Address::ZERO,
+                    U256::from(next),
+                    &[],
+                    &snapshots,
+                    U256::from(14),
+                    U256::ZERO
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
         assert!(
             reward_evidence(
                 Address::ZERO,
-                U256::ZERO,
-                &[],
+                U256::from(103),
+                &[(U256::from(101), true), (U256::from(102), true)],
                 &snapshots,
-                U256::from(2),
+                U256::from(14),
                 U256::ZERO
             )
             .unwrap()
@@ -1407,26 +1564,224 @@ mod tests {
         assert!(
             reward_evidence(
                 Address::ZERO,
-                U256::from(2),
-                &[(U256::ZERO, true), (U256::from(1), true)],
+                U256::from(103),
+                &[(U256::from(101), false), (U256::from(103), false)],
                 &snapshots,
-                U256::from(2),
-                U256::ZERO
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            reward_evidence(
-                Address::ZERO,
-                U256::from(2),
-                &[(U256::ZERO, false), (U256::from(2), false)],
-                &snapshots,
-                U256::from(2),
+                U256::from(14),
                 U256::ZERO
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn evidence_preserves_first_eligible_snapshot_boundary() {
+        for (history, first_interval) in [
+            (vec![], 0),
+            (vec![(14, 5), (28, 0)], 0),
+            (vec![(13, 0)], 1),
+            (vec![(14, 0)], 2),
+            (vec![(15, 0)], 2),
+        ] {
+            let snapshots = history
+                .into_iter()
+                .map(|(interval, power)| AccountSnapshot {
+                    interval: U256::from(interval),
+                    voting_power: U256::from(power),
+                })
+                .collect::<Vec<_>>();
+            let first = U256::from(first_interval);
+            let evidence = reward_evidence(
+                Address::ZERO,
+                first + U256::ONE,
+                &[(first, false)],
+                &snapshots,
+                U256::from(14),
+                U256::ONE,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(evidence.starting_interval, first);
+            assert_eq!(evidence.ending_interval, first);
+        }
+    }
+
+    #[tokio::test]
+    async fn reward_reads_skip_ineligible_history_and_advance_after_claims() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use serde_json::json;
+
+        let tokens = [Address::from([1; 20]), Address::from([2; 20])];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let claimed_all = Arc::new(AtomicBool::new(false));
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            {
+                let calls = calls.clone();
+                let claimed_all = claimed_all.clone();
+                Arc::new(move |request| {
+                    assert_eq!(request["method"], "eth_call");
+                    let input = request["params"][0]
+                        .get("input")
+                        .or_else(|| request["params"][0].get("data"))
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .parse::<Bytes>()
+                        .unwrap();
+                    let after_claim = claimed_all.load(Ordering::SeqCst);
+                    let output =
+                        if input.starts_with(&GovernorRewards::getClaimedCall::SELECTOR) {
+                            let call = GovernorRewards::getClaimedCall::abi_decode(&input).unwrap();
+                            calls.lock().unwrap().push((call.token, call.interval));
+                            let interval = u64::try_from(call.interval).unwrap();
+                            let claimed = if after_claim {
+                                (101..=104).contains(&interval)
+                            } else if call.token == tokens[0] {
+                                matches!(interval, 101 | 103)
+                            } else {
+                                matches!(interval, 101 | 102)
+                            };
+                            GovernorRewards::getClaimedCall::abi_encode_returns(&claimed)
+                        } else {
+                            let call =
+                                GovernorRewards::calculateRewardsCall::abi_decode(&input).unwrap();
+                            let (start, end, hints) = if after_claim {
+                                (105, 105, vec![2])
+                            } else if call.tokens == [tokens[1]] {
+                                (103, 104, vec![1, 2])
+                            } else {
+                                (102, 104, vec![1, 1, 2])
+                            };
+                            assert_eq!(call.startingInterval, U256::from(start));
+                            assert_eq!(call.endingInterval, U256::from(end));
+                            assert_eq!(
+                                call.hints,
+                                hints.into_iter().map(U256::from).collect::<Vec<_>>()
+                            );
+                            assert!(call.ignoreClaimed);
+                            GovernorRewards::calculateRewardsCall::abi_encode_returns(
+                                &vec![U256::ONE; call.tokens.len()],
+                            )
+                        };
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": Bytes::from(output)})
+                })
+            },
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let mut chains = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap();
+        let chain = chains.get_mut(&1).unwrap();
+        chain.rpc_route = crate::RpcChainRoute::new(1, vec![endpoint]);
+        let http = HttpContext::direct_for_tests();
+        let snapshots = [
+            AccountSnapshot {
+                interval: U256::from(1400),
+                voting_power: U256::ZERO,
+            },
+            AccountSnapshot {
+                interval: U256::from(1442),
+                voting_power: U256::from(12),
+            },
+        ];
+        // No eligible completed interval, mixed per-token claims, then a refresh after claiming.
+        for next in [101, 105, 106] {
+            claimed_all.store(next == 106, Ordering::SeqCst);
+            let metadata = GovernorRewardsIntervalMetadata {
+                multiplier: U256::from(14),
+                staking_deploy_time: U256::ZERO,
+                distribution_interval: U256::from(14 * 86400),
+                current_interval: U256::from(next),
+                next_earmark_intervals: tokens
+                    .iter()
+                    .map(|&token| (token, U256::from(next)))
+                    .collect(),
+            };
+            for batch in [false, true] {
+                calls.lock().unwrap().clear();
+                // Small chunks exercise offsets across more than one broker submission.
+                let chunk_size = MulticallChunkSize::new(std::num::NonZeroUsize::new(3).unwrap());
+                if batch {
+                    let evidence = fetch_reward_batch_evidence(
+                        1,
+                        Address::ZERO,
+                        &tokens,
+                        &metadata,
+                        &snapshots,
+                        Some(chain),
+                        &http,
+                        chunk_size,
+                    )
+                    .await
+                    .unwrap();
+                    if next == 101 {
+                        assert!(evidence.is_none());
+                    } else {
+                        let evidence = evidence.unwrap();
+                        assert_eq!(
+                            evidence.starting_interval,
+                            U256::from(if next == 105 { 102 } else { 105 })
+                        );
+                        assert_eq!(evidence.ending_interval, U256::from(next - 1));
+                        assert_eq!(
+                            evidence.claimed_intervals,
+                            if next == 105 {
+                                vec![vec![U256::from(103)], vec![U256::from(102)]]
+                            } else {
+                                vec![vec![], vec![]]
+                            }
+                        );
+                    }
+                } else {
+                    let evidence = fetch_reward_evidence_multi(
+                        1,
+                        Address::ZERO,
+                        &tokens,
+                        &metadata,
+                        &snapshots,
+                        Some(chain),
+                        &http,
+                        chunk_size,
+                    )
+                    .await
+                    .unwrap();
+                    for (index, result) in evidence.into_iter().enumerate() {
+                        let evidence = result.evidence.unwrap();
+                        if next == 101 {
+                            assert!(evidence.is_none());
+                        } else {
+                            let evidence = evidence.unwrap();
+                            let start = if next == 105 { 102 + index } else { 105 };
+                            assert_eq!(evidence.starting_interval, U256::from(start));
+                            assert_eq!(evidence.ending_interval, U256::from(next - 1));
+                            assert_eq!(
+                                evidence.claimed_intervals,
+                                if next == 105 && index == 0 {
+                                    vec![U256::from(103)]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                        }
+                    }
+                }
+                let mut observed = calls.lock().unwrap().clone();
+                observed.sort_unstable();
+                let expected = tokens
+                    .iter()
+                    .flat_map(|&token| {
+                        (101..next).map(move |interval| (token, U256::from(interval)))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(observed, expected);
+            }
+        }
+        server.abort();
     }
 
     #[test]
