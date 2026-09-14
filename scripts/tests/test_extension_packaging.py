@@ -209,7 +209,8 @@ with zipfile.ZipFile('target/browser-extension.zip', 'w') as archive:
         self.assertEqual(trace[0][1], '1')
         self.assertIn('wallet', trace[-1][0])
         self.assertIsNone(trace[-1][1])
-        self.assertEqual(Path(trace[-1][2]), self.root / 'target/browser-extension.zip')
+        # macOS temporary paths may use /var while Bash's PWD uses /private/var.
+        self.assertEqual(Path(trace[-1][2]).resolve(), (self.root / 'target/browser-extension.zip').resolve())
         self.assertIn((self.root / 'target/browser-extension.zip').read_bytes(), (self.root / 'target/release/wallet').read_bytes())
 
     def test_extension_failure_stops_wallet_build_even_with_an_old_zip(self):
