@@ -53,6 +53,8 @@ Token metadata is built in or user-configured. Price anchors for evaluating tran
 
 Self-broadcast and public-account actions may preflight or submit against multiple configured RPC providers for reliability. Each selected provider can observe the public transaction metadata it receives.
 
+After a private transaction is broadcast, its prepared PPOI submissions continue if you switch wallets. These jobs use the configured network route and PPOI endpoint, match outputs against the transaction receipt, and retain prepared proofs rather than wallet keys. They stop when the vault locks, the app closes, or its public sync cache is reset. Encrypted recovery records remain with the sending wallet for later retries. Submission acknowledgements do not mark outputs spendable; normal PPOI verification still determines that.
+
 Artifact gateways can observe artifact downloads, including timing and requested artifact paths. With the recommended Tor or proxy modes, those requests are routed through the selected network path. In direct mode, gateways can also observe your network address.
 
 ## Public Broadcasters
