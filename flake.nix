@@ -10,14 +10,24 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" ];
+          extensions = [
+            "rust-src"
+            "rust-analyzer"
+          ];
           targets = [ "wasm32-unknown-unknown" ];
         };
 
@@ -30,12 +40,14 @@
         isDarwin = pkgs.stdenv.isDarwin;
 
         extensionTools = builtins.fromJSON (builtins.readFile ./scripts/browser-extension-tools.json);
-        bindgenTarget = {
-          x86_64-linux = "x86_64-unknown-linux-musl";
-          aarch64-linux = "aarch64-unknown-linux-musl";
-          x86_64-darwin = "x86_64-apple-darwin";
-          aarch64-darwin = "aarch64-apple-darwin";
-        }.${system};
+        bindgenTarget =
+          {
+            x86_64-linux = "x86_64-unknown-linux-musl";
+            aarch64-linux = "aarch64-unknown-linux-musl";
+            x86_64-darwin = "x86_64-apple-darwin";
+            aarch64-darwin = "aarch64-apple-darwin";
+          }
+          .${system};
         wasmBindgen = pkgs.stdenvNoCC.mkDerivation {
           pname = "wasm-bindgen-cli";
           version = extensionTools.version;
@@ -77,18 +89,27 @@
           apple-sdk
         ];
 
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-          cmake
-          clang
-          libclang.lib
-          rustPlatform.bindgenHook
-          makeWrapper
-          python3
-        ] ++ [ wasmBindgen ] ++ (if isLinux then [
-          wayland-protocols
-          libxkbcommon
-        ] else []);
+        nativeBuildInputs =
+          with pkgs;
+          [
+            pkg-config
+            cmake
+            clang
+            libclang.lib
+            rustPlatform.bindgenHook
+            makeWrapper
+            python3
+          ]
+          ++ [ wasmBindgen ]
+          ++ (
+            if isLinux then
+              [
+                wayland-protocols
+                libxkbcommon
+              ]
+            else
+              [ ]
+          );
 
       in
       {
@@ -103,19 +124,22 @@
             allowBuiltinFetchGit = true;
           };
 
-          cargoBuildFlags = [ "-p" "wallet" ];
+          cargoBuildFlags = [
+            "-p"
+            "wallet"
+          ];
 
           buildFeatures = [ "hardware" ];
 
           inherit nativeBuildInputs;
 
           buildInputs =
-            (if isLinux then linuxBuildInputs else []) ++
-            (if isDarwin then darwinBuildInputs else []);
+            (if isLinux then linuxBuildInputs else [ ]) ++ (if isDarwin then darwinBuildInputs else [ ]);
 
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 
           preBuild = ''
+            patchShebangs scripts
             CARGO_TOOLCHAIN= CARGO_NET_OFFLINE=true scripts/build-browser-extension
             export RAILOXIDE_EXTENSION_BUNDLE="$PWD/target/browser-extension.zip"
           '';
@@ -127,7 +151,9 @@
 
           postFixup = pkgs.lib.optionalString isLinux ''
             wrapProgram $out/bin/railoxide \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath (linuxBuildInputs ++ [ pkgs.vulkan-loader ])}"
+              --prefix LD_LIBRARY_PATH : "${
+                pkgs.lib.makeLibraryPath (linuxBuildInputs ++ [ pkgs.vulkan-loader ])
+              }"
           '';
 
           doCheck = false;
@@ -137,7 +163,12 @@
             homepage = "https://github.com/triamazikamno/railoxide";
             license = licenses.mit;
             mainProgram = "railoxide";
-            platforms = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+            platforms = [
+              "x86_64-linux"
+              "aarch64-linux"
+              "x86_64-darwin"
+              "aarch64-darwin"
+            ];
           };
         };
 
@@ -150,26 +181,34 @@
             pkgs.libclang.lib
             pkgs.python3
             wasmBindgen
-          ] ++ (if isLinux then (with pkgs; [
-            openssl
-            sqlite
-            fontconfig
-            libxkbcommon
-            libx11
-            libxcursor
-            libxi
-            libxrandr
-            libxcb
-            wayland
-            wayland-protocols
-            vulkan-loader
-            alsa-lib
-            libGL
-            zstd
-            libusb1
-            eudev
-            hidapi
-          ]) else if isDarwin then darwinBuildInputs else []);
+          ]
+          ++ (
+            if isLinux then
+              (with pkgs; [
+                openssl
+                sqlite
+                fontconfig
+                libxkbcommon
+                libx11
+                libxcursor
+                libxi
+                libxrandr
+                libxcb
+                wayland
+                wayland-protocols
+                vulkan-loader
+                alsa-lib
+                libGL
+                zstd
+                libusb1
+                eudev
+                hidapi
+              ])
+            else if isDarwin then
+              darwinBuildInputs
+            else
+              [ ]
+          );
 
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 
