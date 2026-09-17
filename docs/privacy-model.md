@@ -61,6 +61,12 @@ Public broadcasters help submit private transactions without using your own publ
 
 RailOxide also monitors public broadcaster availability through Waku. In proxy mode, embedded Waku libp2p transports are disabled to prevent proxy bypass.
 
+## Sender PPOI Submissions
+
+Prepared sender PPOI submissions belong to the chain sync service. The wallet hands off proofs after saving its encrypted recovery records, so submissions can finish after switching wallets, including switches before confirmation. Output positions come from the existing public chain log stream; this workflow does not poll transaction receipts. Active-wallet submissions share the same transport and deduplication state.
+
+The chain retains prepared proofs in memory for up to 30 minutes and retries submission failures for up to 30 minutes. Vault lock, shutdown, and public-cache reset cancel this work. Encrypted recovery records remain authoritative for recovery when the sending wallet is reopened; submission alone does not mark an output spendable.
+
 ## Wallet Storage
 
 The encrypted wallet vault protects wallet secrets and decrypted-wallet cache material. Wallet UTXO payloads, pending-output POI contexts, and output POI recovery records are encrypted with wallet view capability before they enter the local database. Their workflow-row keys are opaque, domain-separated HMAC identifiers rather than transaction hashes, commitments, NPKs, or output roles. Authentication binds each encrypted payload to its record kind, wallet-chain namespace, and opaque row ID.
