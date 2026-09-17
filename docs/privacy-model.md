@@ -53,8 +53,6 @@ Token metadata is built in or user-configured. Price anchors for evaluating tran
 
 Self-broadcast and public-account actions may preflight or submit against multiple configured RPC providers for reliability. Each selected provider can observe the public transaction metadata it receives.
 
-After a private transaction is broadcast, its prepared PPOI submissions continue if you switch wallets. These jobs use the configured network route and PPOI endpoint, match outputs against the transaction receipt, and retain prepared proofs rather than wallet keys. They stop when the vault locks, the app closes, or its public sync cache is reset. Encrypted recovery records remain with the sending wallet for later retries. Submission acknowledgements do not mark outputs spendable; normal PPOI verification still determines that.
-
 Artifact gateways can observe artifact downloads, including timing and requested artifact paths. With the recommended Tor or proxy modes, those requests are routed through the selected network path. In direct mode, gateways can also observe your network address.
 
 ## Public Broadcasters
@@ -62,6 +60,12 @@ Artifact gateways can observe artifact downloads, including timing and requested
 Public broadcasters help submit private transactions without using your own public account for every transaction. A broadcaster can still observe metadata required to evaluate and relay the request it receives.
 
 RailOxide also monitors public broadcaster availability through Waku. In proxy mode, embedded Waku libp2p transports are disabled to prevent proxy bypass.
+
+## Sender PPOI Submissions
+
+Prepared sender PPOI submissions belong to the chain sync service. The wallet hands off proofs after saving its encrypted recovery records, so submissions can finish after switching wallets, including switches before confirmation. Output positions come from the existing public chain log stream; this workflow does not poll transaction receipts. Active-wallet submissions share the same transport and deduplication state.
+
+The chain retains prepared proofs in memory for up to 30 minutes and retries submission failures for up to 30 minutes. Vault lock, shutdown, and public-cache reset cancel this work. Encrypted recovery records remain authoritative for recovery when the sending wallet is reopened; submission alone does not mark an output spendable.
 
 ## Wallet Storage
 

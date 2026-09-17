@@ -563,15 +563,11 @@ async fn create_pending_output_poi_contexts(
             output_role: record.output_role,
         })
         .collect();
-    let created = session
+    session
         .handle
         .create_pending_output_poi_contexts(intents)
         .await
-        .wrap_err("create pending output POI contexts through wallet actor")?;
-    if let Some(sender_poi) = &session.sender_poi {
-        sender_poi.retain(records);
-    }
-    Ok(created)
+        .wrap_err("create pending output POI contexts through wallet actor")
 }
 
 #[cfg(test)]

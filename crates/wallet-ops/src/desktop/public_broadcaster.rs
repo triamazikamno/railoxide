@@ -670,7 +670,6 @@ pub struct WalletSession {
     pub(crate) public_data_plane: PublicDataPlaneHandle,
     pub(super) projection_cancel_tx: watch::Sender<bool>,
     pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    pub(crate) sender_poi: Option<super::sender_poi::SenderPoiSession>,
 }
 
 pub struct WalletPoiArtifactCacheRetry {
@@ -728,9 +727,6 @@ impl WalletSession {
         utxos: &[Utxo],
         tx_hash: Option<FixedBytes<32>>,
     ) {
-        if let (Some(sender_poi), Some(tx_hash)) = (&self.sender_poi, tx_hash) {
-            sender_poi.submit(tx_hash);
-        }
         match self.handle.mark_pending_spent_utxos(utxos, tx_hash).await {
             Ok(
                 WalletPendingSpentMarkOutcome::Marked

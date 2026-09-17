@@ -7,7 +7,6 @@ mod public_broadcaster;
 mod public_broadcaster_submit;
 mod requests;
 mod self_broadcast;
-mod sender_poi;
 mod sessions;
 mod sync_helpers;
 

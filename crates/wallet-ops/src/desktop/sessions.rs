@@ -10,7 +10,6 @@ pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     active_wallet_scope: AsyncMutex<ActiveWalletScope>,
-    sender_poi_outbox: Arc<super::sender_poi::SenderPoiOutbox>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -123,7 +122,6 @@ impl WalletSessionStore {
             db,
             sync_manager,
             active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
-            sender_poi_outbox: Arc::default(),
         })
     }
 
@@ -148,7 +146,6 @@ impl WalletSessionStore {
     }
 
     pub async fn reset_public_sync_caches(&self) -> Result<PublicSyncCachesResetReport> {
-        self.sender_poi_outbox.cancel(false).await;
         self.sync_manager
             .reset_public_sync_caches()
             .await
@@ -171,23 +168,6 @@ impl WalletSessionStore {
         }
 
         let chain_id = request.chain_id;
-        let finality_depth = request
-            .effective_chain
-            .as_ref()
-            .map(|chain| chain.finality_depth)
-            .or_else(|| {
-                sync_service::ChainConfigDefaults::for_chain(chain_id)
-                    .map(|chain| chain.finality_depth)
-            })
-            .ok_or_else(|| eyre!("unsupported chain {chain_id}"))?;
-        let rpc_urls = if let Some(url) = rpc_url_override
-            .as_ref()
-            .filter(|_| request.effective_chain.is_none())
-        {
-            vec![url.clone()]
-        } else {
-            effective_rpc_urls_for_chain(chain_id, request.effective_chain.as_ref())?
-        };
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
             chain_id,
@@ -207,24 +187,10 @@ impl WalletSessionStore {
         )
         .await?;
 
-        let sender_poi = super::sender_poi::SenderPoiSession::new(
-            Arc::clone(&self.sender_poi_outbox),
-            synced.chain_key,
-            finality_depth,
-            query_rpc_pool_with_http_client(rpc_urls, http),
-            PoiRpcClient::with_http_client(
-                request.poi_read_source.rpc_url().clone(),
-                http.client.clone(),
-            ),
-        );
-        let mut session =
-            wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await?;
-        session.sender_poi = Some(sender_poi);
-        Ok(session)
+        wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await
     }
 
     pub async fn shutdown(&self) {
-        self.sender_poi_outbox.cancel(true).await;
         self.sync_manager.shutdown().await;
     }
 }
@@ -313,7 +279,6 @@ async fn wallet_session_from_parts(
         public_data_plane,
         projection_cancel_tx,
         projection_join: Mutex::new(Some(projection_join)),
-        sender_poi: None,
     })
 }
 
