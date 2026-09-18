@@ -66,7 +66,9 @@ fn parse_scaled_amount(input: &str, decimals: u8) -> Result<U256> {
     } else {
         U256::from_str_radix(whole, 10).wrap_err("invalid whole amount")?
     };
-    let scale = uint!(10_U256).pow(U256::from(decimals));
+    let scale = uint!(10_U256)
+        .checked_pow(U256::from(decimals))
+        .ok_or_else(|| eyre!("token precision exceeds the supported amount range"))?;
     let fractional_value = if decimals == 0 || fractional.is_empty() {
         U256::ZERO
     } else {
@@ -78,5 +80,8 @@ fn parse_scaled_amount(input: &str, decimals: u8) -> Result<U256> {
         U256::from_str_radix(&padded, 10).wrap_err("invalid fractional amount")?
     };
 
-    Ok(whole_value * scale + fractional_value)
+    whole_value
+        .checked_mul(scale)
+        .and_then(|whole| whole.checked_add(fractional_value))
+        .ok_or_else(|| eyre!("amount exceeds the supported range"))
 }

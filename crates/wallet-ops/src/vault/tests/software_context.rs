@@ -1222,6 +1222,60 @@ fn passphrase_signers_and_derived_accounts_require_the_bound_session() {
     );
     drop(signer);
 
+    let mut executor_grant = store.create_spend_grant(TEST_PASSWORD).unwrap();
+    let (private_signer, executor_signer) = store
+        .executor_spend_signers_for_session(
+            &mut executor_grant,
+            &context_session,
+            Some(protected_seed_session.as_ref()),
+            137,
+            9,
+        )
+        .unwrap();
+    let mut discovery_grant = store.create_spend_grant(TEST_PASSWORD).unwrap();
+    let addresses = store
+        .executor_addresses_for_session(
+            &mut discovery_grant,
+            &context_session,
+            Some(protected_seed_session.as_ref()),
+            137,
+            9..11,
+        )
+        .unwrap();
+    assert_eq!(addresses[0], (9, executor_signer.address()));
+    assert_ne!(addresses[0].1, addresses[1].1);
+    assert_eq!(
+        private_signer.spending_public_key(),
+        context_session.spending_public_key()
+    );
+    assert_eq!(
+        executor_signer.address(),
+        railgun_wallet::keys::derive_executor_signer(&seed, 4, 137, 9)
+            .unwrap()
+            .address()
+    );
+    assert!(matches!(
+        store.executor_spend_signers_for_session(
+            &mut executor_grant,
+            &context_session,
+            Some(protected_seed_session.as_ref()),
+            137,
+            9,
+        ),
+        Err(ExecutorStoreError::Vault(VaultError::InvalidSpendGrant))
+    ));
+    for session in [None, Some(&wrong_session)] {
+        let mut grant = store.create_spend_grant(TEST_PASSWORD).unwrap();
+        assert!(matches!(
+            store
+                .executor_spend_signers_for_session(&mut grant, &context_session, session, 137, 9,),
+            Err(ExecutorStoreError::Vault(
+                VaultError::SoftwareSeedSessionRequired
+                    | VaultError::SoftwareSeedSessionBindingMismatch
+            ))
+        ));
+    }
+
     let initial_account = store
         .list_active_public_accounts_for_session(&context_session)
         .expect("initial context account")

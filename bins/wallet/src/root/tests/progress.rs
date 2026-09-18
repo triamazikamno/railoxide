@@ -956,6 +956,7 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
     let mut progress = PrivateBroadcasterProgressState {
         gateway_execution: None,
+        stealth_account: None,
         flow: PrivateSubmissionProgressFlow::PublicBroadcaster,
         kind: DeliveryFormKind::Send,
         key,
@@ -1107,6 +1108,43 @@ fn private_self_broadcast_success_requires_successful_receipt() {
     );
     assert!(!private_broadcaster_progress_is_successful(&progress));
 
+    // An outer success without expected effects must not become browser Confirmed.
+    // Canonical execution can confirm it; losing that observation reopens it.
+    for (status, expected) in [
+        (
+            wallet_ops::vault::ExecutorPayloadStatus::MissingEffects,
+            ResultKind::Submitted,
+        ),
+        (
+            wallet_ops::vault::ExecutorPayloadStatus::Executed,
+            ResultKind::Confirmed,
+        ),
+        (
+            wallet_ops::vault::ExecutorPayloadStatus::Uncertain,
+            ResultKind::Submitted,
+        ),
+    ] {
+        let mut result = test_self_broadcast_result(true);
+        result.tx = wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt {
+            receipt: result.tx.receipt().unwrap().clone(),
+            status,
+        };
+        progress.self_broadcast_result = Some(result);
+        assert_eq!(
+            gateway_self_broadcast_result(&progress).unwrap().0,
+            expected
+        );
+        assert_eq!(
+            private_broadcaster_progress_is_successful(&progress),
+            expected == ResultKind::Confirmed
+        );
+        assert_eq!(
+            crate::root::private_broadcaster::gateway_self_broadcast_status(expected).0,
+            wallet_ops::gateway::GatewayDraftStatus::Done,
+            "A submitted executor remains a handed-off browser result, not a stopped action",
+        );
+    }
+
     let mut result = test_self_broadcast_result(true);
     result.tx = wallet_ops::SelfBroadcastTxOutcome::InclusionUnobserved {
         tx_hash: "0xunobserved".to_string(),
@@ -1121,7 +1159,7 @@ fn private_self_broadcast_success_requires_successful_receipt() {
     finish_private_self_broadcast_progress_steps_at_stage(
         &mut progress.steps,
         TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
-        result.tx.receipt().map(|receipt| receipt.status),
+        result.tx.execution_status(),
     );
     progress
         .self_broadcast_attempts

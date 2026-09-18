@@ -111,6 +111,11 @@ use super::{
 mod estimate;
 pub(super) use estimate::{PrivateEstimateInput, PrivateEstimateOutput, PrivateEstimateRequest};
 mod delivery;
+mod executor;
+#[cfg(test)]
+pub(in crate::root) use executor::ExecutorUnshieldQuote;
+pub(in crate::root) use executor::{ExecutorUnshieldApproval, ExecutorUnshieldReview};
+pub(in crate::root) mod fee_editor;
 mod form_lifecycle;
 mod generation;
 mod helpers;

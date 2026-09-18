@@ -3,13 +3,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy::primitives::U256;
 use gpui::{
     AnyElement, App, AppContext, Axis, ClickEvent, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     collapsible::Collapsible,
@@ -155,10 +156,25 @@ impl SpendAuthorizationCache {
 
 #[derive(Clone)]
 pub(super) enum SpendAuthorizationIntent {
+    StealthAccounts(
+        Entity<super::stealth_accounts::StealthAccountsView>,
+        Arc<super::stealth_accounts::StealthAuthorization>,
+    ),
+    PrepareExecutorUnshield(
+        UnshieldAssetKey,
+        Arc<super::private_action::ExecutorUnshieldApproval>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
+    ExecutorUnshield(
+        UnshieldAssetKey,
+        Arc<super::private_action::ExecutorUnshieldReview>,
+        Option<wallet_ops::gateway::GatewayDraftExecution>,
+    ),
     PrivateSend(
         UnshieldAssetKey,
         Option<SponsoredAuthorizationLimit>,
         Option<wallet_ops::gateway::GatewayDraftExecution>,
+        Option<(alloy::primitives::Address, alloy::primitives::U256)>,
     ),
     PrivateSendSelfBroadcastGasPassword(
         UnshieldAssetKey,
@@ -169,6 +185,7 @@ pub(super) enum SpendAuthorizationIntent {
         UnshieldAssetKey,
         Option<SponsoredAuthorizationLimit>,
         Option<wallet_ops::gateway::GatewayDraftExecution>,
+        Option<(alloy::primitives::Address, alloy::primitives::U256)>,
     ),
     PrivateUnshieldSelfBroadcastGasPassword(
         UnshieldAssetKey,
@@ -190,8 +207,10 @@ pub(super) enum SpendAuthorizationIntent {
 impl SpendAuthorizationIntent {
     fn gateway_execution(&self) -> Option<&wallet_ops::gateway::GatewayDraftExecution> {
         match self {
-            Self::PrivateSend(_, _, execution)
-            | Self::PrivateUnshield(_, _, execution)
+            Self::PrivateSend(_, _, execution, _)
+            | Self::PrepareExecutorUnshield(_, _, execution)
+            | Self::ExecutorUnshield(_, _, execution)
+            | Self::PrivateUnshield(_, _, execution, _)
             | Self::PrivateSendSelfBroadcastGasPassword(_, _, execution)
             | Self::PrivateUnshieldSelfBroadcastGasPassword(_, _, execution) => execution.as_ref(),
             Self::PublicSend(draft) => draft.gateway_execution.as_ref(),
@@ -215,13 +234,47 @@ impl SpendAuthorizationIntent {
     }
 
     fn private_review_current(&self, root: &WalletRoot) -> bool {
-        let current = match self {
-            Self::PrivateSend(key, _, _) | Self::PrivateSendSelfBroadcastGasPassword(key, _, _) => {
-                root.send_forms
-                    .get(key)
-                    .map(|form| form.gateway_execution.as_ref())
+        let custom_fee_matches = match self {
+            Self::PrivateSend(key, _, _, expected) => {
+                root.send_forms.get(key).is_some_and(|form| {
+                    form.custom_fee_amount
+                        .map(|amount| (form.selected_fee_token, amount))
+                        == *expected
+                })
             }
-            Self::PrivateUnshield(key, _, _)
+            Self::PrivateUnshield(key, _, _, expected) => {
+                root.unshield_forms.get(key).is_some_and(|form| {
+                    form.custom_fee_amount
+                        .map(|amount| (form.selected_fee_token, amount))
+                        == *expected
+                })
+            }
+            _ => true,
+        };
+        if !custom_fee_matches {
+            return false;
+        }
+        if let Self::StealthAccounts(_, command) = self {
+            return root.stealth_session_is_current(command.session());
+        }
+        if let Self::ExecutorUnshield(key, review, _) = self
+            && !root
+                .unshield_forms
+                .get(key)
+                .and_then(|form| form.executor_review.as_ref())
+                .is_some_and(|current| Arc::ptr_eq(current, review))
+        {
+            return false;
+        }
+        let current = match self {
+            Self::PrivateSend(key, _, _, _)
+            | Self::PrivateSendSelfBroadcastGasPassword(key, _, _) => root
+                .send_forms
+                .get(key)
+                .map(|form| form.gateway_execution.as_ref()),
+            Self::PrivateUnshield(key, _, _, _)
+            | Self::PrepareExecutorUnshield(key, _, _)
+            | Self::ExecutorUnshield(key, _, _)
             | Self::PrivateUnshieldSelfBroadcastGasPassword(key, _, _) => root
                 .unshield_forms
                 .get(key)
@@ -235,7 +288,7 @@ impl SpendAuthorizationIntent {
         }
     }
 
-    fn approve_gateway_review(&self, root: &WalletRoot) -> bool {
+    pub(super) fn approve_gateway_review(&self, root: &WalletRoot) -> bool {
         self.private_review_current(root)
             && self
                 .gateway_execution()
@@ -245,7 +298,11 @@ impl SpendAuthorizationIntent {
     const fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
-            Self::PrivateSend(..) | Self::PrivateUnshield(..) | Self::BlockedShieldRefund(_)
+            Self::PrivateSend(..)
+                | Self::PrivateUnshield(..)
+                | Self::PrepareExecutorUnshield(..)
+                | Self::ExecutorUnshield(..)
+                | Self::BlockedShieldRefund(_)
         )
     }
 }
@@ -285,6 +342,7 @@ impl HardwareSpendAuthorizationCompletion {
                 *key,
                 *authorization_limit,
                 execution.clone(),
+                None,
             )),
             Self::PrivateUnshieldSelfBroadcast {
                 key,
@@ -295,6 +353,7 @@ impl HardwareSpendAuthorizationCompletion {
                 *key,
                 *authorization_limit,
                 execution.clone(),
+                None,
             )),
             Self::BlockedShieldRefund { .. } => None,
         }
@@ -331,6 +390,7 @@ impl From<VaultError> for HardwareSpendAuthorizationError {
 pub(super) struct SpendAuthorizationSummary {
     title: Arc<str>,
     detail: Arc<str>,
+    confirm_label: Arc<str>,
     rows: Vec<SpendAuthorizationSummaryRow>,
     warnings: Vec<Arc<str>>,
     payload: Option<SpendAuthorizationPayload>,
@@ -346,11 +406,17 @@ impl SpendAuthorizationSummary {
         Self {
             title: title.into(),
             detail: detail.into(),
+            confirm_label: "Authorize and continue".into(),
             rows,
             warnings: Vec::new(),
             payload: None,
             requires_explicit_review: false,
         }
+    }
+
+    pub(super) fn with_confirm_label(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.confirm_label = label.into();
+        self
     }
 
     pub(super) fn with_warnings(mut self, warnings: Vec<Arc<str>>) -> Self {
@@ -367,6 +433,15 @@ impl SpendAuthorizationSummary {
             label: label.into(),
             value: value.into(),
         });
+        self
+    }
+
+    pub(super) fn with_custom_transaction_fee(mut self, amount: String) -> Self {
+        self.rows.push(SpendAuthorizationSummaryRow::new(
+            "Custom transaction fee",
+            amount,
+        ));
+        self.requires_explicit_review = true;
         self
     }
 
@@ -435,6 +510,13 @@ pub(super) struct SpendAuthorizationSummaryRow {
     value: Arc<str>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
+    delta: Option<SpendAuthorizationAmountDelta>,
+}
+
+#[derive(Clone)]
+struct SpendAuthorizationAmountDelta {
+    text: String,
+    adverse: bool,
 }
 
 impl SpendAuthorizationSummaryRow {
@@ -444,6 +526,7 @@ impl SpendAuthorizationSummaryRow {
             value: value.into(),
             icon_path: None,
             shortened_copyable: false,
+            delta: None,
         }
     }
 
@@ -454,6 +537,28 @@ impl SpendAuthorizationSummaryRow {
 
     pub(super) const fn with_shortened_copyable(mut self) -> Self {
         self.shortened_copyable = true;
+        self
+    }
+
+    pub(super) fn with_amount_change(
+        mut self,
+        previous: Option<U256>,
+        current: U256,
+        higher_is_worse: bool,
+        format_amount: impl FnOnce(U256) -> String,
+    ) -> Self {
+        if let Some(previous) = previous.filter(|previous| *previous != current) {
+            let increased = current > previous;
+            let (sign, magnitude) = if increased {
+                ("+", current - previous)
+            } else {
+                ("−", previous - current)
+            };
+            self.delta = Some(SpendAuthorizationAmountDelta {
+                text: format!("{sign}{}", format_amount(magnitude)),
+                adverse: increased == higher_is_worse,
+            });
+        }
         self
     }
 
@@ -471,6 +576,8 @@ struct SpendAuthorizationDialogContent {
     lifetime: SpendAuthorizationLifetime,
     payload_open: bool,
     error: Option<Arc<str>>,
+    review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
+    review_focus: gpui::FocusHandle,
 }
 
 #[cfg_attr(not(feature = "hardware"), allow(dead_code))]
@@ -700,10 +807,16 @@ impl SpendAuthorizationDialogContent {
             lifetime: initial_lifetime,
             payload_open: false,
             error: None,
+            review_authorization: None,
+            review_focus: cx.focus_handle(),
         }
     }
 
     fn focus_password(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.review_authorization.is_some() {
+            self.review_focus.focus(window, cx);
+            return;
+        }
         self.password_input
             .read(cx)
             .focus_handle(cx)
@@ -711,6 +824,20 @@ impl SpendAuthorizationDialogContent {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some((scope, authorization)) = self.review_authorization.take() {
+            let intent = self.intent.clone();
+            self.root.update(cx, |root, cx| {
+                if root.current_spend_authorization_scope() != scope
+                    || !intent.approve_gateway_review(root)
+                {
+                    window.close_dialog(cx);
+                    return;
+                }
+                window.close_dialog(cx);
+                root.continue_authorized_spend(intent, authorization, window, cx);
+            });
+            return;
+        }
         let password = Zeroizing::new(self.password_input.read(cx).value().to_string());
         self.password_input
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -760,8 +887,10 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
-            .child(render_spend_authorization_summary(&self.summary))
+            .when(!self.summary.detail.is_empty(), |this| {
+                this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
+            })
+            .child(render_spend_authorization_summary(&self.summary, cx))
             .children(
                 self.summary
                     .warnings
@@ -776,16 +905,20 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                     }),
             )
             .children(payload)
-            .child(app_masked_input(&self.password_input, false))
-            .child(app_muted_text("Remember authorization"))
-            .child(render_spend_authorization_lifetime_buttons(
-                self.lifetime,
-                move |lifetime, cx| {
-                    lifetime_dialog.update(cx, |dialog, cx| dialog.set_lifetime(lifetime, cx));
-                },
-            ))
+            .when(self.review_authorization.is_none(), |this| {
+                this.child(app_masked_input(&self.password_input, false))
+                    .child(app_muted_text("Remember authorization"))
+                    .child(render_spend_authorization_lifetime_buttons(
+                        self.lifetime,
+                        move |lifetime, cx| {
+                            lifetime_dialog
+                                .update(cx, |dialog, cx| dialog.set_lifetime(lifetime, cx));
+                        },
+                    ))
+            })
             .when(
-                self.lifetime.requires_reusable_authorization_warning(),
+                self.review_authorization.is_none()
+                    && self.lifetime.requires_reusable_authorization_warning(),
                 |this| {
                     this.child(
                         Alert::warning(
@@ -817,12 +950,16 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                             }),
                     )
                     .child(
-                        app_button("wallet-spend-auth-submit", "Authorize and continue")
-                            .primary()
-                            .flex_none()
-                            .on_click(move |_event, window, cx| {
-                                dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
-                            }),
+                        app_button(
+                            "wallet-spend-auth-submit",
+                            self.summary.confirm_label.to_string(),
+                        )
+                        .track_focus(&self.review_focus)
+                        .primary()
+                        .flex_none()
+                        .on_click(move |_event, window, cx| {
+                            dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
+                        }),
                     ),
             )
     }
@@ -872,7 +1009,7 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .gap_3()
             .child(app_strong_text(self.summary.title.to_string()))
             .child(app_muted_text(hardware_spend_authorization_detail()).whitespace_normal())
-            .child(render_spend_authorization_summary(&self.summary))
+            .child(render_spend_authorization_summary(&self.summary, cx))
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(
                     SharedString::from(format!("wallet-hardware-spend-auth-warning-{index}")),
@@ -960,7 +1097,10 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     }
 }
 
-fn render_spend_authorization_summary(summary: &SpendAuthorizationSummary) -> DescriptionList {
+fn render_spend_authorization_summary(
+    summary: &SpendAuthorizationSummary,
+    cx: &App,
+) -> DescriptionList {
     DescriptionList::vertical()
         .large()
         .bordered(false)
@@ -970,7 +1110,7 @@ fn render_spend_authorization_summary(summary: &SpendAuthorizationSummary) -> De
                 .rows
                 .iter()
                 .enumerate()
-                .map(|(row_index, row)| spend_authorization_summary_item(row_index, row)),
+                .map(|(row_index, row)| spend_authorization_summary_item(row_index, row, cx)),
         )
 }
 
@@ -1034,14 +1174,16 @@ fn render_spend_authorization_payload(
 fn spend_authorization_summary_item(
     row_index: usize,
     row: &SpendAuthorizationSummaryRow,
+    cx: &App,
 ) -> DescriptionItem {
     DescriptionItem::new(row.label.to_string())
-        .value(spend_authorization_summary_value(row_index, row))
+        .value(spend_authorization_summary_value(row_index, row, cx))
 }
 
 fn spend_authorization_summary_value(
     row_index: usize,
     row: &SpendAuthorizationSummaryRow,
+    cx: &App,
 ) -> AnyElement {
     if let Some(icon_path) = row.icon_path.clone() {
         return div()
@@ -1088,6 +1230,30 @@ fn spend_authorization_summary_value(
                         ("wallet-spend-auth-copy", row_index),
                         row.value.to_string(),
                     )),
+            )
+            .into_any_element();
+    }
+
+    if let Some(delta) = &row.delta {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_wrap()
+            .items_baseline()
+            .gap_x_2()
+            .py(px(2.0))
+            .child(
+                app_text(row.value.to_string())
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_color(rgb(theme::TEXT)),
+            )
+            .child(
+                app_muted_text(delta.text.clone())
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .when(delta.adverse, |this| this.text_color(cx.theme().danger)),
             )
             .into_any_element();
     }
@@ -1229,20 +1395,54 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.open_spend_authorization_dialog_with_review(intent, summary, None, window, cx);
+    }
+
+    pub(in crate::root) fn open_prepared_spend_review(
+        &self,
+        intent: SpendAuthorizationIntent,
+        summary: SpendAuthorizationSummary,
+        authorization: DesktopPrivateSpendAuthorization,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        intent.private_attention(
+            "Review in the desktop app",
+            "Review the updated transaction terms before signing.",
+        );
+        self.open_spend_authorization_dialog_with_review(
+            intent,
+            summary,
+            Some((self.current_spend_authorization_scope(), authorization)),
+            window,
+            cx,
+        );
+    }
+
+    fn open_spend_authorization_dialog_with_review(
+        &self,
+        intent: SpendAuthorizationIntent,
+        summary: SpendAuthorizationSummary,
+        review_authorization: Option<(SpendAuthorizationScope, DesktopPrivateSpendAuthorization)>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
         let content_root = root.clone();
         let content_intent = intent.clone();
         let content = cx.new(|cx| {
-            SpendAuthorizationDialogContent::new(
+            let mut content = SpendAuthorizationDialogContent::new(
                 content_root,
                 content_intent,
                 summary,
                 initial_lifetime,
                 window,
                 cx,
-            )
+            );
+            content.review_authorization = review_authorization;
+            content
         });
         let focus_content = content.clone();
         let dialog_width =
@@ -1337,7 +1537,7 @@ impl WalletRoot {
                     .gap_3()
                     .child(app_strong_text(summary.title.to_string()))
                     .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
-                    .child(render_spend_authorization_summary(&summary))
+                    .child(render_spend_authorization_summary(&summary, cx))
                     .children(summary.warnings.iter().enumerate().map(|(index, warning)| {
                         Alert::warning(
                             SharedString::from(format!(
@@ -1519,6 +1719,13 @@ impl WalletRoot {
             self.release_gateway_private_form(execution, cx);
         }
         self.cancel_governance_authorization(intent, cx);
+        if let SpendAuthorizationIntent::StealthAccounts(view, command) = intent {
+            let view = view.clone();
+            let command = command.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |view, cx| view.cancel_authorization(&command, cx));
+            });
+        }
     }
 
     pub(super) fn finish_spend_authorization(
@@ -1621,7 +1828,7 @@ impl WalletRoot {
         })
     }
 
-    fn continue_authorized_spend(
+    pub(super) fn continue_authorized_spend(
         &mut self,
         intent: SpendAuthorizationIntent,
         authorization: DesktopPrivateSpendAuthorization,
@@ -1632,7 +1839,47 @@ impl WalletRoot {
             return;
         }
         match intent {
-            SpendAuthorizationIntent::PrivateSend(key, authorization_limit, execution) => {
+            SpendAuthorizationIntent::StealthAccounts(view, command) => {
+                // The panel reads WalletRoot to validate its session. Release this update first.
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.continue_authorized(command, authorization, window, cx);
+                    });
+                });
+            }
+            SpendAuthorizationIntent::PrepareExecutorUnshield(key, approval, execution) => {
+                self.prepare_executor_unshield_review(key, approval, authorization, window, cx);
+                if !self
+                    .unshield_forms
+                    .get(&key)
+                    .is_some_and(|form| form.generating)
+                    && let Some(execution) = execution
+                {
+                    self.reject_gateway_private_authorization(&execution, cx);
+                }
+            }
+            SpendAuthorizationIntent::ExecutorUnshield(key, review, execution) => {
+                let current = self.unshield_spend_draft(key, cx);
+                if current.as_ref().is_some_and(|draft| review.matches(draft)) {
+                    self.generate_unshield_calldata_authorized(
+                        key,
+                        authorization,
+                        None,
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.set_unshield_form_error(
+                        key,
+                        "The prepared action changed. Refresh and review it again.",
+                        cx,
+                    );
+                }
+                if let Some(execution) = execution {
+                    self.reject_gateway_private_authorization(&execution, cx);
+                }
+            }
+            SpendAuthorizationIntent::PrivateSend(key, authorization_limit, execution, _) => {
                 self.generate_send_calldata_authorized(
                     key,
                     authorization,
@@ -1666,7 +1913,7 @@ impl WalletRoot {
                     cx,
                 );
             }
-            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit, execution) => {
+            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit, execution, _) => {
                 self.generate_unshield_calldata_authorized(
                     key,
                     authorization,
@@ -1957,6 +2204,36 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_quote_deltas_preserve_small_changes_and_distinguish_adverse_direction() {
+        let approved = U256::from(100);
+        for (current, higher_is_worse, sign, adverse) in [
+            (101, true, "+", true),
+            (99, true, "−", false),
+            (101, false, "+", false),
+            (99, false, "−", true),
+        ] {
+            let row = SpendAuthorizationSummaryRow::new("", "").with_amount_change(
+                Some(approved),
+                U256::from(current),
+                higher_is_worse,
+                |amount| crate::root::format_unshield_amount_input(amount, Some(18)),
+            );
+            let delta = row.delta.expect("one wei change remains visible");
+            assert_eq!(delta.text, format!("{sign}0.000000000000000001"));
+            assert_eq!(delta.adverse, adverse);
+        }
+        for previous in [None, Some(approved)] {
+            let row = SpendAuthorizationSummaryRow::new("", "").with_amount_change(
+                previous,
+                approved,
+                true,
+                |_| panic!("initial and unchanged amounts have no delta"),
+            );
+            assert!(row.delta.is_none());
+        }
+    }
 
     struct LifetimePickerProbe {
         focus: gpui::FocusHandle,

@@ -814,6 +814,8 @@ impl WalletRoot {
         );
         let request_key = request_key.to_owned();
         let native_control = request.request_control.clone();
+        let executor_owner = parse_caip2_chain_id(&request.item.chain_id)
+            .and_then(|chain_id| self.executor_owner_for_public_chain(chain_id));
         let join = self.spawn_public_transaction_submission(async move {
             Box::pin(approve_walletconnect_request_task(
                 request,
@@ -824,6 +826,7 @@ impl WalletRoot {
                 trezor_app_passphrase,
                 trezor_pin_matrix_provider,
                 effective_chain,
+                executor_owner,
                 response_sender,
                 http,
                 hash_fallback_confirmed,

@@ -418,7 +418,7 @@ fn public_broadcaster_estimate_validation_allows_empty_recipient_prompt_state() 
 }
 
 #[test]
-fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
+fn recipient_options_filter_unavailable_app_accounts_and_include_address_books() {
     let private_wallets = vec![
         PrivateWalletRecipientSource {
             label: Arc::from("Active private"),
@@ -455,7 +455,7 @@ fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
             .all(|option| option.label.as_ref() != "Inactive private")
     );
 
-    let public_accounts = vec![
+    let mut public_accounts = vec![
         public_account_metadata(
             "active-public",
             "0x1111111111111111111111111111111111111111",
@@ -469,6 +469,30 @@ fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
             wallet_ops::vault::PublicAccountStatus::Inactive,
         ),
     ];
+    let stealth_accounts = [
+        (1, "0x4444444444444444444444444444444444444444"),
+        (137, "0x5555555555555555555555555555555555555555"),
+    ];
+    for (chain_id, address) in stealth_accounts {
+        let mut account = public_account_metadata(
+            address,
+            address,
+            Some("Stealth account 0"),
+            wallet_ops::vault::PublicAccountStatus::Active,
+        );
+        account.source = serde_json::from_value(serde_json::json!({
+            "ExecutorDerived": {
+                "chain_id": chain_id,
+                "index": 0,
+                "operation": wallet_ops::vault::ExecutorOperationId::random().expect("operation"),
+            }
+        }))
+        .expect("stealth account source");
+        account.scope = wallet_ops::vault::PublicAccountScope::PrivateWallet {
+            wallet_uuid: "wallet".to_string(),
+        };
+        public_accounts.push(account);
+    }
     let public_address_book = vec![PublicAddressBookEntry {
         entry_uuid: "public-book".to_string(),
         label: "Saved public".to_string(),
@@ -478,22 +502,29 @@ fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
         display_order: 0,
     }];
 
-    let public_options = private_unshield_recipient_options(&public_accounts, &public_address_book);
+    for (chain_id, stealth_address) in stealth_accounts {
+        let public_options =
+            private_unshield_recipient_options(&public_accounts, &public_address_book, chain_id);
 
-    assert_eq!(public_options.len(), 2);
-    assert!(public_options.iter().any(|option| {
-        option.label.as_ref() == "Active public"
-            && option.source == RecipientOptionSource::PublicAccount
-    }));
-    assert!(public_options.iter().any(|option| {
-        option.label.as_ref() == "Saved public"
-            && option.source == RecipientOptionSource::PublicAddressBook
-    }));
-    assert!(
-        public_options
-            .iter()
-            .all(|option| option.label.as_ref() != "Inactive public")
-    );
+        assert_eq!(public_options.len(), 3);
+        assert!(public_options.iter().any(|option| {
+            option.label.as_ref() == "Active public"
+                && option.source == RecipientOptionSource::PublicAccount
+        }));
+        assert!(public_options.iter().any(|option| {
+            option.label.as_ref() == "Saved public"
+                && option.source == RecipientOptionSource::PublicAddressBook
+        }));
+        assert!(public_options.iter().any(|option| {
+            option.address.as_ref() == stealth_address
+                && option.source == RecipientOptionSource::PublicAccount
+        }));
+        assert!(
+            public_options
+                .iter()
+                .all(|option| option.label.as_ref() != "Inactive public")
+        );
+    }
 }
 
 #[test]

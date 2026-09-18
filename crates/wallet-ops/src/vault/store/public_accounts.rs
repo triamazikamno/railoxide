@@ -272,7 +272,9 @@ impl DesktopVaultStore {
         }
         if !matches!(
             account.source,
-            PublicAccountSource::Derived | PublicAccountSource::HardwareDerived
+            PublicAccountSource::Derived
+                | PublicAccountSource::HardwareDerived
+                | PublicAccountSource::ExecutorDerived(_)
         ) {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
@@ -301,7 +303,9 @@ impl DesktopVaultStore {
         }
         if !matches!(
             account.source,
-            PublicAccountSource::Derived | PublicAccountSource::HardwareDerived
+            PublicAccountSource::Derived
+                | PublicAccountSource::HardwareDerived
+                | PublicAccountSource::ExecutorDerived(_)
         ) {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
@@ -423,11 +427,15 @@ impl DesktopVaultStore {
                     spend.decrypt_public_account_secret(&account.public_account_uuid, &record)?;
                 Ok(Zeroizing::new(secret.private_key))
             }
-            PublicAccountSource::HardwareDerived => Err(VaultError::InvalidPublicAccountOperation),
+            // Executor keys may only be obtained by the live native owner while
+            // its signing admission remains held through handoff.
+            PublicAccountSource::HardwareDerived | PublicAccountSource::ExecutorDerived(_) => {
+                Err(VaultError::InvalidPublicAccountOperation)
+            }
         }
     }
 
-    pub(super) fn list_public_account_metadata_with_view(
+    pub(in crate::vault) fn list_public_account_metadata_with_view(
         &self,
         view: &ViewUnlock,
     ) -> Result<Vec<PublicAccountMetadata>, VaultError> {

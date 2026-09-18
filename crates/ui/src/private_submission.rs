@@ -3,6 +3,7 @@ use crate::{
     controls::{app_muted_text, app_strong_text},
     private_action::{DisplayRow, display_row},
 };
+use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, Div, IntoElement, ParentElement, SharedString, Styled, div, rgb};
 
 #[must_use]
@@ -39,6 +40,7 @@ pub fn progress_step_body(
     color: u32,
     action: Option<AnyElement>,
 ) -> Div {
+    let show_detail = detail != label || error_copy_id.is_some();
     let copy = error_copy_id
         .map(|id| crate::clipboard::clipboard_with_toast(id, detail.clone()).into_any_element());
     div()
@@ -48,20 +50,22 @@ pub fn progress_step_body(
         .flex_col()
         .gap_1()
         .child(app_strong_text(label).text_color(rgb(color)))
-        .child(
-            div()
-                .flex()
-                .items_start()
-                .gap_1()
-                .child(
-                    app_muted_text(detail)
-                        .flex_1()
-                        .min_w_0()
-                        .whitespace_normal()
-                        .text_color(rgb(color)),
-                )
-                .children(copy),
-        )
+        .when(show_detail, |this| {
+            this.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_1()
+                    .child(
+                        app_muted_text(detail)
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_color(rgb(color)),
+                    )
+                    .children(copy),
+            )
+        })
         .children(action)
 }
 

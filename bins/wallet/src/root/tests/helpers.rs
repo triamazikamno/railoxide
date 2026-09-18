@@ -94,7 +94,7 @@ pub(super) fn utxo_output_with_hashes(
     }
 }
 
-pub(super) fn unshield_utxo_output(
+pub(in crate::root) fn unshield_utxo_output(
     token: Address,
     value: u64,
     tree: u32,
@@ -144,7 +144,7 @@ pub(super) fn temp_wallet_db_root(name: &str) -> PathBuf {
     ))
 }
 
-pub(super) fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> FeeRow {
+pub(in crate::root) fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> FeeRow {
     const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
 
     FeeRow {
@@ -202,6 +202,7 @@ pub(super) fn private_progress_state(
 ) -> PrivateBroadcasterProgressState {
     PrivateBroadcasterProgressState {
         gateway_execution: None,
+        stealth_account: None,
         flow,
         kind: DeliveryFormKind::Send,
         key,

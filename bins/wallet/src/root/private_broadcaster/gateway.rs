@@ -33,14 +33,47 @@ pub(in crate::root) fn gateway_self_broadcast_result(
     }
     progress.self_broadcast_result.as_ref().map(|result| {
         (
-            match result.tx.receipt() {
-                Some(receipt) if receipt.status => GatewayPrivateDraftResult::Confirmed,
+            match result.tx.execution_status() {
+                Some(true) => GatewayPrivateDraftResult::Confirmed,
                 Some(_) => GatewayPrivateDraftResult::Reverted,
+                None if result.tx.receipt().is_some() => GatewayPrivateDraftResult::Submitted,
                 None => GatewayPrivateDraftResult::InclusionUnknown,
             },
             Some(result.tx.tx_hash().to_owned()),
         )
     })
+}
+
+pub(in crate::root) fn gateway_self_broadcast_status(
+    result: GatewayPrivateDraftResult,
+) -> (GatewayDraftStatus, String, String) {
+    match result {
+        GatewayPrivateDraftResult::Confirmed => (
+            GatewayDraftStatus::Done,
+            "Confirmed".into(),
+            "The transaction was confirmed on chain.".into(),
+        ),
+        GatewayPrivateDraftResult::Submitted => (
+            GatewayDraftStatus::Done,
+            "Execution not confirmed".into(),
+            "The transaction has a receipt, but its approved effects are not confirmed. Check Stealth accounts in the desktop app for reconciliation and recovery.".into(),
+        ),
+        GatewayPrivateDraftResult::Reverted => (
+            GatewayDraftStatus::Failed,
+            "Reverted".into(),
+            "The transaction reverted on chain. Check the desktop history for details.".into(),
+        ),
+        GatewayPrivateDraftResult::InclusionUnknown => (
+            GatewayDraftStatus::Failed,
+            "Inclusion unknown".into(),
+            "The transaction may still be included. Its private inputs remain reserved; check history before creating another transaction.".into(),
+        ),
+        _ => (
+            GatewayDraftStatus::Failed,
+            "Stopped".into(),
+            "Local processing stopped before a relay accepted the bundle.".into(),
+        ),
+    }
 }
 
 impl WalletRoot {
@@ -158,12 +191,7 @@ impl WalletRoot {
             if hash.is_some() {
                 projection.transaction_hash = hash;
             }
-            (status, label, message) = match result {
-                GatewayPrivateDraftResult::Confirmed => (GatewayDraftStatus::Done, "Confirmed".into(), "The transaction was confirmed on chain.".into()),
-                GatewayPrivateDraftResult::Reverted => (GatewayDraftStatus::Failed, "Reverted".into(), "The transaction reverted on chain. Check the desktop history for details.".into()),
-                GatewayPrivateDraftResult::InclusionUnknown => (GatewayDraftStatus::Failed, "Inclusion unknown".into(), "The transaction may still be included. Its private inputs remain reserved; check history before creating another transaction.".into()),
-                _ => (GatewayDraftStatus::Failed, "Stopped".into(), "Local processing stopped before a relay accepted the bundle.".into()),
-            };
+            (status, label, message) = gateway_self_broadcast_status(result);
         } else if progress.stopped {
             projection.result = Some(GatewayPrivateDraftResult::Stopped);
             status = GatewayDraftStatus::Failed;

@@ -255,16 +255,132 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
     ) -> Result<SoftwareRailgunSpendSigner, VaultError> {
+        self.software_seed_and_signer_for_session(grant, view_session, protected_seed_session)
+            .map(|(_seed, signer)| signer)
+    }
+
+    /// Derives both signers from the same authorized, identity-checked software seed.
+    /// Native owners must additionally validate their operation and session generation.
+    pub fn executor_spend_signers_for_session(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+        chain_id: u64,
+        executor_index: u32,
+    ) -> Result<
+        (
+            SoftwareRailgunSpendSigner,
+            alloy::signers::local::PrivateKeySigner,
+        ),
+        crate::vault::ExecutorStoreError,
+    > {
+        if view_session.hardware_profile_session().is_some() {
+            return Err(crate::vault::ExecutorStoreError::SoftwareWalletRequired);
+        }
+        let (seed, private_signer) =
+            self.software_seed_and_signer_for_session(grant, view_session, protected_seed_session)?;
+        let executor_signer = railgun_wallet::keys::derive_executor_signer(
+            &seed,
+            view_session.derivation_index(),
+            chain_id,
+            executor_index,
+        )
+        .map_err(VaultError::from)?;
+        Ok((private_signer, executor_signer))
+    }
+
+    /// Derive the reserved operation and optional spare during one authorized seed access.
+    /// No signing keys escape preparation or enter its background inspection.
+    pub(crate) fn executor_preparation_addresses_for_session(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+        chain_id: u64,
+        executor_index: u32,
+        spare_index: Option<u32>,
+    ) -> Result<
+        (
+            alloy::primitives::Address,
+            Option<alloy::primitives::Address>,
+        ),
+        crate::vault::ExecutorStoreError,
+    > {
+        if view_session.hardware_profile_session().is_some() {
+            return Err(crate::vault::ExecutorStoreError::SoftwareWalletRequired);
+        }
+        let (seed, _private_signer) =
+            self.software_seed_and_signer_for_session(grant, view_session, protected_seed_session)?;
+        let address = |index| {
+            railgun_wallet::keys::derive_executor_signer(
+                &seed,
+                view_session.derivation_index(),
+                chain_id,
+                index,
+            )
+            .map(|signer| signer.address())
+            .map_err(VaultError::from)
+        };
+        Ok((
+            address(executor_index)?,
+            spare_index.map(address).transpose()?,
+        ))
+    }
+
+    /// Derive only the addresses in an explicitly requested recovery range.
+    /// No signing keys escape this read/discovery operation.
+    pub fn executor_addresses_for_session(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+        chain_id: u64,
+        range: std::ops::Range<u32>,
+    ) -> Result<Vec<(u32, alloy::primitives::Address)>, crate::vault::ExecutorStoreError> {
+        if view_session.hardware_profile_session().is_some() {
+            return Err(crate::vault::ExecutorStoreError::SoftwareWalletRequired);
+        }
+        if range.is_empty()
+            || range.end > (1 << 31)
+            || range.end - range.start > crate::vault::MAX_EXECUTOR_DISCOVERY_RANGE
+        {
+            return Err(crate::vault::ExecutorStoreError::DiscoveryRange);
+        }
+        let (seed, _private_signer) =
+            self.software_seed_and_signer_for_session(grant, view_session, protected_seed_session)?;
+        range
+            .map(|index| {
+                railgun_wallet::keys::derive_executor_signer(
+                    &seed,
+                    view_session.derivation_index(),
+                    chain_id,
+                    index,
+                )
+                .map(|signer| (index, signer.address()))
+                .map_err(|error| crate::vault::ExecutorStoreError::Vault(VaultError::from(error)))
+            })
+            .collect()
+    }
+
+    fn software_seed_and_signer_for_session(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    ) -> Result<(Zeroizing<[u8; 64]>, SoftwareRailgunSpendSigner), VaultError> {
         let wallet_id = view_session.wallet_id();
         let metadata = self.load_wallet_metadata_with_view(&view_session.view, wallet_id)?;
         let Some(context) = metadata.software_context.as_ref() else {
             return Err(VaultError::InvalidWalletMetadata);
         };
-        let wallet = match context.kind {
+        let (seed, wallet) = match context.kind {
             WalletSoftwareContextKind::Standard => {
                 let bundle = self.load_spend_bundle(grant, wallet_id)?;
                 let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(&bundle.bip39_entropy)?);
-                wallet_keys_from_mnemonic(&mnemonic, "", bundle.derivation_index)?
+                let seed = crate::vault::bip39_seed_from_mnemonic(&mnemonic, "")?;
+                let wallet = wallet_keys_from_seed(&seed, bundle.derivation_index)?;
+                (seed, wallet)
             }
             WalletSoftwareContextKind::Passphrase => {
                 let session =
@@ -297,7 +413,7 @@ impl DesktopVaultStore {
                     zeroize_wallet_keys(&mut wallet);
                     return Err(VaultError::InvalidSoftwareContextIdentity);
                 }
-                wallet
+                (seed, wallet)
             }
         };
         let view_record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
@@ -311,7 +427,7 @@ impl DesktopVaultStore {
             zeroize_wallet_keys(&mut wallet);
             return Err(VaultError::InvalidSoftwareContextIdentity);
         }
-        Ok(SoftwareRailgunSpendSigner { wallet })
+        Ok((seed, SoftwareRailgunSpendSigner { wallet }))
     }
 
     fn encrypted_wallet_records_from_entropy(

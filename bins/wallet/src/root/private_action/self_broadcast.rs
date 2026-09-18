@@ -636,8 +636,18 @@ impl WalletRoot {
         let unwrap = form.unwrap;
         let native_top_up =
             enabled_native_top_up_plan(form.native_top_up_enabled, form.native_top_up.as_ref());
+        let executor_gas = self
+            .effective_chain_configs
+            .get(&asset.chain_id)
+            .filter(|chain| {
+                (unwrap || native_top_up.is_some())
+                    && session.executor_owner().is_some()
+                    && chain.accepted_executor_profile().is_some()
+            })
+            .map(|chain| chain.gas.clone());
         let join = self.runtime.spawn_blocking(move || {
             estimate_desktop_unshield_self_broadcast_cost(
+                executor_gas.as_ref(),
                 &utxos,
                 asset.token,
                 amount,
@@ -1223,7 +1233,10 @@ impl WalletRoot {
     ) -> Vec<PublicAccountMetadata> {
         self.public_accounts
             .iter()
-            .filter(|account| account.status == PublicAccountStatus::Active)
+            .filter(|account| {
+                account.status == PublicAccountStatus::Active
+                    && account.is_available_on_chain(self.selected_chain)
+            })
             .cloned()
             .collect()
     }
@@ -1428,6 +1441,7 @@ impl WalletRoot {
         self.public_accounts.iter().find(|account| {
             account.status == PublicAccountStatus::Active
                 && account.public_account_uuid == selected_uuid
+                && account.is_available_on_chain(self.selected_chain)
         })
     }
 }

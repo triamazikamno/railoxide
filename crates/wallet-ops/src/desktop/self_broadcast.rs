@@ -66,8 +66,7 @@ pub(super) async fn submit_self_broadcast_plan(
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     public_account_uuid: String,
     session: Arc<WalletSession>,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     pending_spent_inputs: Vec<Utxo>,
     native_top_up_cannot_pay_current_gas: bool,
     gas_fee: SelfBroadcastGasFeeSelection,
@@ -79,7 +78,7 @@ pub(super) async fn submit_self_broadcast_plan(
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let signer = vaulted_public_signer(
+    let signer = admitted_public_signer(
         vault_store,
         view_session,
         vault_password,
@@ -87,12 +86,23 @@ pub(super) async fn submit_self_broadcast_plan(
         protected_seed_session,
         None,
         trezor_pin_matrix_provider,
-    )?;
+        session.executor_owner().as_ref(),
+        chain_id,
+    )
+    .await?;
+    signer.while_active(async {
     if signer.address() != gas_payer {
         return Err(eyre!(
             "selected public account signer address does not match account metadata"
         ));
     }
+    let executor = if let Some(owner) = session.executor_owner() {
+        owner
+            .transaction_identity(&transaction)?
+            .map(|identity| (owner, identity))
+    } else {
+        None
+    };
     let mut next_gas_fee = gas_fee;
     let mut submitted_attempts = Vec::new();
     let mut nonce = None;
@@ -107,8 +117,7 @@ pub(super) async fn submit_self_broadcast_plan(
             &query_rpc_pool,
             chain_id,
             gas_payer,
-            to,
-            data.clone(),
+            transaction.clone(),
             next_gas_fee,
             &chain.gas,
             nonce,
@@ -220,17 +229,31 @@ pub(super) async fn submit_self_broadcast_plan(
                         .expect("self-broadcast observer established")
                         .poll()
                         .await;
-                    if let Some((winner_index, tx)) =
+                    if let Some((winner_index, mut tx)) =
                         self_broadcast_observation_outcome(observation, &submitted_attempts)?
                     {
                         let winner = self_broadcast_winner_output(&submitted_attempts, winner_index);
-                        if let Some(receipt) = tx.receipt() {
+                        if let Some(receipt) = tx.receipt() && executor.is_none() {
                             session
                                 .mark_pending_spent_utxos(
                                     &pending_spent_inputs,
                                     parse_submitted_tx_hash(&receipt.tx_hash),
                                 )
                                 .await;
+                        }
+                        if let Some((owner, identity)) = &executor
+                            && let SelfBroadcastTxOutcome::Receipt(receipt) = tx
+                        {
+                            let range = receipt.block_number..receipt.block_number.saturating_add(1);
+                            let reconciliation = match &signer {
+                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_history(owner, identity.operation(), range).await,
+                                _ => owner.reconcile_history(identity.operation(), range).await,
+                            };
+                            let status = reconciliation
+                                .ok()
+                                .and_then(|report| report.record().payload_status(identity.payload()))
+                                .unwrap_or(vault::ExecutorPayloadStatus::Uncertain);
+                            tx = SelfBroadcastTxOutcome::ExecutorReceipt { receipt, status };
                         }
                         return Ok(DesktopSelfBroadcastResult {
                             chain_id,
@@ -266,8 +289,7 @@ pub(super) async fn submit_self_broadcast_plan(
                         &query_rpc_pool,
                         chain_id,
                         gas_payer,
-                        to,
-                        data.clone(),
+                        transaction.clone(),
                         command.gas_fee,
                         gas_limit,
                         nonce,
@@ -333,6 +355,7 @@ pub(super) async fn submit_self_broadcast_plan(
             }
         }
     }
+    }).await
 }
 
 pub(super) fn emit_self_broadcast_event(
@@ -467,8 +490,7 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     chain_id: u64,
     from: Address,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     gas_fee: SelfBroadcastGasFeeSelection,
     gas_limit: u64,
     nonce: u64,
@@ -482,8 +504,7 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
             provider_handle,
             chain_id,
             from,
-            to,
-            data.clone(),
+            transaction.clone(),
             gas_fee,
             gas_limit,
             nonce,
@@ -511,8 +532,7 @@ pub(super) async fn self_broadcast_replacement_preflight(
     provider_handle: ProviderHandle,
     chain_id: u64,
     from: Address,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     gas_fee: SelfBroadcastGasFeeSelection,
     gas_limit: u64,
     nonce: u64,
@@ -527,26 +547,28 @@ pub(super) async fn self_broadcast_replacement_preflight(
         max_priority_fee_per_gas,
     } = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
     let estimated_native_gas_cost = self_broadcast_native_gas_cost(gas_limit, max_fee_per_gas);
+    let required_native = estimated_native_gas_cost
+        .checked_add(transaction.value.unwrap_or_default())
+        .ok_or_else(|| eyre!("self-broadcast native cost exceeds the supported amount"))?;
     let live_native_balance = provider
         .get_balance(from)
         .await
         .wrap_err("fetch self-broadcast native balance")?;
-    if live_native_balance < estimated_native_gas_cost {
+    if live_native_balance < required_native {
         return Err(self_broadcast_insufficient_native_gas_error(
             live_native_balance,
-            estimated_native_gas_cost,
+            required_native,
         ));
     }
     Ok(SelfBroadcastPreflight {
         tx_req: self_broadcast_transaction_request(
             chain_id,
             from,
-            to,
-            data,
+            transaction,
             max_fee_per_gas,
             max_priority_fee_per_gas,
             nonce,
-        )
+        )?
         .with_gas_limit(gas_limit),
         nonce,
         gas_limit,
@@ -1056,8 +1078,7 @@ pub(super) async fn self_broadcast_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     chain_id: u64,
     from: Address,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     gas_fee: SelfBroadcastGasFeeSelection,
     gas: &settings::EffectiveChainGasSettings,
     nonce: Option<u64>,
@@ -1075,8 +1096,7 @@ pub(super) async fn self_broadcast_preflight_from_rpc_pool(
             provider_handle,
             chain_id,
             from,
-            to,
-            data.clone(),
+            transaction.clone(),
             gas_fee,
             quote,
             gas,
@@ -1105,8 +1125,7 @@ pub(super) async fn self_broadcast_preflight(
     provider_handle: ProviderHandle,
     chain_id: u64,
     from: Address,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     gas_fee: SelfBroadcastGasFeeSelection,
     quote: SelfBroadcastGasFeeQuote,
     gas: &settings::EffectiveChainGasSettings,
@@ -1129,26 +1148,29 @@ pub(super) async fn self_broadcast_preflight(
     let tx_req = self_broadcast_transaction_request(
         chain_id,
         from,
-        to,
-        data,
+        transaction,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         nonce,
-    );
+    )?;
     let estimated_gas = provider
         .estimate_gas(tx_req.clone())
         .await
         .wrap_err("estimate self-broadcast gas")?;
-    let gas_limit = self_broadcast_gas_limit_with_buffer(estimated_gas, gas.gas_limit_buffer);
+    let gas_limit =
+        self_broadcast_gas_limit_with_buffer(estimated_gas, gas.gas_limit_buffer, tx_req.gas)?;
     let estimated_native_gas_cost = self_broadcast_native_gas_cost(gas_limit, max_fee_per_gas);
+    let required_native = estimated_native_gas_cost
+        .checked_add(tx_req.value.unwrap_or_default())
+        .ok_or_else(|| eyre!("self-broadcast native cost exceeds the supported amount"))?;
     let live_native_balance = provider
         .get_balance(from)
         .await
         .wrap_err("fetch self-broadcast native balance")?;
-    if live_native_balance < estimated_native_gas_cost {
+    if live_native_balance < required_native {
         return Err(self_broadcast_insufficient_native_gas_error(
             live_native_balance,
-            estimated_native_gas_cost,
+            required_native,
         ));
     }
     Ok(SelfBroadcastPreflight {
@@ -1166,20 +1188,27 @@ pub(super) async fn self_broadcast_preflight(
 pub(crate) fn self_broadcast_transaction_request(
     chain_id: u64,
     from: Address,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     nonce: u64,
-) -> TransactionRequest {
-    TransactionRequest::default()
+) -> Result<TransactionRequest> {
+    if transaction
+        .chain_id
+        .is_some_and(|prepared| prepared != chain_id)
+        || transaction.from.is_some_and(|prepared| prepared != from)
+        || transaction.nonce.is_some_and(|prepared| prepared != nonce)
+    {
+        return Err(eyre!(
+            "prepared transaction no longer matches the selected chain, gas payer, or nonce"
+        ));
+    }
+    Ok(transaction
         .with_chain_id(chain_id)
         .with_from(from)
-        .with_to(to)
-        .with_input(data)
         .with_max_fee_per_gas(max_fee_per_gas)
         .with_max_priority_fee_per_gas(max_priority_fee_per_gas)
-        .with_nonce(nonce)
+        .with_nonce(nonce))
 }
 
 pub(super) async fn sponsored_code_preflight_from_rpc_pool(
@@ -1209,11 +1238,18 @@ pub(super) async fn sponsored_exact_gas_estimate(
         .map_err(|_| eyre!("exact sponsored calldata gas estimation failed"))
 }
 
-pub(crate) const fn self_broadcast_gas_limit_with_buffer(
+pub(crate) fn self_broadcast_gas_limit_with_buffer(
     estimated_gas: u64,
     gas_limit_buffer: u64,
-) -> u64 {
-    estimated_gas.saturating_add(gas_limit_buffer)
+    approved_maximum: Option<u64>,
+) -> Result<u64> {
+    let gas_limit = estimated_gas.saturating_add(gas_limit_buffer);
+    if approved_maximum.is_some_and(|maximum| gas_limit > maximum) {
+        return Err(eyre!(
+            "self-broadcast gas exceeds the reviewed maximum; refresh and approve the quote"
+        ));
+    }
+    Ok(gas_limit)
 }
 
 pub(crate) fn self_broadcast_native_gas_cost(gas_limit: u64, max_fee_per_gas: u128) -> U256 {
@@ -1256,9 +1292,14 @@ pub(super) async fn sign_send_self_broadcast_transaction(
     event_tx: Option<&SelfBroadcastSessionEventSender>,
     before_broadcast: impl FnOnce(FixedBytes<32>) -> Result<()> + Send,
 ) -> Result<()> {
+    let executor = if let Some(owner) = session.executor_owner() {
+        owner
+            .transaction_identity(&tx_req)?
+            .map(|identity| (owner, identity))
+    } else {
+        None
+    };
     tracing::info!(
-        from = %tx_req.from.unwrap_or_default(),
-        to = ?tx_req.to,
         gas = ?tx_req.gas,
         "signing and sending self-broadcast transaction",
     );
@@ -1267,6 +1308,10 @@ pub(super) async fn sign_send_self_broadcast_transaction(
         .await?;
     emit_refreshed_self_broadcast_hardware_session(event_tx, signer);
     let tx_hash = keccak256(&signed_tx);
+    if let Some((owner, identity)) = &executor {
+        owner.record_submission(*identity, tx_hash)?;
+    }
+    signer.ensure_active()?;
     before_broadcast(tx_hash)?;
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
         query_rpc_pool,
@@ -1277,12 +1322,16 @@ pub(super) async fn sign_send_self_broadcast_transaction(
     .await
     .wrap_err("self-broadcast: send")?;
     let tx_hash_string = hex::encode_prefixed(tx_hash);
-    session
-        .mark_pending_spent_utxos(
-            pending_spent_inputs,
-            parse_submitted_tx_hash(&tx_hash_string),
-        )
-        .await;
+    // Executor payloads already reserve inputs durably, without the ordinary
+    // local TTL. Avoid a second lock that would outlive a recovery winner.
+    if executor.is_none() {
+        session
+            .mark_pending_spent_utxos(
+                pending_spent_inputs,
+                parse_submitted_tx_hash(&tx_hash_string),
+            )
+            .await;
+    }
     tracing::info!(%tx_hash, providers = provider_handles.len(), "sent self-broadcast transaction");
     Ok(())
 }
@@ -1691,7 +1740,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
     }
 
     let vault_password = request.vault_password.take();
-    let signer = vaulted_public_signer(
+    let signer = admitted_public_signer(
         &request.vault_store,
         &request.view_session,
         vault_password.as_ref().map(|password| password.as_str()),
@@ -1699,79 +1748,85 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         request.protected_software_seed_session.as_deref(),
         None,
         request.trezor_pin_matrix_provider,
-    )?;
-    drop(vault_password);
-    if signer.address() != signer_address {
-        return Err(eyre!(
-            "selected public account signer address does not match account metadata"
-        ));
-    }
-    let data = request
-        .prepared
-        .data
-        .strip_prefix("0x")
-        .unwrap_or(&request.prepared.data);
-    let data = Bytes::from(hex::decode(data).wrap_err("decode prepared sponsored calldata")?);
-    let authorization = request.prepared.authorization;
-    let tx_req = self_broadcast_transaction_request(
+        request.session.executor_owner().as_ref(),
         request.chain_id,
-        signer_address,
-        request.prepared.to,
-        data,
-        authorization.max_fee_per_gas,
-        authorization.max_priority_fee_per_gas,
-        nonce,
     )
-    .with_gas_limit(authorization.transaction_gas_limit);
+    .await?;
+    signer
+        .while_active(async {
+            drop(vault_password);
+            if signer.address() != signer_address {
+                return Err(eyre!(
+                    "selected public account signer address does not match account metadata"
+                ));
+            }
+            let data: Bytes = request
+                .prepared
+                .data
+                .parse()
+                .wrap_err("decode prepared sponsored calldata")?;
+            let authorization = request.prepared.authorization;
+            let tx_req = self_broadcast_transaction_request(
+                request.chain_id,
+                signer_address,
+                TransactionRequest::default()
+                    .to(request.prepared.to)
+                    .input(data.into()),
+                authorization.max_fee_per_gas,
+                authorization.max_priority_fee_per_gas,
+                nonce,
+            )?
+            .with_gas_limit(authorization.transaction_gas_limit);
 
-    update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
-        TransactionGenerationStage::SigningSelfBroadcast,
-    );
-    if let Some(reason) = sponsored_pending_stop_reason(&request.command_rx) {
-        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
-            reason,
-            bundle_was_accepted: false,
-        });
-    }
-    let signed_raw_transaction = {
-        let signing = signer.sign_transaction_request(tx_req, "sponsored self-broadcast");
-        tokio::pin!(signing);
-        tokio::select! {
-            result = &mut signing => result?,
-            changed = request.command_rx.changed() => {
-                let reason = if changed.is_err() {
-                    SponsoredSelfBroadcastStopReason::Shutdown
-                } else {
-                    sponsored_stop_reason(*request.command_rx.borrow_and_update())
-                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
-                };
+            update_transaction_generation_stage(
+                request.progress_tx.as_ref(),
+                TransactionGenerationStage::SigningSelfBroadcast,
+            );
+            if let Some(reason) = sponsored_pending_stop_reason(&request.command_rx) {
                 return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
                     reason,
                     bundle_was_accepted: false,
                 });
             }
-        }
-    };
-    emit_refreshed_self_broadcast_hardware_session(request.event_tx.as_ref(), &signer);
-    drop(signer);
-    update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
-        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
-    );
-    run_sponsored_self_broadcast_session(
-        SponsoredSelfBroadcastSessionRequest {
-            transaction_tracking: request.transaction_tracking,
-            chain_id: request.chain_id,
-            effective_chain: request.effective_chain,
-            session: request.session,
-            signed_raw_transaction,
-            pending_spent_inputs,
-            command_rx: request.command_rx,
-        },
-        http,
-    )
-    .await
+            let signed_raw_transaction = {
+                let signing = signer.sign_transaction_request(tx_req, "sponsored self-broadcast");
+                tokio::pin!(signing);
+                tokio::select! {
+                    result = &mut signing => result?,
+                    changed = request.command_rx.changed() => {
+                        let reason = if changed.is_err() {
+                            SponsoredSelfBroadcastStopReason::Shutdown
+                        } else {
+                            sponsored_stop_reason(*request.command_rx.borrow_and_update())
+                                .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                        };
+                        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                            reason,
+                            bundle_was_accepted: false,
+                        });
+                    }
+                }
+            };
+            emit_refreshed_self_broadcast_hardware_session(request.event_tx.as_ref(), &signer);
+            update_transaction_generation_stage(
+                request.progress_tx.as_ref(),
+                TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+            );
+            run_sponsored_self_broadcast_session(
+                SponsoredSelfBroadcastSessionRequest {
+                    transaction_tracking: request.transaction_tracking,
+                    chain_id: request.chain_id,
+                    effective_chain: request.effective_chain,
+                    session: request.session,
+                    signed_raw_transaction,
+                    pending_spent_inputs,
+                    command_rx: request.command_rx,
+                },
+                http,
+            )
+            .await
+        })
+        .await
 }
 
 fn sponsored_pending_stop_reason(

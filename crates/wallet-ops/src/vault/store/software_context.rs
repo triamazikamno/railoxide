@@ -249,7 +249,7 @@ impl DesktopVaultStore {
 
         Ok(CreateSoftwareContextResult::Created {
             metadata,
-            public_account,
+            public_account: Box::new(public_account),
             chain_metadata,
             protected_seed_session,
         })

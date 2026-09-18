@@ -855,6 +855,7 @@ impl GatewayView {
                         rows(&estimate["fee_breakdown"]),
                         text(estimate, "network_gas"),
                         private.breakdown_open,
+                        None,
                         {
                             let root = cx.entity();
                             move |open, _, cx| {

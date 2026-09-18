@@ -369,7 +369,13 @@ impl WalletSyncLifecycle {
     }
 
     pub(super) fn invalidate(&mut self) -> WalletSyncLifecycleCleanup {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        if let Some(store) = self.session_store.get() {
+            store.invalidate_executor_owners(generation);
+        }
         self.current_task_by_chain.clear();
         let startup_tasks = std::mem::take(&mut self.startup_tasks)
             .into_values()
@@ -397,7 +403,13 @@ impl WalletSyncLifecycle {
     }
 
     pub(super) fn supersede_wallet(&mut self) -> WalletSyncLifecycleCleanup {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        if let Some(store) = self.session_store.get() {
+            store.invalidate_executor_owners(generation);
+        }
         self.current_task_by_chain.clear();
         let startup_tasks = std::mem::take(&mut self.startup_tasks)
             .into_values()
@@ -1515,7 +1527,7 @@ impl WalletRoot {
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
         self.broadcaster_preference_error = None;
         self.active_broadcaster_tab = BroadcasterActivityTab::default();
-        self.clear_public_wallet_runtime_state();
+        self.clear_public_wallet_runtime_state(cx);
         self.private_action_form = None;
         self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;

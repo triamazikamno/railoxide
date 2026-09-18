@@ -2,7 +2,10 @@ mod actions;
 mod balance_cache;
 mod balances;
 mod contracts;
+pub(crate) use contracts::PublicErc20;
 mod dapp_reads;
+mod executor_recovery;
+pub(crate) use executor_recovery::submit_executor_recovery_step;
 mod gas;
 mod recipient;
 mod runtime;
@@ -31,6 +34,7 @@ pub use balances::{
 };
 pub use dapp_reads::DappRpcReadClient;
 pub(crate) use dapp_reads::stops_dapp_read_retries;
+pub(crate) use gas::public_native_action_gas_units_with_buffer;
 pub use gas::{
     PUBLIC_NATIVE_UNWRAP_GAS_UNITS, estimate_public_action_gas_cost,
     estimate_public_action_gas_cost_with_profile,
@@ -46,7 +50,9 @@ pub use gas::{
     resolve_public_action_gas_fee, simulate_public_advanced_transaction_with_fee,
     simulate_public_advanced_transaction_with_fee_and_reads,
 };
-pub(crate) use signer::{VaultedPublicSigner, vaulted_public_signer};
+#[cfg(test)]
+use signer::vaulted_public_signer;
+pub(crate) use signer::{VaultedPublicSigner, admitted_public_signer};
 pub use submission::public_action_replacement_bumped_fee;
 pub use submission::{
     sanitize_walletconnect_transaction_request, validate_walletconnect_reviewed_transaction,
@@ -98,16 +104,16 @@ use balances::{
     public_balance_snapshot_from_results,
 };
 #[cfg(test)]
-use contracts::{PublicErc20, PublicRelayAdapt};
+use contracts::PublicRelayAdapt;
 #[cfg(test)]
 use gas::{
     PUBLIC_ERC20_SEND_GAS_UNITS, PUBLIC_NATIVE_APPROVE_GAS_UNITS,
     PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS, PUBLIC_NATIVE_SEND_GAS_UNITS,
     PUBLIC_NATIVE_SHIELD_GAS_UNITS, PUBLIC_NATIVE_WRAP_GAS_UNITS, buffered_advanced_gas_limit,
     public_action_tip_fallback, public_advanced_transaction_payload_fingerprint,
-    public_native_action_gas_reserve_with_profile, public_native_action_gas_units_with_buffer,
-    railway_bnb_gas_fee_quote, railway_bnb_gas_fee_quote_bundle, railway_gas_limit,
-    railway_standard_gas_fee_quote, railway_standard_gas_fee_quote_bundle,
+    public_native_action_gas_reserve_with_profile, railway_bnb_gas_fee_quote,
+    railway_bnb_gas_fee_quote_bundle, railway_gas_limit, railway_standard_gas_fee_quote,
+    railway_standard_gas_fee_quote_bundle,
 };
 #[cfg(test)]
 use runtime::{chain_defaults_for_public_chain, public_chain_runtime_config};

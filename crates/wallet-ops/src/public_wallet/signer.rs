@@ -23,6 +23,10 @@ use super::types::{
 
 pub(crate) enum VaultedPublicSigner {
     Software(SoftwareEvmSigner),
+    Executor(
+        SoftwareEvmSigner,
+        crate::desktop::executors::ExecutorPublicSigningGuard,
+    ),
     Hardware(HardwarePublicEvmSigner),
 }
 
@@ -36,6 +40,28 @@ pub(crate) struct HardwarePublicEvmSigner {
 }
 
 impl VaultedPublicSigner {
+    pub(crate) fn while_active<'a, T: 'a>(
+        &'a self,
+        work: impl std::future::Future<Output = Result<T>> + 'a,
+    ) -> impl std::future::Future<Output = Result<T>> + 'a {
+        // Box at the workflow boundary so cancellation does not duplicate large
+        // RPC/proof state in every caller's future.
+        let work = Box::pin(work);
+        async move {
+            match self {
+                Self::Executor(_, guard) => guard.while_active(work).await,
+                _ => work.await,
+            }
+        }
+    }
+
+    pub(crate) fn ensure_active(&self) -> Result<()> {
+        if let Self::Executor(_, guard) = self {
+            guard.ensure_active()?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub(super) fn with_request_control(
         mut self,
@@ -49,7 +75,7 @@ impl VaultedPublicSigner {
 
     pub(crate) fn address(&self) -> Address {
         match self {
-            Self::Software(signer) => signer.address(),
+            Self::Software(signer) | Self::Executor(signer, _) => signer.address(),
             Self::Hardware(signer) => signer.address,
         }
     }
@@ -63,8 +89,11 @@ impl VaultedPublicSigner {
         tx_req: TransactionRequest,
         label: &str,
     ) -> Result<Vec<u8>> {
+        if let Self::Executor(_, guard) = self {
+            guard.ensure_chain(tx_req.chain_id)?;
+        }
         match self {
-            Self::Software(signer) => {
+            Self::Software(signer) | Self::Executor(signer, _) => {
                 let wallet = signer.ethereum_wallet();
                 Ok(tx_req
                     .build(&wallet)
@@ -77,15 +106,21 @@ impl VaultedPublicSigner {
     }
 
     pub(crate) async fn derive_shield_private_key(&self) -> Result<Zeroizing<[u8; 32]>> {
+        self.ensure_active()?;
         match self {
-            Self::Software(signer) => Ok(Zeroizing::new(signer.derive_shield_private_key()?)),
+            Self::Software(signer) | Self::Executor(signer, _) => {
+                Ok(Zeroizing::new(signer.derive_shield_private_key()?))
+            }
             Self::Hardware(signer) => signer.derive_shield_private_key().await,
         }
     }
 
     pub(super) async fn sign_personal_message(&self, message: &[u8]) -> Result<Signature> {
+        self.ensure_active()?;
         match self {
-            Self::Software(signer) => signer.sign_personal_message(message),
+            Self::Software(signer) | Self::Executor(signer, _) => {
+                signer.sign_personal_message(message)
+            }
             Self::Hardware(signer) => signer.sign_message(message).await,
         }
     }
@@ -94,7 +129,7 @@ impl VaultedPublicSigner {
         &self,
     ) -> Result<Option<HardwareTypedDataSigningMode>> {
         match self {
-            Self::Software(_) => Ok(None),
+            Self::Software(_) | Self::Executor(_, _) => Ok(None),
             Self::Hardware(signer) => signer.typed_data_signing_mode().await.map(Some),
         }
     }
@@ -105,8 +140,11 @@ impl VaultedPublicSigner {
         hardware_typed_data_mode: Option<HardwareTypedDataSigningMode>,
         hash_fallback_confirmed: bool,
     ) -> Result<Signature> {
+        self.ensure_active()?;
         match self {
-            Self::Software(signer) => signer.sign_typed_data_v4(typed_data.typed_data()),
+            Self::Software(signer) | Self::Executor(signer, _) => {
+                signer.sign_typed_data_v4(typed_data.typed_data())
+            }
             Self::Hardware(signer) => {
                 signer
                     .sign_typed_data_v4(
@@ -121,7 +159,7 @@ impl VaultedPublicSigner {
 
     pub(crate) fn refreshed_hardware_session(&self) -> Result<Option<HardwareProfileSession>> {
         match self {
-            Self::Software(_) => Ok(None),
+            Self::Software(_) | Self::Executor(_, _) => Ok(None),
             Self::Hardware(signer) => signer.hardware_session().map(Some),
         }
     }
@@ -825,4 +863,57 @@ pub(crate) fn vaulted_public_signer(
     let signer = SoftwareEvmSigner::from_private_key(*private_key)
         .wrap_err("create public account signer")?;
     Ok(VaultedPublicSigner::Software(signer))
+}
+
+/// Resolve the Public source under its native owner before exposing any signer.
+/// The returned executor signer owns the activity guard for its entire lifetime.
+pub(crate) async fn admitted_public_signer(
+    vault_store: &DesktopVaultStore,
+    view_session: &DesktopViewSession,
+    vault_password: Option<&str>,
+    public_account_uuid: &str,
+    protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
+    chain_id: u64,
+) -> Result<VaultedPublicSigner> {
+    let account = vault_store
+        .list_public_accounts_for_session(view_session, true)?
+        .into_iter()
+        .find(|account| account.public_account_uuid == public_account_uuid)
+        .ok_or_else(|| eyre!("Public account is unavailable"))?;
+    if !account.is_available_on_chain(chain_id) {
+        return Err(eyre!(
+            "this Public account is available only on its source chain"
+        ));
+    }
+    if matches!(
+        account.source,
+        crate::vault::PublicAccountSource::ExecutorDerived(_)
+    ) {
+        let owner = executor_owner.ok_or_else(|| {
+            eyre!("Open the owning wallet and chain before spending from this account.")
+        })?;
+        let mut grant = vault_store.create_spend_grant(
+            vault_password.ok_or_else(|| eyre!("spend authorization is required"))?,
+        )?;
+        let (signer, guard) = Box::pin(owner.admit_public_signer(
+            view_session,
+            &account,
+            &mut grant,
+            protected_seed_session,
+        ))
+        .await?;
+        return Ok(VaultedPublicSigner::Executor(signer, guard));
+    }
+    vaulted_public_signer(
+        vault_store,
+        view_session,
+        vault_password,
+        public_account_uuid,
+        protected_seed_session,
+        trezor_app_passphrase,
+        trezor_pin_matrix_provider,
+    )
 }

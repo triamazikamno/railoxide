@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr, eyre};
 use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
 use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_chain_runtime_config, public_shield_token};
-use super::signer::vaulted_public_signer;
+use super::signer::admitted_public_signer;
 use super::submission::{
     emit_public_action_event, emit_refreshed_public_action_hardware_session,
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
@@ -38,7 +38,7 @@ pub async fn submit_public_send_with_progress(
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_public_transaction_intent(&request.intent)?;
-    let signer = vaulted_public_signer(
+    let signer = admitted_public_signer(
         &request.vault_store,
         &request.view_session,
         Some(request.vault_password.as_str()),
@@ -46,27 +46,34 @@ pub async fn submit_public_send_with_progress(
         request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
-    )?;
-    let mut command_rx = request.command_rx;
-    let tx = submit_public_action_step_with_signer(
-        PublicActionProgressStep::Send,
-        "public-send",
-        "public send transaction",
+        request.executor_owner.as_ref(),
         request.chain_id,
-        request.effective_chain.as_ref(),
-        &request.intent,
-        &signer,
-        request.advanced_authorization,
-        false,
-        request.gas_fee,
-        &mut command_rx,
-        request.event_tx.as_ref(),
-        http,
-        request.transaction_tracking.as_ref(),
-        &mut progress,
     )
     .await?;
-    Ok(PublicSendResult { tx })
+    signer
+        .while_active(async {
+            let mut command_rx = request.command_rx;
+            let tx = submit_public_action_step_with_signer(
+                PublicActionProgressStep::Send,
+                "public-send",
+                "public send transaction",
+                request.chain_id,
+                request.effective_chain.as_ref(),
+                &request.intent,
+                &signer,
+                request.advanced_authorization,
+                false,
+                request.gas_fee,
+                &mut command_rx,
+                request.event_tx.as_ref(),
+                http,
+                request.transaction_tracking.as_ref(),
+                &mut progress,
+            )
+            .await?;
+            Ok(PublicSendResult { tx })
+        })
+        .await
 }
 
 /// Submit one public action with an already-derived signer.  Governance workflows use this
@@ -123,6 +130,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         None,
         command_rx,
         event_tx,
+        None,
         progress,
     )
     .await?
@@ -226,7 +234,7 @@ pub async fn submit_public_shield_with_progress(
     let railgun_addr = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
     let addr_data = broadcaster_core::crypto::railgun::AddressData::try_from(&railgun_addr)
         .wrap_err("invalid selected private wallet receive address")?;
-    let signer = vaulted_public_signer(
+    let signer = admitted_public_signer(
         &request.vault_store,
         &request.view_session,
         Some(request.vault_password.as_str()),
@@ -234,237 +242,249 @@ pub async fn submit_public_shield_with_progress(
         request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
-    )?;
-    let mut nonce = None;
-    let mut gas_fee = request.gas_fee;
-    let mut fee_policy = if request.profile == PublicShieldTransactionProfile::Railway
-        && request.gas_fee_mode == PublicActionGasFeeMode::Auto
-    {
-        PublicActionStepFeePolicy::Captured
-    } else {
-        PublicActionStepFeePolicy::Custom
-    };
-    let mut command_rx = request.command_rx;
-    let event_tx = request.event_tx;
-    let shield_private_key = if signer.requires_device_approval() {
-        loop {
-            progress(public_action_progress_update(
-                PublicActionProgressStep::ShieldKey,
-                PublicActionProgressStatus::Pending,
-                None,
-                None,
-            ));
-            match signer.derive_shield_private_key().await {
-                Ok(shield_private_key) => {
-                    progress(public_action_progress_update(
-                        PublicActionProgressStep::ShieldKey,
-                        PublicActionProgressStatus::Done,
-                        None,
-                        None,
-                    ));
-                    break shield_private_key;
-                }
-                Err(error) => {
-                    let message = report_chain_string(&error);
-                    progress(public_action_progress_update(
-                        PublicActionProgressStep::ShieldKey,
-                        PublicActionProgressStatus::Error,
-                        None,
-                        Some(message.clone()),
-                    ));
-                    emit_public_action_event(
-                        event_tx.as_ref(),
-                        PublicActionSessionEvent::StepFailed {
-                            step: PublicActionProgressStep::ShieldKey,
-                            message,
-                        },
-                    );
-                    let Some(command) = recv_public_action_command(&mut command_rx).await else {
-                        return Err(error);
-                    };
-                    gas_fee = command.gas_fee;
-                    fee_policy = PublicActionStepFeePolicy::Custom;
-                }
-            }
-        }
-    } else {
-        signer.derive_shield_private_key().await?
-    };
-    emit_refreshed_public_action_hardware_session(event_tx.as_ref(), &signer);
-    let shield_data = broadcaster_core::contracts::shield::build_shield_calldata(
-        addr_data.master_public_key,
-        &addr_data.viewing_public_key,
-        token,
-        request.amount,
-        &shield_private_key,
+        request.executor_owner.as_ref(),
+        request.chain_id,
     )
-    .wrap_err("build public shield calldata")?;
+    .await?;
+    signer
+        .while_active(async {
+            let mut nonce = None;
+            let mut gas_fee = request.gas_fee;
+            let mut fee_policy = if request.profile == PublicShieldTransactionProfile::Railway
+                && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+            {
+                PublicActionStepFeePolicy::Captured
+            } else {
+                PublicActionStepFeePolicy::Custom
+            };
+            let mut command_rx = request.command_rx;
+            let event_tx = request.event_tx;
+            let shield_private_key = if signer.requires_device_approval() {
+                loop {
+                    progress(public_action_progress_update(
+                        PublicActionProgressStep::ShieldKey,
+                        PublicActionProgressStatus::Pending,
+                        None,
+                        None,
+                    ));
+                    match signer.derive_shield_private_key().await {
+                        Ok(shield_private_key) => {
+                            progress(public_action_progress_update(
+                                PublicActionProgressStep::ShieldKey,
+                                PublicActionProgressStatus::Done,
+                                None,
+                                None,
+                            ));
+                            break shield_private_key;
+                        }
+                        Err(error) => {
+                            let message = report_chain_string(&error);
+                            progress(public_action_progress_update(
+                                PublicActionProgressStep::ShieldKey,
+                                PublicActionProgressStatus::Error,
+                                None,
+                                Some(message.clone()),
+                            ));
+                            emit_public_action_event(
+                                event_tx.as_ref(),
+                                PublicActionSessionEvent::StepFailed {
+                                    step: PublicActionProgressStep::ShieldKey,
+                                    message,
+                                },
+                            );
+                            let Some(command) = recv_public_action_command(&mut command_rx).await
+                            else {
+                                return Err(error);
+                            };
+                            gas_fee = command.gas_fee;
+                            fee_policy = PublicActionStepFeePolicy::Custom;
+                        }
+                    }
+                }
+            } else {
+                signer.derive_shield_private_key().await?
+            };
+            emit_refreshed_public_action_hardware_session(event_tx.as_ref(), &signer);
+            let shield_data = broadcaster_core::contracts::shield::build_shield_calldata(
+                addr_data.master_public_key,
+                &addr_data.viewing_public_key,
+                token,
+                request.amount,
+                &shield_private_key,
+            )
+            .wrap_err("build public shield calldata")?;
 
-    let from_address = signer.address();
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+            let from_address = signer.address();
+            let query_rpc_pool =
+                query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
 
-    let approval_required = if request.asset == PublicAssetId::Native {
-        false
-    } else if request.profile == PublicShieldTransactionProfile::Railoxide {
-        true
-    } else {
-        progress(public_action_progress_update(
-            PublicActionProgressStep::Approve,
-            PublicActionProgressStatus::Pending,
-            None,
-            None,
-        ));
-        match query_erc20_allowance(
-            &chain.rpc_route,
-            http,
-            request.asset,
-            from_address,
-            chain.railgun_contract,
-        )
-        .await
-        {
-            Ok(allowance) => {
-                public_shield_approval_required(request.profile, allowance, request.amount)
-            }
-            Err(error) => {
-                let message = report_chain_string(&error);
+            let approval_required = if request.asset == PublicAssetId::Native {
+                false
+            } else if request.profile == PublicShieldTransactionProfile::Railoxide {
+                true
+            } else {
                 progress(public_action_progress_update(
                     PublicActionProgressStep::Approve,
-                    PublicActionProgressStatus::Error,
+                    PublicActionProgressStatus::Pending,
                     None,
-                    Some(message.clone()),
+                    None,
                 ));
-                emit_public_action_event(
-                    event_tx.as_ref(),
-                    PublicActionSessionEvent::StepFailed {
-                        step: PublicActionProgressStep::Approve,
-                        message,
-                    },
+                match query_erc20_allowance(
+                    &chain.rpc_route,
+                    http,
+                    request.asset,
+                    from_address,
+                    chain.railgun_contract,
+                )
+                .await
+                {
+                    Ok(allowance) => {
+                        public_shield_approval_required(request.profile, allowance, request.amount)
+                    }
+                    Err(error) => {
+                        let message = report_chain_string(&error);
+                        progress(public_action_progress_update(
+                            PublicActionProgressStep::Approve,
+                            PublicActionProgressStatus::Error,
+                            None,
+                            Some(message.clone()),
+                        ));
+                        emit_public_action_event(
+                            event_tx.as_ref(),
+                            PublicActionSessionEvent::StepFailed {
+                                step: PublicActionProgressStep::Approve,
+                                message,
+                            },
+                        );
+                        return Err(error).wrap_err("check public shield ERC-20 allowance");
+                    }
+                }
+            };
+
+            let approve_receipt = if request.asset == PublicAssetId::Native {
+                None
+            } else if !approval_required {
+                progress(public_action_progress_update(
+                    PublicActionProgressStep::Approve,
+                    PublicActionProgressStatus::Done,
+                    None,
+                    Some("Existing allowance is sufficient".to_string()),
+                ));
+                None
+            } else {
+                let approval_amount =
+                    public_shield_approval_amount(request.profile, request.amount);
+                let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
+                    chain.railgun_contract,
+                    approval_amount,
                 );
-                return Err(error).wrap_err("check public shield ERC-20 allowance");
+                let approve_tx = TransactionRequest::default()
+                    .with_chain_id(request.chain_id)
+                    .with_from(from_address)
+                    .with_to(token)
+                    .with_input(approve_data)
+                    .with_nonce(0);
+                let approve_outcome = submit_public_action_step_session(
+                    PublicActionProgressStep::Approve,
+                    approve_tx,
+                    request.profile,
+                    request.profile.gas_limit_strategy(request.asset),
+                    &signer,
+                    "public-shield-approve",
+                    query_rpc_pool.clone(),
+                    chain.finality_depth,
+                    http,
+                    request.transaction_tracking.as_ref(),
+                    request.chain_id,
+                    from_address,
+                    &chain.gas,
+                    None,
+                    nonce,
+                    gas_fee,
+                    fee_policy,
+                    Some(request.authorized_fee_ceiling),
+                    &mut command_rx,
+                    event_tx.as_ref(),
+                    None,
+                    &mut progress,
+                )
+                .await?;
+                let receipt = approve_outcome.receipt;
+                if !receipt.status {
+                    return Err(eyre!(
+                        "public shield approve transaction reverted ({})",
+                        receipt.tx_hash
+                    ));
+                }
+                nonce = Some(approve_outcome.next_nonce);
+                if fee_policy == PublicActionStepFeePolicy::Captured
+                    && request.profile == PublicShieldTransactionProfile::Railway
+                    && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+                {
+                    fee_policy = PublicActionStepFeePolicy::RefreshRailwayStandard;
+                } else {
+                    gas_fee = approve_outcome.gas_fee;
+                    fee_policy = PublicActionStepFeePolicy::Custom;
+                }
+                Some(receipt)
+            };
+
+            let shield_tx = if request.asset == PublicAssetId::Native {
+                public_native_shield_transaction_request(
+                    request.chain_id,
+                    from_address,
+                    chain.relay_adapt_contract,
+                    request.amount,
+                    shield_data,
+                )
+            } else {
+                TransactionRequest::default()
+                    .with_chain_id(request.chain_id)
+                    .with_from(from_address)
+                    .with_to(chain.railgun_contract)
+                    .with_input(shield_data)
+                    .with_nonce(0)
+            };
+            let shield_receipt = submit_public_action_step_session(
+                PublicActionProgressStep::Shield,
+                shield_tx,
+                request.profile,
+                request.profile.gas_limit_strategy(request.asset),
+                &signer,
+                "public-shield",
+                query_rpc_pool,
+                chain.finality_depth,
+                http,
+                request.transaction_tracking.as_ref(),
+                request.chain_id,
+                from_address,
+                &chain.gas,
+                None,
+                nonce,
+                gas_fee,
+                fee_policy,
+                Some(request.authorized_fee_ceiling),
+                &mut command_rx,
+                event_tx.as_ref(),
+                None,
+                &mut progress,
+            )
+            .await?
+            .receipt;
+            if !shield_receipt.status {
+                return Err(eyre!(
+                    "public shield transaction reverted ({})",
+                    shield_receipt.tx_hash
+                ));
             }
-        }
-    };
 
-    let approve_receipt = if request.asset == PublicAssetId::Native {
-        None
-    } else if !approval_required {
-        progress(public_action_progress_update(
-            PublicActionProgressStep::Approve,
-            PublicActionProgressStatus::Done,
-            None,
-            Some("Existing allowance is sufficient".to_string()),
-        ));
-        None
-    } else {
-        let approval_amount = public_shield_approval_amount(request.profile, request.amount);
-        let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
-            chain.railgun_contract,
-            approval_amount,
-        );
-        let approve_tx = TransactionRequest::default()
-            .with_chain_id(request.chain_id)
-            .with_from(from_address)
-            .with_to(token)
-            .with_input(approve_data)
-            .with_nonce(0);
-        let approve_outcome = submit_public_action_step_session(
-            PublicActionProgressStep::Approve,
-            approve_tx,
-            request.profile,
-            request.profile.gas_limit_strategy(request.asset),
-            &signer,
-            "public-shield-approve",
-            query_rpc_pool.clone(),
-            chain.finality_depth,
-            http,
-            request.transaction_tracking.as_ref(),
-            request.chain_id,
-            from_address,
-            &chain.gas,
-            None,
-            nonce,
-            gas_fee,
-            fee_policy,
-            Some(request.authorized_fee_ceiling),
-            &mut command_rx,
-            event_tx.as_ref(),
-            &mut progress,
-        )
-        .await?;
-        let receipt = approve_outcome.receipt;
-        if !receipt.status {
-            return Err(eyre!(
-                "public shield approve transaction reverted ({})",
-                receipt.tx_hash
-            ));
-        }
-        nonce = Some(approve_outcome.next_nonce);
-        if fee_policy == PublicActionStepFeePolicy::Captured
-            && request.profile == PublicShieldTransactionProfile::Railway
-            && request.gas_fee_mode == PublicActionGasFeeMode::Auto
-        {
-            fee_policy = PublicActionStepFeePolicy::RefreshRailwayStandard;
-        } else {
-            gas_fee = approve_outcome.gas_fee;
-            fee_policy = PublicActionStepFeePolicy::Custom;
-        }
-        Some(receipt)
-    };
-
-    let shield_tx = if request.asset == PublicAssetId::Native {
-        public_native_shield_transaction_request(
-            request.chain_id,
-            from_address,
-            chain.relay_adapt_contract,
-            request.amount,
-            shield_data,
-        )
-    } else {
-        TransactionRequest::default()
-            .with_chain_id(request.chain_id)
-            .with_from(from_address)
-            .with_to(chain.railgun_contract)
-            .with_input(shield_data)
-            .with_nonce(0)
-    };
-    let shield_receipt = submit_public_action_step_session(
-        PublicActionProgressStep::Shield,
-        shield_tx,
-        request.profile,
-        request.profile.gas_limit_strategy(request.asset),
-        &signer,
-        "public-shield",
-        query_rpc_pool,
-        chain.finality_depth,
-        http,
-        request.transaction_tracking.as_ref(),
-        request.chain_id,
-        from_address,
-        &chain.gas,
-        None,
-        nonce,
-        gas_fee,
-        fee_policy,
-        Some(request.authorized_fee_ceiling),
-        &mut command_rx,
-        event_tx.as_ref(),
-        &mut progress,
-    )
-    .await?
-    .receipt;
-    if !shield_receipt.status {
-        return Err(eyre!(
-            "public shield transaction reverted ({})",
-            shield_receipt.tx_hash
-        ));
-    }
-
-    Ok(ShieldSendOutput {
-        wrap: None,
-        approve: approve_receipt,
-        shield: shield_receipt,
-    })
+            Ok(ShieldSendOutput {
+                wrap: None,
+                approve: approve_receipt,
+                shield: shield_receipt,
+            })
+        })
+        .await
 }
 
 pub(super) const fn public_shield_approval_amount(

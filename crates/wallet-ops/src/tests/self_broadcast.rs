@@ -11,12 +11,33 @@ fn self_broadcast_top_up_preflight_message_explains_current_gas_requirement() {
 }
 
 #[test]
-fn self_broadcast_transaction_request_sets_outer_evm_fields() {
+fn self_broadcast_transaction_request_preserves_delegation_and_bound_identity() {
+    use alloy::eips::eip7702::Authorization;
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::{SignerSync, local::PrivateKeySigner};
     let from = address(0x11);
     let to = address(0x22);
     let calldata = Bytes::from_static(&[0xaa, 0xbb, 0xcc]);
-
-    let tx_req = self_broadcast_transaction_request(5, from, to, calldata.clone(), 42, 0, 7);
+    let owner = PrivateKeySigner::from_bytes(&FixedBytes::repeat_byte(7)).unwrap();
+    let authorization = Authorization {
+        chain_id: U256::from(5),
+        address: address(0x33),
+        nonce: 9,
+    };
+    let signature = owner
+        .sign_hash_sync(&authorization.signature_hash())
+        .unwrap();
+    let authorization = authorization.into_signed(signature);
+    let mut prepared = TransactionRequest::default()
+        .to(to)
+        .input(calldata.clone().into())
+        .value(U256::from(3));
+    prepared.chain_id = Some(5);
+    prepared.from = Some(from);
+    prepared.nonce = Some(7);
+    prepared.transaction_type = Some(4);
+    prepared.authorization_list = Some(vec![authorization.clone()]);
+    let tx_req = self_broadcast_transaction_request(5, from, prepared.clone(), 42, 0, 7).unwrap();
 
     assert_eq!(tx_req.chain_id, Some(5));
     assert_eq!(tx_req.from, Some(from));
@@ -24,9 +45,28 @@ fn self_broadcast_transaction_request_sets_outer_evm_fields() {
     assert_eq!(tx_req.max_fee_per_gas, Some(42));
     assert_eq!(tx_req.max_priority_fee_per_gas, Some(0));
     assert_eq!(tx_req.nonce, Some(7));
+    assert_eq!(tx_req.value, Some(U256::from(3)));
+    assert_eq!(tx_req.transaction_type, Some(4));
+    assert_eq!(
+        tx_req.authorization_list.as_deref(),
+        Some(std::slice::from_ref(&authorization))
+    );
     assert_eq!(
         tx_req.input.input().expect("self-broadcast input"),
         calldata.as_ref()
+    );
+    for (chain, payer, nonce) in [(6, from, 7), (5, address(0x44), 7), (5, from, 8)] {
+        assert!(
+            self_broadcast_transaction_request(chain, payer, prepared.clone(), 42, 0, nonce)
+                .is_err()
+        );
+    }
+    let legacy = TransactionRequest::default().to(to).input(calldata.into());
+    assert!(
+        self_broadcast_transaction_request(5, from, legacy, 42, 0, 7)
+            .unwrap()
+            .authorization_list
+            .is_none()
     );
 }
 
@@ -172,6 +212,49 @@ fn eip1559_projection_falls_back_to_max_fee_without_fee_history() {
 }
 
 #[test]
+fn executor_unshield_estimate_includes_delegation_and_chain_buffer_before_allocation() {
+    let token = address(0x42);
+    let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
+    let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
+    let gas = crate::settings::EffectiveChainGasSettings {
+        gas_limit_buffer: 30_000,
+        gas_price_buffer_numerator: 1,
+        gas_price_buffer_denominator: 1,
+    };
+    let estimate = |executor_gas| {
+        crate::estimate_desktop_unshield_self_broadcast_cost(
+            executor_gas,
+            &utxos,
+            token,
+            U256::from(1_000),
+            FeeHandlingMode::DeductFromAmount,
+            true,
+            None,
+            quote,
+            120,
+            2,
+        )
+        .unwrap()
+    };
+    let legacy = estimate(None);
+    let executor = estimate(Some(&gas));
+    let without_buffer = estimate(Some(&crate::settings::EffectiveChainGasSettings {
+        gas_limit_buffer: 0,
+        ..gas
+    }));
+    assert!(without_buffer.gas_limit > legacy.gas_limit);
+    assert_eq!(
+        executor.gas_limit,
+        without_buffer.gas_limit + gas.gas_limit_buffer
+    );
+    assert_eq!(
+        executor.gas_cost.maximum_cost,
+        U256::from(executor.gas_limit) * U256::from(120)
+    );
+    assert_eq!(executor.protocol_fees, legacy.protocol_fees);
+}
+
+#[test]
 fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
     let token = address(0x42);
     let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
@@ -192,6 +275,7 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
     )
     .expect("send estimate");
     let unshield = crate::estimate_desktop_unshield_self_broadcast_cost(
+        None,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -239,6 +323,7 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     ];
 
     let separate_tokens = crate::estimate_desktop_unshield_self_broadcast_cost(
+        None,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -275,6 +360,7 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
         native_amount,
     );
     let combined = crate::estimate_desktop_unshield_self_broadcast_cost(
+        None,
         &wrapped_utxos,
         wrapped_native,
         entered_amount,
@@ -339,8 +425,19 @@ fn self_broadcast_replacement_bump_uses_ceil_twelve_point_five_percent() {
 
 #[test]
 fn self_broadcast_gas_cost_uses_max_fee_cap() {
-    assert_eq!(self_broadcast_gas_limit_with_buffer(21_000, 5_000), 26_000);
-    assert_eq!(self_broadcast_gas_limit_with_buffer(u64::MAX, 1), u64::MAX);
+    assert_eq!(
+        self_broadcast_gas_limit_with_buffer(21_000, 5_000, None).unwrap(),
+        26_000
+    );
+    assert_eq!(
+        self_broadcast_gas_limit_with_buffer(u64::MAX, 1, None).unwrap(),
+        u64::MAX
+    );
+    assert_eq!(
+        self_broadcast_gas_limit_with_buffer(21_000, 5_000, Some(26_000)).unwrap(),
+        26_000
+    );
+    assert!(self_broadcast_gas_limit_with_buffer(21_000, 5_000, Some(25_999)).is_err());
     assert_eq!(
         self_broadcast_native_gas_cost(26_000, 2_000_000_000),
         U256::from(52_000_000_000_000_u128)

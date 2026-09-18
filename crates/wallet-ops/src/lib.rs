@@ -250,7 +250,7 @@ pub use public_wallet::{
     walletconnect_sign_typed_data, walletconnect_sign_typed_data_v4,
     walletconnect_transaction_payload_fingerprint,
 };
-use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
+use public_wallet::{VaultedPublicSigner, admitted_public_signer};
 pub use rpc_broker::{
     FailureClass, RpcBroker, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute, RpcOrigin,
     RpcOriginError, RpcRead, RpcReadValidationError, RpcRemoteError, RpcResult, RpcRevert,

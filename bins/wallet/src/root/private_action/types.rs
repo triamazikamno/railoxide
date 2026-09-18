@@ -39,7 +39,7 @@ pub(in crate::root) enum SelfBroadcastFundingMode {
 }
 
 impl DeliveryMode {
-    const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::ManualCalldata => "External wallet",
             Self::PublicBroadcaster => "Public broadcaster",
@@ -233,6 +233,7 @@ pub(in crate::root) struct SponsoredAuthorizationDisplay {
 }
 
 pub(in crate::root) struct SendSpendDraft {
+    pub(in crate::root) custom_fee_amount: Option<U256>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) delivery_mode: DeliveryMode,
     pub(in crate::root) broadcaster_choice: BroadcasterChoice,
@@ -259,6 +260,8 @@ pub(in crate::root) struct SendSpendDraft {
 }
 
 pub(in crate::root) struct UnshieldSpendDraft {
+    pub(in crate::root) custom_fee_amount: Option<U256>,
+    pub(in crate::root) executor_review: Option<Arc<super::ExecutorUnshieldReview>>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) unwrap: bool,
     pub(in crate::root) delivery_mode: DeliveryMode,
@@ -539,6 +542,9 @@ pub(in crate::root) fn private_amount_label(
 }
 
 pub(in crate::root) struct UnshieldFormState {
+    pub(in crate::root) custom_fee_amount: Option<U256>,
+    pub(in crate::root) executor_operation: Option<super::executor::ExecutorUnshieldOperation>,
+    pub(in crate::root) executor_review: Option<Arc<super::ExecutorUnshieldReview>>,
     pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,
@@ -586,6 +592,7 @@ pub(in crate::root) struct UnshieldFormState {
 }
 
 pub(in crate::root) struct SendFormState {
+    pub(in crate::root) custom_fee_amount: Option<U256>,
     pub(in crate::root) gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
     pub(in crate::root) gateway_estimated_at: Option<std::time::Instant>,
     pub(in crate::root) asset: UnshieldAsset,

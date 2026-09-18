@@ -166,6 +166,7 @@ async fn expired_approval_task_publishes_expired_response() {
             None,
             None,
             None,
+            None,
             response_sender,
             http,
             false,

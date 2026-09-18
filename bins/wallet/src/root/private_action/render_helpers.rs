@@ -24,80 +24,69 @@ pub(in crate::root) fn render_fee_token_selector(
     selected_fee_token: Address,
     generating: bool,
 ) -> gpui::Div {
+    fee_token_selector(
+        delivery_element_id(key, kind, "fee-token-selector"),
+        options,
+        selected_fee_token,
+        generating,
+        move |token, _, cx| {
+            root.update(cx, |root, cx| match kind {
+                DeliveryFormKind::Send => root.set_send_fee_token(key, token, cx),
+                DeliveryFormKind::Unshield => root.set_unshield_fee_token(key, token, cx),
+            });
+        },
+    )
+}
+
+pub(in crate::root) fn fee_token_selector(
+    id: SharedString,
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+    disabled: bool,
+    on_select: impl Fn(Address, &mut Window, &mut App) + Clone + 'static,
+) -> gpui::Div {
     let selected_option = options
         .iter()
         .find(|option| option.token == selected_fee_token)
         .cloned();
     let options = options.to_vec();
+    let trigger_id = SharedString::from(format!("{id}-trigger"));
     ui::private_action::fee_token_control(
-        Popover::new(delivery_element_id(key, kind, "fee-token-selector"))
+        Popover::new(id.clone())
             .trigger(
-                Button::new(delivery_element_id(key, kind, "fee-token-selector-trigger"))
+                Button::new(trigger_id.clone())
+                    .debug_selector(move || trigger_id.to_string())
                     .outline()
                     .child(fee_token_selector_trigger_row(
                         selected_option.as_ref(),
                         selected_fee_token,
                     ))
                     .dropdown_caret(true)
-                    .disabled(generating || options.is_empty()),
+                    .disabled(disabled || options.is_empty()),
             )
-            .content(move |_state, window, cx| {
+            .content(move |_state, _window, cx| {
                 let popover = cx.entity();
-                render_fee_token_selector_menu(
-                    &root,
-                    &popover,
-                    key,
-                    kind,
-                    &options,
-                    selected_fee_token,
-                    window,
-                )
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(gpui::rems(16.25))
+                    .children(options.iter().map(|option| {
+                        let popover = popover.clone();
+                        let on_select = on_select.clone();
+                        let token = option.token;
+                        app_button_base(SharedString::from(format!("{id}-{token}")))
+                            .w_full()
+                            .selected(token == selected_fee_token)
+                            .disabled(option.eligible_broadcaster_count == 0)
+                            .on_click(move |_, window, cx| {
+                                popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                on_select(token, window, cx);
+                            })
+                            .child(fee_token_option_label_row(option, px(18.0)))
+                    }))
             }),
     )
-}
-
-pub(in crate::root) fn render_fee_token_selector_menu(
-    root: &Entity<WalletRoot>,
-    popover: &Entity<gpui_component::popover::PopoverState>,
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    options: &[PublicBroadcasterFeeTokenOption],
-    selected_fee_token: Address,
-    _window: &mut Window,
-) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .w(px(260.0))
-        .children(options.iter().map(|option| {
-            let selector_root = root.clone();
-            let popover = popover.clone();
-            let token = option.token;
-            let selected = token == selected_fee_token;
-            let disabled = option.eligible_broadcaster_count == 0;
-            app_button_base(fee_token_element_id(key, kind, token))
-                .w_full()
-                .selected(selected)
-                .disabled(disabled)
-                .on_click(move |_, window, cx| {
-                    popover.update(cx, |state, cx| state.dismiss(window, cx));
-                    selector_root.update(cx, |root, cx| match kind {
-                        DeliveryFormKind::Send => root.set_send_fee_token(key, token, cx),
-                        DeliveryFormKind::Unshield => root.set_unshield_fee_token(key, token, cx),
-                    });
-                })
-                .child(fee_token_option_label_row(option, px(18.0)))
-        }))
-}
-
-pub(in crate::root) fn fee_token_element_id(
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    token: Address,
-) -> SharedString {
-    let action = format!("fee-token-{}", token.to_checksum(None));
-    delivery_element_id(key, kind, &action)
 }
 
 pub(in crate::root) fn fee_token_selector_trigger_row(

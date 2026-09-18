@@ -47,4 +47,7 @@ mod utxo_rows;
 mod waku_lifecycle;
 mod wallet_management;
 
+mod executor_approval;
+
 use helpers::*;
+pub(super) use helpers::{fee_row, unshield_utxo_output};

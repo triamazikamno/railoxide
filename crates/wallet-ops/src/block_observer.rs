@@ -6,7 +6,8 @@ use alloy::eips::BlockNumHash;
 use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
 use alloy::network::{BlockResponse as _, ReceiptResponse as _, TransactionResponse as _};
 use alloy::primitives::{Address, B256, FixedBytes};
-use alloy::providers::Provider as _;
+use alloy::providers::{DynProvider, Provider as _};
+use alloy::rpc::types::TransactionReceipt;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
 
@@ -449,45 +450,22 @@ async fn fetch_receipt(
     transactions: &[B256],
     tx_hash: B256,
 ) -> ReceiptFetch {
-    let receipts = match provider
-        .provider
-        .get_block_receipts(block.hash.into())
-        .await
+    let receipts = match fetch_checked_block_receipts(
+        &provider.provider,
+        BlockNumHash::new(block.number, block.hash),
+        transactions,
+    )
+    .await
     {
-        Ok(Some(receipts)) => receipts,
-        Ok(None) => return ReceiptFetch::Invalid,
-        Err(error)
-            if error
-                .as_error_resp()
-                .is_some_and(|response| response.code == -32601) =>
-        {
-            return ReceiptFetch::Unsupported;
-        }
-        Err(_) => return ReceiptFetch::Failed,
+        Ok(receipts) => receipts,
+        Err(BlockReceiptsError::Unsupported) => return ReceiptFetch::Unsupported,
+        Err(BlockReceiptsError::Failed) => return ReceiptFetch::Failed,
+        Err(BlockReceiptsError::Invalid) => return ReceiptFetch::Invalid,
     };
-    let expected = transactions.iter().copied().collect::<HashSet<_>>();
-    if expected.len() != transactions.len() || receipts.len() != transactions.len() {
-        return ReceiptFetch::Invalid;
-    }
-    let mut seen = HashSet::with_capacity(receipts.len());
-    let mut target_receipt = None;
-    for receipt in receipts {
-        let receipt_tx_hash = receipt.transaction_hash();
-        if !seen.insert(receipt_tx_hash)
-            || !expected.contains(&receipt_tx_hash)
-            || receipt.block_hash() != Some(block.hash)
-            || receipt.block_number() != Some(block.number)
-        {
-            return ReceiptFetch::Invalid;
-        }
-        if receipt_tx_hash == tx_hash {
-            target_receipt = Some(receipt);
-        }
-    }
-    if seen != expected {
-        return ReceiptFetch::Invalid;
-    }
-    let Some(receipt) = target_receipt else {
+    let Some(receipt) = receipts
+        .into_iter()
+        .find(|receipt| receipt.transaction_hash() == tx_hash)
+    else {
         return ReceiptFetch::Invalid;
     };
     let status = receipt.status();
@@ -502,6 +480,53 @@ async fn fetch_receipt(
         gas_used,
         contract_address,
     })
+}
+
+#[derive(Debug)]
+pub(crate) enum BlockReceiptsError {
+    Unsupported,
+    Failed,
+    Invalid,
+}
+
+/// Read a whole block's receipts and match identities locally. Executor outcome
+/// observation uses the same completeness checks as ordinary transaction observation.
+pub(crate) async fn fetch_checked_block_receipts(
+    provider: &DynProvider,
+    block: BlockNumHash,
+    transactions: &[B256],
+) -> std::result::Result<Vec<TransactionReceipt>, BlockReceiptsError> {
+    let receipts = match provider.get_block_receipts(block.hash.into()).await {
+        Ok(Some(receipts)) => receipts,
+        Ok(None) => return Err(BlockReceiptsError::Invalid),
+        Err(error)
+            if error
+                .as_error_resp()
+                .is_some_and(|response| response.code == -32601) =>
+        {
+            return Err(BlockReceiptsError::Unsupported);
+        }
+        Err(_) => return Err(BlockReceiptsError::Failed),
+    };
+    let expected = transactions.iter().copied().collect::<HashSet<_>>();
+    if expected.len() != transactions.len() || receipts.len() != transactions.len() {
+        return Err(BlockReceiptsError::Invalid);
+    }
+    let mut seen = HashSet::with_capacity(receipts.len());
+    for receipt in &receipts {
+        let receipt_tx_hash = receipt.transaction_hash();
+        if !seen.insert(receipt_tx_hash)
+            || !expected.contains(&receipt_tx_hash)
+            || receipt.block_hash() != Some(block.hash)
+            || receipt.block_number() != Some(block.number)
+        {
+            return Err(BlockReceiptsError::Invalid);
+        }
+    }
+    if seen != expected {
+        return Err(BlockReceiptsError::Invalid);
+    }
+    Ok(receipts)
 }
 
 #[cfg(test)]

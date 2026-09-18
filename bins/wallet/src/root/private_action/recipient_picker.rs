@@ -67,10 +67,12 @@ pub(in crate::root) fn hardware_wallet_recipient_source_from_metadata(
 pub(in crate::root) fn private_unshield_recipient_options(
     accounts: &[PublicAccountMetadata],
     address_book: &[PublicAddressBookEntry],
+    chain_id: u64,
 ) -> Vec<RecipientOption> {
     accounts
         .iter()
         .filter(|account| account.status == PublicAccountStatus::Active)
+        .filter(|account| account.is_available_on_chain(chain_id))
         .map(|account| RecipientOption {
             label: Arc::from(
                 public_account_display_label(account)
@@ -303,7 +305,11 @@ impl WalletRoot {
     }
 
     pub(in crate::root) fn private_unshield_recipient_options(&self) -> Vec<RecipientOption> {
-        private_unshield_recipient_options(&self.public_accounts, &self.public_address_book)
+        private_unshield_recipient_options(
+            &self.public_accounts,
+            &self.public_address_book,
+            self.selected_chain,
+        )
     }
 
     fn private_wallet_recipient_sources(&self) -> Vec<PrivateWalletRecipientSource> {

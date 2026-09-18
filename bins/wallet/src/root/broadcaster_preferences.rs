@@ -249,6 +249,7 @@ impl WalletRoot {
         }
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
             form.error = None;
             form.result = None;
         }
@@ -298,6 +299,7 @@ impl WalletRoot {
         }
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
             form.error = None;
             form.result = None;
         }

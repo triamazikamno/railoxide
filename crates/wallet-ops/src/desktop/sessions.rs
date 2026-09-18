@@ -10,6 +10,14 @@ pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     active_wallet_scope: AsyncMutex<ActiveWalletScope>,
+    executor_owners: Mutex<ExecutorOwners>,
+}
+
+#[derive(Default)]
+struct ExecutorOwners {
+    minimum_generation: u64,
+    closing: bool,
+    owners: Vec<Arc<ExecutorOwner>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -122,6 +130,7 @@ impl WalletSessionStore {
             db,
             sync_manager,
             active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
+            executor_owners: Mutex::new(ExecutorOwners::default()),
         })
     }
 
@@ -163,11 +172,17 @@ impl WalletSessionStore {
         let wallet_id = request.view_session.wallet_id().to_owned();
         let mut active_scope = self.active_wallet_scope.lock().await;
         if active_scope.requires_replacement(request.wallet_scope_generation, &wallet_id)? {
+            self.invalidate_executor_owners(request.wallet_scope_generation);
+            self.shutdown_superseded_executor_owners(request.wallet_scope_generation)
+                .await;
             self.sync_manager.remove_all_wallets().await;
             active_scope.replace(request.wallet_scope_generation, wallet_id);
         }
 
         let chain_id = request.chain_id;
+        let executor_view = Arc::clone(&request.view_session);
+        let executor_chain = request.effective_chain.clone();
+        let executor_generation = request.wallet_scope_generation;
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
             chain_id,
@@ -187,10 +202,123 @@ impl WalletSessionStore {
         )
         .await?;
 
-        wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await
+        let mut session =
+            wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await?;
+        if executor_view.hardware_profile_session().is_none()
+            && let Some(chain) = executor_chain
+        {
+            if chain.chain_id != chain_id {
+                session.stop().await?;
+                return Err(eyre!(
+                    "executor configuration does not match the wallet chain"
+                ));
+            }
+            let owner =
+                self.create_executor_owner(executor_generation, executor_view, chain, http.clone());
+            match owner {
+                Ok(owner) => {
+                    owner.start_tip_observation(session.sync_tip_rx.clone());
+                    owner.start_confirmation_observation(
+                        session.handle.clone(),
+                        session.sync_tip_rx.clone(),
+                    );
+                    session.executor_owner = Some(owner);
+                }
+                Err(error) => {
+                    session.stop().await?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(session)
+    }
+
+    /// Called synchronously by the desktop lifecycle before it starts asynchronous cleanup.
+    pub fn invalidate_executor_owners(&self, minimum_generation: u64) {
+        let mut owners = self
+            .executor_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.minimum_generation = owners.minimum_generation.max(minimum_generation);
+        for owner in &owners.owners {
+            if owner.generation() < owners.minimum_generation {
+                owner.close();
+            }
+        }
+    }
+
+    fn create_executor_owner(
+        &self,
+        generation: u64,
+        view: Arc<vault::DesktopViewSession>,
+        chain: settings::EffectiveChainConfig,
+        http: HttpContext,
+    ) -> Result<Arc<ExecutorOwner>> {
+        // Opening the encrypted store can perform I/O. Keep it outside the
+        // registry lock used by synchronous desktop lifecycle invalidation.
+        let owner = Arc::new(ExecutorOwner::new(
+            generation,
+            self.db.clone(),
+            view,
+            chain,
+            http,
+        )?);
+        let mut owners = self
+            .executor_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owners.closing || generation < owners.minimum_generation {
+            owner.close();
+            return Err(eyre!("executor wallet session was superseded"));
+        }
+        owners.owners.push(owner.clone());
+        Ok(owner)
+    }
+
+    async fn shutdown_superseded_executor_owners(&self, generation: u64) {
+        let retired = {
+            let owners = self
+                .executor_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            owners
+                .owners
+                .iter()
+                .filter(|owner| owner.generation() < generation)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for owner in retired {
+            owner.shutdown().await;
+        }
+        // Keep owners registered until cleanup completes, including if this future is cancelled.
+        self.executor_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owners
+            .retain(|owner| owner.generation() >= generation);
     }
 
     pub async fn shutdown(&self) {
+        let owners = {
+            let mut owners = self
+                .executor_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            owners.closing = true;
+            for owner in &owners.owners {
+                owner.close();
+            }
+            owners.owners.clone()
+        };
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        self.executor_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owners
+            .clear();
         self.sync_manager.shutdown().await;
     }
 }
@@ -279,6 +407,7 @@ async fn wallet_session_from_parts(
         public_data_plane,
         projection_cancel_tx,
         projection_join: Mutex::new(Some(projection_join)),
+        executor_owner: None,
     })
 }
 
@@ -521,6 +650,170 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn executor_lifecycle_cancels_reads_and_rejects_stale_owners_without_losing_records() {
+        let root_dir = std::env::temp_dir().join(format!(
+            "executor-lifecycle-{}",
+            vault::generate_opaque_id().unwrap()
+        ));
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let vault = vault::DesktopVaultStore::from_db(db.clone());
+        let password = "synthetic executor lifecycle password";
+        vault
+            .create_vault_with_params(password, vault::KdfParams::new(1024, 1, 1))
+            .unwrap();
+        let wallet_id = vault::generate_opaque_id().unwrap();
+        let metadata = vault
+            .new_wallet_metadata(
+                password,
+                &wallet_id,
+                0,
+                vault::WalletSource::Imported,
+                "Test",
+            )
+            .unwrap();
+        vault.import_wallet_mnemonic_with_metadata(
+            password, &wallet_id, 0, "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", &metadata,
+        ).unwrap();
+        let view = Arc::new(vault.load_view_session(password, &wallet_id).unwrap());
+        let sessions = WalletSessionStore::from_db(
+            db.clone(),
+            PoiReadSource::PoiProxy {
+                rpc_url: Url::parse("http://127.0.0.1:1").unwrap().into(),
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut chain =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default())
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+        chain.rpc_route = crate::RpcChainRoute::new(
+            1,
+            vec![Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()],
+        );
+        let http = HttpContext::direct_for_tests();
+        let owner = sessions
+            .create_executor_owner(0, view.clone(), chain.clone(), http.clone())
+            .unwrap();
+        let records = vault::ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+        let record = records
+            .restore_index(
+                7,
+                Address::repeat_byte(7),
+                chain.accepted_executor_profile().unwrap().delegate(),
+                &[],
+            )
+            .unwrap();
+        let observed = vault::ExecutorNonceObservation::new(
+            alloy::eips::BlockNumHash::new(10, FixedBytes::repeat_byte(10)),
+            U256::from(3),
+        );
+        records
+            .reconcile(record.operation(), observed, &[])
+            .unwrap();
+        let payload_hash = FixedBytes::repeat_byte(4);
+        records
+            .record_issued(
+                record.operation(),
+                vault::IssuedExecutorPayload::new(
+                    observed.nonce(),
+                    record.delegate(),
+                    payload_hash,
+                    vault::ExecutorPayloadPurpose::Operation,
+                    vault::ExecutorPayloadContext::new(
+                        Bytes::from_static(b"issued lifecycle fixture"),
+                        observed,
+                        Vec::new(),
+                    ),
+                ),
+            )
+            .unwrap();
+        records
+            .reconcile(
+                record.operation(),
+                vault::ExecutorNonceObservation::new(
+                    alloy::eips::BlockNumHash::new(12, FixedBytes::repeat_byte(12)),
+                    U256::from(4),
+                ),
+                &[(
+                    payload_hash,
+                    vault::ExecutorPayloadInclusion::new(
+                        alloy::eips::BlockNumHash::new(11, FixedBytes::repeat_byte(11)),
+                        FixedBytes::repeat_byte(5),
+                        vault::ExecutorExecutionResult::Executed,
+                    ),
+                )],
+            )
+            .unwrap();
+        let reading_owner = owner.clone();
+        let reading =
+            tokio::spawn(
+                async move { reading_owner.inspect_record(record.operation(), &[]).await },
+            );
+        let (_connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        sessions.invalidate_executor_owners(1);
+        assert!(owner.records().is_err());
+        assert!(
+            sessions
+                .create_executor_owner(0, view.clone(), chain.clone(), http.clone())
+                .is_err()
+        );
+        assert_eq!(
+            records.records().unwrap()[0].payload_status(payload_hash),
+            Some(vault::ExecutorPayloadStatus::Executed)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        sessions.shutdown_superseded_executor_owners(1).await;
+        let replacement = sessions
+            .create_executor_owner(1, view.clone(), chain.clone(), http.clone())
+            .unwrap();
+        assert_eq!(replacement.records().unwrap().len(), 1);
+        assert_eq!(
+            replacement.records().unwrap()[0].payload_status(payload_hash),
+            Some(vault::ExecutorPayloadStatus::Uncertain)
+        );
+        assert_eq!(
+            records.records().unwrap()[0].payload_status(payload_hash),
+            Some(vault::ExecutorPayloadStatus::Executed)
+        );
+        assert_eq!(records.next_index().unwrap(), 8);
+        sessions.shutdown().await;
+        assert!(replacement.records().is_err());
+        assert!(
+            sessions
+                .create_executor_owner(2, view.clone(), chain, http)
+                .is_err()
+        );
+        drop(replacement);
+        drop(owner);
+        drop(records);
+        drop(sessions);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn offline_poi_data_reset_accepts_database_without_active_owners() {

@@ -98,6 +98,9 @@ pub(super) struct SubmittedPublicActionAttempt {
     live_native_balance: U256,
 }
 
+pub(super) type PublicActionHandoff<'a> =
+    dyn FnMut(FixedBytes<32>, &TransactionRequest) -> Result<()> + Send + 'a;
+
 pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
@@ -119,8 +122,10 @@ pub(super) async fn submit_public_action_step_session(
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     command_rx: &mut Option<PublicActionCommandReceiver>,
     event_tx: Option<&PublicActionSessionEventSender>,
+    mut handoff: Option<&mut PublicActionHandoff<'_>>,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<PublicActionStepOutcome> {
+    let private_handoff = handoff.is_some();
     let mut railway_auto = fee_policy == PublicActionStepFeePolicy::RefreshRailwayStandard;
     let mut next_gas_fee =
         public_action_step_initial_gas_fee_selection(profile, fee_policy, gas_fee);
@@ -233,6 +238,7 @@ pub(super) async fn submit_public_action_step_session(
             context.ensure_open()?;
         }
         emit_public_action_event(event_tx, PublicActionSessionEvent::AttemptHandoff { step });
+        let attempted_request = preflight.tx_req.clone();
         let result = submit_public_action_attempt(
             step,
             preflight,
@@ -242,10 +248,13 @@ pub(super) async fn submit_public_action_step_session(
             label,
             event_tx,
             None,
-            true,
+            !private_handoff,
             &mut |attempt| {
                 if let Some(context) = transaction_tracking {
                     context.ensure_open()?;
+                }
+                if let Some(handoff) = handoff.as_deref_mut() {
+                    handoff(attempt.tx_hash, &attempted_request)?;
                 }
                 retain_public_action_attempt(
                     observer
@@ -425,14 +434,16 @@ pub(super) async fn submit_public_action_step_session(
 
             if let Some((winner_index, receipt)) = receipt {
                 let winner = &submitted_attempts[winner_index];
-                tracing::info!(
-                    step = ?step,
-                    tx_hash = %receipt.tx_hash,
-                    rpc_gas_price = winner.rpc_gas_price,
-                    estimated_native_gas_cost = %winner.estimated_native_gas_cost,
-                    live_native_balance = %winner.live_native_balance,
-                    "public action receipt confirmed from submitted attempts"
-                );
+                if !private_handoff {
+                    tracing::info!(
+                        step = ?step,
+                        tx_hash = %receipt.tx_hash,
+                        rpc_gas_price = winner.rpc_gas_price,
+                        estimated_native_gas_cost = %winner.estimated_native_gas_cost,
+                        live_native_balance = %winner.live_native_balance,
+                        "public action receipt confirmed from submitted attempts"
+                    );
+                }
                 if receipt.status {
                     progress(public_action_progress_update(
                         step,
@@ -778,7 +789,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
                         return Err(PublicActionPreflightError::Other(error));
                     }
                 } else {
-                    tracing::warn!(%error, "public action preflight failed");
+                    tracing::warn!("public action preflight failed");
                 }
                 last_error = Some(error);
             }
@@ -1094,6 +1105,9 @@ async fn sign_send_public_action_transaction(
     emit_refreshed_public_action_hardware_session(event_tx, signer);
     // Stop/abort requested during synchronous hardware approval is observed here before RPC broadcast.
     public_action_before_raw_broadcast_checkpoint().await;
+    signer
+        .ensure_active()
+        .map_err(PublicActionAttemptError::Sending)?;
     broadcast_signed_public_action_transaction(
         query_rpc_pool,
         network_mode,

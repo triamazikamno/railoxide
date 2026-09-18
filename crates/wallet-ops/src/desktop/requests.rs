@@ -106,6 +106,25 @@ impl RailgunSpendSigner for DesktopPrivateSpendSigner<'_> {
 }
 
 impl DesktopPrivateSpendAuthorization {
+    pub(crate) fn executor_spend_grant<'a>(
+        &'a self,
+        store: &vault::DesktopVaultStore,
+    ) -> Result<(
+        vault::SpendGrant,
+        Option<&'a vault::ProtectedSoftwareSeedSession>,
+    )> {
+        let (password, seed) = match self {
+            Self::VaultPassword(password) => (password, None),
+            Self::ProtectedSoftwareSeed { password, session } => (password, Some(session.as_ref())),
+            Self::PreauthorizedSigner(_) => {
+                return Err(eyre!(
+                    "executor signing requires authorization for the original software seed"
+                ));
+            }
+        };
+        Ok((store.create_spend_grant(password.as_str())?, seed))
+    }
+
     pub(crate) fn signer<'a>(
         &'a self,
         vault_store: &vault::DesktopVaultStore,
@@ -421,6 +440,8 @@ pub async fn quote_desktop_self_broadcast_gas_fee(
 }
 
 pub struct DesktopUnshieldSelfBroadcastRequest {
+    pub executor: Option<Arc<PreparedExecutorOperation>>,
+    pub executor_maximum_gas: Option<u64>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,

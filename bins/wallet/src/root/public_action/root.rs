@@ -2256,6 +2256,7 @@ impl WalletRoot {
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicSendRequest {
+            executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -2619,6 +2620,7 @@ impl WalletRoot {
         );
         Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicShieldRequest {
+            executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),

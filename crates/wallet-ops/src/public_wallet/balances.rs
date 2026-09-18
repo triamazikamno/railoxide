@@ -135,6 +135,12 @@ pub async fn refresh_public_balances_at_least(
     http: &HttpContext,
     minimum: Option<BlockNumHash>,
 ) -> Result<PublicBalanceSnapshot> {
+    let accounts = accounts
+        .iter()
+        .filter(|account| account.is_available_on_chain(chain_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let accounts = accounts.as_slice();
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     if accounts.is_empty()
         || public_balance_assets_for_chain_with_registry(chain_id, token_registry).is_empty()

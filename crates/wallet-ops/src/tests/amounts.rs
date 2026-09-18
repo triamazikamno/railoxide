@@ -18,6 +18,17 @@ fn parse_unshield_amount_rejects_too_much_precision() {
 }
 
 #[test]
+fn token_amount_parsing_rejects_overflow_instead_of_changing_the_payment() {
+    let maximum = U256::MAX.to_string();
+    assert_eq!(parse_send_amount(&maximum, None).unwrap(), U256::MAX);
+    assert!(parse_send_amount(&maximum, Some(18)).is_err());
+    // The whole part fits after scaling; adding the fractional part overflows.
+    let beyond = format!("{}.6", U256::MAX / U256::from(10));
+    assert!(parse_send_amount(&beyond, Some(1)).is_err());
+    assert!(parse_send_amount("1", Some(255)).is_err());
+}
+
+#[test]
 fn parse_unshield_amount_requires_raw_units_for_unknown_tokens() {
     assert_eq!(
         parse_unshield_amount("123", None).expect("parsed raw amount"),

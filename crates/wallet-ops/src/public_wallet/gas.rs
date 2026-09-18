@@ -46,7 +46,7 @@ pub fn public_native_action_gas_units(steps: &[PublicActionProgressStep]) -> u64
 }
 
 #[must_use]
-pub(super) fn public_native_action_gas_units_with_buffer(
+pub(crate) fn public_native_action_gas_units_with_buffer(
     steps: &[PublicActionProgressStep],
     gas_limit_buffer: u64,
 ) -> u64 {

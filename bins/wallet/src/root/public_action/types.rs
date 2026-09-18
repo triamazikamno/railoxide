@@ -455,7 +455,9 @@ pub(in crate::root) const fn public_send_authorization_detail(
         PublicAccountSource::HardwareDerived => {
             "Connect your hardware wallet and approve the public send transaction on the device. No EVM private key is stored in the vault."
         }
-        PublicAccountSource::Derived | PublicAccountSource::Imported => {
+        PublicAccountSource::Derived
+        | PublicAccountSource::Imported
+        | PublicAccountSource::ExecutorDerived(_) => {
             "Enter your vault password to authorize this public send."
         }
     }
@@ -468,7 +470,9 @@ pub(in crate::root) const fn public_shield_authorization_detail(
         PublicAccountSource::HardwareDerived => {
             "Connect your hardware wallet and approve the shield key message plus public shield transactions on the device. No EVM private key is stored in the vault."
         }
-        PublicAccountSource::Derived | PublicAccountSource::Imported => {
+        PublicAccountSource::Derived
+        | PublicAccountSource::Imported
+        | PublicAccountSource::ExecutorDerived(_) => {
             "Enter your vault password to authorize this public shield."
         }
     }

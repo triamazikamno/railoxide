@@ -17,7 +17,6 @@ use super::broadcaster_picker::{
     BroadcasterPickerContent, BroadcasterPickerDialogSnapshot, BroadcasterPickerViewMode,
     render_broadcaster_picker_header,
 };
-use super::private_action::delivery_element_id;
 
 #[derive(Clone, Copy)]
 pub(super) enum PublicAccountDialogKind {
@@ -60,8 +59,7 @@ pub(super) fn render_broadcaster_picker_dialog_content(
         selected_address,
         expanded_groups,
         collapsed_selected_children,
-        kind,
-        key,
+        target,
     } = snapshot;
     list.update(cx, |list, cx| {
         let content = BroadcasterPickerContent {
@@ -109,7 +107,7 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                 .justify_between()
                 .gap_2()
                 .child(
-                    Checkbox::new(delivery_element_id(key, kind, "show-all-broadcasters"))
+                    Checkbox::new(target.element_id("show-all-broadcasters"))
                         .label("Allow out-of-range fees")
                         .checked(show_all_broadcasters)
                         .xsmall()
@@ -117,55 +115,43 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                         .on_click(move |checked, _window, cx| {
                             let checked = *checked;
                             toggle_root.update(cx, |root, cx| {
-                                root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                                root.set_broadcaster_picker_allow_out_of_range(checked, cx);
                             });
                         }),
                 )
                 .child(
-                    ButtonGroup::new(delivery_element_id(
-                        key,
-                        kind,
-                        "broadcaster-picker-view-mode",
-                    ))
-                    .child(
-                        Button::new(delivery_element_id(
-                            key,
-                            kind,
-                            "broadcaster-picker-view-grouped",
-                        ))
-                        .icon(Icon::empty().path(GROUP_ICON_PATH))
-                        .selected(view_mode == BroadcasterPickerViewMode::Grouped)
-                        .accessibility_label("Grouped view")
-                        .tooltip("Grouped view"),
-                    )
-                    .child(
-                        Button::new(delivery_element_id(
-                            key,
-                            kind,
-                            "broadcaster-picker-view-list",
-                        ))
-                        .icon(Icon::empty().path(LIST_ICON_PATH))
-                        .selected(view_mode == BroadcasterPickerViewMode::List)
-                        .accessibility_label("List view")
-                        .tooltip("List view"),
-                    )
-                    .compact()
-                    .outline()
-                    .small()
-                    .disabled(generating)
-                    .on_click(move |selected, _window, cx| {
-                        let Some(index) = selected.first() else {
-                            return;
-                        };
-                        let view_mode = if *index == 0 {
-                            BroadcasterPickerViewMode::Grouped
-                        } else {
-                            BroadcasterPickerViewMode::List
-                        };
-                        view_root.update(cx, |root, cx| {
-                            root.set_broadcaster_picker_view_mode(view_mode, cx);
-                        });
-                    }),
+                    ButtonGroup::new(target.element_id("broadcaster-picker-view-mode"))
+                        .child(
+                            Button::new(target.element_id("broadcaster-picker-view-grouped"))
+                                .icon(Icon::empty().path(GROUP_ICON_PATH))
+                                .selected(view_mode == BroadcasterPickerViewMode::Grouped)
+                                .accessibility_label("Grouped view")
+                                .tooltip("Grouped view"),
+                        )
+                        .child(
+                            Button::new(target.element_id("broadcaster-picker-view-list"))
+                                .icon(Icon::empty().path(LIST_ICON_PATH))
+                                .selected(view_mode == BroadcasterPickerViewMode::List)
+                                .accessibility_label("List view")
+                                .tooltip("List view"),
+                        )
+                        .compact()
+                        .outline()
+                        .small()
+                        .disabled(generating)
+                        .on_click(move |selected, _window, cx| {
+                            let Some(index) = selected.first() else {
+                                return;
+                            };
+                            let view_mode = if *index == 0 {
+                                BroadcasterPickerViewMode::Grouped
+                            } else {
+                                BroadcasterPickerViewMode::List
+                            };
+                            view_root.update(cx, |root, cx| {
+                                root.set_broadcaster_picker_view_mode(view_mode, cx);
+                            });
+                        }),
                 ),
         )
         .child(render_broadcaster_picker_header(

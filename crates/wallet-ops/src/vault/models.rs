@@ -258,7 +258,7 @@ pub enum CreateSoftwareContextResult {
     },
     Created {
         metadata: WalletMetadataBundle,
-        public_account: PublicAccountMetadata,
+        public_account: Box<PublicAccountMetadata>,
         chain_metadata: Vec<WalletChainMetadataBundle>,
         protected_seed_session: ProtectedSoftwareSeedSession,
     },
@@ -854,6 +854,33 @@ pub enum PublicAccountSource {
     Derived,
     HardwareDerived,
     Imported,
+    ExecutorDerived(ExecutorPublicAccountSource),
+}
+
+/// A reference to an account retained by the scoped private wallet. Its chain
+/// selects the derivation path even when another network is selected in the UI.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorPublicAccountSource {
+    pub(crate) chain_id: u64,
+    pub(crate) index: u32,
+    pub(crate) operation: super::ExecutorOperationId,
+}
+
+impl ExecutorPublicAccountSource {
+    #[must_use]
+    pub const fn chain_id(self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    #[must_use]
+    pub const fn operation(self) -> super::ExecutorOperationId {
+        self.operation
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -884,6 +911,14 @@ pub struct PublicAccountMetadata {
 }
 
 impl PublicAccountMetadata {
+    #[must_use]
+    pub const fn is_available_on_chain(&self, chain_id: u64) -> bool {
+        match self.source {
+            PublicAccountSource::ExecutorDerived(source) => source.chain_id == chain_id,
+            _ => true,
+        }
+    }
+
     #[must_use]
     pub fn is_active_for_wallet(&self, wallet_uuid: &str) -> bool {
         self.status == PublicAccountStatus::Active && self.is_scoped_to_wallet(wallet_uuid)

@@ -741,6 +741,8 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
 
     let denied = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            executor_owner: None,
+            chain_id: 1,
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
@@ -758,6 +760,8 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
     let signature = runtime
         .block_on(walletconnect_sign_personal_message(
             WalletConnectPersonalSignRequest {
+                executor_owner: None,
+                chain_id: 1,
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
@@ -821,6 +825,8 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
     let signature = runtime
         .block_on(walletconnect_sign_typed_data_v4(
             WalletConnectTypedDataSignRequest {
+                executor_owner: None,
+                chain_id: 1,
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
@@ -888,6 +894,8 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
     let signature = runtime
         .block_on(walletconnect_sign_typed_data_v4(
             WalletConnectTypedDataSignRequest {
+                executor_owner: None,
+                chain_id: 1,
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
@@ -935,6 +943,8 @@ fn walletconnect_typed_data_signing_error_preserves_method_label() {
         let error = runtime
             .block_on(walletconnect_sign_typed_data(
                 WalletConnectTypedDataSignRequest {
+                    executor_owner: None,
+                    chain_id: 1,
                     request_control: None,
                     view_session: Arc::clone(&view_session),
                     vault_store: Arc::clone(&store),
@@ -2674,6 +2684,7 @@ fn public_actions_reject_zero_amount_before_signing() {
 
     let send_result = runtime.block_on(submit_public_send(
         PublicSendRequest {
+            executor_owner: None,
             transaction_tracking: None,
             chain_id: 1,
             effective_chain: None,
@@ -2703,6 +2714,7 @@ fn public_actions_reject_zero_amount_before_signing() {
 
     let shield_result = runtime.block_on(submit_public_shield(
         PublicShieldRequest {
+            executor_owner: None,
             transaction_tracking: None,
             chain_id: 1,
             effective_chain: None,
@@ -2896,6 +2908,8 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
             .unwrap();
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
         let error = runtime.block_on(walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
+            executor_owner: None,
+            chain_id: 1,
             request_control: None,
             vault_store: store.clone(),
             view_session: Arc::new(hardware_view_session),
@@ -2994,6 +3008,8 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
 
     let missing = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            executor_owner: None,
+            chain_id: 1,
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
@@ -3030,6 +3046,8 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
     };
     let wrong = runtime.block_on(walletconnect_sign_personal_message(
         WalletConnectPersonalSignRequest {
+            executor_owner: None,
+            chain_id: 1,
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
@@ -3047,6 +3065,8 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
     let signature = runtime
         .block_on(walletconnect_sign_personal_message(
             WalletConnectPersonalSignRequest {
+                executor_owner: None,
+                chain_id: 1,
                 request_control: None,
                 view_session,
                 vault_store: store,
@@ -3522,6 +3542,8 @@ async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
     control.invalidate(&crate::RpcBrokerError::OriginRejected);
     // Invalid vault credentials distinguish request rejection from signer construction.
     let personal = walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
+        executor_owner: None,
+        chain_id: 1,
         request_control: Some(control.clone()),
         view_session: view_session.clone(),
         vault_store: store.clone(),
@@ -3536,6 +3558,8 @@ async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
     .await
     .unwrap_err();
     let typed = walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
+        executor_owner: None,
+        chain_id: 1,
         request_control: Some(control),
         view_session: view_session.clone(),
         vault_store: store.clone(),
@@ -3637,6 +3661,7 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
         };
         let error = submit_walletconnect_send_transaction(
             WalletConnectSendTransactionRequest {
+                executor_owner: None,
                 request_control: Some(control.clone()),
                 rpc_reads: Some(reads),
                 transaction_tracking: Some(tracking),

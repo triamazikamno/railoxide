@@ -23,6 +23,7 @@ pub(super) async fn approve_walletconnect_request_task(
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     effective_chain: Option<EffectiveChainConfig>,
+    executor_owner: Option<Arc<wallet_ops::ExecutorOwner>>,
     response_sender: DappResponseSender,
     http: HttpContext,
     hash_fallback_confirmed: bool,
@@ -30,6 +31,8 @@ pub(super) async fn approve_walletconnect_request_task(
     event_tx: Option<PublicActionSessionEventSender>,
     transaction_tracking: Option<wallet_ops::PublicTransactionTrackingContext>,
 ) -> Result<WalletConnectRequestApprovalOutcome, DappApprovalTaskError> {
+    let chain_id = parse_caip2_chain_id(&request.item.chain_id)
+        .ok_or_else(|| DappApprovalTaskError::Failed("Request chain is not EIP-155".to_owned()))?;
     let native = request.request_control.is_some();
     response_sender
         .begin_approval()
@@ -49,6 +52,8 @@ pub(super) async fn approve_walletconnect_request_task(
         let result = match request.parsed.clone() {
             WalletConnectParsedRequest::PersonalSign { message, .. } => {
                 walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
+                    executor_owner,
+                    chain_id,
                     request_control: request.request_control.clone(),
                     view_session,
                     vault_store,
@@ -67,6 +72,8 @@ pub(super) async fn approve_walletconnect_request_task(
             | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
                 walletconnect_sign_typed_data(
                     WalletConnectTypedDataSignRequest {
+                        executor_owner,
+                        chain_id,
                         request_control: request.request_control.clone(),
                         view_session,
                         vault_store,
@@ -102,6 +109,7 @@ pub(super) async fn approve_walletconnect_request_task(
                 match transaction_request_from_walletconnect(chain_id, transaction) {
                     Ok(tx_req) => submit_walletconnect_send_transaction(
                         WalletConnectSendTransactionRequest {
+                            executor_owner,
                             request_control: request.request_control.clone(),
                             rpc_reads: request.rpc_reads.clone(),
                             transaction_tracking,

@@ -24,7 +24,10 @@ impl WalletRoot {
         presentation.drafts = self.gateway.drafts.borrow().views(self);
         presentation.selected_account = self
             .selected_public_account()
-            .filter(|account| account.is_active_for_wallet(view.wallet_id()))
+            .filter(|account| {
+                account.is_active_for_wallet(view.wallet_id())
+                    && account.is_available_on_chain(self.selected_chain)
+            })
             .map(|account| account.public_account_uuid.clone());
         presentation.selected_chain = Some(self.selected_chain);
         presentation.refreshing = self.public_balance_refreshing;
@@ -33,11 +36,10 @@ impl WalletRoot {
             .public_balance_snapshot
             .as_deref()
             .filter(|snapshot| snapshot.chain_id == self.selected_chain);
-        for account in self
-            .public_accounts
-            .iter()
-            .filter(|account| account.is_active_for_wallet(view.wallet_id()))
-        {
+        for account in self.public_accounts.iter().filter(|account| {
+            account.is_active_for_wallet(view.wallet_id())
+                && account.is_available_on_chain(self.selected_chain)
+        }) {
             let mut balances = GatewayAccountBalances::default();
             balances
                 .account_uuid
@@ -121,7 +123,8 @@ impl WalletRoot {
             } => {
                 if self.public_accounts.iter().any(|account| {
                     account.public_account_uuid == public_account_uuid
-                        && account.is_active_for_wallet(view.wallet_id())
+                        && (account.is_active_for_wallet(view.wallet_id())
+                            && account.is_available_on_chain(self.selected_chain))
                 }) {
                     self.set_public_selected_balance(
                         public_account_uuid.into(),

@@ -1,4 +1,10 @@
 use super::*;
+use alloy::sol_types::SolCall;
+use broadcaster_core::contracts::railgun::{RelayAdapt7702, relayCall};
+use broadcaster_core::transact::{
+    BroadcasterAuthorization, BroadcasterTransactRequestType, compute_railgun_txid,
+    railgun_txid_leaf_hash,
+};
 use eyre::eyre;
 
 pub(super) async fn prepare_desktop_unshield_public_broadcaster(
@@ -13,6 +19,16 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         ));
     }
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let executor =
+        validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
+    if executor.is_some()
+        && (request.executor_maximum_private_fee.is_none()
+            || request.executor_min_gas_price.is_none())
+    {
+        return Err(eyre!(
+            "review the executor fee limit before proving this operation"
+        ));
+    }
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -25,7 +41,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         min_gas_price,
         prover,
         forest,
-        utxos,
+        mut utxos,
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
@@ -33,13 +49,22 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.fee_token,
         &request.fee_rows,
         &request.selection,
-        request.unwrap || request.native_top_up.is_some(),
+        request.executor.is_none() && (request.unwrap || request.native_top_up.is_some()),
+        request
+            .executor
+            .as_ref()
+            .map(|prepared| prepared.delivery()),
+        executor.and(request.executor_min_gas_price),
         request.fee_policy,
         &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
     )
     .await?;
+    if let Some(prepared) = &request.executor {
+        prepared.require_broadcaster(&broadcaster)?;
+        utxos = request.session.unspent_utxos_for_executor(prepared)?;
+    }
     let bound_min_gas_price =
         public_broadcaster_bound_min_gas_price(request.chain_id, min_gas_price);
     let same_token_fee = request.fee_token == request.token;
@@ -81,7 +106,8 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     initial_split.receiver_amount,
                     U256::ZERO,
                     native_top_up,
-                );
+                )
+                .map(|shape| shape.with_executor(request.executor.is_some()));
             }
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
@@ -99,11 +125,10 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
-            Ok(unshield_approximate_shape(
-                &selection,
-                selection.max_spendable,
-                request.unwrap,
-            ))
+            Ok(
+                unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
+                    .with_executor(request.executor.is_some()),
+            )
         })?;
     let initial_fee_estimate = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
@@ -114,6 +139,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         RAILGUN_PROTOCOL_FEE_BPS,
         min_gas_price,
         seeded_fee_amount,
+        request.custom_fee_amount,
         |split| {
             if let Some(native_top_up) = &initial_native_top_up {
                 return native_top_up_approximate_shape(
@@ -123,7 +149,8 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     split.receiver_amount,
                     split.fee_amount,
                     native_top_up,
-                );
+                )
+                .map(|shape| shape.with_executor(request.executor.is_some()));
             }
             let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
@@ -142,11 +169,10 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
-            Ok(unshield_approximate_shape(
-                &selection,
-                selection.max_spendable,
-                request.unwrap,
-            ))
+            Ok(
+                unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
+                    .with_executor(request.executor.is_some()),
+            )
         },
     ) {
         Ok(estimate) => {
@@ -166,7 +192,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             Some(estimate)
         }
         Err(err) => {
-            if !same_token_fee {
+            if !same_token_fee || request.custom_fee_amount.is_some() {
                 return Err(err).wrap_err("estimate initial public broadcaster unshield fee");
             }
             tracing::warn!(
@@ -182,7 +208,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         .as_ref()
         .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
-    let signer = request.spend_authorization.into_signer(
+    let signer = request.spend_authorization.signer(
         request.vault_store.as_ref(),
         request.view_session.as_ref(),
         "public broadcaster unshield",
@@ -200,7 +226,15 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         relay_adapt_contract: chain.relay_adapt_contract,
     };
 
-    let mut fee_amount = initial_fee_amount;
+    let maximum_fee = executor.and(request.executor_maximum_private_fee);
+    // The fresh estimate includes a buffer. Do not reject an approved fee merely
+    // because that buffer grew; the RPC estimate below must still fit the limit.
+    let mut fee_amount = match request.custom_fee_amount {
+        Some(amount) => validate_custom_public_broadcaster_fee(amount, U256::ZERO, maximum_fee)?,
+        None => maximum_fee.map_or(initial_fee_amount, |maximum| {
+            initial_fee_amount.min(maximum)
+        }),
+    };
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
         let split = public_broadcaster_amount_split_for_tokens_and_protocol(
             request.amount,
@@ -231,15 +265,15 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             TransactionGenerationStage::ProvingTransaction,
         );
         let proof_started = Instant::now();
-        let plan = if let Some(native_top_up) = &native_top_up {
-            let mut composite_request = native_top_up_composite_unshield_request(
-                request.token,
-                split.receiver_amount,
-                request.recipient,
-                request.unwrap,
-                request.verify_proof,
-                native_top_up,
-            )?;
+        let plan = if let Some(mut composite_request) = desktop_composite_unshield_request(
+            request.token,
+            split.receiver_amount,
+            request.recipient,
+            request.unwrap,
+            request.verify_proof,
+            native_top_up.as_ref(),
+            executor,
+        )? {
             composite_request.broadcaster_fee = Some(BroadcasterFeeOutput {
                 recipient: broadcaster.address_data,
                 token_address: request.fee_token,
@@ -324,18 +358,35 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             TransactionGenerationStage::EstimatingBroadcasterFee,
         );
         let gas_started = Instant::now();
-        let call_to = plan.call_to();
-        let call_data = plan.call_data();
+        let mut transaction = issue_desktop_executor_plan(
+            &request.session,
+            request.executor.as_deref(),
+            &request.spend_authorization,
+            &request.vault_store,
+            &plan,
+        )
+        .await?
+        .unwrap_or_else(|| {
+            TransactionRequest::default()
+                .to(plan.call_to())
+                .input(plan.call_data().into())
+        });
+        if transaction.transaction_type == Some(4) {
+            transaction.max_fee_per_gas = Some(public_broadcaster_service_gas_price(min_gas_price));
+            transaction.max_priority_fee_per_gas = Some(min_gas_price);
+        }
+        let executor_issue_elapsed_ms = gas_started.elapsed().as_millis();
+        let rpc_started = Instant::now();
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
             &query_rpc_pool,
             request.chain_id,
-            call_to,
-            &call_data,
+            transaction.clone(),
             broadcaster.fee,
             min_gas_price,
             chain.gas.gas_limit_buffer,
         )
         .await?;
+        let rpc_elapsed_ms = rpc_started.elapsed().as_millis();
         let gas_elapsed_ms = gas_started.elapsed().as_millis();
         tracing::info!(
             attempt,
@@ -344,12 +395,15 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             gas_limit,
             min_gas_price,
             bound_min_gas_price,
+            executor_issue_elapsed_ms,
+            rpc_elapsed_ms,
             gas_elapsed_ms,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
             "estimated public broadcaster unshield fee"
         );
         if broadcaster_fee_covers(fee_amount, computed_fee) {
+            transaction.gas = Some(gas_limit);
             let reported_amounts = public_broadcaster_reported_amounts(
                 request.token,
                 request.fee_token,
@@ -419,6 +473,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 DesktopUnshieldPreparedPlan::Composite(plan) => plan.shape.uses_relay_adapt,
             };
             return Ok(PreparedPublicBroadcasterPlan {
+                transaction: Some(transaction),
                 transaction_count: plan.transaction_count(),
                 input_count: plan.input_count(),
                 private_output_count: plan.private_output_count(),
@@ -444,7 +499,10 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 native_top_up,
             });
         }
-        let next_fee = buffered_public_broadcaster_fee(computed_fee);
+        let next_fee = request.custom_fee_amount.map_or_else(
+            || bounded_public_broadcaster_fee(computed_fee, maximum_fee),
+            |amount| validate_custom_public_broadcaster_fee(amount, computed_fee, maximum_fee),
+        )?;
         log_public_broadcaster_fee_prediction_failure(
             "unshield",
             attempt,
@@ -502,6 +560,8 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         &request.fee_rows,
         &request.selection,
         false,
+        None,
+        None,
         request.fee_policy,
         &request.trust_filter,
         request.anchor_cache.as_ref(),
@@ -544,6 +604,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         U256::ZERO,
         min_gas_price,
         seeded_fee_amount,
+        request.custom_fee_amount,
         |split| {
             let selection = send_selection_info_with_broadcaster_fee_token(
                 &utxos,
@@ -582,7 +643,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             Some(estimate)
         }
         Err(err) => {
-            if !same_token_fee {
+            if !same_token_fee || request.custom_fee_amount.is_some() {
                 return Err(err).wrap_err("estimate initial public broadcaster send fee");
             }
             tracing::warn!(
@@ -611,7 +672,11 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         relay_adapt_contract: chain.relay_adapt_contract,
     };
 
-    let mut fee_amount = initial_fee_amount;
+    let mut fee_amount = request
+        .custom_fee_amount
+        .map_or(Ok(initial_fee_amount), |amount| {
+            validate_custom_public_broadcaster_fee(amount, U256::ZERO, None)
+        })?;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
         let split = public_broadcaster_amount_split_for_tokens(
             request.amount,
@@ -696,8 +761,9 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
             &query_rpc_pool,
             request.chain_id,
-            plan.call.to,
-            &plan.call.data,
+            TransactionRequest::default()
+                .to(plan.call.to)
+                .input(plan.call.data.clone().into()),
             broadcaster.fee,
             min_gas_price,
             chain.gas.gas_limit_buffer,
@@ -758,6 +824,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 "persisted public broadcaster send pending output POI contexts"
             );
             return Ok(PreparedPublicBroadcasterPlan {
+                transaction: None,
                 transaction_count: plan.transaction_count(),
                 input_count: plan.input_count(),
                 private_output_count: plan.private_output_count(),
@@ -786,7 +853,10 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 native_top_up: None,
             });
         }
-        let next_fee = buffered_public_broadcaster_fee(computed_fee);
+        let next_fee = request.custom_fee_amount.map_or_else(
+            || Ok(buffered_public_broadcaster_fee(computed_fee)),
+            |amount| validate_custom_public_broadcaster_fee(amount, computed_fee, None),
+        )?;
         log_public_broadcaster_fee_prediction_failure(
             "send",
             attempt,
@@ -818,21 +888,46 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
 pub(super) async fn estimate_public_broadcaster_fee(
     provider: &(impl Provider + Clone),
     chain_id: u64,
-    to: Address,
-    data: &Bytes,
+    transaction: TransactionRequest,
     token_fee_per_unit_gas: U256,
     min_gas_price: u128,
     gas_limit_buffer: u64,
 ) -> Result<(u64, U256)> {
-    let tx_req = TransactionRequest::default()
-        .with_chain_id(chain_id)
-        .with_to(to)
-        .with_input(data.clone())
-        .with_gas_price(min_gas_price);
+    let tx_req = if transaction.transaction_type == Some(4) {
+        transaction.with_chain_id(chain_id)
+    } else {
+        transaction
+            .with_chain_id(chain_id)
+            .with_gas_price(min_gas_price)
+    };
+    let delegated = tx_req.transaction_type == Some(4);
+    if delegated {
+        // Some RPCs silently ignore authorizations and simulate an empty account.
+        // Require the executor's getter to return ABI data through this delegation.
+        let nonce_request = tx_req
+            .clone()
+            .input(RelayAdapt7702::nonceCall {}.abi_encode().into());
+        let nonce_result = provider
+            .call(nonce_request)
+            .pending()
+            .await
+            .wrap_err("simulate public broadcaster executor delegation")?;
+        RelayAdapt7702::nonceCall::abi_decode_returns(&nonce_result)
+            .wrap_err("RPC did not simulate public broadcaster executor delegation")?;
+    }
     let estimated_gas = provider
-        .estimate_gas(tx_req)
+        .estimate_gas(tx_req.clone())
         .await
         .wrap_err("estimate public broadcaster gas")?;
+    if delegated {
+        // eth_call and eth_estimateGas can have different authorization support.
+        // Check the estimate before the buffer can conceal an execution shortfall.
+        provider
+            .call(tx_req.with_gas_limit(estimated_gas))
+            .pending()
+            .await
+            .wrap_err("simulate public broadcaster transaction at estimated gas")?;
+    }
     let gas_limit = public_broadcaster_gas_limit_with_buffer(estimated_gas, gas_limit_buffer);
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
     Ok((
@@ -844,8 +939,7 @@ pub(super) async fn estimate_public_broadcaster_fee(
 pub(super) async fn estimate_public_broadcaster_fee_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     chain_id: u64,
-    to: Address,
-    data: &Bytes,
+    transaction: TransactionRequest,
     token_fee_per_unit_gas: U256,
     min_gas_price: u128,
     gas_limit_buffer: u64,
@@ -858,8 +952,7 @@ pub(super) async fn estimate_public_broadcaster_fee_from_rpc_pool(
         match estimate_public_broadcaster_fee(
             &provider_handle.provider,
             chain_id,
-            to,
-            data,
+            transaction.clone(),
             token_fee_per_unit_gas,
             min_gas_price,
             gas_limit_buffer,
@@ -891,26 +984,159 @@ pub(crate) const fn public_broadcaster_gas_limit_with_buffer(
 
 pub(crate) fn public_broadcaster_transact_params(
     broadcaster: &PublicBroadcasterCandidate,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     min_gas_price: u128,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
-) -> BroadcasterRawParamsTransact {
-    BroadcasterRawParamsTransact {
+) -> Result<BroadcasterRawParamsTransact> {
+    // The broadcaster owns the outer sender/nonce and this wire format has no
+    // value field. Refuse an unrepresentable request instead of dropping fields.
+    if transaction
+        .chain_id
+        .is_some_and(|chain| chain != broadcaster.chain_id)
+        || transaction.from.is_some()
+        || transaction.nonce.is_some()
+        || transaction.value.is_some_and(|value| value != U256::ZERO)
+        || transaction
+            .transaction_type
+            .is_some_and(|kind| kind != 2 && kind != 4)
+    {
+        return Err(eyre!(
+            "transaction cannot be represented by the selected broadcaster route"
+        ));
+    }
+    let to = transaction
+        .to
+        .and_then(alloy::primitives::TxKind::into_to)
+        .ok_or_else(|| eyre!("broadcaster transaction destination is unavailable"))?;
+    let data = transaction
+        .input
+        .into_input()
+        .ok_or_else(|| eyre!("broadcaster transaction calldata is unavailable"))?;
+    let authorization = match transaction.authorization_list.as_deref() {
+        None => None,
+        Some([authorization]) => Some(BroadcasterAuthorization {
+            address: authorization.inner().address,
+            nonce: U256::from(authorization.inner().nonce),
+            chain_id: authorization.inner().chain_id,
+            signature: alloy::serde::WithOtherFields::new(authorization.signature()?),
+            other: alloy::serde::OtherFields::default(),
+        }),
+        Some(_) => {
+            return Err(eyre!(
+                "broadcaster executor delivery requires one delegation authorization"
+            ));
+        }
+    };
+    if authorization.is_some() != (transaction.transaction_type == Some(4)) {
+        return Err(eyre!(
+            "broadcaster transaction type does not match its authorization"
+        ));
+    }
+    if authorization.is_some()
+        && (transaction.max_fee_per_gas.is_none() || transaction.max_priority_fee_per_gas.is_none())
+    {
+        return Err(eyre!(
+            "executor broadcaster delivery requires approved gas fee caps"
+        ));
+    }
+    let uses_executor = data.starts_with(&RelayAdapt7702::executeCall::SELECTOR);
+    if uses_executor {
+        let call = RelayAdapt7702::executeCall::abi_decode(&data)?;
+        if call._transactions.is_empty()
+            || broadcaster.available_wallets == 0
+            || broadcaster.fee_expiration <= SystemTime::now()
+        {
+            return Err(eyre!(
+                "executor broadcaster fee selection is no longer available"
+            ));
+        }
+        let profile = broadcaster
+            .relay_adapt_7702
+            .and_then(|delegate| {
+                settings::ExecutorProfile::accepted(broadcaster.chain_id, delegate)
+            })
+            .ok_or_else(|| eyre!("broadcaster executor profile is unavailable"))?;
+        if !public_broadcaster_protocol::supports_nonce_bearing_executor(
+            broadcaster.relay_adapt_7702,
+            profile.delegate(),
+        ) {
+            return Err(eyre!(
+                "broadcaster does not advertise the required executor format"
+            ));
+        }
+        let authorization = authorization.as_ref().ok_or_else(|| {
+            eyre!("executor broadcaster delivery requires a fresh delegation authorization")
+        })?;
+        if authorization.chain_id != U256::from(broadcaster.chain_id)
+            || authorization.address != profile.delegate()
+            || authorization.signed_authorization()?.recover_authority()? != to
+        {
+            return Err(eyre!(
+                "executor authorization does not match the selected delivery"
+            ));
+        }
+        let list_keys = broadcaster.parsed_required_poi_list_keys()?;
+        for inner in &call._transactions {
+            let txid = compute_railgun_txid(inner, Some(DEFAULT_TXID_VERSION))?;
+            let leaf = FixedBytes::from(railgun_txid_leaf_hash(
+                txid,
+                u64::from(inner.boundParams.treeNumber),
+            ));
+            if list_keys.iter().any(|key| {
+                !pre_transaction_pois_per_txid_leaf_per_list
+                    .get(key)
+                    .is_some_and(|proofs| proofs.contains_key(&leaf))
+            }) {
+                return Err(eyre!(
+                    "executor request is missing a required private transaction POI"
+                ));
+            }
+        }
+    } else if authorization.is_some() || data.starts_with(&RelayAdapt7702::multicallCall::SELECTOR)
+    {
+        return Err(eyre!(
+            "broadcaster executor delivery requires the current execute wrapper"
+        ));
+    }
+    // SDK broadcasters require the route flag even for direct transact requests.
+    let mut other: alloy::serde::OtherFields = [
+        ("minVersion", serde_json::Value::from("8.0.0")),
+        ("maxVersion", serde_json::Value::from("8.999.0")),
+        // The shared request type has no devLog field. SDK broadcasters use it
+        // to return the original error instead of "Unknown Broadcaster error."
+        ("devLog", true.into()),
+        (
+            "useRelayAdapt",
+            (uses_executor || data.starts_with(&relayCall::SELECTOR)).into(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    if authorization.is_some() {
+        let gas_limit = transaction.gas.ok_or_else(|| {
+            eyre!("executor broadcaster delivery requires an estimated gas limit")
+        })?;
+        // The shared wrapper has no gas-limit field; SDK TX7702 expects decimal text.
+        other.insert("gasLimit".to_owned(), gas_limit.to_string().into());
+    }
+    Ok(BroadcasterRawParamsTransact {
         chain_type: 0,
         chain_id: broadcaster.chain_id,
-        transact_type: None,
+        transact_type: authorization
+            .as_ref()
+            .map(|_| BroadcasterTransactRequestType::Tx7702),
         min_gas_price: Some(U256::from(min_gas_price)),
-        max_fee_per_gas: None,
-        max_priority_fee_per_gas: None,
-        authorization: None,
+        max_fee_per_gas: transaction.max_fee_per_gas.map(U256::from),
+        max_priority_fee_per_gas: transaction.max_priority_fee_per_gas.map(U256::from),
+        authorization,
         fees_id: Some(broadcaster.fees_id.clone()),
         to,
         data,
         broadcaster_viewing_key: FixedBytes::from(broadcaster.viewing_public_key),
         txid_version: Some(DEFAULT_TXID_VERSION.to_string()),
         pre_transaction_pois_per_txid_leaf_per_list,
-    }
+        other,
+    })
 }
 
 pub(super) async fn publish_public_broadcaster_payload(
@@ -965,8 +1191,7 @@ pub(crate) async fn public_broadcaster_republish_loop<F, Fut>(
 
 pub(super) async fn submit_public_broadcaster_plan(
     waku: Arc<WakuClient>,
-    to: Address,
-    data: Bytes,
+    transaction: TransactionRequest,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
     action_token: Address,
@@ -993,35 +1218,80 @@ pub(super) async fn submit_public_broadcaster_plan(
     timeout: Duration,
     republish_interval: Duration,
 ) -> Result<PublicBroadcasterSubmissionResult> {
-    let transact_topic = transact_topic(broadcaster.chain_id);
-    let response_topic = transact_response_topic(broadcaster.chain_id);
     tracing::info!(
         chain_id = broadcaster.chain_id,
         broadcaster = %broadcaster.railgun_address,
         broadcaster_identifier = ?broadcaster.identifier.as_deref(),
         fees_id = %broadcaster.fees_id,
         token = ?broadcaster.token,
-        to = ?to,
         fee_amount = %fee_amount,
         gas_limit,
         min_gas_price,
         bound_min_gas_price,
-        data_len = data.len(),
-        transact_topic = %transact_topic,
-        response_topic = %response_topic,
+        data_len = transaction.input.input().map_or(0, |input| input.len()),
         "preparing public broadcaster transact request"
     );
+    let result = submit_public_broadcaster_transaction(
+        waku,
+        transaction,
+        pre_transaction_pois_per_txid_leaf_per_list,
+        &broadcaster,
+        bound_min_gas_price,
+        progress_tx,
+        timeout,
+        republish_interval,
+    )
+    .await?;
+
+    Ok(PublicBroadcasterSubmissionResult {
+        broadcaster,
+        action_token,
+        fee_token,
+        entered_amount,
+        receiver_amount,
+        recipient_amount,
+        total_private_spend,
+        fee_amount,
+        protocol_fee_amount,
+        protocol_fee_bps,
+        fee_mode,
+        gas_limit,
+        min_gas_price,
+        transaction_count,
+        input_count,
+        private_output_count,
+        public_output_count,
+        relay_call_count,
+        uses_relay_adapt,
+        result,
+        native_top_up,
+    })
+}
+
+/// Publish an admitted complete transaction and its POIs through the existing
+/// encrypted request/response transport. Dropping the future stops local retries.
+pub(super) async fn submit_public_broadcaster_transaction(
+    waku: Arc<WakuClient>,
+    transaction: TransactionRequest,
+    pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
+    broadcaster: &PublicBroadcasterCandidate,
+    bound_min_gas_price: u128,
+    progress_tx: Option<TransactionGenerationProgressSender>,
+    timeout: Duration,
+    republish_interval: Duration,
+) -> Result<PublicBroadcasterResultKind> {
+    let transact_topic = transact_topic(broadcaster.chain_id);
+    let response_topic = transact_response_topic(broadcaster.chain_id);
     update_transaction_generation_stage(
         progress_tx.as_ref(),
         TransactionGenerationStage::PublishingToBroadcaster,
     );
     let params = public_broadcaster_transact_params(
-        &broadcaster,
-        to,
-        data,
+        broadcaster,
+        transaction,
         bound_min_gas_price,
         pre_transaction_pois_per_txid_leaf_per_list,
-    );
+    )?;
     let encrypt_started = Instant::now();
     let encrypted = EncryptedTransactRequest::encrypt(broadcaster.viewing_public_key, &params)
         .wrap_err("encrypt public broadcaster transact request")?;
@@ -1113,7 +1383,12 @@ pub(super) async fn submit_public_broadcaster_plan(
                 );
                 match decode_public_broadcaster_response(&encrypted.shared_key, &msg.payload) {
                     Ok(Some(result)) => {
-                        tracing::info!(?result, "decrypted public broadcaster response");
+                        // Detailed errors can contain the broadcaster's RPC data.
+                        // Show them in progress without copying them into wallet logs.
+                        tracing::info!(
+                            submitted = matches!(result, PublicBroadcasterResultKind::Submitted { .. }),
+                            "decrypted public broadcaster response"
+                        );
                         break result;
                     }
                     Ok(None) => tracing::debug!("public broadcaster response was not decryptable with request key"),
@@ -1125,27 +1400,128 @@ pub(super) async fn submit_public_broadcaster_plan(
     let _ = republish_stop_tx.send(());
     republish_handle.abort();
 
-    Ok(PublicBroadcasterSubmissionResult {
-        broadcaster,
-        action_token,
-        fee_token,
-        entered_amount,
-        receiver_amount,
-        recipient_amount,
-        total_private_spend,
-        fee_amount,
-        protocol_fee_amount,
-        protocol_fee_bps,
-        fee_mode,
-        gas_limit,
-        min_gas_price,
-        transaction_count,
-        input_count,
-        private_output_count,
-        public_output_count,
-        relay_call_count,
-        uses_relay_adapt,
-        result,
-        native_top_up,
-    })
+    Ok(result)
+}
+
+#[cfg(test)]
+mod gas_estimate_tests {
+    use super::*;
+    use alloy::eips::eip7702::Authorization;
+    use alloy::signers::{SignerSync, local::PrivateKeySigner};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn broadcaster_gas_requires_delegated_execution_and_preserves_legacy_estimates() {
+        #[derive(Clone, Copy, Debug)]
+        enum Simulation {
+            IgnoresDelegation,
+            UnderestimatesExecution,
+            Executes,
+            Legacy,
+        }
+
+        let signer = PrivateKeySigner::from_bytes(&FixedBytes::repeat_byte(7)).unwrap();
+        let authorization = Authorization {
+            chain_id: U256::ONE,
+            address: Address::repeat_byte(0x42),
+            nonce: 0,
+        };
+        let signature = signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let authorization = authorization.into_signed(signature);
+        let call_data = Bytes::from_static(&[1, 2, 3]);
+        for simulation in [
+            Simulation::IgnoresDelegation,
+            Simulation::UnderestimatesExecution,
+            Simulation::Executes,
+            Simulation::Legacy,
+        ] {
+            let mut transaction = TransactionRequest::default()
+                .to(signer.address())
+                .input(call_data.clone().into());
+            let delegated = !matches!(simulation, Simulation::Legacy);
+            if delegated {
+                transaction.transaction_type = Some(4);
+                transaction.authorization_list = Some(vec![authorization.clone()]);
+                transaction.max_fee_per_gas = Some(125);
+                transaction.max_priority_fee_per_gas = Some(100);
+            }
+            let expected_authorization =
+                serde_json::to_value(&transaction.authorization_list).unwrap();
+            let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+                Arc::new(move |request| {
+                    assert_eq!(request["params"][1], "pending");
+                    let tx = &request["params"][0];
+                    assert_eq!(tx["authorizationList"], expected_authorization);
+                    let result = match request["method"].as_str().unwrap() {
+                        "eth_estimateGas" => json!(if matches!(simulation, Simulation::Executes) {
+                            "0x1bc22a" // Full execution: 1,819,178 gas.
+                        } else {
+                            "0x1c092" // Empty-account execution: 114,834 gas.
+                        }),
+                        "eth_call" => {
+                            assert!(delegated, "legacy estimates need no delegation checks");
+                            let tx: TransactionRequest =
+                                serde_json::from_value(tx.clone()).unwrap();
+                            if tx.input.input().unwrap().as_ref()
+                                == RelayAdapt7702::nonceCall::SELECTOR
+                            {
+                                if matches!(simulation, Simulation::IgnoresDelegation) {
+                                    json!("0x")
+                                } else {
+                                    json!(Bytes::from(U256::ZERO.to_be_bytes::<32>().to_vec()))
+                                }
+                            } else {
+                                assert_eq!(tx.input.input().unwrap().as_ref(), [1, 2, 3]);
+                                if tx.gas.unwrap() < 1_768_554 {
+                                    return json!({"jsonrpc": "2.0", "id": request["id"],
+                                        "error": {"code": -32000, "message": "out of gas"}});
+                                }
+                                json!("0x")
+                            }
+                        }
+                        method => panic!("unexpected RPC method: {method}"),
+                    };
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                }),
+                Arc::default(),
+                Arc::default(),
+            )
+            .await;
+            let pool = QueryRpcPool::with_http_client(
+                vec![endpoint],
+                Duration::from_secs(30),
+                HttpContext::direct_for_tests().rpc_client,
+            );
+            let result = estimate_public_broadcaster_fee_from_rpc_pool(
+                &pool,
+                1,
+                transaction,
+                U256::from(1_000_000_000u64),
+                100,
+                100_000,
+            )
+            .await;
+            server.abort();
+            match simulation {
+                Simulation::IgnoresDelegation | Simulation::UnderestimatesExecution => {
+                    assert!(
+                        result.is_err(),
+                        "accepted an invalid estimate: {simulation:?}"
+                    );
+                    assert!(pool.available_providers().is_empty());
+                }
+                Simulation::Executes | Simulation::Legacy => {
+                    let expected = if delegated { 1_919_178 } else { 214_834 };
+                    let (gas, fee) = result.unwrap();
+                    assert_eq!(gas, expected);
+                    assert_eq!(
+                        fee,
+                        broadcaster_fee_amount(U256::from(1_000_000_000u64), gas, 125)
+                    );
+                }
+            }
+        }
+    }
 }

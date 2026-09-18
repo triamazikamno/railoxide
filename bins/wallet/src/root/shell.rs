@@ -251,7 +251,7 @@ pub(crate) fn open_wallet_window(
 }
 
 impl WalletRoot {
-    fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
+    pub(super) fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
         if self.active_wallet_tab == tab {
             return;
         }
@@ -311,6 +311,7 @@ impl Render for WalletRoot {
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_walletconnect_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
+        self.ensure_stealth_accounts(window, cx);
         if should_apply_background_focus(window.has_active_dialog(cx)) {
             self.focus_vault_input_if_requested(window, cx);
             self.focus_utxo_table_if_requested(window, cx);

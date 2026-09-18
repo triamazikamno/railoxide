@@ -887,6 +887,11 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         allow_standard_children: bool,
     ) -> Result<WalletMetadataBundle, VaultError> {
+        // Prevent an executor writer holding a view session from recreating records
+        // between collecting the deletion keys and deleting the wallet.
+        let _executor_guard = crate::vault::executors::EXECUTOR_RECORD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let Some(target) = metadata
             .iter()
@@ -1040,6 +1045,12 @@ impl DesktopVaultStore {
                     &wallet_chain_uuid,
                 ));
             }
+        }
+
+        for record in self.db.list_desktop_wallet_vault_records(
+            &crate::vault::executors::executor_wallet_prefix(wallet_uuid),
+        )? {
+            keys_to_delete.push(record.key);
         }
 
         if !wallet_private_namespaces.is_empty() {

@@ -3,6 +3,7 @@ mod broadcaster_preferences;
 mod core_crypto;
 mod derivation_compatibility;
 mod encrypted_cache;
+mod executors;
 mod first_run;
 mod gateway_permissions;
 mod hardware;

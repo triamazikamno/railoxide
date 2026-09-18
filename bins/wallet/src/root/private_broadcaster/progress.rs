@@ -261,7 +261,7 @@ pub(in crate::root) fn private_broadcaster_progress_is_successful(
             progress
                 .self_broadcast_result
                 .as_ref()
-                .is_some_and(|result| result.tx.receipt().is_some_and(|receipt| receipt.status))
+                .is_some_and(|result| result.tx.execution_status() == Some(true))
                 || progress
                     .sponsored_self_broadcast_outcome
                     .as_ref()
@@ -551,7 +551,7 @@ pub(super) const fn private_broadcaster_stage_label(
     }
 }
 
-pub(super) const fn private_broadcaster_stage_detail(
+pub(in crate::root) const fn private_broadcaster_stage_detail(
     stage: TransactionGenerationStage,
     status: PublicActionStepStatus,
     requires_device_approval: bool,
@@ -595,7 +595,7 @@ pub(super) const fn private_broadcaster_stage_detail(
     }
 }
 
-pub(super) const fn private_broadcaster_stage_id(
+pub(in crate::root) const fn private_broadcaster_stage_id(
     stage: TransactionGenerationStage,
 ) -> &'static str {
     match stage {

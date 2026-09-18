@@ -92,6 +92,18 @@ pub fn negotiate_walletconnect_namespaces_with_account_support(
     selected_account: Address,
     selected_account_support: WalletConnectNamespaceAccountSupport,
 ) -> Result<WalletConnectNamespaceNegotiation> {
+    let scoped_chains;
+    let supported_chain_ids = if let PublicAccountSource::ExecutorDerived(source) =
+        selected_account_support.account_source
+    {
+        scoped_chains = supported_chain_ids
+            .intersection(&BTreeSet::from([source.chain_id()]))
+            .copied()
+            .collect();
+        &scoped_chains
+    } else {
+        supported_chain_ids
+    };
     let mut unsupported_required = Vec::new();
     let mut approved_namespaces = BTreeMap::new();
 
@@ -324,7 +336,9 @@ pub(crate) const fn walletconnect_method_supported_for_account_support(
                 selected_account_support.hardware_typed_data_signing_mode,
             )
         }
-        PublicAccountSource::Derived | PublicAccountSource::Imported => true,
+        PublicAccountSource::Derived
+        | PublicAccountSource::Imported
+        | PublicAccountSource::ExecutorDerived(_) => true,
     }
 }
 

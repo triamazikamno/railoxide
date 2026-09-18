@@ -479,7 +479,9 @@ impl DappProvider {
             &permission.public_account_scope,
             permission.owning_private_wallet_uuid.as_deref(),
         ) {
-            Ok(WalletConnectSessionAccountResolution::Usable(account)) => {
+            Ok(WalletConnectSessionAccountResolution::Usable(account))
+                if account.is_available_on_chain(permission.chain_id) =>
+            {
                 Ok((permission.clone(), account))
             }
             _ => Err(4100),
@@ -1629,7 +1631,14 @@ impl DappProvider {
             self.wallet
                 .public_accounts
                 .iter()
-                .filter(|account| account.is_active_for_wallet(view.wallet_id()))
+                .filter(|account| {
+                    account.is_active_for_wallet(view.wallet_id())
+                        && self
+                            .wallet
+                            .public_view
+                            .selected_chain
+                            .is_none_or(|chain| account.is_available_on_chain(chain))
+                })
                 .map(|account| GatewayAccountChoice {
                     uuid: account.public_account_uuid.clone(),
                     label: account.label.clone(),

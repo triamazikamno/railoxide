@@ -1,5 +1,8 @@
 use super::*;
 
+mod executor_discovery;
+mod executor_observation;
+pub(crate) mod executors;
 mod local_cache;
 mod private_tx;
 mod prover_cache;
@@ -38,6 +41,8 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     );
 }
 
+pub use executor_discovery::*;
+pub use executors::*;
 pub use local_cache::*;
 pub use private_tx::*;
 pub use prover_cache::*;

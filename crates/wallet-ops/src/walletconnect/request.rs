@@ -280,6 +280,7 @@ sol! {
     }
 
     interface WrappedNative {
+        event Deposit(address indexed dst, uint256 wad);
         function deposit() external payable;
         function withdraw(uint256 amount) external;
     }
@@ -460,6 +461,15 @@ pub fn validate_dapp_request_account(
     chain_id: u64,
     selected_account_support: WalletConnectNamespaceAccountSupport,
 ) -> std::result::Result<(), DappRequestValidationError> {
+    if !selected_account.is_available_on_chain(chain_id) {
+        return Err(DappRequestValidationError::AccountMismatch);
+    }
+    if let WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id }
+    | WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } = request
+        && !selected_account.is_available_on_chain(*chain_id)
+    {
+        return Err(DappRequestValidationError::TransactionChainMismatch);
+    }
     if !walletconnect_approved_request_method_supported_for_account_support(
         request.method(),
         selected_account_support,

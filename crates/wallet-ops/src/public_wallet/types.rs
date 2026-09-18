@@ -259,6 +259,7 @@ impl Drop for PublicBalanceRefreshGuard {
 }
 
 pub struct PublicSendRequest {
+    pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<EffectiveChainConfig>,
@@ -309,6 +310,7 @@ pub struct PublicSendResult {
 }
 
 pub struct PublicShieldRequest {
+    pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
     pub effective_chain: Option<EffectiveChainConfig>,
@@ -330,6 +332,8 @@ pub struct PublicShieldRequest {
 }
 
 pub struct WalletConnectPersonalSignRequest {
+    pub chain_id: u64,
+    pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub request_control: Option<crate::dapp_request::DappRequestControl>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
@@ -343,6 +347,8 @@ pub struct WalletConnectPersonalSignRequest {
 }
 
 pub struct WalletConnectTypedDataSignRequest {
+    pub chain_id: u64,
+    pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub request_control: Option<crate::dapp_request::DappRequestControl>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
@@ -423,6 +429,7 @@ pub struct WalletConnectHardwareTypedDataCapabilityResult {
 }
 
 pub struct WalletConnectSendTransactionRequest {
+    pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub request_control: Option<crate::dapp_request::DappRequestControl>,
     pub rpc_reads: Option<super::DappRpcReadClient>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,

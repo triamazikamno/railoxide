@@ -94,12 +94,25 @@ impl WalletRoot {
                 self.send_forms
                     .get(&key)
                     .and_then(|form| form.gateway_execution.clone()),
+                draft
+                    .custom_fee_amount
+                    .map(|amount| (draft.fee_token, amount)),
             )
         };
         let summary = if requires_gas_payer_password {
             private_send_gas_payer_authorization_summary(&draft)
         } else {
             private_send_authorization_summary(&draft)
+        };
+        let summary = if let Some(amount) = draft.custom_fee_amount {
+            summary.with_custom_transaction_fee(super::fee_editor::custom_fee_label(
+                draft.asset.chain_id,
+                draft.fee_token,
+                amount,
+                &self.effective_token_registry,
+            ))
+        } else {
+            summary
         };
         self.request_spend_authorization(intent, summary, window, cx);
     }
@@ -130,13 +143,15 @@ impl WalletRoot {
         } else {
             form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
         };
-        if !gateway_private_estimate_is_ready(
-            form.gateway_execution.as_ref(),
-            estimate_is_current,
-            form.gateway_estimated_at,
-            !(self_broadcast
-                && form.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship),
-        ) {
+        if (form.custom_fee_amount.is_some() && !estimate_is_current)
+            || !gateway_private_estimate_is_ready(
+                form.gateway_execution.as_ref(),
+                estimate_is_current,
+                form.gateway_estimated_at,
+                !(self_broadcast
+                    && form.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship),
+            )
+        {
             self.set_send_form_error(
                 key,
                 "Refresh the current fee estimate before submitting this review.",
@@ -150,6 +165,7 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let custom_fee_amount = form.custom_fee_amount;
         let self_broadcast_funding = effective_delivery_funding_mode(
             delivery_mode,
             self.effective_chain_configs.get(&asset.chain_id),
@@ -390,6 +406,7 @@ impl WalletRoot {
         let fee_policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
 
         Some(SendSpendDraft {
+            custom_fee_amount,
             asset,
             delivery_mode,
             broadcaster_choice,
@@ -448,6 +465,7 @@ impl WalletRoot {
         };
         draft.sponsored_authorization_limit = authorization_limit;
         let SendSpendDraft {
+            custom_fee_amount,
             asset,
             delivery_mode,
             broadcaster_choice,
@@ -675,6 +693,7 @@ impl WalletRoot {
             }
             DeliveryMode::PublicBroadcaster => {
                 let request = DesktopSendPublicBroadcasterRequest {
+                    custom_fee_amount,
                     chain_id,
                     effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
                     view_session,
@@ -991,6 +1010,18 @@ impl WalletRoot {
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
+        if self.unshield_requires_executor(&draft) {
+            if draft.delivery_mode == DeliveryMode::ManualCalldata {
+                self.set_unshield_form_error(key, "External-wallet export is unavailable for this stealth-account action. Select a supported delivery method.", cx);
+                return;
+            }
+            self.request_executor_unshield_authorization(key, &draft, window, cx);
+            return;
+        }
+        if let Some(form) = self.unshield_forms.get_mut(&key) {
+            form.executor_review = None;
+            form.executor_operation = None;
+        }
         let requires_gas_payer_password = self.selected_wallet_source().is_hardware_derived()
             && self_broadcast_requires_software_gas_payer_password(
                 draft.delivery_mode,
@@ -1011,6 +1042,9 @@ impl WalletRoot {
                 self.unshield_forms
                     .get(&key)
                     .and_then(|form| form.gateway_execution.clone()),
+                draft
+                    .custom_fee_amount
+                    .map(|amount| (draft.fee_token, amount)),
             )
         };
         let summary = if requires_gas_payer_password {
@@ -1018,12 +1052,39 @@ impl WalletRoot {
         } else {
             private_unshield_authorization_summary(&draft)
         };
+        let summary = if let Some(amount) = draft.custom_fee_amount {
+            summary.with_custom_transaction_fee(super::fee_editor::custom_fee_label(
+                draft.asset.chain_id,
+                draft.fee_token,
+                amount,
+                &self.effective_token_registry,
+            ))
+        } else {
+            summary
+        };
         self.request_spend_authorization(intent, summary, window, cx);
     }
 
     pub(in crate::root) fn unshield_spend_draft(
         &mut self,
         key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<UnshieldSpendDraft> {
+        self.unshield_spend_draft_with_quote_admission(key, true, cx)
+    }
+
+    pub(in crate::root) fn unshield_spend_draft_for_prepared_review(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<UnshieldSpendDraft> {
+        self.unshield_spend_draft_with_quote_admission(key, false, cx)
+    }
+
+    fn unshield_spend_draft_with_quote_admission(
+        &mut self,
+        key: UnshieldAssetKey,
+        require_current_quote: bool,
         cx: &mut Context<'_, Self>,
     ) -> Option<UnshieldSpendDraft> {
         self.refresh_unshield_native_top_up_state(key, cx);
@@ -1048,13 +1109,17 @@ impl WalletRoot {
         } else {
             form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
         };
-        if !gateway_private_estimate_is_ready(
-            form.gateway_execution.as_ref(),
-            estimate_is_current,
-            form.gateway_estimated_at,
-            !(self_broadcast
-                && form.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship),
-        ) {
+        if require_current_quote
+            && ((form.custom_fee_amount.is_some() && !estimate_is_current)
+                || !gateway_private_estimate_is_ready(
+                    form.gateway_execution.as_ref(),
+                    estimate_is_current,
+                    form.gateway_estimated_at,
+                    !(self_broadcast
+                        && form.self_broadcast_funding
+                            == SelfBroadcastFundingMode::PrivateSponsorship),
+                ))
+        {
             self.set_unshield_form_error(
                 key,
                 "Refresh the current fee estimate before submitting this review.",
@@ -1069,6 +1134,7 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let custom_fee_amount = form.custom_fee_amount;
         let self_broadcast_funding = effective_delivery_funding_mode(
             delivery_mode,
             self.effective_chain_configs.get(&asset.chain_id),
@@ -1312,6 +1378,11 @@ impl WalletRoot {
         let fee_policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
 
         Some(UnshieldSpendDraft {
+            custom_fee_amount,
+            executor_review: self
+                .unshield_forms
+                .get(&key)
+                .and_then(|form| form.executor_review.clone()),
             asset,
             unwrap,
             delivery_mode,
@@ -1371,7 +1442,23 @@ impl WalletRoot {
             return;
         };
         draft.sponsored_authorization_limit = authorization_limit;
+        let requires_executor = self.unshield_requires_executor(&draft);
+        if (requires_executor && draft.executor_review.is_none())
+            || draft
+                .executor_review
+                .as_ref()
+                .is_some_and(|review| !requires_executor || !review.matches(&draft))
+        {
+            self.set_unshield_form_error(
+                key,
+                "Refresh and approve the stealth-account quote before signing.",
+                cx,
+            );
+            return;
+        }
         let UnshieldSpendDraft {
+            custom_fee_amount,
+            executor_review,
             asset,
             unwrap,
             delivery_mode,
@@ -1417,13 +1504,25 @@ impl WalletRoot {
         };
         let native_top_up_request = native_top_up_request_from_plan(native_top_up.as_ref());
 
-        let self_broadcast_gas_fee =
-            sponsored_authorization_limit.map_or(self_broadcast_gas_fee, |limit| {
-                SelfBroadcastGasFeeSelection::Custom {
-                    max_fee_per_gas: limit.max_fee_per_gas,
-                    max_priority_fee_per_gas: limit.max_priority_fee_per_gas,
+        let self_broadcast_gas_fee = executor_review
+            .as_ref()
+            .and_then(|review| match review.quote {
+                super::executor::ExecutorUnshieldQuote::SelfBroadcast { gas_fee, .. } => {
+                    Some(gas_fee)
                 }
+                super::executor::ExecutorUnshieldQuote::Broadcaster(_) => None,
+            })
+            .unwrap_or_else(|| {
+                sponsored_authorization_limit.map_or(self_broadcast_gas_fee, |limit| {
+                    SelfBroadcastGasFeeSelection::Custom {
+                        max_fee_per_gas: limit.max_fee_per_gas,
+                        max_priority_fee_per_gas: limit.max_priority_fee_per_gas,
+                    }
+                })
             });
+        let self_broadcast_initial_gas_fee =
+            self_broadcast_initial_gas_values(&self_broadcast_gas_fee, None)
+                .or(self_broadcast_initial_gas_fee);
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
             if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
                 None
@@ -1572,6 +1671,16 @@ impl WalletRoot {
             DeliveryMode::ManualCalldata => {}
         }
 
+        if let Some(review) = &executor_review
+            && let Some(progress) = &mut self.private_broadcaster_progress
+        {
+            progress.stealth_account =
+                Some(super::super::stealth_accounts::StealthAccountTarget::new(
+                    &session,
+                    review.prepared.operation(),
+                ));
+        }
+
         let http = self.http.clone();
         let waku = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let Some(waku) = self.active_waku() else {
@@ -1616,6 +1725,16 @@ impl WalletRoot {
             }
             DeliveryMode::PublicBroadcaster => {
                 let request = DesktopUnshieldPublicBroadcasterRequest {
+                    custom_fee_amount,
+                    executor: executor_review
+                        .as_ref()
+                        .map(|review| Arc::clone(&review.prepared)),
+                    executor_maximum_private_fee: executor_review
+                        .as_ref()
+                        .and_then(|review| review.maximum_private_fee()),
+                    executor_min_gas_price: executor_review
+                        .as_ref()
+                        .and_then(|review| review.broadcaster_min_gas_price()),
                     chain_id,
                     effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
                     view_session,
@@ -1702,12 +1821,20 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(async move {
-                        submit_desktop_sponsored_unshield_self_broadcast(request, &http)
-                            .await
-                            .map(|result| UnshieldResult::Sponsored(Box::new(result)))
+                        Box::pin(submit_desktop_sponsored_unshield_self_broadcast(
+                            request, &http,
+                        ))
+                        .await
+                        .map(|result| UnshieldResult::Sponsored(Box::new(result)))
                     })
                 } else {
                     let request = DesktopUnshieldSelfBroadcastRequest {
+                        executor: executor_review
+                            .as_ref()
+                            .map(|review| Arc::clone(&review.prepared)),
+                        executor_maximum_gas: executor_review
+                            .as_ref()
+                            .and_then(|review| review.maximum_gas()),
                         transaction_tracking,
                         chain_id,
                         effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -1733,7 +1860,7 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(async move {
-                        submit_desktop_unshield_self_broadcast(request, &http)
+                        Box::pin(submit_desktop_unshield_self_broadcast(request, &http))
                             .await
                             .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
                     })

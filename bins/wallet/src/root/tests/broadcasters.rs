@@ -40,6 +40,7 @@ fn fee_token_options_use_poi_spendable_balances_and_broadcaster_counts() {
         &snapshot,
         &fee_rows,
         None,
+        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -87,6 +88,7 @@ fn fee_token_options_use_fee_only_transaction_spend_limit() {
         &snapshot,
         &fee_rows,
         None,
+        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -121,6 +123,7 @@ fn fee_token_options_include_known_token_icons() {
     let options = public_broadcaster_fee_token_options_from_snapshot(
         &snapshot,
         &fee_rows,
+        None,
         None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
@@ -169,7 +172,7 @@ fn ethereum_weth_public_broadcaster_count_is_zero_without_available_broadcasters
 }
 
 #[test]
-fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
+fn fee_token_options_and_selection_follow_execution_route() {
     let token = Address::from([0x39; 20]);
     let required_relay = Address::from([0x40; 20]);
     let other_relay = Address::from([0x41; 20]);
@@ -196,6 +199,7 @@ fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
         &snapshot,
         &[row.clone()],
         Some(required_relay),
+        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -203,8 +207,9 @@ fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
     );
     let mismatched = public_broadcaster_fee_token_options_from_snapshot(
         &snapshot,
-        &[row],
+        &[row.clone()],
         Some(other_relay),
+        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -213,6 +218,49 @@ fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
 
     assert_eq!(matching[0].eligible_broadcaster_count, 1);
     assert_eq!(mismatched[0].eligible_broadcaster_count, 0);
+
+    let profile = build_effective_chain_configs(&WalletSettings::default()).unwrap()[&1]
+        .accepted_executor_profile()
+        .unwrap();
+    let trust = wallet_ops::PublicBroadcasterTrustFilter::default();
+    for (version, delegate, expected_count) in [
+        ("8.2.3", Some(profile.delegate()), 1),
+        ("8.4.0", Some(profile.delegate()), 1),
+        ("9.0.0", Some(profile.delegate()), 0),
+        ("8.2.3", None, 0),
+        ("8.2.3", Some(other_relay), 0),
+    ] {
+        row.version = Arc::from(version);
+        row.relay_adapt_7702 = delegate;
+        let rows = [row.clone()];
+        let policy = BroadcasterFeePolicy::default();
+        let options = public_broadcaster_fee_token_options_from_snapshot(
+            &snapshot,
+            &rows,
+            Some(other_relay),
+            Some(profile),
+            policy,
+            &trust,
+            None,
+            |_| None,
+        );
+        let candidates = super::super::public_broadcaster::public_broadcaster_candidates_for_route(
+            &rows,
+            1,
+            token,
+            Some(other_relay),
+            Some(profile),
+            policy,
+            None,
+            &trust,
+        );
+        assert_eq!(options[0].eligible_broadcaster_count, expected_count);
+        assert_eq!(candidates.len(), expected_count);
+        assert_eq!(
+            public_broadcaster_submit_disabled_for_fee_token_options(&options, token),
+            expected_count == 0,
+        );
+    }
 }
 
 #[test]

@@ -545,6 +545,7 @@ impl WalletRoot {
             .find(|account| {
                 account.public_account_uuid == input.account
                     && account.is_active_for_wallet(wallet.wallet_id())
+                    && account.is_available_on_chain(input.chain_id)
             })
             .cloned()
             .ok_or("This public account is unavailable")?;

@@ -293,7 +293,9 @@ impl WalletRoot {
         let accounts = self
             .public_accounts
             .iter()
-            .filter(|account| ticket.includes_status(account.status))
+            .filter(|account| {
+                ticket.includes_status(account.status) && account.is_available_on_chain(chain_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let http = self.http.clone();

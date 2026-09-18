@@ -38,6 +38,7 @@ use crate::hardware::{
 
 mod core;
 mod crypto;
+mod executors;
 mod models;
 mod records;
 mod store;
@@ -47,6 +48,7 @@ mod view_cache_migration;
 
 pub use core::*;
 pub use crypto::*;
+pub use executors::*;
 pub use models::*;
 pub use records::*;
 pub use store::{GatewayPermission, SoftwareContextMatch};

@@ -317,6 +317,30 @@ impl GatewayDraftExecution {
         true
     }
 
+    /// Hold submission until preparation has been checked against the approved terms.
+    pub fn require_prepared_review(&self) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.cancelled
+            || state.started
+            || !state.review_approved
+            || matches!(
+                state.status,
+                GatewayDraftStatus::Failed | GatewayDraftStatus::Done
+            )
+        {
+            return false;
+        }
+        state.review_approved = false;
+        state.status = GatewayDraftStatus::Attention;
+        state.step = "Preparing account".into();
+        state.message =
+            "Checking the prepared transaction against your approved fee limits.".into();
+        true
+    }
+
     /// Revalidation failure permits an explicit draft retry, never replay of started work.
     pub fn reject_private_review(&self, message: String) {
         let mut state = self
@@ -733,7 +757,11 @@ mod tests {
         assert!(!execution.start());
         assert!(execution.approve_review());
         execution.cancel_review(); // Closing the successfully approved dialog is not rejection.
+        assert!(execution.require_prepared_review());
+        assert!(!execution.start()); // Preparation must satisfy the approved terms before handoff.
+        assert!(execution.approve_review());
         assert!(execution.start());
+        assert!(!execution.require_prepared_review());
         assert!(!duplicate.start());
         execution.finish(false); // The task can finish before queued handoff events are delivered.
         assert!(!execution.snapshot().can_retry);

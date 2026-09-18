@@ -244,6 +244,8 @@ pub enum RecordKind {
     WalletConnectSession,
     SoftwareContextSeed,
     GatewayPermission,
+    ExecutorAllocation,
+    ExecutorOperation,
 }
 
 impl RecordKind {
@@ -274,6 +276,8 @@ impl RecordKind {
             Self::WalletConnectSession => "walletconnect-session",
             Self::SoftwareContextSeed => "software-context-seed",
             Self::GatewayPermission => "gateway-permission",
+            Self::ExecutorAllocation => "executor-allocation",
+            Self::ExecutorOperation => "executor-operation",
         }
     }
 

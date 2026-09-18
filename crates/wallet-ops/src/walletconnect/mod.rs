@@ -90,5 +90,7 @@ pub enum WalletConnectError {
 
 pub(crate) type Result<T> = std::result::Result<T, WalletConnectError>;
 
+pub(crate) use request::WrappedNative;
+
 #[cfg(test)]
 mod tests;

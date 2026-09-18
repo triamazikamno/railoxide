@@ -1,7 +1,7 @@
 //! Immutable estimate inputs shared by native forms and gateway drafts.
 use super::{
     Address, Arc, BroadcasterChoice, ChainUtxoState, DeliveryFormKind, DesktopNativeTopUpPlan,
-    FeeHandlingMode, PublicBroadcasterCostEstimate, UnshieldAsset, WalletRoot,
+    FeeHandlingMode, PublicBroadcasterCostEstimate, U256, UnshieldAsset, WalletRoot,
     effective_fee_handling_mode, format_send_amount_input, native_top_up_request_from_plan,
     parse_send_amount, parse_unshield_amount, select_public_broadcaster_with_policy_and_trust,
     send_public_broadcaster_estimate_input_error, unshield_public_broadcaster_estimate_input_error,
@@ -23,6 +23,7 @@ pub(in crate::root) enum PrivateEstimateOutput {
 
 #[derive(Clone)]
 pub(in crate::root) struct PrivateEstimateInput {
+    pub(in crate::root) custom_fee_amount: Option<U256>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient: String,
     pub(in crate::root) amount: String,
@@ -153,6 +154,7 @@ impl WalletRoot {
         Ok(Some(match kind {
             DeliveryFormKind::Send => {
                 PrivateEstimateRequest::Send(DesktopSendPublicBroadcasterEstimateRequest {
+                    custom_fee_amount: input.custom_fee_amount,
                     chain_id: asset.chain_id,
                     effective_chain,
                     session,
@@ -173,6 +175,9 @@ impl WalletRoot {
                     return Ok(None);
                 };
                 PrivateEstimateRequest::Unshield(DesktopUnshieldPublicBroadcasterEstimateRequest {
+                    custom_fee_amount: input.custom_fee_amount,
+                    approved_fee_amount: None,
+                    executor: None,
                     chain_id: asset.chain_id,
                     effective_chain,
                     session,
@@ -215,6 +220,7 @@ mod tests {
                 }
             };
             let mut input = PrivateEstimateInput {
+                custom_fee_amount: None,
                 asset: UnshieldAsset {
                     chain_id: 1,
                     token: Address::ZERO,

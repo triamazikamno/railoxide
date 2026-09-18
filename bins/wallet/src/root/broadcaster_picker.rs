@@ -48,7 +48,7 @@ use super::{
     token_display_label, token_display_metadata,
 };
 
-const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const BROADCASTER_PICKER_DIALOG_FIXED_CHROME_HEIGHT: Pixels = px(100.0);
 pub(super) const BROADCASTER_PICKER_MIN_LIST_HEIGHT: Pixels = px(120.0);
 pub(super) const BROADCASTER_PICKER_LIST_HORIZONTAL_PADDING: Pixels = px(8.0);
@@ -68,9 +68,32 @@ pub(super) enum BroadcasterChoice {
     },
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum BroadcasterPickerTarget {
+    Private {
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+    },
+    Recovery(WeakEntity<super::stealth_accounts::StealthAccountsView>),
+}
+
+impl BroadcasterPickerTarget {
+    fn is_private(&self, kind: DeliveryFormKind, key: UnshieldAssetKey) -> bool {
+        matches!(self, Self::Private { kind: current_kind, key: current_key } if *current_kind == kind && *current_key == key)
+    }
+
+    pub(super) fn element_id(&self, suffix: &str) -> SharedString {
+        match self {
+            Self::Private { kind, key } => {
+                super::private_action::delivery_element_id(*key, *kind, suffix)
+            }
+            Self::Recovery(_) => format!("stealth-recovery-broadcaster-{suffix}").into(),
+        }
+    }
+}
+
 pub(super) struct BroadcasterPickerState {
-    pub(super) kind: DeliveryFormKind,
-    pub(super) key: UnshieldAssetKey,
+    pub(super) target: BroadcasterPickerTarget,
     pub(super) query_input: Entity<InputState>,
     pub(super) list: Entity<ListState<BroadcasterPickerDelegate>>,
     pub(super) scroll_indicator: Entity<BroadcasterPickerScrollIndicator>,
@@ -216,8 +239,19 @@ pub(super) struct BroadcasterPickerFeeEstimateContext {
     service_gas_price: u128,
 }
 
-impl BroadcasterPickerFeeEstimateContext {
-    pub(super) fn from_estimate(estimate: &PublicBroadcasterCostEstimate) -> Self {
+impl From<&wallet_ops::ExecutorRecoveryFeeEstimate> for BroadcasterPickerFeeEstimateContext {
+    fn from(estimate: &wallet_ops::ExecutorRecoveryFeeEstimate) -> Self {
+        Self {
+            railgun_address: estimate.broadcaster().railgun_address.clone(),
+            fee_amount: estimate.fee_amount(),
+            gas_limit: estimate.gas_limit(),
+            service_gas_price: public_broadcaster_service_gas_price(estimate.min_gas_price()),
+        }
+    }
+}
+
+impl From<&PublicBroadcasterCostEstimate> for BroadcasterPickerFeeEstimateContext {
+    fn from(estimate: &PublicBroadcasterCostEstimate) -> Self {
         Self {
             railgun_address: estimate.broadcaster.railgun_address.clone(),
             fee_amount: estimate.fee_amount,
@@ -337,15 +371,13 @@ pub(super) struct BroadcasterPickerDialogSnapshot {
     pub(super) expanded_groups: BTreeSet<BroadcasterPickerGroupKey>,
     pub(super) collapsed_selected_children:
         BTreeMap<BroadcasterPickerGroupKey, BroadcasterPickerSelectedCollapse>,
-    pub(super) kind: DeliveryFormKind,
-    pub(super) key: UnshieldAssetKey,
+    pub(super) target: BroadcasterPickerTarget,
 }
 
 pub(super) struct BroadcasterPickerDelegate {
     selected_index: Option<IndexPath>,
     root: WeakEntity<WalletRoot>,
-    kind: DeliveryFormKind,
-    key: UnshieldAssetKey,
+    target: BroadcasterPickerTarget,
     generating: bool,
     entries: Vec<BroadcasterPickerEntry>,
     empty_message: SharedString,
@@ -363,15 +395,10 @@ pub(super) struct BroadcasterPickerDelegate {
 }
 
 impl BroadcasterPickerDelegate {
-    pub(super) fn new(
-        root: WeakEntity<WalletRoot>,
-        kind: DeliveryFormKind,
-        key: UnshieldAssetKey,
-    ) -> Self {
+    pub(super) fn new(root: WeakEntity<WalletRoot>, target: BroadcasterPickerTarget) -> Self {
         Self {
             root,
-            kind,
-            key,
+            target,
             generating: false,
             entries: Vec::new(),
             empty_message: SharedString::from("No broadcasters match this search."),
@@ -639,6 +666,30 @@ impl WalletRoot {
             return;
         };
 
+        self.open_broadcaster_picker_for_target(
+            BroadcasterPickerTarget::Private { kind, key },
+            &asset_label,
+            chain_id,
+            fee_token,
+            window,
+            cx,
+        );
+        self.refresh_public_broadcaster_anchor(kind, key, cx);
+        self.schedule_broadcaster_picker_fee_estimate(kind, key, cx);
+    }
+
+    pub(super) fn open_broadcaster_picker_for_target(
+        &mut self,
+        target: BroadcasterPickerTarget,
+        asset_label: &str,
+        chain_id: u64,
+        fee_token: alloy::primitives::Address,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.broadcaster_picker.is_some() {
+            return;
+        }
         let query_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("search broadcasters"));
         let focus_query_input = query_input.clone();
@@ -650,13 +701,16 @@ impl WalletRoot {
         .detach();
         let root = cx.weak_entity();
         let list = cx.new(|cx| {
-            ListState::new(BroadcasterPickerDelegate::new(root, kind, key), window, cx)
-                .selectable(true)
+            ListState::new(
+                BroadcasterPickerDelegate::new(root, target.clone()),
+                window,
+                cx,
+            )
+            .selectable(true)
         });
         let scroll_indicator = cx.new(|cx| BroadcasterPickerScrollIndicator::new(list.clone(), cx));
         self.broadcaster_picker = Some(BroadcasterPickerState {
-            kind,
-            key,
+            target,
             query_input,
             list,
             scroll_indicator,
@@ -670,8 +724,7 @@ impl WalletRoot {
             fee_estimate_id: 0,
             fee_estimate_retry: BroadcasterPickerFeeEstimateRetryState::default(),
         });
-        self.refresh_public_broadcaster_anchor(kind, key, cx);
-        self.schedule_broadcaster_picker_fee_estimate(kind, key, cx);
+        self.public_broadcaster_anchor_refresh.wake();
         Self::open_broadcaster_picker_dialog(
             format!(
                 "{asset_label} · fee token {}",
@@ -681,13 +734,37 @@ impl WalletRoot {
             window,
             cx,
         );
-        cx.defer_in(window, move |_this, window, cx| {
+        cx.defer_in(window, move |_, window, cx| {
             focus_query_input
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx);
         });
         cx.notify();
+    }
+
+    pub(super) fn set_broadcaster_picker_allow_out_of_range(
+        &mut self,
+        checked: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(target) = self
+            .broadcaster_picker
+            .as_ref()
+            .map(|picker| picker.target.clone())
+        else {
+            return;
+        };
+        match target {
+            BroadcasterPickerTarget::Private { kind, key } => {
+                self.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+            }
+            BroadcasterPickerTarget::Recovery(view) => cx.defer(move |cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.set_recovery_allow_out_of_range(checked, cx);
+                });
+            }),
+        }
     }
 
     fn open_broadcaster_picker_dialog(
@@ -749,7 +826,7 @@ impl WalletRoot {
         let Some(picker) = self.broadcaster_picker.as_mut() else {
             return;
         };
-        if picker.kind != kind || picker.key != key {
+        if !picker.target.is_private(kind, key) {
             return;
         }
         picker.fee_estimate_refresh_pending = picker.fee_estimate_context.is_some();
@@ -767,8 +844,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if let Some(picker) = self.broadcaster_picker.as_mut()
-            && picker.kind == kind
-            && picker.key == key
+            && picker.target.is_private(kind, key)
         {
             picker.fee_estimate_context = Some(context);
             picker.fee_estimate_refresh_pending = false;
@@ -786,8 +862,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if self.broadcaster_picker.as_ref().is_none_or(|picker| {
-            picker.kind != kind
-                || picker.key != key
+            !picker.target.is_private(kind, key)
                 || picker.estimating_fee_context
                 || (picker.fee_estimate_context.is_some() && !picker.fee_estimate_refresh_pending)
                 || picker.fee_estimate_retry.is_scheduled()
@@ -831,9 +906,7 @@ impl WalletRoot {
             .spawn(async move { request.estimate(&http).await });
         cx.spawn(async move |this, cx| {
             let context = match join.await {
-                Ok(Ok(estimate)) => Some(BroadcasterPickerFeeEstimateContext::from_estimate(
-                    &estimate,
-                )),
+                Ok(Ok(estimate)) => Some(BroadcasterPickerFeeEstimateContext::from(&estimate)),
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "broadcaster picker fee estimate failed");
                     None
@@ -848,8 +921,7 @@ impl WalletRoot {
                 let Some(picker) = root.broadcaster_picker.as_mut() else {
                     return;
                 };
-                if picker.kind != kind || picker.key != key || picker.fee_estimate_id != estimate_id
-                {
+                if !picker.target.is_private(kind, key) || picker.fee_estimate_id != estimate_id {
                     return;
                 }
                 picker.estimating_fee_context = false;
@@ -875,8 +947,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let should_schedule = self.broadcaster_picker.as_ref().is_some_and(|picker| {
-            picker.kind == kind
-                && picker.key == key
+            picker.target.is_private(kind, key)
                 && picker.fee_estimate_retry.should_schedule(
                     picker.estimating_fee_context,
                     picker.fee_estimate_context.is_some(),
@@ -899,8 +970,7 @@ impl WalletRoot {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |root, cx| {
                 let current = root.broadcaster_picker.as_mut().is_some_and(|picker| {
-                    picker.kind == kind
-                        && picker.key == key
+                    picker.target.is_private(kind, key)
                         && picker.fee_estimate_retry.clear_if_current(generation)
                 });
                 if current {
@@ -922,13 +992,13 @@ impl WalletRoot {
                 .get(&key)?
                 .cost_estimate
                 .as_ref()
-                .map(BroadcasterPickerFeeEstimateContext::from_estimate),
+                .map(BroadcasterPickerFeeEstimateContext::from),
             DeliveryFormKind::Unshield => self
                 .unshield_forms
                 .get(&key)?
                 .cost_estimate
                 .as_ref()
-                .map(BroadcasterPickerFeeEstimateContext::from_estimate),
+                .map(BroadcasterPickerFeeEstimateContext::from),
         }
     }
 
@@ -962,6 +1032,7 @@ impl WalletRoot {
                     return None;
                 }
                 PrivateEstimateInput {
+                    custom_fee_amount: form.custom_fee_amount,
                     asset: form.asset.clone(),
                     recipient: String::new(),
                     amount: form.amount_input.read(cx).value().to_string(),
@@ -979,6 +1050,7 @@ impl WalletRoot {
                     return None;
                 }
                 PrivateEstimateInput {
+                    custom_fee_amount: form.custom_fee_amount,
                     asset: form.asset.clone(),
                     recipient: String::new(),
                     amount: form.amount_input.read(cx).value().to_string(),
@@ -1002,12 +1074,25 @@ impl WalletRoot {
 
     pub(super) fn choose_broadcaster_from_picker(
         &mut self,
-        kind: DeliveryFormKind,
-        key: UnshieldAssetKey,
+        target: BroadcasterPickerTarget,
         railgun_address: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if let BroadcasterPickerTarget::Recovery(view) = target {
+            self.broadcaster_picker = None;
+            window.close_dialog(cx);
+            window.defer(cx, move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.choose_recovery_broadcaster(railgun_address, window, cx);
+                });
+            });
+            cx.notify();
+            return;
+        }
+        let BroadcasterPickerTarget::Private { kind, key } = target else {
+            return;
+        };
         let choice = BroadcasterChoice::Specific { railgun_address };
         let Some((chain_id, fee_token, unwrap, native_top_up, favorites_only, allow_suspicious)) =
             (match kind {
@@ -1061,6 +1146,12 @@ impl WalletRoot {
         cx: &App,
     ) -> Option<BroadcasterPickerDialogSnapshot> {
         let picker = self.broadcaster_picker.as_ref()?;
+        let recovery = match &picker.target {
+            BroadcasterPickerTarget::Recovery(view) => {
+                Some(view.upgrade()?.read(cx).recovery_picker_context()?)
+            }
+            BroadcasterPickerTarget::Private { .. } => None,
+        };
         let (
             chain_id,
             token,
@@ -1073,8 +1164,11 @@ impl WalletRoot {
             cost_estimate,
             cost_estimate_pending,
             estimating_cost,
-        ) = (match picker.kind {
-            DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
+        ) = (match &picker.target {
+            BroadcasterPickerTarget::Private {
+                kind: DeliveryFormKind::Send,
+                key,
+            } => self.send_forms.get(key).map(|form| {
                 (
                     form.asset.chain_id,
                     form.selected_fee_token,
@@ -1089,7 +1183,10 @@ impl WalletRoot {
                     form.estimating_cost,
                 )
             }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
+            BroadcasterPickerTarget::Private {
+                kind: DeliveryFormKind::Unshield,
+                key,
+            } => self.unshield_forms.get(key).map(|form| {
                 (
                     form.asset.chain_id,
                     form.selected_fee_token,
@@ -1104,6 +1201,21 @@ impl WalletRoot {
                     form.estimating_cost,
                 )
             }),
+            BroadcasterPickerTarget::Recovery(_) => recovery.as_ref().map(|data| {
+                (
+                    data.chain_id,
+                    data.token,
+                    false,
+                    data.choice.clone(),
+                    data.busy,
+                    data.allow_out_of_range,
+                    data.favorites_only,
+                    false,
+                    None,
+                    data.estimating,
+                    false,
+                )
+            }),
         })?;
         let query = picker
             .query_input
@@ -1112,13 +1224,18 @@ impl WalletRoot {
             .trim()
             .to_ascii_lowercase();
         let policy = self.public_broadcaster_fee_policy(show_all_broadcasters);
-        let candidates = self.current_public_broadcaster_candidates(
-            chain_id,
-            token,
-            unwrap,
-            native_top_up,
-            favorites_only,
-            policy,
+        let candidates = recovery.as_ref().map_or_else(
+            || {
+                self.current_public_broadcaster_candidates(
+                    chain_id,
+                    token,
+                    unwrap,
+                    native_top_up,
+                    favorites_only,
+                    policy,
+                )
+            },
+            |data| data.candidates.clone(),
         );
         let candidates = if show_all_broadcasters {
             candidates
@@ -1138,8 +1255,10 @@ impl WalletRoot {
         } else {
             "No broadcasters match this search."
         });
-        let fee_estimate_context = cost_estimate
-            .map(BroadcasterPickerFeeEstimateContext::from_estimate)
+        let fee_estimate_context = recovery
+            .as_ref()
+            .and_then(|data| data.fee_context.clone())
+            .or_else(|| cost_estimate.map(BroadcasterPickerFeeEstimateContext::from))
             .or_else(|| picker.fee_estimate_context.clone());
         let estimated_fee_placeholder =
             if cost_estimate_pending || estimating_cost || picker.estimating_fee_context {
@@ -1183,8 +1302,7 @@ impl WalletRoot {
             selected_address,
             expanded_groups: picker.expanded_groups.clone(),
             collapsed_selected_children: picker.collapsed_selected_children.clone(),
-            kind: picker.kind,
-            key: picker.key,
+            target: picker.target.clone(),
         })
     }
 }
@@ -1215,8 +1333,7 @@ impl ListDelegate for BroadcasterPickerDelegate {
             broadcaster_picker_section_divider_before(&self.entries, self.view_mode, ix.row);
         let entry = self.entries.get(ix.row)?.clone();
         let root = self.root.clone();
-        let kind = self.kind;
-        let key = self.key;
+        let target = self.target.clone();
         match entry {
             BroadcasterPickerEntry::Group(group) => Some(
                 ListItem::new(SharedString::from(broadcaster_picker_group_element_id(
@@ -1257,8 +1374,7 @@ impl ListDelegate for BroadcasterPickerDelegate {
                         let railgun_address = railgun_address.clone();
                         let _ = root.update(cx, |root, cx| {
                             root.choose_broadcaster_from_picker(
-                                kind,
-                                key,
+                                target.clone(),
                                 railgun_address,
                                 window,
                                 cx,
@@ -1315,11 +1431,10 @@ impl ListDelegate for BroadcasterPickerDelegate {
         else {
             return;
         };
-        let kind = self.kind;
-        let key = self.key;
+        let target = self.target.clone();
         let _ = self.root.update(cx, |root, cx| match entry {
             BroadcasterPickerEntry::Broadcaster(row) => {
-                root.choose_broadcaster_from_picker(kind, key, row.railgun_address, window, cx);
+                root.choose_broadcaster_from_picker(target, row.railgun_address, window, cx);
             }
             BroadcasterPickerEntry::Group(group) => root.toggle_broadcaster_picker_group(
                 group.key,
@@ -1395,7 +1510,7 @@ pub(super) fn broadcaster_candidate_estimated_fee_amount_for_estimate(
     candidate: &PublicBroadcasterCandidate,
     estimate: &PublicBroadcasterCostEstimate,
 ) -> Option<U256> {
-    let context = BroadcasterPickerFeeEstimateContext::from_estimate(estimate);
+    let context = BroadcasterPickerFeeEstimateContext::from(estimate);
     broadcaster_candidate_estimated_fee_amount(candidate, Some(&context))
 }
 

@@ -53,6 +53,17 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
     native_top_up: Option<&'a wallet_ops::DesktopNativeTopUpPlan>,
 }
 
+pub(super) struct PublicBroadcasterFeeDisplay<'a> {
+    pub(super) broadcaster: &'a PublicBroadcasterCandidate,
+    pub(super) registry: Option<&'a EffectiveTokenRegistry>,
+    pub(super) chain_id: u64,
+    pub(super) fee_token: Address,
+    pub(super) fee_amount: U256,
+    pub(super) gas_limit: u64,
+    pub(super) min_gas_price: u128,
+    pub(super) fee_anchor_rate: Option<U256>,
+}
+
 pub(super) struct PrivateBroadcasterProgressContext<'a> {
     pub(super) display: PublicBroadcasterCostDisplay<'a>,
     pub(super) anchor_cache: &'a TokenAnchorRateCache,
@@ -93,6 +104,19 @@ fn format_gwei(wei: u128) -> String {
 }
 
 impl<'a> PublicBroadcasterCostDisplay<'a> {
+    pub(super) const fn fee_display(&self) -> PublicBroadcasterFeeDisplay<'_> {
+        PublicBroadcasterFeeDisplay {
+            broadcaster: self.broadcaster,
+            registry: self.registry,
+            chain_id: self.chain_id,
+            fee_token: self.fee_token,
+            fee_amount: self.fee_amount,
+            gas_limit: self.gas_limit,
+            min_gas_price: self.min_gas_price,
+            fee_anchor_rate: self.fee_anchor_rate,
+        }
+    }
+
     pub(super) const fn from_result(
         result: &'a PublicBroadcasterSubmissionResult,
         fee_anchor_rate: Option<U256>,
@@ -182,6 +206,63 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         &self,
         anchor_cache: &TokenAnchorRateCache,
     ) -> Vec<ui::private_action::DisplayRow> {
+        self.fee_display().fee_rows(anchor_cache)
+    }
+
+    pub(super) fn private_spend_label(&self) -> &'static str {
+        if self.action_token == self.fee_token {
+            "Total private spend"
+        } else {
+            "Action-token private spend"
+        }
+    }
+
+    pub(super) fn action_amount(&self, amount: U256) -> String {
+        format_token_amount_for_display(self.chain_id, self.action_token, amount, self.registry)
+    }
+
+    pub(super) fn action_amount_with_usd(
+        &self,
+        amount: U256,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        format_value_with_usd_label(
+            self.action_amount(amount),
+            amount,
+            token_display_metadata(self.registry, self.chain_id, &self.action_token)
+                .map(|metadata| metadata.decimals),
+            anchor_cache.cached_token_usd_micro_value(self.chain_id, self.action_token, amount),
+            false,
+        )
+    }
+
+    pub(super) fn fee_amount_with_usd(&self, anchor_cache: &TokenAnchorRateCache) -> String {
+        self.fee_display().fee_amount_with_usd(anchor_cache)
+    }
+
+    pub(super) fn protocol_fee_value_with_usd(
+        &self,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        self.action_amount_with_usd(self.protocol_fee_amount, anchor_cache)
+    }
+
+    pub(super) fn gas_value(&self) -> String {
+        self.fee_display().gas_value()
+    }
+
+    pub(super) fn native_top_up_recipient_suffix(&self) -> Option<String> {
+        self.native_top_up.as_ref().map(|top_up| {
+            format_native_top_up_recipient_suffix(self.chain_id, top_up.native_amount)
+        })
+    }
+}
+
+impl PublicBroadcasterFeeDisplay<'_> {
+    pub(super) fn fee_rows(
+        &self,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> Vec<ui::private_action::DisplayRow> {
         let breakdown = self.fee_breakdown();
         [
             (
@@ -202,18 +283,6 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         .collect()
     }
 
-    pub(super) fn private_spend_label(&self) -> &'static str {
-        if self.action_token == self.fee_token {
-            "Total private spend"
-        } else {
-            "Action-token private spend"
-        }
-    }
-
-    pub(super) fn action_amount(&self, amount: U256) -> String {
-        format_token_amount_for_display(self.chain_id, self.action_token, amount, self.registry)
-    }
-
     pub(super) fn fee_amount(&self) -> String {
         format_token_amount_for_display(
             self.chain_id,
@@ -221,14 +290,6 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             self.fee_amount,
             self.registry,
         )
-    }
-
-    pub(super) fn action_amount_with_usd(
-        &self,
-        amount: U256,
-        anchor_cache: &TokenAnchorRateCache,
-    ) -> String {
-        self.token_amount_with_usd(anchor_cache, self.action_token, amount, false)
     }
 
     pub(super) fn fee_amount_with_usd(&self, anchor_cache: &TokenAnchorRateCache) -> String {
@@ -269,7 +330,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         anchor_cache: &TokenAnchorRateCache,
     ) -> String {
         let token_value = self.native_gas_cost_value(breakdown);
-        Self::value_with_usd(
+        format_value_with_usd_label(
             token_value,
             breakdown.native_gas_cost,
             Some(18),
@@ -318,26 +379,11 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         )
     }
 
-    pub(super) fn protocol_fee_value_with_usd(
-        &self,
-        anchor_cache: &TokenAnchorRateCache,
-    ) -> String {
-        self.action_amount_with_usd(self.protocol_fee_amount, anchor_cache)
-    }
-
-    fn token_amount_with_usd(
-        &self,
-        anchor_cache: &TokenAnchorRateCache,
-        token: Address,
-        amount: U256,
-        negative: bool,
-    ) -> String {
-        self.token_amount_value_with_usd(
-            format_token_amount_for_display(self.chain_id, token, amount, self.registry),
-            anchor_cache,
-            token,
-            amount,
-            negative,
+    pub(super) fn gas_value(&self) -> String {
+        format!(
+            "~{} gas @ {} gwei",
+            self.gas_limit,
+            format_gwei(public_broadcaster_service_gas_price(self.min_gas_price))
         )
     }
 
@@ -349,7 +395,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         amount: U256,
         negative: bool,
     ) -> String {
-        Self::value_with_usd(
+        format_value_with_usd_label(
             token_value,
             amount,
             token_display_metadata(self.registry, self.chain_id, &token)
@@ -357,30 +403,6 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             anchor_cache.cached_token_usd_micro_value(self.chain_id, token, amount),
             negative,
         )
-    }
-
-    fn value_with_usd(
-        token_value: String,
-        amount: U256,
-        decimals: Option<u8>,
-        usd_micro_value: Option<U256>,
-        negative: bool,
-    ) -> String {
-        format_value_with_usd_label(token_value, amount, decimals, usd_micro_value, negative)
-    }
-
-    pub(super) fn gas_value(&self) -> String {
-        format!(
-            "~{} gas @ {} gwei",
-            self.gas_limit,
-            format_gwei(public_broadcaster_service_gas_price(self.min_gas_price))
-        )
-    }
-
-    pub(super) fn native_top_up_recipient_suffix(&self) -> Option<String> {
-        self.native_top_up.as_ref().map(|top_up| {
-            format_native_top_up_recipient_suffix(self.chain_id, top_up.native_amount)
-        })
     }
 }
 
@@ -591,6 +613,7 @@ impl WalletRoot {
             return;
         }
         let input = PrivateEstimateInput {
+            custom_fee_amount: form.custom_fee_amount,
             asset: form.asset.clone(),
             recipient: form.recipient_input.read(cx).value().to_string(),
             amount: form.amount_input.read(cx).value().to_string(),
@@ -651,7 +674,7 @@ impl WalletRoot {
                 form.estimating_cost = false;
                 let picker_context = match result {
                     Ok(estimate) => {
-                        let context = BroadcasterPickerFeeEstimateContext::from_estimate(&estimate);
+                        let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
                         form.error = None;
                         form.cost_estimate = Some(estimate);
                         form.gateway_estimated_at = form
@@ -697,6 +720,7 @@ impl WalletRoot {
             return;
         }
         let input = PrivateEstimateInput {
+            custom_fee_amount: form.custom_fee_amount,
             asset: form.asset.clone(),
             recipient: form.recipient_input.read(cx).value().to_string(),
             amount: form.amount_input.read(cx).value().to_string(),
@@ -767,7 +791,7 @@ impl WalletRoot {
                 form.estimating_cost = false;
                 let picker_context = match result {
                     Ok(estimate) => {
-                        let context = BroadcasterPickerFeeEstimateContext::from_estimate(&estimate);
+                        let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
                         form.error = None;
                         form.cost_estimate = Some(estimate);
                         form.gateway_estimated_at = form
@@ -812,13 +836,20 @@ fn render_transaction_fee_breakdown(
     display: &PublicBroadcasterCostDisplay<'_>,
     anchor_cache: &TokenAnchorRateCache,
     open: bool,
+    custom_fee: bool,
+    edit_action: Option<AnyElement>,
 ) -> impl IntoElement {
+    let mut total = display.fee_amount_with_usd(anchor_cache);
+    if custom_fee {
+        total.push_str(" · Custom");
+    }
     ui::private_action::transaction_fee_breakdown(
         delivery_element_id(key, kind, "transaction-fee-breakdown"),
-        display.fee_amount_with_usd(anchor_cache),
+        total,
         display.fee_rows(anchor_cache),
         display.gas_value(),
         open,
+        edit_action,
         move |open, _, cx| {
             root.update(cx, |root, cx| {
                 root.set_transaction_fee_breakdown_open(kind, key, open, cx);
@@ -845,6 +876,8 @@ pub(super) fn render_public_broadcaster_cost_estimate(
     anchor_cache: &TokenAnchorRateCache,
     transaction_fee_breakdown_open: bool,
     refreshing: bool,
+    custom_fee_amount: Option<U256>,
+    fee_editable: bool,
 ) -> gpui::Div {
     let display =
         PublicBroadcasterCostDisplay::from_estimate(asset, estimate, fee_anchor_rate, registry);
@@ -858,6 +891,11 @@ pub(super) fn render_public_broadcaster_cost_estimate(
             &display,
             anchor_cache,
             transaction_fee_breakdown_open,
+            custom_fee_amount.is_some(),
+            fee_editable.then(|| {
+                super::private_action::fee_editor::fee_edit_button(root.clone(), kind, key)
+                    .into_any_element()
+            }),
         ),
         public_broadcaster_estimate_shape(estimate),
         delivery_element_id(key, kind, "refresh-estimate"),

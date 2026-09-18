@@ -1,4 +1,5 @@
 use super::helpers::*;
+use alloy::rpc::types::TransactionRequest;
 
 #[test]
 fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_required() {
@@ -39,6 +40,79 @@ fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_req
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0].fees_id, "ok");
     assert_eq!(candidates[1].fees_id, "poi");
+}
+
+#[test]
+fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
+    let (mut reserved, _) = sample_public_broadcaster_candidate(11);
+    let chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .remove(&1)
+            .unwrap();
+    reserved.relay_adapt_7702 = Some(chain.accepted_executor_profile().unwrap().delegate());
+    let rows = [fee_row_with_broadcaster_seed(
+        1,
+        reserved.token,
+        50,
+        0.9,
+        "refreshed-fees",
+        11,
+    )];
+    let delivery = crate::ExecutorDelivery::PublicBroadcaster(Box::new(reserved.clone()));
+    let policy = BroadcasterFeePolicy::default();
+    let trust = PublicBroadcasterTrustFilter::default();
+    let select = |delivery,
+                  selection: &PublicBroadcasterSelection,
+                  anchor,
+                  trust: &PublicBroadcasterTrustFilter| {
+        crate::desktop::public_broadcaster_for_request(
+            &rows,
+            1,
+            reserved.token,
+            None,
+            selection,
+            policy,
+            trust,
+            anchor,
+            delivery,
+        )
+    };
+    let random = PublicBroadcasterSelection::Random;
+    assert_eq!(
+        select(None, &random, None, &trust).unwrap().fees_id,
+        "refreshed-fees"
+    );
+    for selection in [
+        random.clone(),
+        PublicBroadcasterSelection::Specific {
+            railgun_address: reserved.railgun_address.clone(),
+        },
+    ] {
+        let selected = select(Some(&delivery), &selection, None, &trust).unwrap();
+        assert_eq!(selected.fees_id, reserved.fees_id);
+        assert_eq!(selected.fee, reserved.fee);
+        assert_eq!(selected.fee_expiration, reserved.fee_expiration);
+    }
+    assert!(select(Some(&delivery), &random, Some(U256::from(100)), &trust).is_err());
+    let favorites_only = PublicBroadcasterTrustFilter {
+        favorites_only: true,
+        ..trust
+    };
+    assert!(select(Some(&delivery), &random, None, &favorites_only).is_err());
+    let mut expired = reserved.clone();
+    expired.fee_expiration = SystemTime::now() - Duration::from_secs(1);
+    assert!(
+        select(
+            Some(&crate::ExecutorDelivery::PublicBroadcaster(Box::new(
+                expired
+            ))),
+            &random,
+            None,
+            &PublicBroadcasterTrustFilter::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -515,17 +589,17 @@ fn public_broadcaster_policy_uses_fixed_anchor_without_cache() {
 #[test]
 fn public_broadcaster_fee_breakdown_splits_gas_and_margin() {
     let breakdown = public_broadcaster_fee_breakdown(
-        uint!(2_500_U256),
+        uint!(3_000_U256),
         10,
         100,
         Some(uint!(2_000_000_000_000_000_000_U256)),
     );
 
-    assert_eq!(breakdown.native_gas_cost, uint!(1_010_U256));
-    assert_eq!(breakdown.fee_token_gas_cost, Some(uint!(2_020_U256)));
+    assert_eq!(breakdown.native_gas_cost, uint!(1_250_U256));
+    assert_eq!(breakdown.fee_token_gas_cost, Some(uint!(2_500_U256)));
     assert_eq!(
         breakdown.broadcaster_fee,
-        Some(PublicBroadcasterFeeMargin::Positive(uint!(480_U256)))
+        Some(PublicBroadcasterFeeMargin::Positive(uint!(500_U256)))
     );
 }
 
@@ -541,9 +615,9 @@ fn public_broadcaster_fee_breakdown_handles_negative_and_missing_anchor() {
 
     assert_eq!(
         negative.broadcaster_fee,
-        Some(PublicBroadcasterFeeMargin::Negative(uint!(1_020_U256)))
+        Some(PublicBroadcasterFeeMargin::Negative(uint!(1_500_U256)))
     );
-    assert_eq!(missing.native_gas_cost, uint!(1_010_U256));
+    assert_eq!(missing.native_gas_cost, uint!(1_250_U256));
     assert_eq!(missing.fee_token_gas_cost, None);
     assert_eq!(missing.broadcaster_fee, None);
 }
@@ -782,6 +856,8 @@ fn public_broadcaster_fee_stabilization_accepts_covering_fee() {
 
 #[test]
 fn public_broadcaster_fee_stabilization_buffers_retries() {
+    use crate::desktop::bounded_public_broadcaster_fee;
+
     assert_eq!(
         buffered_public_broadcaster_fee(uint!(10_000_U256)),
         uint!(10_100_U256)
@@ -790,6 +866,185 @@ fn public_broadcaster_fee_stabilization_buffers_retries() {
         buffered_public_broadcaster_fee(uint!(1_U256)),
         uint!(2_U256)
     );
+    let approved = buffered_public_broadcaster_fee(uint!(10_000_U256));
+    // A small required-fee increase can consume the approved buffer, but must
+    // neither increase the approved spend nor reject a fee that still fits.
+    assert_eq!(
+        bounded_public_broadcaster_fee(uint!(10_050_U256), Some(approved)).unwrap(),
+        approved
+    );
+    assert_eq!(
+        bounded_public_broadcaster_fee(approved, Some(approved)).unwrap(),
+        approved
+    );
+    assert!(bounded_public_broadcaster_fee(approved + U256::ONE, Some(approved)).is_err());
+    assert_eq!(
+        bounded_public_broadcaster_fee(uint!(10_050_U256), None).unwrap(),
+        buffered_public_broadcaster_fee(uint!(10_050_U256))
+    );
+}
+
+#[test]
+fn executor_quote_refresh_consumes_approved_fee_cushion_before_increasing_the_quote() {
+    let token = address(0x25);
+    let entered = uint!(10_000_000_000_000_U256);
+    for (fee_token, mode) in [
+        (token, FeeHandlingMode::DeductFromAmount),
+        (token, FeeHandlingMode::AddToAmount),
+        (address(0x26), FeeHandlingMode::DeductFromAmount),
+    ] {
+        let broadcaster = eligible_public_broadcasters(
+            &[fee_row(
+                1,
+                fee_token,
+                1_000_000_000_000_000_000,
+                0.9,
+                "approval",
+            )],
+            1,
+            fee_token,
+            None,
+            SystemTime::now(),
+        )
+        .remove(0);
+        let estimate = |gas_price, starting_fee| {
+            approximate_public_broadcaster_cost(
+                broadcaster.clone(),
+                token,
+                fee_token,
+                entered,
+                mode,
+                RAILGUN_PROTOCOL_FEE_BPS,
+                gas_price,
+                starting_fee,
+                None,
+                |_split| {
+                    let capacity = entered * U256::from(2);
+                    let selection = selection_info(capacity, 1, 1, 2, 1, capacity);
+                    Ok(unshield_approximate_shape(&selection, capacity, true).with_executor(true))
+                },
+            )
+            .unwrap()
+        };
+        let approved = estimate(100_000, U256::ZERO);
+        // Re-applying the cushion after a 0.5% price move needlessly exceeds approval.
+        assert!(estimate(100_500, U256::ZERO).fee_amount > approved.fee_amount);
+        for price in [100_500, 101_000] {
+            let refreshed = estimate(price, approved.fee_amount);
+            assert_eq!(refreshed.fee_amount, approved.fee_amount);
+            assert_eq!(refreshed.recipient_amount, approved.recipient_amount);
+            assert_eq!(refreshed.total_private_spend, approved.total_private_spend);
+        }
+        let exceeded = estimate(101_001, approved.fee_amount);
+        assert!(exceeded.fee_amount > approved.fee_amount);
+        if fee_token == token && mode == FeeHandlingMode::DeductFromAmount {
+            assert!(exceeded.recipient_amount < approved.recipient_amount);
+        } else if mode == FeeHandlingMode::AddToAmount {
+            assert!(exceeded.total_private_spend > approved.total_private_spend);
+        }
+    }
+}
+
+#[test]
+fn custom_broadcaster_fee_stays_exact_within_the_reviewed_limit() {
+    use crate::desktop::validate_custom_public_broadcaster_fee;
+    let custom = uint!(20_000_U256);
+    for required in [uint!(10_000_U256), custom] {
+        assert_eq!(
+            validate_custom_public_broadcaster_fee(custom, required, Some(custom)).unwrap(),
+            custom
+        );
+    }
+    assert!(validate_custom_public_broadcaster_fee(custom, custom + U256::ONE, None).is_err());
+    assert!(
+        validate_custom_public_broadcaster_fee(custom, U256::ONE, Some(custom - U256::ONE))
+            .is_err()
+    );
+    assert!(validate_custom_public_broadcaster_fee(U256::ZERO, U256::ZERO, None).is_err());
+}
+
+#[test]
+fn custom_broadcaster_fee_drives_note_selection_and_recipient_amounts() {
+    let token = address(0x25);
+    let entered = uint!(10_000_000_000_U256);
+    let custom = uint!(2_000_000_000_U256);
+    let capacity = entered * U256::from(2);
+    for (fee_token, mode) in [
+        (token, FeeHandlingMode::DeductFromAmount),
+        (token, FeeHandlingMode::AddToAmount),
+        (address(0x26), FeeHandlingMode::DeductFromAmount),
+    ] {
+        let broadcaster = eligible_public_broadcasters(
+            &[fee_row(
+                1,
+                fee_token,
+                1_000_000_000_000_000_000,
+                0.9,
+                "custom-fee",
+            )],
+            1,
+            fee_token,
+            None,
+            SystemTime::now(),
+        )
+        .remove(0);
+        let estimate = approximate_public_broadcaster_cost(
+            broadcaster.clone(),
+            token,
+            fee_token,
+            entered,
+            mode,
+            uint!(25_U256),
+            100,
+            custom + U256::ONE,
+            Some(custom),
+            |split| {
+                assert_eq!(split.fee_amount, custom);
+                let selection = selection_info(capacity, 1, 1, 2, 1, capacity);
+                Ok(unshield_approximate_shape(&selection, capacity, true).with_executor(true))
+            },
+        )
+        .unwrap();
+        assert_eq!(estimate.fee_amount, custom);
+        if token == fee_token && mode == FeeHandlingMode::DeductFromAmount {
+            assert_eq!(estimate.receiver_amount, entered - custom);
+            assert_eq!(estimate.total_private_spend, entered);
+        } else if mode == FeeHandlingMode::AddToAmount {
+            let gross = crate::desktop::railgun_protocol_gross_amount_for_recipient(
+                entered,
+                uint!(25_U256),
+            )
+            .unwrap();
+            assert_eq!(estimate.recipient_amount, entered);
+            assert_eq!(estimate.receiver_amount, gross);
+            assert_eq!(estimate.total_private_spend, gross + custom);
+        } else {
+            assert_eq!(estimate.receiver_amount, entered);
+            assert_eq!(estimate.total_private_spend, entered);
+        }
+        assert_eq!(
+            estimate.recipient_amount + estimate.protocol_fee_amount,
+            estimate.receiver_amount
+        );
+        assert!(
+            approximate_public_broadcaster_cost(
+                broadcaster,
+                token,
+                fee_token,
+                entered,
+                mode,
+                uint!(25_U256),
+                100,
+                U256::ZERO,
+                Some(U256::ONE),
+                |_| {
+                    let selection = selection_info(capacity, 1, 1, 2, 1, capacity);
+                    Ok(unshield_approximate_shape(&selection, capacity, true).with_executor(true))
+                },
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -806,6 +1061,19 @@ fn fee_handling_mode_deducts_or_adds_fee() {
         .expect("add split");
     assert_eq!(added.receiver_amount, entered);
     assert_eq!(added.total_private_spend, uint!(107_U256));
+
+    for protocol_fee in [U256::ZERO, RAILGUN_PROTOCOL_FEE_BPS] {
+        assert!(
+            public_broadcaster_amount_split_for_tokens_and_protocol(
+                entered,
+                U256::MAX,
+                FeeHandlingMode::AddToAmount,
+                true,
+                protocol_fee,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -933,6 +1201,7 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
         U256::ZERO,
         100,
         U256::ZERO,
+        None,
         |_split| {
             let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
             Ok(send_approximate_shape(&selection, selected_total))
@@ -945,6 +1214,9 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
     assert_eq!(deducted.protocol_fee_amount, U256::ZERO);
     assert_eq!(deducted.recipient_amount, deducted.receiver_amount);
     assert_eq!(deducted.fee_mode, FeeHandlingMode::DeductFromAmount);
+    let cushioned_gas_cost = U256::from(deducted.gas_limit) * U256::from(125);
+    assert_eq!(deducted.native_gas_cost, cushioned_gas_cost);
+    assert!(deducted.fee_amount >= cushioned_gas_cost);
 
     let added = approximate_public_broadcaster_cost(
         broadcaster,
@@ -955,6 +1227,7 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
         U256::ZERO,
         100,
         U256::ZERO,
+        None,
         |_split| {
             let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
             Ok(send_approximate_shape(&selection, selected_total))
@@ -1000,6 +1273,7 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         relay_call_count: 0,
         uses_relay_adapt: false,
         unwrap_count: 0,
+        executor: false,
         send: true,
     };
     let initial_fee_amount =
@@ -1015,6 +1289,7 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         U256::ZERO,
         100,
         initial_fee_amount,
+        None,
         |split| {
             observed_fee_amounts.push(split.fee_amount);
             let selection = selection_info(max_receiver, 2, 2, 3, 0, max_receiver);
@@ -1069,6 +1344,7 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
         RAILGUN_PROTOCOL_FEE_BPS,
         100,
         U256::ZERO,
+        None,
         |_split| {
             let selection = selection_info(selected_total, 1, 1, 1, 1, selected_total);
             Ok(unshield_approximate_shape(
@@ -1102,9 +1378,10 @@ fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
         relay_call_count: 0,
         uses_relay_adapt: false,
         unwrap_count: 0,
+        executor: false,
         send: true,
     });
-    let larger = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+    let larger_shape = ApproximateTransactionShape {
         transaction_count: 2,
         input_count: 2,
         private_output_count: 3,
@@ -1113,8 +1390,11 @@ fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
         relay_call_count: 1,
         uses_relay_adapt: true,
         unwrap_count: 1,
+        executor: false,
         send: false,
-    });
+    };
+    let larger = approximate_public_broadcaster_gas(larger_shape);
+    assert!(approximate_public_broadcaster_gas(larger_shape.with_executor(true)) > larger);
 
     assert!(larger > base);
 }
@@ -1130,6 +1410,7 @@ fn approximate_public_broadcaster_gas_applies_safety_uplift() {
         relay_call_count: 0,
         uses_relay_adapt: false,
         unwrap_count: 0,
+        executor: false,
         send: true,
     });
 
@@ -1155,6 +1436,37 @@ fn public_broadcaster_bound_min_gas_price_is_zero_on_arbitrum() {
     assert_eq!(
         public_broadcaster_bound_min_gas_price(1, 21_000_000),
         21_000_000
+    );
+}
+
+#[tokio::test]
+async fn executor_submission_keeps_reviewed_gas_price_without_a_gas_quote_rpc() {
+    use broadcaster_core::query_rpc_pool::QueryRpcPool;
+
+    let chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .remove(&1)
+            .unwrap();
+    // Submission must not need a gas-price endpoint once the quote is reviewed.
+    let pool = QueryRpcPool::with_http_client(
+        Vec::new(),
+        Duration::from_secs(30),
+        crate::HttpContext::direct_for_tests().rpc_client,
+    );
+    let price =
+        crate::desktop::public_broadcaster_submission_gas_price(Some(100), &pool, &chain.gas)
+            .await
+            .unwrap();
+    assert_eq!(
+        price, 100,
+        "the reviewed price must not be refreshed or buffered again"
+    );
+    assert!(
+        crate::desktop::public_broadcaster_submission_gas_price(None, &pool, &chain.gas)
+            .await
+            .is_err(),
+        "a new quote still requires a gas-price endpoint"
     );
 }
 
@@ -1191,6 +1503,7 @@ fn approximate_public_broadcaster_gas_counts_each_unwrap_workflow() {
         relay_call_count: 4,
         uses_relay_adapt: true,
         unwrap_count: 1,
+        executor: false,
         send: false,
     };
     let one_unwrap = approximate_public_broadcaster_gas(shape);
@@ -1204,14 +1517,23 @@ fn approximate_public_broadcaster_gas_counts_each_unwrap_workflow() {
 
 #[test]
 fn public_broadcaster_transact_envelope_roundtrips() {
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::transactCall;
+
     let (candidate, broadcaster) = sample_public_broadcaster_candidate(9);
+    let call = transactCall {
+        _transactions: Vec::new(),
+    };
     let params = public_broadcaster_transact_params(
         &candidate,
-        address(0x33),
-        Bytes::from(vec![1, 2, 3, 4]),
+        TransactionRequest::default()
+            .to(address(0x33))
+            .gas_limit(210_000)
+            .input(call.abi_encode().into()),
         20_000_000_000,
         BTreeMap::new(),
-    );
+    )
+    .unwrap();
 
     let encrypted = EncryptedTransactRequest::encrypt_with_seed(
         candidate.viewing_public_key,
@@ -1222,17 +1544,29 @@ fn public_broadcaster_transact_envelope_roundtrips() {
     let payload = encrypted.to_transact_payload().expect("serialize envelope");
     let value: serde_json::Value = serde_json::from_slice(&payload).expect("json envelope");
     assert_eq!(value["method"], "transact");
-    assert!(value["params"]["encryptedData"].is_array());
+    // Check the wire spelling before typed decoding normalizes the public key.
+    assert_eq!(value["params"]["pubkey"], hex::encode(encrypted.pubkey));
+    assert_eq!(
+        value["params"]["encryptedData"],
+        serde_json::to_value(&encrypted.encrypted_data).unwrap()
+    );
     assert_eq!(transact_topic(1), "/railgun/v2/0-1-transact/json");
 
-    let decrypted = try_decrypt_transact_request(
-        &broadcaster.viewing_private_key,
-        encrypted.pubkey,
-        &encrypted.encrypted_data,
-    )
-    .expect("decrypt request")
-    .expect("request for broadcaster");
+    let pubkey: FixedBytes<32> =
+        serde_json::from_value(value["params"]["pubkey"].clone()).expect("envelope public key");
+    let encrypted_data = serde_json::from_value(value["params"]["encryptedData"].clone())
+        .expect("envelope encrypted data");
+    let decrypted =
+        try_decrypt_transact_request(&broadcaster.viewing_private_key, pubkey.0, &encrypted_data)
+            .expect("decrypt request")
+            .expect("request for broadcaster");
     assert_eq!(decrypted.params.fees_id.as_deref(), Some("fees-id"));
+    assert_eq!(decrypted.params.other["minVersion"], "8.0.0");
+    assert_eq!(decrypted.params.other["maxVersion"], "8.999.0");
+    assert!(!decrypted.params.other.contains_key("gasLimit"));
+    assert_eq!(decrypted.params.other["useRelayAdapt"], false);
+    // SDK broadcasters suppress unrecognized errors unless this wire flag is set.
+    assert_eq!(decrypted.params.other["devLog"], true);
     assert_eq!(
         decrypted.params.min_gas_price,
         Some(uint!(20_000_000_000_U256))
@@ -1243,11 +1577,34 @@ fn public_broadcaster_transact_envelope_roundtrips() {
             .pre_transaction_pois_per_txid_leaf_per_list
             .is_empty()
     );
+
+    let error = "execution reverted: recovery authorization nonce is already used";
+    let response =
+        DecryptedTransactResponse::encrypted_error_message(None, &decrypted.shared_key, error)
+            .expect("encrypt detailed error");
+    assert_eq!(
+        decode_public_broadcaster_response(&encrypted.shared_key, &response).unwrap(),
+        Some(PublicBroadcasterResultKind::Failed {
+            error: error.into()
+        })
+    );
 }
 
 #[test]
 fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::{ActionData, relayCall};
+
     let (mut candidate, broadcaster) = sample_public_broadcaster_candidate(10);
+    let call = relayCall {
+        _transactions: Vec::new(),
+        _actionData: ActionData {
+            random: FixedBytes::ZERO,
+            requireSuccess: true,
+            minGasLimit: U256::ZERO,
+            calls: Vec::new(),
+        },
+    };
     let list_key = FixedBytes::from([0x88; 32]);
     let txid_leaf = FixedBytes::from([0x99; 32]);
     candidate.required_poi_list_keys = vec![hex::encode(list_key)];
@@ -1256,11 +1613,13 @@ fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
         .expect("required list keys");
     let params = public_broadcaster_transact_params(
         &candidate,
-        address(0x33),
-        Bytes::from(vec![1, 2, 3, 4]),
+        TransactionRequest::default()
+            .to(candidate.relay_adapt)
+            .input(call.abi_encode().into()),
         20_000_000_000,
         sample_poi_map(&required_keys, &[txid_leaf]),
-    );
+    )
+    .unwrap();
 
     let encrypted = EncryptedTransactRequest::encrypt_with_seed(
         candidate.viewing_public_key,
@@ -1276,6 +1635,7 @@ fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
     .expect("decrypt request")
     .expect("request for broadcaster");
 
+    assert_eq!(decrypted.params.other["useRelayAdapt"], true);
     let per_leaf = decrypted
         .params
         .pre_transaction_pois_per_txid_leaf_per_list
@@ -1286,20 +1646,149 @@ fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
 }
 
 #[test]
-fn public_broadcaster_transact_payload_includes_batched_poi() {
+fn public_broadcaster_transact_payload_preserves_executor_authorization_and_all_pois() {
+    use alloy::eips::eip7702::Authorization;
+    use alloy::signers::{SignerSync, local::PrivateKeySigner};
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::{
+        BoundParams, CommitmentPreimage, RelayAdapt7702, RelayAdapt7702ActionData, SnarkProof,
+        Transaction,
+    };
+    use broadcaster_core::crypto::aes_gcm::{decrypt_in_place_16b_iv, split_iv_tag};
+    use broadcaster_core::transact::{BroadcasterTransactRequestType, compute_railgun_txid};
     let (mut candidate, broadcaster) = sample_public_broadcaster_candidate(11);
     let list_keys = [FixedBytes::from([0x81; 32]), FixedBytes::from([0x82; 32])];
-    let leaves = [FixedBytes::from([0x91; 32]), FixedBytes::from([0x92; 32])];
+    let owner = PrivateKeySigner::from_bytes(&FixedBytes::repeat_byte(7)).unwrap();
+    let chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .remove(&1)
+            .unwrap();
+    let delegate = chain.accepted_executor_profile().unwrap().delegate();
+    candidate.version = "alternative-implementation".to_owned();
+    candidate.relay_adapt_7702 = Some(delegate);
+    let transactions = [1, 2].map(|tree| Transaction {
+        proof: SnarkProof::default(),
+        merkleRoot: FixedBytes::repeat_byte(tree),
+        nullifiers: vec![FixedBytes::repeat_byte(tree + 1)],
+        commitments: vec![FixedBytes::repeat_byte(tree + 2)],
+        boundParams: BoundParams::new_transact(
+            u32::from(tree),
+            0,
+            1,
+            Vec::new(),
+            owner.address(),
+            FixedBytes::ZERO,
+        ),
+        unshieldPreimage: CommitmentPreimage::empty(),
+    });
+    let leaves = transactions
+        .iter()
+        .map(|transaction| {
+            FixedBytes::from(railgun_txid_leaf_hash(
+                compute_railgun_txid(
+                    transaction,
+                    Some(broadcaster_core::transact::DEFAULT_TXID_VERSION),
+                )
+                .unwrap(),
+                u64::from(transaction.boundParams.treeNumber),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let action = RelayAdapt7702ActionData {
+        requireSuccess: true,
+        minGasLimit: U256::ZERO,
+        calls: Vec::new(),
+    };
+    let hash = broadcaster_core::contracts::executor::execute_signing_hash(
+        &transactions,
+        &action,
+        U256::from(3),
+        1,
+        owner.address(),
+    );
+    let call = RelayAdapt7702::executeCall {
+        _transactions: transactions.into(),
+        _actionData: action,
+        _nonce: U256::from(3),
+        _signature: owner.sign_hash_sync(&hash).unwrap().as_bytes().into(),
+    };
+    let authorization = Authorization {
+        chain_id: U256::ONE,
+        address: delegate,
+        nonce: 7,
+    };
+    let signature = owner
+        .sign_hash_sync(&authorization.signature_hash())
+        .unwrap();
+    let signed_authorization = authorization.into_signed(signature);
+    let mut transaction = TransactionRequest::default()
+        .to(owner.address())
+        .input(call.abi_encode().into());
+    transaction.transaction_type = Some(4);
+    transaction.authorization_list = Some(vec![signed_authorization.clone()]);
+    transaction.max_fee_per_gas = Some(25_000_000_000);
+    transaction.max_priority_fee_per_gas = Some(1_000_000_000);
+    transaction.gas = Some(1_495_776);
     candidate.required_poi_list_keys = list_keys.iter().map(hex::encode).collect();
     let required_keys = candidate
         .parsed_required_poi_list_keys()
         .expect("required list keys");
     let params = public_broadcaster_transact_params(
         &candidate,
-        address(0x33),
-        Bytes::from(vec![1, 2, 3, 4]),
+        transaction.clone(),
         20_000_000_000,
         sample_poi_map(&required_keys, &leaves),
+    )
+    .unwrap();
+    let mut missing_gas = transaction.clone();
+    missing_gas.gas = None;
+    assert!(
+        public_broadcaster_transact_params(
+            &candidate,
+            missing_gas,
+            20_000_000_000,
+            sample_poi_map(&required_keys, &leaves),
+        )
+        .is_err()
+    );
+    let mut delegated = transaction.clone();
+    delegated.transaction_type = Some(2);
+    delegated.authorization_list = None;
+    // An installed delegation still needs fresh authorization to select the
+    // SDK broadcaster's TX7702 route instead of its ordinary contract route.
+    assert!(
+        public_broadcaster_transact_params(
+            &candidate,
+            delegated,
+            20_000_000_000,
+            sample_poi_map(&required_keys, &leaves),
+        )
+        .is_err()
+    );
+    for list in list_keys {
+        let mut incomplete = sample_poi_map(&required_keys, &leaves);
+        incomplete.get_mut(&list).unwrap().remove(&leaves[1]);
+        assert!(
+            public_broadcaster_transact_params(
+                &candidate,
+                transaction.clone(),
+                20_000_000_000,
+                incomplete
+            )
+            .is_err()
+        );
+    }
+    let mut incompatible = candidate.clone();
+    incompatible.relay_adapt_7702 = Some(Address::repeat_byte(0x23));
+    assert!(
+        public_broadcaster_transact_params(
+            &incompatible,
+            transaction,
+            20_000_000_000,
+            sample_poi_map(&required_keys, &leaves)
+        )
+        .is_err()
     );
 
     let encrypted = EncryptedTransactRequest::encrypt_with_seed(
@@ -1316,13 +1805,65 @@ fn public_broadcaster_transact_payload_includes_batched_poi() {
     .expect("decrypt request")
     .expect("request for broadcaster");
 
+    assert_eq!(
+        decrypted.params.transact_type,
+        Some(BroadcasterTransactRequestType::Tx7702)
+    );
+    assert_eq!(
+        decrypted.params.other.get("gasLimit"),
+        Some(&serde_json::json!("1495776"))
+    );
+    assert_eq!(
+        decrypted.params.other.get("useRelayAdapt"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        decrypted.params.max_fee_per_gas,
+        Some(U256::from(25_000_000_000_u64))
+    );
+    assert_eq!(
+        decrypted.params.max_priority_fee_per_gas,
+        Some(U256::from(1_000_000_000_u64))
+    );
+    assert_eq!(
+        decrypted
+            .params
+            .authorization
+            .unwrap()
+            .signed_authorization()
+            .unwrap(),
+        signed_authorization
+    );
+    assert_eq!(decrypted.params.data.as_ref(), call.abi_encode());
+    // Inspect the encrypted JSON itself: typed decoding accepts both prefixes
+    // and would hide an incompatible spelling from the SDK's string lookups.
+    let (iv, tag) = split_iv_tag(encrypted.encrypted_data[0].as_ref().try_into().unwrap());
+    let mut plaintext = encrypted.encrypted_data[1].to_vec();
+    decrypt_in_place_16b_iv(&decrypted.shared_key, &iv, &tag, &mut plaintext).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
     let poi_map = decrypted.params.pre_transaction_pois_per_txid_leaf_per_list;
     assert_eq!(poi_map.len(), 2);
     for list_key in list_keys {
         let per_leaf = poi_map.get(&list_key).expect("list key");
         assert_eq!(per_leaf.len(), 2);
-        for leaf in leaves {
-            assert!(per_leaf.contains_key(&leaf));
+        for leaf in &leaves {
+            assert!(per_leaf.contains_key(leaf));
+            let wire_poi = &wire["preTransactionPOIsPerTxidLeafPerList"][hex::encode(list_key)]
+                [hex::encode(leaf)];
+            assert_eq!(
+                wire_poi["txidMerkleroot"],
+                hex::encode(per_leaf[leaf].txid_merkleroot)
+            );
+            assert_eq!(
+                wire_poi["poiMerkleroots"],
+                serde_json::json!(
+                    per_leaf[leaf]
+                        .poi_merkleroots
+                        .iter()
+                        .map(hex::encode)
+                        .collect::<Vec<_>>()
+                )
+            );
         }
     }
 }

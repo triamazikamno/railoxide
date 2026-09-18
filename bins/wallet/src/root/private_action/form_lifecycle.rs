@@ -358,6 +358,7 @@ impl WalletRoot {
         self.send_forms.insert(
             key,
             SendFormState {
+                custom_fee_amount: None,
                 gateway_execution: None,
                 gateway_estimated_at: None,
                 asset,
@@ -617,6 +618,7 @@ impl WalletRoot {
         form.asset = asset;
         form.selected_fee_token = selected_fee_token;
         form.broadcaster_choice = broadcaster_choice;
+        form.custom_fee_amount = None;
         form.fee_mode = fee_mode;
         form.pending_programmatic_amount_input = Some(amount.clone());
         form.self_broadcast_estimated_native_gas_cost = None;
@@ -731,6 +733,7 @@ impl WalletRoot {
         form.native_top_up_enabled = false;
         form.selected_fee_token = selected_fee_token;
         form.broadcaster_choice = broadcaster_choice;
+        form.custom_fee_amount = None;
         form.fee_mode = fee_mode;
         form.pending_programmatic_amount_input = Some(amount.clone());
         form.self_broadcast_estimated_native_gas_cost = None;
@@ -788,6 +791,7 @@ impl WalletRoot {
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
+        form.custom_fee_amount = None;
         if mode == DeliveryMode::SelfBroadcast {
             form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
         }
@@ -828,6 +832,7 @@ impl WalletRoot {
             return;
         }
         form.broadcaster_choice = choice;
+        form.custom_fee_amount = None;
         form.error = None;
         form.result = None;
         form.estimate_id = 0;
@@ -884,6 +889,7 @@ impl WalletRoot {
             return;
         }
         form.selected_fee_token = fee_token;
+        form.custom_fee_amount = None;
         if fee_token != action_token {
             form.fee_mode = FeeHandlingMode::AddToAmount;
         }
@@ -960,6 +966,7 @@ impl WalletRoot {
         form.allow_suspicious_broadcasters = allow;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
         }
         let should_reestimate = !preserve_estimate;
         if should_reestimate {
@@ -1047,6 +1054,7 @@ impl WalletRoot {
         form.favorites_only_broadcasters = enabled;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
         }
         let should_reestimate = !preserve_estimate;
         if should_reestimate {
@@ -1725,6 +1733,9 @@ impl WalletRoot {
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
+                custom_fee_amount: None,
+                executor_operation: None,
+                executor_review: None,
                 gateway_execution: None,
                 gateway_estimated_at: None,
                 asset,
@@ -1898,6 +1909,7 @@ impl WalletRoot {
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
+        form.custom_fee_amount = None;
         if mode == DeliveryMode::SelfBroadcast {
             form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
         }
@@ -1938,6 +1950,7 @@ impl WalletRoot {
             return;
         }
         form.broadcaster_choice = choice;
+        form.custom_fee_amount = None;
         form.error = None;
         form.result = None;
         form.estimate_id = 0;
@@ -1996,6 +2009,7 @@ impl WalletRoot {
             return;
         }
         form.selected_fee_token = fee_token;
+        form.custom_fee_amount = None;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
@@ -2073,6 +2087,7 @@ impl WalletRoot {
         form.allow_suspicious_broadcasters = allow;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
         }
         let should_reestimate = !preserve_estimate;
         if should_reestimate {
@@ -2154,6 +2169,7 @@ impl WalletRoot {
         form.favorites_only_broadcasters = enabled;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
+            form.custom_fee_amount = None;
         }
         let should_reestimate = !preserve_estimate;
         if should_reestimate {

@@ -1,5 +1,6 @@
 use super::*;
 use eyre::eyre;
+use railgun_wallet::TransactionCall;
 
 pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     request: DesktopUnshieldPlanRequest<'_>,
@@ -13,6 +14,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         ));
     }
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
+    let executor = validate_desktop_executor_preparation(request.session, request.executor)?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -29,7 +31,11 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = request.session.unspent_utxos();
+    let utxos = if let Some(prepared) = request.executor {
+        request.session.unspent_utxos_for_executor(prepared)?
+    } else {
+        request.session.unspent_utxos()
+    };
     let mode = if request.unwrap {
         UnshieldMode::UnwrapBase
     } else {
@@ -58,7 +64,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         .map(|_| desktop_native_top_up_plan_from_request(&request, &chain, receiver_amount, &utxos))
         .transpose()?;
 
-    let signer = request.spend_authorization.into_signer(
+    let signer = request.spend_authorization.signer(
         request.vault_store,
         request.view_session,
         "unshield",
@@ -75,15 +81,15 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         request.progress_tx,
         TransactionGenerationStage::ProvingTransaction,
     );
-    if let Some(native_top_up) = native_top_up {
-        let composite_request = native_top_up_composite_unshield_request(
-            request.token,
-            receiver_amount,
-            request.recipient,
-            request.unwrap,
-            request.verify_proof,
-            &native_top_up,
-        )?;
+    if let Some(composite_request) = desktop_composite_unshield_request(
+        request.token,
+        receiver_amount,
+        request.recipient,
+        request.unwrap,
+        request.verify_proof,
+        native_top_up.as_ref(),
+        executor,
+    )? {
         let plan = tx_builder
             .build_composite_unshield_plan_with_signer(
                 &request.view_session.scan_keys(),
@@ -95,12 +101,21 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
             )
             .await
             .wrap_err("build desktop composite unshield calldata")?;
-
+        let plan = DesktopUnshieldPreparedPlan::Composite(plan);
+        let transaction = issue_desktop_executor_plan(
+            request.session,
+            request.executor,
+            &request.spend_authorization,
+            request.vault_store,
+            &plan,
+        )
+        .await?;
         return Ok(PreparedDesktopUnshieldPlan {
-            plan: DesktopUnshieldPreparedPlan::Composite(plan),
+            transaction,
+            plan,
             max_spendable: selection_info.max_spendable,
             prover,
-            native_top_up: Some(native_top_up),
+            native_top_up,
         });
     }
 
@@ -117,11 +132,110 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         .wrap_err("build desktop unshield calldata")?;
 
     Ok(PreparedDesktopUnshieldPlan {
+        transaction: None,
         plan: DesktopUnshieldPreparedPlan::Single(plan),
         max_spendable: selection_info.max_spendable,
         prover,
         native_top_up: None,
     })
+}
+
+pub(super) fn validate_desktop_executor_preparation(
+    session: &WalletSession,
+    prepared: Option<&PreparedExecutorOperation>,
+) -> Result<Option<railgun_wallet::tx::ExecutorContext>> {
+    prepared
+        .map(|prepared| {
+            let owner = session
+                .executor_owner()
+                .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?;
+            owner.validate_preparation(prepared)?;
+            Ok(prepared.context())
+        })
+        .transpose()
+}
+
+pub(super) async fn issue_desktop_executor_plan(
+    session: &WalletSession,
+    prepared: Option<&PreparedExecutorOperation>,
+    authorization: &DesktopPrivateSpendAuthorization,
+    vault: &vault::DesktopVaultStore,
+    plan: &DesktopUnshieldPreparedPlan,
+) -> Result<Option<TransactionRequest>> {
+    let Some(prepared) = prepared else {
+        return Ok(None);
+    };
+    let owner = session
+        .executor_owner()
+        .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?;
+    let (mut grant, protected_seed) = authorization.executor_spend_grant(vault)?;
+    let issued = owner
+        .issue_operation(
+            prepared,
+            &TransactionCall {
+                to: plan.call_to(),
+                data: plan.call_data(),
+            },
+            &plan.input_utxos(),
+            &mut grant,
+            protected_seed,
+        )
+        .await?;
+    Ok(Some(issued.transaction().clone()))
+}
+
+pub(crate) fn desktop_composite_unshield_request(
+    token: Address,
+    receiver_amount: U256,
+    recipient: Address,
+    unwrap: bool,
+    verify_proof: bool,
+    native_top_up: Option<&DesktopNativeTopUpPlan>,
+    executor: Option<railgun_wallet::tx::ExecutorContext>,
+) -> Result<Option<CompositeUnshieldRequest>> {
+    if let Some(top_up) = native_top_up {
+        let mut request = native_top_up_composite_unshield_request(
+            token,
+            receiver_amount,
+            recipient,
+            unwrap,
+            verify_proof,
+            top_up,
+        )?;
+        request.executor = executor;
+        return Ok(Some(request));
+    }
+    let Some(executor) = executor else {
+        return Ok(None);
+    };
+    if !unwrap {
+        return Err(eyre!("this direct unshield does not require an executor"));
+    }
+    let net = native_top_up_net_after_protocol_fee(receiver_amount);
+    Ok(Some(CompositeUnshieldRequest {
+        executor: Some(executor),
+        legs: vec![CompositeUnshieldLeg {
+            token_address: token,
+            amount: receiver_amount,
+            recipient: CompositeUnshieldRecipient::RelayAdapt,
+            role: CompositeUnshieldLegRole::Primary,
+        }],
+        relay_actions: Some(CompositeRelayActions {
+            min_gas_limit: U256::ZERO,
+            calls: vec![
+                CompositeRelayAction::UnwrapBase { amount: net },
+                CompositeRelayAction::Transfer {
+                    token: CompositeRelayActionToken::BaseNative,
+                    recipient,
+                    amount: net,
+                },
+            ],
+        }),
+        broadcaster_fee: None,
+        min_gas_price: 0,
+        verify_proof,
+        spend_up_to: false,
+    }))
 }
 
 fn desktop_native_top_up_plan_from_request(
@@ -282,6 +396,7 @@ pub(crate) fn native_top_up_composite_unshield_request(
     };
 
     Ok(CompositeUnshieldRequest {
+        executor: None,
         legs,
         relay_actions: Some(CompositeRelayActions {
             min_gas_limit: U256::ZERO,
@@ -755,6 +870,7 @@ pub async fn prepare_desktop_unshield_calldata(
 ) -> Result<PreparedUnshieldCall> {
     let prepared = prepare_desktop_unshield_plan_without_broadcaster_fee(
         DesktopUnshieldPlanRequest {
+            executor: None,
             chain_id: request.chain_id,
             effective_chain: request.effective_chain.as_ref(),
             view_session: request.view_session.as_ref(),
@@ -981,6 +1097,8 @@ impl SponsoredPrivateIntent {
             calls,
         });
         Ok(MixedPrivateActionRequest {
+            executor: None,
+            executor_calls: Vec::new(),
             private_sends,
             public_unshields,
             relay_actions,
@@ -1110,6 +1228,7 @@ fn sponsored_approximate_gas(
         relay_call_count: preview.shape.relay_call_count,
         uses_relay_adapt: preview.shape.uses_relay_adapt,
         unwrap_count,
+        executor: false,
         send,
     })
 }
@@ -2032,6 +2151,16 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         ));
     }
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
+    // The first approval needs the executor gas budget before seed access and allocation.
+    let executor_profile = request
+        .effective_chain
+        .as_ref()
+        .and_then(settings::EffectiveChainConfig::accepted_executor_profile);
+    let uses_executor = request.executor.is_some()
+        || ((request.unwrap || request.native_top_up.is_some())
+            && request.session.executor_owner().is_some()
+            && executor_profile.is_some());
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -2043,28 +2172,62 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.chain_id,
         request.fee_token,
     );
-    let candidates = public_broadcaster_candidates(
-        &request.fee_rows,
-        request.chain_id,
-        request.fee_token,
-        if request.unwrap || request.native_top_up.is_some() {
-            Some(chain.relay_adapt_contract)
-        } else {
-            None
-        },
-        SystemTime::now(),
-        policy,
-        anchor_rate,
-    );
-    let broadcaster = select_public_broadcaster_with_policy_and_trust(
-        &candidates,
-        &request.selection,
-        policy,
-        &request.trust_filter,
-    )?;
+    let broadcaster = if uses_executor
+        && request.executor.is_none()
+        && let Some(profile) = executor_profile
+    {
+        let candidates = public_broadcaster_candidates(
+            &request.fee_rows,
+            request.chain_id,
+            request.fee_token,
+            None,
+            SystemTime::now(),
+            policy,
+            anchor_rate,
+        )
+        .into_iter()
+        .filter(|candidate| {
+            ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone()))
+                .admit(profile)
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+        select_public_broadcaster_with_policy_and_trust(
+            &candidates,
+            &request.selection,
+            policy,
+            &request.trust_filter,
+        )?
+    } else {
+        public_broadcaster_for_request(
+            &request.fee_rows,
+            request.chain_id,
+            request.fee_token,
+            if !uses_executor && (request.unwrap || request.native_top_up.is_some()) {
+                Some(chain.relay_adapt_contract)
+            } else {
+                None
+            },
+            &request.selection,
+            policy,
+            &request.trust_filter,
+            anchor_rate,
+            request
+                .executor
+                .as_ref()
+                .map(|prepared| prepared.delivery()),
+        )?
+    };
+    if let Some(executor) = &request.executor {
+        executor.require_broadcaster(&broadcaster)?;
+    }
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
-    let utxos = request.session.unspent_utxos();
+    let utxos = if let Some(prepared) = request.executor.as_deref() {
+        request.session.unspent_utxos_for_executor(prepared)?
+    } else {
+        request.session.unspent_utxos()
+    };
     let same_token_fee = request.fee_token == request.token;
     let native_top_up = request
         .native_top_up
@@ -2097,7 +2260,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     seed_split.receiver_amount,
                     U256::ZERO,
                     native_top_up,
-                );
+                )
+                .map(|shape| shape.with_executor(uses_executor));
             }
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
@@ -2115,11 +2279,10 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
-            Ok(unshield_approximate_shape(
-                &selection,
-                selection.max_spendable,
-                request.unwrap,
-            ))
+            Ok(
+                unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
+                    .with_executor(uses_executor),
+            )
         })?;
 
     let mut estimate = approximate_public_broadcaster_cost(
@@ -2130,7 +2293,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.fee_mode,
         RAILGUN_PROTOCOL_FEE_BPS,
         min_gas_price,
-        initial_fee_amount,
+        request.approved_fee_amount.unwrap_or(initial_fee_amount),
+        request.custom_fee_amount,
         |split| {
             if let Some(native_top_up) = &native_top_up {
                 return native_top_up_approximate_shape(
@@ -2140,7 +2304,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     split.receiver_amount,
                     split.fee_amount,
                     native_top_up,
-                );
+                )
+                .map(|shape| shape.with_executor(uses_executor));
             }
             let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
@@ -2159,11 +2324,10 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
-            Ok(unshield_approximate_shape(
-                &selection,
-                selection.max_spendable,
-                request.unwrap,
-            ))
+            Ok(
+                unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
+                    .with_executor(uses_executor),
+            )
         },
     )?;
     let reported_amounts = public_broadcaster_reported_amounts(
@@ -2206,7 +2370,10 @@ pub fn estimate_desktop_send_self_broadcast_cost(
     ))
 }
 
+/// Supplying executor gas settings includes delegation overhead and the configured buffer
+/// before an account is reserved. This estimate does not authorize signing or delivery.
 pub fn estimate_desktop_unshield_self_broadcast_cost(
+    executor_gas: Option<&settings::EffectiveChainGasSettings>,
     utxos: &[Utxo],
     token: Address,
     entered_amount: U256,
@@ -2217,6 +2384,9 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
 ) -> Result<DesktopSelfBroadcastCostEstimate> {
+    if executor_gas.is_some() && !unwrap && native_top_up.is_none() {
+        return Err(eyre!("executor quote does not match the selected action"));
+    }
     let receiver_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode)?;
     let shape = if let Some(native_top_up) = native_top_up {
         native_top_up_approximate_shape(
@@ -2265,13 +2435,23 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
             amount: unshield_protocol_fee_amount_for_fee_mode(entered_amount, fee_mode)?,
         }]
     };
-    Ok(desktop_self_broadcast_cost_estimate(
-        shape,
+    let mut cost = desktop_self_broadcast_cost_estimate(
+        shape.with_executor(executor_gas.is_some()),
         quote,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         protocol_fees,
-    ))
+    );
+    if let Some(gas) = executor_gas {
+        cost.gas_limit = cost.gas_limit.saturating_add(gas.gas_limit_buffer);
+        cost.gas_cost = eip1559_gas_cost_projection(
+            cost.gas_limit,
+            quote,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        );
+    }
+    Ok(cost)
 }
 
 fn desktop_self_broadcast_cost_estimate(
@@ -2363,6 +2543,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         U256::ZERO,
         min_gas_price,
         initial_fee_amount,
+        request.custom_fee_amount,
         |split| {
             let selection = send_selection_info_with_broadcaster_fee_token(
                 &utxos,
@@ -2395,12 +2576,23 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
     let session = Arc::clone(&request.session);
-    let prepared = prepare_desktop_unshield_public_broadcaster(request, http).await?;
+    let prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
     let pending_spent_inputs = prepared.plan.input_utxos();
+    let transaction = prepared.transaction.unwrap_or_else(|| {
+        TransactionRequest::default()
+            .to(prepared.plan.call_to())
+            .input(prepared.plan.call_data().into())
+    });
+    let executor = if let Some(owner) = session.executor_owner() {
+        owner
+            .transaction_identity(&transaction)?
+            .map(|identity| (owner, identity))
+    } else {
+        None
+    };
     let result = submit_public_broadcaster_plan(
         waku,
-        prepared.plan.call_to(),
-        prepared.plan.call_data(),
+        transaction,
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
         prepared.action_token,
@@ -2428,7 +2620,14 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         republish_interval,
     )
     .await?;
-    mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
+    if let Some((owner, identity)) = &executor
+        && let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result
+    {
+        owner.record_submission(*identity, tx_hash.parse()?)?;
+    }
+    if executor.is_none() {
+        mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
+    }
     Ok(result)
 }
 
@@ -2450,8 +2649,11 @@ pub async fn submit_desktop_send_public_broadcaster(
         .collect::<Vec<_>>();
     let result = submit_public_broadcaster_plan(
         waku,
-        prepared.plan.call.to,
-        prepared.plan.call.data,
+        prepared.transaction.unwrap_or_else(|| {
+            TransactionRequest::default()
+                .to(prepared.plan.call.to)
+                .input(prepared.plan.call.data.into())
+        }),
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
         prepared.action_token,
@@ -2487,8 +2689,29 @@ pub async fn submit_desktop_unshield_self_broadcast(
     request: DesktopUnshieldSelfBroadcastRequest,
     http: &HttpContext,
 ) -> Result<DesktopSelfBroadcastResult> {
+    if let Some(prepared) = &request.executor {
+        if request.executor_maximum_gas.is_none_or(|gas| gas == 0)
+            || matches!(request.gas_fee, SelfBroadcastGasFeeSelection::Auto)
+        {
+            return Err(eyre!(
+                "review the executor gas limit and fee values before proving this operation"
+            ));
+        }
+        let payer = self_broadcast_gas_payer(
+            &request.vault_store,
+            &request.view_session,
+            &request.public_account_uuid,
+        )?;
+        if !matches!(prepared.delivery(), ExecutorDelivery::SelfBroadcast { sender, sponsored: false } if *sender == payer)
+        {
+            return Err(eyre!(
+                "executor preparation selected another gas payer or funding route"
+            ));
+        }
+    }
     let prepared = prepare_desktop_unshield_plan_without_broadcaster_fee(
         DesktopUnshieldPlanRequest {
+            executor: request.executor.as_deref(),
             chain_id: request.chain_id,
             effective_chain: request.effective_chain.as_ref(),
             view_session: request.view_session.as_ref(),
@@ -2533,6 +2756,14 @@ pub async fn submit_desktop_unshield_self_broadcast(
         .await?;
     }
     let pending_spent_inputs = prepared.plan.input_utxos();
+    let mut transaction = prepared.transaction.unwrap_or_else(|| {
+        TransactionRequest::default()
+            .to(prepared.plan.call_to())
+            .input(prepared.plan.call_data().into())
+    });
+    if request.executor.is_some() {
+        transaction.gas = request.executor_maximum_gas;
+    }
     let mut result = submit_self_broadcast_plan(
         request.transaction_tracking.as_ref(),
         request.chain_id,
@@ -2547,8 +2778,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
-        prepared.plan.call_to(),
-        prepared.plan.call_data(),
+        transaction,
         pending_spent_inputs,
         prepared.native_top_up.is_some(),
         request.gas_fee,
@@ -2597,8 +2827,9 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.trezor_pin_matrix_provider,
         prepared.public_account_uuid,
         Arc::clone(&request.session),
-        prepared.plan.call.to,
-        prepared.plan.call.data,
+        TransactionRequest::default()
+            .to(prepared.plan.call.to)
+            .input(prepared.plan.call.data.into()),
         pending_spent_inputs,
         false,
         request.gas_fee,
@@ -2667,8 +2898,9 @@ pub async fn submit_desktop_send_self_broadcast(
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
-        prepared.plan.call.to,
-        prepared.plan.call.data,
+        TransactionRequest::default()
+            .to(prepared.plan.call.to)
+            .input(prepared.plan.call.data.into()),
         pending_spent_inputs,
         false,
         request.gas_fee,
@@ -2683,7 +2915,7 @@ pub async fn submit_desktop_send_self_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use railgun_wallet::tx::CompositePlanShape;
+    use railgun_wallet::tx::{CompositeExecution, CompositePlanShape};
 
     fn test_sponsored_authorization(
         action: SponsoredActionKind,
@@ -3251,22 +3483,24 @@ mod tests {
             Some(&SponsorshipError::SponsoredPlanShapeChangeRequired)
         );
         let error = sponsored_rebuild_error(BuildError::CompositePlanShapeChanged {
-            expected: CompositePlanShape {
+            expected: Box::new(CompositePlanShape {
+                execution: CompositeExecution::RelayAdapt(Address::ZERO),
                 transaction_count: 1,
                 input_count: 1,
                 private_output_count: 1,
                 public_output_count: 1,
                 relay_call_count: 2,
                 uses_relay_adapt: true,
-            },
-            actual: CompositePlanShape {
+            }),
+            actual: Box::new(CompositePlanShape {
+                execution: CompositeExecution::RelayAdapt(Address::ZERO),
                 transaction_count: 2,
                 input_count: 1,
                 private_output_count: 1,
                 public_output_count: 1,
                 relay_call_count: 2,
                 uses_relay_adapt: true,
-            },
+            }),
         });
         assert_eq!(
             error.downcast_ref::<SponsorshipError>(),

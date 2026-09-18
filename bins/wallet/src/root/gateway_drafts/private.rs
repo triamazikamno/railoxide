@@ -256,6 +256,7 @@ impl WalletRoot {
             input.amount.clone()
         };
         Ok(PrivateEstimateInput {
+            custom_fee_amount: None,
             asset,
             recipient,
             amount,
@@ -569,7 +570,7 @@ impl WalletRoot {
             let view_id = &picker.view_id;
             let query = &picker.query;
             let context = prepared.or(picker.estimate.as_ref()).map(|prepared| {
-                crate::root::broadcaster_picker::BroadcasterPickerFeeEstimateContext::from_estimate(
+                crate::root::broadcaster_picker::BroadcasterPickerFeeEstimateContext::from(
                     &prepared.estimate,
                 )
             });
@@ -1204,6 +1205,7 @@ impl WalletRoot {
                 form.gateway_execution = Some(execution.clone());
                 form.delivery_mode = DeliveryMode::PublicBroadcaster;
                 form.selected_fee_token = input.fee_token;
+                form.custom_fee_amount = None;
                 form.broadcaster_choice = input.broadcaster;
                 form.fee_mode = input.fee_mode;
                 form.allow_suspicious_broadcasters = input.allow_out_of_range;
@@ -1221,6 +1223,7 @@ impl WalletRoot {
                 form.gateway_execution = Some(execution.clone());
                 form.delivery_mode = DeliveryMode::PublicBroadcaster;
                 form.selected_fee_token = input.fee_token;
+                form.custom_fee_amount = None;
                 form.broadcaster_choice = input.broadcaster;
                 form.fee_mode = input.fee_mode;
                 form.allow_suspicious_broadcasters = input.allow_out_of_range;

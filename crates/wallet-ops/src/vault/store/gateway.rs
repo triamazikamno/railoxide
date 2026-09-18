@@ -104,6 +104,9 @@ impl DesktopVaultStore {
             .into_iter()
             .find(|account| account.public_account_uuid == public_account_uuid)
             .ok_or(VaultError::PublicAccountNotFound)?;
+        if !account.is_available_on_chain(chain_id) {
+            return Err(VaultError::InvalidPublicAccountOperation);
+        }
         let owning_private_wallet_uuid = match &account.scope {
             PublicAccountScope::Global => None,
             PublicAccountScope::PrivateWallet { wallet_uuid } => Some(wallet_uuid.clone()),

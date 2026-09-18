@@ -499,6 +499,7 @@ pub fn transaction_fee_breakdown(
     rows: Vec<DisplayRow>,
     network_gas: String,
     open: bool,
+    edit_action: Option<gpui::AnyElement>,
     on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     gpui_component::collapsible::Collapsible::new()
@@ -506,54 +507,62 @@ pub fn transaction_fee_breakdown(
         .w_full()
         .min_w_0()
         .child(
-            crate::controls::app_button_base(id)
-                .ghost()
-                .w_full()
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
                 .min_w_0()
-                .h_auto()
-                .min_h_8()
-                .px_0()
-                .py_1()
-                .text_size(APP_TEXT_SIZE)
-                .line_height(relative(APP_TEXT_LINE_HEIGHT))
-                .accessibility_label("Transaction fee")
                 .child(
-                    div()
-                        .w_full()
+                    crate::controls::app_button_base(id)
+                        .ghost()
+                        .flex_1()
                         .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(div().flex_none().child("Transaction fee"))
+                        .h_auto()
+                        .min_h_8()
+                        .px_0()
+                        .py_1()
+                        .text_size(APP_TEXT_SIZE)
+                        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+                        .accessibility_label("Transaction fee")
                         .child(
                             div()
-                                .flex_1()
+                                .w_full()
                                 .min_w_0()
                                 .flex()
                                 .items_center()
-                                .justify_end()
-                                .gap_2()
+                                .gap_3()
+                                .child(div().flex_none().child("Transaction fee"))
                                 .child(
                                     div()
+                                        .flex_1()
                                         .min_w_0()
-                                        .text_align(gpui::TextAlign::Right)
-                                        .whitespace_normal()
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .child(total),
-                                )
-                                .child(
-                                    gpui_component::Icon::new(if open {
-                                        gpui_component::IconName::ChevronUp
-                                    } else {
-                                        gpui_component::IconName::ChevronDown
-                                    })
-                                    .xsmall()
-                                    .flex_none()
-                                    .text_color(rgb(theme::TEXT_MUTED)),
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .text_align(gpui::TextAlign::Right)
+                                                .whitespace_normal()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .child(total),
+                                        )
+                                        .child(
+                                            gpui_component::Icon::new(if open {
+                                                gpui_component::IconName::ChevronUp
+                                            } else {
+                                                gpui_component::IconName::ChevronDown
+                                            })
+                                            .xsmall()
+                                            .flex_none()
+                                            .text_color(rgb(theme::TEXT_MUTED)),
+                                        ),
                                 ),
-                        ),
+                        )
+                        .on_click(move |_, window, cx| on_toggle(!open, window, cx)),
                 )
-                .on_click(move |_, window, cx| on_toggle(!open, window, cx)),
+                .children(edit_action),
         )
         .content(
             div()

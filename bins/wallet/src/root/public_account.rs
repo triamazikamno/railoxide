@@ -118,6 +118,19 @@ pub(super) fn restored_public_account_selection(
 }
 
 impl WalletRoot {
+    pub(super) fn executor_owner_for_public_chain(
+        &self,
+        chain_id: u64,
+    ) -> Option<Arc<wallet_ops::ExecutorOwner>> {
+        match self.chain_states.get(&chain_id) {
+            Some(
+                super::ChainUtxoState::Ready { session, .. }
+                | super::ChainUtxoState::Syncing { session, .. },
+            ) => session.executor_owner(),
+            _ => None,
+        }
+    }
+
     pub(super) fn open_public_account_dialog(
         &mut self,
         kind: PublicAccountDialogKind,
@@ -285,6 +298,9 @@ impl WalletRoot {
     }
 
     pub(super) fn render_public_wallet_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
+        if let Some(view) = self.stealth_accounts_body() {
+            return view.into_any_element();
+        }
         let refresh_root = root.clone();
 
         div()
@@ -341,12 +357,14 @@ impl WalletRoot {
                     .children(self.public_form.error.as_ref().map(|message| {
                         Alert::error("wallet-public-error", message.to_string()).small()
                     }))
-                    .child(self.render_public_account_list(root)),
+                    .child(self.render_public_account_list(root))
+                    .child(self.render_stealth_accounts_section(root)),
             )
             .into_any_element()
     }
 
-    pub(super) fn clear_public_wallet_runtime_state(&mut self) {
+    pub(super) fn clear_public_wallet_runtime_state(&mut self, cx: &mut Context<'_, Self>) {
+        self.clear_stealth_accounts(cx);
         self.public_balance_cache.clear();
         self.public_accounts.clear();
         self.public_balance_snapshot = None;
@@ -385,7 +403,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.clear_public_wallet_runtime_state();
+        self.clear_public_wallet_runtime_state(cx);
         for input in [
             &self.public_form.add_label_input,
             &self.public_form.add_password_input,
@@ -547,9 +565,10 @@ impl WalletRoot {
         public_account_uuid: Option<&str>,
     ) -> Option<&PublicAccountMetadata> {
         let selected = public_account_uuid?;
-        self.public_accounts
-            .iter()
-            .find(|account| account.public_account_uuid == selected)
+        self.public_accounts.iter().find(|account| {
+            account.public_account_uuid == selected
+                && account.is_available_on_chain(self.selected_chain)
+        })
     }
 
     pub(super) fn set_public_selected_balance(
@@ -614,9 +633,10 @@ impl WalletRoot {
     }
 
     pub(super) fn has_active_public_accounts(&self) -> bool {
-        self.public_accounts
-            .iter()
-            .any(|account| account.status == PublicAccountStatus::Active)
+        self.public_accounts.iter().any(|account| {
+            account.status == PublicAccountStatus::Active
+                && account.is_available_on_chain(self.selected_chain)
+        })
     }
 
     pub(super) fn add_public_derived_account_from_input(
@@ -1485,15 +1505,15 @@ impl WalletRoot {
                 "No Public accounts yet. Add a derived account or import a private key.",
             ));
         }
-        let accounts = if search_active {
-            self.public_accounts
-                .iter()
-                .filter(|account| public_account_matches_search(account, search_query))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            self.public_accounts.clone()
-        };
+        let accounts = self
+            .public_accounts
+            .iter()
+            .filter(|account| account.is_available_on_chain(self.selected_chain))
+            .filter(|account| {
+                !search_active || public_account_matches_search(account, search_query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if accounts.is_empty() {
             return card.child(app_muted_text("No Public accounts match this search."));
         }
@@ -1795,7 +1815,9 @@ impl WalletRoot {
             );
         }
         let action_buttons = match account.source {
-            PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
+            PublicAccountSource::Derived
+            | PublicAccountSource::HardwareDerived
+            | PublicAccountSource::ExecutorDerived(_) => {
                 let status_uuid = Arc::clone(&account_uuid);
                 let inactive = account.status == PublicAccountStatus::Inactive;
                 action_buttons.child(
@@ -1962,6 +1984,38 @@ impl WalletRoot {
                     .child(metadata_badges),
             );
 
+        if let PublicAccountSource::ExecutorDerived(source) = account.source {
+            let history_root = root.clone();
+            account_content = account_content.child(
+                app_button(
+                    SharedString::from(format!(
+                        "public-stealth-history-{}",
+                        account.public_account_uuid
+                    )),
+                    "View stealth account",
+                )
+                .small()
+                .ghost()
+                .on_click(move |_, window, cx| {
+                    history_root.update(cx, |root, cx| {
+                        let session = match root.chain_states.get(&source.chain_id()) {
+                            Some(
+                                super::ChainUtxoState::Ready { session, .. }
+                                | super::ChainUtxoState::Syncing { session, .. },
+                            ) => Some(session.clone()),
+                            _ => None,
+                        };
+                        if let Some(session) = session {
+                            let target = super::stealth_accounts::StealthAccountTarget::new(
+                                &session,
+                                source.operation(),
+                            );
+                            root.open_stealth_account(&target, window, cx);
+                        }
+                    });
+                }),
+            );
+        }
         let visible_balances =
             self.public_account_visible_balances(&account.public_account_uuid, account.status);
         if !visible_balances.is_empty() {

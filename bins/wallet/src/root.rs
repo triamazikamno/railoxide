@@ -78,6 +78,8 @@ mod shell;
 mod sidebar;
 mod spend_authorization;
 mod startup;
+mod stealth_accounts;
+mod submission_progress;
 mod tokens;
 mod ui_helpers;
 mod utxo;
@@ -488,6 +490,7 @@ pub(crate) struct WalletRoot {
     address_book_label_input: Entity<InputState>,
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
+    stealth_accounts: Option<stealth_accounts::StealthAccountsPanel>,
     public_balance_cache: PublicBalanceCache,
     public_transaction_tracker: wallet_ops::PublicTransactionTracker,
     public_transaction_submissions: public_transactions::PublicTransactionSubmissions,
@@ -1469,6 +1472,7 @@ impl WalletRoot {
             address_book_label_input,
             address_book_save_error: None,
             public_form,
+            stealth_accounts: None,
             public_balance_cache: PublicBalanceCache::default(),
             public_transaction_tracker,
             public_transaction_submissions:

@@ -116,6 +116,14 @@ impl PreparedSelfBroadcastDraft {
                     unwrap,
                     native_top_up,
                 } => estimate_desktop_unshield_self_broadcast_cost(
+                    self.effective_chain
+                        .as_ref()
+                        .filter(|chain| {
+                            (*unwrap || native_top_up.is_some())
+                                && session.executor_owner().is_some()
+                                && chain.accepted_executor_profile().is_some()
+                        })
+                        .map(|chain| &chain.gas),
                     &utxos,
                     self.asset.token,
                     self.amount,

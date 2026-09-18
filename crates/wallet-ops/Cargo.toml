@@ -18,7 +18,7 @@ name = "hardware_derivation_probe"
 required-features = ["hardware"]
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers", "json-rpc", "ens"] }
+alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers", "json-rpc", "ens", "k256"] }
 ens-normalize-rs = { workspace = true }
 alloy-signer = { workspace = true }
 arti-client = { workspace = true, features = ["onion-service-client"] }
@@ -64,6 +64,7 @@ broadcaster-monitor = { path = "../broadcaster-monitor" }
 local-db = { workspace = true }
 merkletree = { workspace = true }
 poi = { workspace = true }
+public-broadcaster-protocol = { workspace = true }
 protobuf = { workspace = true, optional = true }
 railgun-wallet = { workspace = true }
 railgun-ui = { path = "../railgun-ui" }

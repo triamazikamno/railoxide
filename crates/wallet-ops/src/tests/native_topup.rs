@@ -393,3 +393,66 @@ fn native_top_up_public_broadcaster_shape_rejects_composite_batch_overflow() {
             .contains("composite unshield plan exceeds batch transaction limit")
     );
 }
+
+#[test]
+fn executor_unwrap_keeps_protocol_fee_and_existing_dust_out_of_transfer() {
+    let token = wrapped_native_token_for_chain(1).unwrap();
+    let recipient = address(0x42);
+    let context = railgun_wallet::tx::ExecutorContext {
+        chain_id: 1,
+        executor: address(0x43),
+        delegate: address(0x44),
+        execution_nonce: U256::ZERO,
+    };
+    let gross = uint!(10_000_U256);
+    let request = crate::desktop::desktop_composite_unshield_request(
+        token,
+        gross,
+        recipient,
+        true,
+        false,
+        None,
+        Some(context),
+    )
+    .unwrap()
+    .unwrap();
+    let net = gross - crate::railgun_protocol_fee_amount(gross, RAILGUN_PROTOCOL_FEE_BPS);
+    assert_eq!(request.legs.len(), 1);
+    assert_eq!(request.legs[0].amount, gross);
+    assert_eq!(
+        request.legs[0].recipient,
+        CompositeUnshieldRecipient::RelayAdapt
+    );
+    assert_eq!(
+        request.relay_actions.unwrap().calls,
+        vec![
+            CompositeRelayAction::UnwrapBase { amount: net },
+            CompositeRelayAction::Transfer {
+                token: CompositeRelayActionToken::BaseNative,
+                recipient,
+                amount: net,
+            },
+        ]
+    );
+    // A direct output must retain its direct route, rather than leaving an unused
+    // executor reservation attached to a plain transact call.
+    assert!(
+        crate::desktop::desktop_composite_unshield_request(
+            token,
+            gross,
+            recipient,
+            false,
+            false,
+            None,
+            Some(context),
+        )
+        .is_err()
+    );
+    assert!(
+        crate::desktop::desktop_composite_unshield_request(
+            token, gross, recipient, false, false, None, None,
+        )
+        .unwrap()
+        .is_none()
+    );
+}

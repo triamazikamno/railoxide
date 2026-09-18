@@ -311,6 +311,27 @@ impl WalletRoot {
             ),
         );
 
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster
+            && form.custom_fee_amount.is_some()
+            && (form.cost_estimate.is_none() || form.error.is_some())
+            && !form.generating
+            && form.gateway_execution.is_none()
+            && form.result.is_none()
+        {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(app_muted_text("Custom transaction fee"))
+                    .child(super::fee_editor::fee_edit_button(
+                        estimate_root.clone(),
+                        DeliveryFormKind::Send,
+                        key,
+                    )),
+            );
+        }
+
         if should_render_public_broadcaster_cost_preview(
             form.delivery_mode,
             form.result.is_some(),
@@ -331,6 +352,8 @@ impl WalletRoot {
                     &self.public_broadcaster_anchor_cache,
                     form.transaction_fee_breakdown_open,
                     form.estimating_cost,
+                    form.custom_fee_amount,
+                    !form.generating && form.gateway_execution.is_none(),
                 ));
             } else if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
@@ -749,6 +772,27 @@ impl WalletRoot {
             ),
         );
 
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster
+            && form.custom_fee_amount.is_some()
+            && (form.cost_estimate.is_none() || form.error.is_some())
+            && !form.generating
+            && form.gateway_execution.is_none()
+            && form.result.is_none()
+        {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(app_muted_text("Custom transaction fee"))
+                    .child(super::fee_editor::fee_edit_button(
+                        estimate_root.clone(),
+                        DeliveryFormKind::Unshield,
+                        key,
+                    )),
+            );
+        }
+
         if should_render_public_broadcaster_cost_preview(
             form.delivery_mode,
             form.result.is_some(),
@@ -769,6 +813,8 @@ impl WalletRoot {
                     &self.public_broadcaster_anchor_cache,
                     form.transaction_fee_breakdown_open,
                     form.estimating_cost,
+                    form.custom_fee_amount,
+                    !form.generating && form.gateway_execution.is_none(),
                 ));
             } else if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)

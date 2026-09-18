@@ -16,8 +16,8 @@ use crate::public_wallet::{
     PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
     PublicSendRequest, PublicSendResult, PublicTransactionIntent, VaultedPublicSigner,
-    estimate_public_advanced_transaction_with_fee, simulate_public_advanced_transaction_with_fee,
-    submit_public_action_step_with_signer, vaulted_public_signer,
+    admitted_public_signer, estimate_public_advanced_transaction_with_fee,
+    simulate_public_advanced_transaction_with_fee, submit_public_action_step_with_signer,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::{
@@ -663,7 +663,7 @@ pub async fn submit_governance_action_with_progress(
         Some(&request.estimate),
     )
     .map_err(|error| eyre!(error))?;
-    let signer = vaulted_public_signer(
+    let signer = admitted_public_signer(
         &request.public_send.vault_store,
         &request.public_send.view_session,
         Some(request.public_send.vault_password.as_str()),
@@ -674,30 +674,37 @@ pub async fn submit_governance_action_with_progress(
             .as_deref(),
         request.public_send.trezor_app_passphrase,
         request.public_send.trezor_pin_matrix_provider,
-    )?;
-    if signer.address() != request.review.context.actor {
-        return Err(eyre!(GovernanceActionError::WrongPublicContext));
-    }
-    let mut command_rx = request.public_send.command_rx;
-    let tx = submit_public_action_step_with_signer(
-        request.progress_step,
-        "public-action",
-        "public action transaction",
+        request.public_send.executor_owner.as_ref(),
         request.public_send.chain_id,
-        request.public_send.effective_chain.as_ref(),
-        &request.public_send.intent,
-        &signer,
-        request.public_send.advanced_authorization,
-        false,
-        request.public_send.gas_fee,
-        &mut command_rx,
-        request.public_send.event_tx.as_ref(),
-        http,
-        request.public_send.transaction_tracking.as_ref(),
-        &mut progress,
     )
     .await?;
-    Ok(PublicSendResult { tx })
+    signer
+        .while_active(async {
+            if signer.address() != request.review.context.actor {
+                return Err(eyre!(GovernanceActionError::WrongPublicContext));
+            }
+            let mut command_rx = request.public_send.command_rx;
+            let tx = submit_public_action_step_with_signer(
+                request.progress_step,
+                "public-action",
+                "public action transaction",
+                request.public_send.chain_id,
+                request.public_send.effective_chain.as_ref(),
+                &request.public_send.intent,
+                &signer,
+                request.public_send.advanced_authorization,
+                false,
+                request.public_send.gas_fee,
+                &mut command_rx,
+                request.public_send.event_tx.as_ref(),
+                http,
+                request.public_send.transaction_tracking.as_ref(),
+                &mut progress,
+            )
+            .await?;
+            Ok(PublicSendResult { tx })
+        })
+        .await
 }
 
 /// Validate workflow identity before deriving a signer or allowing any signature attempt.
@@ -780,7 +787,7 @@ pub async fn submit_governance_workflow_with_progress(
     validate_governance_workflow(&request.initial, &request.workflow)
         .map_err(|error| eyre!(error))?;
     let GovernanceWorkflowRequest { initial, workflow } = request;
-    let signer: VaultedPublicSigner = vaulted_public_signer(
+    let signer: VaultedPublicSigner = admitted_public_signer(
         &initial.public_send.vault_store,
         &initial.public_send.view_session,
         Some(initial.public_send.vault_password.as_str()),
@@ -791,119 +798,130 @@ pub async fn submit_governance_workflow_with_progress(
             .as_deref(),
         initial.public_send.trezor_app_passphrase,
         initial.public_send.trezor_pin_matrix_provider,
-    )?;
-    if signer.address() != initial.review.context.actor {
-        return Err(eyre!(GovernanceActionError::WrongPublicContext));
-    }
-    let chain_id = initial.public_send.chain_id;
-    let effective_chain = initial.public_send.effective_chain.as_ref();
-    let actor = signer.address();
-    let mut command_rx = initial.public_send.command_rx;
-    let event_tx = initial.public_send.event_tx.as_ref();
-    let first = submit_public_action_step_with_signer(
-        initial.progress_step,
-        "public-action",
-        "public action transaction",
-        chain_id,
-        effective_chain,
-        &initial.public_send.intent,
-        &signer,
-        initial.public_send.advanced_authorization,
-        false,
-        initial.public_send.gas_fee,
-        &mut command_rx,
-        event_tx,
-        http,
-        initial.public_send.transaction_tracking.as_ref(),
-        &mut progress,
+        initial.public_send.executor_owner.as_ref(),
+        initial.public_send.chain_id,
     )
     .await?;
-    let mut transactions = vec![PublicSendResult { tx: first }];
-
-    let (next_intent, next_context, next_step) = match &workflow {
-        GovernanceWorkflow::StakeApproval(plan) => {
-            let Some((balance, allowance)) =
-                fetch_governance_token_balance_allowance(chain_id, actor, effective_chain, http)
-                    .await?
-            else {
-                return Err(eyre!(GovernanceActionError::FreshStateUnavailable));
-            };
-            let continued = continue_stake_after_approval(plan, balance, allowance)
-                .map_err(|error| eyre!(error))?;
-            let intent = continued
-                .stake
-                .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
-            let context = GovernanceActionContext {
-                private_wallet_uuid: initial.review.context.private_wallet_uuid.clone(),
+    signer
+        .while_active(async {
+            if signer.address() != initial.review.context.actor {
+                return Err(eyre!(GovernanceActionError::WrongPublicContext));
+            }
+            let chain_id = initial.public_send.chain_id;
+            let effective_chain = initial.public_send.effective_chain.as_ref();
+            let actor = signer.address();
+            let mut command_rx = initial.public_send.command_rx;
+            let event_tx = initial.public_send.event_tx.as_ref();
+            let first = submit_public_action_step_with_signer(
+                initial.progress_step,
+                "public-action",
+                "public action transaction",
                 chain_id,
-                public_account_uuid: initial.review.context.public_account_uuid.clone(),
-                actor,
-                contract: continued.staking,
-                contract_kind: GovernanceContractKind::Staking,
-                observed_state: continued.observed_state,
-            };
-            (intent, context, PublicActionProgressStep::Stake)
-        }
-        GovernanceWorkflow::UndelegateThenUnlock(plan) => {
-            let metrics = fetch_staking_global_metrics(chain_id, effective_chain, http)
-                .await?
-                .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
-            let account = fetch_account_stakes(
-                chain_id,
-                &[actor],
-                metrics.chain_time,
                 effective_chain,
+                &initial.public_send.intent,
+                &signer,
+                initial.public_send.advanced_authorization,
+                false,
+                initial.public_send.gas_fee,
+                &mut command_rx,
+                event_tx,
                 http,
-                MulticallChunkSize::new(DEFAULT_MULTICALL_CHUNK_SIZE),
+                initial.public_send.transaction_tracking.as_ref(),
+                &mut progress,
             )
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
-            let stakes = account.stakes.map_err(|error| {
-                eyre!("{}: {error}", GovernanceActionError::FreshStateUnavailable)
-            })?;
-            let fresh = stakes
-                .into_iter()
-                .find(|position| position.id == plan.stake_id)
-                .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
-            let continued =
-                continue_unlock_after_undelegation(plan, &fresh).map_err(|error| eyre!(error))?;
-            let context = GovernanceActionContext {
-                private_wallet_uuid: initial.review.context.private_wallet_uuid.clone(),
-                chain_id,
-                public_account_uuid: initial.review.context.public_account_uuid.clone(),
-                actor,
-                contract: initial.review.context.contract,
-                contract_kind: GovernanceContractKind::Staking,
-                observed_state: continued.observed_state,
+            .await?;
+            let mut transactions = vec![PublicSendResult { tx: first }];
+
+            let (next_intent, next_context, next_step) = match &workflow {
+                GovernanceWorkflow::StakeApproval(plan) => {
+                    let Some((balance, allowance)) = fetch_governance_token_balance_allowance(
+                        chain_id,
+                        actor,
+                        effective_chain,
+                        http,
+                    )
+                    .await?
+                    else {
+                        return Err(eyre!(GovernanceActionError::FreshStateUnavailable));
+                    };
+                    let continued = continue_stake_after_approval(plan, balance, allowance)
+                        .map_err(|error| eyre!(error))?;
+                    let intent = continued
+                        .stake
+                        .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
+                    let context = GovernanceActionContext {
+                        private_wallet_uuid: initial.review.context.private_wallet_uuid.clone(),
+                        chain_id,
+                        public_account_uuid: initial.review.context.public_account_uuid.clone(),
+                        actor,
+                        contract: continued.staking,
+                        contract_kind: GovernanceContractKind::Staking,
+                        observed_state: continued.observed_state,
+                    };
+                    (intent, context, PublicActionProgressStep::Stake)
+                }
+                GovernanceWorkflow::UndelegateThenUnlock(plan) => {
+                    let metrics = fetch_staking_global_metrics(chain_id, effective_chain, http)
+                        .await?
+                        .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
+                    let account = fetch_account_stakes(
+                        chain_id,
+                        &[actor],
+                        metrics.chain_time,
+                        effective_chain,
+                        http,
+                        MulticallChunkSize::new(DEFAULT_MULTICALL_CHUNK_SIZE),
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
+                    let stakes = account.stakes.map_err(|error| {
+                        eyre!("{}: {error}", GovernanceActionError::FreshStateUnavailable)
+                    })?;
+                    let fresh = stakes
+                        .into_iter()
+                        .find(|position| position.id == plan.stake_id)
+                        .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
+                    let continued = continue_unlock_after_undelegation(plan, &fresh)
+                        .map_err(|error| eyre!(error))?;
+                    let context = GovernanceActionContext {
+                        private_wallet_uuid: initial.review.context.private_wallet_uuid.clone(),
+                        chain_id,
+                        public_account_uuid: initial.review.context.public_account_uuid.clone(),
+                        actor,
+                        contract: initial.review.context.contract,
+                        contract_kind: GovernanceContractKind::Staking,
+                        observed_state: continued.observed_state,
+                    };
+                    (continued.intent, context, PublicActionProgressStep::Unlock)
+                }
             };
-            (continued.intent, context, PublicActionProgressStep::Unlock)
-        }
-    };
-    let resolved = next_intent
-        .resolve(&next_context)
-        .map_err(|error| eyre!(error))?;
-    let second = submit_public_action_step_with_signer(
-        next_step,
-        "public-action",
-        "public action transaction",
-        chain_id,
-        effective_chain,
-        &resolved.raw,
-        &signer,
-        None,
-        true,
-        initial.public_send.gas_fee,
-        &mut command_rx,
-        event_tx,
-        http,
-        initial.public_send.transaction_tracking.as_ref(),
-        &mut progress,
-    )
-    .await?;
-    transactions.push(PublicSendResult { tx: second });
-    Ok(GovernanceWorkflowResult { transactions })
+            let resolved = next_intent
+                .resolve(&next_context)
+                .map_err(|error| eyre!(error))?;
+            let second = submit_public_action_step_with_signer(
+                next_step,
+                "public-action",
+                "public action transaction",
+                chain_id,
+                effective_chain,
+                &resolved.raw,
+                &signer,
+                None,
+                true,
+                initial.public_send.gas_fee,
+                &mut command_rx,
+                event_tx,
+                http,
+                initial.public_send.transaction_tracking.as_ref(),
+                &mut progress,
+            )
+            .await?;
+            transactions.push(PublicSendResult { tx: second });
+            Ok(GovernanceWorkflowResult { transactions })
+        })
+        .await
 }
 
 fn positive(amount: U256) -> std::result::Result<(), GovernanceActionError> {

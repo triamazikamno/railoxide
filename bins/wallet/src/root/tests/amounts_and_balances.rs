@@ -201,7 +201,7 @@ fn public_broadcaster_cost_display_uses_shared_amount_precision() {
 
     let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
     assert_eq!(display.action_amount(display.recipient_amount), "3217 DAI");
-    assert_eq!(display.fee_amount(), "0.16334 DAI");
+    assert_eq!(display.fee_display().fee_amount(), "0.16334 DAI");
 }
 
 #[test]
@@ -239,7 +239,9 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
         display.action_amount_with_usd(uint!(2_000_000_000_000_000_000_U256), &cache),
         display.fee_amount_with_usd(&cache),
         display.protocol_fee_value_with_usd(&cache),
-        display.broadcaster_fee_value_with_usd(&breakdown, &cache),
+        display
+            .fee_display()
+            .broadcaster_fee_value_with_usd(&breakdown, &cache),
     ];
     assert!(stable_token_values.iter().all(|value| !value.contains('$')));
     assert!(
@@ -249,6 +251,7 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
     );
     assert!(
         display
+            .fee_display()
             .native_gas_cost_value_with_usd(&breakdown, &cache)
             .contains('$')
     );
@@ -263,6 +266,7 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
     );
     assert!(
         display
+            .fee_display()
             .broadcaster_fee_value_with_usd(&breakdown, &outside_peg_cache)
             .contains("-$")
     );

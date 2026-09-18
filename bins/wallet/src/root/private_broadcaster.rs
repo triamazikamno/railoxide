@@ -6,7 +6,9 @@ use gpui::{
     Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Icon, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip};
+use gpui_component::{
+    Disableable, Icon, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
+};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme;
@@ -22,7 +24,7 @@ use super::gas_fee::{GasRetryInputs, format_gwei};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
     ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
-    progress_footer_action, public_action_step_color, render_public_action_step_marker,
+    progress_footer_action,
 };
 use super::public_broadcaster_cost::{
     PrivateBroadcasterProgressContext, PublicBroadcasterCostDisplay, cost_estimate_detail_text,
@@ -30,11 +32,11 @@ use super::public_broadcaster_cost::{
     render_public_broadcaster_tx_hash_row,
 };
 use super::spend_authorization::spend_authorization_recipient_display;
+use super::submission_progress::{SubmissionProgressStep, render_submission_progress_stepper};
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
-    app_panel, app_status_tag, app_step_row, app_stepper_container, dialog_max_height,
-    format_native_token_amount_for_display, format_recipient_amount_with_native_top_up,
-    secondary_dialog_content_width,
+    app_panel, app_status_tag, dialog_max_height, format_native_token_amount_for_display,
+    format_recipient_amount_with_native_top_up, secondary_dialog_content_width,
 };
 
 const SPONSORED_SHUTDOWN_ABORT_GRACE: Duration = Duration::from_secs(20);
@@ -44,7 +46,7 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 mod gateway;
 #[cfg(test)]
-pub(super) use gateway::gateway_self_broadcast_result;
+pub(super) use gateway::{gateway_self_broadcast_result, gateway_self_broadcast_status};
 mod progress;
 mod types;
 
@@ -56,15 +58,15 @@ pub(super) use progress::{
     mark_private_broadcaster_active_step_stopped, private_broadcaster_closed_active_progress,
     private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_footer_action,
     private_broadcaster_progress_is_terminal, private_broadcaster_progress_steps,
+    private_broadcaster_stage_detail, private_broadcaster_stage_id,
     private_progress_stage_disables_stop, private_submission_discard_attempt_available,
     self_broadcast_progress_steps, self_broadcast_step_retry_kind,
     sponsored_stop_uses_session_command,
 };
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
-    private_broadcaster_retry_button_id, private_broadcaster_stage_detail,
-    private_broadcaster_stage_id, private_broadcaster_stage_label, private_broadcaster_step_detail,
-    public_broadcaster_waiting_can_stop,
+    private_broadcaster_retry_button_id, private_broadcaster_stage_label,
+    private_broadcaster_step_detail, public_broadcaster_waiting_can_stop,
 };
 #[cfg(test)]
 pub(super) use progress::{
@@ -277,6 +279,7 @@ impl WalletRoot {
         };
         self.private_broadcaster_progress = Some(PrivateBroadcasterProgressState {
             gateway_execution,
+            stealth_account: None,
             flow: PrivateSubmissionProgressFlow::PublicBroadcaster,
             kind,
             key,
@@ -341,6 +344,7 @@ impl WalletRoot {
         };
         self.private_broadcaster_progress = Some(PrivateBroadcasterProgressState {
             gateway_execution,
+            stealth_account: None,
             flow: PrivateSubmissionProgressFlow::SelfBroadcast,
             kind,
             key,
@@ -434,6 +438,7 @@ impl WalletRoot {
                         .render_private_broadcaster_progress_dialog_content(
                             &content_root,
                             content_width,
+                            cx,
                         ),
                 )
         });
@@ -716,8 +721,16 @@ impl WalletRoot {
         finish_private_self_broadcast_progress_steps_at_stage(
             &mut progress.steps,
             final_stage,
-            result.tx.receipt().map(|receipt| receipt.status),
+            result.tx.execution_status(),
         );
+        if result.tx.receipt().is_some()
+            && result.tx.execution_status().is_none()
+            && let Some(step) = progress.steps.last_mut()
+        {
+            step.message = Some(Arc::from(
+                "The approved execution effects are not confirmed. This operation remains available in Stealth accounts.",
+            ));
+        }
         progress
             .self_broadcast_attempts
             .clone_from(&result.attempts);
@@ -994,6 +1007,7 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         content_width: Pixels,
+        cx: &gpui::App,
     ) -> gpui::Div {
         let Some(progress) = self.private_broadcaster_progress.as_ref() else {
             return div()
@@ -1040,6 +1054,29 @@ impl WalletRoot {
                 result.tx.tx_hash().to_owned(),
                 delivery_element_id(progress.key, progress.kind, "progress-copy-self-tx"),
             ));
+        }
+        if private_broadcaster_progress_is_terminal(progress)
+            && let Some(target) = &progress.stealth_account
+        {
+            let target = target.clone();
+            let recovery_root = root.clone();
+            content = content.child(
+                app_button(
+                    delivery_element_id(progress.key, progress.kind, "progress-stealth-account"),
+                    "View stealth account",
+                )
+                .outline()
+                .disabled(!self.can_open_stealth_account(&target, cx))
+                .on_click(move |_, window, cx| {
+                    recovery_root.update(cx, |root, cx| {
+                        if root.can_open_stealth_account(&target, cx) {
+                            root.close_private_broadcaster_progress_dialog(window, cx);
+                            window.close_all_dialogs(cx);
+                            root.open_stealth_account(&target, window, cx);
+                        }
+                    });
+                }),
+            );
         }
         #[cfg(feature = "hardware")]
         if let Some(prompt) = self
@@ -1306,6 +1343,20 @@ fn self_broadcast_progress_context_rows(
         if let Some(receipt) = result.tx.receipt() {
             values.push(("Block", receipt.block_number.to_string()));
         }
+        if let wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt { status, .. } = &result.tx {
+            let execution = match status {
+                wallet_ops::vault::ExecutorPayloadStatus::Executed => "approved effects confirmed",
+                wallet_ops::vault::ExecutorPayloadStatus::Reverted => "reverted",
+                wallet_ops::vault::ExecutorPayloadStatus::MissingEffects => {
+                    "expected effects missing"
+                }
+                wallet_ops::vault::ExecutorPayloadStatus::Invalidated { .. } => {
+                    "another approved payload executed"
+                }
+                wallet_ops::vault::ExecutorPayloadStatus::Uncertain => "not confirmed",
+            };
+            values.push(("Execution", execution.into()));
+        }
     } else if let Some(output) = &progress.recipient_output {
         values.push(("Recipient receives", output.to_string()));
     }
@@ -1472,59 +1523,28 @@ pub(super) fn render_private_broadcaster_progress_stepper(
     root: &Entity<WalletRoot>,
     progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
-    let steps = &progress.steps;
-    let mut stepper = app_stepper_container();
-    let last_index = steps.len().saturating_sub(1);
-    for (index, step) in steps.iter().enumerate() {
-        stepper = stepper.child(render_private_broadcaster_progress_step(
-            root.clone(),
-            progress,
-            step,
-            index == last_index,
-        ));
-    }
-    stepper
-}
-
-fn render_private_broadcaster_progress_step(
-    root: Entity<WalletRoot>,
-    progress: &PrivateBroadcasterProgressState,
-    step: &PrivateBroadcasterProgressStepState,
-    is_last: bool,
-) -> gpui::Div {
-    let color = public_action_step_color(step.status);
-    let error = step.status == PublicActionStepStatus::Error;
-    let detail = if error {
-        step.message
-            .as_deref()
-            .unwrap_or("This broadcaster submission step failed.")
-            .to_owned()
-    } else {
-        private_broadcaster_step_detail(progress, step, Instant::now())
-    };
-    let copy_id = error.then(|| {
-        SharedString::from(format!(
-            "wallet-private-broadcaster-{}-error-copy",
-            private_broadcaster_stage_id(step.stage)
-        ))
-    });
-    let body = ui::private_submission::progress_step_body(
-        private_broadcaster_stage_label(step.stage, progress.requires_device_approval).into(),
-        detail,
-        copy_id,
-        color,
-        render_self_broadcast_step_action(root, progress, step),
-    )
-    .when(!is_last, gpui::Styled::pb_3);
-
-    app_step_row(
-        render_public_action_step_marker(step.status, color),
-        body,
-        is_last,
-        color,
-        px(32.0),
-        None,
-    )
+    render_submission_progress_stepper(progress.steps.iter().map(|step| {
+        let detail = if step.status == PublicActionStepStatus::Error {
+            step.message
+                .as_deref()
+                .unwrap_or("This broadcaster submission step failed.")
+                .to_owned()
+        } else {
+            private_broadcaster_step_detail(progress, step, Instant::now())
+        };
+        SubmissionProgressStep {
+            label: private_broadcaster_stage_label(step.stage, progress.requires_device_approval)
+                .into(),
+            detail,
+            status: step.status,
+            error_copy_id: format!(
+                "wallet-private-broadcaster-{}-error-copy",
+                private_broadcaster_stage_id(step.stage)
+            )
+            .into(),
+            action: render_self_broadcast_step_action(root.clone(), progress, step),
+        }
+    }))
 }
 
 fn render_self_broadcast_step_action(
@@ -1621,8 +1641,8 @@ pub(super) fn render_private_self_broadcast_status_notice(
     kind: DeliveryFormKind,
     result: &DesktopSelfBroadcastResult,
 ) -> gpui::Div {
-    let (title, detail, border) = match result.tx.receipt() {
-        Some(receipt) if receipt.status => (
+    let (title, detail, border) = match result.tx.execution_status() {
+        Some(true) => (
             "Self-broadcast confirmed",
             "Open the self-broadcast status dialog for transaction details.",
             theme::SUCCESS,
@@ -1631,6 +1651,11 @@ pub(super) fn render_private_self_broadcast_status_notice(
             "Self-broadcast reverted",
             "Open the self-broadcast status dialog for receipt details.",
             theme::DANGER,
+        ),
+        None if result.tx.receipt().is_some() => (
+            "Execution not confirmed",
+            "The receipt does not establish the approved effects. Stealth accounts retains this operation for reconciliation and recovery.",
+            theme::WARNING,
         ),
         None => (
             "Transaction inclusion unknown",

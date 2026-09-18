@@ -10,7 +10,7 @@ use wallet_ops::{
     fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
-    settings::{EffectiveChainConfig, EffectiveTokenRegistry},
+    settings::{EffectiveChainConfig, EffectiveTokenRegistry, ExecutorProfile},
 };
 
 use crate::assets::WalletIconSource;
@@ -66,26 +66,37 @@ impl WalletRoot {
         favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterCandidate> {
-        let required_relay_adapt = required_relay_adapt_for_unshield(
-            &self.effective_chain_configs,
-            chain_id,
-            unwrap,
-            native_top_up,
-        );
-        let candidates = public_broadcaster_candidates_for_asset(
+        public_broadcaster_candidates_for_route(
             &self.monitor_fee_rows(),
             chain_id,
             token,
-            required_relay_adapt,
+            required_relay_adapt_for_unshield(
+                &self.effective_chain_configs,
+                chain_id,
+                unwrap,
+                native_top_up,
+            ),
+            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up),
             policy,
             self.public_broadcaster_anchor_cache
                 .cached_rate(chain_id, token),
-        )
-        .unwrap_or_default();
-        filter_public_broadcasters_by_trust(
-            &candidates,
             &self.public_broadcaster_trust_filter(favorites_only),
         )
+    }
+
+    fn public_broadcaster_executor_profile(
+        &self,
+        chain_id: u64,
+        unwrap: bool,
+        native_top_up: bool,
+    ) -> Option<ExecutorProfile> {
+        if (unwrap || native_top_up) && !self.selected_wallet_source().is_hardware_derived() {
+            self.effective_chain_configs
+                .get(&chain_id)
+                .and_then(EffectiveChainConfig::accepted_executor_profile)
+        } else {
+            None
+        }
     }
 
     pub(super) fn current_public_broadcaster_fee_token_options(
@@ -114,6 +125,7 @@ impl WalletRoot {
             snapshot,
             &fee_rows,
             required_relay_adapt,
+            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up),
             policy,
             &self.public_broadcaster_trust_filter(favorites_only),
             Some(&self.effective_token_registry),
@@ -261,10 +273,40 @@ fn max_broadcaster_fee_token_amount_from_snapshot(
     planner_max_broadcaster_fee_token_amount_from_outputs(&snapshot.utxos, token)
 }
 
+pub(super) fn public_broadcaster_candidates_for_route(
+    fee_rows: &[broadcaster_monitor::FeeRow],
+    chain_id: u64,
+    token: Address,
+    required_relay_adapt: Option<Address>,
+    executor_profile: Option<ExecutorProfile>,
+    policy: BroadcasterFeePolicy,
+    anchor_rate: Option<U256>,
+    trust_filter: &PublicBroadcasterTrustFilter,
+) -> Vec<PublicBroadcasterCandidate> {
+    let mut candidates = public_broadcaster_candidates_for_asset(
+        fee_rows,
+        chain_id,
+        token,
+        required_relay_adapt.filter(|_| executor_profile.is_none()),
+        policy,
+        anchor_rate,
+    )
+    .unwrap_or_default();
+    if let Some(profile) = executor_profile {
+        candidates.retain(|candidate| {
+            wallet_ops::ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone()))
+                .admit(profile)
+                .is_ok()
+        });
+    }
+    filter_public_broadcasters_by_trust(&candidates, trust_filter)
+}
+
 pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
     snapshot: &ListUtxosOutput,
     fee_rows: &[broadcaster_monitor::FeeRow],
     required_relay_adapt: Option<Address>,
+    executor_profile: Option<ExecutorProfile>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
     registry: Option<&EffectiveTokenRegistry>,
@@ -282,16 +324,16 @@ pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
             if max_spendable.is_zero() {
                 return None;
             }
-            let candidates = public_broadcaster_candidates_for_asset(
+            let candidates = public_broadcaster_candidates_for_route(
                 fee_rows,
                 snapshot.chain_id,
                 token,
                 required_relay_adapt,
+                executor_profile,
                 policy,
                 anchor_rate_for_token(token),
-            )
-            .unwrap_or_default();
-            let candidates = filter_public_broadcasters_by_trust(&candidates, trust_filter);
+                trust_filter,
+            );
             let eligible_broadcaster_count =
                 fee_policy_eligible_public_broadcasters(&candidates, policy).len();
             Some(PublicBroadcasterFeeTokenOption {

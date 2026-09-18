@@ -220,6 +220,12 @@ pub(super) fn update_transaction_generation_stage(
 }
 
 pub struct DesktopUnshieldPublicBroadcasterRequest {
+    /// Exact total payment in fee-token base units; `None` uses automatic estimation.
+    pub custom_fee_amount: Option<U256>,
+    pub executor: Option<Arc<PreparedExecutorOperation>>,
+    pub executor_maximum_private_fee: Option<U256>,
+    /// Buffered gas price from the same reviewed quote as the maximum private fee.
+    pub executor_min_gas_price: Option<u128>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -246,6 +252,8 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
 }
 
 pub struct DesktopSendPublicBroadcasterRequest {
+    /// Exact total payment in fee-token base units; `None` uses automatic estimation.
+    pub custom_fee_amount: Option<U256>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -270,6 +278,11 @@ pub struct DesktopSendPublicBroadcasterRequest {
 }
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
+    pub custom_fee_amount: Option<U256>,
+    /// Start automatic preparation estimates at this approved fee, consuming its
+    /// existing cushion. An insufficient fee produces a higher quote for review.
+    pub approved_fee_amount: Option<U256>,
+    pub executor: Option<Arc<PreparedExecutorOperation>>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub session: Arc<WalletSession>,
@@ -288,6 +301,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
 }
 
 pub struct DesktopSendPublicBroadcasterEstimateRequest {
+    pub custom_fee_amount: Option<U256>,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub session: Arc<WalletSession>,
@@ -364,6 +378,7 @@ pub struct PublicBroadcasterSubmissionResult {
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedPublicBroadcasterPlan<P> {
+    pub(super) transaction: Option<TransactionRequest>,
     pub(super) plan: P,
     pub(super) pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     pub(super) broadcaster: PublicBroadcasterCandidate,
@@ -449,22 +464,46 @@ pub struct DesktopSponsoredSelfBroadcastResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfBroadcastTxOutcome {
     Receipt(TxReceiptOutput),
-    InclusionUnobserved { tx_hash: String },
+    ExecutorReceipt {
+        receipt: TxReceiptOutput,
+        status: vault::ExecutorPayloadStatus,
+    },
+    InclusionUnobserved {
+        tx_hash: String,
+    },
 }
 
 impl SelfBroadcastTxOutcome {
     #[must_use]
     pub const fn receipt(&self) -> Option<&TxReceiptOutput> {
         match self {
-            Self::Receipt(receipt) => Some(receipt),
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => Some(receipt),
             Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    /// Receipt success only establishes completion once the executor's intended
+    /// effects have been observed on the canonical chain.
+    #[must_use]
+    pub const fn execution_status(&self) -> Option<bool> {
+        match self {
+            Self::Receipt(receipt) => Some(receipt.status),
+            Self::ExecutorReceipt {
+                status: vault::ExecutorPayloadStatus::Executed,
+                ..
+            } => Some(true),
+            Self::ExecutorReceipt {
+                status: vault::ExecutorPayloadStatus::Reverted,
+                ..
+            } => Some(false),
+            Self::ExecutorReceipt { .. } | Self::InclusionUnobserved { .. } => None,
         }
     }
 
     #[must_use]
     pub fn tx_hash(&self) -> &str {
         match self {
-            Self::Receipt(receipt) => &receipt.tx_hash,
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => &receipt.tx_hash,
             Self::InclusionUnobserved { tx_hash } => tx_hash,
         }
     }
@@ -493,6 +532,7 @@ pub(super) struct PreparedPrivatePlan<P> {
 }
 
 pub(super) struct PreparedDesktopUnshieldPlan {
+    pub(super) transaction: Option<TransactionRequest>,
     pub(super) plan: DesktopUnshieldPreparedPlan,
     pub(super) max_spendable: U256,
     pub(super) prover: ProverService,
@@ -570,6 +610,7 @@ pub(super) struct PreparedBlockedShieldRescuePlan {
 }
 
 pub(super) struct DesktopUnshieldPlanRequest<'a> {
+    pub(super) executor: Option<&'a PreparedExecutorOperation>,
     pub(super) chain_id: u64,
     pub(super) effective_chain: Option<&'a settings::EffectiveChainConfig>,
     pub(super) view_session: &'a vault::DesktopViewSession,
@@ -670,6 +711,7 @@ pub struct WalletSession {
     pub(crate) public_data_plane: PublicDataPlaneHandle,
     pub(super) projection_cancel_tx: watch::Sender<bool>,
     pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(super) executor_owner: Option<Arc<ExecutorOwner>>,
 }
 
 pub struct WalletPoiArtifactCacheRetry {
@@ -693,7 +735,15 @@ impl WalletPoiArtifactCacheRetry {
 }
 
 impl WalletSession {
+    #[must_use]
+    pub fn executor_owner(&self) -> Option<Arc<ExecutorOwner>> {
+        self.executor_owner.clone()
+    }
+
     pub async fn stop(&self) -> Result<()> {
+        if let Some(owner) = &self.executor_owner {
+            owner.shutdown().await;
+        }
         let result = self
             .sync_manager
             .remove_wallet_session(&self.handle)
@@ -719,7 +769,36 @@ impl WalletSession {
         let Some(snapshot) = self.handle.current_snapshot() else {
             return Vec::new();
         };
-        poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay)
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        if let Some(owner) = &self.executor_owner {
+            return owner.available_inputs(inputs).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "executor input reservations are unavailable; private spending remains blocked"
+                );
+                Vec::new()
+            });
+        }
+        inputs
+    }
+
+    /// Spendable notes for this prepared operation, including its own durable reservation.
+    pub fn unspent_utxos_for_executor(
+        &self,
+        prepared: &PreparedExecutorOperation,
+    ) -> Result<Vec<Utxo>> {
+        let snapshot = self
+            .handle
+            .current_snapshot()
+            .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
+        // Retain ordinary actor/chain pending-spend and POI admission. Only this
+        // operation's additional durable executor reservation may be reused.
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        self.executor_owner
+            .as_ref()
+            .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?
+            .inputs_for_preparation(inputs, prepared)
     }
 
     pub(crate) async fn mark_pending_spent_utxos(
@@ -780,6 +859,9 @@ impl WalletSession {
 
 impl Drop for WalletSession {
     fn drop(&mut self) {
+        if let Some(owner) = &self.executor_owner {
+            owner.close();
+        }
         let _ = self.projection_cancel_tx.send(true);
         if let Ok(projection_join) = self.projection_join.get_mut()
             && let Some(projection_join) = projection_join.take()
@@ -1215,7 +1297,7 @@ pub fn broadcaster_fee_amount(
 
 #[must_use]
 pub const fn public_broadcaster_service_gas_price(min_gas_price: u128) -> u128 {
-    min_gas_price * 101 / 100
+    min_gas_price * 125 / 100
 }
 
 #[must_use]
@@ -1298,6 +1380,37 @@ pub fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
         }
 }
 
+pub(crate) fn bounded_public_broadcaster_fee(
+    required_fee: U256,
+    maximum: Option<U256>,
+) -> Result<U256> {
+    if maximum.is_some_and(|maximum| required_fee > maximum) {
+        return Err(eyre!(
+            "executor broadcaster fee exceeds the reviewed maximum; refresh and approve the quote"
+        ));
+    }
+    let buffered = buffered_public_broadcaster_fee(required_fee);
+    Ok(maximum.map_or(buffered, |maximum| buffered.min(maximum)))
+}
+
+pub(crate) fn validate_custom_public_broadcaster_fee(
+    amount: U256,
+    required: U256,
+    maximum: Option<U256>,
+) -> Result<U256> {
+    if amount.is_zero() || amount < required {
+        return Err(eyre!(
+            "Custom transaction fee is too low. Increase it or use automatic estimation."
+        ));
+    }
+    if maximum.is_some_and(|maximum| amount > maximum) {
+        return Err(eyre!(
+            "Custom transaction fee exceeds the reviewed maximum. Review the updated fee before submitting."
+        ));
+    }
+    Ok(amount)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ApproximateTransactionShape {
     pub(crate) transaction_count: usize,
@@ -1309,6 +1422,18 @@ pub(crate) struct ApproximateTransactionShape {
     pub(crate) uses_relay_adapt: bool,
     pub(crate) unwrap_count: usize,
     pub(crate) send: bool,
+    pub(crate) executor: bool,
+}
+
+impl ApproximateTransactionShape {
+    pub(crate) const fn with_executor(mut self, executor: bool) -> Self {
+        self.executor = executor;
+        if executor && self.relay_call_count == 1 {
+            // The executor unwrap uses separate exact unwrap and transfer calls.
+            self.relay_call_count = 2;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1341,7 +1466,12 @@ pub(crate) fn public_broadcaster_amount_split(
             }
             (entered_amount - fee_amount, entered_amount)
         }
-        FeeHandlingMode::AddToAmount => (entered_amount, entered_amount + fee_amount),
+        FeeHandlingMode::AddToAmount => (
+            entered_amount,
+            entered_amount
+                .checked_add(fee_amount)
+                .ok_or_else(|| eyre!("amount plus transaction fee exceeds the supported range"))?,
+        ),
     };
     Ok(PublicBroadcasterAmountSplit {
         entered_amount,
@@ -1396,7 +1526,9 @@ pub(crate) fn public_broadcaster_amount_split_for_tokens_and_protocol(
         }
     };
     let total_private_spend = if same_token_fee {
-        receiver_amount + fee_amount
+        receiver_amount
+            .checked_add(fee_amount)
+            .ok_or_else(|| eyre!("amount plus transaction fee exceeds the supported range"))?
     } else {
         receiver_amount
     };
@@ -1716,6 +1848,48 @@ pub(crate) fn public_broadcaster_anchor_rate_for_policy(
         .or_else(|| fixed_token_anchor_rate(chain_id, token))
 }
 
+/// Executor requests keep the quote selected before approval until it expires.
+/// Refreshed advertisements are candidates for a new preparation, not this one.
+pub(crate) fn public_broadcaster_for_request(
+    fee_rows: &[FeeRow],
+    chain_id: u64,
+    token: Address,
+    required_relay_adapt: Option<Address>,
+    selection: &PublicBroadcasterSelection,
+    policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
+    anchor_rate: Option<U256>,
+    executor_delivery: Option<&ExecutorDelivery>,
+) -> Result<PublicBroadcasterCandidate> {
+    let candidates = if let Some(delivery) = executor_delivery {
+        let ExecutorDelivery::PublicBroadcaster(candidate) = delivery else {
+            return Err(eyre!("executor preparation selected another funding route"));
+        };
+        if candidate.chain_id != chain_id || candidate.token != token {
+            return Err(eyre!("executor broadcaster chain or fee token changed"));
+        }
+        let profile = candidate
+            .relay_adapt_7702
+            .and_then(|delegate| settings::ExecutorProfile::accepted(chain_id, delegate))
+            .ok_or_else(|| eyre!("broadcaster executor profile is unavailable"))?;
+        delivery.admit(profile)?;
+        let mut candidate = candidate.as_ref().clone();
+        candidate.fee_policy_status = policy.classify_fee(candidate.fee, anchor_rate);
+        vec![candidate]
+    } else {
+        public_broadcaster_candidates(
+            fee_rows,
+            chain_id,
+            token,
+            required_relay_adapt,
+            SystemTime::now(),
+            policy,
+            anchor_rate,
+        )
+    };
+    select_public_broadcaster_with_policy_and_trust(&candidates, selection, policy, trust_filter)
+}
+
 pub(super) async fn public_broadcaster_setup(
     session: &WalletSession,
     chain_id: u64,
@@ -1724,6 +1898,8 @@ pub(super) async fn public_broadcaster_setup(
     fee_rows: &[FeeRow],
     selection: &PublicBroadcasterSelection,
     require_relay_adapt: bool,
+    executor_delivery: Option<&ExecutorDelivery>,
+    reviewed_min_gas_price: Option<u128>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
@@ -1731,7 +1907,7 @@ pub(super) async fn public_broadcaster_setup(
 ) -> Result<PublicBroadcasterSetup> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
-    let candidates = public_broadcaster_candidates(
+    let broadcaster = public_broadcaster_for_request(
         fee_rows,
         chain_id,
         token,
@@ -1740,18 +1916,19 @@ pub(super) async fn public_broadcaster_setup(
         } else {
             None
         },
-        SystemTime::now(),
-        policy,
-        anchor_rate,
-    );
-    let broadcaster = select_public_broadcaster_with_policy_and_trust(
-        &candidates,
         selection,
         policy,
         trust_filter,
+        anchor_rate,
+        executor_delivery,
     )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
-    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+    let min_gas_price = public_broadcaster_submission_gas_price(
+        reviewed_min_gas_price,
+        &query_rpc_pool,
+        &chain.gas,
+    )
+    .await?;
     let artifact_source = artifact_source(http, session.db.as_ref())?;
     let prover = ProverService::new_with_db(&artifact_source, &session.db);
     let chain_handle = session
@@ -1774,6 +1951,19 @@ pub(super) async fn public_broadcaster_setup(
     })
 }
 
+/// Keep the price approved with the fee ceiling through proving and gas estimation.
+/// Requests without a reviewed quote retain automatic gas pricing.
+pub(crate) async fn public_broadcaster_submission_gas_price(
+    reviewed: Option<u128>,
+    query_rpc_pool: &QueryRpcPool,
+    gas: &settings::EffectiveChainGasSettings,
+) -> Result<u128> {
+    match reviewed {
+        Some(price) => Ok(price),
+        None => buffered_gas_price_from_rpc_pool(query_rpc_pool, gas).await,
+    }
+}
+
 pub(crate) const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
     let raw = APPROX_BASE_GAS
         + APPROX_GAS_PER_TRANSACTION * shape.transaction_count.saturating_sub(1) as u64
@@ -1782,7 +1972,10 @@ pub(crate) const fn approximate_public_broadcaster_gas(shape: ApproximateTransac
         + APPROX_GAS_PER_PUBLIC_OUTPUT * shape.public_output_count as u64
         + if shape.send { APPROX_SEND_EXTRA_GAS } else { 0 }
         + APPROX_UNWRAP_EXTRA_GAS * shape.unwrap_count as u64
-        + APPROX_SAFETY_GAS;
+        + APPROX_SAFETY_GAS
+        // Provisional budget for delegation setup, owner-signature verification,
+        // and the first nonce write. Final proved requests use RPC estimation.
+        + if shape.executor { 60_000 } else { 0 };
     raw.saturating_mul(APPROX_GAS_UPLIFT_NUMERATOR)
         .saturating_add(APPROX_GAS_UPLIFT_DENOMINATOR - 1)
         / APPROX_GAS_UPLIFT_DENOMINATOR
@@ -1852,10 +2045,13 @@ pub(crate) fn approximate_public_broadcaster_cost(
     protocol_fee_bps: U256,
     min_gas_price: u128,
     initial_fee_amount: U256,
+    custom_fee_amount: Option<U256>,
     mut select_shape: impl FnMut(PublicBroadcasterAmountSplit) -> Result<ApproximateTransactionShape>,
 ) -> Result<PublicBroadcasterCostEstimate> {
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
-    let mut fee_amount = initial_fee_amount;
+    let mut fee_amount = custom_fee_amount.map_or(Ok(initial_fee_amount), |amount| {
+        validate_custom_public_broadcaster_fee(amount, U256::ZERO, None)
+    })?;
     let mut latest_shape = None;
     let mut latest_split = None;
     let mut latest_gas_limit = 0;
@@ -1913,7 +2109,10 @@ pub(crate) fn approximate_public_broadcaster_cost(
                 native_top_up: None,
             });
         }
-        fee_amount = buffered_public_broadcaster_fee(computed_fee);
+        fee_amount = custom_fee_amount.map_or_else(
+            || Ok(buffered_public_broadcaster_fee(computed_fee)),
+            |amount| validate_custom_public_broadcaster_fee(amount, computed_fee, None),
+        )?;
     }
 
     let shape = latest_shape.ok_or_else(|| eyre!("could not estimate public broadcaster cost"))?;
@@ -1999,6 +2198,7 @@ pub(crate) const fn send_approximate_shape(
         relay_call_count: 0,
         uses_relay_adapt: false,
         unwrap_count: 0,
+        executor: false,
         send: true,
     }
 }
@@ -2017,6 +2217,7 @@ pub(crate) const fn unshield_approximate_shape(
         relay_call_count: if unwrap { 1 } else { 0 },
         uses_relay_adapt: unwrap,
         unwrap_count: if unwrap { 1 } else { 0 },
+        executor: false,
         send: false,
     }
 }
@@ -2057,6 +2258,7 @@ pub(crate) fn native_top_up_approximate_shape(
             relay_call_count: 3,
             uses_relay_adapt: true,
             unwrap_count: 1,
+            executor: false,
             send: false,
         });
     }
@@ -2109,6 +2311,7 @@ pub(crate) fn native_top_up_approximate_shape(
         relay_call_count: 2,
         uses_relay_adapt: true,
         unwrap_count: 1,
+        executor: false,
         send: false,
     })
 }

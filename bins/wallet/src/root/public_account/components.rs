@@ -120,6 +120,7 @@ pub(in crate::root) const fn public_account_source_label(
         PublicAccountSource::Derived => "Derived",
         PublicAccountSource::HardwareDerived => "Hardware",
         PublicAccountSource::Imported => "Imported",
+        PublicAccountSource::ExecutorDerived(_) => "Stealth",
     }
 }
 
@@ -127,9 +128,9 @@ pub(in crate::root) const fn public_account_source_icon(
     source: PublicAccountSource,
 ) -> RailgunPublicAccountIcon {
     match source {
-        PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
-            RailgunPublicAccountIcon::Derived
-        }
+        PublicAccountSource::Derived
+        | PublicAccountSource::HardwareDerived
+        | PublicAccountSource::ExecutorDerived(_) => RailgunPublicAccountIcon::Derived,
         PublicAccountSource::Imported => RailgunPublicAccountIcon::Imported,
     }
 }
