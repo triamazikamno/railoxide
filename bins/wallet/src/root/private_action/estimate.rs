@@ -39,7 +39,7 @@ impl PrivateEstimateInput {
     fn for_picker(mut self, recipient: String) -> Self {
         self.recipient = recipient;
         if self.amount.trim().is_empty() {
-            // Use the same initial amount as native forms, only for this display estimate.
+            // Blank forms still need a representative amount for this display estimate.
             self.amount = format_send_amount_input(self.asset.max_batched, self.asset.decimals);
         }
         self
@@ -90,6 +90,10 @@ impl WalletRoot {
     ) -> Result<Option<PrivateEstimateRequest>, String> {
         let asset = &input.asset;
         let recipient = input.recipient.trim();
+        // A blank amount is the untouched form, not an input error.
+        if input.amount.trim().is_empty() {
+            return Ok(None);
+        }
         let (kind, unwrap, native_top_up) = match &input.output {
             PrivateEstimateOutput::Send => (DeliveryFormKind::Send, false, None),
             PrivateEstimateOutput::Unshield {

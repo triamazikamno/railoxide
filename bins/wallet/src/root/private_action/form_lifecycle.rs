@@ -205,8 +205,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let key = UnshieldAssetKey::from_asset(&asset);
-        let amount = format_send_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = new_prefilled_amount_input(amount, window, cx);
+        let amount_input = new_text_input(window, cx, "amount");
         let recipient_input = new_text_input(window, cx, "0zk recipient");
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
             DeliveryFormKind::Send,
@@ -607,7 +606,8 @@ impl WalletRoot {
         } else {
             FeeHandlingMode::AddToAmount
         };
-        let amount = format_send_amount_input(asset.max_batched, asset.decimals);
+        // Switching assets clears the amount; the user must enter it deliberately.
+        let amount = String::new();
 
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
@@ -718,8 +718,8 @@ impl WalletRoot {
             } else {
                 BroadcasterChoice::Random
             };
-        let max_entered_amount = unshield_max_entered_amount_for_mode(asset.max_batched, fee_mode);
-        let amount = format_unshield_amount_input(max_entered_amount, asset.decimals);
+        // Switching assets clears the amount; the user must enter it deliberately.
+        let amount = String::new();
 
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
@@ -1561,8 +1561,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let key = UnshieldAssetKey::from_asset(&asset);
-        let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = new_prefilled_amount_input(amount, window, cx);
+        let amount_input = new_text_input(window, cx, "amount");
         let recipient_input = new_text_input(window, cx, "0x recipient");
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
             DeliveryFormKind::Unshield,

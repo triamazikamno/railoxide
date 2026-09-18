@@ -16,18 +16,6 @@ pub(in crate::root) fn private_action_amount_input(
     ui::private_action::amount_input(state, generating, submit_enabled, submit)
 }
 
-pub(in crate::root) fn new_prefilled_amount_input(
-    value: String,
-    window: &mut Window,
-    cx: &mut Context<'_, WalletRoot>,
-) -> Entity<InputState> {
-    let input = new_prefilled_input(window, cx, "amount", value);
-    input.update(cx, |input, cx| {
-        input.set_cursor_position(Position::new(0, 0), window, cx);
-    });
-    input
-}
-
 pub(in crate::root) fn set_programmatic_amount_input_value(
     input: &Entity<InputState>,
     value: String,
