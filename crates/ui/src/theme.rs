@@ -65,7 +65,6 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
 
     let theme = gpui_component::Theme::global_mut(cx);
     theme.shadow = false;
-    theme.tile_shadow = false;
     theme.focus_ring = false;
 
     let rgb = |value: u32| -> Hsla { rgb(value).into() };
@@ -158,7 +157,6 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.table_row_border = rgb(BORDER_SUBTLE);
     colors.title_bar = rgb(SURFACE);
     colors.title_bar_border = rgb(BORDER_SUBTLE);
-    colors.tiles = rgb(BACKGROUND);
     colors.warning = rgb(WARNING);
     colors.warning_active = rgb(0xccb98f);
     colors.warning_hover = rgb(0xffefbf);

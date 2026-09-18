@@ -1,13 +1,8 @@
 use gpui::{
-    AnyElement, App, Div, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
-    rgb,
+    AnyElement, App, Div, ElementId, Entity, FontWeight, IntoElement, ParentElement, SharedString,
+    Styled, Window, div, prelude::FluentBuilder as _, px, relative, rgb,
 };
-use gpui_component::input::{
-    Copy, Cut, DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToNextWordEnd,
-    DeleteToPreviousWordStart, Input, InputState, MoveToEnd, MoveToNextWord, MoveToPreviousWord,
-    MoveToStart, SelectToEnd, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
-};
+use gpui_component::input::{Input, InputState};
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
@@ -107,39 +102,11 @@ pub fn recipient_book_button(id: impl Into<ElementId>) -> Button {
 
 #[must_use]
 pub fn app_masked_input(state: &Entity<InputState>, disabled: bool) -> Div {
-    div()
-        .w_full()
-        .capture_action::<Copy>(|_, _, cx| cx.stop_propagation())
-        .capture_action::<Cut>(|_, _, cx| cx.stop_propagation())
-        .capture_action::<MoveToPreviousWord>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(MoveToStart), cx);
-        })
-        .capture_action::<MoveToNextWord>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(MoveToEnd), cx);
-        })
-        .capture_action::<SelectToPreviousWordStart>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(SelectToStart), cx);
-        })
-        .capture_action::<SelectToNextWordEnd>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(SelectToEnd), cx);
-        })
-        .capture_action::<DeleteToPreviousWordStart>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(DeleteToBeginningOfLine), cx);
-        })
-        .capture_action::<DeleteToNextWordEnd>(|_, window, cx| {
-            cx.stop_propagation();
-            window.dispatch_action(Box::new(DeleteToEndOfLine), cx);
-        })
-        .child(
-            app_input(state)
-                .role(gpui::accesskit::Role::PasswordInput)
-                .disabled(disabled),
-        )
+    div().w_full().child(
+        app_input(state)
+            .role(gpui::accesskit::Role::PasswordInput)
+            .disabled(disabled),
+    )
 }
 
 #[must_use]

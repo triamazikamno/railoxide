@@ -54,7 +54,7 @@ class ExtensionPackagingTests(unittest.TestCase):
                 (wasm_directory / f'{crate}.wasm').write_bytes(b'\0asm\1\0\0\0')
             metadata = {
                 'packages': [
-                    {'id': 'kit', 'name': 'gpui-kit-assets', 'version': '0.6.0',
+                    {'id': 'kit', 'name': 'gpui-kit-assets', 'version': '0.6.4',
                      'manifest_path': str(kit / 'Cargo.toml')},
                     {'id': 'protocol', 'name': 'dapp-gateway-protocol', 'version': '0.1.0',
                      'manifest_path': str(root / 'Cargo.toml'), 'license': 'MIT'},

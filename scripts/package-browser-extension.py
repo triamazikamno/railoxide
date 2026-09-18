@@ -78,9 +78,9 @@ def write_archive(output, files):
 
 def package(metadata_path):
     metadata = json.loads(Path(metadata_path).read_text(encoding='utf-8'))
-    packages = [p for p in metadata['packages'] if p['name'] == 'gpui-kit-assets' and p['version'] == '0.6.0']
+    packages = [p for p in metadata['packages'] if p['name'] == 'gpui-kit-assets' and p['version'] == '0.6.4']
     if len(packages) != 1:
-        raise RuntimeError('Expected exactly one locked gpui-kit-assets 0.6.0 source')
+        raise RuntimeError('Expected exactly one locked gpui-kit-assets 0.6.4 source')
     package_source = Path(packages[0]['manifest_path']).parent
     wasm = Path(metadata['target_directory']) / 'wasm32-unknown-unknown/release/browser_frontend.wasm'
     if not wasm.is_file():
@@ -132,7 +132,7 @@ def package(metadata_path):
         # Preserve a deterministic mapping to locked source bytes, without local paths.
         mapping = [
             '# Packaged component assets', '',
-            'Source: crates.io gpui-kit-assets 0.6.0, selected from locked Cargo metadata.',
+            'Source: crates.io gpui-kit-assets 0.6.4, selected from locked Cargo metadata.',
             'Source assets/icons/*.svg maps to package assets/icons/*.svg unchanged.',
             'Kit package license: Apache-2.0; Lucide icons: ISC. See package licenses/.',
             '',

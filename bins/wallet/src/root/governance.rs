@@ -4043,7 +4043,7 @@ impl WalletRoot {
                                     cx,
                                 )
                                 .sortable(false)
-                                .row_selectable(false)
+                                .row_selectable(true)
                                 .col_selectable(false)
                                 .col_movable(false)
                                 .col_resizable(false)
@@ -6507,7 +6507,7 @@ mod tests {
                         let table = cx.new(|cx| {
                             TableState::new(TableProbeDelegate::new(), window, cx)
                                 .sortable(false)
-                                .row_selectable(false)
+                                .row_selectable(true)
                                 .col_selectable(false)
                                 .col_movable(false)
                                 .col_resizable(false)
@@ -6638,7 +6638,7 @@ mod tests {
                                 cx,
                             )
                             .sortable(false)
-                            .row_selectable(false)
+                            .row_selectable(true)
                             .col_selectable(false)
                             .col_movable(false)
                             .col_resizable(false)
@@ -6700,7 +6700,7 @@ mod tests {
                         let table = cx.new(|cx| {
                             TableState::new(TableProbeDelegate::with_rows(6), window, cx)
                                 .sortable(false)
-                                .row_selectable(false)
+                                .row_selectable(true)
                                 .col_selectable(false)
                                 .col_movable(false)
                                 .col_resizable(false)
