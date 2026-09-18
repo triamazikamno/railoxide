@@ -115,7 +115,7 @@ pub fn receive_address(
     on_copy: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::Div {
     use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
-    use gpui_component::{IconName, button::ButtonVariants as _};
+    use gpui_component::{IconName, Sizable as _, button::ButtonVariants as _};
     let on_copy = std::rc::Rc::new(on_copy);
     let row_copy = on_copy.clone();
     div()
@@ -151,9 +151,13 @@ pub fn receive_address(
                         .text_color(rgb(theme::TEAL)),
                 )
                 .child(
-                    crate::controls::app_button(copy_id, "Copy address")
+                    crate::controls::app_button_base(copy_id)
                         .ghost()
+                        .xsmall()
+                        .compact()
                         .icon(IconName::Copy)
+                        .accessibility_label("Copy address")
+                        .tooltip("Copy address")
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             on_copy(window, cx);

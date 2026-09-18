@@ -1715,6 +1715,37 @@ impl WalletRoot {
         let edit_uuid = Arc::clone(&account_uuid);
         let address_dialog_uuid = Arc::clone(&account_uuid);
         let address_dialog_address = account.address;
+        let address_copy_root = root.clone();
+        let address_copy_value = SharedString::from(public_address_qr_payload(account.address));
+        let address_copy_button = div()
+            .group(row_group.clone())
+            .flex_none()
+            .opacity(0.0)
+            .group_hover(row_group.clone(), |this| this.opacity(1.0))
+            .hover(|this| this.opacity(1.0))
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                public_account_icon_button(
+                    SharedString::from(format!(
+                        "wallet-public-address-copy-{}",
+                        account.public_account_uuid
+                    )),
+                    IconName::Copy,
+                    "Copy address",
+                )
+                .on_click(move |_event, window, cx| {
+                    cx.stop_propagation();
+                    if address_copy_root.read(cx).view_session.is_some() {
+                        ui::clipboard::copy_to_clipboard_with_toast(
+                            address_copy_value.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            );
         let has_walletconnect_session =
             self.walletconnect_account_has_session(&account.public_account_uuid);
         let source_badge = public_account_metadata_badge(
@@ -1979,7 +2010,8 @@ impl WalletRoot {
                                                     .text_color(rgb(theme::TEXT)),
                                             ),
                                     ),
-                            ),
+                            )
+                            .child(address_copy_button),
                     )
                     .child(metadata_badges),
             );
