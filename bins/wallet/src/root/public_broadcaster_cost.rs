@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_component::{IconName, Sizable, spinner::Spinner};
 use railgun_ui::format_token_amount;
+use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
@@ -20,12 +21,12 @@ use super::private_action::{PrivateEstimateInput, PrivateEstimateOutput, deliver
 use super::private_broadcaster::PrivateBroadcasterProgressState;
 use super::public_action::public_action_protocol_fee_label;
 use super::spend_authorization::spend_authorization_recipient_display;
+use super::utxo::short_hash;
 use super::{
     COST_ESTIMATE_DEBOUNCE, DeliveryFormKind, DeliveryMode, UnshieldAsset, UnshieldAssetKey,
-    WalletRoot, broadcaster_candidate_anchor_rate, copyable_mono_field,
-    format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
-    format_report_chain, format_token_amount_for_display, format_value_with_usd_label,
-    should_show_distinct_amount, token_display_metadata,
+    WalletRoot, broadcaster_candidate_anchor_rate, format_native_token_amount_for_display,
+    format_native_top_up_recipient_suffix, format_report_chain, format_token_amount_for_display,
+    format_value_with_usd_label, should_show_distinct_amount, token_display_metadata,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -862,7 +863,24 @@ pub(super) fn render_public_broadcaster_tx_hash_row(
     tx_hash: String,
     button_id: SharedString,
 ) -> gpui::Div {
-    copyable_mono_field("Tx hash", tx_hash, button_id)
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text("Tx hash").flex_none())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    app_strong_text(short_hash(&tx_hash)).font_family(theme::APP_MONO_FONT_FAMILY),
+                )
+                .child(clipboard_with_toast(button_id, tx_hash)),
+        )
 }
 
 pub(super) fn render_public_broadcaster_cost_estimate(
@@ -991,12 +1009,20 @@ pub(super) fn cost_estimate_detail_text(text: impl Into<SharedString>) -> gpui::
 pub(super) fn render_private_broadcaster_progress_context(
     progress: &PrivateBroadcasterProgressState,
     context: &PrivateBroadcasterProgressContext<'_>,
-    broadcaster_action: Option<AnyElement>,
+    mut broadcaster_action: Option<AnyElement>,
 ) -> gpui::Div {
-    ui::private_submission::transaction_context(
-        private_broadcaster_progress_context_rows(progress, context),
-        broadcaster_action,
-    )
+    let rows = private_broadcaster_progress_context_rows(progress, context)
+        .into_iter()
+        .map(|row| {
+            let action = if row.label == "Broadcaster" {
+                broadcaster_action.take()
+            } else {
+                None
+            };
+            (row, action)
+        })
+        .collect();
+    ui::private_submission::transaction_context_with_actions(rows)
 }
 
 pub(super) fn private_broadcaster_progress_context_rows(

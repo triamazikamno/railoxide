@@ -212,7 +212,7 @@ pub(super) fn app_refresh_button(
     }
 }
 
-pub(super) fn app_status_tag(label: impl Into<SharedString>, color: u32) -> impl IntoElement {
+pub(super) fn app_status_tag(label: impl Into<SharedString>, color: u32) -> Tag {
     Tag::custom(
         rgb_with_alpha(color, 0.12).into(),
         rgb(color).into(),

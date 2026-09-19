@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
+    prelude::FluentBuilder as _, px, rems, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
+    Disableable, Icon, IconName, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
@@ -33,6 +33,7 @@ use super::public_broadcaster_cost::{
 };
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::submission_progress::{SubmissionProgressStep, render_submission_progress_stepper};
+use super::utxo::short_hash;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
     app_panel, app_status_tag, dialog_max_height, format_native_token_amount_for_display,
@@ -1137,7 +1138,7 @@ impl WalletRoot {
         let address = public_broadcaster_progress_address(progress)?;
         if self.is_banned_broadcaster(address) {
             return Some(
-                render_broadcaster_preference_progress_chip("Banned", theme::DANGER)
+                render_broadcaster_preference_progress_chip("Banned", theme::DANGER, None)
                     .into_any_element(),
             );
         }
@@ -1150,39 +1151,55 @@ impl WalletRoot {
         });
         if submitted && self.is_favorite_broadcaster(address) {
             return Some(
-                render_broadcaster_preference_progress_chip("Favorited", theme::WARNING)
-                    .into_any_element(),
+                render_broadcaster_preference_progress_chip(
+                    "Favorited",
+                    theme::WARNING,
+                    Some(IconName::Star),
+                )
+                .into_any_element(),
             );
         }
-        let control = if submitted {
-            OperationControl::Favorite
-        } else if public_broadcaster_waiting_can_stop(progress, Instant::now())
-            && !progress.stop_available
-        {
-            OperationControl::Ban
-        } else {
-            return None;
-        };
         let action_root = root.clone();
         let address = address.to_owned();
+        if submitted {
+            return Some(
+                app_button_base(delivery_element_id(
+                    progress.key,
+                    progress.kind,
+                    "broadcaster-preference-favorite",
+                ))
+                .outline()
+                .xsmall()
+                .flex_none()
+                .icon(Icon::new(IconName::Star))
+                .accessibility_label("Add to favorites")
+                .tooltip(
+                    "Save this broadcaster to your favorites so future transactions can prefer it.",
+                )
+                .on_click(move |_event, _window, cx| {
+                    action_root.update(cx, |root, cx| {
+                        root.add_favorite_broadcaster(&address, cx);
+                    });
+                })
+                .into_any_element(),
+            );
+        }
+        let can_ban = public_broadcaster_waiting_can_stop(progress, Instant::now())
+            && !progress.stop_available;
+        if !can_ban {
+            return None;
+        }
         Some(
             ui::private_submission::operation_controls(
                 delivery_element_id(progress.key, progress.kind, "broadcaster-preference"),
-                [control],
-                move |control, _, cx| {
-                    action_root.update(cx, |root, cx| match control {
-                        OperationControl::Favorite => {
-                            root.add_favorite_broadcaster(&address, cx);
-                        }
-                        OperationControl::Ban => {
-                            root.add_banned_broadcaster(&address, cx);
-                        }
-                        OperationControl::Stop
-                        | OperationControl::StopRetries
-                        | OperationControl::StopWaiting => {}
+                [OperationControl::Ban],
+                move |_control, _, cx| {
+                    action_root.update(cx, |root, cx| {
+                        root.add_banned_broadcaster(&address, cx);
                     });
                 },
             )
+            .flex_none()
             .into_any_element(),
         )
     }
@@ -1263,8 +1280,12 @@ fn public_broadcaster_progress_address(progress: &PrivateBroadcasterProgressStat
 fn render_broadcaster_preference_progress_chip(
     label: &'static str,
     color: u32,
+    icon: Option<IconName>,
 ) -> impl IntoElement {
     app_status_tag(label, color)
+        .flex_none()
+        .gap_1()
+        .children(icon.map(|icon| Icon::new(icon).size(rems(0.8125))))
 }
 
 fn render_pending_public_broadcaster_progress_context(
@@ -1404,14 +1425,18 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
                     row.value = spend_authorization_recipient_display(&row.value);
                     Some(action)
                 }
-                "Transaction hash" => Some(private_broadcaster_copy_action(
-                    format!(
-                        "private-self-broadcast-tx-hash-copy-{}",
-                        progress.generation_id
-                    ),
-                    row.value.clone(),
-                    "Copy transaction hash",
-                )),
+                "Transaction hash" => {
+                    let action = private_broadcaster_copy_action(
+                        format!(
+                            "private-self-broadcast-tx-hash-copy-{}",
+                            progress.generation_id
+                        ),
+                        row.value.clone(),
+                        "Copy transaction hash",
+                    );
+                    row.value = short_hash(&row.value);
+                    Some(action)
+                }
                 _ => None,
             };
             (row, action)

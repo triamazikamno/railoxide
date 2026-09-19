@@ -358,38 +358,15 @@ pub(super) fn walletconnect_completed_tx_hash_row(request_key: &str, tx_hash: &s
     let copy_id = SharedString::from(format!(
         "walletconnect-request-result-tx-copy-{request_key}"
     ));
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(APP_TEXT_SIZE)
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("Transaction hash"),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .flex()
-                .items_start()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(theme::BORDER_SUBTLE))
-                .bg(rgb(theme::SURFACE))
-                .p(px(8.0))
-                .child(
-                    app_muted_text(tx_hash.to_owned())
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .font_family(APP_MONO_FONT_FAMILY)
-                        .whitespace_normal(),
-                )
-                .child(clipboard_with_toast(copy_id, tx_hash.to_owned())),
-        )
+    walletconnect_kv_element_row(
+        "Transaction hash",
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(app_muted_text(short_hash(tx_hash)).font_family(APP_MONO_FONT_FAMILY))
+            .child(clipboard_with_toast(copy_id, tx_hash.to_owned())),
+    )
 }
 
 pub(super) fn walletconnect_approved_chains_row(session: &WalletConnectSessionRecord) -> gpui::Div {
