@@ -610,7 +610,11 @@ async function bootstrapView({ popup = false, tab = false, mode = 'notification'
   const domEvents = new Map(), windowEvents = new Map(), sent = [], viewCalls = [];
   let time = 0;
   const ports = [], timers = new Map();
-  const node = () => ({ hidden: false, textContent: '', addEventListener() {} });
+  const nodes = new Map();
+  const node = selector => {
+    if (!nodes.has(selector)) nodes.set(selector, { hidden: selector === '#graphics-help', textContent: '', addEventListener() {} });
+    return nodes.get(selector);
+  };
   function connect() {
     const port = {
       onMessage: { addListener(callback) { port.incoming = callback; } },
@@ -693,6 +697,29 @@ test('only trusted extension input emits activity, never startup, focus, synthet
   assert.equal(sent.filter(message => message.type === 'user_activity').length, 2, 'locked, disconnected and closed documents cannot extend inactivity');
 });
 
+
+test('graphics startup recovery links to the configured desktop without depending on a live worker', async () => {
+  for (const [endpoint, expected] of [
+    ['', 'http://127.0.0.1:43110/install#graphics-troubleshooting'],
+    ['ws://127.0.0.1:44000/', 'http://127.0.0.1:44000/install#graphics-troubleshooting'],
+    ['desktop.local', 'http://desktop.local:43110/install#graphics-troubleshooting'],
+    ['wss://desktop.example:44000/', 'https://desktop.example:44000/install#graphics-troubleshooting'],
+  ]) {
+    const view = await bootstrapView({ ready: false });
+    view.context.chrome.storage = { local: { async get() { return { gatewayPreferences: { endpoint } }; } } };
+    view.disconnected();
+    view.context.railoxideHost.stage('graphics initialization');
+    view.timers.get(30_000)();
+    await flush();
+    const help = view.context.document.querySelector('#graphics-help');
+    assert.equal(help.href, expected);
+    assert.equal(help.hidden, false);
+  }
+  const view = await bootstrapView({ ready: false });
+  view.context.railoxideHost.fail('Packaged resource unavailable.');
+  await flush();
+  assert.equal(view.context.document.querySelector('#graphics-help').hidden, true);
+});
 
 test('toolbar popup opening emits activity once and cannot survive lock, generation or port retirement', async () => {
   const snapshot = (generation = 7, locked = false) => ({

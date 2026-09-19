@@ -251,6 +251,21 @@ function stopRuntime() {
   if (runtimeInitialized) runtime.stop();
 }
 
+async function showGraphicsHelp() {
+  try {
+    const saved = await chrome.storage.local.get('gatewayPreferences');
+    const url = new URL(configuration(saved.gatewayPreferences?.endpoint ?? '').endpoint);
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+    url.pathname = '/install';
+    url.hash = 'graphics-troubleshooting';
+    const help = document.querySelector('#graphics-help');
+    help.href = url.href;
+    help.hidden = false;
+  } catch {
+    recovery.textContent = 'Check your browser’s graphics settings. Open the extension install page from the RailOxide desktop app for troubleshooting steps.';
+  }
+}
+
 function fail(detail) {
   if (state !== 'loading') return;
   state = 'failed';
@@ -260,6 +275,10 @@ function fail(detail) {
   document.documentElement.classList.add('failed');
   message.textContent = `Startup failed during ${phase}. ${detail}`;
   recovery.textContent = 'Reload this gateway view. If it fails again, rebuild with scripts/build-browser-extension, reload the extension in brave://extensions, and reopen it.';
+  if (phase === 'graphics initialization') {
+    recovery.textContent = 'Check your browser’s graphics settings. Keep the RailOxide desktop app running to open the troubleshooting guide.';
+    void showGraphicsHelp();
+  }
   recovery.hidden = false;
   reload.hidden = false;
   // A Rust callback may still hold the App borrow. Release it on the next task.

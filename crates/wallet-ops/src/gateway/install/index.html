@@ -42,6 +42,8 @@
     background:var(--input-surface); border:1px solid var(--border-subtle); border-radius:4px; padding:1px 6px;
   }
   .kbd { display:inline-flex; align-items:center; gap:6px; }
+  .command { display:flex; flex-wrap:wrap; margin-top:8px; }
+  .command .code { min-width:0; overflow-wrap:anywhere; }
   .dl { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   .btn {
     display:inline-flex; align-items:center; justify-content:center; gap:6px; height:32px; padding:0 12px;
@@ -172,6 +174,21 @@
 
   <div class="step"><span class="n" style="border-color:transparent"></span><h3>Updating</h3>
     <div class="c"><p>Download again, extract over the same folder, then click <b>Reload</b> on the extension card.</p></div></div>
+
+  <section class="step" id="graphics-troubleshooting">
+    <span class="n" style="border-color:transparent" aria-hidden="true"></span><h3>Graphics startup fails in a Linux VM</h3>
+    <div class="c">
+      <p>If the extension reports “Startup failed during graphics initialization” in Brave, try these steps:</p>
+      <ol>
+        <li>Open <span class="kbd"><span class="code">brave://settings/system</span><button class="copy" type="button">Copy</button></span> and enable <b>Use graphics acceleration when available</b>. Your VM’s <b>3D acceleration can remain disabled</b>.</li>
+        <li>Fully quit Brave, then launch it from a terminal:
+          <div class="kbd command"><code class="code">brave-browser --disable-gpu-compositing --ignore-gpu-blocklist</code><button class="copy" type="button">Copy</button></div>
+        </li>
+        <li>Reopen the extension.</li>
+      </ol>
+      <p>This configuration worked with VM 3D acceleration disabled, including on Whonix. If startup still fails, open <span class="code">brave://gpu</span>, select <b>Download Report to File</b>, and include the report in your bug report.</p>
+    </div>
+  </section>
 
   <details>
     <summary>Build from source</summary>
