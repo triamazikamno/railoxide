@@ -1736,6 +1736,7 @@ mod integration_tests {
                 "version": 1,
                 "generation": generation,
                 "locked": locked,
+                "native_usd_pricing": {},
                 "accounts": [],
                 "private_view_supported": false,
                 "private_view": null,

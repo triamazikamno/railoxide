@@ -127,8 +127,8 @@ pub use amounts::{
 pub use anchors::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, TokenAnchorRateCache,
     TokenAnchorRefreshHandle, average_non_outlier_anchor_rates, fixed_token_anchor_rate,
-    known_token_anchor_sources, oracle_answer_to_anchor_rate, refresh_token_anchor_rates,
-    spawn_token_anchor_refresh_worker,
+    known_token_anchor_sources, oracle_answer_to_anchor_rate, probe_native_usd_quote,
+    refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
 };
 pub use desktop::*;
 pub use governance::{

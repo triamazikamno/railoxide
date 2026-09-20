@@ -309,6 +309,32 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
         SettingsApplyMode::Clean
     );
 
+    let mut pricing = saved.clone();
+    pricing
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .unwrap()
+        .native_usd_pricing = wallet_ops::settings::NativeUsdPricing::Disabled;
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &pricing),
+        SettingsApplyMode::NewRequests
+    );
+    let old_chain = build_effective_chain_configs(&saved).unwrap();
+    let new_chain = build_effective_chain_configs(&pricing).unwrap();
+    assert!(
+        old_chain
+            .get(1)
+            .unwrap()
+            .operationally_matches(new_chain.get(1).unwrap())
+    );
+    pricing.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
+        vec!["https://rpc.example".into()];
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &pricing),
+        SettingsApplyMode::NetworkingRestart
+    );
+
     let mut network_draft = saved.clone();
     network_draft.network.mode = NetworkModeSetting::Direct;
     assert_eq!(
@@ -1308,6 +1334,53 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         saved
     );
 
+    // Pricing can be saved without a network runtime and still preserves draft/revision isolation.
+    cx.update(|window, cx| {
+        owner.update(cx, |editor, cx| {
+            let revision = wallet_ops::settings::settings_revision(&editor.saved)
+                .unwrap()
+                .to_string();
+            let mut draft = wallet_ops::settings::chain_editor_draft(&editor.saved, 1).unwrap();
+            draft.native_usd_pricing = railgun_ui::chain_editor::NativeUsdChoice::Disabled;
+            let reply = editor
+                .handle_chain_editor_command(
+                    &revision,
+                    &ChainEditorCommand::Save {
+                        draft,
+                        existing: true,
+                    },
+                    window,
+                    cx,
+                )
+                .unwrap();
+            assert!(!reply.restart_required);
+            assert!(reply.draft.is_none());
+            assert_eq!(
+                editor.saved.chains.per_chain[&1].native_usd_pricing,
+                wallet_ops::settings::NativeUsdPricing::Disabled
+            );
+        });
+    });
+    // A Test validates the draft like Save but persists nothing and publishes no status.
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            let persisted =
+                wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap();
+            let before = editor.saved.clone();
+            let mut draft = wallet_ops::settings::chain_editor_draft(&editor.saved, 1).unwrap();
+            draft.native_usd_pricing = railgun_ui::chain_editor::NativeUsdChoice::Oracle;
+            draft.fields.insert(
+                ChainField::NativeUsdOracle,
+                Address::repeat_byte(8).to_string(),
+            );
+            editor.handle_chain_editor_probe(&draft, cx);
+            assert_eq!(editor.saved, before);
+            assert_eq!(
+                wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+                persisted
+            );
+        });
+    });
     // A narrow addition must keep an older unrelated Settings draft, and its old save must fail.
     cx.update(|window, cx| {
         owner.update(cx, |editor, cx| {
@@ -1317,6 +1390,11 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
                 .to_string();
             let mut draft = ChainDraft::new();
             draft.chain_id = "9007199254740993".into();
+            draft.native_usd_pricing = railgun_ui::chain_editor::NativeUsdChoice::Oracle;
+            draft.fields.insert(
+                ChainField::NativeUsdOracle,
+                Address::repeat_byte(7).to_string(),
+            );
             for (field, value) in [
                 (ChainField::Name, "Custom"),
                 (ChainField::NativeName, "Custom coin"),

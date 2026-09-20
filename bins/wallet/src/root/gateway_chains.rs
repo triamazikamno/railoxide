@@ -1,7 +1,9 @@
 use super::{Context, WalletRoot, Window, WindowExt};
 use crate::root::settings::SettingsApplyMode;
-use railgun_ui::chain_editor::{ChainEditorCommand, ChainEditorSnapshot};
-use wallet_ops::settings::{chain_editor_mutation, chain_editor_snapshot, editor_chain_id};
+use railgun_ui::chain_editor::{ChainEditorCommand, ChainEditorSnapshot, NativeUsdProbe};
+use wallet_ops::settings::{
+    chain_editor_mutation, chain_editor_probe_chain, chain_editor_snapshot, editor_chain_id,
+};
 
 impl WalletRoot {
     pub(in crate::root) const fn gateway_chain_publication_available(&self) -> bool {
@@ -21,6 +23,10 @@ impl WalletRoot {
         let Some(handle) = self.gateway.handle.clone() else {
             return;
         };
+        if matches!(request.command(), ChainEditorCommand::Probe { .. }) {
+            self.probe_gateway_chain_editor(request, handle, cx);
+            return;
+        }
         let result = (|| -> Result<ChainEditorSnapshot, String> {
             let editor = self
                 .settings_editor
@@ -34,6 +40,10 @@ impl WalletRoot {
                 }
                 ChainEditorCommand::Save { .. } | ChainEditorCommand::Remove { .. } => None,
                 ChainEditorCommand::Reset { chain_id } => Some(editor_chain_id(chain_id)?),
+                // Tests never reach this path; they are answered asynchronously above.
+                ChainEditorCommand::Probe { .. } => {
+                    return Err("This command does not change a chain".to_owned());
+                }
             };
             let revision = request
                 .revision()
@@ -88,5 +98,42 @@ impl WalletRoot {
             })
             .detach();
         }
+    }
+
+    /// Reads a draft's own source for the extension's Test action. Nothing is persisted,
+    /// cached or published, and a retired view receives no result.
+    fn probe_gateway_chain_editor(
+        &self,
+        request: wallet_ops::gateway::GatewayChainEditorRequest,
+        handle: wallet_ops::gateway::GatewayHandle,
+        cx: &Context<'_, Self>,
+    ) {
+        use wallet_ops::gateway::GatewayChainEditorOutcome;
+        let ChainEditorCommand::Probe { draft } = request.command() else {
+            return;
+        };
+        let prepared = self
+            .settings_editor
+            .as_ref()
+            .ok_or_else(|| "Settings are unavailable".to_owned())
+            .and_then(|editor| chain_editor_probe_chain(&editor.read(cx).saved, draft));
+        let http = self.reusable_network_context();
+        self.runtime.spawn(async move {
+            let result = match prepared {
+                Ok(chain) => wallet_ops::probe_native_usd_quote(&chain, &http).await,
+                Err(message) => Err(message),
+            };
+            if !request.is_current() {
+                return;
+            }
+            handle
+                .complete_chain_editor_request(
+                    request,
+                    GatewayChainEditorOutcome::Probed {
+                        probe: NativeUsdProbe::new(result),
+                    },
+                )
+                .await;
+        });
     }
 }

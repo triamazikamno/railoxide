@@ -537,7 +537,7 @@ impl WalletRoot {
                 let Ok(review) = GovernanceActionReview::from_resolved(
                     &refreshed.resolved,
                     refreshed.context.clone(),
-                    Some(estimate.fee_projection(None)),
+                    Some(estimate.fee_projection(None, 18)),
                 ) else {
                     root.reject_governance_authorization(
                         &target,
@@ -1217,7 +1217,7 @@ async fn build_governance_spend_draft(
     let review = GovernanceActionReview::from_resolved(
         &resolved,
         context,
-        Some(estimate.fee_projection(None)),
+        Some(estimate.fee_projection(None, 18)),
     )
     .map_err(|error| error.to_string())?;
     let stage = derive_governance_proposal_status(&fresh, &rules, chain_time)
@@ -1634,7 +1634,7 @@ pub(super) async fn build_typed_governance_spend_draft(
     let review = GovernanceActionReview::from_resolved(
         &resolved,
         context,
-        Some(estimate.fee_projection(None)),
+        Some(estimate.fee_projection(None, 18)),
     )
     .map_err(|error| error.to_string())?;
     let gas_fee = match gas_fee_selection {

@@ -2287,7 +2287,7 @@ mod tests {
     fn moving_value_requires_finite_known_amount_and_cached_price() {
         let token = Address::from([0x55; 20]);
         let rates = TokenAnchorRateCache::new();
-        rates.store_native_usd_rate(1, U256::from(1_000_000_u64));
+        rates.store_native_usd_rate(1, U256::from(1_000_000_u64), 18);
         rates.store_rate(1, token, U256::from(1_000_000_000_000_000_000_u64));
         let known_token = WalletConnectAmount::KnownToken {
             token,

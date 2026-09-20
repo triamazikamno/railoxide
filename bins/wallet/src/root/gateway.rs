@@ -577,6 +577,8 @@ impl WalletRoot {
                 ..GatewayWalletState::default()
             };
             if unlocked {
+                snapshot.native_usd_pricing =
+                    self.public_broadcaster_anchor_cache.native_usd_statuses();
                 snapshot.token_registry = Some(Arc::new(self.effective_token_registry.clone()));
                 snapshot.set_rpc_context(self.http.clone(), &self.effective_chain_configs);
             }

@@ -61,6 +61,7 @@ pub struct GatewayUnlockState {
 /// View capability and immutable networking authority. Presentation defaults do not advance the epoch.
 #[derive(Clone, Default)]
 pub struct GatewayWalletState {
+    pub native_usd_pricing: BTreeMap<String, railgun_ui::chain_editor::NativeUsdStatus>,
     pub public_view: super::GatewayPublicView,
     pub network_view: Option<GatewayNetworkView>,
     pub private_view_supported: bool,
@@ -141,6 +142,7 @@ impl GatewayWalletState {
             && self.routes == other.routes
             && self.network_view == other.network_view
             && self.public_view == other.public_view
+            && self.native_usd_pricing == other.native_usd_pricing
             && self.private_actions_supported == other.private_actions_supported
             && self.private_self_broadcast_supported == other.private_self_broadcast_supported
             && self.private_view_supported == other.private_view_supported
@@ -1773,6 +1775,11 @@ impl DappProvider {
             private_actions_supported: self.wallet.private_actions_supported,
             private_self_broadcast_supported: self.wallet.private_self_broadcast_supported,
             chain_management_supported: peer_id.is_some() && self.wallet.view.is_some(),
+            native_usd_pricing: if peer_id.is_some() && self.wallet.view.is_some() {
+                self.wallet.native_usd_pricing.clone()
+            } else {
+                BTreeMap::new()
+            },
             network_control_supported: self.wallet.network_view.is_some() && peer_id.is_some(),
             network_view: peer_id
                 .as_ref()

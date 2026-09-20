@@ -151,6 +151,7 @@ impl From<ChainSettingsOverride> for super::ChainSettingsOverride {
             indexed_wallet_block_range: old.indexed_wallet_block_range,
         };
         Self {
+            native_usd_pricing: super::NativeUsdPricing::Default,
             enabled: old.enabled,
             rpc_endpoints: old.rpc_endpoints,
             contracts: super::ChainContractSettings {

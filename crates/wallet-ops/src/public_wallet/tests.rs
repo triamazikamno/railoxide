@@ -701,6 +701,7 @@ async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
     settings.chains.custom.insert(
         CHAIN,
         crate::settings::CustomChainSettings {
+            native_usd_pricing: crate::settings::NativeUsdPricing::Default,
             name: "Custom test network".into(),
             native_currency: crate::settings::NativeCurrency {
                 name: "Custom coin".into(),
@@ -1519,6 +1520,7 @@ fn walletconnect_fee_projection_keeps_raw_buffered_source_and_optional_usd() {
         resolved,
         PublicActionFeeSource::OperationTable,
         Some(U256::from(2_000_000_u64)),
+        18,
     );
     assert_eq!(projection.expected_fee_per_gas, 120);
     assert_eq!(projection.expected_gas_cost, U256::from(12_000));
@@ -1552,8 +1554,17 @@ fn walletconnect_fee_projection_keeps_raw_buffered_source_and_optional_usd() {
         expected_gas_cost: U256::from(12_000_u64),
         max_gas_cost: U256::from(13_200_u64),
     };
+    let custom_precision = estimate.fee_projection(Some(U256::from(2_000_000)), 6);
+    assert_eq!(
+        custom_precision.expected_native_usd_micro_value,
+        Some(U256::from(24_000))
+    );
+    assert_eq!(
+        custom_precision.maximum_native_usd_micro_value,
+        Some(U256::from(26_400))
+    );
     let estimate_projection =
-        estimate.fee_projection(Some(U256::from(1_000_000_000_000_000_000_u128)));
+        estimate.fee_projection(Some(U256::from(1_000_000_000_000_000_000_u128)), 18);
     assert_eq!(
         estimate_projection.source,
         PublicActionFeeSource::NetworkSimulation

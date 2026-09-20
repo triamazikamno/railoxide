@@ -391,7 +391,7 @@ fn sponsorship_display_scales_token_usd_and_gwei_values() {
     let settings = WalletSettings::default();
     let registry = build_effective_token_registry(&settings).expect("effective token registry");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, U256::from(3_000_000_000_u64));
+    cache.store_native_usd_rate(1, U256::from(3_000_000_000_u64), 18);
     let weth: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
         .parse()
         .expect("WETH address");

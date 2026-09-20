@@ -66,13 +66,13 @@ pub(in crate::root) fn classify_settings_apply_mode(
         return SettingsApplyMode::Clean;
     }
     if draft.network != saved.network
-        || draft.chains.per_chain != saved.chains.per_chain
+        || built_in_operations_changed(saved, draft)
         || draft.indexed_artifacts != saved.indexed_artifacts
         || draft.poi != saved.poi
         || draft.waku != saved.waku
     {
         SettingsApplyMode::NetworkingRestart
-    } else if draft.chains.custom != saved.chains.custom
+    } else if draft.chains != saved.chains
         || draft.privacy != saved.privacy
         || draft.broadcaster != saved.broadcaster
         || draft.gas != saved.gas
@@ -82,6 +82,15 @@ pub(in crate::root) fn classify_settings_apply_mode(
     } else {
         SettingsApplyMode::FutureSessions
     }
+}
+
+fn built_in_operations_changed(saved: &WalletSettings, draft: &WalletSettings) -> bool {
+    railgun_ui::DEFAULT_CHAINS.iter().any(|id| {
+        let previous = saved.chains.per_chain.get(id).cloned().unwrap_or_default();
+        let mut next = draft.chains.per_chain.get(id).cloned().unwrap_or_default();
+        next.native_usd_pricing = previous.native_usd_pricing;
+        next != previous
+    })
 }
 
 pub(in crate::root) fn settings_save_action_enabled(

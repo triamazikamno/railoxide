@@ -379,6 +379,7 @@ pub(super) fn walletconnect_fee_projection(
     quote: Option<PublicActionGasFeeQuote>,
     selection: PublicActionGasFeeSelection,
     native_usd_micro_rate: Option<U256>,
+    native_decimals: u8,
 ) -> Result<(PublicActionFeeProjection, PublicActionResolvedGasFee), String> {
     let resolved = resolve_public_action_gas_fee(
         chain_id,
@@ -397,6 +398,7 @@ pub(super) fn walletconnect_fee_projection(
             resolved,
             PublicActionFeeSource::OperationTable,
             native_usd_micro_rate,
+            native_decimals,
         ),
         resolved,
     ))
@@ -659,6 +661,10 @@ impl WalletRoot {
                 selection,
                 self.public_broadcaster_anchor_cache
                     .cached_native_usd_rate(chain_id),
+                self.effective_chain_configs
+                    .get(chain_id)?
+                    .native_currency
+                    .decimals,
             )
             .ok()
             .map(|(projection, _)| projection)
@@ -996,6 +1002,35 @@ impl WalletRoot {
         self.walletconnect_fee_state_changed_by_editor(cx);
     }
 
+    pub(in crate::root) fn refresh_walletconnect_fee_usd_values(&mut self) {
+        let Some(state) = self.walletconnect.walletconnect_fee_state.as_mut() else {
+            return;
+        };
+        let chain_id = self
+            .walletconnect
+            .pending_requests
+            .get(state.request_key.as_ref())
+            .and_then(|request| parse_chain_id(&request.item.chain_id).ok());
+        let revalue = |projection: &mut PublicActionFeeProjection| {
+            projection.expected_native_usd_micro_value = chain_id.and_then(|id| {
+                self.public_broadcaster_anchor_cache
+                    .cached_native_usd_micro_value(id, projection.expected_gas_cost)
+            });
+            projection.maximum_native_usd_micro_value = chain_id.and_then(|id| {
+                self.public_broadcaster_anchor_cache
+                    .cached_native_usd_micro_value(id, projection.maximum_gas_cost)
+            });
+        };
+        if let Some(projection) = &mut state.last_successful_display_projection {
+            revalue(projection);
+        }
+        match &mut state.status {
+            WalletConnectFeeStatus::EstimatedFromOperation(projection)
+            | WalletConnectFeeStatus::Simulated(projection) => revalue(projection),
+            _ => {}
+        }
+    }
+
     fn walletconnect_fee_state_changed_by_editor(&mut self, cx: &Context<'_, Self>) {
         self.walletconnect.walletconnect_fee_quote_task = None;
         self.walletconnect.walletconnect_gas_fee.refreshing = false;
@@ -1041,6 +1076,9 @@ impl WalletRoot {
             selection,
             self.public_broadcaster_anchor_cache
                 .cached_native_usd_rate(chain_id),
+            self.effective_chain_configs
+                .get(chain_id)
+                .map_or(18, |chain| chain.native_currency.decimals),
         ) {
             Ok((projection, _)) => {
                 state.apply_successful_operation_projection(projection);
@@ -1410,7 +1448,7 @@ impl WalletRoot {
                 state.simulation_requested = false;
                 match result {
                     WalletConnectSimulationResult::Complete(estimate) => {
-                        let projection = estimate.fee_projection(native_usd_micro_rate);
+                        let projection = estimate.fee_projection(native_usd_micro_rate, root.effective_chain_configs.get(chain_id).map_or(18, |chain| chain.native_currency.decimals));
                         state.apply_successful_simulation_projection(projection);
                         state.error = None;
                         state.simulation_retryable = false;
@@ -1635,6 +1673,7 @@ mod tests {
                 max_priority_fee_per_gas: 2,
             },
             None,
+            18,
         )
         .expect("custom projection");
         assert_eq!(resolved.max_fee_per_gas, 20);

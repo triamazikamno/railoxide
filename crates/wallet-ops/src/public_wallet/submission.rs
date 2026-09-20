@@ -1244,6 +1244,7 @@ mod tests {
         settings.chains.custom.insert(
             CHAIN,
             CustomChainSettings {
+                native_usd_pricing: crate::settings::NativeUsdPricing::Default,
                 name: "Custom EVM".into(),
                 native_currency: NativeCurrency {
                     name: "Custom".into(),

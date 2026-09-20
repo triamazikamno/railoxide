@@ -202,6 +202,9 @@ pub fn build_effective_chain_configs(
             chain_id,
             EffectiveChainConfig {
                 chain_id,
+                native_usd_oracle: saved
+                    .native_usd_pricing
+                    .resolve(Some(preset.native_usd_oracle)),
                 name: preset.name.to_owned(),
                 native_currency: preset.native_currency,
                 explorer_urls: Vec::new(),
@@ -246,6 +249,7 @@ pub fn build_effective_chain_configs(
             chain_id,
             EffectiveChainConfig {
                 chain_id,
+                native_usd_oracle: saved.native_usd_pricing.resolve(None),
                 name: saved.name.clone(),
                 native_currency: saved.native_currency.clone(),
                 explorer_urls: saved.explorer_urls.clone(),

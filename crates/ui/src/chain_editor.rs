@@ -1,5 +1,7 @@
 //! Chain management presentation. Hosts own authority, validation, persistence, and networking.
-use crate::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
+use crate::controls::{
+    app_button, app_input, app_input_group, app_muted_text, app_strong_text, app_text,
+};
 use crate::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_LINE_HEIGHT};
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
@@ -14,11 +16,13 @@ use gpui_component::{
     checkbox::Checkbox,
     collapsible::Collapsible,
     dialog::DialogButtonProps,
-    input::InputState,
+    input::{InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, InputState},
+    select::{Select, SelectEvent, SelectItem, SelectState},
     tag::Tag,
 };
 use railgun_ui::chain_editor::{
-    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary,
+    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary, NativeUsdChoice,
+    NativeUsdProbe, NativeUsdState, NativeUsdStatus,
 };
 use std::collections::BTreeMap;
 
@@ -39,6 +43,13 @@ pub struct ChainEditorEvent {
 pub struct ChainEditor {
     snapshot: ChainEditorSnapshot,
     draft: Option<ChainDraft>,
+    opened_draft: Option<ChainDraft>,
+    pricing_select: Option<Entity<SelectState<Vec<PricingItem>>>>,
+    pricing_status: BTreeMap<String, NativeUsdStatus>,
+    pricing_preset: Option<Entity<InputState>>,
+    /// The last Test reply and the draft source it read, so a stale result stays hidden.
+    probe: Option<NativeUsdProbe>,
+    probe_source: Option<String>,
     chain_id: Option<Entity<InputState>>,
     fields: BTreeMap<ChainField, FieldInput>,
     existing: bool,
@@ -96,6 +107,12 @@ impl ChainEditor {
         Self {
             snapshot,
             draft: None,
+            opened_draft: None,
+            pricing_select: None,
+            pricing_status: BTreeMap::new(),
+            pricing_preset: None,
+            probe: None,
+            probe_source: None,
             chain_id: None,
             fields: BTreeMap::new(),
             existing: false,
@@ -123,6 +140,7 @@ impl ChainEditor {
         cx: &mut Context<'_, Self>,
     ) {
         self.pending = false;
+        self.clear_probe();
         match result {
             Ok(mut snapshot) => {
                 self.error = None;
@@ -151,10 +169,28 @@ impl ChainEditor {
         cx.notify();
     }
 
+    /// Applies one unsaved Test reply. It never touches the draft, snapshot or saved status.
+    pub fn receive_probe(&mut self, probe: NativeUsdProbe, cx: &mut Context<'_, Self>) {
+        self.pending = false;
+        self.probe = Some(probe);
+        cx.notify();
+    }
+
+    /// Updates saved-source feedback without touching draft inputs or settings revision.
+    pub fn set_pricing_status(
+        &mut self,
+        status: BTreeMap<String, NativeUsdStatus>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.pricing_status = status;
+        cx.notify();
+    }
+
     /// Retires credential-bearing data on lock, disconnect, revocation, or view closure.
     pub fn retire(&mut self, cx: &mut Context<'_, Self>) {
         self.clear_draft();
         self.snapshot = ChainEditorSnapshot::default();
+        self.pricing_status.clear();
         self.pending = false;
         self.stale = false;
         self.error = None;
@@ -171,8 +207,17 @@ impl ChainEditor {
         );
     }
 
+    fn clear_probe(&mut self) {
+        self.probe = None;
+        self.probe_source = None;
+    }
+
     fn clear_draft(&mut self) {
+        self.clear_probe();
         self.draft = None;
+        self.opened_draft = None;
+        self.pricing_select = None;
+        self.pricing_preset = None;
         self.chain_id = None;
         self.fields.clear();
         self.existing = false;
@@ -185,6 +230,34 @@ impl ChainEditor {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.opened_draft = Some(draft.clone());
+        self.pricing_preset = draft
+            .defaults
+            .get(&ChainField::NativeUsdOracle)
+            .map(|value| new_input(value, window, cx));
+        let has_preset = draft.defaults.contains_key(&ChainField::NativeUsdOracle);
+        let items = pricing_items(has_preset, draft.value(ChainField::NativeSymbol));
+        let selected = if !has_preset && draft.native_usd_pricing == NativeUsdChoice::Disabled {
+            NativeUsdChoice::Default
+        } else {
+            draft.native_usd_pricing
+        };
+        let index = items
+            .iter()
+            .position(|item| item.choice == selected)
+            .map(gpui_component::IndexPath::new);
+        let select = cx.new(|cx| SelectState::new(items, index, window, cx));
+        cx.subscribe(&select, |this, _, event, cx| {
+            if let SelectEvent::Confirm(Some(choice)) = event {
+                if let Some(draft) = this.draft.as_mut() {
+                    draft.native_usd_pricing = *choice;
+                }
+                this.clear_probe();
+                cx.notify();
+            }
+        })
+        .detach();
+        self.pricing_select = Some(select);
         self.fields = ChainField::ALL
             .iter()
             .copied()
@@ -238,6 +311,7 @@ impl ChainEditor {
         }
         self.pending = true;
         self.error = None;
+        self.clear_probe();
         cx.emit(ChainEditorEvent {
             revision: self.snapshot.revision.clone(),
             command,
@@ -246,15 +320,9 @@ impl ChainEditor {
     }
 
     fn save(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(mut draft) = self.draft.clone() else {
+        let Some(draft) = self.collected_draft(cx) else {
             return;
         };
-        if let Some(input) = self.chain_id.as_ref() {
-            draft.chain_id = input.read(cx).value().to_string();
-        }
-        for (&field, input) in &self.fields {
-            draft.fields.insert(field, input.value(cx));
-        }
         self.send(
             ChainEditorCommand::Save {
                 draft,
@@ -262,6 +330,41 @@ impl ChainEditor {
             },
             cx,
         );
+    }
+
+    /// The open draft with every input's current value, as the host receives it.
+    fn collected_draft(&self, cx: &App) -> Option<ChainDraft> {
+        let mut draft = self.draft.clone()?;
+        if let Some(input) = self.chain_id.as_ref() {
+            draft.chain_id = input.read(cx).value().to_string();
+        }
+        for (&field, input) in &self.fields {
+            draft.fields.insert(field, input.value(cx));
+        }
+        Some(draft)
+    }
+
+    /// Reads the draft's own source once. Save stays available whatever the result is.
+    fn start_probe(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(source) = self.draft_pricing_source(cx) else {
+            return;
+        };
+        let Some(draft) = self.collected_draft(cx) else {
+            return;
+        };
+        self.send(ChainEditorCommand::Probe { draft }, cx);
+        self.probe_source = Some(source);
+    }
+
+    /// The address the draft currently resolves to, or none when it has no source.
+    fn draft_pricing_source(&self, cx: &App) -> Option<String> {
+        let source = match self.draft.as_ref()?.native_usd_pricing {
+            NativeUsdChoice::Oracle => self.fields.get(&ChainField::NativeUsdOracle)?.value(cx),
+            NativeUsdChoice::Default => self.field_default(ChainField::NativeUsdOracle)?.to_owned(),
+            NativeUsdChoice::Disabled => return None,
+        };
+        let source = source.trim().to_owned();
+        (!source.is_empty()).then_some(source)
     }
 
     fn discard(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -656,6 +759,7 @@ impl ChainEditor {
         }
         body = body
             .child(self.render_endpoints_section(cx))
+            .child(self.render_pricing_section(draft, cx))
             .child(self.render_advanced_section(cx));
         if draft.built_in {
             body = body.child(self.render_railgun_section(draft, cx));
@@ -1078,6 +1182,184 @@ impl ChainEditor {
         .children(help.map(|text| subtle_text(text).whitespace_normal()))
     }
 
+    fn only_pricing_differs(&self, draft: &ChainDraft, cx: &App) -> bool {
+        let Some(opened) = &self.opened_draft else {
+            return false;
+        };
+        draft.enabled == opened.enabled
+            && draft.quick_sync_enabled == opened.quick_sync_enabled
+            && draft.use_default_relays == opened.use_default_relays
+            && self.fields.iter().all(|(&field, input)| {
+                field == ChainField::NativeUsdOracle || input.value(cx) == opened.value(field)
+            })
+    }
+
+    fn render_pricing_section(&self, draft: &ChainDraft, cx: &Context<'_, Self>) -> gpui::Div {
+        let status = self
+            .pricing_status
+            .get(&draft.chain_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_w_0()
+            .child(section_title("USD PRICE"));
+        if let Some(select) = &self.pricing_select {
+            section = section.child(
+                Select::new(select)
+                    .accessibility_label("Native USD source")
+                    .disabled(self.pending)
+                    .w_full(),
+            );
+        }
+        let source = self.draft_pricing_source(cx);
+        match draft.native_usd_pricing {
+            NativeUsdChoice::Oracle => {
+                if let Some(FieldInput::Single(input)) =
+                    self.fields.get(&ChainField::NativeUsdOracle)
+                {
+                    section = section
+                        .child(self.render_field_label(ChainField::NativeUsdOracle, cx))
+                        .child(
+                            app_input_group(
+                                "chain-pricing-oracle",
+                                input,
+                                ChainField::NativeUsdOracle.label(),
+                            )
+                            .disabled(self.pending)
+                            .addon(self.render_test_addon(source.is_none(), cx)),
+                        )
+                        .child(subtle_text("Use a Chainlink-compatible feed on this chain, quoting USD per whole native coin.").whitespace_normal());
+                }
+            }
+            NativeUsdChoice::Default => {
+                if let Some(preset) = &self.pricing_preset {
+                    section = section
+                        .child(
+                            app_input_group("chain-pricing-preset", preset, "Preset oracle")
+                                .readonly(true)
+                                .addon(self.render_test_addon(source.is_none(), cx)),
+                        )
+                        .child(
+                            subtle_text("Inherits this chain's preset USD feed.")
+                                .whitespace_normal(),
+                        );
+                } else {
+                    section = section.child(
+                        subtle_text("No preset feed. Native amounts have no USD value.")
+                            .whitespace_normal(),
+                    );
+                }
+            }
+            NativeUsdChoice::Disabled => {
+                section =
+                    section.child(subtle_text("Native USD pricing is off.").whitespace_normal());
+            }
+        }
+        if let Some(probe) = self
+            .probe
+            .as_ref()
+            .filter(|_| self.probe_source.is_some() && self.probe_source == source)
+        {
+            section = section.child(self.render_probe_alert(probe, cx));
+        }
+        let quote = status.quote.as_ref().map(|quote| {
+            let price = quote
+                .micro_usd
+                .parse::<ruint::aliases::U256>()
+                .ok()
+                .map_or_else(|| "Unavailable".into(), railgun_ui::format_usd_micro_value);
+            let time = i64::try_from(quote.obtained_at)
+                .ok()
+                .and_then(|time| chrono::DateTime::from_timestamp(time, 0))
+                .map_or_else(
+                    || "Unknown time".into(),
+                    |time| time.format("%Y-%m-%d %H:%M UTC").to_string(),
+                );
+            format!(
+                "{price} per {}. Updated {time}.",
+                self.opened_draft
+                    .as_ref()
+                    .map_or("native coin", |draft| draft.value(ChainField::NativeSymbol))
+            )
+        });
+        let detail = [quote, status.reason]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let alert = match status.state {
+            NativeUsdState::Unconfigured => {
+                Alert::new("native-usd-status", "No active source").title("Saved pricing")
+            }
+            NativeUsdState::Pending => Alert::info(
+                "native-usd-status",
+                if detail.is_empty() {
+                    "Waiting for the oracle".into()
+                } else {
+                    detail
+                },
+            )
+            .title("Saved pricing: pending"),
+            NativeUsdState::Available => {
+                Alert::success("native-usd-status", detail).title("Saved pricing: available")
+            }
+            NativeUsdState::Failed if status.quote.is_some() => Alert::warning(
+                "native-usd-status",
+                format!("Previous price remains in use. {detail}"),
+            )
+            .title("Saved pricing: refresh failed"),
+            NativeUsdState::Failed => {
+                Alert::error("native-usd-status", detail).title("Saved pricing: unavailable")
+            }
+        };
+        section.child(alert.small())
+    }
+
+    /// The trailing Test action shared by the oracle and preset rows.
+    fn render_test_addon(&self, empty: bool, cx: &Context<'_, Self>) -> InputGroupAddon {
+        // A save sets `pending` too, so only a started test without its reply spins.
+        let testing = self.pending && self.probe_source.is_some() && self.probe.is_none();
+        InputGroupAddon::new("chain-pricing-test-addon")
+            .align(InputGroupAddonAlignment::InlineEnd)
+            .child(
+                InputGroupButton::new("chain-pricing-test")
+                    .label("Test")
+                    .debug_selector(|| "chain-pricing-test".into())
+                    .disabled(self.pending || empty)
+                    .loading(testing)
+                    // The spinner takes the icon slot, so the slot has to exist while
+                    // the test runs. This icon itself is never drawn.
+                    .when(testing, |button| button.icon(IconName::Loader))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_probe(cx))),
+            )
+    }
+
+    /// Unsaved feedback for the draft's source. It never becomes saved pricing status.
+    fn render_probe_alert(&self, probe: &NativeUsdProbe, cx: &App) -> Alert {
+        let alert = match (&probe.quote, &probe.message) {
+            (Some(quote), _) => {
+                let price = quote
+                    .micro_usd
+                    .parse::<ruint::aliases::U256>()
+                    .ok()
+                    .map_or_else(|| "Unavailable".into(), railgun_ui::format_usd_micro_value);
+                let symbol = self
+                    .fields
+                    .get(&ChainField::NativeSymbol)
+                    .map(|input| input.value(cx))
+                    .filter(|symbol| !symbol.trim().is_empty())
+                    .unwrap_or_else(|| "native coin".to_owned());
+                Alert::success("native-usd-probe", format!("{price} per {symbol}."))
+            }
+            (None, Some(message)) => Alert::error("native-usd-probe", message.clone()),
+            (None, None) => Alert::error("native-usd-probe", "The test did not return a price."),
+        };
+        alert.title("Test result").small()
+    }
+
     fn render_footer(&self, draft: &ChainDraft, cx: &Context<'_, Self>) -> gpui::Div {
         let unavailable = self.pending || self.snapshot.revision.is_empty();
         let mut footer = div()
@@ -1117,7 +1399,7 @@ impl ChainEditor {
             .child(
                 app_button(
                     "chain-save",
-                    if draft.built_in {
+                    if draft.built_in && !self.only_pricing_differs(draft, cx) {
                         "Save and restart"
                     } else if self.existing {
                         "Save"
@@ -1151,14 +1433,13 @@ impl ChainEditor {
                         .title(app_strong_text(format!("Reset \"{name}\" to preset?")))
                         .child(
                             app_muted_text(
-                                "Removes this chain's overrides. Networking and private sync \
-                                 restart for every wallet.",
+                                "Removes this chain's overrides. Networking restarts if operational settings change.",
                             )
                             .whitespace_normal(),
                         )
                         .button_props(
                             DialogButtonProps::default()
-                                .ok_text("Reset and restart")
+                                .ok_text("Reset")
                                 .ok_variant(ButtonVariant::Primary)
                                 .cancel_variant(ButtonVariant::Secondary),
                         )
@@ -1241,7 +1522,9 @@ fn new_input(
     cx: &mut Context<'_, ChainEditor>,
 ) -> Entity<InputState> {
     let value = value.to_owned();
-    cx.new(|cx| InputState::new(window, cx).default_value(value))
+    let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+    cx.observe(&input, |_, _, cx| cx.notify()).detach();
+    input
 }
 
 fn row_icon_button(
@@ -1360,5 +1643,151 @@ fn display_name(draft: &ChainDraft) -> String {
         format!("Chain {}", draft.chain_id)
     } else {
         name.to_owned()
+    }
+}
+
+#[derive(Clone)]
+struct PricingItem {
+    choice: NativeUsdChoice,
+    label: SharedString,
+    description: &'static str,
+}
+
+impl SelectItem for PricingItem {
+    type Value = NativeUsdChoice;
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+    fn value(&self) -> &Self::Value {
+        &self.choice
+    }
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(app_text(self.label.clone()))
+            .child(app_muted_text(self.description))
+    }
+}
+
+fn pricing_items(preset: bool, symbol: &str) -> Vec<PricingItem> {
+    let mut items = vec![
+        PricingItem {
+            choice: NativeUsdChoice::Default,
+            label: if preset {
+                format!("{symbol} / USD (preset)").into()
+            } else {
+                "None".into()
+            },
+            description: if preset {
+                "Use this chain's preset feed"
+            } else {
+                "No native USD pricing"
+            },
+        },
+        PricingItem {
+            choice: NativeUsdChoice::Oracle,
+            label: "Custom oracle".into(),
+            description: "A USD feed on this chain",
+        },
+    ];
+    if preset {
+        items.push(PricingItem {
+            choice: NativeUsdChoice::Disabled,
+            label: "Off".into(),
+            description: "Disable native USD pricing",
+        });
+    }
+    items
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn saved_pricing_updates_preserve_keyboard_selected_source_and_unsaved_inputs(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let mut editor = None;
+        let handle = cx.add_window(|window, cx| {
+            let mut snapshot = ChainEditorSnapshot::default();
+            snapshot.revision = "saved-revision".into();
+            let view = cx.new(|cx| ChainEditor::new(snapshot, cx));
+            view.update(cx, |editor, cx| {
+                let mut draft = ChainDraft::new();
+                draft.chain_id = "1".into();
+                draft.built_in = true;
+                draft.fields.insert(ChainField::NativeSymbol, "ETH".into());
+                draft.fields.insert(ChainField::Name, "Ethereum".into());
+                draft.fields.insert(
+                    ChainField::NativeUsdOracle,
+                    "0x0000000000000000000000000000000000000001".into(),
+                );
+                draft.defaults.insert(
+                    ChainField::NativeUsdOracle,
+                    draft.value(ChainField::NativeUsdOracle).into(),
+                );
+                editor.edit(draft, true, window, cx);
+            });
+            editor = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let cx = VisualTestContext::from_window(*handle, cx).into_mut();
+        cx.simulate_resize(gpui::size(px(360.0), px(480.0)));
+        cx.update(|window, cx| {
+            let select = editor.read(cx).pricing_select.clone().unwrap();
+            select.update(cx, |select, cx| select.focus(window, cx));
+        });
+        cx.simulate_keystrokes("enter down enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert_eq!(
+                    editor.draft.as_ref().unwrap().native_usd_pricing,
+                    NativeUsdChoice::Oracle
+                );
+                let FieldInput::Single(input) = &editor.fields[&ChainField::NativeUsdOracle] else {
+                    unreachable!()
+                };
+                input.update(cx, |input, cx| {
+                    input.set_value("unfinished oracle", window, cx);
+                });
+                let mut status = NativeUsdStatus::default();
+                status.state = NativeUsdState::Failed;
+                status.reason = Some("Check the oracle contract".into());
+                editor.set_pricing_status(BTreeMap::from([("1".into(), status)]), cx);
+                assert_eq!(
+                    editor.fields[&ChainField::NativeUsdOracle].value(cx),
+                    "unfinished oracle"
+                );
+                assert_eq!(editor.snapshot.revision, "saved-revision");
+                assert!(!editor.stale);
+                assert!(editor.only_pricing_differs(editor.draft.as_ref().unwrap(), cx));
+                let FieldInput::Single(input) = &editor.fields[&ChainField::BlockRange] else {
+                    unreachable!()
+                };
+                input.update(cx, |input, cx| input.set_value("123", window, cx));
+                assert!(!editor.only_pricing_differs(editor.draft.as_ref().unwrap(), cx));
+            });
+            window.set_rem_size(px(22.0));
+            window.draw(cx).clear(cx);
+        });
+        let save = cx
+            .debug_bounds("chain-save")
+            .expect("save stays rendered at enlarged scale");
+        assert!(save.bottom() <= px(480.0));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.retire(cx);
+                assert!(editor.pricing_status.is_empty());
+                assert!(!editor.is_editing());
+                window.remove_window();
+            });
+        });
     }
 }

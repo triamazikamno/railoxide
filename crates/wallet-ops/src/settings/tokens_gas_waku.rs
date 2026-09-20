@@ -386,6 +386,7 @@ pub struct WakuDirectPeerSetting {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveChainConfig {
+    pub native_usd_oracle: Option<Address>,
     pub chain_id: u64,
     pub name: String,
     pub native_currency: super::NativeCurrency,
@@ -411,6 +412,14 @@ pub struct EffectiveRailgunConfig {
 }
 
 impl EffectiveChainConfig {
+    /// Pricing edits alone do not invalidate RPC, drafts, or wallet sync.
+    #[must_use]
+    pub fn operationally_matches(&self, other: &Self) -> bool {
+        let mut compared = other.clone();
+        compared.native_usd_oracle = self.native_usd_oracle;
+        *self == compared
+    }
+
     pub fn require_railgun(&self) -> eyre::Result<&EffectiveRailgunConfig> {
         if !self.enabled {
             return Err(eyre::eyre!("chain {} is disabled", self.chain_id));

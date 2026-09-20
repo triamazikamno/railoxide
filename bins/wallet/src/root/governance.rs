@@ -6899,7 +6899,7 @@ mod tests {
         let token = Address::from([1; 20]);
         let cache = TokenAnchorRateCache::new();
         cache.store_rate(1, token, U256::from(10).pow(U256::from(18)));
-        cache.store_native_usd_rate(1, U256::from(2_000_000));
+        cache.store_native_usd_rate(1, U256::from(2_000_000), 18);
 
         assert_eq!(
             reward_usd_label(
@@ -6921,7 +6921,7 @@ mod tests {
         let zero_token = Address::from([2; 20]);
         let cache = TokenAnchorRateCache::new();
         cache.store_rate(1, priced_token, U256::from(10).pow(U256::from(18)));
-        cache.store_native_usd_rate(1, U256::from(2_000_000));
+        cache.store_native_usd_rate(1, U256::from(2_000_000), 18);
         let rewards = BTreeMap::from([
             (
                 (String::from("account"), priced_token),
@@ -6964,7 +6964,7 @@ mod tests {
         let cache = TokenAnchorRateCache::new();
         cache.store_rate(1, first, U256::ONE);
         cache.store_rate(1, second, U256::ONE);
-        cache.store_native_usd_rate(1, U256::ONE);
+        cache.store_native_usd_rate(1, U256::ONE, 18);
         let unpriced_reward = positive_reward(unpriced, U256::ONE);
         assert_eq!(
             reward_usd_label(1, unpriced, Some(&unpriced_reward), &cache),
@@ -7309,7 +7309,11 @@ mod tests {
         );
         assert!(!unpriced_native.below_fee);
 
-        cache.store_native_usd_rate(chain, U256::from(2_000) * U256::from(10).pow(U256::from(6)));
+        cache.store_native_usd_rate(
+            chain,
+            U256::from(2_000) * U256::from(10).pow(U256::from(6)),
+            18,
+        );
         let fee_usd = cache
             .cached_native_usd_micro_value(chain, gas_cost)
             .expect("native fee is priced");
@@ -7339,7 +7343,11 @@ mod tests {
         let covered = Address::from([2; 20]);
         let below = Address::from([3; 20]);
         let cache = TokenAnchorRateCache::new();
-        cache.store_native_usd_rate(chain, U256::from(2_000) * U256::from(10).pow(U256::from(6)));
+        cache.store_native_usd_rate(
+            chain,
+            U256::from(2_000) * U256::from(10).pow(U256::from(6)),
+            18,
+        );
         cache.store_rate(chain, covered, U256::from(10).pow(U256::from(18)));
         cache.store_rate(chain, below, U256::from(10).pow(U256::from(18)));
         let key = key("wallet", chain, "a", address);

@@ -2,10 +2,12 @@ use super::{
     Context, SettingsApplyMode, WalletSettings, WalletSettingsEditor, Window, WindowExt,
     classify_settings_apply_mode,
 };
-use railgun_ui::chain_editor::{ChainEditorCommand, ChainEditorSnapshot};
+use railgun_ui::chain_editor::{
+    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, NativeUsdProbe,
+};
 use wallet_ops::settings::{
-    SettingsRevision, chain_editor_mutation, chain_editor_snapshot, commit_wallet_settings,
-    editor_chain_id, settings_revision,
+    SettingsRevision, chain_editor_mutation, chain_editor_probe_chain, chain_editor_snapshot,
+    commit_wallet_settings, editor_chain_id, settings_revision,
 };
 
 impl super::WalletRoot {
@@ -38,7 +40,13 @@ impl super::WalletRoot {
                     .child(dialog_editor.clone()),
             )
         });
-        editor.update(cx, |editor, cx| editor.receive(snapshot, window, cx));
+        editor.update(cx, |editor, cx| {
+            editor.set_pricing_status(
+                self.public_broadcaster_anchor_cache.native_usd_statuses(),
+                cx,
+            );
+            editor.receive(snapshot, window, cx);
+        });
     }
 }
 
@@ -96,6 +104,10 @@ impl WalletSettingsEditor {
             }
             ChainEditorCommand::Save { .. } | ChainEditorCommand::Remove { .. } => None,
             ChainEditorCommand::Reset { chain_id } => Some(editor_chain_id(chain_id)?),
+            // Tests are read-only and take the asynchronous path instead.
+            ChainEditorCommand::Probe { .. } => {
+                return Err("This command does not change a chain".to_owned());
+            }
         };
         let revision = revision
             .parse()
@@ -128,5 +140,49 @@ impl WalletSettingsEditor {
             }
         }
         Ok(snapshot)
+    }
+
+    /// Reads the draft's own source through the active wallet's network context. Nothing is
+    /// persisted, cached or published, and the reply never replaces the open draft.
+    pub(in crate::root) fn handle_chain_editor_probe(
+        &self,
+        draft: &ChainDraft,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let prepared = chain_editor_probe_chain(&self.saved, draft).and_then(|chain| {
+            let http = self
+                .active_root
+                .as_ref()
+                .and_then(|root| {
+                    root.read_with(cx, |root, _| root.reusable_network_context())
+                        .ok()
+                })
+                .ok_or_else(|| "Wallet networking is not ready".to_owned())?;
+            Ok::<_, String>((chain, http))
+        });
+        let (chain, http) = match prepared {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                let editor = self.chain_editor.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.receive_probe(NativeUsdProbe::new(Err(message)), cx);
+                });
+                return;
+            }
+        };
+        let join = self
+            .runtime
+            .spawn(async move { wallet_ops::probe_native_usd_quote(&chain, &http).await });
+        cx.spawn(async move |this, cx| {
+            let result = join
+                .await
+                .unwrap_or_else(|_| Err("The test could not be completed".to_owned()));
+            let _ = this.update(cx, |editor, cx| {
+                editor.chain_editor.update(cx, |editor, cx| {
+                    editor.receive_probe(NativeUsdProbe::new(result), cx);
+                });
+            });
+        })
+        .detach();
     }
 }

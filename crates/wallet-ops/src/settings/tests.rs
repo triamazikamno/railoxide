@@ -2815,8 +2815,9 @@ fn encoded_settings_decode_without_db() {
     assert_eq!(decoded, settings);
 }
 
-fn custom_evm_chain() -> super::CustomChainSettings {
+pub(super) fn custom_evm_chain() -> super::CustomChainSettings {
     super::CustomChainSettings {
+        native_usd_pricing: crate::settings::NativeUsdPricing::Default,
         name: "Test EVM".into(),
         native_currency: super::NativeCurrency {
             name: "Test coin".into(),
@@ -3113,5 +3114,89 @@ fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings
             .collect::<Vec<_>>()
     );
     drop(store);
+    fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[test]
+fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
+    let root_dir = temp_db_root();
+    let mut expected = WalletSettings::default();
+    expected.chains.custom.insert(999, custom_evm_chain());
+    expected.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
+        vec!["https://rpc.example".into()];
+    expected.chains.per_chain.get_mut(&56).unwrap().enabled = false;
+    expected.runtime.auto_lock_timeout_secs = Some(600);
+    expected
+        .tokens
+        .custom_tokens
+        .push(super::CustomTokenSettings {
+            chain_id: 999,
+            token_address: Address::repeat_byte(7).to_string(),
+            symbol: "TOKEN".into(),
+            decimals: 6,
+            icon_path: None,
+            price_anchor: Some(super::PriceAnchorSettings::Fixed {
+                rate: "123456".into(),
+            }),
+        });
+    // Default choices are omitted, producing the released v7 field shape.
+    let mut released = expected.clone();
+    released.version = 7;
+    let payload = rmp_serde::to_vec_named(&released).unwrap();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .unwrap();
+    assert!(
+        super::storage::load_wallet_settings_with_writer(&store, |_| {
+            Err(WalletSettingsError::WriteUnavailable)
+        })
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+    drop(store);
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    let migrated = load_wallet_settings(&store).unwrap();
+    assert_eq!(migrated, expected);
+    assert_ne!(
+        store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+    assert!(
+        migrated
+            .chains
+            .per_chain
+            .values()
+            .all(|chain| chain.native_usd_pricing == super::NativeUsdPricing::Default)
+    );
+    assert!(
+        migrated
+            .chains
+            .custom
+            .values()
+            .all(|chain| chain.native_usd_pricing == super::NativeUsdPricing::Default)
+    );
+    drop(store);
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    assert_eq!(load_wallet_settings(&reopened).unwrap(), expected);
+    drop(reopened);
     fs::remove_dir_all(root_dir).unwrap();
 }

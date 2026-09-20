@@ -12,8 +12,8 @@ use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use railgun_ui::{
-    NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, lookup_token,
-    native_usd_anchor_entries, native_usd_micro_value, token_anchor_entries, token_usd_micro_value,
+    TokenAnchorInfo, TokenAnchorSource, lookup_token, native_usd_micro_value, token_anchor_entries,
+    token_usd_micro_value,
 };
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -27,7 +27,10 @@ use crate::settings::{
 };
 use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
 
+mod native_usd;
 mod uniswap_v3_twap;
+
+pub use native_usd::probe_native_usd_quote;
 
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
 const BPS_DENOMINATOR: U256 = alloy::uint!(10_000_U256);
@@ -40,6 +43,7 @@ const TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 sol! {
     interface AggregatorInterface {
         function latestAnswer() external view returns (int256);
+        function decimals() external view returns (uint8);
     }
     interface UniswapV3PoolInterface {
         function token0() external view returns (address);
@@ -153,12 +157,6 @@ struct RuntimeTokenAnchorInfo {
 }
 
 #[derive(Debug, Clone)]
-struct RuntimeNativeUsdAnchorInfo {
-    chain_id: u64,
-    anchor_sources: Vec<RuntimeTokenAnchorSource>,
-}
-
-#[derive(Debug, Clone)]
 enum RuntimeTokenAnchorSource {
     Fixed {
         token_fee_per_unit_gas: U256,
@@ -222,7 +220,7 @@ impl TokenAnchorKey {
 #[derive(Debug)]
 pub struct TokenAnchorRateCache {
     rates: RwLock<BTreeMap<TokenAnchorKey, U256>>,
-    native_usd_rates: RwLock<BTreeMap<u64, U256>>,
+    native_pricing: RwLock<native_usd::NativePricing>,
     refresh_tx: watch::Sender<u64>,
 }
 
@@ -231,7 +229,7 @@ impl Default for TokenAnchorRateCache {
         let (refresh_tx, _refresh_rx) = watch::channel(0_u64);
         Self {
             rates: RwLock::new(BTreeMap::new()),
-            native_usd_rates: RwLock::new(BTreeMap::new()),
+            native_pricing: RwLock::new(native_usd::NativePricing::default()),
             refresh_tx,
         }
     }
@@ -262,18 +260,18 @@ impl TokenAnchorRateCache {
 
     #[must_use]
     pub fn cached_native_usd_rate(&self, chain_id: u64) -> Option<U256> {
-        self.native_usd_rates
+        self.native_pricing
             .read()
             .ok()
-            .and_then(|rates| rates.get(&chain_id).copied())
+            .and_then(|native| native.rates.get(&chain_id).map(|(rate, _)| *rate))
     }
 
-    pub fn store_native_usd_rate(&self, chain_id: u64, rate: U256) {
+    pub fn store_native_usd_rate(&self, chain_id: u64, rate: U256, native_decimals: u8) {
         if rate.is_zero() {
             return;
         }
-        if let Ok(mut rates) = self.native_usd_rates.write() {
-            rates.insert(chain_id, rate);
+        if let Ok(mut rates) = self.native_pricing.write() {
+            rates.rates.insert(chain_id, (rate, native_decimals));
         }
     }
 
@@ -293,7 +291,9 @@ impl TokenAnchorRateCache {
 
     #[must_use]
     pub fn cached_native_usd_micro_value(&self, chain_id: u64, amount: U256) -> Option<U256> {
-        native_usd_micro_value(amount, self.cached_native_usd_rate(chain_id)?)
+        let native = self.native_pricing.read().ok()?;
+        let &(rate, decimals) = native.rates.get(&chain_id)?;
+        native_usd_micro_value(amount, rate, decimals)
     }
 
     #[must_use]
@@ -302,18 +302,33 @@ impl TokenAnchorRateCache {
     }
 
     fn notify_refreshed(&self) {
-        let current = *self.refresh_tx.borrow();
-        let _ = self.refresh_tx.send(current.wrapping_add(1));
+        self.refresh_tx
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
 #[derive(Debug)]
 pub struct TokenAnchorRefreshHandle {
     wake_tx: watch::Sender<u64>,
+    configuration_tx: watch::Sender<u64>,
+    cache: Arc<TokenAnchorRateCache>,
     abort_handle: AbortHandle,
 }
 
 impl TokenAnchorRefreshHandle {
+    pub fn reconcile_native_sources(
+        &self,
+        chains: &EffectiveChainRegistry,
+        operational_changes: &[u64],
+    ) {
+        if self
+            .cache
+            .reconcile_native_sources(chains, operational_changes)
+        {
+            self.configuration_tx
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
     pub fn wake(&self) {
         let current = *self.wake_tx.borrow();
         let _ = self.wake_tx.send(current.wrapping_add(1));
@@ -335,17 +350,22 @@ pub fn spawn_token_anchor_refresh_worker(
     token_registry: EffectiveTokenRegistry,
     http: HttpContext,
 ) -> TokenAnchorRefreshHandle {
+    cache.reconcile_native_sources(&effective_chains, &[]);
+    let (configuration_tx, configuration_rx) = watch::channel(0_u64);
     let (wake_tx, wake_rx) = watch::channel(0_u64);
     let task = runtime.spawn(run_token_anchor_refresh_worker(
-        cache,
+        Arc::clone(&cache),
         chain_ids,
         effective_chains,
         token_registry,
         http,
         wake_rx,
+        configuration_rx,
     ));
     TokenAnchorRefreshHandle {
         wake_tx,
+        configuration_tx,
+        cache,
         abort_handle: task.abort_handle(),
     }
 }
@@ -357,37 +377,42 @@ async fn run_token_anchor_refresh_worker(
     token_registry: EffectiveTokenRegistry,
     http: HttpContext,
     mut wake_rx: watch::Receiver<u64>,
+    configuration_rx: watch::Receiver<u64>,
 ) {
-    refresh_token_anchor_rates(
-        &cache,
-        &chain_ids,
-        &effective_chains,
-        &token_registry,
-        &http,
-    )
-    .await;
-    let mut last_refresh = Instant::now();
-    let mut next_refresh =
-        last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
-    loop {
-        tokio::select! {
-            () = sleep_until(next_refresh) => {
-                refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
-                last_refresh = Instant::now();
-                next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
-            }
-            changed = wake_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                if last_refresh.elapsed() >= TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL {
+    let native_worker = native_usd::run_worker(&cache, &http, configuration_rx, wake_rx.clone());
+    let token_worker = async {
+        refresh_token_anchor_rates(
+            &cache,
+            &chain_ids,
+            &effective_chains,
+            &token_registry,
+            &http,
+        )
+        .await;
+        let mut last_refresh = Instant::now();
+        let mut next_refresh =
+            last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
+        loop {
+            tokio::select! {
+                () = sleep_until(next_refresh) => {
                     refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
                     last_refresh = Instant::now();
                     next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
                 }
+                changed = wake_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    if last_refresh.elapsed() >= TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL {
+                        refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
+                        last_refresh = Instant::now();
+                        next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
+                    }
+                }
             }
         }
-    }
+    };
+    tokio::select! { () = native_worker => {}, () = token_worker => {} }
 }
 
 fn token_anchor_refresh_delay(
@@ -395,13 +420,10 @@ fn token_anchor_refresh_delay(
     chain_ids: &[u64],
     token_registry: &EffectiveTokenRegistry,
 ) -> Duration {
-    let missing_native_rate = chain_ids
-        .iter()
-        .any(|chain_id| cache.cached_native_usd_rate(*chain_id).is_none());
     let missing_token_rate = token_anchor_entries_for_chains(chain_ids, token_registry)
         .into_iter()
         .any(|entry| cache.cached_rate(entry.chain_id, entry.token).is_none());
-    if missing_native_rate || missing_token_rate {
+    if missing_token_rate {
         TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
     } else {
         TOKEN_ANCHOR_REFRESH_INTERVAL
@@ -420,14 +442,11 @@ pub async fn refresh_token_anchor_rates(
         "token anchor refresh started"
     );
     let entries = token_anchor_entries_for_chains(chain_ids, token_registry);
-    let native_entries = native_usd_anchor_entries_for_chains(chain_ids);
-    let oracle_addresses_by_chain =
-        oracle_addresses_for_token_and_native_entries(&entries, &native_entries);
-    let (pool_keys, observation_keys) = twap_keys_for_entries(&entries, &native_entries);
+    let oracle_addresses_by_chain = oracle_addresses_for_entries(&entries);
+    let (pool_keys, observation_keys) = twap_keys_for_entries(&entries);
     refresh_token_anchor_rates_with_fetch(
         cache,
         &entries,
-        &native_entries,
         oracle_addresses_by_chain,
         pool_keys,
         observation_keys,
@@ -508,7 +527,6 @@ type AnchorSourceFuture<'a> = Pin<Box<dyn Future<Output = AnchorSourceResult> + 
 async fn refresh_token_anchor_rates_with_fetch<'a, F>(
     cache: &TokenAnchorRateCache,
     entries: &[RuntimeTokenAnchorInfo],
-    native_entries: &[RuntimeNativeUsdAnchorInfo],
     oracle_addresses_by_chain: BTreeMap<u64, Vec<Address>>,
     pool_keys: BTreeSet<PoolKey>,
     observation_keys: BTreeSet<ObservationKey>,
@@ -520,12 +538,6 @@ async fn refresh_token_anchor_rates_with_fetch<'a, F>(
     let mut oracle_answers = BTreeMap::new();
     let mut twap_inputs = TwapFetchedInputs::default();
     store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
-    store_native_usd_rates_from_entries_with_inputs(
-        cache,
-        native_entries,
-        &oracle_answers,
-        &twap_inputs,
-    );
 
     let mut pending = FuturesUnordered::new();
     for (chain_id, addresses) in oracle_addresses_by_chain {
@@ -587,20 +599,8 @@ async fn refresh_token_anchor_rates_with_fetch<'a, F>(
             },
         }
         store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
-        store_native_usd_rates_from_entries_with_inputs(
-            cache,
-            native_entries,
-            &oracle_answers,
-            &twap_inputs,
-        );
     }
     store_anchor_rates_from_entries_with_inputs(cache, entries, &oracle_answers, &twap_inputs);
-    store_native_usd_rates_from_entries_with_inputs(
-        cache,
-        native_entries,
-        &oracle_answers,
-        &twap_inputs,
-    );
 }
 
 async fn fetch_oracle_answers_for_chain(
@@ -724,25 +724,6 @@ fn static_anchor_entry_to_runtime(
     )
 }
 
-fn native_usd_anchor_entries_for_chains(chain_ids: &[u64]) -> Vec<RuntimeNativeUsdAnchorInfo> {
-    let chain_ids = chain_ids.iter().copied().collect::<BTreeSet<_>>();
-    native_usd_anchor_entries()
-        .filter(|entry| chain_ids.contains(&entry.chain_id))
-        .map(static_native_usd_entry_to_runtime)
-        .collect()
-}
-
-fn static_native_usd_entry_to_runtime(entry: NativeUsdAnchorInfo) -> RuntimeNativeUsdAnchorInfo {
-    RuntimeNativeUsdAnchorInfo {
-        chain_id: entry.chain_id,
-        anchor_sources: entry
-            .anchor_sources
-            .iter()
-            .map(|source| static_anchor_source_to_runtime(entry.chain_id, source))
-            .collect(),
-    }
-}
-
 fn static_anchor_source_to_runtime(
     chain_id: u64,
     source: &TokenAnchorSource,
@@ -843,31 +824,9 @@ fn price_anchor_to_runtime_source(
     }
 }
 
-#[cfg(test)]
 fn oracle_addresses_for_entries(entries: &[RuntimeTokenAnchorInfo]) -> BTreeMap<u64, Vec<Address>> {
     let mut addresses: BTreeMap<u64, BTreeSet<Address>> = BTreeMap::new();
     for entry in entries {
-        for source in &entry.anchor_sources {
-            collect_oracle_addresses_from_source(source, &mut addresses);
-        }
-    }
-    addresses
-        .into_iter()
-        .map(|(chain_id, addresses)| (chain_id, addresses.into_iter().collect()))
-        .collect()
-}
-
-fn oracle_addresses_for_token_and_native_entries(
-    entries: &[RuntimeTokenAnchorInfo],
-    native_entries: &[RuntimeNativeUsdAnchorInfo],
-) -> BTreeMap<u64, Vec<Address>> {
-    let mut addresses: BTreeMap<u64, BTreeSet<Address>> = BTreeMap::new();
-    for entry in entries {
-        for source in &entry.anchor_sources {
-            collect_oracle_addresses_from_source(source, &mut addresses);
-        }
-    }
-    for entry in native_entries {
         for source in &entry.anchor_sources {
             collect_oracle_addresses_from_source(source, &mut addresses);
         }
@@ -930,16 +889,10 @@ fn collect_twap_keys_from_source(
 
 fn twap_keys_for_entries(
     entries: &[RuntimeTokenAnchorInfo],
-    native_entries: &[RuntimeNativeUsdAnchorInfo],
 ) -> (BTreeSet<PoolKey>, BTreeSet<ObservationKey>) {
     let mut pools = BTreeSet::new();
     let mut observations = BTreeSet::new();
     for entry in entries {
-        for source in &entry.anchor_sources {
-            collect_twap_keys_from_source(entry.chain_id, source, &mut pools, &mut observations);
-        }
-    }
-    for entry in native_entries {
         for source in &entry.anchor_sources {
             collect_twap_keys_from_source(entry.chain_id, source, &mut pools, &mut observations);
         }
@@ -1089,25 +1042,6 @@ fn store_anchor_rates_from_entries_with_inputs(
         );
         if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
             cache.store_rate(entry.chain_id, entry.token, rate);
-        }
-    }
-}
-
-fn store_native_usd_rates_from_entries_with_inputs(
-    cache: &TokenAnchorRateCache,
-    entries: &[RuntimeNativeUsdAnchorInfo],
-    oracle_answers: &BTreeMap<(u64, Address), U256>,
-    twap_inputs: &TwapFetchedInputs,
-) {
-    for entry in entries {
-        let rates = anchor_rates_from_sources_with_inputs(
-            entry.chain_id,
-            &entry.anchor_sources,
-            oracle_answers,
-            twap_inputs,
-        );
-        if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
-            cache.store_native_usd_rate(entry.chain_id, rate);
         }
     }
 }
@@ -1700,10 +1634,10 @@ mod tests {
     fn cache_stores_native_usd_rates_by_chain() {
         let cache = TokenAnchorRateCache::new();
 
-        cache.store_native_usd_rate(1, U256::ZERO);
+        cache.store_native_usd_rate(1, U256::ZERO, 18);
         assert_eq!(cache.cached_native_usd_rate(1), None);
 
-        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
 
         assert_eq!(
             cache.cached_native_usd_rate(1),
@@ -1713,18 +1647,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_native_or_token_rates_use_fast_refresh_retry() {
+    fn missing_token_rates_use_fast_refresh_retry() {
         let cache = TokenAnchorRateCache::new();
         let settings = crate::settings::WalletSettings::default();
         let token_registry = crate::settings::build_effective_token_registry(&settings)
             .expect("effective token registry");
 
-        assert_eq!(
-            token_anchor_refresh_delay(&cache, &[1], &token_registry),
-            TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
-        );
-
-        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
         assert_eq!(
             token_anchor_refresh_delay(&cache, &[1], &token_registry),
             TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
@@ -2042,7 +1970,7 @@ mod tests {
             RuntimeTokenAnchorInfo {
                 chain_id: 42,
                 token,
-                anchor_sources: vec![successful_source.clone()],
+                anchor_sources: vec![successful_source],
             },
             RuntimeTokenAnchorInfo {
                 chain_id: 42,
@@ -2056,17 +1984,11 @@ mod tests {
                 }],
             },
         ];
-        let native_entries = [RuntimeNativeUsdAnchorInfo {
-            chain_id: 42,
-            anchor_sources: vec![successful_source],
-        }];
-        let oracle_addresses_by_chain =
-            oracle_addresses_for_token_and_native_entries(&entries, &native_entries);
+        let oracle_addresses_by_chain = oracle_addresses_for_entries(&entries);
 
         let refresh = refresh_token_anchor_rates_with_fetch(
             &cache,
             &entries,
-            &native_entries,
             oracle_addresses_by_chain,
             BTreeSet::new(),
             BTreeSet::new(),
@@ -2105,10 +2027,6 @@ mod tests {
             cache.cached_rate(42, token),
             Some(uint!(3_000_000_000_U256))
         );
-        assert_eq!(
-            cache.cached_native_usd_rate(42),
-            Some(uint!(3_000_000_000_U256))
-        );
         assert_eq!(cache.cached_rate(42, pending_token), None);
     }
 
@@ -2139,7 +2057,6 @@ mod tests {
         async {
             refresh_token_anchor_rates_with_fetch(
                 &cache,
-                &[],
                 &[],
                 BTreeMap::from([(chainlink_chain_id, vec![chainlink_address])]),
                 BTreeSet::from([pool]),
@@ -2182,32 +2099,6 @@ mod tests {
         assert!(output.contains("chain_id=202"));
         assert!(!output.contains(chainlink_sentinel));
         assert!(!output.contains(twap_sentinel));
-    }
-
-    #[test]
-    fn native_usd_rates_store_from_oracle_answers() {
-        let cache = TokenAnchorRateCache::new();
-        let entry = RuntimeNativeUsdAnchorInfo {
-            chain_id: 1,
-            anchor_sources: runtime_sources(SHARED_ORACLE_SOURCE_6),
-        };
-        let mut answers = BTreeMap::new();
-        answers.insert(
-            (1, address!("0x0000000000000000000000000000000000000100")),
-            uint!(3_000_00000000_U256),
-        );
-
-        store_native_usd_rates_from_entries_with_inputs(
-            &cache,
-            &[entry],
-            &answers,
-            &TwapFetchedInputs::default(),
-        );
-
-        assert_eq!(
-            cache.cached_native_usd_rate(1),
-            Some(uint!(3_000_000_000_U256))
-        );
     }
 
     #[test]
@@ -2280,7 +2171,7 @@ mod tests {
                 anchor_sources: vec![twap_source(1_800)],
             },
         ];
-        let (pools, observations) = twap_keys_for_entries(&entries, &[]);
+        let (pools, observations) = twap_keys_for_entries(&entries);
         assert_eq!(pools.len(), 2);
         assert_eq!(observations.len(), 3);
         assert!(observations.contains(&ObservationKey {
@@ -2322,13 +2213,12 @@ mod tests {
             }],
         };
         let entries = [direct_entry, product_entry];
-        let (pool_keys, observation_keys) = twap_keys_for_entries(&entries, &[]);
+        let (pool_keys, observation_keys) = twap_keys_for_entries(&entries);
         let cache = TokenAnchorRateCache::new();
         let mut fetch_count = 0;
         refresh_token_anchor_rates_with_fetch(
             &cache,
             &entries,
-            &[],
             BTreeMap::new(),
             pool_keys,
             observation_keys,
@@ -2700,12 +2590,10 @@ mod tests {
         .await
         .expect("direct HTTP context");
         let cache = TokenAnchorRateCache::new();
-        let (pool_keys, observation_keys) =
-            twap_keys_for_entries(std::slice::from_ref(&entry), &[]);
+        let (pool_keys, observation_keys) = twap_keys_for_entries(std::slice::from_ref(&entry));
         refresh_token_anchor_rates_with_fetch(
             &cache,
             std::slice::from_ref(&entry),
-            &[],
             BTreeMap::new(),
             pool_keys,
             observation_keys,
@@ -2736,7 +2624,7 @@ mod tests {
         )
         .await;
         server.join().expect("fixture server");
-        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
         assert_eq!(
             cache.cached_rate(1, rail),
             Some(uint!(1_000_000_000_000_000_000_U256))

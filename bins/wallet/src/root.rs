@@ -1340,6 +1340,13 @@ impl WalletRoot {
         let mut public_broadcaster_sort_seed = [0_u8; 32];
         rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
         let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
+        if let Some(settings) = &settings_editor {
+            let editor = settings.read(cx).chain_editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor
+                    .set_pricing_status(public_broadcaster_anchor_cache.native_usd_statuses(), cx);
+            });
+        }
         let (root_shutdown, _) = watch::channel(false);
         let root = Self {
             selected_chain: initial_chain_id,
@@ -1932,6 +1939,16 @@ impl WalletRoot {
             while anchor_refresh_rx.changed().await.is_ok() {
                 if this
                     .update(cx, |root, cx| {
+                        root.refresh_walletconnect_fee_usd_values();
+                        if let Some(settings) = &root.settings_editor {
+                            let editor = settings.read(cx).chain_editor.clone();
+                            editor.update(cx, |editor, cx| {
+                                editor.set_pricing_status(
+                                    root.public_broadcaster_anchor_cache.native_usd_statuses(),
+                                    cx,
+                                );
+                            });
+                        }
                         root.publish_gateway_desktop_state();
                         cx.notify();
                     })

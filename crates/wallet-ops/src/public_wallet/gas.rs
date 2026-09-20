@@ -218,6 +218,7 @@ pub fn project_public_action_fee(
     resolved_fee: PublicActionResolvedGasFee,
     source: PublicActionFeeSource,
     native_usd_micro_rate: Option<U256>,
+    native_decimals: u8,
 ) -> PublicActionFeeProjection {
     let projection = public_action_eip1559_gas_cost_projection(
         raw_gas_limit,
@@ -236,16 +237,22 @@ pub fn project_public_action_fee(
         expected_fee_per_gas: projection.expected_fee_per_gas,
         expected_gas_cost: projection.expected_cost,
         maximum_gas_cost: projection.maximum_cost,
-        expected_native_usd_micro_value: native_usd_micro_rate
-            .and_then(|rate| native_usd_micro_value(projection.expected_cost, rate)),
-        maximum_native_usd_micro_value: native_usd_micro_rate
-            .and_then(|rate| native_usd_micro_value(projection.maximum_cost, rate)),
+        expected_native_usd_micro_value: native_usd_micro_rate.and_then(|rate| {
+            native_usd_micro_value(projection.expected_cost, rate, native_decimals)
+        }),
+        maximum_native_usd_micro_value: native_usd_micro_rate.and_then(|rate| {
+            native_usd_micro_value(projection.maximum_cost, rate, native_decimals)
+        }),
     }
 }
 
 impl PublicAdvancedTransactionEstimate {
     #[must_use]
-    pub fn fee_projection(&self, native_usd_micro_rate: Option<U256>) -> PublicActionFeeProjection {
+    pub fn fee_projection(
+        &self,
+        native_usd_micro_rate: Option<U256>,
+        native_decimals: u8,
+    ) -> PublicActionFeeProjection {
         PublicActionFeeProjection {
             source: PublicActionFeeSource::NetworkSimulation,
             raw_gas_limit: self.raw_gas_limit,
@@ -255,10 +262,11 @@ impl PublicAdvancedTransactionEstimate {
             expected_fee_per_gas: self.expected_fee_per_gas,
             expected_gas_cost: self.expected_gas_cost,
             maximum_gas_cost: self.max_gas_cost,
-            expected_native_usd_micro_value: native_usd_micro_rate
-                .and_then(|rate| native_usd_micro_value(self.expected_gas_cost, rate)),
+            expected_native_usd_micro_value: native_usd_micro_rate.and_then(|rate| {
+                native_usd_micro_value(self.expected_gas_cost, rate, native_decimals)
+            }),
             maximum_native_usd_micro_value: native_usd_micro_rate
-                .and_then(|rate| native_usd_micro_value(self.max_gas_cost, rate)),
+                .and_then(|rate| native_usd_micro_value(self.max_gas_cost, rate, native_decimals)),
         }
     }
 }
@@ -657,6 +665,7 @@ async fn estimate_public_advanced_transaction_with_fee_core(
                     resolved,
                     PublicActionFeeSource::NetworkSimulation,
                     None,
+                    request.effective_chain.native_currency.decimals,
                 );
                 return Ok(PublicAdvancedTransactionEstimate {
                     payload_fingerprint: public_advanced_transaction_payload_fingerprint(

@@ -186,7 +186,7 @@ fn private_asset_rows_include_usd_when_cache_has_rates() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let totals = [
         wallet_ops::TokenTotal {
@@ -213,7 +213,7 @@ fn private_asset_rows_from_snapshot_sort_by_usd_descending() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let snapshot = ListUtxosOutput {
         chain_id: 1,
@@ -262,7 +262,7 @@ fn private_asset_rows_from_snapshot_preserve_equal_and_unpriced_order() {
     let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
     let unknown = Address::from([0x99; 20]);
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let snapshot = ListUtxosOutput {
         chain_id: 1,
@@ -316,7 +316,7 @@ fn private_total_balance_sums_priced_assets() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let snapshot = ListUtxosOutput {
         chain_id: 1,
@@ -374,7 +374,7 @@ fn private_total_balance_absent_without_priced_assets() {
 fn private_asset_display_amounts_prioritize_usd_when_available() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let totals = [wallet_ops::TokenTotal {
         token: usdc.to_checksum(None),
@@ -410,7 +410,7 @@ fn private_asset_rows_omit_usd_without_required_pricing() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let unknown = Address::from([0x99; 20]);
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     let totals = [
         wallet_ops::TokenTotal {
             token: rail.to_checksum(None),

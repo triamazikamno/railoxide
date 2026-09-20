@@ -8314,7 +8314,7 @@ mod tests {
         };
         let anchor_rates = TokenAnchorRateCache::new();
         anchor_rates.store_rate(1, target, U256::from(100_000_000_u64));
-        anchor_rates.store_native_usd_rate(1, U256::from(13_194_600_000_u64));
+        anchor_rates.store_native_usd_rate(1, U256::from(13_194_600_000_u64), 18);
         let priced = proposal_decoded_preview(
             &DecodedProposalAction::Erc20Transfer {
                 recipient,
@@ -8354,7 +8354,7 @@ mod tests {
         };
         let stable_rates = TokenAnchorRateCache::new();
         stable_rates.store_rate(1, stable_target, U256::from(1_000_000_000_u64));
-        stable_rates.store_native_usd_rate(1, U256::from(1_000_000_000_u64));
+        stable_rates.store_native_usd_rate(1, U256::from(1_000_000_000_u64), 18);
         let stable = proposal_decoded_preview(
             &DecodedProposalAction::Erc20Transfer {
                 recipient,

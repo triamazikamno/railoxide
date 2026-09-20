@@ -134,9 +134,37 @@ impl ChainSettings {
     }
 }
 
+/// A same-chain oracle quoting USD per whole native coin.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum NativeUsdPricing {
+    #[default]
+    Default,
+    Disabled,
+    Oracle {
+        contract_address: super::Address,
+    },
+}
+
+impl NativeUsdPricing {
+    const fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    pub(super) const fn resolve(self, preset: Option<super::Address>) -> Option<super::Address> {
+        match self {
+            Self::Default => preset,
+            Self::Disabled => None,
+            Self::Oracle { contract_address } => Some(contract_address),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChainSettingsOverride {
+    #[serde(skip_serializing_if = "NativeUsdPricing::is_default")]
+    pub native_usd_pricing: NativeUsdPricing,
     pub enabled: bool,
     pub rpc_endpoints: Vec<String>,
     pub contracts: ChainContractSettings,
@@ -148,6 +176,7 @@ pub struct ChainSettingsOverride {
 impl Default for ChainSettingsOverride {
     fn default() -> Self {
         Self {
+            native_usd_pricing: NativeUsdPricing::Default,
             enabled: true,
             rpc_endpoints: Vec::new(),
             contracts: ChainContractSettings::default(),
@@ -427,6 +456,9 @@ pub use railgun_ui::NativeCurrency;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CustomChainSettings {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "NativeUsdPricing::is_default")]
+    pub native_usd_pricing: NativeUsdPricing,
     pub name: String,
     pub native_currency: NativeCurrency,
     pub rpc_endpoints: Vec<String>,

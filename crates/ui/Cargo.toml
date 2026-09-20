@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 railgun-ui = { path = "../railgun-ui" }
 ruint = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

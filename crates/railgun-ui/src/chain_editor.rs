@@ -12,6 +12,7 @@ pub enum ChainField {
     NativeName,
     NativeSymbol,
     NativeDecimals,
+    NativeUsdOracle,
     RpcEndpoints,
     ExplorerUrls,
     WrappedNativeToken,
@@ -43,6 +44,7 @@ impl ChainField {
         Self::NativeName,
         Self::NativeSymbol,
         Self::NativeDecimals,
+        Self::NativeUsdOracle,
         Self::RpcEndpoints,
         Self::ExplorerUrls,
         Self::WrappedNativeToken,
@@ -75,6 +77,7 @@ impl ChainField {
             Self::NativeName => "Native currency name",
             Self::NativeSymbol => "Native currency symbol",
             Self::NativeDecimals => "Native currency decimals",
+            Self::NativeUsdOracle => "Oracle contract",
             Self::RpcEndpoints => "RPC endpoints",
             Self::ExplorerUrls => "Block explorers",
             Self::WrappedNativeToken => "Wrapped native token",
@@ -181,10 +184,21 @@ impl ChainField {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeUsdChoice {
+    #[default]
+    Default,
+    Disabled,
+    Oracle,
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ChainDraft {
+    #[serde(default)]
+    pub native_usd_pricing: NativeUsdChoice,
     /// Decimal u64, kept as a string across JavaScript and JSON.
     pub chain_id: String,
     pub built_in: bool,
@@ -236,10 +250,23 @@ pub struct ChainSummary {
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ChainEditorCommand {
     List,
-    Inspect { chain_id: String },
-    Save { draft: ChainDraft, existing: bool },
-    Remove { chain_id: String },
-    Reset { chain_id: String },
+    Inspect {
+        chain_id: String,
+    },
+    Save {
+        draft: ChainDraft,
+        existing: bool,
+    },
+    /// Read the draft's own native USD source once. Nothing is persisted, cached or published.
+    Probe {
+        draft: ChainDraft,
+    },
+    Remove {
+        chain_id: String,
+    },
+    Reset {
+        chain_id: String,
+    },
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -250,4 +277,70 @@ pub struct ChainEditorSnapshot {
     pub chains: Vec<ChainSummary>,
     pub draft: Option<ChainDraft>,
     pub restart_required: bool,
+}
+
+/// Saved runtime pricing, delivered separately from editable chain configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct NativeUsdStatus {
+    pub state: NativeUsdState,
+    pub quote: Option<NativeUsdQuote>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeUsdState {
+    #[default]
+    Unconfigured,
+    Pending,
+    Available,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct NativeUsdQuote {
+    pub micro_usd: String,
+    pub obtained_at: u64,
+    pub feed_decimals: u8,
+}
+
+impl NativeUsdQuote {
+    #[must_use]
+    pub const fn new(micro_usd: String, obtained_at: u64, feed_decimals: u8) -> Self {
+        Self {
+            micro_usd,
+            obtained_at,
+            feed_decimals,
+        }
+    }
+}
+
+/// One unsaved Test outcome for a draft's source. Never saved pricing and never persisted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct NativeUsdProbe {
+    pub quote: Option<NativeUsdQuote>,
+    pub message: Option<String>,
+}
+
+impl NativeUsdProbe {
+    /// The failure message is user-facing, so hosts must keep endpoints out of it.
+    #[must_use]
+    pub fn new(result: Result<NativeUsdQuote, String>) -> Self {
+        match result {
+            Ok(quote) => Self {
+                quote: Some(quote),
+                message: None,
+            },
+            Err(message) => Self {
+                quote: None,
+                message: Some(message),
+            },
+        }
+    }
 }

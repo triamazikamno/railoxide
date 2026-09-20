@@ -225,7 +225,7 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
     estimate.protocol_fee_bps = uint!(25_U256);
     let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, dai, uint!(3_000_000_000_000_000_000_000_U256));
     let breakdown = PublicBroadcasterFeeBreakdown {
         native_gas_cost: uint!(1_000_000_000_000_000_U256),
@@ -257,7 +257,7 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
     );
 
     let outside_peg_cache = TokenAnchorRateCache::new();
-    outside_peg_cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    outside_peg_cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     outside_peg_cache.store_rate(1, dai, uint!(1_500_000_000_000_000_000_000_U256));
     assert!(
         display
@@ -1373,7 +1373,7 @@ fn public_balance_helpers_ignore_stale_chain_snapshot() {
 fn public_balance_usd_label_prices_native_and_erc20_balances() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
 
     assert_eq!(
@@ -1403,7 +1403,7 @@ fn public_balance_usd_label_omits_unpriced_and_unavailable_balances() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let unknown = Address::from([0x77; 20]);
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
 
     assert_eq!(
         public_balance_usd_label(
@@ -1448,7 +1448,7 @@ fn public_account_usd_total_label_sums_priced_balances() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
     let snapshot = PublicBalanceSnapshot {
         chain_id: 1,
@@ -1495,7 +1495,7 @@ fn public_account_usd_total_label_sums_priced_balances() {
 fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
     let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
     let cache = TokenAnchorRateCache::new();
-    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
     let snapshot = PublicBalanceSnapshot {
         chain_id: 1,
         refreshed_at: SystemTime::UNIX_EPOCH,

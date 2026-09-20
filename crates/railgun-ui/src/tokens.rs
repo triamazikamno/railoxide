@@ -32,12 +32,6 @@ pub struct TokenAnchorInfo {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct NativeUsdAnchorInfo {
-    pub chain_id: u64,
-    pub anchor_sources: &'static [TokenAnchorSource],
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct KnownTokenInfo {
     pub chain_id: u64,
     pub token: Address,
@@ -148,24 +142,7 @@ const ARB_PER_ETH_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Product
     sources: ARB_PER_ETH_18_PRODUCT_SOURCES,
     scale_decimals: 18,
 }];
-const BNB_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
-    addr: address!("0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"),
-    token_decimals: 6,
-    oracle_decimals: 8,
-    is_inversed: false,
-}];
-const MATIC_USD_6_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
-    addr: address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"),
-    token_decimals: 6,
-    oracle_decimals: 8,
-    is_inversed: false,
-}];
-const ARB_ETH_USD_6_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
-    addr: address!("0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
-    token_decimals: 6,
-    oracle_decimals: 8,
-    is_inversed: false,
-}];
+
 const RAIL_ETH_TWAP_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::UniswapV3Twap {
     pool: address!("0x2837809FD68e4a4104af76bbec5b622b6146B2cb"),
     base_token: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
@@ -173,14 +150,6 @@ const RAIL_ETH_TWAP_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::UniswapV
     base_token_decimals: 18,
     window_seconds: 1_800,
 }];
-
-#[rustfmt::skip]
-const NATIVE_USD_ANCHORS: &[(u64, &[TokenAnchorSource])] = &[
-    (1, ETH_USD_6_ANCHOR),
-    (56, BNB_USD_6_ANCHOR),
-    (137, MATIC_USD_6_NATIVE_ANCHOR),
-    (42161, ARB_ETH_USD_6_NATIVE_ANCHOR),
-];
 
 #[rustfmt::skip]
 const TOKENS: &[(u64, Address, &str, u8, &[TokenAnchorSource])] = &[
@@ -254,15 +223,6 @@ pub fn token_anchor_entries() -> impl Iterator<Item = TokenAnchorInfo> {
         .map(|(chain_id, token, _, _, anchor_sources)| TokenAnchorInfo {
             chain_id: *chain_id,
             token: *token,
-            anchor_sources,
-        })
-}
-
-pub fn native_usd_anchor_entries() -> impl Iterator<Item = NativeUsdAnchorInfo> {
-    NATIVE_USD_ANCHORS
-        .iter()
-        .map(|(chain_id, anchor_sources)| NativeUsdAnchorInfo {
-            chain_id: *chain_id,
             anchor_sources,
         })
 }
@@ -406,8 +366,13 @@ pub fn token_usd_micro_value(
 }
 
 #[must_use]
-pub fn native_usd_micro_value(amount: U256, native_usd_micro_rate: U256) -> Option<U256> {
-    token_usd_micro_value(amount, WRAPPED_NATIVE_FEE_RATE, native_usd_micro_rate)
+pub fn native_usd_micro_value(
+    amount: U256,
+    native_usd_micro_rate: U256,
+    native_decimals: u8,
+) -> Option<U256> {
+    let scale = U256::from(10).checked_pow(U256::from(native_decimals))?;
+    token_usd_micro_value(amount, scale, native_usd_micro_rate)
 }
 
 /// Returns no supplemental USD value when the token's valuation is within 2% of $1 per token.
@@ -599,29 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn native_usd_anchor_entries_cover_supported_wallet_chains() {
-        let entries = native_usd_anchor_entries().collect::<Vec<_>>();
-
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.chain_id)
-                .collect::<Vec<_>>(),
-            [1, 56, 137, 42161]
-        );
-        assert!(entries.iter().all(|entry| !entry.anchor_sources.is_empty()));
-        assert_eq!(
-            entries[0].anchor_sources,
-            &[TokenAnchorSource::ChainlinkOracle {
-                addr: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
-                token_decimals: 6,
-                oracle_decimals: 8,
-                is_inversed: false,
-            }]
-        );
-    }
-
-    #[test]
     fn usd_value_helpers_price_tokens_and_native_assets() {
         let native_usd = uint!(3_000_000_000_U256);
 
@@ -638,7 +580,7 @@ mod tests {
             Some(uint!(1_500_000_000_U256))
         );
         assert_eq!(
-            native_usd_micro_value(uint!(2_000_000_000_000_000_000_U256), native_usd),
+            native_usd_micro_value(uint!(2_000_000_000_000_000_000_U256), native_usd, 18),
             Some(uint!(6_000_000_000_U256))
         );
     }

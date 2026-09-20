@@ -38,6 +38,13 @@ impl WalletSettingsEditor {
             &chain_editor,
             window,
             |editor, view, event: &ui::chain_editor::ChainEditorEvent, window, cx| {
+                // A Test reads the network asynchronously and must not replace the draft.
+                if let railgun_ui::chain_editor::ChainEditorCommand::Probe { draft } =
+                    &event.command
+                {
+                    editor.handle_chain_editor_probe(draft, cx);
+                    return;
+                }
                 let result =
                     editor.handle_chain_editor_command(&event.revision, &event.command, window, cx);
                 view.update(cx, |view, cx| view.receive(result, window, cx));

@@ -2,7 +2,7 @@ use gpui::{
     AnyElement, App, Div, ElementId, Entity, FontWeight, IntoElement, ParentElement, SharedString,
     Styled, Window, div, prelude::FluentBuilder as _, px, relative, rgb,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputGroup, InputState};
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
@@ -78,6 +78,19 @@ pub fn app_input(state: &Entity<InputState>) -> Input {
         .w_full()
         .px(px(8.0))
         .bg(rgb(theme::SURFACE))
+}
+
+/// The same input contract inside an [`InputGroup`] frame, which owns the
+/// surface and border so the control paints none of its own.
+#[must_use]
+pub fn app_input_group(
+    id: impl Into<ElementId>,
+    state: &Entity<InputState>,
+    label: impl Into<SharedString>,
+) -> InputGroup {
+    InputGroup::new(id)
+        .bg(rgb(theme::SURFACE))
+        .input(Input::new(state).px(px(8.0)).aria_label(label))
 }
 
 /// Recipient field shared by Unshield and browser Send, with integrated trailing actions.

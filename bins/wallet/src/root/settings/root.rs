@@ -245,14 +245,33 @@ impl WalletRoot {
                 .effective_chain_configs
                 .iter()
                 .filter_map(|(&id, previous)| {
-                    (effective_chain_configs.get(id) != Some(previous)).then_some(id)
+                    effective_chain_configs
+                        .get(id)
+                        .is_none_or(|next| !previous.operationally_matches(next))
+                        .then_some(id)
                 })
                 .collect();
             for &id in &changed {
                 self.http.rpc_broker().invalidate_block(id);
                 self.gateway.drafts.borrow_mut().retire_chain(id);
             }
+            let route_changes: Vec<_> = changed
+                .iter()
+                .copied()
+                .filter(|id| {
+                    match (
+                        self.effective_chain_configs.get(*id),
+                        effective_chain_configs.get(*id),
+                    ) {
+                        (Some(previous), Some(next)) => previous.rpc_route != next.rpc_route,
+                        _ => true,
+                    }
+                })
+                .collect();
+            self.public_broadcaster_anchor_refresh
+                .reconcile_native_sources(&effective_chain_configs, &route_changes);
             self.effective_chain_configs = effective_chain_configs;
+            self.refresh_walletconnect_fee_usd_values();
             if self
                 .effective_chain_configs
                 .enabled(self.selected_chain)

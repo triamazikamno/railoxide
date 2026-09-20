@@ -1,12 +1,14 @@
 //! Shared chain editor inside the extension's current authenticated view.
 use super::*;
-use railgun_ui::chain_editor::ChainEditorSnapshot;
+use railgun_ui::chain_editor::{ChainEditorSnapshot, NativeUsdProbe};
 use ui::chain_editor::{ChainEditor, ChainEditorEvent};
 
 pub(super) struct ChainManagement {
     pub(super) editor: Entity<ChainEditor>,
     pub(super) supported: bool,
     pub(super) token: Option<String>,
+    pub(super) pricing_status:
+        std::collections::BTreeMap<String, railgun_ui::chain_editor::NativeUsdStatus>,
     sequence: u64,
     inspect_on_open: Option<u64>,
     _subscription: Subscription,
@@ -69,6 +71,18 @@ impl ChainManagement {
                         .as_deref()
                         .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
                     let result = match value {
+                        // A Test result is unsaved feedback: it never replaces the draft.
+                        Some(mut value) if status == "probed" => {
+                            if let Ok(probe) =
+                                serde_json::from_value::<NativeUsdProbe>(value["probe"].take())
+                            {
+                                view.chain_management
+                                    .editor
+                                    .update(cx, |editor, cx| editor.receive_probe(probe, cx));
+                                cx.notify();
+                            }
+                            return;
+                        }
                         Some(mut value) if status == "ready" => {
                             serde_json::from_value::<ChainEditorSnapshot>(value["snapshot"].take())
                                 .map_err(|_| {
@@ -102,6 +116,7 @@ impl ChainManagement {
             editor,
             supported: false,
             token: None,
+            pricing_status: std::collections::BTreeMap::new(),
             sequence: 0,
             inspect_on_open: None,
             _subscription: subscription,
@@ -134,6 +149,10 @@ impl GatewayView {
         let token = format!("chains:{}", self.chain_management.sequence);
         self.chain_management.token = Some(token.clone());
         self.chain_management.inspect_on_open = chain_id;
+        let status = self.chain_management.pricing_status.clone();
+        self.chain_management
+            .editor
+            .update(cx, |editor, cx| editor.set_pricing_status(status, cx));
         host_command(
             "chain_editor",
             &serde_json::json!({"action":"open", "editor_token":token}).to_string(),

@@ -145,6 +145,25 @@ const networkErrors = new Set([
 ]);
 const boundedNetworkText = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
 const networkInteger = value => Number.isSafeInteger(value) && value >= 0;
+const boundedNativeQuote = quote => !!quote && typeof quote.microUsd === 'string' &&
+  /^[1-9][0-9]{0,77}$/.test(quote.microUsd) && BigInt(quote.microUsd) <= (1n << 256n) - 1n &&
+  networkInteger(quote.obtainedAt) && Number.isInteger(quote.feedDecimals) &&
+  quote.feedDecimals >= 0 && quote.feedDecimals <= 255;
+function nativeUsdPresentation(message) {
+  const statuses = message.native_usd_pricing ?? {};
+  if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses) || Object.keys(statuses).length > 68) return null;
+  if (message.locked && Object.keys(statuses).length) return null;
+  for (const [chain, status] of Object.entries(statuses)) {
+    if (!/^[1-9][0-9]{0,19}$/.test(chain) || BigInt(chain) > 18446744073709551615n ||
+        !status || !['unconfigured', 'pending', 'available', 'failed'].includes(status.state) ||
+        (status.reason !== null && !boundedNetworkText(status.reason, 512))) return null;
+    const quote = status.quote;
+    if (quote !== null && !boundedNativeQuote(quote)) return null;
+    if ((status.state === 'available' && quote === null) || (status.state === 'unconfigured' && quote !== null)) return null;
+  }
+  return statuses;
+}
+
 function networkPresentation(message) {
   const value = message.network_view;
   if (message.locked || message.network_control_supported !== true || !value ||
@@ -331,8 +350,12 @@ function receiveChainEditor(session, message) {
   const [port, view] = entry;
   if (!view.pending || view.pending.id !== message.request_id) return;
   const outcome = message.outcome;
-  if (!outcome || !['ready', 'failed'].includes(outcome.status) || encoder.encode(JSON.stringify(outcome)).length > 131_072 ||
+  if (!outcome || !['ready', 'failed', 'probed'].includes(outcome.status) || encoder.encode(JSON.stringify(outcome)).length > 131_072 ||
       (outcome.status === 'failed' && !boundedNetworkText(outcome.message, 4096)) ||
+      // A test result carries one quote or one reason, never saved pricing or endpoints.
+      (outcome.status === 'probed' && (!outcome.probe ||
+        (outcome.probe.message !== null && !boundedNetworkText(outcome.probe.message, 4096)) ||
+        (outcome.probe.quote !== null && !boundedNativeQuote(outcome.probe.quote)))) ||
       (outcome.status === 'ready' && (!outcome.snapshot || !boundedNetworkText(outcome.snapshot.revision, 128) ||
         !Array.isArray(outcome.snapshot.chains) || outcome.snapshot.chains.length > 68))) return;
   clearTimeout(view.pending.timer);
@@ -596,6 +619,8 @@ async function receive(session, bytes) {
     }
     if (message.type === 'chain_editor') { receiveChainEditor(session, message); return; }
     if (message.type === 'ui_snapshot') {
+      const nativeUsd = nativeUsdPresentation(message);
+      if (nativeUsd === null) return;
       if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
       if (message.locked && (message.accounts.length ||
@@ -606,7 +631,7 @@ async function receive(session, bytes) {
         ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
           privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
       const network = networkPresentation(message);
-      publishSnapshot({ ...message, network_control_supported: network !== null, network_view: network, private_actions_supported: privateActions,
+      publishSnapshot({ ...message, native_usd_pricing: nativeUsd, network_control_supported: network !== null, network_view: network, private_actions_supported: privateActions,
         private_self_broadcast_supported: privateActions && message.private_self_broadcast_supported === true,
         private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
         public_view: message.locked ? null : publicView,

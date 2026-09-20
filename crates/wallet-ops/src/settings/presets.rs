@@ -8,6 +8,7 @@ pub(super) struct EvmPreset {
     pub rpc_endpoints: Vec<String>,
     pub multicall: Address,
     pub wrapped_native: Option<Address>,
+    pub native_usd_oracle: Address,
     pub block_time: Duration,
     pub finality_depth: u64,
 }
@@ -35,6 +36,7 @@ impl EvmPreset {
                 .map(str::to_owned)
                 .collect(),
                 multicall: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
+                native_usd_oracle: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_secs(12),
                 finality_depth: 12,
@@ -57,6 +59,7 @@ impl EvmPreset {
                 .map(str::to_owned)
                 .collect(),
                 multicall: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
+                native_usd_oracle: address!("0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_millis(450),
                 finality_depth: 15,
@@ -79,6 +82,7 @@ impl EvmPreset {
                 .map(str::to_owned)
                 .collect(),
                 multicall: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
+                native_usd_oracle: address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_secs(1),
                 finality_depth: 256,
@@ -104,6 +108,7 @@ impl EvmPreset {
                 .map(str::to_owned)
                 .collect(),
                 multicall: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
+                native_usd_oracle: address!("0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_millis(250),
                 finality_depth: 64,

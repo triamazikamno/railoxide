@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 7;
+pub const WALLET_SETTINGS_VERSION: u32 = 8;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 4;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =

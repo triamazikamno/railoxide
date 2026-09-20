@@ -670,6 +670,21 @@ impl GatewayView {
                     if !view.chain_management.supported {
                         view.retire_chain_editor(cx);
                     }
+                    view.chain_management.pricing_status = if view.chain_management.supported {
+                        js_sys::JSON::stringify(&field(&snapshot, "native_usd_pricing"))
+                            .ok()
+                            .and_then(|value| value.as_string())
+                            .and_then(|value| serde_json::from_str(&value).ok())
+                            .unwrap_or_default()
+                    } else {
+                        Default::default()
+                    };
+                    if view.chain_management.token.is_some() {
+                        let status = view.chain_management.pricing_status.clone();
+                        view.chain_management
+                            .editor
+                            .update(cx, |editor, cx| editor.set_pricing_status(status, cx));
+                    }
                     view.generation = generation;
                     if view.private_sheet.as_ref().is_some_and(|(wallet, chain)| {
                         private.selected_wallet.as_ref() != Some(wallet)

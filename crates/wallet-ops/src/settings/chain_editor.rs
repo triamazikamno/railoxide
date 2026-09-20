@@ -2,11 +2,11 @@
 use super::{
     ChainContractSettings, ChainDeploymentSettings, ChainGasSettings, ChainMutation,
     ChainSettingsOverride, CustomChainSettings, MAX_CHAIN_MUTATION_BYTES, NativeCurrency,
-    QuickSyncSettings, RailgunContractSettings, RailgunSettingsOverride, WalletSettings, presets,
-    settings_revision,
+    NativeUsdPricing, QuickSyncSettings, RailgunContractSettings, RailgunSettingsOverride,
+    WalletSettings, presets, settings_revision,
 };
 use railgun_ui::chain_editor::{
-    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary,
+    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary, NativeUsdChoice,
 };
 
 pub fn chain_editor_snapshot(
@@ -84,6 +84,7 @@ fn stored_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String
     let Some(chain) = settings.chains.custom.get(&id) else {
         return built_in_draft(settings, id);
     };
+    fill_native_pricing(&mut draft, chain.native_usd_pricing);
     fill_general_draft(
         &mut draft,
         &chain.name,
@@ -98,6 +99,19 @@ fn stored_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String
     Ok(draft)
 }
 
+fn fill_native_pricing(draft: &mut ChainDraft, pricing: NativeUsdPricing) {
+    draft.native_usd_pricing = match pricing {
+        NativeUsdPricing::Default => NativeUsdChoice::Default,
+        NativeUsdPricing::Disabled => NativeUsdChoice::Disabled,
+        NativeUsdPricing::Oracle { contract_address } => {
+            draft
+                .fields
+                .insert(ChainField::NativeUsdOracle, contract_address.to_string());
+            NativeUsdChoice::Oracle
+        }
+    };
+}
+
 fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String> {
     let preset = presets::EvmPreset::for_chain(id).ok_or("Chain is no longer configured")?;
     let defaults = ChainSettingsOverride::default();
@@ -105,6 +119,7 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
     let mut draft = ChainDraft::new();
     draft.chain_id = id.to_string();
     draft.built_in = true;
+    fill_native_pricing(&mut draft, chain.native_usd_pricing);
     fill_general_draft(
         &mut draft,
         preset.name,
@@ -188,6 +203,7 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
 fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String> {
     let mut inherited = settings.clone();
     if let Some(chain) = inherited.chains.custom.get_mut(&id) {
+        chain.native_usd_pricing = NativeUsdPricing::Default;
         chain.contracts = ChainContractSettings::default();
         chain.finality_depth = None;
         chain.gas = ChainGasSettings::default();
@@ -200,6 +216,11 @@ fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Str
         .cloned()
         .ok_or("Chain is no longer configured")?;
     let mut draft = ChainDraft::new();
+    if let Some(oracle) = chain.native_usd_oracle {
+        draft
+            .fields
+            .insert(ChainField::NativeUsdOracle, oracle.to_string());
+    }
     // Custom identity, endpoints and optional contracts are definitions, never inherited.
     for (field, value) in [
         (ChainField::FinalityDepth, chain.finality_depth),
@@ -338,6 +359,9 @@ fn remove_inherited_values(
         }
     }
     for (field, value) in defaults.fields {
+        if field == ChainField::NativeUsdOracle {
+            continue;
+        }
         // Keep explicit empty relay lists distinct from preset inheritance.
         if field == ChainField::SponsoredBundleRelays {
             if !lines(draft, field).is_empty()
@@ -456,10 +480,35 @@ pub fn chain_editor_mutation(
         ChainEditorCommand::Reset { chain_id } => Ok(ChainMutation::ResetBuiltIn {
             chain_id: editor_chain_id(chain_id)?,
         }),
-        ChainEditorCommand::List | ChainEditorCommand::Inspect { .. } => {
+        ChainEditorCommand::List
+        | ChainEditorCommand::Inspect { .. }
+        | ChainEditorCommand::Probe { .. } => {
             Err("This command does not change a chain".to_owned())
         }
     }
+}
+
+/// Validates a Test draft exactly like Save and resolves its effective chain. The candidate
+/// settings are discarded here: no caller may persist them.
+pub fn chain_editor_probe_chain(
+    settings: &WalletSettings,
+    draft: &ChainDraft,
+) -> Result<super::EffectiveChainConfig, String> {
+    let id = editor_chain_id(&draft.chain_id)?;
+    let candidate = chain_editor_mutation(
+        settings,
+        &ChainEditorCommand::Save {
+            draft: draft.clone(),
+            existing: settings.chains.contains(id),
+        },
+    )?
+    .prepare(settings)
+    .map_err(|error| error.to_string())?;
+    super::build_effective_chain_configs(&candidate)
+        .map_err(|error| error.to_string())?
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "Chain is no longer configured".to_owned())
 }
 
 pub fn editor_chain_id(value: &str) -> Result<u64, String> {
@@ -509,6 +558,17 @@ fn draft_mutation(
         remove_inherited_values(settings, &mut normalized, id)?;
     }
     let draft = &normalized;
+    let native_usd_pricing = match draft.native_usd_pricing {
+        NativeUsdChoice::Default => NativeUsdPricing::Default,
+        NativeUsdChoice::Disabled => NativeUsdPricing::Disabled,
+        NativeUsdChoice::Oracle => NativeUsdPricing::Oracle {
+            contract_address: draft
+                .value(ChainField::NativeUsdOracle)
+                .trim()
+                .parse()
+                .map_err(|_| "Oracle contract must be a valid Ethereum address")?,
+        },
+    };
     let contracts = ChainContractSettings {
         wrapped_native_token: optional_text(draft, ChainField::WrappedNativeToken),
         multicall_contract: optional_text(draft, ChainField::MulticallContract),
@@ -564,6 +624,7 @@ fn draft_mutation(
         Ok(ChainMutation::EditBuiltIn {
             chain_id: id,
             overrides: ChainSettingsOverride {
+                native_usd_pricing,
                 enabled: draft.enabled,
                 rpc_endpoints: lines(draft, ChainField::RpcEndpoints),
                 contracts,
@@ -581,6 +642,7 @@ fn draft_mutation(
             return Err("Custom chains support public EVM operations only".to_owned());
         }
         let definition = CustomChainSettings {
+            native_usd_pricing,
             name: draft.value(ChainField::Name).trim().to_owned(),
             native_currency: NativeCurrency {
                 name: draft.value(ChainField::NativeName).trim().to_owned(),
@@ -616,6 +678,63 @@ fn draft_mutation(
 mod tests {
     use super::*;
     use crate::settings::build_effective_chain_configs;
+
+    #[test]
+    fn native_pricing_round_trips_modes_and_rejects_bad_oracles() {
+        let mut settings = WalletSettings::default();
+        settings
+            .chains
+            .custom
+            .insert(999, super::super::tests::custom_evm_chain());
+        for id in [1, 999] {
+            let preset = presets::EvmPreset::for_chain(id).map(|preset| preset.native_usd_oracle);
+            for choice in [
+                NativeUsdChoice::Disabled,
+                NativeUsdChoice::Oracle,
+                NativeUsdChoice::Default,
+            ] {
+                let mut draft = chain_editor_draft(&settings, id).unwrap();
+                draft.native_usd_pricing = choice;
+                draft.fields.insert(
+                    ChainField::NativeUsdOracle,
+                    "0x0000000000000000000000000000000000000001".into(),
+                );
+                settings = save_draft(&settings, draft);
+                settings = crate::settings::decode_wallet_settings(
+                    &crate::settings::encode_wallet_settings(&settings).unwrap(),
+                )
+                .unwrap();
+                let reopened = chain_editor_draft(&settings, id).unwrap();
+                assert_eq!(reopened.native_usd_pricing, choice);
+                let chains = super::super::build_effective_chain_configs(&settings).unwrap();
+                let chain = chains.get(id).unwrap();
+                assert_eq!(
+                    chain.native_usd_oracle,
+                    match choice {
+                        NativeUsdChoice::Default => preset,
+                        NativeUsdChoice::Disabled => None,
+                        NativeUsdChoice::Oracle =>
+                            Some(alloy::primitives::Address::with_last_byte(1)),
+                    }
+                );
+                if id == 999 {
+                    assert!(chain.railgun.is_none());
+                    assert!(chain.wrapped_native_token.is_none());
+                }
+            }
+            let mut draft = chain_editor_draft(&settings, id).unwrap();
+            draft.native_usd_pricing = NativeUsdChoice::Oracle;
+            draft
+                .fields
+                .insert(ChainField::NativeUsdOracle, "invalid".into());
+            assert!(
+                draft_mutation(&settings, &draft, true)
+                    .err()
+                    .unwrap()
+                    .contains("Oracle contract")
+            );
+        }
+    }
 
     fn save_draft(settings: &WalletSettings, draft: ChainDraft) -> WalletSettings {
         chain_editor_mutation(

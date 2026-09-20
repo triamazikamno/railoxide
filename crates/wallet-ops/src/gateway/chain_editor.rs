@@ -1,7 +1,7 @@
 //! Volatile, authenticated editor views. Endpoint-bearing replies never enter UI snapshots.
 use super::{DappProvider, Delivery, GatewayWalletState, PeerId, valid_id};
 use crate::gateway::GatewayServerMessage;
-use railgun_ui::chain_editor::{ChainEditorCommand, ChainEditorSnapshot};
+use railgun_ui::chain_editor::{ChainEditorCommand, ChainEditorSnapshot, NativeUsdProbe};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -33,8 +33,16 @@ pub enum GatewayChainEditorCommand {
 #[derive(Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GatewayChainEditorOutcome {
-    Ready { snapshot: ChainEditorSnapshot },
-    Failed { message: String },
+    Ready {
+        snapshot: ChainEditorSnapshot,
+    },
+    /// An unsaved Test result. It never changes the view's selected chain.
+    Probed {
+        probe: NativeUsdProbe,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -200,6 +208,11 @@ impl DappProvider {
             ChainEditorCommand::Remove { chain_id } | ChainEditorCommand::Reset { chain_id } => {
                 view.selected.as_ref() == Some(chain_id)
             }
+            // A Test reads the draft's own chain, which is the selected one unless it is new.
+            ChainEditorCommand::Probe { draft } => view
+                .selected
+                .as_ref()
+                .is_none_or(|selected| *selected == draft.chain_id),
             ChainEditorCommand::List | ChainEditorCommand::Inspect { .. } => true,
         };
         if !identity_matches {
@@ -421,6 +434,40 @@ mod tests {
             },
         );
         let (_, mut queued) = provider.drain().pop().unwrap();
+        // A Test is bound to the view's chain and cannot outlive the view.
+        let probe = |request_id: &str, chain: &str| {
+            let mut draft = railgun_ui::chain_editor::ChainDraft::new();
+            draft.chain_id = chain.into();
+            GatewayChainEditorCommand::Run {
+                view_id: "2".into(),
+                request_id: request_id.into(),
+                revision: revision.clone(),
+                command: ChainEditorCommand::Probe { draft },
+            }
+        };
+        assert!(
+            provider
+                .chain_editor_command(1, peer, 1, probe("probe-rebound", "56"))
+                .is_none()
+        );
+        let probing = provider
+            .chain_editor_command(1, peer, 1, probe("probe", "1"))
+            .unwrap();
+        provider.chain_editor_command(
+            1,
+            peer,
+            1,
+            GatewayChainEditorCommand::Close {
+                view_id: "2".into(),
+            },
+        );
+        provider.complete_chain_editor_request(
+            probing,
+            GatewayChainEditorOutcome::Probed {
+                probe: NativeUsdProbe::new(Err("Could not read the oracle".to_owned())),
+            },
+        );
+        assert!(provider.drain().is_empty());
         provider.update_wallet(GatewayWalletState::default(), 2);
         assert!(provider.delivery(1, &mut queued) == DeliveryStatus::Discard);
         drop(provider);

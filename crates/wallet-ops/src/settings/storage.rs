@@ -26,6 +26,17 @@ pub fn load_wallet_settings(store: &DbStore) -> Result<WalletSettings, WalletSet
 }
 
 fn load_wallet_settings_locked(store: &DbStore) -> Result<WalletSettings, WalletSettingsError> {
+    load_wallet_settings_with_writer(store, |payload| {
+        store
+            .put_app_settings_record(WALLET_SETTINGS_KEY, payload)
+            .map_err(Into::into)
+    })
+}
+
+pub(super) fn load_wallet_settings_with_writer(
+    store: &DbStore,
+    write: impl FnOnce(&[u8]) -> Result<(), WalletSettingsError>,
+) -> Result<WalletSettings, WalletSettingsError> {
     let Some(payload) = store.get_app_settings_record(WALLET_SETTINGS_KEY)? else {
         return Ok(WalletSettings::default());
     };
@@ -41,7 +52,7 @@ fn load_wallet_settings_locked(store: &DbStore) -> Result<WalletSettings, Wallet
         || indexed_gateway_migrated
     {
         let payload = encode_wallet_settings(&settings)?;
-        store.put_app_settings_record(WALLET_SETTINGS_KEY, &payload)?;
+        write(&payload)?;
     }
     Ok(settings)
 }
@@ -194,6 +205,11 @@ fn decode_wallet_settings_with_migration(
     let version: Version = rmp_serde::from_slice(data)?;
     match version.version {
         WALLET_SETTINGS_VERSION => Ok((rmp_serde::from_slice(data)?, None)),
+        7 => {
+            let mut settings: WalletSettings = rmp_serde::from_slice(data)?;
+            settings.version = WALLET_SETTINGS_VERSION;
+            Ok((settings, Some(7)))
+        }
         1..=6 => {
             let mut legacy: super::legacy::LegacyWalletSettings = rmp_serde::from_slice(data)?;
             if version.version == 1 {

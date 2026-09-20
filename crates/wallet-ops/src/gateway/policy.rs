@@ -50,6 +50,7 @@ pub(super) fn proposed_chain(
         return Err("Too many explorer URLs");
     }
     let definition = CustomChainSettings {
+        native_usd_pricing: crate::settings::NativeUsdPricing::Default,
         name: metadata.chain_name,
         native_currency: NativeCurrency {
             name: metadata.native_currency.name,
@@ -204,6 +205,22 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn dapp_chain_metadata_cannot_install_native_pricing() {
+        let metadata = serde_json::json!([{
+            "chainId": "0x2105", "chainName": "Custom",
+            "nativeCurrency": { "name": "Coin", "symbol": "COIN", "decimals": 6, "extension": true },
+            "rpcUrls": ["https://rpc.example"],
+            "native_usd_pricing": { "type": "oracle", "contract_address": Address::repeat_byte(7).to_string() },
+            "nativeUsdPricing": { "type": "oracle", "contractAddress": Address::repeat_byte(7).to_string() }
+        }]);
+        let definition = proposed_chain(8453, &metadata).unwrap();
+        assert_eq!(
+            definition.native_usd_pricing,
+            crate::settings::NativeUsdPricing::Default
+        );
+    }
 
     #[tokio::test]
     async fn proposed_endpoint_timeout_finishes_before_approval_expiry() {

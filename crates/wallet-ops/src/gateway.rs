@@ -292,6 +292,8 @@ pub enum GatewayServerMessage {
         outcome: GatewayProviderOutcome,
     },
     UiSnapshot {
+        native_usd_pricing:
+            std::collections::BTreeMap<String, railgun_ui::chain_editor::NativeUsdStatus>,
         version: u16,
         generation: u64,
         locked: bool,

@@ -1467,6 +1467,17 @@ test('chain editor replies stay on live UI views without persistence, replay, or
   for (const other of [panel, standalone, page]) assert.equal(JSON.stringify(other.port.messages).includes(secret), false);
   assert.equal(popup.port.messages.filter(message => message.type === 'ui_snapshot').some(message => JSON.stringify(message).includes(secret)), false);
   const lastSnapshot = ui => ui.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
+  const nativeUsd = { [id]: { state: 'available', quote: { microUsd: '3000000000', obtainedAt: 1780000000, feedDecimals: 8 }, reason: null } };
+  const editorReplies = popup.port.messages.filter(message => message.type === 'chain_editor').length;
+  await session.send({ ...base, chain_management_supported: true, native_usd_pricing: nativeUsd });
+  assert.deepEqual(JSON.parse(JSON.stringify(lastSnapshot(popup).native_usd_pricing)), nativeUsd);
+  assert.equal(popup.port.messages.filter(message => message.type === 'chain_editor').length, editorReplies,
+    'a price update cannot replace an open editor draft');
+  const beforeInvalidPrice = popup.port.messages.length;
+  for (const microUsd of ['9'.repeat(79), 3000000000]) {
+    await session.send({ ...base, chain_management_supported: true, native_usd_pricing: { [id]: { ...nativeUsd[id], quote: { ...nativeUsd[id].quote, microUsd } } } });
+    assert.equal(popup.port.messages.length, beforeInvalidPrice, 'quotes require bounded decimal strings');
+  }
   const railgun = { ...base, chain_management_supported: true, chains: [{ id: 1, name: 'Ethereum', railgun: true }],
     public_view: { selected_account: 'first', selected_chain: 1, drafts: [] } };
   const publicOnly = { ...base, chain_management_supported: true, chains: [{ id, name: 'Custom', railgun: false }],
@@ -1521,6 +1532,9 @@ test('chain editor replies stay on live UI views without persistence, replay, or
   assert.equal(panel.port.messages.length, panelCount);
   await session.send({ type: 'state', version: 1, generation: 2, locked: true });
   assert.ok(standalone.port.messages.some(message => message.type === 'chain_editor' && message.outcome.status === 'retired'));
+  const beforeStalePricing = standalone.port.messages.length;
+  await session.send({ ...base, chain_management_supported: true, native_usd_pricing: nativeUsd });
+  assert.equal(standalone.port.messages.length, beforeStalePricing, 'old pricing cannot revive a retired generation');
   const lockedCount = standalone.port.messages.length;
   await session.send(reply(requests[2]));
   assert.equal(standalone.port.messages.length, lockedCount);
