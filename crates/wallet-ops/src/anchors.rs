@@ -981,7 +981,12 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
     )
     .await?;
     let mut fetched = TwapFetchedInputs::default();
-    for (pair, key) in metadata_results.chunks_exact(2).zip(pools.iter().copied()) {
+    for (pair, key) in metadata_results
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(pools.iter().copied())
+    {
         let (Ok(token0), Ok(token1)) = (pair[0].clone(), pair[1].clone()) else {
             continue;
         };

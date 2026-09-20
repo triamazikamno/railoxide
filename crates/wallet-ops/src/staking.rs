@@ -465,7 +465,7 @@ pub async fn fetch_account_stakes(
     let mut voting_power = vec![Err(String::new()); accounts.len()];
     let mut balances = vec![Err(String::new()); accounts.len()];
     let mut failures = vec![None; accounts.len()];
-    for (account_index, triple) in metadata.chunks_exact(3).enumerate() {
+    for (account_index, triple) in metadata.as_chunks::<3>().0.iter().enumerate() {
         match &triple[0] {
             Ok(count) => match usize::try_from(*count) {
                 Ok(count) => counts[account_index] = Some(count),

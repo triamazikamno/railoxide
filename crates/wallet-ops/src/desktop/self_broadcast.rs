@@ -15,7 +15,7 @@ struct SelfBroadcastWinnerOutput {
     live_native_balance: U256,
 }
 
-fn self_broadcast_winner_output(
+const fn self_broadcast_winner_output(
     attempts: &[SubmittedSelfBroadcastAttempt],
     winner_index: usize,
 ) -> SelfBroadcastWinnerOutput {

@@ -17,7 +17,7 @@ pub(in crate::root) fn render_public_account_identicon(address: &Address) -> gpu
         .items_center()
         .justify_center()
         .gap_0();
-    for row in pattern.chunks_exact(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE) {
+    for row in pattern.as_chunks::<PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE>().0 {
         let mut row_div = div().flex().gap_0();
         for active in row {
             let cell = div().size(PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE);

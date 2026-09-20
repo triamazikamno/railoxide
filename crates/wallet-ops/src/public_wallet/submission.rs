@@ -502,7 +502,7 @@ fn retain_public_action_attempt(
     observer.register(attempt.tx_hash, attempt_id);
 }
 
-fn public_action_winner_gas_fee(
+const fn public_action_winner_gas_fee(
     attempts: &[SubmittedPublicActionAttempt],
     winner_index: usize,
 ) -> PublicActionGasFeeSelection {
