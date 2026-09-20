@@ -637,6 +637,15 @@ impl WalletRoot {
             .collect();
     }
 
+    /// Whether any paired browser reports an extension older than the bundled one.
+    fn gateway_update_available(&self) -> bool {
+        self.gateway.snapshot.peers.iter().any(|peer| {
+            peer.extension_version
+                .as_deref()
+                .is_some_and(|reported| extension_update_available(reported, install_bundle()))
+        })
+    }
+
     pub(super) fn render_gateway_status_pill(
         &self,
         root: &Entity<Self>,
@@ -644,6 +653,7 @@ impl WalletRoot {
     ) -> impl IntoElement {
         let popover_root = root.clone();
         let content_root = root.clone();
+        let update_available = self.gateway_update_available();
         let width =
             SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET;
         let total_pairings = self.gateway.snapshot.peers.len();
@@ -725,6 +735,23 @@ impl WalletRoot {
                                 .child("Browser pairing"),
                         )
                         .child(status)
+                        .when(update_available, |this| {
+                            this.child(
+                                div()
+                                    .id("wallet-gateway-update-available")
+                                    .flex_none()
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("One or more paired extensions can be updated")
+                                            .build(window, cx)
+                                    })
+                                    .child(
+                                        Icon::empty()
+                                            .path(icons::circle_fading_arrow_up_icon_path())
+                                            .small()
+                                            .text_color(rgb(theme::WARNING)),
+                                    ),
+                            )
+                        })
                     }),
             );
         let popover = Popover::new("wallet-gateway-status-popover")
@@ -915,13 +942,15 @@ impl WalletRoot {
             let paired = gateway_peer_age(peer.paired_at, now);
             let mut detail = format!("Last active {last_active} · paired {paired}");
             if let Some(reported) = peer.extension_version.as_deref() {
-                if extension_update_available(reported, install_bundle()) {
-                    detail.push_str(" · Update available");
-                } else {
-                    detail.push_str(" · v");
-                    detail.push_str(reported);
-                }
+                detail.push_str(" · v");
+                detail.push_str(reported);
             }
+            let update = peer.extension_version.as_deref().and_then(|reported| {
+                let bundle = install_bundle();
+                extension_update_available(reported, bundle).then_some((reported, bundle.version))
+            });
+            let update_root = root.clone();
+            let update_popover = popover.clone();
             let menu_target = GatewayPeerMenuTarget {
                 root: root.clone(),
                 peer_id: peer.id,
@@ -931,72 +960,103 @@ impl WalletRoot {
             };
             let revoke_root = root.clone();
             let peer_id = peer.id;
-            peers_content = peers_content.child(
-                div()
-                    .id(SharedString::from(format!("gateway-peer-row-{identity}")))
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .min_w_0()
-                    .py_1p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                app_text(display_name)
-                                    .id(SharedString::from(format!(
-                                        "gateway-peer-label-{identity}"
+            peers_content =
+                peers_content.child(
+                    div()
+                        .id(SharedString::from(format!("gateway-peer-row-{identity}")))
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .min_w_0()
+                        .py_1p5()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .min_w_0()
+                                .child(
+                                    app_text(display_name)
+                                        .id(SharedString::from(format!(
+                                            "gateway-peer-label-{identity}"
+                                        )))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .line_height(px(17.0))
+                                        .when(is_hex_identity, |this| {
+                                            this.font_family(theme::APP_MONO_FONT_FAMILY)
+                                        })
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tooltip.clone()).build(window, cx)
+                                        }),
+                                )
+                                .when_some(update, |this, (reported, latest)| {
+                                    this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "gateway-peer-update-{identity}"
                                     )))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.0))
-                                    .line_height(px(17.0))
-                                    .when(is_hex_identity, |this| {
-                                        this.font_family(theme::APP_MONO_FONT_FAMILY)
-                                    })
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(tooltip.clone()).build(window, cx)
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
+                                    .ghost()
+                                    .small()
                                     .flex_none()
-                                    .child(app_status_tag(status, color)),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "gateway-peer-revoke-{identity}"
-                                )))
-                                .ghost()
-                                .small()
-                                .flex_none()
-                                .icon(Icon::empty().path(icons::ban_icon_path()))
-                                .accessibility_label("Revoke pairing")
-                                .tooltip("Revoke pairing")
-                                .disabled(disabled)
-                                .on_click(
-                                    move |_, window, cx| {
-                                        revoke_gateway_peer(&revoke_root, peer_id, window, cx);
-                                    },
+                                    .icon(
+                                        Icon::empty()
+                                            .path(icons::circle_fading_arrow_up_icon_path())
+                                            .text_color(rgb(theme::WARNING)),
+                                    )
+                                    .accessibility_label("Update extension")
+                                    .tooltip(format!(
+                                        "Update available: v{reported} installed, v{latest} bundled"
+                                    ))
+                                    .disabled(
+                                        disabled || self.gateway.snapshot.listener_addr.is_none(),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        update_popover
+                                            .update(cx, |state, cx| state.dismiss(window, cx));
+                                        update_root.update(cx, |root, cx| {
+                                            root.open_gateway_install_dialog(window, cx);
+                                        });
+                                    }),
+                                )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .child(app_status_tag(status, color)),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "gateway-peer-revoke-{identity}"
+                                    )))
+                                    .ghost()
+                                    .small()
+                                    .flex_none()
+                                    .icon(Icon::empty().path(icons::ban_icon_path()))
+                                    .accessibility_label("Revoke pairing")
+                                    .tooltip("Revoke pairing")
+                                    .disabled(disabled)
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            revoke_gateway_peer(&revoke_root, peer_id, window, cx);
+                                        },
+                                    ),
                                 ),
-                            ),
-                    )
-                    .child(
-                        app_muted_text(detail)
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.0))
-                            .line_height(px(17.0)),
-                    )
-                    .context_menu(move |menu, _window, cx| {
-                        gateway_peer_menu(menu, &menu_target, cx)
-                    }),
-            );
+                        )
+                        .child(
+                            app_muted_text(detail)
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0)),
+                        )
+                        .context_menu(move |menu, _window, cx| {
+                            gateway_peer_menu(menu, &menu_target, cx)
+                        }),
+                );
             if index + 1 < peer_count {
                 peers_content = peers_content.child(Separator::horizontal());
             }

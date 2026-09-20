@@ -1,4 +1,4 @@
-//! Addresses to open in a browser to install the extension from the gateway.
+//! Addresses to open in a browser to install or update the extension from the gateway.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::{Rc, Weak};
 
@@ -120,7 +120,7 @@ impl WalletRoot {
                 .flex_col()
                 .gap_3()
                 .child(app_muted_text(
-                    "Open this address in the browser you want to pair.",
+                    "Open this address in the browser you want to pair or update. Installing the bundled extension over an existing one keeps its pairing.",
                 ))
                 .child(address_rows)
                 .when(loading, |this| {
@@ -144,7 +144,7 @@ impl WalletRoot {
                         .child(
                             Icon::new(crate::assets::RailgunSidebarIcon::BrowserExtensions).small(),
                         )
-                        .child(app_strong_text("Install browser extension")),
+                        .child(app_strong_text("Install or update browser extension")),
                 )
                 .on_ok(move |_, window, cx| {
                     if let Some(url) =
