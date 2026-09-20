@@ -370,6 +370,7 @@ pub struct WakuSettings {
     pub shard_id: u32,
     pub dns_enr_trees: Option<Vec<String>>,
     pub direct_peers: Option<Vec<WakuDirectPeerSetting>>,
+    pub backup_peers: Option<Vec<WakuDirectPeerSetting>>,
     pub doh_endpoint: Option<String>,
     pub doh_fallback_endpoints: Option<Vec<String>>,
     pub max_peers: usize,
@@ -477,6 +478,7 @@ impl Default for WakuSettings {
             shard_id: DEFAULT_WAKU_SHARD_ID,
             dns_enr_trees: None,
             direct_peers: None,
+            backup_peers: None,
             doh_endpoint: None,
             doh_fallback_endpoints: None,
             max_peers: DEFAULT_WAKU_MAX_PEERS,
@@ -493,9 +495,12 @@ impl WakuSettings {
                 validate_enr_tree(&format!("waku.dns_enr_trees[{index}]"), tree, errors);
             }
         }
-        if let Some(direct_peers) = self.direct_peers.as_deref() {
-            for (index, peer) in direct_peers.iter().enumerate() {
-                validate_waku_direct_peer(index, peer, errors);
+        for (field, peers) in [
+            ("waku.direct_peers", self.direct_peers.as_deref()),
+            ("waku.backup_peers", self.backup_peers.as_deref()),
+        ] {
+            for (index, peer) in peers.unwrap_or_default().iter().enumerate() {
+                validate_waku_direct_peer(field, index, peer, errors);
             }
         }
         if let Some(doh_endpoint) = self.doh_endpoint.as_deref() {

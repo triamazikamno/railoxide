@@ -1295,23 +1295,25 @@ impl WalletSettingsEditor {
         .layout(Axis::Vertical)
     }
 
-    pub(in crate::root) fn open_waku_direct_peer_dialog(
+    pub(in crate::root) fn open_waku_peer_dialog(
         &self,
+        kind: WakuPeerList,
         index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let initial = index
-            .and_then(|index| display_waku_direct_peers(&self.draft).get(index).cloned())
+            .and_then(|index| kind.peers(&self.draft).get(index).cloned())
             .unwrap_or_default();
         let inputs = WakuDirectPeerDialogInputs {
             peer_id: cx.new(|cx| InputState::new(window, cx).default_value(initial.peer_id)),
             addr: cx.new(|cx| InputState::new(window, cx).default_value(initial.addr)),
         };
-        let title = if index.is_some() {
-            "Edit direct peer"
-        } else {
-            "Add direct peer"
+        let title = match (kind, index.is_some()) {
+            (WakuPeerList::Direct, true) => "Edit direct peer",
+            (WakuPeerList::Direct, false) => "Add direct peer",
+            (WakuPeerList::Backup, true) => "Edit backup peer",
+            (WakuPeerList::Backup, false) => "Add backup peer",
         };
         let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
@@ -1332,8 +1334,8 @@ impl WalletSettingsEditor {
                     let peer = waku_direct_peer_from_dialog_inputs(&save_inputs, cx);
                     save_editor.update(cx, |editor, cx| {
                         match index {
-                            Some(index) => set_waku_direct_peer(&mut editor.draft, index, peer),
-                            None => add_waku_direct_peer(&mut editor.draft, peer),
+                            Some(index) => set_waku_peer(&mut editor.draft, kind, index, peer),
+                            None => add_waku_peer(&mut editor.draft, kind, peer),
                         }
                         editor.programmatic_draft_changed(cx);
                     });
@@ -1350,21 +1352,23 @@ impl WalletSettingsEditor {
         });
     }
 
-    pub(in crate::root) fn render_waku_direct_peer_list(
+    pub(in crate::root) fn render_waku_peer_list(
         editor: &Entity<Self>,
+        kind: WakuPeerList,
         peers: Vec<WakuDirectPeerSetting>,
     ) -> gpui::Div {
         let add_editor = editor.clone();
+        let kind_id = kind.id();
         let body = div().w_full().flex().flex_col().gap_2().child(
             div().flex().justify_end().child(
                 settings_icon_button(
-                    "wallet-settings-waku-direct-peer-add",
+                    SharedString::from(format!("wallet-settings-waku-{kind_id}-peer-add")),
                     IconName::Plus,
                     "Add",
                 )
                 .on_click(move |_event, window, cx| {
                     add_editor.update(cx, |editor, cx| {
-                        editor.open_waku_direct_peer_dialog(None, window, cx);
+                        editor.open_waku_peer_dialog(kind, None, window, cx);
                     });
                 }),
             ),
@@ -1373,7 +1377,11 @@ impl WalletSettingsEditor {
         let peer_count = peers.len();
         let mut list = div().w_full().flex().flex_col();
         if peers.is_empty() {
-            list = list.child(app_muted_text("No additional direct peers configured.").py(px(8.0)));
+            let message = match kind {
+                WakuPeerList::Direct => "No additional direct peers configured.",
+                WakuPeerList::Backup => "No backup peers configured.",
+            };
+            list = list.child(app_muted_text(message).py_2());
         }
         for (index, peer) in peers.into_iter().enumerate() {
             let edit_editor = editor.clone();
@@ -1381,7 +1389,7 @@ impl WalletSettingsEditor {
             list = list.child(
                 div()
                     .id(SharedString::from(format!(
-                        "wallet-settings-waku-direct-peer-row-{index}"
+                        "wallet-settings-waku-{kind_id}-peer-row-{index}"
                     )))
                     .flex()
                     .items_center()
@@ -1428,7 +1436,7 @@ impl WalletSettingsEditor {
                             .child(
                                 settings_icon_button(
                                     SharedString::from(format!(
-                                        "wallet-settings-waku-direct-peer-edit-{index}"
+                                        "wallet-settings-waku-{kind_id}-peer-edit-{index}"
                                     )),
                                     Icon::new(RailgunActionIcon::Pencil),
                                     "Edit",
@@ -1436,7 +1444,8 @@ impl WalletSettingsEditor {
                                 .on_click(
                                     move |_event, window, cx| {
                                         edit_editor.update(cx, |editor, cx| {
-                                            editor.open_waku_direct_peer_dialog(
+                                            editor.open_waku_peer_dialog(
+                                                kind,
                                                 Some(index),
                                                 window,
                                                 cx,
@@ -1448,7 +1457,7 @@ impl WalletSettingsEditor {
                             .child(
                                 settings_danger_icon_button(
                                     SharedString::from(format!(
-                                        "wallet-settings-waku-direct-peer-remove-{index}"
+                                        "wallet-settings-waku-{kind_id}-peer-remove-{index}"
                                     )),
                                     Icon::new(RailgunActionIcon::Trash2),
                                     "Remove",
@@ -1456,7 +1465,7 @@ impl WalletSettingsEditor {
                                 .on_click(
                                     move |_event, _window, cx| {
                                         remove_editor.update(cx, |editor, cx| {
-                                            remove_waku_direct_peer(&mut editor.draft, index);
+                                            remove_waku_peer(&mut editor.draft, kind, index);
                                             editor.programmatic_draft_changed(cx);
                                         });
                                     },
@@ -1468,19 +1477,28 @@ impl WalletSettingsEditor {
         body.child(list)
     }
 
-    pub(in crate::root) fn waku_direct_peer_list_item(
+    pub(in crate::root) fn waku_peer_list_item(
         editor: Entity<Self>,
+        kind: WakuPeerList,
         peers: Vec<WakuDirectPeerSetting>,
     ) -> SettingItem {
+        let (title, description) = match kind {
+            WakuPeerList::Direct => (
+                "Direct peers",
+                "Additional peers available immediately, using the selected network mode.",
+            ),
+            WakuPeerList::Backup => (
+                "Backup peers",
+                "Added after 60 seconds without a connection, then reconnected normally. Discovery can find these peers earlier.",
+            ),
+        };
         SettingItem::new(
-            "Direct peers",
+            title,
             SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                Self::render_waku_direct_peer_list(&editor, peers.clone())
+                Self::render_waku_peer_list(&editor, kind, peers.clone())
             }),
         )
-        .description(
-            "Additional libp2p peers to dial directly. Each row is one peer ID and one multiaddr.",
-        )
+        .description(description)
         .layout(Axis::Vertical)
     }
 

@@ -1,6 +1,6 @@
 use super::{
-    Address, BTreeMap, ChainContractSettings, ChainGasSettings, DEFAULT_WAKU_DIRECT_PEER_ADDR,
-    DEFAULT_WAKU_DIRECT_PEER_ID, EffectiveChainConfig, EffectiveChainGasSettings,
+    Address, BTreeMap, ChainContractSettings, ChainGasSettings, DEFAULT_WAKU_BACKUP_PEER_ADDR,
+    DEFAULT_WAKU_BACKUP_PEER_ID, EffectiveChainConfig, EffectiveChainGasSettings,
     EffectiveTokenInfo, EffectiveTokenRegistry, FromStr, PriceAnchorSettings, RAILGUN_TREE,
     SensitiveUrl, TokenAnchorSource, TokenKey, TokenPriceAnchorOverride, Url,
     WakuDirectPeerSetting, WalletSettings, WalletSettingsValidationError,
@@ -392,10 +392,15 @@ pub fn default_waku_dns_enr_trees() -> Vec<String> {
 }
 
 #[must_use]
-pub fn default_waku_direct_peers() -> Vec<WakuDirectPeerSetting> {
+pub const fn default_waku_direct_peers() -> Vec<WakuDirectPeerSetting> {
+    Vec::new()
+}
+
+#[must_use]
+pub fn default_waku_backup_peers() -> Vec<WakuDirectPeerSetting> {
     vec![WakuDirectPeerSetting {
-        peer_id: DEFAULT_WAKU_DIRECT_PEER_ID.to_string(),
-        addr: DEFAULT_WAKU_DIRECT_PEER_ADDR.to_string(),
+        peer_id: DEFAULT_WAKU_BACKUP_PEER_ID.to_string(),
+        addr: DEFAULT_WAKU_BACKUP_PEER_ADDR.to_string(),
     }]
 }
 

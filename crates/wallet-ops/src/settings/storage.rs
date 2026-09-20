@@ -203,12 +203,12 @@ fn decode_wallet_settings_with_migration(
         6
     }
     let version: Version = rmp_serde::from_slice(data)?;
-    match version.version {
+    let (mut settings, migrated) = match version.version {
         WALLET_SETTINGS_VERSION => Ok((rmp_serde::from_slice(data)?, None)),
-        7 => {
+        7..=8 => {
             let mut settings: WalletSettings = rmp_serde::from_slice(data)?;
             settings.version = WALLET_SETTINGS_VERSION;
-            Ok((settings, Some(7)))
+            Ok((settings, Some(version.version)))
         }
         1..=6 => {
             let mut legacy: super::legacy::LegacyWalletSettings = rmp_serde::from_slice(data)?;
@@ -221,7 +221,19 @@ fn decode_wallet_settings_with_migration(
             Ok((legacy.into(), Some(version.version)))
         }
         version => Err(WalletSettingsError::UnsupportedVersion { version }),
+    }?;
+    if migrated.is_some() {
+        settings.waku.backup_peers = settings.waku.direct_peers.as_ref().map(|_| Vec::new());
+        // Freeze the released default so future endpoint changes cannot change this migration.
+        if let Some([peer]) = settings.waku.direct_peers.as_deref()
+            && peer.peer_id == "16Uiu2HAkwhijhoc4UxAJD4fmYgSX91FzSDqehAaxJogYFcyo736a"
+            && peer.addr == "/dns4/baaamooobaaa.mooo.com/tcp/8000/wss"
+        {
+            settings.waku.backup_peers = Some(vec![peer.clone()]);
+            settings.waku.direct_peers = None;
+        }
     }
+    Ok((settings, migrated))
 }
 
 pub fn encode_wallet_ui_state(state: &WalletUiState) -> Result<Vec<u8>, WalletUiStateError> {

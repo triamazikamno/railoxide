@@ -26,6 +26,7 @@ pub struct WakuMonitorConfig {
     pub shard_id: Option<u32>,
     pub dns_enr_trees: Option<Vec<String>>,
     pub direct_peers: Vec<WakuMonitorDirectPeer>,
+    pub backup_peers: Vec<WakuMonitorDirectPeer>,
     pub doh_endpoint: Option<String>,
     pub doh_fallback_endpoints: Option<Vec<String>>,
     pub max_peers: Option<usize>,
@@ -56,6 +57,7 @@ impl WakuMonitorConfig {
         ClientConfig {
             nwaku_url: self.nwaku_url.clone(),
             direct_peers: grouped_direct_peers(&self.direct_peers),
+            backup_peers: grouped_direct_peers(&self.backup_peers),
             dns_enr_trees: self.dns_enr_trees.clone(),
             doh_endpoint: Some(doh),
             doh_fallback_endpoints: self.doh_fallback_endpoints.clone(),
@@ -560,6 +562,13 @@ mod tests {
                     addr: format!("/dns4/example.invalid/tcp/8000/wss/p2p/{PEER_ID}"),
                 },
             ],
+            backup_peers: vec![
+                WakuMonitorDirectPeer {
+                    peer_id: PEER_ID.to_string(),
+                    addr: "/dns4/backup.example.invalid/tcp/8000/wss".to_string(),
+                };
+                2
+            ],
             max_peers: Some(42),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             doh_fallback_endpoints: Some(vec![
@@ -580,6 +589,17 @@ mod tests {
         assert_eq!(cfg.direct_peers.len(), 1);
         assert_eq!(cfg.direct_peers[0].peer_id, PEER_ID);
         assert_eq!(cfg.direct_peers[0].addrs.len(), 2);
+        assert_eq!(cfg.backup_peers.len(), 1);
+        assert_eq!(cfg.backup_peers[0].peer_id, PEER_ID);
+        assert_eq!(
+            cfg.backup_peers[0].addrs,
+            vec!["/dns4/backup.example.invalid/tcp/8000/wss"]
+        );
+        assert!(
+            !cfg.direct_peers[0]
+                .addrs
+                .contains(&cfg.backup_peers[0].addrs[0])
+        );
         assert_eq!(
             cfg.doh_endpoint.as_deref(),
             Some("https://example.invalid/dns-query")

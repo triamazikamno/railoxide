@@ -42,7 +42,7 @@ use wallet_ops::{
         IndexedArtifactSourceModeSetting, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WakuDirectPeerSetting,
         WalletSettings, build_effective_chain_configs, build_effective_token_registry,
-        default_token_price_anchor_overrides, default_waku_direct_peers,
+        default_token_price_anchor_overrides, default_waku_backup_peers, default_waku_direct_peers,
         default_waku_dns_enr_trees,
     },
     vault::DesktopVaultStore,

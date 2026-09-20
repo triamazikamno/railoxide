@@ -26,8 +26,9 @@ use wallet_ops::{
     build_wallet_network_context_with_progress, request_tor_state_reset,
     settings::{
         EffectiveChainRegistry, EffectiveTokenRegistry, WalletSettings,
-        build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
-        load_wallet_settings, load_wallet_ui_state, save_wallet_settings,
+        build_effective_chain_configs, build_effective_token_registry, default_waku_backup_peers,
+        default_waku_direct_peers, load_wallet_settings, load_wallet_ui_state,
+        save_wallet_settings,
     },
     spawn_token_anchor_refresh_worker,
     vault::DesktopVaultStore,
@@ -1110,6 +1111,17 @@ async fn build_wallet_startup(
             .direct_peers
             .clone()
             .unwrap_or_else(default_waku_direct_peers)
+            .iter()
+            .map(|peer| WakuMonitorDirectPeer {
+                peer_id: peer.peer_id.clone(),
+                addr: peer.addr.clone(),
+            })
+            .collect(),
+        backup_peers: settings
+            .waku
+            .backup_peers
+            .clone()
+            .unwrap_or_else(default_waku_backup_peers)
             .iter()
             .map(|peer| WakuMonitorDirectPeer {
                 peer_id: peer.peer_id.clone(),

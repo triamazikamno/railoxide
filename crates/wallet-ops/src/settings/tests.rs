@@ -2758,37 +2758,39 @@ fn waku_dns_enr_trees_validate_scheme() {
 }
 
 #[test]
-fn default_waku_direct_peer_is_valid() {
-    let peers = super::default_waku_direct_peers();
+fn default_waku_backup_peer_is_valid() {
+    let peers = super::default_waku_backup_peers();
     assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].peer_id, super::DEFAULT_WAKU_DIRECT_PEER_ID);
-    assert_eq!(peers[0].addr, super::DEFAULT_WAKU_DIRECT_PEER_ADDR);
+    assert_eq!(peers[0].peer_id, super::DEFAULT_WAKU_BACKUP_PEER_ID);
+    assert_eq!(peers[0].addr, super::DEFAULT_WAKU_BACKUP_PEER_ADDR);
 
     let mut settings = WalletSettings::default();
-    settings.waku.direct_peers = Some(peers);
-    settings.validate().expect("default direct peer is valid");
+    settings.waku.backup_peers = Some(peers);
+    settings.validate().expect("default backup peer is valid");
 }
 
 #[test]
-fn waku_direct_peers_validate_peer_id_and_multiaddr() {
-    let mut settings = WalletSettings::default();
-    settings.waku.direct_peers = Some(vec![WakuDirectPeerSetting {
-        peer_id: "not-a-peer-id".to_string(),
-        addr: "not-a-multiaddr".to_string(),
-    }]);
-
-    let err = settings.validate().expect_err("bad direct peer rejected");
-
-    assert!(
-        err.messages
-            .iter()
-            .any(|message| message.contains("waku.direct_peers[0].peer_id"))
-    );
-    assert!(
-        err.messages
-            .iter()
-            .any(|message| message.contains("waku.direct_peers[0].addr"))
-    );
+fn waku_peers_validate_peer_id_and_multiaddr() {
+    for field in ["direct_peers", "backup_peers"] {
+        let mut settings = WalletSettings::default();
+        let peers = Some(vec![WakuDirectPeerSetting {
+            peer_id: "not-a-peer-id".to_string(),
+            addr: "not-a-multiaddr".to_string(),
+        }]);
+        if field == "direct_peers" {
+            settings.waku.direct_peers = peers;
+        } else {
+            settings.waku.backup_peers = peers;
+        }
+        let err = settings.validate().expect_err("bad peer rejected");
+        for member in ["peer_id", "addr"] {
+            assert!(
+                err.messages
+                    .iter()
+                    .any(|message| message.contains(&format!("waku.{field}[0].{member}")))
+            );
+        }
+    }
 }
 
 #[test]
@@ -2813,6 +2815,93 @@ fn encoded_settings_decode_without_db() {
     let data = encode_wallet_settings(&settings).expect("encode settings");
     let decoded = decode_wallet_settings(&data).expect("decode settings");
     assert_eq!(decoded, settings);
+}
+
+#[test]
+fn released_waku_peer_choices_migrate_and_stay_independent_on_reload() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    // Frozen released default: migration must still recognize it if future defaults change.
+    let old_default = vec![super::WakuDirectPeerSetting {
+        peer_id: "16Uiu2HAkwhijhoc4UxAJD4fmYgSX91FzSDqehAaxJogYFcyo736a".into(),
+        addr: "/dns4/baaamooobaaa.mooo.com/tcp/8000/wss".into(),
+    }];
+    let mut custom = old_default.clone();
+    custom[0].addr = "/dns4/custom.example/tcp/8000/wss".into();
+    let choices = [
+        None,
+        Some(Vec::new()),
+        Some(old_default.clone()),
+        Some(custom.clone()),
+        Some([old_default.clone(), custom.clone()].concat()),
+    ];
+    // No version means released v6. Exercise both legacy conversion branches and absent/null fields.
+    for version in 0..=8 {
+        for direct in &choices {
+            for omit_direct in [false, true] {
+                if omit_direct && direct.is_some() {
+                    continue;
+                }
+                let mut wire = json!({
+                    "version": version,
+                    "runtime": { "public_balance_refresh_interval_secs": 47 },
+                    "waku": { "direct_peers": direct, "max_peers": 7 }
+                });
+                if version == 0 {
+                    wire.as_object_mut().unwrap().remove("version");
+                }
+                if omit_direct {
+                    wire["waku"].as_object_mut().unwrap().remove("direct_peers");
+                }
+                let payload = rmp_serde::to_vec_named(&wire).unwrap();
+                store
+                    .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+                    .unwrap();
+
+                let migrated = load_wallet_settings(&store).unwrap();
+                if direct.as_ref() == Some(&old_default) {
+                    assert_eq!(migrated.waku.direct_peers, None);
+                    assert_eq!(migrated.waku.backup_peers, Some(old_default.clone()));
+                } else {
+                    assert_eq!(&migrated.waku.direct_peers, direct);
+                    assert_eq!(
+                        migrated.waku.backup_peers,
+                        direct.as_ref().map(|_| Vec::new())
+                    );
+                }
+                assert_eq!(migrated.runtime.public_balance_refresh_interval_secs, 47);
+                assert_eq!(migrated.waku.max_peers, 7);
+                let persisted = store
+                    .get_app_settings_record(WALLET_SETTINGS_KEY)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(persisted, payload);
+                assert_eq!(load_wallet_settings(&store).unwrap(), migrated);
+                assert_eq!(
+                    store
+                        .get_app_settings_record(WALLET_SETTINGS_KEY)
+                        .unwrap()
+                        .unwrap(),
+                    persisted
+                );
+            }
+        }
+    }
+    // Current records honor each list independently, including an explicit opt-out.
+    for direct in choices {
+        for backup in [None, Some(Vec::new()), Some(custom.clone())] {
+            let mut saved = WalletSettings::default();
+            saved.waku.direct_peers = direct.clone();
+            saved.waku.backup_peers = backup;
+            save_wallet_settings(&store, &saved).unwrap();
+            assert_eq!(load_wallet_settings(&store).unwrap(), saved);
+        }
+    }
+    drop(store);
+    fs::remove_dir_all(root_dir).unwrap();
 }
 
 pub(super) fn custom_evm_chain() -> super::CustomChainSettings {
@@ -3139,9 +3228,12 @@ fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
                 rate: "123456".into(),
             }),
         });
+    expected.waku.direct_peers = Some(Vec::new());
+    expected.waku.backup_peers = Some(Vec::new());
     // Default choices are omitted, producing the released v7 field shape.
     let mut released = expected.clone();
     released.version = 7;
+    released.waku.backup_peers = None;
     let payload = rmp_serde::to_vec_named(&released).unwrap();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),

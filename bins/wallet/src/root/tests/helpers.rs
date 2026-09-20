@@ -19,9 +19,8 @@ pub(super) use wallet_ops::{
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
-        WakuDirectPeerSetting, WalletSettings, build_effective_chain_configs,
-        build_effective_token_registry, default_waku_direct_peers, default_waku_dns_enr_trees,
-        encode_wallet_settings,
+        WalletSettings, build_effective_chain_configs, build_effective_token_registry,
+        default_waku_dns_enr_trees, encode_wallet_settings,
     },
     vault::{
         PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletMetadataBundle,

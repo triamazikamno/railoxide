@@ -53,6 +53,7 @@ pub(super) fn validate_enr_tree(field: &str, value: &str, errors: &mut Vec<Strin
 }
 
 pub(super) fn validate_waku_direct_peer(
+    field: &str,
     index: usize,
     peer: &WakuDirectPeerSetting,
     errors: &mut Vec<String>,
@@ -60,19 +61,17 @@ pub(super) fn validate_waku_direct_peer(
     let peer_id = peer.peer_id.trim();
     let addr = peer.addr.trim();
     if peer_id.is_empty() {
-        errors.push(format!(
-            "waku.direct_peers[{index}].peer_id must not be empty"
-        ));
+        errors.push(format!("{field}[{index}].peer_id must not be empty"));
     } else if parse_peer_id(peer_id).is_err() {
         errors.push(format!(
-            "waku.direct_peers[{index}].peer_id must be a valid libp2p peer ID"
+            "{field}[{index}].peer_id must be a valid libp2p peer ID"
         ));
     }
     if addr.is_empty() {
-        errors.push(format!("waku.direct_peers[{index}].addr must not be empty"));
+        errors.push(format!("{field}[{index}].addr must not be empty"));
     } else if parse_multiaddr(addr).is_err() {
         errors.push(format!(
-            "waku.direct_peers[{index}].addr must be a valid libp2p multiaddr"
+            "{field}[{index}].addr must be a valid libp2p multiaddr"
         ));
     }
 }

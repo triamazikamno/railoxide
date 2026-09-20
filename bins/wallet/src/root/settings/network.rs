@@ -33,14 +33,41 @@ pub(in crate::root) fn display_waku_dns_enr_trees(settings: &WalletSettings) -> 
         .unwrap_or_else(default_waku_dns_enr_trees)
 }
 
-pub(in crate::root) fn display_waku_direct_peers(
-    settings: &WalletSettings,
-) -> Vec<WakuDirectPeerSetting> {
-    settings
-        .waku
-        .direct_peers
-        .clone()
-        .unwrap_or_else(default_waku_direct_peers)
+impl WakuPeerList {
+    pub(in crate::root) const fn id(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Backup => "backup",
+        }
+    }
+
+    pub(in crate::root) fn peers(self, settings: &WalletSettings) -> Vec<WakuDirectPeerSetting> {
+        match self {
+            Self::Direct => settings
+                .waku
+                .direct_peers
+                .clone()
+                .unwrap_or_else(default_waku_direct_peers),
+            Self::Backup => settings
+                .waku
+                .backup_peers
+                .clone()
+                .unwrap_or_else(default_waku_backup_peers),
+        }
+    }
+
+    fn peers_mut(self, settings: &mut WalletSettings) -> &mut Vec<WakuDirectPeerSetting> {
+        match self {
+            Self::Direct => settings
+                .waku
+                .direct_peers
+                .get_or_insert_with(default_waku_direct_peers),
+            Self::Backup => settings
+                .waku
+                .backup_peers
+                .get_or_insert_with(default_waku_backup_peers),
+        }
+    }
 }
 
 pub(in crate::root) fn default_waku_doh_fallback_endpoints(
@@ -77,19 +104,6 @@ pub(in crate::root) fn materialize_waku_dns_enr_trees(
         .dns_enr_trees
         .as_mut()
         .expect("DNS ENR trees were just initialized")
-}
-
-pub(in crate::root) fn materialize_waku_direct_peers(
-    settings: &mut WalletSettings,
-) -> &mut Vec<WakuDirectPeerSetting> {
-    if settings.waku.direct_peers.is_none() {
-        settings.waku.direct_peers = Some(default_waku_direct_peers());
-    }
-    settings
-        .waku
-        .direct_peers
-        .as_mut()
-        .expect("direct peers were just initialized")
 }
 
 pub(in crate::root) fn set_waku_doh_fallback_endpoint(
@@ -141,27 +155,33 @@ pub(in crate::root) fn remove_waku_dns_enr_tree(settings: &mut WalletSettings, i
     }
 }
 
-pub(in crate::root) fn set_waku_direct_peer(
+pub(in crate::root) fn set_waku_peer(
     settings: &mut WalletSettings,
+    kind: WakuPeerList,
     index: usize,
     peer: WakuDirectPeerSetting,
 ) {
-    let peers = materialize_waku_direct_peers(settings);
+    let peers = kind.peers_mut(settings);
     if peers.len() <= index {
         peers.resize(index + 1, WakuDirectPeerSetting::default());
     }
     peers[index] = peer;
 }
 
-pub(in crate::root) fn add_waku_direct_peer(
+pub(in crate::root) fn add_waku_peer(
     settings: &mut WalletSettings,
+    kind: WakuPeerList,
     peer: WakuDirectPeerSetting,
 ) {
-    materialize_waku_direct_peers(settings).push(peer);
+    kind.peers_mut(settings).push(peer);
 }
 
-pub(in crate::root) fn remove_waku_direct_peer(settings: &mut WalletSettings, index: usize) {
-    let peers = materialize_waku_direct_peers(settings);
+pub(in crate::root) fn remove_waku_peer(
+    settings: &mut WalletSettings,
+    kind: WakuPeerList,
+    index: usize,
+) {
+    let peers = kind.peers_mut(settings);
     if index < peers.len() {
         peers.remove(index);
     }

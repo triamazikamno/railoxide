@@ -609,35 +609,32 @@ fn waku_dns_enr_tree_settings_display_presets_until_customized() {
 }
 
 #[test]
-fn waku_direct_peer_settings_mutations_update_rows() {
+fn waku_peer_mutations_keep_lists_separate_and_preserve_opt_out() {
+    use crate::root::settings::{add_waku_peer, remove_waku_peer, set_waku_peer};
+
     let mut settings = WalletSettings::default();
-    assert_eq!(
-        display_waku_direct_peers(&settings),
-        default_waku_direct_peers()
+    let backup = wallet_ops::settings::default_waku_backup_peers().remove(0);
+    let mut direct = backup.clone();
+    direct.addr = "/dns4/direct.example/tcp/8000/wss".into();
+
+    add_waku_peer(&mut settings, WakuPeerList::Direct, direct.clone());
+    assert_eq!(WakuPeerList::Backup.peers(&settings), vec![backup.clone()]);
+
+    let mut edited_backup = backup;
+    edited_backup.addr = "/dns4/backup.example/tcp/8000/wss".into();
+    set_waku_peer(
+        &mut settings,
+        WakuPeerList::Backup,
+        0,
+        edited_backup.clone(),
     );
-    assert!(settings.waku.direct_peers.is_none());
+    assert_eq!(WakuPeerList::Backup.peers(&settings), vec![edited_backup]);
+    assert_eq!(WakuPeerList::Direct.peers(&settings), vec![direct.clone()]);
 
-    remove_waku_direct_peer(&mut settings, 0);
-    assert_eq!(settings.waku.direct_peers, Some(Vec::new()));
-    assert!(display_waku_direct_peers(&settings).is_empty());
-
-    let first = WakuDirectPeerSetting {
-        peer_id: "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
-        addr: "/dns4/prod.rootedinprivacy.com/tcp/30304/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
-    };
-    let edited = WakuDirectPeerSetting {
-        peer_id: first.peer_id.clone(),
-        addr: "/dns4/prod.rootedinprivacy.com/tcp/8000/wss/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
-    };
-
-    add_waku_direct_peer(&mut settings, first);
-    assert_eq!(display_waku_direct_peers(&settings).len(), 1);
-
-    set_waku_direct_peer(&mut settings, 0, edited.clone());
-    assert_eq!(settings.waku.direct_peers, Some(vec![edited]));
-
-    remove_waku_direct_peer(&mut settings, 0);
-    assert_eq!(settings.waku.direct_peers, Some(Vec::new()));
+    remove_waku_peer(&mut settings, WakuPeerList::Backup, 0);
+    assert_eq!(settings.waku.backup_peers, Some(Vec::new()));
+    assert!(WakuPeerList::Backup.peers(&settings).is_empty());
+    assert_eq!(WakuPeerList::Direct.peers(&settings), vec![direct]);
 }
 
 #[test]

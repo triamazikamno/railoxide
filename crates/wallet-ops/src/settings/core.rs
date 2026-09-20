@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 8;
+pub const WALLET_SETTINGS_VERSION: u32 = 9;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 4;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
@@ -23,9 +23,9 @@ pub const DEFAULT_WAKU_SHARD_ID: u32 = 1;
 pub const DEFAULT_WAKU_MAX_PEERS: usize = 10;
 pub const DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PUBLIC_BROADCASTER_RESPONSE_TIMEOUT_SECS: u64 = 120;
-pub const DEFAULT_WAKU_DIRECT_PEER_ID: &str =
+pub const DEFAULT_WAKU_BACKUP_PEER_ID: &str =
     "16Uiu2HAkwhijhoc4UxAJD4fmYgSX91FzSDqehAaxJogYFcyo736a";
-pub const DEFAULT_WAKU_DIRECT_PEER_ADDR: &str = "/dns4/baaamooobaaa.mooo.com/tcp/8000/wss";
+pub const DEFAULT_WAKU_BACKUP_PEER_ADDR: &str = "/dns4/baaamooobaaa.mooo.com/tcp/8000/wss";
 
 pub(super) const MAX_FINALITY_DEPTH: u64 = 1_000_000;
 pub(super) const MAX_BLOCK_RANGE: u64 = 5_000_000;

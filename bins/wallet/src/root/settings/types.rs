@@ -308,6 +308,12 @@ pub(in crate::root) struct TokenDialogInputs {
     pub(in crate::root) icon_path: Entity<InputState>,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::root) enum WakuPeerList {
+    Direct,
+    Backup,
+}
+
 #[derive(Clone)]
 pub(in crate::root) struct WakuDirectPeerDialogInputs {
     pub(in crate::root) peer_id: Entity<InputState>,

@@ -290,8 +290,10 @@ impl Render for WalletSettingsEditor {
         let waku_dns_enr_kind = SettingsUrlListKind::WakuDnsEnrTree;
         let waku_dns_enr_trees = waku_dns_enr_kind.endpoints(&self.draft);
         let waku_dns_enr_editor = editor.clone();
-        let waku_direct_peers = display_waku_direct_peers(&self.draft);
+        let waku_direct_peers = WakuPeerList::Direct.peers(&self.draft);
         let waku_direct_peers_editor = editor.clone();
+        let waku_backup_peers = WakuPeerList::Backup.peers(&self.draft);
+        let waku_backup_peers_editor = editor.clone();
         let waku_doh_fallback_kind = SettingsUrlListKind::WakuDohFallback;
         let waku_doh_fallback_endpoints = waku_doh_fallback_kind.endpoints(&self.draft);
         let waku_doh_fallback_editor = editor.clone();
@@ -500,9 +502,15 @@ impl Render for WalletSettingsEditor {
                         waku_dns_enr_kind,
                         waku_dns_enr_trees,
                     ))
-                    .item(Self::waku_direct_peer_list_item(
+                    .item(Self::waku_peer_list_item(
                         waku_direct_peers_editor,
+                        WakuPeerList::Direct,
                         waku_direct_peers,
+                    ))
+                    .item(Self::waku_peer_list_item(
+                        waku_backup_peers_editor,
+                        WakuPeerList::Backup,
+                        waku_backup_peers,
                     ))
                     .item(SettingItem::new("DoH endpoint", waku_doh).layout(Axis::Vertical))
                     .item(Self::settings_url_list_item(
