@@ -284,6 +284,10 @@ impl Actor {
         RouteLoad::from(submission).exceeds(submission.route())
     }
     pub(super) fn any_threshold_reached(&self) -> bool {
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "route equality and hashing exclude the endpoint verification cache"
+        )]
         let mut loads = HashMap::<&RpcRoute, RouteLoad>::new();
         for pending in &self.pending {
             let route = pending.submission.route();

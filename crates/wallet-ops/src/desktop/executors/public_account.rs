@@ -125,7 +125,12 @@ impl ExecutorOwner {
             // Never trust a previous session's completion or an observation that
             // may have been reorganized away. No local payload means no scan.
             let mut chain = self.chain.clone();
-            chain.relay_adapt_7702_contract = record.delegate().to_string();
+            chain
+                .railgun
+                .as_mut()
+                .ok_or_else(|| eyre!("chain does not support Railgun"))?
+                .deployment
+                .relay_adapt_7702_contract = record.delegate();
             chain.enabled = true;
             let (inspection, nonce) = self
                 .while_active(inspect_for_recovery_signing(

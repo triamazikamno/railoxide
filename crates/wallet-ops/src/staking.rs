@@ -202,7 +202,7 @@ pub fn validate_deployment_relationships(
 /// Validate both contract relationships before exposing staking actions.
 pub async fn validate_deployment(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> std::result::Result<(), DeploymentValidationError> {
     let contracts = governance_contracts(chain_id)
@@ -247,7 +247,7 @@ pub async fn validate_deployment(
 
 pub async fn validate_governance_deployment(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> std::result::Result<(), DeploymentValidationError> {
     validate_deployment(chain_id, effective_chain, http).await
@@ -255,7 +255,7 @@ pub async fn validate_governance_deployment(
 
 pub async fn fetch_staking_global_metrics(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Option<StakingGlobalMetrics>> {
     let Some(contracts) = governance_contracts(chain_id) else {
@@ -341,7 +341,7 @@ pub async fn fetch_staking_global_metrics(
 pub async fn fetch_governance_token_balance_allowance(
     chain_id: u64,
     actor: Address,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Option<(U256, U256)>> {
     let Some(contracts) = governance_contracts(chain_id) else {
@@ -395,7 +395,7 @@ pub async fn fetch_account_stakes(
     chain_id: u64,
     accounts: &[Address],
     chain_time: U256,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<AccountStakeResult>> {
@@ -600,7 +600,7 @@ pub fn reward_staking_interval(distribution_interval: U256, multiplier: U256) ->
 pub async fn fetch_account_snapshots(
     chain_id: u64,
     account: Address,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<AccountSnapshot>> {
@@ -621,7 +621,7 @@ pub async fn fetch_account_snapshots(
 pub async fn fetch_account_snapshots_multi(
     chain_id: u64,
     accounts: &[Address],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<AccountSnapshotsResult>> {
@@ -783,7 +783,7 @@ async fn fetch_chain_time(pool: &QueryRpcPool) -> Result<U256> {
 
 fn provider_for_chain(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;

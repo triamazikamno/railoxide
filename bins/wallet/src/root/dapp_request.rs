@@ -12,10 +12,15 @@ use wallet_ops::{
 };
 
 #[derive(Clone)]
-pub(super) struct DappRequestBinding {
+pub(super) struct DappRequestAccount {
     pub(super) public_account_uuid: String,
     pub(super) public_account_scope: PublicAccountScope,
     pub(super) owning_private_wallet_uuid: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct DappRequestBinding {
+    pub(super) account: Option<DappRequestAccount>,
     pub(super) peer_name: String,
     pub(super) peer_url: String,
 }
@@ -34,7 +39,7 @@ pub(super) struct DappRequestUi {
     pub(super) session_identity: DappSessionIdentity,
     pub(super) parsed: WalletConnectParsedRequest,
     pub(super) item: WalletConnectPendingRequest,
-    pub(super) account_source: PublicAccountSource,
+    pub(super) account_source: Option<PublicAccountSource>,
     pub(super) request_control: Option<DappRequestControl>,
     pub(super) rpc_reads: Option<DappRpcReadClient>,
 }

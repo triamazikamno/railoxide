@@ -122,12 +122,12 @@ pub(super) async fn build_staking_action_draft(
     view_session: Arc<wallet_ops::vault::DesktopViewSession>,
     vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
     token_decimals: Option<u8>,
-    effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: wallet_ops::HttpContext,
     reward_evidence_mode: RewardEvidenceMode,
     gas_fee_selection: PublicActionGasFeeSelection,
 ) -> Result<GovernanceSpendDraft, String> {
-    validate_governance_deployment(context_key.chain_id, effective_chain.as_ref(), &http)
+    validate_governance_deployment(context_key.chain_id, &effective_chain, &http)
         .await
         .map_err(|error| error.to_string())?;
     let recipe = GovernanceDraftRecipe::Staking {
@@ -154,7 +154,7 @@ pub(super) async fn build_staking_action_draft(
                 let (balance, allowance) = fetch_governance_token_balance_allowance(
                     chain_id,
                     actor,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                 )
                 .await
@@ -193,14 +193,9 @@ pub(super) async fn build_staking_action_draft(
             StakingActionKind::Delegate { stake_id } => {
                 let delegate = Address::from_str(delegate_input.trim())
                     .map_err(|_| "Enter a valid delegate address".to_owned())?;
-                let position = fresh_stake_position(
-                    chain_id,
-                    actor,
-                    stake_id,
-                    effective_chain.as_ref(),
-                    &http,
-                )
-                .await?;
+                let position =
+                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
+                        .await?;
                 let plan =
                     plan_delegate(actor, &position, delegate).map_err(|error| error.to_string())?;
                 (
@@ -214,14 +209,9 @@ pub(super) async fn build_staking_action_draft(
                 )
             }
             StakingActionKind::Undelegate { stake_id } => {
-                let position = fresh_stake_position(
-                    chain_id,
-                    actor,
-                    stake_id,
-                    effective_chain.as_ref(),
-                    &http,
-                )
-                .await?;
+                let position =
+                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
+                        .await?;
                 let plan = plan_undelegate(actor, &position).map_err(|error| error.to_string())?;
                 (
                     contracts.staking,
@@ -234,19 +224,13 @@ pub(super) async fn build_staking_action_draft(
                 )
             }
             StakingActionKind::Unlock { stake_id } => {
-                let position = fresh_stake_position(
-                    chain_id,
-                    actor,
-                    stake_id,
-                    effective_chain.as_ref(),
-                    &http,
-                )
-                .await?;
-                let metrics =
-                    fetch_staking_global_metrics(chain_id, effective_chain.as_ref(), &http)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
+                let position =
+                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
+                        .await?;
+                let metrics = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
                 let projected_claim_timestamp = metrics
                     .chain_time
                     .checked_add(metrics.stake_locktime)
@@ -289,19 +273,13 @@ pub(super) async fn build_staking_action_draft(
                 )
             }
             StakingActionKind::PrincipalClaim { stake_id } => {
-                let position = fresh_stake_position(
-                    chain_id,
-                    actor,
-                    stake_id,
-                    effective_chain.as_ref(),
-                    &http,
-                )
-                .await?;
-                let metrics =
-                    fetch_staking_global_metrics(chain_id, effective_chain.as_ref(), &http)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
+                let position =
+                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
+                        .await?;
+                let metrics = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
                 let plan = plan_principal_claim(actor, &position, metrics.chain_time)
                     .map_err(|error| error.to_string())?;
                 let review = GovernanceStakingReviewProjection::PrincipalClaim(plan.clone());
@@ -328,7 +306,7 @@ pub(super) async fn build_staking_action_draft(
                     chain_id,
                     actor,
                     &tokens,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                     reward_evidence_mode,
                 )
@@ -375,7 +353,7 @@ async fn plan_reward_claim_draft(
     chain_id: u64,
     actor: Address,
     requested_tokens: &[Address],
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
     reward_evidence_mode: RewardEvidenceMode,
 ) -> Result<
@@ -433,7 +411,7 @@ async fn fetch_reward_selection_evidence(
     chain_id: u64,
     actor: Address,
     requested_tokens: &[Address],
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<wallet_ops::RewardBatchEvidence, String> {
     let metadata = fetch_interval_metadata(chain_id, requested_tokens, effective_chain, http)
@@ -484,7 +462,7 @@ async fn plan_reward_steps_for_evidence(
     chain_id: u64,
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<Vec<wallet_ops::RewardClaimStep>, String> {
     plan_reward_steps_with_fee(chain_id, actor, evidence, effective_chain, http)
@@ -498,7 +476,7 @@ async fn plan_reward_steps_with_fee(
     chain_id: u64,
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
     let gas_ceiling = wallet_ops::fetch_latest_block_gas_limit(chain_id, effective_chain, http)
@@ -545,7 +523,7 @@ async fn estimate_reward_selection(
     actor: Address,
     tokens: &[Address],
     available: wallet_ops::RewardBatchEvidence,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<RewardSelectionEstimate, Arc<str>> {
     let evidence = (!tokens.is_empty())
@@ -701,7 +679,7 @@ async fn estimate_reward_intent(
     actor: Address,
     contract: Address,
     action: GovernanceActionIntent,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<wallet_ops::PublicAdvancedTransactionEstimate, String> {
     let context = GovernanceActionContext {
@@ -719,7 +697,7 @@ async fn estimate_reward_intent(
     wallet_ops::estimate_public_advanced_transaction(
         PublicAdvancedTransactionEstimateRequest {
             chain_id,
-            effective_chain: effective_chain.cloned(),
+            effective_chain: effective_chain.clone(),
             from: actor,
             intent: resolved.raw,
             gas_fee: PublicActionGasFeeSelection::Auto,
@@ -736,7 +714,7 @@ async fn exact_reward_steps(
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
     gas_ceiling: u64,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
     let amounts = wallet_ops::fetch_reward_batch_interval_amounts(
@@ -833,7 +811,7 @@ async fn fresh_stake_position(
     chain_id: u64,
     actor: Address,
     stake_id: U256,
-    effective_chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<StakePosition, String> {
     let metrics = fetch_staking_global_metrics(chain_id, effective_chain, http)
@@ -2439,12 +2417,14 @@ impl WalletRoot {
         gas_fee.quote_error = None;
         let refresh_id = gas_fee.refresh_id;
         let chain_id = self.selected_chain;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         cx.spawn(async move |this, cx| {
             let result = wallet_ops::quote_public_action_gas_fee_bundle_with_profile(
                 chain_id,
-                effective_chain.as_ref(),
+                &effective_chain,
                 wallet_ops::PublicShieldTransactionProfile::Railoxide,
                 &http,
             )
@@ -2526,7 +2506,9 @@ impl WalletRoot {
         };
         let chain_id = self.selected_chain;
         let context_key = self.governance_context_key();
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         let actor = selection.actor;
         let actor_uuid = selection.actor_uuid;
@@ -2569,7 +2551,7 @@ impl WalletRoot {
                     chain_id,
                     actor,
                     &available_tokens,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                 )
                 .await
@@ -2582,7 +2564,7 @@ impl WalletRoot {
                         actor,
                         &tokens,
                         available,
-                        effective_chain.as_ref(),
+                        &effective_chain,
                         &http,
                     )
                     .await
@@ -2716,7 +2698,9 @@ impl WalletRoot {
             return;
         };
         let chain_id = self.selected_chain;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         let actor_source = account.source;
         let amount_input = self
@@ -2791,7 +2775,7 @@ impl WalletRoot {
         self.governance.action_flow.draft = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = build_staking_action_draft(
+            let result = Box::pin(build_staking_action_draft(
                 selection.clone(),
                 context_key.clone(),
                 wallet_id.clone(),
@@ -2805,7 +2789,7 @@ impl WalletRoot {
                 http.clone(),
                 reward_evidence_mode,
                 gas_fee_selection,
-            )
+            ))
             .await;
             let _ = this.update_in(cx, |root, window, cx| {
                 if root.governance.action_flow.generation != generation
@@ -2885,7 +2869,13 @@ impl WalletRoot {
             return;
         };
         let actor_uuid: Arc<str> = Arc::from(selection.actor_uuid.clone());
-        let effective_chain = self.effective_chain_configs.get(&context.chain_id).cloned();
+        let Ok(effective_chain) = self
+            .effective_chain_configs
+            .enabled(context.chain_id)
+            .cloned()
+        else {
+            return;
+        };
         let http = self.http.clone();
         let generation = self.governance.action_flow.generation.wrapping_add(1);
         self.governance.action_flow.generation = generation;
@@ -2893,8 +2883,8 @@ impl WalletRoot {
         self.governance.action_flow.pending = true;
         self.governance.action_flow.draft = None;
         cx.spawn_in(window, async move |this, cx| {
-            let result: Result<Option<GovernanceSpendDraft>, String> = async {
-                validate_governance_deployment(context.chain_id, effective_chain.as_ref(), &http)
+            let result: Result<Option<GovernanceSpendDraft>, String> = Box::pin(async {
+                validate_governance_deployment(context.chain_id, &effective_chain, &http)
                     .await
                     .map_err(|error| error.to_string())?;
                 let contracts = governance_contracts(context.chain_id)
@@ -2914,7 +2904,7 @@ impl WalletRoot {
                 let metadata = fetch_interval_metadata(
                     context.chain_id,
                     &progress.plan.reward_tokens,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                 )
                 .await
@@ -2923,7 +2913,7 @@ impl WalletRoot {
                 let snapshots = fetch_account_snapshots(
                     context.chain_id,
                     context.actor,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                     wallet_ops::MulticallChunkSize::default(),
                 )
@@ -2935,7 +2925,7 @@ impl WalletRoot {
                     &progress.plan.reward_tokens,
                     &metadata,
                     &snapshots,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                     wallet_ops::MulticallChunkSize::default(),
                 )
@@ -2948,7 +2938,7 @@ impl WalletRoot {
                     context.chain_id,
                     context.actor,
                     &fresh,
-                    effective_chain.as_ref(),
+                    &effective_chain,
                     &http,
                 )
                 .await?;
@@ -2986,7 +2976,7 @@ impl WalletRoot {
                 )
                 .await
                 .map(Some)
-            }
+            })
             .await;
             let _ = this.update_in(cx, |root, window, cx| {
                 if root.selected_chain != context.chain_id
@@ -3082,10 +3072,13 @@ impl WalletRoot {
             .iter()
             .map(|participant| participant.address)
             .collect::<Vec<_>>();
-        let effective_chain = self
+        let Ok(effective_chain) = self
             .effective_chain_configs
-            .get(&key.context.chain_id)
-            .cloned();
+            .enabled(key.context.chain_id)
+            .cloned()
+        else {
+            return;
+        };
         let http = self.http.clone();
         let proposal = proposal.clone();
         cx.spawn(async move |this, cx| {
@@ -3093,7 +3086,7 @@ impl WalletRoot {
                 key.context.chain_id,
                 &proposal,
                 &accounts,
-                effective_chain.as_ref(),
+                &effective_chain,
                 &http,
             )
             .await
@@ -3196,7 +3189,9 @@ impl WalletRoot {
         let generation = self.governance.staking.begin(key.clone());
         let chain_id = key.chain_id;
         let participant_ids = key.participants.clone();
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         let mut tokens = governance_contracts(chain_id)
             .map(|contracts| {
@@ -3209,7 +3204,7 @@ impl WalletRoot {
             .unwrap_or_default();
         tokens.sort();
         cx.spawn(async move |this, cx| {
-            let global = fetch_staking_global_metrics(chain_id, effective_chain.as_ref(), &http)
+            let global = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
                 .await
                 .map_err(|error| Arc::from(error.to_string()))
                 .and_then(|metrics| {
@@ -3232,11 +3227,10 @@ impl WalletRoot {
             let Some(metrics) = global_metrics else {
                 return;
             };
-            let metadata =
-                fetch_interval_metadata(chain_id, &tokens, effective_chain.as_ref(), &http)
-                    .await
-                    .ok()
-                    .flatten();
+            let metadata = fetch_interval_metadata(chain_id, &tokens, &effective_chain, &http)
+                .await
+                .ok()
+                .flatten();
             let countdown = metadata
                 .as_ref()
                 .and_then(|metadata| reward_interval_countdown(metadata, metrics.chain_time));
@@ -3271,7 +3265,7 @@ impl WalletRoot {
                 chain_id,
                 &addresses,
                 metrics.chain_time,
-                effective_chain.as_ref(),
+                &effective_chain,
                 &http,
                 wallet_ops::MulticallChunkSize::default(),
             )
@@ -3313,7 +3307,7 @@ impl WalletRoot {
             let snapshot_results = fetch_account_snapshots_multi(
                 chain_id,
                 &addresses,
-                effective_chain.as_ref(),
+                &effective_chain,
                 &http,
                 wallet_ops::MulticallChunkSize::default(),
             )
@@ -3348,7 +3342,7 @@ impl WalletRoot {
                                     &per_token_tokens,
                                     metadata,
                                     &snapshots,
-                                    per_token_effective_chain.as_ref(),
+                                    &per_token_effective_chain,
                                     &per_token_http,
                                     wallet_ops::MulticallChunkSize::default(),
                                 )
@@ -3378,7 +3372,7 @@ impl WalletRoot {
                                     &bulk_tokens,
                                     metadata,
                                     &snapshots,
-                                    bulk_effective_chain.as_ref(),
+                                    &bulk_effective_chain,
                                     &bulk_http,
                                     wallet_ops::MulticallChunkSize::default(),
                                 )
@@ -7419,6 +7413,7 @@ mod tests {
 
         let steps = [step(120_000), step(90_000)];
         let quote = wallet_ops::SelfBroadcastGasFeeQuote {
+            observed_fee_model: None,
             rpc_gas_price: 8,
             current_base_fee_per_gas: Some(8),
             suggested_max_fee_per_gas: 20,

@@ -9,7 +9,12 @@ pub fn chain_label_row(label: impl Into<SharedString>, icon: Option<&'static str
         .flex()
         .items_center()
         .gap_2()
-        .children(icon.map(|path| img(path).size(px(16.0)).flex_none()))
+        .child(
+            div()
+                .size(px(16.0))
+                .flex_none()
+                .children(icon.map(|path| img(path).size_full())),
+        )
         .child(app_text(label))
 }
 

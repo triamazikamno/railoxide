@@ -1176,11 +1176,12 @@ impl WalletRoot {
         let request_generation = self.proposals.request_generation;
         let chain_generation = self.proposals.generation;
         let http = self.http.clone();
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
-            let result =
-                load_initial(chain_id, requested_page, effective_chain.as_ref(), &http).await;
+            let result = load_initial(chain_id, requested_page, &effective_chain, &http).await;
             let _ = result_tx.send(result);
         });
         self.proposals.task_tracker.track(join);
@@ -1377,12 +1378,14 @@ impl WalletRoot {
         } else {
             self.proposals.active_page_token
         };
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         tracing::debug!(chain_id, page, prefetch, "loading governance proposal page");
         let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
-            let result = load_page(&overview, page, effective_chain.as_ref(), &http).await;
+            let result = load_page(&overview, page, &effective_chain, &http).await;
             let _ = result_tx.send(result);
         });
         if prefetch {
@@ -2050,7 +2053,7 @@ impl WalletRoot {
                                             &self.public_broadcaster_anchor_cache,
                                             &self.effective_token_registry,
                                             self.effective_chain_configs
-                                                .get(&self.proposals.chain_id),
+                                                .get(self.proposals.chain_id),
                                             &self.public_accounts,
                                             self.view_session
                                                 .as_ref()
@@ -2129,7 +2132,7 @@ fn proposal_copy_control(
 async fn load_initial(
     chain_id: u64,
     requested_page: usize,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> eyre::Result<InitialLoad> {
     let overview = fetch_governance_overview(chain_id, effective_chain, http).await?;
@@ -2170,7 +2173,7 @@ async fn load_initial(
 async fn load_page(
     overview: &GovernanceOverview,
     page: usize,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> eyre::Result<Vec<ResolvedProposal>> {
     let size = std::num::NonZeroUsize::new(PROPOSALS_PAGE_SIZE).expect("non-zero page size");
@@ -5139,38 +5142,30 @@ fn proposal_known_address_label(
         return Some("Treasury".to_owned());
     }
     let effective_chain = effective_chain?;
-    let multicall = effective_chain
-        .rpc_route
-        .multicall()
-        .map(|address| address.to_string());
+    let private = effective_chain.railgun.as_ref();
     let configured = [
-        ("RAILGUN", effective_chain.railgun_contract.as_str()),
-        ("Relay Adapt", effective_chain.relay_adapt_contract.as_str()),
+        (
+            "RAILGUN",
+            private.map(|private| private.deployment.contract),
+        ),
+        (
+            "Relay Adapt",
+            private.map(|private| private.deployment.relay_adapt_contract),
+        ),
         (
             "Relay Adapt 7702",
-            effective_chain.relay_adapt_7702_contract.as_str(),
+            private.map(|private| private.deployment.relay_adapt_7702_contract),
         ),
-        ("Multicall", multicall.as_deref().unwrap_or_default()),
+        ("Multicall", effective_chain.rpc_route.multicall()),
+        ("Wrapped native token", effective_chain.wrapped_native_token),
+        (
+            "Coinbase payer",
+            private.and_then(|private| private.coinbase_payer),
+        ),
     ];
     configured
         .into_iter()
-        .find_map(|(label, raw)| {
-            (raw.parse::<Address>().ok() == Some(address)).then_some(label.to_owned())
-        })
-        .or_else(|| {
-            effective_chain
-                .wrapped_native_token
-                .as_deref()
-                .and_then(|raw| raw.parse::<Address>().ok())
-                .filter(|wrapped| *wrapped == address)
-                .map(|_| "Wrapped native token".to_owned())
-        })
-        .or_else(|| {
-            effective_chain
-                .coinbase_payer
-                .filter(|payer| *payer == address)
-                .map(|_| "Coinbase payer".to_owned())
-        })
+        .find_map(|(label, target)| (target == Some(address)).then(|| label.to_owned()))
 }
 
 fn proposal_action_target_label(
@@ -5976,11 +5971,13 @@ fn render_proposal_actions_card(
         let expanded = expanded_calldata.contains(&action_identity);
         let compact_calldata = compact_calldata_display(&calldata);
         let address = action.call_contract.to_checksum(None);
-        let wrapped_native_token = effective_chain
-            .and_then(|chain| chain.wrapped_native_token.as_deref())
-            .and_then(|address| address.parse::<Address>().ok());
-        let railgun_contract =
-            effective_chain.and_then(|chain| chain.railgun_contract.parse::<Address>().ok());
+        let wrapped_native_token = effective_chain.and_then(|chain| chain.wrapped_native_token);
+        let railgun_contract = effective_chain.and_then(|chain| {
+            chain
+                .railgun
+                .as_ref()
+                .map(|private| private.deployment.contract)
+        });
         let decoded = decode_proposal_action(
             chain_id,
             action.call_contract,

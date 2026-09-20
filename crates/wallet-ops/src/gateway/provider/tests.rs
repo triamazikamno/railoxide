@@ -55,6 +55,13 @@ pub(in crate::gateway) fn state(view: &Arc<DesktopViewSession>) -> GatewayWallet
         active_wallet_generation: 1,
         public_accounts: Vec::new(),
         chain_ids: vec![1, 10],
+        native_currencies: crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .into_values()
+        .map(|chain| (chain.chain_id, chain.native_currency))
+        .collect(),
         default_chain_id: Some(1),
         ..GatewayWalletState::default()
     }
@@ -262,8 +269,8 @@ fn connect_is_owned_by_session_and_web_origin_and_revocation_is_origin_local() {
             .is_empty()
     );
     assert_eq!(
-        result(&request(&mut provider, 1, "a", "chain", "eth_chainId", now))["error"]["code"],
-        4100
+        result(&request(&mut provider, 1, "a", "chain", "eth_chainId", now))["result"],
+        "0x1"
     );
     drop(provider);
     drop(view);
@@ -1198,7 +1205,7 @@ async fn queued_reads_keep_the_entry_deadline_and_expiry_never_dispatches() {
 }
 
 #[tokio::test]
-async fn authorized_completion_preserves_remote_payload_across_default_chain_change() {
+async fn authorized_completion_preserves_remote_payload_across_chain_addition_and_selection() {
     for remote_error in [false, true] {
         let (path, mut provider, view) = fixture();
         let (endpoint, started, release, server) = held_rpc(remote_error).await;
@@ -1216,6 +1223,14 @@ async fn authorized_completion_preserves_remote_payload_across_default_chain_cha
             .unwrap();
         let mut wallet = provider.wallet.clone();
         wallet.default_chain_id = Some(10);
+        wallet.chain_ids.push(9_007_199_254_740_993);
+        wallet.routes.insert(
+            9_007_199_254_740_993,
+            RpcChainRoute::new(
+                9_007_199_254_740_993,
+                vec![reqwest::Url::parse("https://custom.example").unwrap()],
+            ),
+        );
         assert!(provider.wallet.same_authority(&wallet));
         assert!(!provider.wallet.same_state(&wallet));
         provider.update_wallet(wallet, provider.generation);
@@ -1788,7 +1803,12 @@ async fn native_local_balance_requires_current_authorized_observation() {
     let (endpoint, requests, server) = balance_rpc().await;
     let (path, mut provider, view) = fixture();
     authorize(&mut provider, &view, endpoint);
-    let native = crate::public_wallet::native_asset_for_chain(1).unwrap();
+    let native = crate::public_wallet::native_asset_for_chain(
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .unwrap(),
+    );
     let (_, account) = seed_balance(&mut provider, native.clone(), Instant::now());
     let params = json!([account.address, "latest"]);
     assert!(provider.wallet.token_registry.is_none());
@@ -1892,7 +1912,12 @@ async fn local_balance_delivery_rechecks_generation_and_namespace() {
         &view,
         url::Url::parse("http://127.0.0.1:1").unwrap(),
     );
-    let native = crate::public_wallet::native_asset_for_chain(1).unwrap();
+    let native = crate::public_wallet::native_asset_for_chain(
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .unwrap(),
+    );
     for case in ["pending", "refreshed-generation", "replaced-namespace"] {
         provider.wallet.public_balance_cache.clear();
         let (scope, account) = seed_balance(&mut provider, native.clone(), Instant::now());
@@ -1950,7 +1975,14 @@ async fn queued_balance_loses_eligibility_before_dispatch_and_forwards() {
     authorize(&mut provider, &view, endpoint);
     let (scope, account) = seed_balance(
         &mut provider,
-        crate::public_wallet::native_asset_for_chain(1).unwrap(),
+        crate::public_wallet::native_asset_for_chain(
+            crate::settings::build_effective_chain_configs(
+                &crate::settings::WalletSettings::default(),
+            )
+            .unwrap()
+            .get(1)
+            .unwrap(),
+        ),
         Instant::now(),
     );
     for index in 0..32 {
@@ -2456,7 +2488,9 @@ async fn native_approval_decisions_and_delivery_remain_bound_to_original_authori
         match invalidation {
             "document" => provider.unregister(1, "doc"),
             "revoke" => {
-                provider.revoke(&ready.permission.permission_id).unwrap();
+                provider
+                    .revoke(&provider.permissions[0].permission_id.clone())
+                    .unwrap();
             }
             "wallet" => {
                 let mut wallet = provider.wallet.clone();
@@ -3529,4 +3563,437 @@ async fn unsealed_remote_outcomes_revalidate_live_authority_before_actor_update(
             std::fs::remove_dir_all(path).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn unconnected_chain_query_revalidates_selection_and_lock_before_delivery() {
+    for change in ["selection", "disabled", "locked"] {
+        let (path, mut provider, view) = fixture();
+        provider
+            .register(
+                1,
+                PeerId::from_bytes([8; 16]),
+                "doc".into(),
+                "https://basescan.org",
+            )
+            .unwrap();
+        messages(&mut provider);
+        provider
+            .request(
+                1,
+                "doc".into(),
+                "chain".into(),
+                "eth_chainId",
+                json!([]),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(provider.jobs.is_empty());
+        let (_, mut delivery) = provider
+            .drain()
+            .into_iter()
+            .find(|(_, delivery)| delivery.ticket_id().is_some())
+            .unwrap();
+        assert!(provider.delivery(1, &mut delivery) == DeliveryStatus::Current);
+        assert_eq!(
+            serde_json::to_value(&delivery.message).unwrap()["result"],
+            "0x1"
+        );
+        let mut wallet = provider.wallet.clone();
+        match change {
+            "selection" => wallet.default_chain_id = Some(10),
+            "disabled" => wallet.chain_ids.retain(|id| *id != 1),
+            "locked" => wallet.view = None,
+            _ => unreachable!(),
+        }
+        provider
+            .authority_fallback
+            .as_ref()
+            .unwrap()
+            .send_replace(wallet.clone());
+        assert!(provider.delivery(1, &mut delivery) == DeliveryStatus::Changed);
+        assert_eq!(
+            serde_json::to_value(&delivery.message).unwrap()["error"]["code"],
+            if change == "locked" { 4100 } else { -32002 }
+        );
+        provider.delivered(delivery.ticket_id().unwrap());
+        provider.update_wallet(wallet, provider.generation + 1);
+        messages(&mut provider);
+        let latest = request(
+            &mut provider,
+            1,
+            "doc",
+            "latest-chain",
+            "eth_chainId",
+            Instant::now(),
+        );
+        if change == "selection" {
+            assert_eq!(result(&latest)["result"], "0xa");
+        } else {
+            assert_eq!(
+                result(&latest)["error"]["code"],
+                if change == "locked" { 4100 } else { 4901 }
+            );
+        }
+        assert!(provider.permissions.is_empty());
+        assert!(provider.jobs.is_empty());
+        drop(delivery);
+        drop(provider);
+        drop(view);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn chain_addition_without_account_access_requires_current_confirmation() {
+    for outcome in [
+        "added",
+        "added_before_publication",
+        "reject",
+        "lock",
+        "disconnect",
+        "expire",
+    ] {
+        let (path, mut provider, view) = fixture();
+        let mut wallet = provider.wallet.clone();
+        wallet.http = Some(HttpContext::direct_for_tests());
+        provider.update_wallet(wallet, 2);
+        provider
+            .register(
+                1,
+                PeerId::from_bytes([8; 16]),
+                "doc".into(),
+                "https://basescan.org",
+            )
+            .unwrap();
+        messages(&mut provider);
+        let chain = request(
+            &mut provider,
+            1,
+            "doc",
+            "initial-chain",
+            "eth_chainId",
+            Instant::now(),
+        );
+        assert_eq!(result(&chain)["result"], "0x1", "{chain:?}");
+        provider.request(1, "doc".into(), "add".into(), "wallet_addEthereumChain", json!([{
+            "chainId": "0x2105", "chainName": "Base Mainnet",
+            "nativeCurrency": {"name": "ETH", "symbol": "ETH", "decimals": 18},
+            "rpcUrls": ["https://mainnet.base.org"], "blockExplorerUrls": ["https://basescan.org"]
+        }]), Instant::now()).unwrap();
+        let output = messages(&mut provider);
+        assert_eq!(
+            provider.approval_updates.borrow().len(),
+            1,
+            "{outcome}: {output:?}"
+        );
+        let ready = provider.approval_updates.borrow()[0].clone();
+        assert!(ready.authorization.is_none());
+        let (reply, read_result) = oneshot::channel();
+        provider.approval_read(
+            &ready.id,
+            url::Url::parse("https://mainnet.base.org").unwrap().into(),
+            RpcRead::from_method_params("eth_blockNumber", json!([]), 8453).unwrap(),
+            Instant::now(),
+            reply,
+        );
+        assert!(matches!(
+            read_result.await.unwrap(),
+            Err(RpcBrokerError::OriginRejected)
+        ));
+        assert!(provider.pending.is_empty());
+        assert!(provider.jobs.is_empty());
+        assert!(provider.permissions.is_empty());
+        assert!(
+            provider
+                .store
+                .list_gateway_permissions(&view)
+                .unwrap()
+                .is_empty()
+        );
+        match outcome {
+            "added" | "added_before_publication" => {
+                provider.begin_approval(&ready.id).unwrap();
+                let mut wallet = provider.wallet.clone();
+                wallet.chain_ids.push(8453);
+                wallet.configured_chain_ids.push(8453);
+                wallet.routes.insert(
+                    8453,
+                    RpcChainRoute::new(
+                        8453,
+                        vec![url::Url::parse("https://mainnet.base.org").unwrap()],
+                    ),
+                );
+                if outcome == "added_before_publication" {
+                    provider
+                        .authority_fallback
+                        .as_ref()
+                        .unwrap()
+                        .send_replace(wallet);
+                } else {
+                    provider.update_wallet(wallet, provider.generation);
+                }
+                provider
+                    .complete_approval(&ready.id, Ok(Value::Null))
+                    .unwrap();
+                let output = messages(&mut provider);
+                assert_eq!(result(&output)["result"], Value::Null);
+                assert!(result(&output).get("error").is_none());
+                assert_eq!(provider.wallet.default_chain_id, Some(1));
+            }
+            "reject" => {
+                provider
+                    .complete_approval(
+                        &ready.id,
+                        Err(crate::gateway::GatewayApprovalFailure::Local(
+                            LocalProviderFailure::UserRejected,
+                        )),
+                    )
+                    .unwrap();
+                assert_eq!(result(&messages(&mut provider))["error"]["code"], 4001);
+            }
+            "lock" => invalidate_authority(&provider, true),
+            "disconnect" => provider.unregister(1, "doc"),
+            "expire" => provider.tick(ready.deadline + Duration::from_secs(1)),
+            _ => unreachable!(),
+        }
+        assert!(provider.begin_approval(&ready.id).is_err());
+        assert!(provider.permissions.is_empty());
+        assert!(
+            provider
+                .store
+                .list_gateway_permissions(&view)
+                .unwrap()
+                .is_empty()
+        );
+        if matches!(outcome, "added" | "reject") {
+            assert_eq!(
+                result(&request(
+                    &mut provider,
+                    1,
+                    "doc",
+                    "accounts",
+                    "eth_accounts",
+                    Instant::now()
+                ))["result"],
+                json!([])
+            );
+            for (method, params) in [
+                ("wallet_switchEthereumChain", json!([{"chainId":"0x2105"}])),
+                (
+                    "personal_sign",
+                    json!(["0x6869", "0x0000000000000000000000000000000000000001"]),
+                ),
+                ("eth_blockNumber", json!([])),
+            ] {
+                provider
+                    .request(
+                        1,
+                        "doc".into(),
+                        method.into(),
+                        method,
+                        params,
+                        Instant::now(),
+                    )
+                    .unwrap();
+                assert_eq!(result(&messages(&mut provider))["error"]["code"], 4100);
+            }
+        }
+        drop(ready);
+        drop(provider);
+        drop(view);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn proposed_chain_requires_current_approval_and_runtime_before_add_then_switch() {
+    const ID: u64 = 9_007_199_254_740_993;
+    for outcome in ["reject", "expire", "retire", "missing-runtime", "added"] {
+        let (path, mut provider, view) = fixture();
+        authorize(
+            &mut provider,
+            &view,
+            url::Url::parse("http://127.0.0.1:1").unwrap(),
+        );
+        let before = provider.wallet.clone();
+        let permissions = provider.permissions.clone();
+        let raw = json!([{
+            "chainId": "0x20000000000001", "chainName": "Custom",
+            "nativeCurrency": {"name":"Custom coin", "symbol":"CSTM", "decimals":6, "futureCurrencyField": true},
+            "rpcUrls": ["https://synthetic:credential@custom.invalid/rpc"],
+            "iconUrls": ["https://never-fetched.invalid/icon.svg"], "futureExtension": {"keep":true}
+        }]);
+        let mut malformed = raw.clone();
+        malformed[0]["rpcUrls"] = json!(["http://plain.invalid"]);
+        provider
+            .request(
+                1,
+                "doc".into(),
+                "malformed".into(),
+                "wallet_addEthereumChain",
+                malformed,
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(result(&messages(&mut provider))["error"]["code"], -32602);
+        assert!(provider.approvals.is_empty());
+        provider
+            .request(
+                1,
+                "doc".into(),
+                "add".into(),
+                "wallet_addEthereumChain",
+                raw.clone(),
+                Instant::now(),
+            )
+            .unwrap();
+        let output = messages(&mut provider);
+        assert!(
+            !serde_json::to_string(&output)
+                .unwrap()
+                .contains("credential")
+        );
+        let ready = provider.approval_updates.borrow()[0].clone();
+        let crate::WalletConnectParsedRequest::WalletAddEthereumChain {
+            chain_id,
+            raw: retained,
+            definition: Some(definition),
+        } = &ready.parsed
+        else {
+            panic!("complete new definition expected")
+        };
+        assert_eq!((*chain_id, retained), (ID, &raw));
+        assert_eq!(definition.native_currency.decimals, 6);
+        assert!(provider.jobs.is_empty());
+        assert!(before.same_state(&provider.wallet));
+        if outcome == "reject" {
+            provider
+                .complete_approval(
+                    &ready.id,
+                    Err(crate::gateway::GatewayApprovalFailure::Local(
+                        LocalProviderFailure::UserRejected,
+                    )),
+                )
+                .unwrap();
+            assert_eq!(result(&messages(&mut provider))["error"]["code"], 4001);
+        } else if outcome == "expire" {
+            provider.tick(ready.deadline + Duration::from_secs(1));
+            assert!(provider.begin_approval(&ready.id).is_err());
+        } else if outcome == "retire" {
+            invalidate_authority(&provider, true);
+            assert!(provider.begin_approval(&ready.id).is_err());
+        } else {
+            provider.begin_approval(&ready.id).unwrap();
+            if outcome == "added" {
+                let mut wallet = provider.wallet.clone();
+                wallet.chain_ids.push(ID);
+                wallet.configured_chain_ids.push(ID);
+                wallet.routes.insert(
+                    ID,
+                    RpcChainRoute::new(
+                        ID,
+                        vec![url::Url::parse(&definition.rpc_endpoints[0]).unwrap()],
+                    )
+                    .with_identity_verification(),
+                );
+                wallet
+                    .native_currencies
+                    .insert(ID, definition.native_currency.clone());
+                provider.update_wallet(wallet, provider.generation);
+            }
+            let completed = provider.complete_approval(&ready.id, Ok(Value::Null));
+            assert_eq!(completed.is_ok(), outcome == "added");
+            let output = messages(&mut provider);
+            if outcome == "missing-runtime" {
+                assert_eq!(result(&output)["error"]["code"], 4901);
+            } else {
+                assert_eq!(result(&output)["result"], Value::Null);
+                assert!(result(&output).get("error").is_none());
+                assert!(provider.permissions == permissions);
+                assert_eq!(provider.wallet.default_chain_id, before.default_chain_id);
+                provider
+                    .request(
+                        1,
+                        "doc".into(),
+                        "switch".into(),
+                        "wallet_switchEthereumChain",
+                        json!([{"chainId":"0x20000000000001"}]),
+                        Instant::now(),
+                    )
+                    .unwrap();
+                let switch = provider.approval_updates.borrow()[0].clone();
+                provider.begin_approval(&switch.id).unwrap();
+                provider
+                    .complete_approval(&switch.id, Ok(Value::Null))
+                    .unwrap();
+                let output = messages(&mut provider);
+                assert!(result(&output).get("error").is_none());
+                assert_eq!(provider.permissions[0].chain_id, ID);
+                assert_eq!(
+                    result(&request(
+                        &mut provider,
+                        1,
+                        "doc",
+                        "chain",
+                        "eth_chainId",
+                        Instant::now()
+                    ))["result"],
+                    "0x20000000000001"
+                );
+            }
+        }
+        if outcome != "added" {
+            assert!(before.same_state(&provider.wallet));
+            assert!(provider.permissions == permissions);
+        }
+        drop(ready);
+        drop(provider);
+        drop(view);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn changed_chain_route_retires_held_read_without_rebinding_its_payload() {
+    let (path, mut provider, view) = fixture();
+    let (endpoint, started, release, server) = held_rpc(false).await;
+    authorize(&mut provider, &view, endpoint);
+    request(
+        &mut provider,
+        1,
+        "doc",
+        "old-route",
+        "eth_blockNumber",
+        Instant::now(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let permissions = provider.permissions.clone();
+    let mut next = provider.wallet.clone();
+    next.routes.insert(
+        1,
+        RpcChainRoute::new(
+            1,
+            vec![url::Url::parse("https://replacement.invalid").unwrap()],
+        ),
+    );
+    provider.update_wallet(next, provider.generation);
+    let output = messages(&mut provider);
+    assert!(result(&output)["error"].is_object());
+    assert!(provider.permissions == permissions);
+    release.notify_one();
+    if let Some(Ok(completion)) = provider.jobs.join_next().await {
+        provider.complete_read(completion);
+    }
+    assert!(
+        messages(&mut provider)
+            .iter()
+            .all(|(_, message)| message["request_id"] != "old-route")
+    );
+    server.abort();
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
 }

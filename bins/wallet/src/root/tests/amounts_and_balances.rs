@@ -1741,7 +1741,15 @@ fn public_action_error_summary_explains_wrap_gas_estimate() {
 #[test]
 fn public_action_asset_label_uses_native_symbol() {
     assert_eq!(
-        public_action_asset_label(1, PublicAssetId::Native, None),
+        public_action_asset_label(
+            wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default()
+            )
+            .unwrap()
+            .get(1),
+            PublicAssetId::Native,
+            None
+        ),
         "ETH"
     );
 }

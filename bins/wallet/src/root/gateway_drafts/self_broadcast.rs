@@ -43,16 +43,16 @@ pub(super) struct PreparedSelfBroadcastDraft {
     pub(super) gas_quote: Option<SelfBroadcastGasFeeQuote>,
     pub(super) estimate: SponsoredFundingEstimateState,
     snapshot: Arc<ListUtxosOutput>,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
 }
 
 struct SelfBroadcastDraftEstimation {
     gas_quote: Option<SelfBroadcastGasFeeQuote>,
-    result: Result<PreparedSelfBroadcastDraft, String>,
+    result: eyre::Result<PreparedSelfBroadcastDraft>,
 }
 
 async fn estimate_self_broadcast_draft(
-    prepared: Result<(PreparedSelfBroadcastDraft, Arc<WalletSession>), String>,
+    prepared: eyre::Result<(PreparedSelfBroadcastDraft, Arc<WalletSession>)>,
     quote: impl std::future::Future<Output = eyre::Result<SelfBroadcastGasFeeQuote>>,
 ) -> SelfBroadcastDraftEstimation {
     // Chain gas prices are useful while the recipient, amount or signer is still incomplete.
@@ -62,7 +62,7 @@ async fn estimate_self_broadcast_draft(
             prepared.gas_quote = gas_quote;
             tokio::task::spawn_blocking(move || prepared.estimate(&session))
                 .await
-                .map_err(|_| "Self-broadcast estimate was interrupted.".to_owned())
+                .map_err(|_| eyre::eyre!("Self-broadcast estimate was interrupted."))
         }
         Err(error) => Err(error),
     };
@@ -84,7 +84,7 @@ impl PreparedSelfBroadcastDraft {
                     self.raw.chain_id,
                     &self.signer.public_account_uuid,
                 )
-            && root.effective_chain_configs.get(&self.raw.chain_id) == self.effective_chain.as_ref()
+            && root.effective_chain_configs.get(self.raw.chain_id) == Some(&self.effective_chain)
     }
 
     pub(super) fn retains_background_estimate(&self) -> bool {
@@ -116,8 +116,7 @@ impl PreparedSelfBroadcastDraft {
                     unwrap,
                     native_top_up,
                 } => estimate_desktop_unshield_self_broadcast_cost(
-                    self.effective_chain
-                        .as_ref()
+                    Some(&self.effective_chain)
                         .filter(|chain| {
                             (*unwrap || native_top_up.is_some())
                                 && session.executor_owner().is_some()
@@ -148,9 +147,7 @@ impl PreparedSelfBroadcastDraft {
             );
             return self;
         }
-        let Some(chain) = &self.effective_chain else {
-            return self;
-        };
+        let chain = &self.effective_chain;
         let limit = match &self.output {
             PrivateEstimateOutput::Send => {
                 parse_railgun_recipient(&self.recipient).and_then(|recipient| {
@@ -220,10 +217,7 @@ impl PreparedSelfBroadcastDraft {
             }
             Err(error) => sponsored_estimate_failure_state(
                 self.raw.chain_id,
-                chain
-                    .wrapped_native_token
-                    .as_deref()
-                    .and_then(|token| token.parse().ok()),
+                chain.wrapped_native_token,
                 &error,
             ),
         };
@@ -507,7 +501,7 @@ impl WalletRoot {
         &self,
         input: &GatewayPrivateDraftInput,
         recipient: String,
-    ) -> Result<(PreparedSelfBroadcastDraft, Arc<WalletSession>), String> {
+    ) -> eyre::Result<(PreparedSelfBroadcastDraft, Arc<WalletSession>)> {
         let GatewayPrivateDelivery::SelfBroadcast {
             delivery:
                 GatewayPrivateSelfBroadcastInput::SelfBroadcast {
@@ -517,21 +511,22 @@ impl WalletRoot {
                 },
         } = &input.delivery
         else {
-            return Err("Choose self-broadcast delivery.".into());
+            eyre::bail!("Choose self-broadcast delivery.");
         };
-        let asset = self.private_draft_asset(input)?;
-        self.private_draft_recipient(input)?;
+        let asset = self.private_draft_asset(input).map_err(eyre::Report::msg)?;
+        self.private_draft_recipient(input)
+            .map_err(eyre::Report::msg)?;
         let signer = self
             .gateway_private_signers(&input.wallet)
             .into_iter()
             .find(|account| Some(account.public_account_uuid.as_str()) == signer.as_deref())
-            .ok_or("Choose a Public account for this transaction.")?;
+            .ok_or_else(|| eyre::eyre!("Choose a Public account for this transaction."))?;
         if let Some(reason) = signer_unavailable_reason(&signer) {
-            return Err(reason.into());
+            eyre::bail!(reason);
         }
         let options = self.gateway_self_broadcast_options(input);
         if let Some(error) = options.signer_error {
-            return Err(error);
+            eyre::bail!(error);
         }
         let (funding, incentive) = match funding {
             GatewayPrivateFunding::PublicBalance {} => (
@@ -540,14 +535,15 @@ impl WalletRoot {
             ),
             GatewayPrivateFunding::Sponsorship { incentive } => {
                 if let Some(reason) = options.sponsorship_unavailable {
-                    return Err(reason);
+                    eyre::bail!(reason);
                 }
                 let incentive = match incentive {
                     GatewayPrivateIncentive::Economy {} => SponsoredIncentive::Economy,
                     GatewayPrivateIncentive::Standard {} => SponsoredIncentive::Standard,
                     GatewayPrivateIncentive::Priority {} => SponsoredIncentive::Priority,
                     GatewayPrivateIncentive::Custom { percent } => {
-                        sponsored_incentive_from_text(SponsoredIncentive::Custom(5), percent)?
+                        sponsored_incentive_from_text(SponsoredIncentive::Custom(5), percent)
+                            .map_err(eyre::Report::msg)?
                     }
                 };
                 (SelfBroadcastFundingMode::PrivateSponsorship, incentive)
@@ -559,35 +555,37 @@ impl WalletRoot {
         };
         let maximum = match input.kind {
             GatewayPrivateDraftKind::PrivateSend => {
-                parse_railgun_recipient(recipient.trim()).map_err(|error| error.to_string())?;
+                parse_railgun_recipient(recipient.trim())?;
                 asset.max_batched
             }
             GatewayPrivateDraftKind::Unshield => {
                 recipient
                     .parse::<Address>()
-                    .map_err(|_| "Enter a public recipient")?;
+                    .map_err(|_| eyre::eyre!("Enter a public recipient"))?;
                 crate::root::unshield_max_entered_amount_for_mode(asset.max_batched, fee_mode)
             }
         };
         let amount = if input.max {
             maximum
         } else {
-            parse_send_amount(&input.amount, asset.decimals).map_err(|error| error.to_string())?
+            parse_send_amount(&input.amount, asset.decimals)?
         };
         if amount.is_zero() || amount > maximum {
-            return Err("Enter an amount within the available private balance.".into());
+            eyre::bail!("Enter an amount within the available private balance.");
         }
         // Top-up construction must use the exact entered amount, including the native Max policy.
         let mut output_input = input.clone();
         output_input.max = false;
         output_input.amount = format_send_amount_input(amount, asset.decimals);
-        let output = self.private_draft_output(&output_input, &asset, &recipient, fee_mode)?;
-        let gas_selection = gas_selection(fee)?;
+        let output = self
+            .private_draft_output(&output_input, &asset, &recipient, fee_mode)
+            .map_err(eyre::Report::msg)?;
+        let gas_selection = gas_selection(fee).map_err(eyre::Report::msg)?;
         let Some(ChainUtxoState::Ready {
             snapshot, session, ..
         }) = self.chain_states.get(&input.chain_id)
         else {
-            return Err("Generation is available after wallet sync finishes.".into());
+            eyre::bail!("Generation is available after wallet sync finishes.");
         };
         Ok((
             PreparedSelfBroadcastDraft {
@@ -610,7 +608,10 @@ impl WalletRoot {
                 gas_quote: None,
                 estimate: SponsoredFundingEstimateState::Unavailable,
                 snapshot: snapshot.clone(),
-                effective_chain: self.effective_chain_configs.get(&input.chain_id).cloned(),
+                effective_chain: self
+                    .effective_chain_configs
+                    .railgun(input.chain_id)
+                    .cloned()?,
             },
             session.clone(),
         ))
@@ -636,15 +637,18 @@ impl WalletRoot {
             return;
         };
         let chain_id = input.chain_id;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
-        let prepared =
-            recipient.and_then(|recipient| self.prepare_gateway_self_broadcast(input, recipient));
+        let Ok(effective_chain) = self.effective_chain_configs.railgun(chain_id).cloned() else {
+            return;
+        };
+        let prepared = recipient
+            .map_err(eyre::Report::msg)
+            .and_then(|recipient| self.prepare_gateway_self_broadcast(input, recipient));
         let complete = prepared.is_ok();
         let http = self.http.clone();
         let job = self.runtime.spawn(async move {
             estimate_self_broadcast_draft(
                 prepared,
-                quote_desktop_self_broadcast_gas_fee(chain_id, effective_chain.as_ref(), &http),
+                quote_desktop_self_broadcast_gas_fee(chain_id, &effective_chain, &http),
             )
             .await
         });
@@ -679,7 +683,7 @@ impl WalletRoot {
                         }
                         estimation.result
                     }
-                    Err(_) => Err("Self-broadcast estimate was interrupted.".to_owned()),
+                    Err(_) => Err(eyre::eyre!("Self-broadcast estimate was interrupted.")),
                 };
                 match result {
                     Ok(prepared) if prepared.is_current(root, &record.view.input) => {
@@ -703,9 +707,10 @@ impl WalletRoot {
                     result => {
                         record.prepared = None;
                         record.view.status = GatewayDraftStatus::Editing;
-                        record.view.message = result.err().unwrap_or_else(|| {
-                            "Private funds or signer changed. Refresh the estimate.".into()
-                        });
+                        record.view.message = result.err().map_or_else(
+                            || "Private funds or signer changed. Refresh the estimate.".into(),
+                            |error| error.to_string(),
+                        );
                         record.view.estimate = complete.then(|| {
                             let mut display = GatewayPrivateDraftEstimate::default();
                             display.self_broadcast_fees = serde_json::to_value(
@@ -755,9 +760,9 @@ impl WalletRoot {
         options.default_signer =
             default_self_broadcast_gas_payer_uuid(&eligible_accounts).map(|uuid| uuid.to_string());
         options.show_sponsorship =
-            sponsored_funding_choice_visible(self.effective_chain_configs.get(&input.chain_id));
+            sponsored_funding_choice_visible(self.effective_chain_configs.get(input.chain_id));
         options.sponsorship_unavailable = sponsored_self_broadcast_availability_reason(
-            self.effective_chain_configs.get(&input.chain_id),
+            self.effective_chain_configs.get(input.chain_id),
         )
         .map(str::to_owned);
         let (selected, sponsored) = match &input.delivery {
@@ -887,7 +892,7 @@ mod tests {
     async fn incomplete_self_broadcast_inputs_still_fetch_gas_quote() {
         let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(1_000_000_000);
         let estimation = estimate_self_broadcast_draft(
-            Err("Enter a public recipient".into()),
+            Err(eyre::eyre!("Enter a public recipient")),
             std::future::ready(Ok(quote)),
         )
         .await;

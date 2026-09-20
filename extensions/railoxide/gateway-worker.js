@@ -273,8 +273,84 @@ function networkCommand(port, message) {
   port.postMessage(snapshotFor(port));
 }
 
+// Endpoint-bearing replies belong only to a live, authenticated extension view.
+const chainEditorViews = new Map();
+function closeChainEditor(port, send = true) {
+  const view = chainEditorViews.get(port);
+  chainEditorViews.delete(port);
+  if (!view) return;
+  clearTimeout(view.pending?.timer);
+  try { port.postMessage({ type: 'chain_editor', editor_token: view.token, generation: view.generation,
+    outcome: { status: 'retired' } }); } catch {}
+  const session = owner?.candidate;
+  if (send && session?.established && current(session) && !session.locked && session.generation === view.generation) {
+    try { command(session, { type: 'chain_editor', version: 1, generation: view.generation,
+      command: { action: 'close', view_id: view.id } }); }
+    catch { failed(session, 'disconnected', true); }
+  }
+}
+function chainEditorCommand(port, message) {
+  const session = owner?.candidate;
+  const input = message.command;
+  if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
+      message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
+      uiSnapshot.chain_management_supported !== true || !input || !boundedNetworkText(input.editor_token, 128)) return;
+  let view = chainEditorViews.get(port);
+  let native;
+  if (input.action === 'open') {
+    if (view || chainEditorViews.size >= 16 || Object.keys(input).some(key => !['action', 'editor_token'].includes(key))) return;
+    session.chainEditorSequence = (session.chainEditorSequence ?? 0n) + 1n;
+    view = { id: session.chainEditorSequence.toString(), token: input.editor_token, generation: session.generation, seen: new Set(), pending: null };
+    chainEditorViews.set(port, view);
+    native = { action: 'open', view_id: view.id, request_id: crypto.randomUUID() };
+  } else {
+    if (!view || input.editor_token !== view.token || view.generation !== session.generation) return;
+    if (input.action === 'close') { closeChainEditor(port); return; }
+    if (input.action !== 'run' || view.pending || view.seen.size >= 256 ||
+        !boundedNetworkText(input.request_id, 128) || view.seen.has(input.request_id) ||
+        !boundedNetworkText(input.revision, 128) || !input.command ||
+        encoder.encode(JSON.stringify(input.command)).length > 65_536 ||
+        Object.keys(input).some(key => !['action', 'editor_token', 'request_id', 'revision', 'command'].includes(key))) return;
+    native = { action: 'run', view_id: view.id, request_id: input.request_id, revision: input.revision, command: input.command };
+  }
+  view.seen.add(native.request_id);
+  const pending = { id: native.request_id, timer: null };
+  view.pending = pending;
+  pending.timer = setTimeout(() => {
+    if (chainEditorViews.get(port) !== view || view.pending !== pending) return;
+    closeChainEditor(port);
+  }, 30_000);
+  try { command(session, { type: 'chain_editor', version: 1, generation: session.generation, command: native }); }
+  catch { failed(session, 'disconnected', true); }
+}
+function receiveChainEditor(session, message) {
+  if (!current(session) || session.locked || uiSnapshot.locked || uiSnapshot.chain_management_supported !== true ||
+      message.generation !== session.generation || uiSnapshot.generation !== session.generation) return;
+  const entry = [...chainEditorViews].find(([, view]) => view.id === message.view_id && view.generation === message.generation);
+  if (!entry) return;
+  const [port, view] = entry;
+  if (!view.pending || view.pending.id !== message.request_id) return;
+  const outcome = message.outcome;
+  if (!outcome || !['ready', 'failed'].includes(outcome.status) || encoder.encode(JSON.stringify(outcome)).length > 131_072 ||
+      (outcome.status === 'failed' && !boundedNetworkText(outcome.message, 4096)) ||
+      (outcome.status === 'ready' && (!outcome.snapshot || !boundedNetworkText(outcome.snapshot.revision, 128) ||
+        !Array.isArray(outcome.snapshot.chains) || outcome.snapshot.chains.length > 68))) return;
+  clearTimeout(view.pending.timer);
+  view.pending = null;
+  // Do not cache this result, spread it into uiSnapshot, or broadcast it to other views.
+  try { port.postMessage({ type: 'chain_editor', editor_token: view.token, generation: view.generation, outcome }); }
+  catch { closeChainEditor(port); }
+}
+
 function publishSnapshot(snapshot, authoritative = true) {
   if (!receiveNetworkResults(snapshot)) return;
+  if (snapshot.chains?.find(chain => chain.id === snapshot.public_view?.selected_chain)?.railgun === false) {
+    lastHomeTab = 'public';
+    for (const port of ports) homeTabs.set(port, 'public');
+  }
+  for (const [port, view] of [...chainEditorViews]) {
+    if (snapshot.locked || snapshot.chain_management_supported !== true || snapshot.generation !== view.generation) closeChainEditor(port, false);
+  }
   for (const [port, picker] of privatePickers) {
     if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
         !snapshot.public_view?.drafts?.some(draft => draft.draft_id === picker.draft_id && draft.revision === picker.revision &&
@@ -285,7 +361,7 @@ function publishSnapshot(snapshot, authoritative = true) {
   uiSnapshot = presentation;
   updateRequestAttention(authoritative);
   for (const port of ports) {
-    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
+    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); closeChainEditor(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
   }
 }
 function snapshotFor(port) {
@@ -518,6 +594,7 @@ async function receive(session, bytes) {
       publish(status);
       return;
     }
+    if (message.type === 'chain_editor') { receiveChainEditor(session, message); return; }
     if (message.type === 'ui_snapshot') {
       if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
           !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
@@ -700,6 +777,7 @@ chrome.runtime.onConnect.addListener(port => {
   port.onDisconnect.addListener(() => {
     if (unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); }
     closeNetworkView(port);
+    closeChainEditor(port);
     const picker = privatePickers.get(port);
     privatePickers.delete(port);
     const session = owner?.candidate;
@@ -735,13 +813,14 @@ chrome.runtime.onConnect.addListener(port => {
       return;
     }
     if (message.type === 'network') { networkCommand(port, message); return; }
+    if (message.type === 'chain_editor') { chainEditorCommand(port, message); return; }
     if (message.type === 'home_tab' || message.type === 'private_view') {
       const session = owner?.candidate;
       if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
           message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
           uiSnapshot.private_view_supported !== true) return;
       if (message.type === 'home_tab') {
-        if (!['private', 'public'].includes(message.value)) return;
+        if (!['private', 'public'].includes(message.value) || (message.value === 'private' && uiSnapshot.chains?.find(chain => chain.id === uiSnapshot.public_view?.selected_chain)?.railgun === false)) return;
         lastHomeTab = message.value;
         homeTabs.set(port, message.value);
         port.postMessage(snapshotFor(port));

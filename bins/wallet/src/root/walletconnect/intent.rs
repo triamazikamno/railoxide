@@ -10,10 +10,7 @@ use wallet_ops::{
 };
 
 use crate::assets::WalletIconSource;
-use crate::root::{
-    format_native_token_amount_for_display, format_token_amount_for_display,
-    native_token_display_label, token_display_metadata,
-};
+use crate::root::{format_token_amount_for_display, token_display_metadata};
 
 use super::{
     WalletConnectRequestUi, fee::WalletConnectFeeStatus,
@@ -398,6 +395,7 @@ pub(super) struct WalletConnectPeerProvenance {
 pub(super) struct WalletConnectIntentView<'a> {
     pub(super) action: WalletConnectIntentAction,
     pub(super) chain_id: u64,
+    pub(super) native_currency: railgun_ui::NativeCurrency,
     pub(super) hero: WalletConnectHero,
     pub(super) amount: WalletConnectAmount,
     pub(super) icon: Option<WalletIconSource>,
@@ -415,7 +413,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     request: &'a WalletConnectRequestUi,
     context: WalletConnectIntentContext<'_>,
 ) -> WalletConnectIntentView<'a> {
-    let selected_account = request.item.account;
+    let selected_account = request.item.account.expect("account-bound intent");
     let mut chain_id = context.chain.chain_id;
     let mut amount = WalletConnectAmount::None;
     let mut icon = None;
@@ -493,10 +491,15 @@ pub(super) fn build_walletconnect_intent<'a>(
             action = WalletConnectIntentAction::AccountRequest;
             hero_summary = WalletConnectHeroSummary::None;
         }
-        WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
+        WalletConnectParsedRequest::WalletAddEthereumChain {
+            chain_id,
+            definition,
+            ..
+        } => {
             action = WalletConnectIntentAction::ChainAdd;
-            hero_summary = WalletConnectHeroSummary::Policy(format!(
-                "Use saved configuration for chain {chain_id}"
+            hero_summary = WalletConnectHeroSummary::Policy(definition.as_ref().map_or_else(
+                || format!("Use saved configuration for chain {chain_id}"),
+                |chain| format!("Add {} ({chain_id})", chain.name),
             ));
         }
         WalletConnectParsedRequest::WalletWatchAsset { address, .. } => {
@@ -530,6 +533,7 @@ pub(super) fn build_walletconnect_intent<'a>(
     let usd_context = amount.usd().map(ToOwned::to_owned);
     let authorization = authorization_projection(action, &hero, &amount);
     WalletConnectIntentView {
+        native_currency: context.chain.native_currency.clone(),
         action,
         chain_id,
         hero,
@@ -737,7 +741,7 @@ fn resolve_transaction(
         parties: Vec::new(),
         risks: Vec::new(),
     };
-    let selected_account = request.item.account;
+    let selected_account = request.item.account.expect("account-bound intent");
 
     let Some(kind) = decoded.map(|decoded| &decoded.kind) else {
         if resolved.attached_native.is_some() {
@@ -784,11 +788,8 @@ fn resolve_transaction(
             resolved.action = WalletConnectIntentAction::NativeTransfer;
             resolved.amount = WalletConnectAmount::Native {
                 raw: native_value,
-                symbol: native_token_display_label(context.chain.chain_id).to_owned(),
-                display: format_native_token_amount_for_display(
-                    context.chain.chain_id,
-                    native_value,
-                ),
+                symbol: context.chain.native_currency.symbol.clone(),
+                display: context.chain.native_currency.format_amount(native_value),
                 usd: context
                     .anchor_rates
                     .cached_native_usd_micro_value(context.chain.chain_id, native_value)
@@ -1130,8 +1131,8 @@ fn resolve_token_amount(
 fn native_amount(context: WalletConnectIntentContext<'_>, raw: U256) -> WalletConnectNativeAmount {
     WalletConnectNativeAmount {
         raw,
-        symbol: native_token_display_label(context.chain.chain_id).to_owned(),
-        display: format_native_token_amount_for_display(context.chain.chain_id, raw),
+        symbol: context.chain.native_currency.symbol.clone(),
+        display: context.chain.native_currency.format_amount(raw),
         usd: context
             .anchor_rates
             .cached_native_usd_micro_value(context.chain.chain_id, raw)
@@ -1158,8 +1159,6 @@ fn is_trusted_wrapped_native(config: &EffectiveChainConfig, target: Option<Addre
     };
     config
         .wrapped_native_token
-        .as_deref()
-        .and_then(|address| address.parse::<Address>().ok())
         .is_some_and(|wrapped| wrapped == target)
 }
 
@@ -1379,11 +1378,7 @@ mod tests {
     use crate::root::dapp_request::{DappRequestBinding, DappSessionIdentity};
     use serde_json::json;
     use std::collections::BTreeMap;
-    use std::time::Duration;
-    use wallet_ops::RpcChainRoute;
-    use wallet_ops::settings::{
-        EffectiveChainGasSettings, EffectiveTokenInfo, IndexedArtifactSourceModeSetting,
-    };
+    use wallet_ops::settings::EffectiveTokenInfo;
     use wallet_ops::vault::{
         PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletConnectPeerMetadata,
     };
@@ -1677,36 +1672,15 @@ mod tests {
     use wallet_ops::{WalletConnectEvmTransaction, WalletConnectPendingRequest};
 
     fn chain(wrapped_native_token: Option<&str>) -> EffectiveChainConfig {
-        EffectiveChainConfig {
-            chain_id: 1,
-            enabled: true,
-            rpc_route: RpcChainRoute::new(1, Vec::<reqwest::Url>::new()),
-            sponsored_bundle_relays: Vec::new(),
-            archive_rpc_url: None,
-            quick_sync_enabled: false,
-            quick_sync_endpoint: None,
-            indexed_artifact_source_mode: IndexedArtifactSourceModeSetting::default(),
-            indexed_artifact_source: None,
-            indexed_wallet_block_range: 0,
-            deployment_block: 0,
-            v2_start_block: 0,
-            legacy_shield_block: 0,
-            archive_until_block: 0,
-            railgun_contract: String::new(),
-            relay_adapt_contract: String::new(),
-            relay_adapt_7702_contract: String::new(),
-            wrapped_native_token: wrapped_native_token.map(ToOwned::to_owned),
-            coinbase_payer: None,
-            finality_depth: 0,
-            block_time: Duration::ZERO,
-            block_range: None,
-            poll_interval_secs: None,
-            gas: EffectiveChainGasSettings {
-                gas_limit_buffer: 0,
-                gas_price_buffer_numerator: 0,
-                gas_price_buffer_denominator: 1,
-            },
-        }
+        let mut chain = wallet_ops::settings::build_effective_chain_configs(
+            &wallet_ops::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        chain.wrapped_native_token = wrapped_native_token.map(|value| value.parse().unwrap());
+        chain
     }
 
     fn context<'a>(
@@ -1738,9 +1712,11 @@ mod tests {
             key: "session-topic:7".to_owned(),
             review_token: 1,
             binding: DappRequestBinding {
-                public_account_uuid: "public-account".to_owned(),
-                public_account_scope: PublicAccountScope::Global,
-                owning_private_wallet_uuid: None,
+                account: Some(super::super::DappRequestAccount {
+                    public_account_uuid: "public-account".to_owned(),
+                    public_account_scope: PublicAccountScope::Global,
+                    owning_private_wallet_uuid: None,
+                }),
                 peer_name: "Aave".to_owned(),
                 peer_url: "https://app.aave.com".to_owned(),
             },
@@ -1752,12 +1728,12 @@ mod tests {
                 dapp_name: "Aave".to_owned(),
                 chain_id: "eip155:1".to_owned(),
                 method,
-                account,
+                account: Some(account),
                 decoded_transaction,
                 raw_details: json!({}),
                 expiry_timestamp: Some(1_700_000_300),
             },
-            account_source: PublicAccountSource::Imported,
+            account_source: Some(PublicAccountSource::Imported),
         }
     }
 
@@ -1905,7 +1881,7 @@ mod tests {
             ),
             U256::from(1),
         );
-        assert_eq!(native.symbol, native_token_display_label(1));
+        assert_eq!(native.symbol, "ETH");
         assert!(native.usd.is_none());
     }
 

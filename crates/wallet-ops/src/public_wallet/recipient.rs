@@ -17,7 +17,7 @@ use crate::{
 /// with ENSIP-15 normalization, while submitting the single read with a wallet origin.
 pub async fn resolve_public_ens_recipient(
     name: &str,
-    ethereum: Option<&EffectiveChainConfig>,
+    ethereum: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Address> {
     let normalized = ens_normalize_rs::normalize(name).map_err(|_| eyre!("Invalid ENS name"))?;

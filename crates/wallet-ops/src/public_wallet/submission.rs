@@ -723,17 +723,17 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
     if rpc_reads.is_some() && profile != PublicShieldTransactionProfile::Railoxide {
         return Err(eyre!("admitted dapp reads require the Railoxide transaction profile").into());
     }
-    let quote = if mode.needs_fee_quote(gas_fee)
-        && (profile != PublicShieldTransactionProfile::Railway || railway_auto)
+    let quote = if profile == PublicShieldTransactionProfile::Railoxide
+        || (mode.needs_fee_quote(gas_fee) && railway_auto)
     {
         Some(
             match rpc_reads {
                 Some(reads) => {
-                    crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
+                    super::gas::public_action_gas_fee_quote_from_rpc_pool_with_reads(
                         query_rpc_pool,
                         network_mode,
-                        super::gas::public_action_tip_fallback(chain_id),
-                        Some((reads, chain_id)),
+                        chain_id,
+                        Some(reads),
                     )
                     .await
                 }
@@ -857,7 +857,7 @@ async fn public_action_preflight(
         }
         .wrap_err("fetch public action nonce")?
     };
-    let tx_req = if profile.uses_legacy_envelope(chain_id) {
+    let tx_req = if super::gas::public_action_uses_legacy_envelope(chain_id, profile, quote) {
         public_action_legacy_transaction_request(
             base_tx_req,
             chain_id,
@@ -1230,6 +1230,131 @@ mod tests {
     use super::*;
     use crate::PublicTransactionLookup;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn custom_native_preparation_signs_observed_envelope_with_reviewed_bounds() {
+        use crate::settings::{
+            CustomChainSettings, NativeCurrency, WalletSettings, build_effective_chain_configs,
+        };
+        use alloy::consensus::{Transaction, TxEnvelope};
+        use alloy::eips::Decodable2718;
+
+        const CHAIN: u64 = 9_007_199_254_740_993;
+        let mut settings = WalletSettings::default();
+        settings.chains.custom.insert(
+            CHAIN,
+            CustomChainSettings {
+                name: "Custom EVM".into(),
+                native_currency: NativeCurrency {
+                    name: "Custom".into(),
+                    symbol: "CSTM".into(),
+                    decimals: 6,
+                },
+                rpc_endpoints: vec!["http://127.0.0.1:9".into()],
+                explorer_urls: vec![],
+                enabled: true,
+                contracts: crate::settings::ChainContractSettings::default(),
+                finality_depth: None,
+                gas: crate::settings::ChainGasSettings::default(),
+            },
+        );
+        let chain = build_effective_chain_configs(&settings)
+            .unwrap()
+            .get(CHAIN)
+            .cloned()
+            .unwrap();
+        let amount =
+            crate::parse_send_amount("1.25", Some(chain.native_currency.decimals)).unwrap();
+        assert_eq!(chain.native_currency.format_amount(amount), "1.25 CSTM");
+        assert!(chain.railgun.is_none() && chain.wrapped_native_token.is_none());
+        let http = HttpContext::direct_for_tests();
+        let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+        let signer = VaultedPublicSigner::Software(
+            crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
+        );
+        let from = signer.address();
+        for (base_fee, failed_header, estimated_gas) in [
+            (None, false, 42_000),
+            (Some(5), false, 42_000),
+            (None, true, 42_000),
+            (Some(5), false, 50_001),
+        ] {
+            let reads = crate::DappRpcReadClient::new(move |_, read| {
+                Box::pin(async move {
+                    Ok(match read.method() {
+                        "eth_getBlockByNumber" if failed_header => {
+                            return Err(crate::RpcBrokerError::InvalidResponse);
+                        }
+                        "eth_getBlockByNumber" => {
+                            let mut block: alloy::rpc::types::Block =
+                                alloy::rpc::types::Block::default();
+                            block.header.inner.base_fee_per_gas = base_fee;
+                            serde_json::to_value(block).unwrap()
+                        }
+                        "eth_gasPrice" => json!("0x64"),
+                        "eth_maxPriorityFeePerGas" => json!("0x2"),
+                        "eth_feeHistory" => return Err(crate::RpcBrokerError::InvalidResponse),
+                        "eth_getTransactionCount" => json!("0x7"),
+                        "eth_getBalance" => json!("0x100000000"),
+                        "eth_estimateGas" => json!(format!("0x{estimated_gas:x}")),
+                        method => panic!("unexpected read {method}"),
+                    })
+                })
+            });
+            let prepared = public_action_preflight_from_rpc_pool_with_mode_and_reads(
+                &pool,
+                crate::WalletNetworkMode::Direct,
+                CHAIN,
+                from,
+                TransactionRequest::default()
+                    .with_to(Address::repeat_byte(2))
+                    .with_value(amount),
+                PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: 100,
+                    max_priority_fee_per_gas: 2,
+                },
+                &chain.gas,
+                PublicShieldTransactionProfile::Railoxide,
+                PublicActionGasLimitStrategy::ChainBuffer,
+                Some(50_000),
+                None,
+                None,
+                PublicActionPreflightMode::Managed,
+                None,
+                false,
+                Some(&reads),
+            )
+            .await;
+            if failed_header || estimated_gas > 50_000 {
+                assert!(
+                    prepared.is_err(),
+                    "failed observation or exceeded review must prevent signing"
+                );
+                continue;
+            }
+            let prepared = prepared.unwrap();
+            let exposure = prepared.estimated_native_gas_cost;
+            let signed = signer
+                .sign_transaction_request(prepared.tx_req, "custom native test")
+                .await
+                .unwrap();
+            let envelope = TxEnvelope::decode_2718(&mut signed.as_slice()).unwrap();
+            assert_eq!(envelope.chain_id(), Some(CHAIN));
+            assert_eq!(envelope.value(), U256::from(1_250_000));
+            assert_eq!(envelope.gas_limit(), 50_000);
+            assert_eq!(envelope.max_fee_per_gas(), 100);
+            assert_eq!(
+                envelope.value()
+                    + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas()),
+                exposure
+            );
+            assert_eq!(
+                matches!(envelope, TxEnvelope::Legacy(_)),
+                base_fee.is_none()
+            );
+            assert_eq!(envelope.max_priority_fee_per_gas(), base_fee.map(|_| 2));
+        }
+    }
 
     #[tokio::test]
     async fn broadcast_handoff_retains_ambiguous_attempt_before_replacement() {

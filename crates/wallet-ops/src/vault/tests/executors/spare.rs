@@ -275,7 +275,8 @@ fn chain(rpc: &Rpc) -> crate::settings::EffectiveChainConfig {
     let mut chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     chain.finality_depth = 1;
     chain.rpc_route =

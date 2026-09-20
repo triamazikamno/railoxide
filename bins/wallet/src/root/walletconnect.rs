@@ -51,7 +51,7 @@ use wallet_ops::{
     is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required,
     negotiate_walletconnect_namespaces_with_account_support, parse_walletconnect_session_request,
     reject_walletconnect_session_proposal,
-    settings::EffectiveChainConfig,
+    settings::{EffectiveChainConfig, EffectiveChainRegistry},
     start_walletconnect_pairing, submit_walletconnect_send_transaction,
     validate_walletconnect_session_request_with_account_support,
     vault::{
@@ -83,8 +83,8 @@ use super::{
 };
 
 use super::dapp_request::{
-    DappApprovalTaskError, DappRequestBinding, DappRequestError, DappRequestRoute, DappRequestUi,
-    DappResponseSender, DappSessionIdentity,
+    DappApprovalTaskError, DappRequestAccount, DappRequestBinding, DappRequestError,
+    DappRequestRoute, DappRequestUi, DappResponseSender, DappSessionIdentity,
 };
 
 mod account_select;
@@ -780,9 +780,11 @@ impl WalletConnectRequestRoute {
 impl DappRequestBinding {
     fn from_walletconnect_session(session: &WalletConnectSessionRecord) -> Self {
         Self {
-            public_account_uuid: session.selected_public_account_uuid.clone(),
-            public_account_scope: session.selected_public_account_scope.clone(),
-            owning_private_wallet_uuid: session.owning_private_wallet_uuid.clone(),
+            account: Some(DappRequestAccount {
+                public_account_uuid: session.selected_public_account_uuid.clone(),
+                public_account_scope: session.selected_public_account_scope.clone(),
+                owning_private_wallet_uuid: session.owning_private_wallet_uuid.clone(),
+            }),
             peer_name: session.peer_metadata.name.clone(),
             peer_url: session.peer_metadata.url.clone(),
         }
@@ -979,7 +981,7 @@ fn walletconnect_request_uses_hardware_typed_data_hash_fallback(
     request: &WalletConnectRequestUi,
     mode: HardwareTypedDataSigningMode,
 ) -> bool {
-    request.account_source == PublicAccountSource::HardwareDerived
+    request.account_source == Some(PublicAccountSource::HardwareDerived)
         && matches!(
             request.item.method,
             WalletConnectSupportedMethod::EthSignTypedData

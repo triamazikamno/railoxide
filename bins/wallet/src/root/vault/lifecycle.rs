@@ -966,8 +966,7 @@ impl WalletRoot {
 
     pub(super) fn enabled_chain_ids_for_created_wallet(&self) -> BTreeSet<u64> {
         self.effective_chain_configs
-            .values()
-            .filter(|chain| chain.enabled)
+            .railgun_chains()
             .map(|chain| chain.chain_id)
             .collect()
     }

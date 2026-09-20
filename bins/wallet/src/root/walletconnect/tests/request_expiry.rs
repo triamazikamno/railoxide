@@ -46,7 +46,7 @@ fn send_transaction_approval_does_not_use_expiry_timeout_after_authorization() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.parsed = WalletConnectParsedRequest::EthSendTransaction {
         transaction: WalletConnectEvmTransaction {
-            from: request.item.account,
+            from: request.item.account.unwrap(),
             to: None,
             value: None,
             data: None,
@@ -63,7 +63,7 @@ fn send_transaction_approval_does_not_use_expiry_timeout_after_authorization() {
     };
     let personal_sign = WalletConnectParsedRequest::PersonalSign {
         message: "0x68656c6c6f".to_owned(),
-        account: request.item.account,
+        account: request.item.account.unwrap(),
     };
 
     assert!(!walletconnect_request_approval_uses_expiry_timeout(
@@ -137,7 +137,12 @@ async fn expired_approval_task_publishes_expired_response() {
     ));
     let mut request =
         test_walletconnect_request("session-topic:expired", Some(current_unix_seconds()));
-    request.binding.public_account_uuid = "public-account".to_owned();
+    request
+        .binding
+        .account
+        .as_mut()
+        .unwrap()
+        .public_account_uuid = "public-account".to_owned();
     let request_id = request.item.id;
     let session = test_walletconnect_session("session-topic");
     let session_topic = session.session_topic.clone();
@@ -165,7 +170,13 @@ async fn expired_approval_task_publishes_expired_response() {
             None,
             None,
             None,
-            None,
+            wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap(),
             None,
             response_sender,
             http,

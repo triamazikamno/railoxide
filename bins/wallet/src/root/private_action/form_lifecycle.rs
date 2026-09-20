@@ -1416,7 +1416,9 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let chain_id = key.chain_id;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let refresh_id = match kind {
             DeliveryFormKind::Send => {
                 let Some(form) = self.send_forms.get_mut(&key) else {
@@ -1448,8 +1450,7 @@ impl WalletRoot {
         let http = self.http.clone();
         cx.spawn(async move |this, cx| {
             let result =
-                quote_desktop_self_broadcast_gas_fee(chain_id, effective_chain.as_ref(), &http)
-                    .await;
+                quote_desktop_self_broadcast_gas_fee(chain_id, &effective_chain, &http).await;
             let _ = this.update(cx, |root, cx| {
                 let gas_fee = match kind {
                     DeliveryFormKind::Send => root

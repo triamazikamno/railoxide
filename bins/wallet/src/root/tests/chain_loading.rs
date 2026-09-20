@@ -433,27 +433,41 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
     let mut lifecycle = WalletSyncLifecycle::new();
     let registration = lifecycle.prepare_startup(1);
     assert!(registration.session_store.set(Arc::clone(&store)).is_ok());
-    let session = store
-        .start_view_wallet_session_immediate(
-            wallet_ops::ViewWalletChainSessionRequest {
-                view_session,
-                wallet_scope_generation: registration.generation,
-                chain_id: 1,
-                effective_chain: None,
-                sync_start_policy:
-                    wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
-                init_block_number: Some(0),
-                sync_to_block: Some(0),
-                use_indexed_wallet_catch_up: false,
-                poi_read_source: poi_policy,
-                rewind_wallet_cache: false,
-                progress_tx: None,
+    let session = Box::pin(store.start_view_wallet_session_immediate(
+        wallet_ops::ViewWalletChainSessionRequest {
+            view_session,
+            wallet_scope_generation: registration.generation,
+            chain_id: 1,
+            effective_chain: {
+                let mut chain = wallet_ops::settings::build_effective_chain_configs(
+                    &wallet_ops::settings::WalletSettings::default(),
+                )
+                .unwrap()
+                .get(1)
+                .cloned()
+                .unwrap();
+                chain.rpc_route = wallet_ops::RpcChainRoute::new(
+                    1,
+                    vec![reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")],
+                );
+                let private = chain.railgun.as_mut().unwrap();
+                private.archive_rpc_url = None;
+                private.sync.quick_sync_endpoint = None;
+                private.sync.indexed_artifact_source = None;
+                chain
             },
-            Some(reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")),
-            &http,
-        )
-        .await
-        .expect("register chain and wallet session");
+            sync_start_policy: wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+            init_block_number: Some(0),
+            sync_to_block: Some(0),
+            use_indexed_wallet_catch_up: false,
+            poi_read_source: poi_policy,
+            rewind_wallet_cache: false,
+            progress_tx: None,
+        },
+        &http,
+    ))
+    .await
+    .expect("register chain and wallet session");
     let mut observation_rx = session.observation_rx.clone();
     let initial_observation = observation_rx.borrow_and_update().clone();
     assert_eq!(initial_observation.snapshot.chain_id, 1);
@@ -939,27 +953,42 @@ async fn installed_chain_state_must_be_released_before_sync_manager_replacement(
     let registration = lifecycle.prepare_startup(1);
     assert!(registration.session_store.set(Arc::clone(&store)).is_ok());
     let session = Arc::new(
-        store
-            .start_view_wallet_session_immediate(
-                wallet_ops::ViewWalletChainSessionRequest {
-                    view_session,
-                    wallet_scope_generation: registration.generation,
-                    chain_id: 1,
-                    effective_chain: None,
-                    sync_start_policy:
-                        wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
-                    init_block_number: Some(0),
-                    sync_to_block: Some(0),
-                    use_indexed_wallet_catch_up: false,
-                    poi_read_source: poi_policy.clone(),
-                    rewind_wallet_cache: false,
-                    progress_tx: None,
+        Box::pin(store.start_view_wallet_session_immediate(
+            wallet_ops::ViewWalletChainSessionRequest {
+                view_session,
+                wallet_scope_generation: registration.generation,
+                chain_id: 1,
+                effective_chain: {
+                    let mut chain = wallet_ops::settings::build_effective_chain_configs(
+                        &wallet_ops::settings::WalletSettings::default(),
+                    )
+                    .unwrap()
+                    .get(1)
+                    .cloned()
+                    .unwrap();
+                    chain.rpc_route = wallet_ops::RpcChainRoute::new(
+                        1,
+                        vec![reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")],
+                    );
+                    let private = chain.railgun.as_mut().unwrap();
+                    private.archive_rpc_url = None;
+                    private.sync.quick_sync_endpoint = None;
+                    private.sync.indexed_artifact_source = None;
+                    chain
                 },
-                Some(reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")),
-                &http,
-            )
-            .await
-            .expect("start wallet session"),
+                sync_start_policy:
+                    wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                init_block_number: Some(0),
+                sync_to_block: Some(0),
+                use_indexed_wallet_catch_up: false,
+                poi_read_source: poi_policy.clone(),
+                rewind_wallet_cache: false,
+                progress_tx: None,
+            },
+            &http,
+        ))
+        .await
+        .expect("start wallet session"),
     );
     let observation = session.observation_rx.borrow().clone();
     let mut chain_state = ChainUtxoState::Ready {

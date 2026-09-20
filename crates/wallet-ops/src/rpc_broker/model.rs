@@ -775,17 +775,31 @@ impl RpcOrigin {
 ///
 /// Equality and hashing compare contents, so independently built equivalent snapshots share
 /// deduplication keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RpcChainRoute {
     chain_id: u64,
     endpoints: Arc<[SensitiveUrl]>,
     multicall: Option<Address>,
+    verify_identity: bool,
+    pub(super) verified_identities: Arc<[(SensitiveUrl, tokio::sync::OnceCell<()>)]>,
 }
+
+impl PartialEq for RpcChainRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain_id == other.chain_id
+            && self.endpoints == other.endpoints
+            && self.multicall == other.multicall
+            && self.verify_identity == other.verify_identity
+    }
+}
+
+impl Eq for RpcChainRoute {}
 
 impl Hash for RpcChainRoute {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.chain_id.hash(state);
         self.multicall.hash(state);
+        self.verify_identity.hash(state);
         for endpoint in self.endpoints.iter() {
             endpoint.expose_url().hash(state);
         }
@@ -796,15 +810,38 @@ impl RpcChainRoute {
     /// Creates a chain route from a chain ID and RPC endpoints.
     #[must_use]
     pub fn new<E: Into<SensitiveUrl>>(chain_id: u64, endpoints: Vec<E>) -> Self {
+        let endpoints: Arc<[SensitiveUrl]> = endpoints
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .into();
+        let verified_identities = endpoints
+            .iter()
+            .map(|endpoint| (endpoint.clone(), tokio::sync::OnceCell::new()))
+            .collect::<Vec<_>>()
+            .into();
         Self {
             chain_id,
-            endpoints: endpoints
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<_>>()
-                .into(),
+            endpoints,
             multicall: None,
+            verify_identity: false,
+            verified_identities,
         }
+    }
+    #[must_use]
+    pub const fn with_identity_verification(mut self) -> Self {
+        self.verify_identity = true;
+        self
+    }
+    pub(crate) const fn requires_identity_verification(&self) -> bool {
+        self.verify_identity
+    }
+    /// Restrict an admitted read while retaining this configuration's verified identities.
+    pub(crate) fn for_endpoint(&self, endpoint: SensitiveUrl) -> Self {
+        debug_assert!(self.endpoints.contains(&endpoint));
+        let mut route = self.clone();
+        route.endpoints = vec![endpoint].into();
+        route
     }
     #[must_use]
     pub const fn with_multicall(mut self, address: Address) -> Self {

@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[non_exhaustive]
 pub struct GatewayPublicView {
     pub selected_account: Option<String>,
+    #[serde(serialize_with = "railgun_ui::chain_id::optional::serialize")]
     pub selected_chain: Option<u64>,
     pub balances: Vec<GatewayAccountBalances>,
     pub refreshing: bool,
@@ -41,6 +42,7 @@ pub struct GatewaySitePermission {
     pub permission_id: String,
     pub origin: String,
     pub account_uuid: String,
+    #[serde(with = "railgun_ui::chain_id")]
     pub chain_id: u64,
 }
 
@@ -55,6 +57,7 @@ pub enum GatewayPublicCommand {
         public_account_uuid: String,
     },
     SelectChain {
+        #[serde(with = "railgun_ui::chain_id")]
         chain_id: u64,
     },
     RefreshBalances,
@@ -80,6 +83,9 @@ pub struct GatewayPendingRequest {
 
 #[derive(Clone)]
 pub enum GatewayUiEventKind {
+    ChainEditor {
+        request: super::GatewayChainEditorRequest,
+    },
     Unlock {
         request: Arc<super::GatewayUnlockRequest>,
     },
@@ -109,6 +115,7 @@ impl GatewayUiEvent {
     #[must_use]
     pub fn is_current(&self, wallet: &GatewayWalletState, generation: u64) -> bool {
         (!matches!(&self.kind, GatewayUiEventKind::Network { request } if !wallet.network_view.as_ref().is_some_and(|view| request.is_current(&view.context_revision))))
+            && (!matches!(&self.kind, GatewayUiEventKind::ChainEditor { request } if !request.is_current()))
             && self.generation == generation
             && self.wallet.same_authority(wallet)
             && (!matches!(self.kind, GatewayUiEventKind::PrivateView { .. })

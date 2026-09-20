@@ -49,12 +49,11 @@ impl WalletRoot {
             self.walletconnect
                 .watch_asset_metadata
                 .insert(key.clone(), None);
-            let endpoint = resolve_effective_chain_rpc_route(
-                chain_id,
-                self.effective_chain_configs.get(&chain_id),
-            )
-            .ok()
-            .and_then(|route| route.endpoints().first().cloned());
+            let endpoint = self
+                .effective_chain_configs
+                .get(chain_id)
+                .and_then(|chain| resolve_effective_chain_rpc_route(chain_id, chain).ok())
+                .and_then(|route| route.endpoints().first().cloned());
             let control = request.request_control.clone().expect("gateway request");
             let review_token = request.review_token;
             let join = self.runtime.spawn(async move {
@@ -119,6 +118,24 @@ impl WalletRoot {
         } else {
             None
         };
+        let mut addition = match &request.parsed {
+            WalletConnectParsedRequest::WalletAddEthereumChain {
+                chain_id,
+                definition: Some(definition),
+                ..
+            } => {
+                let revision = self.settings_editor.as_ref().and_then(|editor| {
+                    wallet_ops::settings::settings_revision(&editor.read(cx).saved).ok()
+                });
+                let Some(revision) = revision else {
+                    self.walletconnect.error = Some(Arc::from("Chain settings are unavailable."));
+                    cx.notify();
+                    return;
+                };
+                Some((*chain_id, definition.clone(), revision))
+            }
+            _ => None,
+        };
         let sender = match self.walletconnect_response_sender(&request, cx) {
             Ok(sender) => sender,
             Err(error) => {
@@ -131,23 +148,47 @@ impl WalletRoot {
         let active_wallet_generation = self.active_wallet_generation;
         self.walletconnect.request_actions.insert(key.clone());
         self.walletconnect.error = None;
-        let begin = self
-            .runtime
-            .spawn(async move { sender.begin_approval().await.map(|()| sender) });
+        let http = self.http.clone();
+        let control = request.request_control.clone();
+        let begin = self.runtime.spawn(async move {
+            sender.begin_approval().await.map_err(|_| {
+                Arc::<str>::from("Approval could not start. Review and confirm again.")
+            })?;
+            if let Some((chain_id, definition, _)) = &mut addition {
+                let verified = if let Some(control) = control {
+                    wallet_ops::gateway::policy::verify_proposed_chain(
+                        &http, &control, *chain_id, definition,
+                    )
+                    .await
+                } else {
+                    Err(wallet_ops::RpcBrokerError::OriginRejected)
+                };
+                let Ok(multicall) = verified else {
+                    let _ = sender.return_to_review().await;
+                    return Err(Arc::from(
+                        "Endpoint verification failed. Check the proposed network and try again.",
+                    ));
+                };
+                definition.contracts.multicall_contract =
+                    multicall.map(|address| address.to_string());
+            }
+            Ok((sender, addition))
+        });
         let runtime = self.runtime.clone();
         cx.spawn_in(window, async move |this, cx| {
             let begun = begin.await;
-            let Ok(Ok(sender)) = begun else {
+            let Ok(Ok((sender, addition))) = begun else {
+                let message = begun.ok().and_then(Result::err).unwrap_or_else(|| {
+                    Arc::from("Approval could not start. Review and confirm again.")
+                });
                 let _ = this.update_in(cx, |root, _, cx| {
                     root.walletconnect.request_actions.remove(&key);
-                    root.walletconnect.error = Some(Arc::from(
-                        "Approval could not start. Review and confirm again.",
-                    ));
+                    root.walletconnect.error = Some(message);
                     cx.notify();
                 });
                 return;
             };
-            let persisted = this.update_in(cx, |root, _, cx| -> Result<(), String> {
+            let persisted = this.update_in(cx, |root, _, cx| {
                 if !root.root_replacement_is_allowed()
                     || !root
                         .walletconnect
@@ -172,6 +213,32 @@ impl WalletRoot {
                         .update(cx, |editor, cx| editor.add_dapp_token(token, control, cx))?;
                     root.effective_token_registry = registry;
                     root.publish_gateway_desktop_state();
+                }
+                if let Some((chain_id, definition, revision)) = addition {
+                    let editor = root
+                        .settings_editor
+                        .clone()
+                        .ok_or("Chain settings are unavailable")?;
+                    let candidate = wallet_ops::settings::ChainMutation::Add {
+                        chain_id,
+                        definition: *definition,
+                    }
+                    .prepare(&editor.read(cx).saved)
+                    .map_err(|error| error.to_string())?;
+                    root.admit_chain_settings(&candidate)?;
+                    request
+                        .request_control
+                        .as_ref()
+                        .ok_or("This request is no longer available")?
+                        .ensure_current()
+                        .map_err(|_| "This request is no longer available")?;
+                    if !root.gateway_chain_publication_available() {
+                        return Err("The browser connection is unavailable".to_owned());
+                    }
+                    editor.update(cx, |editor, cx| {
+                        editor.commit_chain_candidate(revision, candidate.clone(), cx)
+                    })?;
+                    root.apply_saved_request_settings(&candidate, cx);
                 }
                 Ok(())
             });
@@ -208,7 +275,7 @@ impl WalletRoot {
                     && root.active_wallet_generation == active_wallet_generation
                     && root.root_replacement_is_allowed()
                     && root.view_session.is_some()
-                    && root.effective_chain_configs.contains_key(&chain_id)
+                    && root.effective_chain_configs.get(chain_id).is_some()
                 {
                     root.select_chain(chain_id, window, cx);
                 }

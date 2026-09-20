@@ -19,11 +19,12 @@ pub use private_view::{
 };
 mod reads;
 pub use provider::{
-    GatewayAccountChoice, GatewayApprovalRequest, GatewayChainChoice, GatewayConnectPrompt,
-    GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError, GatewayNetworkOperation,
-    GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult, GatewayNetworkStatus,
-    GatewayNetworkView, GatewayPermissionSummary, GatewayUnlockState, GatewayWalletState,
-    GatewayWalletSwitchRequest, GatewayWalletSwitchTransition,
+    GatewayAccountChoice, GatewayApprovalAccount, GatewayApprovalRequest, GatewayChainChoice,
+    GatewayChainEditorCommand, GatewayChainEditorOutcome, GatewayChainEditorRequest,
+    GatewayConnectPrompt, GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError,
+    GatewayNetworkOperation, GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult,
+    GatewayNetworkStatus, GatewayNetworkView, GatewayPermissionSummary, GatewayUnlockState,
+    GatewayWalletState, GatewayWalletSwitchRequest, GatewayWalletSwitchTransition,
 };
 mod private_drafts;
 pub use private_drafts::{
@@ -161,6 +162,11 @@ pub struct GatewayPairingOffer {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayClientMessage {
+    ChainEditor {
+        version: u16,
+        generation: u64,
+        command: GatewayChainEditorCommand,
+    },
     GetUnlockState {
         version: u16,
     },
@@ -229,6 +235,7 @@ pub enum GatewayClientMessage {
         version: u16,
         request_id: String,
         public_account_uuid: Option<String>,
+        #[serde(with = "railgun_ui::chain_id")]
         chain_id: u64,
     },
 }
@@ -236,6 +243,13 @@ pub enum GatewayClientMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayServerMessage {
+    ChainEditor {
+        version: u16,
+        generation: u64,
+        view_id: String,
+        request_id: String,
+        outcome: GatewayChainEditorOutcome,
+    },
     UnlockState {
         version: u16,
         generation: u64,
@@ -285,6 +299,8 @@ pub enum GatewayServerMessage {
         public_view: GatewayPublicView,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         network_control_supported: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        chain_management_supported: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         network_view: Option<Box<GatewayNetworkView>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -313,6 +329,11 @@ pub enum GatewayProviderOutcome {
 }
 
 enum Command {
+    ChainEditorResult(
+        GatewayChainEditorRequest,
+        GatewayChainEditorOutcome,
+        oneshot::Sender<()>,
+    ),
     NetworkResult(GatewayNetworkRequest, GatewayNetworkOutcome),
     Summaries(Box<GatewayWalletState>, u64, Vec<(String, String)>),
     BeginWalletSwitch(
@@ -365,6 +386,22 @@ pub struct GatewayHandle {
 }
 
 impl GatewayHandle {
+    pub async fn complete_chain_editor_request(
+        &self,
+        request: GatewayChainEditorRequest,
+        outcome: GatewayChainEditorOutcome,
+    ) {
+        let (done, receive) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::ChainEditorResult(request, outcome, done))
+            .await
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
     pub async fn complete_network_request(
         &self,
         request: GatewayNetworkRequest,

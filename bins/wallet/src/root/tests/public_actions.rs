@@ -114,6 +114,7 @@ fn advanced_public_send_hardware_warning_is_added() {
 #[test]
 fn railway_bnb_auto_authorization_binds_rpc_gas_price_as_legacy_fee() {
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: None,
         rpc_gas_price: 7,
         current_base_fee_per_gas: Some(5),
         suggested_max_fee_per_gas: 12,

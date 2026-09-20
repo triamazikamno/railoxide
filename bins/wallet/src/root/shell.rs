@@ -252,6 +252,9 @@ pub(crate) fn open_wallet_window(
 
 impl WalletRoot {
     pub(super) fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
+        if tab != WalletTab::Public && !self.selected_chain_has_railgun() {
+            return;
+        }
         if self.active_wallet_tab == tab {
             return;
         }
@@ -334,6 +337,13 @@ impl Render for WalletRoot {
         };
 
         div()
+            .when(self.settings_editor.is_some(), |this| {
+                this.on_action(cx.listener(
+                    |this, action: &ui::chain_select::EditChain, window, cx| {
+                        this.open_chain_editor(action.chain_id, window, cx);
+                    },
+                ))
+            })
             .relative()
             .size_full()
             .flex()
@@ -850,8 +860,8 @@ impl WalletRoot {
     fn balances_status_for_state(&self, state: &ChainUtxoState) -> PresenceStatus {
         let Some(block_time) = self
             .effective_chain_configs
-            .get(&self.selected_chain)
-            .map(|chain| chain.block_time)
+            .get(self.selected_chain)
+            .and_then(|chain| chain.block_time)
         else {
             return PresenceStatus::Unknown;
         };
@@ -1075,6 +1085,10 @@ impl WalletRoot {
             })
             .children(WalletTab::ALL.into_iter().map(|tab| {
                 Tab::new()
+                    .disabled(tab != WalletTab::Public && !self.selected_chain_has_railgun())
+                    .when(tab != WalletTab::Public && !self.selected_chain_has_railgun(), |tab| {
+                        tab.tooltip(|window, cx| Tooltip::new("This chain supports Public accounts only; no Railgun deployment is configured.").build(window, cx))
+                    })
                     .min_w(px(92.0))
                     .label(tab.label())
                     .prefix(
@@ -1253,8 +1267,8 @@ impl Render for BalancesStatusHoverCard {
             let chain_id = root.selected_chain;
             let block_time = root
                 .effective_chain_configs
-                .get(&chain_id)
-                .map(|chain| chain.block_time);
+                .get(chain_id)
+                .and_then(|chain| chain.block_time);
             let state = root.chain_states.get(&chain_id);
             let counts = root.wallet_status_counts(
                 state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),

@@ -740,14 +740,14 @@ impl WalletRoot {
         let selected_chain = self.selected_chain;
         let effective_chains = self
             .effective_chain_configs
-            .values()
-            .filter(|chain| chain.enabled)
+            .railgun_chains()
             .cloned()
             .collect::<Vec<_>>();
         let http = self.http.clone();
         let join = self.runtime.spawn(async move {
             let mut chains = Vec::with_capacity(effective_chains.len());
             for effective_chain in effective_chains {
+                let private = effective_chain.require_railgun()?;
                 let current_safe_head = if intent == SoftwareContextSyncIntent::CreateNew {
                     Some(wallet_ops::fetch_current_safe_head(&effective_chain, &http).await?)
                 } else {
@@ -755,7 +755,7 @@ impl WalletRoot {
                 };
                 if creation_chain_baseline(
                     intent,
-                    effective_chain.deployment_block,
+                    private.deployment.deployment_block,
                     current_safe_head,
                 )
                 .is_none()
@@ -767,8 +767,8 @@ impl WalletRoot {
                 chains.push(SoftwareContextChainInput {
                     chain_type: 0,
                     chain_id: effective_chain.chain_id,
-                    contract: effective_chain.railgun_contract,
-                    deployment_block: effective_chain.deployment_block,
+                    contract: private.deployment.contract.to_string(),
+                    deployment_block: private.deployment.deployment_block,
                     current_safe_head,
                 });
             }

@@ -100,6 +100,13 @@ impl WalletRoot {
             }
         }
         presentation.selected_chain = Some(self.selected_chain);
+        if !self.selected_chain_has_railgun() {
+            presentation.receive_address = None;
+            presentation.selection_message = Some(
+                "Private balances and Shield are unavailable on public-only chains".to_owned(),
+            );
+            return presentation;
+        }
         presentation.selection_message = self.gateway.private_selection_message.map(str::to_owned);
         if self.wallet_switch_loading_generation == Some(self.wallet_switch_generation) {
             presentation.selection_message = Some("Switching wallet…".into());

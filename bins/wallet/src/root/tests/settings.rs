@@ -10,10 +10,7 @@ use crate::root::settings::{
 };
 use crate::root::startup::tor_bootstrap_recovery_is_current;
 use wallet_ops::WalletNetworkProgressStage;
-use wallet_ops::settings::{
-    IndexedArtifactSettings, IndexedArtifactSourceModeSetting,
-    default_sponsored_bundle_relay_endpoints,
-};
+use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
 
 #[test]
 fn private_tab_is_default_wallet_tab() {
@@ -204,12 +201,18 @@ fn startup_settings_invalid_record_is_recoverable_error() {
 
 #[test]
 fn startup_initial_chain_restores_enabled_remembered_chain() {
-    assert_eq!(resolve_initial_chain_id(&[1, 56, 137], Some(137)), 137);
+    assert_eq!(
+        resolve_initial_chain_id(&[1, 9_007_199_254_740_993], Some(9_007_199_254_740_993)),
+        9_007_199_254_740_993
+    );
 }
 
 #[test]
 fn startup_initial_chain_falls_back_when_remembered_chain_disabled() {
-    assert_eq!(resolve_initial_chain_id(&[1, 56], Some(137)), 1);
+    assert_eq!(
+        resolve_initial_chain_id(&[1, 56], Some(9_007_199_254_740_993)),
+        1
+    );
 }
 
 #[test]
@@ -612,125 +615,6 @@ fn waku_direct_peer_settings_mutations_update_rows() {
 }
 
 #[test]
-fn chain_rpc_settings_display_presets_until_customized() {
-    let settings = WalletSettings::default();
-    for chain_id in railgun_ui::DEFAULT_CHAINS {
-        assert_eq!(
-            display_chain_rpc_endpoints(&settings, *chain_id),
-            default_chain_rpc_endpoints(*chain_id).expect("supported chain preset")
-        );
-        assert!(
-            settings
-                .chains
-                .per_chain
-                .get(chain_id)
-                .is_some_and(|chain| chain.rpc_endpoints.is_empty())
-        );
-    }
-
-    let mut custom = settings;
-    custom.chains.per_chain.entry(1).or_default().rpc_endpoints = vec![
-        "https://rpc-one.example".to_string(),
-        "https://rpc-two.example".to_string(),
-    ];
-
-    assert_eq!(
-        display_chain_rpc_endpoints(&custom, 1),
-        vec![
-            "https://rpc-one.example".to_string(),
-            "https://rpc-two.example".to_string()
-        ]
-    );
-}
-
-#[test]
-fn chain_rpc_settings_mutations_materialize_presets() {
-    let mut settings = WalletSettings::default();
-    let defaults = default_chain_rpc_endpoints(1).expect("supported chain preset");
-
-    set_chain_rpc_endpoint(&mut settings, 1, 0, " https://custom-rpc.example ");
-    let endpoints = &settings
-        .chains
-        .per_chain
-        .get(&1)
-        .expect("chain settings")
-        .rpc_endpoints;
-    assert_eq!(endpoints.len(), defaults.len());
-    assert_eq!(endpoints[0], "https://custom-rpc.example");
-
-    add_chain_rpc_endpoint(&mut settings, 1, " https://added-rpc.example ");
-    let endpoints = &settings
-        .chains
-        .per_chain
-        .get(&1)
-        .expect("chain settings")
-        .rpc_endpoints;
-    assert_eq!(endpoints.len(), defaults.len() + 1);
-    assert_eq!(endpoints.last().unwrap(), "https://added-rpc.example");
-
-    remove_chain_rpc_endpoint(&mut settings, 1, 1);
-    assert_eq!(
-        settings
-            .chains
-            .per_chain
-            .get(&1)
-            .expect("chain settings")
-            .rpc_endpoints
-            .len(),
-        defaults.len()
-    );
-}
-
-#[test]
-fn chain_rpc_settings_remove_default_creates_custom_override() {
-    let mut settings = WalletSettings::default();
-    let defaults = default_chain_rpc_endpoints(1).expect("supported chain preset");
-
-    remove_chain_rpc_endpoint(&mut settings, 1, 0);
-
-    let expected = defaults.into_iter().skip(1).collect::<Vec<_>>();
-    assert_eq!(display_chain_rpc_endpoints(&settings, 1), expected);
-}
-
-#[test]
-fn sponsored_relay_settings_preserve_default_override_and_disabled_states() {
-    let mut settings = WalletSettings::default();
-    let defaults = default_sponsored_bundle_relay_endpoints(1);
-    assert_eq!(display_sponsored_bundle_relays(&settings, 1), defaults);
-    assert_eq!(
-        settings
-            .chains
-            .per_chain
-            .get(&1)
-            .expect("ethereum settings")
-            .sponsored_bundle_relays,
-        None
-    );
-
-    set_sponsored_bundle_relay(&mut settings, 1, 0, " https://custom-relay.example ");
-    assert_eq!(
-        display_sponsored_bundle_relays(&settings, 1)[0],
-        "https://custom-relay.example"
-    );
-    while !display_sponsored_bundle_relays(&settings, 1).is_empty() {
-        remove_sponsored_bundle_relay(&mut settings, 1, 0);
-    }
-    assert_eq!(
-        display_sponsored_bundle_relays(&settings, 1),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        settings
-            .chains
-            .per_chain
-            .get(&1)
-            .expect("ethereum settings")
-            .sponsored_bundle_relays,
-        Some(Vec::new())
-    );
-}
-
-#[test]
 fn poi_gateway_settings_mutations_update_direct_list() {
     let mut settings = WalletSettings::default();
     settings.poi.artifact.gateway_urls = vec![
@@ -795,94 +679,6 @@ fn indexed_artifact_custom_settings_only_show_for_custom_mode() {
     assert!(should_show_indexed_artifact_custom_settings(
         IndexedArtifactSourceModeSetting::Custom
     ));
-}
-
-#[test]
-fn chain_quick_sync_setting_displays_preset_until_customized() {
-    let settings = WalletSettings::default();
-    for chain_id in railgun_ui::DEFAULT_CHAINS {
-        assert_eq!(
-            display_chain_quick_sync_endpoint(&settings, *chain_id),
-            default_chain_quick_sync_endpoint(*chain_id).unwrap_or_default()
-        );
-    }
-
-    let mut custom = settings;
-    custom
-        .chains
-        .per_chain
-        .entry(1)
-        .or_default()
-        .quick_sync
-        .endpoint = Some("https://quick.example/graphql".to_string());
-
-    assert_eq!(
-        display_chain_quick_sync_endpoint(&custom, 1),
-        "https://quick.example/graphql"
-    );
-}
-
-#[test]
-fn chain_contract_settings_display_presets_until_customized() {
-    let settings = WalletSettings::default();
-    for chain_id in railgun_ui::DEFAULT_CHAINS {
-        assert_eq!(
-            display_chain_contract_settings(&settings, *chain_id),
-            default_chain_contract_settings(*chain_id).expect("supported chain preset")
-        );
-        assert!(
-            settings
-                .chains
-                .per_chain
-                .get(chain_id)
-                .is_some_and(|chain| chain.contracts.railgun_contract.is_none())
-        );
-    }
-
-    let mut custom = settings;
-    custom
-        .chains
-        .per_chain
-        .entry(1)
-        .or_default()
-        .contracts
-        .multicall_contract = Some("0x0000000000000000000000000000000000000001".to_string());
-
-    let displayed = display_chain_contract_settings(&custom, 1);
-    let defaults = default_chain_contract_settings(1).expect("ethereum preset");
-    assert_eq!(displayed.railgun_contract, defaults.railgun_contract);
-    assert_eq!(displayed.coinbase_payer, defaults.coinbase_payer);
-    assert_eq!(
-        displayed.multicall_contract.as_deref(),
-        Some("0x0000000000000000000000000000000000000001")
-    );
-}
-
-#[test]
-fn settings_discard_reverts_relay_adapter_7702_display_value() {
-    let saved = WalletSettings::default();
-    let mut draft = saved.clone();
-    draft
-        .chains
-        .per_chain
-        .entry(1)
-        .or_default()
-        .contracts
-        .relay_adapt_7702_contract = Some("0x0000000000000000000000000000000000000001".to_string());
-    assert_eq!(
-        display_chain_contract_settings(&draft, 1)
-            .relay_adapt_7702_contract
-            .as_deref(),
-        Some("0x0000000000000000000000000000000000000001")
-    );
-
-    let discarded = settings_draft_after_discard(&saved);
-    assert_eq!(
-        display_chain_contract_settings(&discarded, 1).relay_adapt_7702_contract,
-        default_chain_contract_settings(1)
-            .expect("ethereum preset")
-            .relay_adapt_7702_contract
-    );
 }
 
 #[test]
@@ -1412,4 +1208,215 @@ fn token_settings_display_applies_builtin_overrides_and_custom_tokens() {
         .expect("custom token");
     assert!(!custom.built_in);
     assert_eq!(custom.decimals, 4);
+}
+
+#[gpui::test]
+fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{
+        AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext,
+        div,
+    };
+    use railgun_ui::chain_editor::{ChainDraft, ChainEditorCommand, ChainField};
+    use std::{cell::RefCell, rc::Rc};
+
+    /// The app root paints the dialog layer; the bare editor does not, so confirmations need a host.
+    struct ChainEditorHost(Entity<ui::chain_editor::ChainEditor>);
+
+    impl Render for ChainEditorHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.0.clone())
+                .children(gpui_component::Root::render_dialog_layer(window, cx))
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("shared-chain-editor");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut saved = WalletSettings::default();
+    saved.runtime.auto_lock_timeout_secs = Some(600);
+    wallet_ops::settings::save_wallet_settings(store.db().as_ref(), &saved).unwrap();
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                runtime.handle().clone(),
+                saved.clone(),
+                maintenance,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        let shared = editor.read(cx).chain_editor.clone();
+        let host = cx.new(|_| ChainEditorHost(shared));
+        *slot.borrow_mut() = Some(editor);
+        gpui_component::Root::new(host, window, cx)
+    });
+    let owner = owner_slot.borrow_mut().take().unwrap();
+    let cx = VisualTestContext::from_window(*handle, cx).into_mut();
+    cx.simulate_resize(gpui::size(px(600.0), px(720.0)));
+    let click = |cx: &mut VisualTestContext, id: &'static str| {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = cx
+            .debug_bounds(id)
+            .expect("chain editor control is rendered");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    click(cx, "edit-chain-1");
+    click(cx, "chain-enabled");
+    click(cx, "chain-discard");
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        saved
+    );
+    click(cx, "edit-chain-1");
+    click(cx, "chain-enabled");
+    click(cx, "chain-save");
+    saved.chains.per_chain.get_mut(&1).unwrap().enabled = false;
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        saved
+    );
+    // Saving returns to the list; reopen the chain before resetting it.
+    click(cx, "edit-chain-1");
+    click(cx, "chain-reset");
+    // Reset is destructive, so it lands only after the confirmation dialog is confirmed.
+    assert!(
+        cx.debug_bounds("dialog-layer").is_some(),
+        "reset opens a confirmation dialog before changing anything"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    saved.chains.per_chain.remove(&1);
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        saved
+    );
+
+    // A narrow addition must keep an older unrelated Settings draft, and its old save must fail.
+    cx.update(|window, cx| {
+        owner.update(cx, |editor, cx| {
+            editor.draft.runtime.auto_lock_timeout_secs = Some(900);
+            let revision = wallet_ops::settings::settings_revision(&editor.saved)
+                .unwrap()
+                .to_string();
+            let mut draft = ChainDraft::new();
+            draft.chain_id = "9007199254740993".into();
+            for (field, value) in [
+                (ChainField::Name, "Custom"),
+                (ChainField::NativeName, "Custom coin"),
+                (ChainField::NativeSymbol, "CSTM"),
+                (ChainField::NativeDecimals, "6"),
+                (
+                    ChainField::RpcEndpoints,
+                    "https://synthetic:credential@rpc.example",
+                ),
+            ] {
+                draft.fields.insert(field, value.into());
+            }
+            editor
+                .handle_chain_editor_command(
+                    &revision,
+                    &ChainEditorCommand::Save {
+                        draft,
+                        existing: false,
+                    },
+                    window,
+                    cx,
+                )
+                .unwrap();
+            assert_eq!(editor.draft.runtime.auto_lock_timeout_secs, Some(900));
+            assert!(
+                editor
+                    .saved
+                    .chains
+                    .custom
+                    .contains_key(&9_007_199_254_740_993)
+            );
+            assert!(!editor.persist_draft(cx));
+            assert_eq!(editor.saved.runtime.auto_lock_timeout_secs, Some(600));
+            // A storage read failure must not advance the owner's saved/active revision.
+            let before = editor.saved.clone();
+            let record = store.db().list_app_settings_records("").unwrap().remove(0);
+            store
+                .db()
+                .put_app_settings_record(&record.key, &[0xc1])
+                .unwrap();
+            let revision = wallet_ops::settings::settings_revision(&before)
+                .unwrap()
+                .to_string();
+            assert!(
+                editor
+                    .handle_chain_editor_command(
+                        &revision,
+                        &ChainEditorCommand::Remove {
+                            chain_id: "9007199254740993".into(),
+                        },
+                        window,
+                        cx
+                    )
+                    .is_err()
+            );
+            assert_eq!(editor.saved, before);
+            assert_eq!(
+                store
+                    .db()
+                    .get_app_settings_record(&record.key)
+                    .unwrap()
+                    .unwrap(),
+                vec![0xc1]
+            );
+            store
+                .db()
+                .put_app_settings_record(&record.key, &record.payload)
+                .unwrap();
+        });
+    });
+    assert!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref())
+            .unwrap()
+            .chains
+            .custom
+            .contains_key(&9_007_199_254_740_993)
+    );
+    // Leaving the reset draft returns the shared list, which already carries that addition.
+    click(cx, "chain-discard");
+    assert!(
+        cx.debug_bounds("edit-chain-9007199254740993").is_some(),
+        "a commit made outside the editor refreshes the shared chain list"
+    );
+    click(cx, "edit-chain-9007199254740993");
+    click(cx, "chain-save");
+    assert!(
+        cx.debug_bounds("edit-chain-9007199254740993").is_some(),
+        "saving a custom chain returns to the list"
+    );
+    cx.simulate_resize(gpui::size(px(360.0), px(480.0)));
+    cx.update(|window, cx| {
+        window.set_rem_size(px(22.0));
+        window.draw(cx).clear(cx);
+    });
+    // The fixed footer remains reachable when the advanced field body overflows.
+    click(cx, "edit-chain-1");
+    click(cx, "chain-discard");
+    // Dropping the window and entities releases the test database before removal.
+    cx.update(|window, _| window.remove_window());
+    drop(owner);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
 }

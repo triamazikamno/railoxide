@@ -128,11 +128,11 @@ pub(super) fn test_walletconnect_request(
             dapp_name: "Aave".to_owned(),
             chain_id: "eip155:1".to_owned(),
             method: WalletConnectSupportedMethod::EthSendTransaction,
-            account,
+            account: Some(account),
             decoded_transaction: None,
             raw_details: json!({}),
             expiry_timestamp,
         },
-        account_source: PublicAccountSource::Imported,
+        account_source: Some(PublicAccountSource::Imported),
     }
 }

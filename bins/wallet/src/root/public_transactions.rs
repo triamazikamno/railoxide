@@ -14,7 +14,7 @@ use super::WalletRoot;
 #[derive(Default)]
 pub(super) struct PublicTransactionSubmissions {
     closed: bool,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<(u64, JoinHandle<()>)>,
 }
 
 pub(super) struct PublicTransactionSubmission<T> {
@@ -58,9 +58,16 @@ impl PublicTransactionCleanup {
 }
 
 impl PublicTransactionSubmissions {
+    pub(super) fn is_busy_on_chain(&self, chain_id: u64) -> bool {
+        self.tasks
+            .iter()
+            .any(|(chain, task)| *chain == chain_id && !task.is_finished())
+    }
+
     fn spawn<T: Send + 'static>(
         &mut self,
         runtime: &Handle,
+        chain_id: u64,
         future: impl Future<Output = T> + Send + 'static,
     ) -> PublicTransactionSubmission<T> {
         let (sender, result) = oneshot::channel();
@@ -74,8 +81,8 @@ impl PublicTransactionSubmissions {
             let _ = sender.send(future.await);
         });
         let abort = Some(task.abort_handle());
-        self.tasks.retain(|task| !task.is_finished());
-        self.tasks.push(task);
+        self.tasks.retain(|(_, task)| !task.is_finished());
+        self.tasks.push((chain_id, task));
         PublicTransactionSubmission { result, abort }
     }
 
@@ -87,12 +94,12 @@ impl PublicTransactionSubmissions {
         self.closed = true;
         tracker.close();
         let tasks = std::mem::take(&mut self.tasks);
-        for task in &tasks {
+        for (_, task) in &tasks {
             task.abort();
         }
         let (completed, receiver) = watch::channel(false);
         runtime.spawn(async move {
-            for task in tasks {
+            for (_, task) in tasks {
                 let _ = task.await;
             }
             tracker.shutdown().await;
@@ -135,10 +142,11 @@ impl WalletRoot {
 
     pub(super) fn spawn_public_transaction_submission<T: Send + 'static>(
         &mut self,
+        chain_id: u64,
         future: impl Future<Output = T> + Send + 'static,
     ) -> PublicTransactionSubmission<T> {
         self.public_transaction_submissions
-            .spawn(&self.runtime, future)
+            .spawn(&self.runtime, chain_id, future)
     }
 
     pub(super) fn begin_public_transaction_shutdown(&mut self) -> PublicTransactionCleanup {
@@ -221,7 +229,7 @@ mod tests {
             entered: Some(retiring_tx),
             release: release_rx,
         };
-        let submission = submissions.spawn(&runtime, async move {
+        let submission = submissions.spawn(&runtime, 1, async move {
             let _retirement = retirement;
             let _ = started_tx.send(());
             std::future::pending::<()>().await;
@@ -230,8 +238,9 @@ mod tests {
         let cleanup = submissions.shutdown(&runtime, tracker);
         retiring_rx.await.expect("submission is retiring");
         assert!(!cleanup.is_finished());
-        let rejected: PublicTransactionSubmission<()> =
-            submissions.spawn(&runtime, async { panic!("closed admission polled work") });
+        let rejected: PublicTransactionSubmission<()> = submissions.spawn(&runtime, 1, async {
+            panic!("closed admission polled work")
+        });
         assert!(rejected.await.is_err());
         release_tx.send(()).expect("release retirement");
         cleanup.wait().await.expect("cleanup completed");

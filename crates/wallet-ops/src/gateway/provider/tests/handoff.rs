@@ -74,7 +74,10 @@ async fn native_summaries_are_peer_scoped_and_lock_purges_stale_work_and_termina
             "doc".into(),
             "locked-sign".into(),
             "personal_sign",
-            json!(["0x1234", ready.account.address]),
+            json!([
+                "0x1234",
+                ready.authorization.as_ref().unwrap().account.address
+            ]),
             Instant::now(),
         )
         .unwrap();

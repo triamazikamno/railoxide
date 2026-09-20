@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{B256, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::BlockNumberOrTag;
@@ -9,7 +8,7 @@ use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 
 use super::actions::{public_send_transaction_request, validate_public_transaction_intent};
-use super::runtime::public_chain_runtime_config;
+use super::runtime::{public_chain_runtime_config, verified_public_chain_runtime_config};
 use super::types::{
     PublicActionFeeProjection, PublicActionFeeSource, PublicActionGasFeeQuote,
     PublicActionGasFeeQuoteBundle, PublicActionGasFeeSelection, PublicActionKind,
@@ -23,7 +22,7 @@ use crate::{
     Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
     SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
     expected_eip1559_fee_per_gas, query_rpc_pool_with_http_client, railgun_protocol_fee_amount,
-    resolve_self_broadcast_gas_fee, self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
+    resolve_self_broadcast_gas_fee,
 };
 use railgun_ui::native_usd_micro_value;
 
@@ -70,7 +69,7 @@ pub fn public_native_action_gas_reserve(
 
 pub fn estimate_public_action_gas_cost(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     kind: PublicActionKind,
     asset: PublicAssetId,
     gas_fee: PublicActionGasFeeSelection,
@@ -89,7 +88,7 @@ pub fn estimate_public_action_gas_cost(
 
 pub fn estimate_public_action_gas_cost_with_profile(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     kind: PublicActionKind,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
@@ -110,7 +109,7 @@ pub fn estimate_public_action_gas_cost_with_profile(
 
 pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     kind: PublicActionKind,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
@@ -130,7 +129,7 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
         profile,
         chain.gas.gas_limit_buffer,
     );
-    if profile.uses_legacy_envelope(chain_id) {
+    if public_action_uses_legacy_envelope(chain_id, profile, quote) {
         return Ok(legacy_gas_cost_projection(
             expected_gas_units,
             maximum_gas_units,
@@ -297,7 +296,7 @@ pub fn resolve_public_action_gas_fee(
         },
     };
     let resolved = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
-    if !profile.uses_legacy_envelope(chain_id) {
+    if !public_action_uses_legacy_envelope(chain_id, profile, Some(quote)) {
         return Ok(resolved);
     }
 
@@ -437,7 +436,7 @@ pub(super) fn railway_gas_limit(estimated_gas: u64) -> u64 {
 
 pub async fn quote_public_action_gas_fee(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuote> {
     quote_public_action_gas_fee_with_reads(chain_id, effective_chain, http, None).await
@@ -445,24 +444,25 @@ pub async fn quote_public_action_gas_fee(
 
 pub async fn quote_public_action_gas_fee_with_reads(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<PublicActionGasFeeQuote> {
-    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let chain =
+        verified_public_chain_runtime_config(chain_id, effective_chain, http, rpc_reads).await?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
-    crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
+    public_action_gas_fee_quote_from_rpc_pool_with_reads(
         &query_rpc_pool,
         http.network_mode(),
-        public_action_tip_fallback(chain_id),
-        rpc_reads.map(|reads| (reads, chain_id)),
+        chain_id,
+        rpc_reads,
     )
     .await
 }
 
 pub async fn quote_public_action_gas_fee_with_profile(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     profile: PublicShieldTransactionProfile,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuote> {
@@ -475,11 +475,11 @@ pub async fn quote_public_action_gas_fee_with_profile(
 
 pub async fn quote_public_action_gas_fee_bundle_with_profile(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     profile: PublicShieldTransactionProfile,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
-    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let chain = verified_public_chain_runtime_config(chain_id, effective_chain, http, None).await?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
         &query_rpc_pool,
@@ -500,7 +500,13 @@ pub async fn estimate_public_advanced_transaction(
             "advanced gas estimation requires a raw transaction intent"
         ));
     }
-    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = verified_public_chain_runtime_config(
+        request.chain_id,
+        &request.effective_chain,
+        http,
+        None,
+    )
+    .await?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let quote = public_action_gas_fee_quote_from_rpc_pool(
         &query_rpc_pool,
@@ -577,14 +583,32 @@ async fn estimate_public_advanced_transaction_with_fee_core(
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
-    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())
-        .map_err(|_| unavailable_simulation_error("RPC providers are unavailable."))?;
+    let chain = verified_public_chain_runtime_config(
+        request.chain_id,
+        &request.effective_chain,
+        http,
+        rpc_reads,
+    )
+    .await
+    .map_err(|_| unavailable_simulation_error("RPC providers are unavailable."))?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let mut tx_req =
         public_send_transaction_request(request.chain_id, request.from, &request.intent)
-            .map_err(|error| unavailable_simulation_error(&error.to_string()))?
-            .with_max_fee_per_gas(resolved.max_fee_per_gas)
-            .with_max_priority_fee_per_gas(resolved.max_priority_fee_per_gas);
+            .map_err(|error| unavailable_simulation_error(&error.to_string()))?;
+    match quote.observed_fee_model {
+        Some(crate::EvmFeeModel::Legacy) => {
+            tx_req.gas_price = Some(resolved.max_fee_per_gas);
+        }
+        Some(crate::EvmFeeModel::Eip1559) => {
+            tx_req.max_fee_per_gas = Some(resolved.max_fee_per_gas);
+            tx_req.max_priority_fee_per_gas = Some(resolved.max_priority_fee_per_gas);
+        }
+        None => {
+            return Err(unavailable_simulation_error(
+                "Chain fee model has not been observed.",
+            ));
+        }
+    }
     tx_req.access_list = request.access_list;
 
     let providers = query_rpc_pool.available_providers();
@@ -907,7 +931,7 @@ pub(super) fn public_advanced_transaction_payload_fingerprint(
 pub async fn estimate_public_native_action_gas_reserve(
     chain_id: u64,
     steps: &[PublicActionProgressStep],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
 ) -> Result<U256> {
@@ -927,12 +951,12 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
     chain_id: u64,
     steps: &[PublicActionProgressStep],
     profile: PublicShieldTransactionProfile,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
     authorization_ceiling: Option<PublicActionGasFeeSelection>,
 ) -> Result<U256> {
-    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let chain = verified_public_chain_runtime_config(chain_id, effective_chain, http, None).await?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let quote_bundle = public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
         &query_rpc_pool,
@@ -959,7 +983,7 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile(
     chain_id: u64,
     steps: &[PublicActionProgressStep],
     profile: PublicShieldTransactionProfile,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
 ) -> Result<U256> {
@@ -980,12 +1004,87 @@ pub(super) async fn public_action_gas_fee_quote_from_rpc_pool(
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
 ) -> Result<PublicActionGasFeeQuote> {
-    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
+    public_action_gas_fee_quote_from_rpc_pool_with_reads(
+        query_rpc_pool,
+        network_mode,
+        chain_id,
+        None,
+    )
+    .await
+}
+
+pub(super) fn public_action_uses_legacy_envelope(
+    chain_id: u64,
+    profile: PublicShieldTransactionProfile,
+    quote: Option<PublicActionGasFeeQuote>,
+) -> bool {
+    profile.uses_legacy_envelope(chain_id)
+        || (profile == PublicShieldTransactionProfile::Railoxide
+            && quote
+                .is_some_and(|quote| quote.observed_fee_model == Some(crate::EvmFeeModel::Legacy)))
+}
+
+pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_reads(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> Result<PublicActionGasFeeQuote> {
+    let base_fee = observed_public_base_fee(query_rpc_pool, chain_id, rpc_reads).await?;
+    let mut quote = crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
         query_rpc_pool,
         network_mode,
         public_action_tip_fallback(chain_id),
+        rpc_reads.map(|reads| (reads, chain_id)),
     )
-    .await
+    .await?;
+    quote.observed_fee_model = Some(if base_fee.is_some() {
+        crate::EvmFeeModel::Eip1559
+    } else {
+        crate::EvmFeeModel::Legacy
+    });
+    quote.current_base_fee_per_gas = base_fee;
+    if base_fee.is_none() {
+        quote.suggested_max_fee_per_gas = quote.rpc_gas_price;
+        quote.suggested_max_priority_fee_per_gas = 0;
+    }
+    Ok(quote)
+}
+
+async fn observed_public_base_fee(
+    query_rpc_pool: &QueryRpcPool,
+    chain_id: u64,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> Result<Option<u128>> {
+    for provider in query_rpc_pool.available_providers() {
+        let observation = async {
+            match rpc_reads {
+                Some(reads) => reads
+                    .latest_block(provider.url.clone().into(), chain_id)
+                    .await
+                    .map_err(eyre::Report::new),
+                None => provider
+                    .provider
+                    .get_block_by_number(BlockNumberOrTag::Latest)
+                    .await
+                    .map_err(eyre::Report::new),
+            }
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(15), observation).await {
+            Ok(Ok(Some(block))) => return Ok(block.header.base_fee_per_gas.map(u128::from)),
+            Ok(Err(error))
+                if error
+                    .downcast_ref::<crate::RpcBrokerError>()
+                    .is_some_and(super::stops_dapp_read_retries) =>
+            {
+                return Err(error);
+            }
+            _ => {}
+        }
+    }
+    Err(eyre!(
+        "Could not observe the chain fee model from a current block header"
+    ))
 }
 
 pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_profile(
@@ -1104,6 +1203,7 @@ pub(super) fn railway_standard_gas_fee_quote_bundle(
         .checked_add(aggressive_priority_fee_per_gas)
         .ok_or_else(|| eyre!("Railway aggressive max fee overflow"))?;
     let standard = PublicActionGasFeeQuote {
+        observed_fee_model: None,
         rpc_gas_price: max_fee_per_gas,
         current_base_fee_per_gas: base_fee_per_gas
             .len()
@@ -1134,6 +1234,7 @@ pub(super) fn railway_bnb_gas_fee_quote_bundle(
     let standard_gas_price = capped_gas_price * 110 / 100;
     let aggressive_gas_price = capped_gas_price * 140 / 100;
     let standard = PublicActionGasFeeQuote {
+        observed_fee_model: None,
         rpc_gas_price: standard_gas_price,
         current_base_fee_per_gas: None,
         suggested_max_fee_per_gas: standard_gas_price,

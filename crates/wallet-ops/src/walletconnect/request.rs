@@ -96,6 +96,7 @@ pub enum WalletConnectParsedRequest {
     WalletAddEthereumChain {
         chain_id: u64,
         raw: Value,
+        definition: Option<Box<crate::settings::CustomChainSettings>>,
     },
     WalletWatchAsset {
         address: Address,
@@ -145,7 +146,7 @@ impl WalletConnectParsedRequest {
                 topic,
                 dapp_name,
                 chain_id,
-                selected_account,
+                Some(selected_account),
                 expiry_timestamp,
             )
         })
@@ -158,7 +159,7 @@ impl WalletConnectParsedRequest {
         topic: &str,
         dapp_name: &str,
         chain_id: &str,
-        selected_account: Address,
+        selected_account: Option<Address>,
         expiry_timestamp: Option<u64>,
     ) -> WalletConnectPendingRequest {
         WalletConnectPendingRequest {
@@ -167,7 +168,7 @@ impl WalletConnectParsedRequest {
             dapp_name: dapp_name.to_owned(),
             chain_id: chain_id.to_owned(),
             method: self.method(),
-            account: self.account().unwrap_or(selected_account),
+            account: self.account().or(selected_account),
             decoded_transaction: match self {
                 Self::EthSendTransaction { transaction } => {
                     Some(decode_walletconnect_transaction(transaction))
@@ -233,7 +234,7 @@ pub struct WalletConnectPendingRequest {
     pub dapp_name: String,
     pub chain_id: String,
     pub method: WalletConnectSupportedMethod,
-    pub account: Address,
+    pub account: Option<Address>,
     pub decoded_transaction: Option<WalletConnectDecodedTransaction>,
     pub raw_details: Value,
     pub expiry_timestamp: Option<u64>,
@@ -368,6 +369,28 @@ pub fn parse_walletconnect_session_request(
     }
 }
 
+pub(crate) fn parse_dapp_chain_request(
+    method: &str,
+    params: &Value,
+) -> Result<WalletConnectParsedRequest> {
+    let chain_id = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|value| value.get("chainId"))
+        .and_then(|value| serde_json::from_value::<alloy::primitives::U64>(value.clone()).ok())
+        .map(|value| value.to())
+        .ok_or_else(|| malformed_params("chainId is required"))?;
+    if method == "wallet_switchEthereumChain" {
+        Ok(WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id })
+    } else {
+        Ok(WalletConnectParsedRequest::WalletAddEthereumChain {
+            chain_id,
+            raw: params.clone(),
+            definition: None,
+        })
+    }
+}
+
 /// Parses native dapp policies and resolves personal-sign order using the approved account.
 /// Alloy 2.3.0 has no `wallet_addEthereumChain` or `wallet_watchAsset` request model.
 /// This adapter reads their routing identity with Alloy Address/U64 and retains raw extension fields.
@@ -381,21 +404,7 @@ pub fn parse_dapp_request_for_account(
         method,
         "wallet_addEthereumChain" | "wallet_switchEthereumChain"
     ) {
-        let chain_id = params
-            .as_array()
-            .and_then(|values| values.first())
-            .and_then(|value| value.get("chainId"))
-            .and_then(|value| serde_json::from_value::<alloy::primitives::U64>(value.clone()).ok())
-            .map(|value| value.to())
-            .ok_or_else(|| malformed_params("chainId is required"))?;
-        if method == "wallet_switchEthereumChain" {
-            Ok(WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id })
-        } else {
-            Ok(WalletConnectParsedRequest::WalletAddEthereumChain {
-                chain_id,
-                raw: params.clone(),
-            })
-        }
+        parse_dapp_chain_request(method, params)
     } else if method == "wallet_watchAsset" {
         let value = if let Some(values) = params.as_array() {
             if values.len() != 1 {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use gpui::{Context, Window};
 use railgun_ui::{
-    chain_icon_asset_path, chain_name, format_token_amount, format_usd_micro_value, short_address,
+    chain_icon_asset_path, format_token_amount, format_usd_micro_value, short_address,
 };
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceRefreshTicket,
@@ -16,33 +16,30 @@ use super::{WalletRoot, format_report_chain, token_display_metadata};
 use crate::assets::WalletIconSource;
 
 pub(super) fn public_asset_label(
-    chain_id: u64,
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     asset: PublicAssetId,
     registry: Option<&EffectiveTokenRegistry>,
 ) -> String {
+    let Some(chain) = chain else {
+        return "Unavailable".to_owned();
+    };
     match asset {
-        PublicAssetId::Native => chain_name(chain_id).map_or_else(
-            || "Native".to_string(),
-            |name| match chain_id {
-                56 => "BNB".to_string(),
-                137 => "MATIC".to_string(),
-                _ => format!("{name} native"),
-            },
-        ),
-        PublicAssetId::Erc20(token) => token_display_metadata(registry, chain_id, &token)
+        PublicAssetId::Native => chain.native_currency.symbol.clone(),
+        PublicAssetId::Erc20(token) => token_display_metadata(registry, chain.chain_id, &token)
             .map_or_else(|| short_address(&token), |info| info.symbol),
     }
 }
 
 pub(super) fn public_asset_decimals(
-    chain_id: u64,
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     asset: PublicAssetId,
     registry: Option<&EffectiveTokenRegistry>,
 ) -> Option<u8> {
+    let chain = chain?;
     match asset {
-        PublicAssetId::Native => Some(18),
+        PublicAssetId::Native => Some(chain.native_currency.decimals),
         PublicAssetId::Erc20(token) => {
-            token_display_metadata(registry, chain_id, &token).map(|info| info.decimals)
+            token_display_metadata(registry, chain.chain_id, &token).map(|info| info.decimals)
         }
     }
 }
@@ -299,7 +296,9 @@ impl WalletRoot {
             .cloned()
             .collect::<Vec<_>>();
         let http = self.http.clone();
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let effective_token_registry = self.effective_token_registry.clone();
         let minimum = ticket.minimum_block();
         if chain_id == self.selected_chain {
@@ -316,7 +315,7 @@ impl WalletRoot {
             refresh_public_balances_at_least(
                 chain_id,
                 &accounts,
-                effective_chain.as_ref(),
+                &effective_chain,
                 Some(&effective_token_registry),
                 &http,
                 minimum,

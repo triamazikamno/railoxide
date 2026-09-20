@@ -129,7 +129,7 @@ pub(crate) const fn new_wallet_chain_start_from_head(
 
 pub(crate) async fn initialize_new_wallet_chain_metadata_for_session(
     view_session: Arc<vault::DesktopViewSession>,
-    effective_chains: BTreeMap<u64, settings::EffectiveChainConfig>,
+    effective_chains: settings::EffectiveChainRegistry,
     db: Arc<DbStore>,
     http: HttpContext,
     skip_chain_id: Option<u64>,
@@ -147,12 +147,16 @@ pub(crate) async fn initialize_new_wallet_chain_metadata_for_session(
     };
 
     for chain_id in pending_chain_ids {
-        let Some(effective_chain) = effective_chains.get(&chain_id) else {
+        let Some(effective_chain) = effective_chains.get(chain_id) else {
             report.skipped_unavailable += 1;
             continue;
         };
         if !effective_chain.enabled {
             report.skipped_disabled += 1;
+            continue;
+        }
+        if effective_chain.railgun.is_none() {
+            report.skipped_unavailable += 1;
             continue;
         }
         if skip_chain_id == Some(chain_id) {
@@ -192,23 +196,10 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
     init_policy: CreatedWalletChainInitPolicy,
 ) -> NewWalletChainMetadataInitOutcome {
     let chain_id = effective_chain.chain_id;
-    let chain_defaults = match chain_defaults_for_chain(chain_id) {
-        Ok(defaults) => defaults,
-        Err(error) => {
-            tracing::warn!(chain_id, error = %error, "skip new wallet chain metadata for unsupported chain");
-            return NewWalletChainMetadataInitOutcome::Failed;
-        }
+    let Ok(private) = effective_chain.require_railgun() else {
+        return NewWalletChainMetadataInitOutcome::Failed;
     };
-    let contract = match parse_effective_address(
-        "railgun contract",
-        &effective_chain.railgun_contract,
-    ) {
-        Ok(contract) => contract.to_checksum(None),
-        Err(error) => {
-            tracing::warn!(chain_id, error = %error, "skip new wallet chain metadata for invalid contract");
-            return NewWalletChainMetadataInitOutcome::Failed;
-        }
-    };
+    let contract = private.deployment.contract.to_checksum(None);
 
     match vault_store.find_wallet_chain_metadata_for_session(view_session, 0, chain_id, &contract) {
         Ok(Some(_)) => {
@@ -227,14 +218,7 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
         }
     }
 
-    let baseline = match new_wallet_chain_baseline(
-        init_policy,
-        &chain_defaults,
-        effective_chain,
-        http,
-    )
-    .await
-    {
+    let baseline = match new_wallet_chain_baseline(init_policy, effective_chain, http).await {
         Ok(baseline) => baseline,
         Err(error) => {
             tracing::warn!(chain_id, error = %error, "retain pending new wallet chain initialization until its baseline is available");
@@ -300,31 +284,35 @@ fn complete_new_wallet_chain_metadata_initialization(
 
 async fn new_wallet_chain_baseline(
     init_policy: CreatedWalletChainInitPolicy,
-    defaults: &ChainConfigDefaults,
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<DesktopWalletChainStart> {
     match init_policy {
         CreatedWalletChainInitPolicy::InitialCreate => {
-            let head = fetch_effective_chain_head(defaults, effective_chain, http).await?;
+            let head = fetch_effective_chain_head(effective_chain, http).await?;
             Ok(new_wallet_chain_start_from_head(
-                effective_chain.deployment_block,
+                effective_chain
+                    .require_railgun()?
+                    .deployment
+                    .deployment_block,
                 effective_chain.finality_depth,
                 head,
             ))
         }
         CreatedWalletChainInitPolicy::Resumed => Ok(new_wallet_chain_start_from_deployment(
-            effective_chain.deployment_block,
+            effective_chain
+                .require_railgun()?
+                .deployment
+                .deployment_block,
         )),
     }
 }
 
 async fn fetch_effective_chain_head(
-    defaults: &ChainConfigDefaults,
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<u64> {
-    let chain_cfg = chain_config(defaults, None, Some(effective_chain), http, None)?;
+    let chain_cfg = verified_chain_config(effective_chain, http, None).await?;
     let providers = chain_cfg.rpcs.available_providers();
     if providers.is_empty() {
         return Err(eyre!(
@@ -399,39 +387,25 @@ pub(super) async fn setup_synced_view_wallet_with_store(
     init_block_number: Option<u64>,
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
-    effective_chain: Option<settings::EffectiveChainConfig>,
+    effective_chain: settings::EffectiveChainConfig,
     poi_read_source: PoiReadSource,
     rewind_wallet_cache: bool,
-    rpc_url_override: Option<Url>,
     http: &HttpContext,
     progress_tx: Option<SyncProgressSender>,
     wait_until_ready: bool,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
 ) -> Result<SyncedViewWallet> {
-    let chain_defaults = chain_defaults_for_chain(chain_id)?;
-    let effective_contract = effective_chain
-        .as_ref()
-        .map(|chain| parse_effective_address("railgun contract", &chain.railgun_contract))
-        .transpose()?;
+    settings::resolve_effective_chain_rpc_route(chain_id, &effective_chain)?;
+    let private = effective_chain.require_railgun()?;
     let chain_key = ChainKey {
-        chain_id: chain_defaults.chain_id,
-        contract: effective_contract.unwrap_or(chain_defaults.contract),
+        chain_id,
+        contract: private.deployment.contract,
     };
-
-    let effective_use_indexed_wallet_catch_up = effective_chain
-        .as_ref()
-        .map_or(use_indexed_wallet_catch_up, |chain| {
-            use_indexed_wallet_catch_up && chain.quick_sync_enabled
-        });
-    let chain_cfg = chain_config(
-        &chain_defaults,
-        rpc_url_override,
-        effective_chain.as_ref(),
-        http,
-        progress_tx.clone(),
-    )?;
-    let wallet_quick_sync_endpoint = chain_cfg.quick_sync_endpoint.clone();
+    let effective_use_indexed_wallet_catch_up =
+        use_indexed_wallet_catch_up && private.sync.quick_sync_endpoint.is_some();
+    let chain_cfg = verified_chain_config(&effective_chain, http, progress_tx.clone()).await?;
+    let wallet_quick_sync_endpoint = chain_cfg.sync.quick_sync_endpoint.clone();
     let chain_service = sync_manager
         .add_chain_with_rpc_http_client(chain_cfg, http.rpc_client.clone())
         .await
@@ -445,11 +419,7 @@ pub(super) async fn setup_synced_view_wallet_with_store(
     let chain_handle = chain_service.handle();
     let safe_head = *chain_handle.safe_head_rx.borrow();
     let safe_head = (safe_head > 0).then_some(safe_head);
-    let deployment_block = effective_chain
-        .as_ref()
-        .map_or(chain_defaults.deployment_block, |chain| {
-            chain.deployment_block
-        });
+    let deployment_block = private.deployment.deployment_block;
     let mut resolved_start = resolve_desktop_wallet_chain_start(
         sync_start_policy,
         existing_wallet_chain_metadata.as_ref(),
@@ -589,119 +559,64 @@ async fn finish_waited_wallet_startup(
     Err::<(), _>(error).wrap_err(context)
 }
 
-pub(crate) fn chain_defaults_for_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
-    ChainConfigDefaults::for_chain(chain_id).ok_or_else(|| eyre!("unsupported chain id {chain_id}"))
-}
-
 pub async fn fetch_current_safe_head(
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<u64> {
-    let defaults = chain_defaults_for_chain(effective_chain.chain_id)?;
-    let head = fetch_effective_chain_head(&defaults, effective_chain, http).await?;
+    let private = effective_chain.require_railgun()?;
+    let head = fetch_effective_chain_head(effective_chain, http).await?;
     Ok(head
         .saturating_sub(effective_chain.finality_depth)
-        .max(effective_chain.deployment_block))
+        .max(private.deployment.deployment_block))
 }
 
-pub(crate) fn chain_config(
-    defaults: &ChainConfigDefaults,
-    rpc_url_override: Option<Url>,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
+async fn verified_chain_config(
+    effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
     progress_tx: Option<SyncProgressSender>,
 ) -> Result<ChainConfig> {
-    let rpc_urls = if effective_chain.is_some() {
-        effective_rpc_urls_for_chain(defaults.chain_id, effective_chain)?
-    } else if let Some(rpc_url) = rpc_url_override {
-        vec![rpc_url]
-    } else {
-        defaults.rpc_urls.clone()
-    };
-    let quick_sync_endpoint = effective_chain
-        .filter(|chain| chain.quick_sync_enabled)
-        .and_then(|chain| chain.quick_sync_endpoint.as_ref())
-        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse quick-sync URL {url}")))
-        .transpose()?
-        .or_else(|| {
-            effective_chain
-                .is_none()
-                .then(|| defaults.quick_sync_endpoint.clone())
-                .flatten()
-        });
-    let contract = effective_chain
-        .map(|chain| parse_effective_address("railgun contract", &chain.railgun_contract))
-        .transpose()?
-        .unwrap_or(defaults.contract);
-    let archive_rpc_url = effective_chain
-        .and_then(|chain| chain.archive_rpc_url.as_ref())
-        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse archive RPC URL {url}")))
-        .transpose()?;
-    let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
-        rpc_urls,
-        DEFAULT_QUERY_RPC_COOLDOWN,
-        http.rpc_client.clone(),
-    ));
-
-    Ok(ChainConfig {
-        chain_id: defaults.chain_id,
-        contract,
-        rpcs: query_rpc_pool,
-        archive_rpc_url,
-        archive_until_block: effective_chain.map_or(defaults.archive_until_block, |chain| {
-            chain.archive_until_block
-        }),
-        deployment_block: effective_chain
-            .map_or(defaults.deployment_block, |chain| chain.deployment_block),
-        v2_start_block: effective_chain
-            .map_or(defaults.v2_start_block, |chain| chain.v2_start_block),
-        legacy_shield_block: effective_chain.map_or(defaults.legacy_shield_block, |chain| {
-            chain.legacy_shield_block
-        }),
-        block_range: effective_chain
-            .and_then(|chain| chain.block_range)
-            .unwrap_or(DEFAULT_BLOCK_RANGE),
-        indexed_wallet_block_range: effective_chain
-            .map_or(defaults.indexed_wallet_block_range, |chain| {
-                chain.indexed_wallet_block_range
-            }),
-        block_time: effective_chain.map_or(defaults.block_time, |chain| chain.block_time),
-        poll_interval: effective_chain
-            .and_then(|chain| chain.poll_interval_secs)
-            .map_or(DEFAULT_POLL_INTERVAL, Duration::from_secs),
-        finality_depth: effective_chain
-            .map_or(defaults.finality_depth, |chain| chain.finality_depth),
-        quick_sync_endpoint,
-        indexed_artifact_source: effective_chain
-            .and_then(|chain| chain.indexed_artifact_source.as_ref())
-            .map(|source| sync_service::IndexedArtifactSourceConfig {
-                trusted_publisher_pubkey: source.trusted_publisher_pubkey,
-                manifest_source: match &source.manifest_source {
-                    settings::IndexedArtifactManifestSource::Url(url) => {
-                        sync_service::IndexedArtifactManifestSource::Url(url.clone())
-                    }
-                    settings::IndexedArtifactManifestSource::Cid(cid) => {
-                        sync_service::IndexedArtifactManifestSource::Cid(cid.clone())
-                    }
-                    settings::IndexedArtifactManifestSource::IpnsName(name) => {
-                        sync_service::IndexedArtifactManifestSource::IpnsName(name.clone())
-                    }
-                },
-                gateway_urls: source.gateway_urls.clone(),
-                gateway_pool: Some(http.gateway_pool()),
-                max_manifest_age: source.max_manifest_age,
-                concurrency: source.concurrency,
-                max_in_flight_bytes: source.max_in_flight_bytes,
-            }),
-        anchor_interval: defaults.anchor_interval,
-        anchor_retention: defaults.anchor_retention,
-        http_client: Some(http.client.clone()),
-        progress_tx,
-    })
+    let mut config = chain_config(effective_chain, http, progress_tx)?;
+    let route = effective_chain
+        .rpc_route
+        .verify_identity(&http.rpc_client)
+        .await?;
+    config.rpcs = query_rpc_pool_with_http_client(route.endpoint_urls(), http);
+    if let Some(archive) = &config.archive_rpc_url {
+        crate::RpcChainRoute::new(effective_chain.chain_id, vec![archive.clone()])
+            .with_identity_verification()
+            .verify_identity(&http.rpc_client)
+            .await?;
+    }
+    Ok(config)
 }
 
-pub(super) fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
-    Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
+pub(crate) fn chain_config(
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+    progress_tx: Option<SyncProgressSender>,
+) -> Result<ChainConfig> {
+    let private = effective_chain.require_railgun()?;
+    let route =
+        settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?;
+    let mut sync = private.sync.clone();
+    if let Some(source) = &mut sync.indexed_artifact_source {
+        source.gateway_pool = Some(http.gateway_pool());
+    }
+    Ok(ChainConfig {
+        deployment: private.deployment,
+        sync,
+        rpcs: query_rpc_pool_with_http_client(route.endpoint_urls(), http),
+        archive_rpc_url: private
+            .archive_rpc_url
+            .as_ref()
+            .map(|url| url.expose_url().clone()),
+        block_time: effective_chain
+            .block_time
+            .ok_or_else(|| eyre!("private sync requires a block cadence"))?,
+        finality_depth: effective_chain.finality_depth,
+        http_client: http.client.clone(),
+        progress_tx,
+    })
 }
 
 pub(super) const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'static str {
@@ -918,27 +833,33 @@ mod tests {
                 .expect("acquire test sync manager ownership");
                 sync_manager
                     .add_chain(ChainConfig {
-                        chain_id: chain_key.chain_id,
-                        contract: chain_key.contract,
+                        deployment: broadcaster_core::deployment::RailgunDeployment {
+                            chain_id: chain_key.chain_id,
+                            contract: chain_key.contract,
+                            relay_adapt_contract: Address::ZERO,
+                            relay_adapt_7702_contract: Address::ZERO,
+                            deployment_block: 0,
+                            v2_start_block: 0,
+                            legacy_shield_block: 0,
+                        },
+                        sync: sync_service::RailgunSyncOptions {
+                            archive_until_block: 0,
+                            block_range: 100,
+                            indexed_wallet_block_range: 100,
+                            poll_interval: Duration::from_mins(1),
+                            quick_sync_endpoint: None,
+                            indexed_artifact_source: None,
+                            anchor_interval: 1000,
+                            anchor_retention: 5,
+                        },
                         rpcs: Arc::new(QueryRpcPool::new(
                             vec![rpc_url.clone()],
                             Duration::from_millis(1),
                         )),
                         archive_rpc_url: None,
-                        archive_until_block: 0,
-                        deployment_block: 0,
-                        v2_start_block: 0,
-                        legacy_shield_block: 0,
-                        block_range: 100,
-                        indexed_wallet_block_range: 100,
                         block_time: Duration::from_secs(12),
-                        poll_interval: Duration::from_mins(1),
                         finality_depth: 0,
-                        quick_sync_endpoint: None,
-                        indexed_artifact_source: None,
-                        anchor_interval: 1000,
-                        anchor_retention: 5,
-                        http_client: None,
+                        http_client: reqwest::Client::new(),
                         progress_tx: None,
                     })
                     .await

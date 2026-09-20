@@ -5,7 +5,7 @@ use super::*;
 fn hardware_typed_data_error_maps_to_unsupported_method() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
-    request.account_source = PublicAccountSource::HardwareDerived;
+    request.account_source = Some(PublicAccountSource::HardwareDerived);
     let error = eyre::eyre!(
         "WalletConnect eth_signTypedData_v4 is unsupported for hardware Public accounts"
     );
@@ -25,7 +25,7 @@ fn hardware_typed_data_error_maps_to_unsupported_method() {
 fn hardware_typed_data_recovery_mismatch_maps_to_error_response() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
-    request.account_source = PublicAccountSource::HardwareDerived;
+    request.account_source = Some(PublicAccountSource::HardwareDerived);
     let error = eyre::eyre!(
         "hardware public signer address mismatch: expected 0x1111111111111111111111111111111111111111, got 0x2222222222222222222222222222222222222222"
     );
@@ -230,10 +230,20 @@ fn walletconnect_hash_fallback_mode_uses_request_session_account() {
         .load_hardware_view_session(TEST_PASSWORD, &hardware_session, wallet_id, &view_key)
         .expect("hardware view session");
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
-    request.account_source = PublicAccountSource::HardwareDerived;
+    request.account_source = Some(PublicAccountSource::HardwareDerived);
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
-    request.binding.public_account_uuid = "hardware-account-a".to_owned();
-    request.binding.public_account_scope = PublicAccountScope::Global;
+    request
+        .binding
+        .account
+        .as_mut()
+        .unwrap()
+        .public_account_uuid = "hardware-account-a".to_owned();
+    request
+        .binding
+        .account
+        .as_mut()
+        .unwrap()
+        .public_account_scope = PublicAccountScope::Global;
     let other_account = PublicAccountMetadata {
         public_account_uuid: "selected-account-b".to_owned(),
         address: alloy::primitives::Address::from([0x22; 20]),
@@ -247,7 +257,7 @@ fn walletconnect_hash_fallback_mode_uses_request_session_account() {
     };
     let request_account = PublicAccountMetadata {
         public_account_uuid: "hardware-account-a".to_owned(),
-        address: request.item.account,
+        address: request.item.account.unwrap(),
         label: None,
         source: PublicAccountSource::HardwareDerived,
         scope: PublicAccountScope::Global,
@@ -471,7 +481,7 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
     let rates = TokenAnchorRateCache::new();
     let accounts = [account.clone()];
     let context = WalletConnectIntentContext {
-        chain: &chains[&1],
+        chain: chains.get(1).unwrap(),
         selected_chain_id: 1,
         token_registry: &registry,
         anchor_rates: &rates,
@@ -498,15 +508,17 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
             id: format!("opaque-{method}"),
             deadline,
             origin: origin.clone(),
-            permission: GatewayPermission {
-                permission_id: "grant".to_owned(),
-                origin: origin.clone(),
-                public_account_uuid: account.public_account_uuid.clone(),
-                public_account_scope: account.scope.clone(),
-                owning_private_wallet_uuid: None,
-                chain_id: 1,
-            },
-            account: account.clone(),
+            authorization: Some(wallet_ops::gateway::GatewayApprovalAccount {
+                permission: GatewayPermission {
+                    permission_id: "grant".to_owned(),
+                    origin: origin.clone(),
+                    public_account_uuid: account.public_account_uuid.clone(),
+                    public_account_scope: account.scope.clone(),
+                    owning_private_wallet_uuid: None,
+                    chain_id: 1,
+                },
+                account: account.clone(),
+            }),
             chain_id: 1,
             parsed: parsed.clone(),
             control: control.clone(),
@@ -537,7 +549,12 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
         assert_eq!(native_intent.risks, legacy_intent.risks);
         assert_eq!(request.item.raw_details, legacy.item.raw_details);
         assert_eq!(
-            request.binding.public_account_uuid,
+            request
+                .binding
+                .account
+                .as_ref()
+                .expect("account-bound request")
+                .public_account_uuid,
             account.public_account_uuid
         );
         let support = WalletConnectNamespaceAccountSupport::for_account_source(account.source);
@@ -590,6 +607,31 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
             vec![request.key]
         );
     }
+    let approval = GatewayApprovalRequest {
+        id: "unconnected-chain-add".to_owned(),
+        deadline,
+        origin,
+        authorization: None,
+        chain_id: 8453,
+        parsed: WalletConnectParsedRequest::WalletAddEthereumChain {
+            chain_id: 8453,
+            raw: json!([{"chainId":"0x2105"}]),
+            definition: None,
+        },
+        control: DappRequestControl::new(deadline, || Ok(())),
+    };
+    let reads = wallet_ops::DappRpcReadClient::new(|_, _| {
+        Box::pin(async { panic!("chain addition must not get account RPC access") })
+    });
+    let request = super::super::root::gateway_pending_request(&approval, reads).unwrap();
+    assert!(request.binding.account.is_none());
+    assert!(request.item.account.is_none());
+    assert!(request.account_source.is_none());
+    assert!(request.rpc_reads.is_none());
+    assert_eq!(
+        walletconnect_hardware_typed_data_mode_for_request(&request, &accounts, None),
+        HardwareTypedDataSigningMode::Unsupported
+    );
 }
 
 #[test]

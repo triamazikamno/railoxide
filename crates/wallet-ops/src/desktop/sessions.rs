@@ -137,20 +137,18 @@ impl WalletSessionStore {
     pub async fn start_view_wallet_session(
         &self,
         request: ViewWalletChainSessionRequest,
-        rpc_url_override: Option<Url>,
         http: &HttpContext,
     ) -> Result<WalletSession> {
-        self.start_view_wallet_session_with_wait(request, rpc_url_override, http, true)
+        self.start_view_wallet_session_with_wait(request, http, true)
             .await
     }
 
     pub async fn start_view_wallet_session_immediate(
         &self,
         request: ViewWalletChainSessionRequest,
-        rpc_url_override: Option<Url>,
         http: &HttpContext,
     ) -> Result<WalletSession> {
-        self.start_view_wallet_session_with_wait(request, rpc_url_override, http, false)
+        self.start_view_wallet_session_with_wait(request, http, false)
             .await
     }
 
@@ -164,10 +162,12 @@ impl WalletSessionStore {
     async fn start_view_wallet_session_with_wait(
         &self,
         request: ViewWalletChainSessionRequest,
-        rpc_url_override: Option<Url>,
         http: &HttpContext,
         wait_until_ready: bool,
     ) -> Result<WalletSession> {
+        // Reject unavailable/private-ineligible requests before replacing any active owner.
+        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?;
+        request.effective_chain.require_railgun()?;
         self.sync_manager.set_gateway_pool(http.gateway_pool());
         let wallet_id = request.view_session.wallet_id().to_owned();
         let mut active_scope = self.active_wallet_scope.lock().await;
@@ -193,7 +193,6 @@ impl WalletSessionStore {
             request.effective_chain.clone(),
             request.poi_read_source.clone(),
             request.rewind_wallet_cache,
-            rpc_url_override,
             http,
             request.progress_tx.clone(),
             wait_until_ready,
@@ -204,9 +203,8 @@ impl WalletSessionStore {
 
         let mut session =
             wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await?;
-        if executor_view.hardware_profile_session().is_none()
-            && let Some(chain) = executor_chain
-        {
+        if executor_view.hardware_profile_session().is_none() {
+            let chain = executor_chain;
             if chain.chain_id != chain_id {
                 session.stop().await?;
                 return Err(eyre!(
@@ -696,7 +694,8 @@ mod tests {
         let mut chain =
             settings::build_effective_chain_configs(&settings::WalletSettings::default())
                 .unwrap()
-                .remove(&1)
+                .get(1)
+                .cloned()
                 .unwrap();
         chain.rpc_route = crate::RpcChainRoute::new(
             1,
@@ -706,6 +705,29 @@ mod tests {
         let owner = sessions
             .create_executor_owner(0, view.clone(), chain.clone(), http.clone())
             .unwrap();
+        let mut public_only = chain.clone();
+        public_only.railgun = None;
+        let rejected = Box::pin(sessions.start_view_wallet_session_immediate(
+            ViewWalletChainSessionRequest {
+                view_session: view.clone(),
+                wallet_scope_generation: 99,
+                chain_id: 1,
+                effective_chain: public_only,
+                sync_start_policy: DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                init_block_number: None,
+                sync_to_block: None,
+                use_indexed_wallet_catch_up: false,
+                poi_read_source: PoiReadSource::PoiProxy {
+                    rpc_url: Url::parse("http://127.0.0.1:1").unwrap().into(),
+                },
+                rewind_wallet_cache: false,
+                progress_tx: None,
+            },
+            &http,
+        ))
+        .await;
+        assert!(rejected.is_err());
+        // The rejected request must not retire the current executor before the checks below.
         let records = vault::ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
         let record = records
             .restore_index(

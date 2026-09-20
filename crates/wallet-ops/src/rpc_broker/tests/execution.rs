@@ -2212,3 +2212,56 @@ async fn reverted_member_is_not_retried_on_the_next_endpoint() {
     first_server.abort();
     second_server.abort();
 }
+
+#[tokio::test]
+async fn verified_routes_reuse_identity_and_withdraw_failed_identity_endpoints() {
+    let rejected_checks = Arc::new(AtomicUsize::new(0));
+    let rejected = rejected_checks.clone();
+    let (bad, bad_server) = spawn_rpc_mock(
+        Arc::new(move |request| {
+            assert_eq!(request["method"], "eth_chainId");
+            rejected.fetch_add(1, Ordering::SeqCst);
+            rpc_result(&request, &json!("0x2"))
+        }),
+        Arc::default(),
+        Arc::default(),
+    )
+    .await;
+    let identity_checks = Arc::new(AtomicUsize::new(0));
+    let checks = identity_checks.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let (good, good_server) = spawn_rpc_mock(
+        Arc::new(move |request| {
+            if request["method"] == "eth_chainId" {
+                checks.fetch_add(1, Ordering::SeqCst);
+                rpc_result(&request, &json!("0x1"))
+            } else {
+                assert_eq!(request["method"], "eth_gasPrice");
+                observed_reads.fetch_add(1, Ordering::SeqCst);
+                rpc_result(&request, &json!("0x42"))
+            }
+        }),
+        Arc::default(),
+        Arc::default(),
+    )
+    .await;
+    let route = RpcRoute::from(RpcChainRoute::new(1, vec![bad, good]).with_identity_verification());
+    let broker = test_broker(Duration::from_millis(1), 1);
+    for _ in 0..4 {
+        let results = broker
+            .submit(RpcSubmission::new(
+                route.clone(),
+                vec![RpcRead::from_method_params("eth_gasPrice", json!([]), 1).unwrap()],
+                test_origin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
+    }
+    assert_eq!(identity_checks.load(Ordering::SeqCst), 1);
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
+    assert_eq!(rejected_checks.load(Ordering::SeqCst), 3);
+    bad_server.abort();
+    good_server.abort();
+}

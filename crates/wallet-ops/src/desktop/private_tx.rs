@@ -465,7 +465,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
             request.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id)?;
     let token = utxo.token_address();
     let amount = utxo.note.value;
@@ -872,7 +872,7 @@ pub async fn prepare_desktop_unshield_calldata(
         DesktopUnshieldPlanRequest {
             executor: None,
             chain_id: request.chain_id,
-            effective_chain: request.effective_chain.as_ref(),
+            effective_chain: &request.effective_chain,
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
@@ -927,7 +927,7 @@ pub async fn prepare_desktop_send_calldata(
     let prepared = prepare_desktop_send_plan_without_broadcaster_fee(
         DesktopSendPlanRequest {
             chain_id: request.chain_id,
-            effective_chain: request.effective_chain.as_ref(),
+            effective_chain: &request.effective_chain,
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
@@ -1329,14 +1329,19 @@ fn quote_sponsored_authorization_limit(
             effective_chain.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(chain_id, Some(effective_chain))?;
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let wrapped_native = chain
         .wrapped_native_token
         .ok_or(SponsorshipError::MissingWrappedNativeToken)?;
     let payer = effective_chain
+        .require_railgun()?
         .coinbase_payer
         .ok_or(SponsorshipError::MissingCoinbasePayer)?;
-    if effective_chain.sponsored_bundle_relays.is_empty() {
+    if effective_chain
+        .require_railgun()?
+        .sponsored_bundle_relays
+        .is_empty()
+    {
         return Err(SponsorshipError::MissingRelay.into());
     }
     let payment = sponsored_provisional_payment_for_intent(
@@ -1652,11 +1657,12 @@ async fn prepare_desktop_sponsored_calldata(
             effective_chain.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(chain_id, Some(effective_chain))?;
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let wrapped_native = chain
         .wrapped_native_token
         .ok_or(SponsorshipError::MissingWrappedNativeToken)?;
     let payer = effective_chain
+        .require_railgun()?
         .coinbase_payer
         .ok_or(SponsorshipError::MissingCoinbasePayer)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
@@ -1695,7 +1701,10 @@ async fn prepare_desktop_sponsored_calldata(
     validate_sponsored_admission(SponsoredAdmission {
         action: intent.action(),
         delivery: PrivateDeliveryMode::SelfBroadcast,
-        has_relays: !effective_chain.sponsored_bundle_relays.is_empty(),
+        has_relays: !effective_chain
+            .require_railgun()?
+            .sponsored_bundle_relays
+            .is_empty(),
         wrapped_native_token: Some(wrapped_native),
         coinbase_payer: Some(payer),
         payer_verified: true,
@@ -2002,7 +2011,7 @@ pub async fn prepare_desktop_sponsored_unshield_calldata(
     request: DesktopSponsoredUnshieldCalldataRequest,
     http: &HttpContext,
 ) -> Result<PreparedSponsoredCall> {
-    let chain = effective_desktop_chain_config(request.chain_id, Some(&request.effective_chain))?;
+    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -2150,13 +2159,10 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             request.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
     // The first approval needs the executor gas budget before seed access and allocation.
-    let executor_profile = request
-        .effective_chain
-        .as_ref()
-        .and_then(settings::EffectiveChainConfig::accepted_executor_profile);
+    let executor_profile = request.effective_chain.accepted_executor_profile();
     let uses_executor = request.executor.is_some()
         || ((request.unwrap || request.native_top_up.is_some())
             && request.session.executor_owner().is_some()
@@ -2487,7 +2493,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     }
     parse_railgun_recipient(&request.recipient)?;
 
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let policy = request.fee_policy;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
         request.anchor_cache.as_ref(),
@@ -2713,7 +2719,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
         DesktopUnshieldPlanRequest {
             executor: request.executor.as_deref(),
             chain_id: request.chain_id,
-            effective_chain: request.effective_chain.as_ref(),
+            effective_chain: &request.effective_chain,
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
@@ -2767,7 +2773,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
     let mut result = submit_self_broadcast_plan(
         request.transaction_tracking.as_ref(),
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
         request
@@ -2819,7 +2825,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
     submit_self_broadcast_plan(
         request.transaction_tracking.as_ref(),
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
         Some(request.vault_password.as_str()),
@@ -2849,7 +2855,7 @@ pub async fn submit_desktop_send_self_broadcast(
     let prepared = prepare_desktop_send_plan_without_broadcaster_fee(
         DesktopSendPlanRequest {
             chain_id: request.chain_id,
-            effective_chain: request.effective_chain.as_ref(),
+            effective_chain: &request.effective_chain,
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
@@ -2887,7 +2893,7 @@ pub async fn submit_desktop_send_self_broadcast(
     submit_self_broadcast_plan(
         request.transaction_tracking.as_ref(),
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
         request
@@ -3543,14 +3549,20 @@ mod tests {
 
     #[test]
     fn sponsored_quote_uses_buffered_shape_without_extra_percentage_headroom() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let effective_chain =
             settings::build_effective_chain_configs(&settings::WalletSettings::default())
                 .expect("effective chains")
-                .remove(&1)
+                .get(1)
+                .cloned()
                 .expect("ethereum config");
         let chain = test_chain_config(wrapped_native);
-        let payer = effective_chain.coinbase_payer.expect("coinbase payer");
+        let payer = effective_chain
+            .require_railgun()
+            .unwrap()
+            .coinbase_payer
+            .expect("coinbase payer");
         let signer = Address::from([0x33; 20]);
         let amount = U256::from(20_000_000_000_000_000_u128);
         let recipient = Address::from([0x34; 20]);
@@ -3604,11 +3616,13 @@ mod tests {
 
     #[test]
     fn sponsored_quote_credits_snapshot_balance_against_builder_funding() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let effective_chain =
             settings::build_effective_chain_configs(&settings::WalletSettings::default())
                 .expect("effective chains")
-                .remove(&1)
+                .get(1)
+                .cloned()
                 .expect("ethereum config");
         let amount = U256::from(20_000_000_000_000_000_u128);
         let recipient = Address::from([0x34; 20]);
@@ -3670,11 +3684,13 @@ mod tests {
 
     #[test]
     fn sponsored_quote_does_not_report_an_intermediate_required_balance() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let effective_chain =
             settings::build_effective_chain_configs(&settings::WalletSettings::default())
                 .expect("effective chains")
-                .remove(&1)
+                .get(1)
+                .cloned()
                 .expect("ethereum config");
         let token = Address::from([0x81; 20]);
         let signer = Address::from([0x82; 20]);
@@ -3717,17 +3733,24 @@ mod tests {
 
     #[test]
     fn sponsored_wrapped_native_quote_binds_canonical_coalesced_total() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let effective_chain =
             settings::build_effective_chain_configs(&settings::WalletSettings::default())
                 .expect("effective chains")
-                .remove(&1)
+                .get(1)
+                .cloned()
                 .expect("ethereum config");
-        let payer = effective_chain.coinbase_payer.expect("coinbase payer");
+        let payer = effective_chain
+            .require_railgun()
+            .unwrap()
+            .coinbase_payer
+            .expect("coinbase payer");
         let relay_adapt: Address = effective_chain
-            .relay_adapt_contract
-            .parse()
-            .expect("relay adapt");
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .relay_adapt_contract;
         let signer = Address::from([0x71; 20]);
         let recipient = Address::from([0x72; 20]);
         let entered_amount = U256::from(1_596_000_000_000_211_u128);
@@ -3818,7 +3841,8 @@ mod tests {
 
     #[test]
     fn native_top_up_estimate_rejects_unwrap_as_unsupported() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let chain = test_chain_config(wrapped_native);
         let error = desktop_native_top_up_plan_for_estimate(
             1,
@@ -3837,7 +3861,8 @@ mod tests {
 
     #[test]
     fn native_top_up_plan_validation_counts_wrapped_native_broadcaster_fee() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let token = Address::from([0x51; 20]);
         let recipient = Address::from([0x52; 20]);
         let receiver_amount = U256::from(25_u64);

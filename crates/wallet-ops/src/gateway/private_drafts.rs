@@ -31,6 +31,7 @@ pub enum GatewayBroadcasterChoice {
 #[non_exhaustive]
 pub struct GatewayPrivateDraftInput {
     pub wallet: String,
+    #[serde(with = "railgun_ui::chain_id")]
     pub chain_id: u64,
     pub kind: GatewayPrivateDraftKind,
     pub asset: String,

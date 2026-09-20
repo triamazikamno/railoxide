@@ -30,6 +30,7 @@ pub enum GatewayDraftFee {
 #[serde(deny_unknown_fields)]
 pub struct GatewayDraftInput {
     pub account: String,
+    #[serde(with = "railgun_ui::chain_id")]
     pub chain_id: u64,
     pub kind: GatewayDraftKind,
     pub asset: String,

@@ -39,11 +39,27 @@ fn effective_token_registry_formats_private_and_public_assets() {
         Some(std::path::Path::new(icon))
     );
     assert_eq!(
-        public_asset_label(1, PublicAssetId::Erc20(token), Some(&registry)),
+        public_asset_label(
+            wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default()
+            )
+            .unwrap()
+            .get(1),
+            PublicAssetId::Erc20(token),
+            Some(&registry)
+        ),
         "TST"
     );
     assert_eq!(
-        public_asset_decimals(1, PublicAssetId::Erc20(token), Some(&registry)),
+        public_asset_decimals(
+            wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default()
+            )
+            .unwrap()
+            .get(1),
+            PublicAssetId::Erc20(token),
+            Some(&registry)
+        ),
         Some(4)
     );
     assert_eq!(

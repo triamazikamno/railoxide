@@ -603,7 +603,7 @@ pub fn reward_batch_positive_split_boundary(
 pub async fn fetch_interval_metadata(
     chain_id: u64,
     tokens: &[Address],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Option<GovernorRewardsIntervalMetadata>> {
     let Some(contracts) = governance_contracts(chain_id) else {
@@ -682,7 +682,7 @@ pub async fn fetch_reward_evidence(
     token: Address,
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Option<RewardEvidence>> {
@@ -711,7 +711,7 @@ pub async fn fetch_reward_evidence_multi(
     tokens: &[Address],
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardEvidenceResult>> {
@@ -915,7 +915,7 @@ pub async fn fetch_reward_batch_evidence(
     tokens: &[Address],
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Option<RewardBatchEvidence>> {
@@ -1095,7 +1095,7 @@ pub async fn fetch_reward_batch_claimed_intervals(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<Vec<U256>>> {
@@ -1186,7 +1186,7 @@ pub async fn fetch_reward_batch_authorization_state(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<RewardBatchAuthorizationState> {
@@ -1245,7 +1245,7 @@ pub async fn fetch_reward_batch_authorization_state(
 /// Fetch the latest block gas limit from the configured query pool.
 pub async fn fetch_latest_block_gas_limit(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<u64> {
     let (pool, _) = provider_for_chain(chain_id, effective_chain, http)?;
@@ -1291,7 +1291,7 @@ pub async fn fetch_reward_interval_amounts(
     chain_id: u64,
     account: Address,
     evidence: &RewardEvidence,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardIntervalAmount>> {
@@ -1365,7 +1365,7 @@ pub async fn fetch_reward_batch_interval_amounts(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardBatchIntervalAmount>> {
@@ -1440,7 +1440,7 @@ pub async fn fetch_reward_batch_interval_amounts(
 
 fn provider_for_chain(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
@@ -1676,7 +1676,7 @@ mod tests {
             &crate::settings::WalletSettings::default(),
         )
         .unwrap();
-        let chain = chains.get_mut(&1).unwrap();
+        let chain = chains.get_mut(1).unwrap();
         chain.rpc_route = crate::RpcChainRoute::new(1, vec![endpoint]);
         let http = HttpContext::direct_for_tests();
         let snapshots = [
@@ -1713,7 +1713,7 @@ mod tests {
                         &tokens,
                         &metadata,
                         &snapshots,
-                        Some(chain),
+                        chain,
                         &http,
                         chunk_size,
                     )
@@ -1744,7 +1744,7 @@ mod tests {
                         &tokens,
                         &metadata,
                         &snapshots,
-                        Some(chain),
+                        chain,
                         &http,
                         chunk_size,
                     )

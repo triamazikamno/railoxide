@@ -298,7 +298,12 @@ impl ExecutorOwner {
         }
         // Reading a recorded accepted profile also works while new allocation is disabled.
         let mut chain = self.chain.clone();
-        chain.relay_adapt_7702_contract = record.delegate().to_string();
+        chain
+            .railgun
+            .as_mut()
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?
+            .deployment
+            .relay_adapt_7702_contract = record.delegate();
         chain.enabled = true;
         let inspection = self
             .while_active(inspect_recovery_executor(
@@ -341,8 +346,8 @@ impl ExecutorOwner {
                 ExecutorRecoveryExecution::PaidExecute { nonce }
             }
         };
-        let railgun = self.chain.railgun_contract.parse::<Address>()?;
-        let token = recovery_token(asset, self.chain.wrapped_native_token.as_deref())?;
+        let railgun = self.chain.require_railgun()?.deployment.contract;
+        let token = recovery_token(asset, self.chain.wrapped_native_token)?;
         let allowance = self
             .while_active(recovery_allowance(
                 &chain,
@@ -538,12 +543,10 @@ fn prepare_recovery_replacement(
     Ok(replacement)
 }
 
-fn recovery_token(asset: ExecutorAsset, wrapped: Option<&str>) -> Result<TokenData> {
+fn recovery_token(asset: ExecutorAsset, wrapped: Option<Address>) -> Result<TokenData> {
     Ok(match asset {
         ExecutorAsset::Native => TokenData::erc20(
-            wrapped
-                .ok_or_else(|| eyre!("native shielding is unavailable on this chain"))?
-                .parse()?,
+            wrapped.ok_or_else(|| eyre!("native shielding is unavailable on this chain"))?,
         ),
         ExecutorAsset::Erc20(token) => TokenData::erc20(token),
         ExecutorAsset::Erc721 {
@@ -816,7 +819,8 @@ mod tests {
     async fn executor_native_recovery_reserves_all_steps_and_never_wraps_the_reserve() {
         let chain = build_effective_chain_configs(&WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
         let source = Address::repeat_byte(1);
         let responses = Asserter::new();

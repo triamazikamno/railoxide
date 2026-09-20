@@ -12,7 +12,7 @@ use crate::walletconnect::{
     DappRequestValidationError, WalletConnectNamespaceAccountSupport, WalletConnectParsedRequest,
     parse_dapp_request_for_account, validate_dapp_request_account,
 };
-use crate::{RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRead, WalletRpcOrigin};
+use crate::{RpcBrokerError, RpcOrigin, RpcRead, WalletRpcOrigin};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::{
@@ -24,11 +24,16 @@ pub struct GatewayApprovalRequest {
     pub id: String,
     pub deadline: Instant,
     pub origin: RpcOrigin,
-    pub permission: GatewayPermission,
-    pub account: PublicAccountMetadata,
+    /// Absent only for chain additions, which require no account grant.
+    pub authorization: Option<GatewayApprovalAccount>,
+    /// The proposed chain for additions; the granted chain for account-bound requests.
     pub chain_id: u64,
     pub parsed: WalletConnectParsedRequest,
     pub control: DappRequestControl,
+}
+pub struct GatewayApprovalAccount {
+    pub permission: GatewayPermission,
+    pub account: PublicAccountMetadata,
 }
 pub(super) struct PendingApproval {
     pub(super) id: String,
@@ -116,7 +121,10 @@ impl DappProvider {
         };
         let doc = &self.documents[&(session, document.clone())];
         let origin = doc.origin.clone();
-        if self.wallet.view.is_some() && self.resolve(&origin).is_err() {
+        if method != "wallet_addEthereumChain"
+            && self.wallet.view.is_some()
+            && self.resolve(&origin).is_err()
+        {
             self.respond(session, &document, &request_id, Err(4100));
             return Ok(());
         }
@@ -169,67 +177,118 @@ impl DappProvider {
     }
     fn prepare_approval(&self, pending: &mut PendingApproval) -> Result<(), i32> {
         self.waiting_approval_is_current(pending)?;
-        let (permission, account) = self.resolve(&pending.origin)?;
-        if !self.wallet.chain_ids.contains(&permission.chain_id)
-            || !self.wallet.routes.contains_key(&permission.chain_id)
-        {
-            return Err(4901);
-        }
+        let authorization = if pending.method == "wallet_addEthereumChain" {
+            None
+        } else {
+            let (permission, account) = self.resolve(&pending.origin)?;
+            if !self.wallet.chain_ids.contains(&permission.chain_id)
+                || !self.wallet.routes.contains_key(&permission.chain_id)
+            {
+                return Err(4901);
+            }
+            Some(GatewayApprovalAccount {
+                permission,
+                account,
+            })
+        };
         if self.wallet.http.is_none() {
             return Err(4900);
         }
-        let parsed = parse_dapp_request_for_account(
-            0,
-            &pending.method,
-            pending.params.as_ref().expect("waiting request"),
-            account.address,
-        )
+        let mut parsed = if let Some(authorization) = &authorization {
+            parse_dapp_request_for_account(
+                0,
+                &pending.method,
+                pending.params.as_ref().expect("waiting request"),
+                authorization.account.address,
+            )
+        } else {
+            crate::walletconnect::parse_dapp_chain_request(
+                &pending.method,
+                pending.params.as_ref().expect("waiting request"),
+            )
+        }
         .map_err(|error| match error {
             crate::walletconnect::WalletConnectError::UnsupportedMethod(_) => 4200,
             _ => -32602,
         })?;
-        match &parsed {
-            WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id }
-            | WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
+        match &mut parsed {
+            WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
                 if !self.wallet.chain_ids.contains(chain_id)
                     || !self.wallet.routes.contains_key(chain_id)
                 {
                     return Err(4901);
                 }
             }
+            WalletConnectParsedRequest::WalletAddEthereumChain {
+                chain_id,
+                raw,
+                definition,
+            } => {
+                if !self.wallet.routes.contains_key(chain_id) {
+                    if self.wallet.configured_chain_ids.contains(chain_id)
+                        || self.wallet.chain_ids.contains(chain_id)
+                    {
+                        return Err(4901);
+                    }
+                    *definition = Some(Box::new(
+                        super::super::policy::proposed_chain(*chain_id, raw).map_err(|_| -32602)?,
+                    ));
+                }
+            }
             WalletConnectParsedRequest::WalletWatchAsset {
                 chain_id: Some(chain_id),
                 ..
-            } if *chain_id != permission.chain_id => return Err(4901),
+            } if authorization
+                .as_ref()
+                .is_none_or(|authorization| *chain_id != authorization.permission.chain_id) =>
+            {
+                return Err(4901);
+            }
             _ => {}
         }
-        let support = if account.source == PublicAccountSource::HardwareDerived {
-            let mode = account.hardware_descriptor.as_ref().and_then(|descriptor| {
-                self.wallet
-                    .view
-                    .as_ref()
-                    .and_then(|view| view.hardware_profile_session())
-                    .and_then(|session| session.typed_data_signing_mode(descriptor))
-            });
-            mode.map_or_else(
-                WalletConnectNamespaceAccountSupport::hardware_typed_data_capability_unknown,
-                WalletConnectNamespaceAccountSupport::hardware,
-            )
-        } else {
-            WalletConnectNamespaceAccountSupport::for_account_source(account.source)
-        };
-        validate_dapp_request_account(&parsed, &account, permission.chain_id, support).map_err(
-            |error| match error {
-                DappRequestValidationError::UnsupportedMethod => 4200,
-                DappRequestValidationError::AccountMismatch => 4100,
-                DappRequestValidationError::TransactionChainMismatch
-                | DappRequestValidationError::TypedDataChainMismatch => -32602,
-            },
-        )?;
+        if let Some(GatewayApprovalAccount {
+            permission,
+            account,
+        }) = &authorization
+        {
+            let support = if account.source == PublicAccountSource::HardwareDerived {
+                let mode = account.hardware_descriptor.as_ref().and_then(|descriptor| {
+                    self.wallet
+                        .view
+                        .as_ref()
+                        .and_then(|view| view.hardware_profile_session())
+                        .and_then(|session| session.typed_data_signing_mode(descriptor))
+                });
+                mode.map_or_else(
+                    WalletConnectNamespaceAccountSupport::hardware_typed_data_capability_unknown,
+                    WalletConnectNamespaceAccountSupport::hardware,
+                )
+            } else {
+                WalletConnectNamespaceAccountSupport::for_account_source(account.source)
+            };
+            validate_dapp_request_account(&parsed, account, permission.chain_id, support).map_err(
+                |error| match error {
+                    DappRequestValidationError::UnsupportedMethod => 4200,
+                    DappRequestValidationError::AccountMismatch => 4100,
+                    DappRequestValidationError::TransactionChainMismatch
+                    | DappRequestValidationError::TypedDataChainMismatch => -32602,
+                },
+            )?;
+        }
         let doc = &self.documents[&(pending.session, pending.document.clone())];
         let wallet = self.wallet.clone();
         let live = self.authority.clone();
-        let chain_id = permission.chain_id;
+        let account_chain = authorization
+            .as_ref()
+            .map(|authorization| authorization.permission.chain_id);
+        let chain_id = match &parsed {
+            WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => *chain_id,
+            _ => account_chain.ok_or(4100)?,
+        };
+        let switch_target = match &parsed {
+            WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => Some(*chain_id),
+            _ => None,
+        };
         let lifetime = self.gateway_lifetime.clone();
         let control = DappRequestControl::new(pending.deadline, move || {
             if lifetime.as_ref().is_some_and(|lifetime| {
@@ -247,13 +306,21 @@ impl DappProvider {
             {
                 return Err(RpcBrokerError::OriginRejected);
             }
-            if !current.chain_ids.contains(&chain_id) || !current.routes.contains_key(&chain_id) {
+            if account_chain.is_some()
+                && (!current.chain_ids.contains(&chain_id)
+                    || !current.routes.contains_key(&chain_id))
+            {
                 return Err(RpcBrokerError::NoEndpoint { chain_id });
             }
             if current.http.is_none() {
                 return Err(RpcBrokerError::Shutdown);
             }
-            if !current.same_authority(&wallet) {
+            if !current.same_authority(&wallet)
+                || (account_chain.is_some() && !current.same_chain_authority(&wallet, chain_id))
+            {
+                return Err(RpcBrokerError::Timeout);
+            }
+            if switch_target.is_some_and(|target| !current.same_chain_authority(&wallet, target)) {
                 return Err(RpcBrokerError::Timeout);
             }
             Ok(())
@@ -270,16 +337,21 @@ impl DappProvider {
             document_generation: doc.generation,
             generation: self.generation,
             wallet: self.wallet.clone(),
-            permission: Some(permission.clone()),
+            // Retain any existing grant only as an invalidation boundary. Adding a chain
+            // never creates or changes it and never needs an account to approve.
+            permission: self
+                .resolve(&pending.origin)
+                .ok()
+                .map(|(permission, _)| permission),
             local_balance: None,
+            unconnected_chain: None,
         };
         pending.ready = Some((
             Arc::new(GatewayApprovalRequest {
                 id: pending.id.clone(),
                 deadline: pending.deadline,
                 origin: pending.origin.clone(),
-                permission,
-                account,
+                authorization,
                 chain_id,
                 parsed,
                 control,
@@ -555,8 +627,11 @@ impl DappProvider {
                     .map(|()| Value::Null)
                     .map_err(GatewayApprovalFailure::Local),
                 WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
-                    if self.wallet.chain_ids.contains(chain_id)
-                        && self.wallet.routes.contains_key(chain_id)
+                    // The desktop commits authority synchronously; its watch publication
+                    // may still be queued when this completion reaches the actor.
+                    let authority = self.authority.borrow();
+                    if authority.chain_ids.contains(chain_id)
+                        && authority.routes.contains_key(chain_id)
                     {
                         Ok(Value::Null)
                     } else {
@@ -637,11 +712,15 @@ impl DappProvider {
         if !current.same_authority(&self.wallet) {
             return Err(LocalProviderFailure::Unauthorized);
         }
+        let authorization = request
+            .authorization
+            .as_ref()
+            .ok_or(LocalProviderFailure::Unauthorized)?;
         self.store
             .grant_gateway_permission(
                 view,
                 &request.origin,
-                &request.permission.public_account_uuid,
+                &authorization.permission.public_account_uuid,
                 chain_id,
             )
             .map_err(|_| LocalProviderFailure::Internal)?;
@@ -679,6 +758,10 @@ impl DappProvider {
             let _ = reply.send(Err(error));
             return;
         }
+        if request.authorization.is_none() {
+            let _ = reply.send(Err(RpcBrokerError::OriginRejected));
+            return;
+        }
         if !owner.wallet.routes[&request.chain_id]
             .endpoints()
             .contains(&endpoint)
@@ -709,10 +792,7 @@ impl DappProvider {
             }
         };
         let read_id = ticket.id;
-        let mut route = RpcChainRoute::new(request.chain_id, vec![endpoint]);
-        if let Some(multicall) = owner.wallet.routes[&request.chain_id].multicall() {
-            route = route.with_multicall(multicall);
-        }
+        let route = owner.wallet.routes[&request.chain_id].for_endpoint(endpoint);
         self.reads.insert(
             read_id,
             PendingRead {

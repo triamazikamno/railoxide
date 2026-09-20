@@ -19,6 +19,7 @@ let runtimeInitialized = false;
 let uiPort;
 let stateCallback;
 let snapshotCallback;
+let chainEditorCallback;
 let connectSnapshot = { locked: true, accounts: [], pending_connects: [], pending_requests: [] };
 const isSidePanel = new URL(location.href).search === '?mode=sidepanel';
 function sendViewPresence() {
@@ -195,6 +196,7 @@ function attachWorker() {
         message.request_id === viewChange.id && typeof message.success === 'boolean') {
       viewChange.saved(message);
     }
+    if (uiPort === port && message?.type === 'chain_editor' && chainEditorCallback) chainEditorCallback(message);
     if (uiPort === port && message?.type === 'ui_snapshot') {
       if (openingSnapshotPending) {
         openingSnapshotPending = false;
@@ -236,6 +238,7 @@ function detachWorker() {
   hostEpoch += 1;
   stateCallback = null;
   snapshotCallback = null;
+  chainEditorCallback = null;
   connectSnapshot = { locked: true, accounts: [], pending_connects: [], pending_requests: [] };
   clearTimeout(portRetry);
   const port = uiPort;
@@ -332,6 +335,7 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
     stateCallback = callback;
     deliverStatus(gatewayStatus);
   },
+  subscribeChainEditor(callback) { chainEditorCallback = callback; },
   subscribeConnect(callback) {
     snapshotCallback = callback;
     deliverSnapshot(connectSnapshot);
@@ -344,7 +348,7 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
     if (state !== 'ready' || !uiPort) return;
     if (command === 'unlock') {
       try { uiPort.postMessage({ type: 'unlock', command: JSON.parse(value) }); } catch {}
-    } else if (command === 'public_view' || command === 'private_view' || command === 'network') {
+    } else if (command === 'public_view' || command === 'private_view' || command === 'network' || command === 'chain_editor') {
       try {
         uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
           tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });

@@ -184,7 +184,7 @@ impl GatewayView {
                 .map_or_else(String::new, |asset| asset.id.clone())
         });
         let mut input = existing.map_or_else(|| json!({
-            "wallet":wallet,"chain_id":chain,"kind":kind,"asset":default_asset,"amount":"","max":false,
+            "wallet":wallet,"chain_id":chain_json(chain),"kind":kind,"asset":default_asset,"amount":"","max":false,
             "recipient":"","address_book_entry":null,"fee_token":default_asset,"fee_mode":"deduct",
             "broadcaster":{"mode":"random"},"allow_out_of_range":false,"favorites_only":false,
             "unwrap":false,"native_top_up":false

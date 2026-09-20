@@ -613,7 +613,7 @@ pub async fn fetch_governance_participation(
     chain_id: u64,
     proposal: &GovernanceProposal,
     accounts: &[Address],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Vec<GovernanceParticipationRow>> {
     let contracts = governance_contracts(chain_id)
@@ -1033,7 +1033,7 @@ pub fn derive_governance_proposal_stage(
 /// Unsupported chains return `Ok(None)` without issuing an RPC request.
 pub async fn fetch_governance_overview(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Option<GovernanceOverview>> {
     let Some(contracts) = governance_contracts(chain_id) else {
@@ -1053,7 +1053,7 @@ pub async fn fetch_governance_overview(
 /// Fetch the latest block timestamp from a configured governance RPC.
 pub async fn fetch_governance_chain_time(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<U256> {
     let (query_rpc_pool, _) = provider_for_chain(chain_id, effective_chain, http)?;
@@ -1101,7 +1101,7 @@ pub async fn fetch_governance_page(
     overview: &GovernanceOverview,
     page: usize,
     page_size: NonZeroUsize,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<Vec<GovernanceProposal>> {
     let v2_count = usize::try_from(overview.v2.proposal_count)
@@ -1178,7 +1178,7 @@ pub async fn fetch_governance_page(
 
 fn provider_for_chain(
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
@@ -1813,12 +1813,12 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
+        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
         effective_chain.rpc_route =
             RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
 
-        let overview = fetch_governance_overview(1, Some(effective_chain), &http)
+        let overview = fetch_governance_overview(1, effective_chain, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1832,7 +1832,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            Some(effective_chain),
+            effective_chain,
             &http,
         )
         .await
@@ -1893,12 +1893,12 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
+        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
         effective_chain.rpc_route =
             RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
 
-        let overview = fetch_governance_overview(1, Some(effective_chain), &http)
+        let overview = fetch_governance_overview(1, effective_chain, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1906,7 +1906,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            Some(effective_chain),
+            effective_chain,
             &http,
         )
         .await
@@ -1934,11 +1934,11 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
+        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
         effective_chain.rpc_route =
             RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
         let http = HttpContext::direct_for_tests();
-        let overview = fetch_governance_overview(1, Some(effective_chain), &http)
+        let overview = fetch_governance_overview(1, effective_chain, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1946,7 +1946,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            Some(effective_chain),
+            effective_chain,
             &http,
         )
         .await
@@ -2232,7 +2232,7 @@ mod tests {
         let settings = crate::settings::WalletSettings::default();
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(&1).expect("Ethereum config");
+        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
         effective_chain.rpc_route = RpcChainRoute::new(1, vec![Url::parse(&fixture.url).unwrap()])
             .with_multicall(MULTICALL);
         let accounts: Vec<_> = (1_u8..=11)
@@ -2243,7 +2243,7 @@ mod tests {
             1,
             &participation_proposal(GovernanceContractVersion::V2),
             &accounts,
-            Some(effective_chain),
+            effective_chain,
             &http,
         )
         .await

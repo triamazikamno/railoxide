@@ -60,7 +60,7 @@ pub async fn estimate_reward_claim_baseline(
     chain_id: u64,
     actor: Address,
     evidence: &crate::RewardBatchEvidence,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     let contract = governance_contracts(chain_id)
@@ -77,7 +77,7 @@ pub async fn estimate_reward_claim_baseline(
     crate::estimate_public_advanced_transaction(
         PublicAdvancedTransactionEstimateRequest {
             chain_id,
-            effective_chain: effective_chain.cloned(),
+            effective_chain: effective_chain.clone(),
             from: actor,
             intent: PublicTransactionIntent::Raw {
                 to: Some(contract),
@@ -489,7 +489,7 @@ pub struct GovernancePreflight {
 
 pub fn governance_estimate_request(
     review: &GovernanceActionReview,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
 ) -> PublicAdvancedTransactionEstimateRequest {
     PublicAdvancedTransactionEstimateRequest {
@@ -509,7 +509,7 @@ pub fn governance_estimate_request(
 pub async fn simulate_governance_action(
     review: &GovernanceActionReview,
     rebuilt: GovernanceResolvedAction,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
     quote: crate::PublicActionGasFeeQuote,
     resolved_fee: crate::PublicActionResolvedGasFee,
     http: &HttpContext,
@@ -549,7 +549,7 @@ pub async fn simulate_governance_action(
 pub async fn estimate_governance_action(
     review: &GovernanceActionReview,
     rebuilt: GovernanceResolvedAction,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
     quote: crate::PublicActionGasFeeQuote,
     resolved_fee: crate::PublicActionResolvedGasFee,
     http: &HttpContext,
@@ -689,7 +689,7 @@ pub async fn submit_governance_action_with_progress(
                 "public-action",
                 "public action transaction",
                 request.public_send.chain_id,
-                request.public_send.effective_chain.as_ref(),
+                &request.public_send.effective_chain,
                 &request.public_send.intent,
                 &signer,
                 request.public_send.advanced_authorization,
@@ -808,7 +808,7 @@ pub async fn submit_governance_workflow_with_progress(
                 return Err(eyre!(GovernanceActionError::WrongPublicContext));
             }
             let chain_id = initial.public_send.chain_id;
-            let effective_chain = initial.public_send.effective_chain.as_ref();
+            let effective_chain = &initial.public_send.effective_chain;
             let actor = signer.address();
             let mut command_rx = initial.public_send.command_rx;
             let event_tx = initial.public_send.event_tx.as_ref();

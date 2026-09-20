@@ -22,7 +22,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::rpc_broker::total_failure;
 use crate::settings::{
-    EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings,
+    EffectiveChainRegistry, EffectiveTokenRegistry, PriceAnchorSettings,
     resolve_effective_chain_rpc_route,
 };
 use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
@@ -331,7 +331,7 @@ pub fn spawn_token_anchor_refresh_worker(
     runtime: &Handle,
     cache: Arc<TokenAnchorRateCache>,
     chain_ids: Vec<u64>,
-    effective_chains: BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: EffectiveChainRegistry,
     token_registry: EffectiveTokenRegistry,
     http: HttpContext,
 ) -> TokenAnchorRefreshHandle {
@@ -353,7 +353,7 @@ pub fn spawn_token_anchor_refresh_worker(
 async fn run_token_anchor_refresh_worker(
     cache: Arc<TokenAnchorRateCache>,
     chain_ids: Vec<u64>,
-    effective_chains: BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: EffectiveChainRegistry,
     token_registry: EffectiveTokenRegistry,
     http: HttpContext,
     mut wake_rx: watch::Receiver<u64>,
@@ -411,7 +411,7 @@ fn token_anchor_refresh_delay(
 pub async fn refresh_token_anchor_rates(
     cache: &TokenAnchorRateCache,
     chain_ids: &[u64],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: &EffectiveChainRegistry,
     token_registry: &EffectiveTokenRegistry,
     http: &HttpContext,
 ) {
@@ -606,7 +606,7 @@ async fn refresh_token_anchor_rates_with_fetch<'a, F>(
 async fn fetch_oracle_answers_for_chain(
     chain_id: u64,
     oracle_addresses: &[Address],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: &EffectiveChainRegistry,
     http: &HttpContext,
 ) -> Result<BTreeMap<Address, U256>> {
     fetch_oracle_answers_for_chain_with_timeout(
@@ -622,11 +622,16 @@ async fn fetch_oracle_answers_for_chain(
 async fn fetch_oracle_answers_for_chain_with_timeout(
     chain_id: u64,
     oracle_addresses: &[Address],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: &EffectiveChainRegistry,
     http: &HttpContext,
     request_timeout: Duration,
 ) -> Result<BTreeMap<Address, U256>> {
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chains.get(&chain_id))?;
+    let chain_route = resolve_effective_chain_rpc_route(
+        chain_id,
+        effective_chains
+            .get(chain_id)
+            .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
+    )?;
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(request_timeout)
         .with_attempt_timeout(Duration::from_secs(5));
@@ -946,7 +951,7 @@ async fn fetch_twap_inputs_for_chain(
     chain_id: u64,
     pools: &[PoolKey],
     observations: &[ObservationKey],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: &EffectiveChainRegistry,
     http: &HttpContext,
 ) -> Result<TwapFetchedInputs> {
     fetch_twap_inputs_for_chain_with_timeout(
@@ -964,14 +969,19 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
     chain_id: u64,
     pools: &[PoolKey],
     observations: &[ObservationKey],
-    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chains: &EffectiveChainRegistry,
     http: &HttpContext,
     request_timeout: Duration,
 ) -> Result<TwapFetchedInputs> {
     if pools.is_empty() && observations.is_empty() {
         return Ok(TwapFetchedInputs::default());
     }
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chains.get(&chain_id))?;
+    let chain_route = resolve_effective_chain_rpc_route(
+        chain_id,
+        effective_chains
+            .get(chain_id)
+            .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
+    )?;
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(request_timeout)
         .with_attempt_timeout(Duration::from_secs(5));
@@ -1745,11 +1755,11 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let multicall = effective_chains
-            .get(&1)
+            .get(1)
             .and_then(|chain| chain.rpc_route.multicall())
             .expect("multicall");
         effective_chains
-            .get_mut(&1)
+            .get_mut(1)
             .expect("Ethereum config")
             .rpc_route =
             RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
@@ -1788,11 +1798,11 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         let multicall = effective_chains
-            .get(&1)
+            .get(1)
             .and_then(|chain| chain.rpc_route.multicall())
             .expect("multicall");
         effective_chains
-            .get_mut(&1)
+            .get_mut(1)
             .expect("Ethereum config")
             .rpc_route =
             RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
@@ -1834,7 +1844,7 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         effective_chains
-            .get_mut(&42161)
+            .get_mut(42161)
             .expect("Arbitrum config")
             .rpc_route =
             RpcChainRoute::new(42161, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
@@ -1907,7 +1917,7 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         effective_chains
-            .get_mut(&42161)
+            .get_mut(42161)
             .expect("Arbitrum config")
             .rpc_route =
             RpcChainRoute::new(42161, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])
@@ -1970,7 +1980,7 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         effective_chains
-            .get_mut(&42161)
+            .get_mut(42161)
             .expect("Arbitrum config")
             .rpc_route = RpcChainRoute::new(
             42161,
@@ -2676,7 +2686,7 @@ mod tests {
         let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
             .expect("effective chain configs");
         effective_chains
-            .get_mut(&1)
+            .get_mut(1)
             .expect("Ethereum config")
             .rpc_route =
             RpcChainRoute::new(1, vec![reqwest::Url::parse(&rpc_url).expect("RPC URL")])

@@ -20,6 +20,12 @@ use crate::vault::{
 use crate::walletconnect::WalletConnectDecodedTransaction;
 
 pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvmFeeModel {
+    Legacy,
+    Eip1559,
+}
 pub type PublicActionGasFeeSelection = crate::SelfBroadcastGasFeeSelection;
 pub type PublicActionResolvedGasFee = crate::SelfBroadcastResolvedGasFee;
 
@@ -262,7 +268,7 @@ pub struct PublicSendRequest {
     pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<EffectiveChainConfig>,
+    pub effective_chain: EffectiveChainConfig,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -285,7 +291,7 @@ pub struct PublicAdvancedTransactionAuthorization {
 
 pub struct PublicAdvancedTransactionEstimateRequest {
     pub chain_id: u64,
-    pub effective_chain: Option<EffectiveChainConfig>,
+    pub effective_chain: EffectiveChainConfig,
     pub from: Address,
     pub intent: PublicTransactionIntent,
     pub gas_fee: PublicActionGasFeeSelection,
@@ -313,7 +319,7 @@ pub struct PublicShieldRequest {
     pub executor_owner: Option<Arc<crate::ExecutorOwner>>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<EffectiveChainConfig>,
+    pub effective_chain: EffectiveChainConfig,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -434,7 +440,7 @@ pub struct WalletConnectSendTransactionRequest {
     pub rpc_reads: Option<super::DappRpcReadClient>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<EffectiveChainConfig>,
+    pub effective_chain: EffectiveChainConfig,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,

@@ -264,10 +264,10 @@ impl GatewayView {
         if let Some(form) = &self.draft_form {
             let stale = if form.private.is_some() {
                 form.input["wallet"].as_str() != self.private_view.selected_wallet.as_deref()
-                    || form.input["chain_id"].as_u64() != self.private_view.selected_chain
+                    || json_chain_id(&form.input["chain_id"]) != self.private_view.selected_chain
             } else {
                 Some(text(&form.input, "account")) != self.public_view.selected_account
-                    || form.input["chain_id"].as_u64() != self.public_view.selected_chain
+                    || json_chain_id(&form.input["chain_id"]) != self.public_view.selected_chain
             };
             if stale {
                 self.draft_form = None;
@@ -386,7 +386,9 @@ impl GatewayView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.public_view.drafts_supported {
+        if !self.public_view.drafts_supported
+            || (kind == "shield" && !self.selected_chain_has_railgun())
+        {
             return;
         }
         if self.draft.as_ref().is_some_and(DraftSnapshot::executing) {
@@ -403,11 +405,11 @@ impl GatewayView {
         };
         let existing = self.draft.as_ref().filter(|draft| {
             text(&draft.input, "account") == account
-                && draft.input["chain_id"].as_u64() == Some(chain)
+                && json_chain_id(&draft.input["chain_id"]) == Some(chain)
         });
         let mut input = existing.map_or_else(
             || {
-                json!({"account":account, "chain_id":chain, "kind":kind,
+                json!({"account":account, "chain_id":chain_json(chain), "kind":kind,
             "asset":"native", "amount":"", "recipient":"", "address_book_entry":null,
             "fee":{"mode":"normal"}, "mimic_railway":true, "max":false})
             },
@@ -1083,7 +1085,7 @@ impl GatewayView {
                         .child(
                             note(public_view::chain_name(
                                 &self.chains,
-                                form.input["chain_id"].as_u64().unwrap_or_default(),
+                                json_chain_id(&form.input["chain_id"]).unwrap_or_default(),
                             ))
                             .flex_none(),
                         ),

@@ -27,7 +27,6 @@ use super::{
 };
 use crate::RpcChainRoute;
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
-use sync_service::ChainConfigDefaults;
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -62,7 +61,7 @@ struct ReleasedV4WalletSettingsWire {
     version: u32,
     network: super::NetworkSettings,
     privacy: super::PrivacySettings,
-    chains: super::ChainSettings,
+    chains: super::legacy::ChainSettings,
     indexed_artifacts: super::IndexedArtifactSettings,
     poi: super::PoiSettings,
     broadcaster: super::PublicBroadcasterSettings,
@@ -73,12 +72,50 @@ struct ReleasedV4WalletSettingsWire {
     walletconnect: super::WalletConnectSettings,
 }
 
+fn released_chains(chains: &super::ChainSettings) -> super::legacy::ChainSettings {
+    super::legacy::ChainSettings {
+        per_chain: chains
+            .per_chain
+            .iter()
+            .map(|(&id, chain)| {
+                let private = &chain.railgun;
+                (
+                    id,
+                    super::legacy::ChainSettingsOverride {
+                        enabled: chain.enabled,
+                        rpc_endpoints: chain.rpc_endpoints.clone(),
+                        sponsored_bundle_relays: private.sponsored_bundle_relays.clone(),
+                        quick_sync: private.quick_sync.clone(),
+                        contracts: super::legacy::ChainContractSettings {
+                            railgun_contract: private.contracts.railgun_contract.clone(),
+                            relay_adapt_contract: private.contracts.relay_adapt_contract.clone(),
+                            relay_adapt_7702_contract: private
+                                .contracts
+                                .relay_adapt_7702_contract
+                                .clone(),
+                            coinbase_payer: private.contracts.coinbase_payer.clone(),
+                            wrapped_native_token: chain.contracts.wrapped_native_token.clone(),
+                            multicall_contract: chain.contracts.multicall_contract.clone(),
+                        },
+                        deployment: private.deployment.clone(),
+                        finality_depth: chain.finality_depth,
+                        block_range: private.block_range,
+                        poll_interval_secs: private.poll_interval_secs,
+                        indexed_wallet_block_range: private.indexed_wallet_block_range,
+                        gas: chain.gas.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 fn released_settings_payload(settings: &WalletSettings, version: u32) -> Vec<u8> {
     rmp_serde::to_vec_named(&ReleasedV4WalletSettingsWire {
         version,
         network: settings.network.clone(),
         privacy: settings.privacy.clone(),
-        chains: settings.chains.clone(),
+        chains: released_chains(&settings.chains),
         indexed_artifacts: settings.indexed_artifacts.clone(),
         poi: settings.poi.clone(),
         broadcaster: settings.broadcaster.clone(),
@@ -100,7 +137,7 @@ fn released_v4_settings_payload(settings: &WalletSettings) -> Vec<u8> {
 struct ReleasedV1WalletSettingsWire {
     version: u32,
     network: super::NetworkSettings,
-    chains: super::ChainSettings,
+    chains: super::legacy::ChainSettings,
     indexed_artifacts: super::IndexedArtifactSettings,
     poi: ReleasedV1PoiSettingsWire,
     broadcaster: super::PublicBroadcasterSettings,
@@ -194,8 +231,7 @@ fn released_v2_settings_payload() -> Vec<u8> {
     ethereum.rpc_endpoints = vec!["https://existing-rpc.example".to_string()];
     ethereum.contracts.wrapped_native_token =
         Some("0x0000000000000000000000000000000000000001".to_string());
-    let chains = settings
-        .chains
+    let chains = released_chains(&settings.chains)
         .per_chain
         .into_iter()
         .map(|(chain_id, chain)| {
@@ -906,12 +942,22 @@ fn version_2_settings_migrate_with_sponsored_fields_unset() {
         .expect("migrated ethereum settings");
     assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
     assert_eq!(ethereum.rpc_endpoints, vec!["https://existing-rpc.example"]);
-    assert_eq!(ethereum.sponsored_bundle_relays, None);
-    assert_eq!(ethereum.contracts.coinbase_payer, None);
+    assert_eq!(ethereum.railgun.sponsored_bundle_relays, None);
+    assert_eq!(ethereum.railgun.contracts.coinbase_payer, None);
     let effective = build_effective_chain_configs(&migrated).expect("effective migrated settings");
-    let ethereum = effective.get(&1).expect("effective ethereum");
-    assert_eq!(ethereum.sponsored_bundle_relays.len(), 2);
-    assert_eq!(ethereum.coinbase_payer, super::default_coinbase_payer(1));
+    let ethereum = effective.get(1).expect("effective ethereum");
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .sponsored_bundle_relays
+            .len(),
+        2
+    );
+    assert_eq!(
+        ethereum.require_railgun().unwrap().coinbase_payer,
+        super::default_coinbase_payer(1)
+    );
     let rewritten = store
         .get_app_settings_record(WALLET_SETTINGS_KEY)
         .expect("read rewritten settings")
@@ -930,7 +976,7 @@ fn version_2_settings_migrate_with_sponsored_fields_unset() {
 struct ReleasedV3WalletSettingsWire {
     version: u32,
     network: super::NetworkSettings,
-    chains: super::ChainSettings,
+    chains: super::legacy::ChainSettings,
     indexed_artifacts: super::IndexedArtifactSettings,
     poi: super::PoiSettings,
     broadcaster: super::PublicBroadcasterSettings,
@@ -952,7 +998,7 @@ fn version_3_settings_migrate_with_railway_preference_disabled() {
     let released_payload = rmp_serde::to_vec_named(&ReleasedV3WalletSettingsWire {
         version: 3,
         network: settings.network,
-        chains: settings.chains,
+        chains: released_chains(&settings.chains),
         indexed_artifacts: settings.indexed_artifacts,
         poi: settings.poi,
         broadcaster: settings.broadcaster,
@@ -992,8 +1038,8 @@ fn version_3_sponsored_fields_are_not_strict_version_2_readable() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.sponsored_bundle_relays = Some(vec!["https://relay.example".to_string()]);
-    ethereum.contracts.coinbase_payer =
+    ethereum.railgun.sponsored_bundle_relays = Some(vec!["https://relay.example".to_string()]);
+    ethereum.railgun.contracts.coinbase_payer =
         Some("0x381787eBFD112E742fc965289c59630B2e7ce0A4".to_string());
     let encoded = encode_wallet_settings(&settings).expect("encode version 3 settings");
 
@@ -1488,43 +1534,90 @@ fn walletconnect_settings_do_not_persist_custom_relay_url() {
 fn effective_chain_configs_use_supported_presets_without_overrides() {
     let settings = WalletSettings::default();
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let ethereum = configs.get(&1).expect("ethereum config");
-    let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
+    let ethereum = configs.get(1).expect("ethereum config");
+    let defaults = super::presets::EvmPreset::for_chain(1).unwrap();
+    let deployment = broadcaster_core::deployment::RailgunDeployment::for_chain(1).unwrap();
+    let sync = sync_service::RailgunSyncOptions::for_chain(
+        1,
+        crate::desktop::DEFAULT_BLOCK_RANGE,
+        crate::desktop::DEFAULT_POLL_INTERVAL,
+    )
+    .unwrap();
 
-    for (map_chain_id, config) in &configs {
+    for (map_chain_id, config) in configs.iter() {
         assert_eq!(*map_chain_id, config.chain_id);
         assert_eq!(config.chain_id, config.rpc_route.chain_id());
     }
 
     assert!(ethereum.enabled);
-    assert_eq!(ethereum.rpc_route.endpoint_urls(), defaults.rpc_urls,);
+    assert_eq!(
+        ethereum.rpc_route.endpoint_urls(),
+        defaults
+            .rpc_endpoints
+            .iter()
+            .map(|url| Url::parse(url).unwrap())
+            .collect::<Vec<_>>(),
+    );
     assert!(ethereum.rpc_route.endpoints().len() > 1);
     assert_eq!(ethereum.finality_depth, defaults.finality_depth);
     assert!(ethereum.has_sponsorship_prerequisites());
     for chain_id in [56, 137, 42161] {
-        let chain = configs.get(&chain_id).expect("supported chain config");
-        assert!(chain.sponsored_bundle_relays.is_empty());
-        assert_eq!(chain.coinbase_payer, None);
+        let chain = configs.get(chain_id).expect("supported chain config");
+        assert!(
+            chain
+                .require_railgun()
+                .unwrap()
+                .sponsored_bundle_relays
+                .is_empty()
+        );
+        assert_eq!(chain.require_railgun().unwrap().coinbase_payer, None);
         assert!(!chain.has_sponsorship_prerequisites());
     }
-    assert_eq!(ethereum.deployment_block, defaults.deployment_block);
-    assert_eq!(ethereum.v2_start_block, defaults.v2_start_block);
-    assert_eq!(ethereum.legacy_shield_block, defaults.legacy_shield_block);
-    assert_eq!(ethereum.archive_until_block, defaults.archive_until_block);
-    assert_eq!(ethereum.archive_rpc_url, None);
     assert_eq!(
-        ethereum.quick_sync_endpoint,
-        defaults.quick_sync_endpoint.map(|url| url.to_string())
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .deployment_block,
+        deployment.deployment_block
     );
     assert_eq!(
-        ethereum.rpc_route.multicall(),
-        Some(defaults.multicall_contract)
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .v2_start_block,
+        deployment.v2_start_block
     );
     assert_eq!(
-        ethereum.indexed_artifact_source_mode,
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .legacy_shield_block,
+        deployment.legacy_shield_block
+    );
+    assert_eq!(
+        ethereum.require_railgun().unwrap().sync.archive_until_block,
+        sync.archive_until_block
+    );
+    assert_eq!(ethereum.require_railgun().unwrap().archive_rpc_url, None);
+    assert_eq!(
+        ethereum.require_railgun().unwrap().sync.quick_sync_endpoint,
+        sync.quick_sync_endpoint
+    );
+    assert_eq!(ethereum.rpc_route.multicall(), Some(defaults.multicall));
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .indexed_artifact_source_mode,
         IndexedArtifactSourceModeSetting::Official
     );
     let source = ethereum
+        .require_railgun()
+        .unwrap()
+        .sync
         .indexed_artifact_source
         .as_ref()
         .expect("official indexed artifact source");
@@ -1534,7 +1627,7 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     );
     assert!(matches!(
         &source.manifest_source,
-        super::IndexedArtifactManifestSource::IpnsName(name)
+        sync_service::IndexedArtifactManifestSource::IpnsName(name)
             if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
     ));
     assert_eq!(
@@ -1554,29 +1647,29 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
 fn effective_chain_rpc_route_validates_chain_identities() {
     let settings = WalletSettings::default();
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let ethereum = configs.get(&1).expect("ethereum config");
+    let ethereum = configs.get(1).expect("ethereum config");
 
     assert_eq!(
-        resolve_effective_chain_rpc_route(1, None).expect("default route"),
+        super::default_chain_rpc_route(1).expect("default route"),
         ethereum.rpc_route
     );
     assert_eq!(
-        resolve_effective_chain_rpc_route(1, Some(ethereum)).expect("effective route"),
+        resolve_effective_chain_rpc_route(1, ethereum).expect("effective route"),
         ethereum.rpc_route
     );
-    assert!(resolve_effective_chain_rpc_route(9_999, Some(ethereum)).is_err());
+    assert!(resolve_effective_chain_rpc_route(9_999, ethereum).is_err());
 
     let mut outer_mismatch = ethereum.clone();
     outer_mismatch.chain_id = 56;
-    assert!(resolve_effective_chain_rpc_route(1, Some(&outer_mismatch)).is_err());
+    assert!(resolve_effective_chain_rpc_route(1, &outer_mismatch).is_err());
 
     let mut embedded_mismatch = ethereum.clone();
     embedded_mismatch.rpc_route = RpcChainRoute::new(56, ethereum.rpc_route.endpoint_urls());
-    assert!(resolve_effective_chain_rpc_route(1, Some(&embedded_mismatch)).is_err());
+    assert!(resolve_effective_chain_rpc_route(1, &embedded_mismatch).is_err());
 
     let mut no_endpoints = ethereum.clone();
     no_endpoints.rpc_route = RpcChainRoute::new(1, Vec::<Url>::new());
-    let error = resolve_effective_chain_rpc_route(1, Some(&no_endpoints))
+    let error = resolve_effective_chain_rpc_route(1, &no_endpoints)
         .expect_err("empty endpoint list is rejected");
     assert!(error.to_string().contains("has no RPC endpoints"));
 }
@@ -1587,8 +1680,10 @@ fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
     let inherited = build_effective_chain_configs(&settings).expect("inherited sponsored relays");
     assert!(
         !inherited
-            .get(&1)
+            .get(1)
             .expect("ethereum config")
+            .require_railgun()
+            .unwrap()
             .sponsored_bundle_relays
             .is_empty()
     );
@@ -1597,18 +1692,31 @@ fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings")
+        .railgun
         .sponsored_bundle_relays = Some(vec![
         "https://user:secret@relay-a.example/path".to_string(),
         "http://relay-b.example".to_string(),
     ]);
     let configs = build_effective_chain_configs(&settings).expect("effective sponsored relays");
-    let ethereum = configs.get(&1).expect("ethereum config");
-    assert_eq!(ethereum.sponsored_bundle_relays.len(), 2);
+    let ethereum = configs.get(1).expect("ethereum config");
     assert_eq!(
-        ethereum.sponsored_bundle_relays[1].expose_url().as_str(),
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .sponsored_bundle_relays
+            .len(),
+        2
+    );
+    assert_eq!(
+        ethereum.require_railgun().unwrap().sponsored_bundle_relays[1]
+            .expose_url()
+            .as_str(),
         "http://relay-b.example/"
     );
-    let debug = format!("{:?}", ethereum.sponsored_bundle_relays);
+    let debug = format!(
+        "{:?}",
+        ethereum.require_railgun().unwrap().sponsored_bundle_relays
+    );
     assert!(!debug.contains("user"));
     assert!(!debug.contains("secret"));
 
@@ -1617,12 +1725,15 @@ fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings")
+        .railgun
         .sponsored_bundle_relays = Some(Vec::new());
     let disabled = build_effective_chain_configs(&settings).expect("disabled sponsored relays");
     assert!(
         disabled
-            .get(&1)
+            .get(1)
             .expect("ethereum config")
+            .require_railgun()
+            .unwrap()
             .sponsored_bundle_relays
             .is_empty()
     );
@@ -1636,8 +1747,8 @@ fn sponsored_settings_validate_relay_schemes_and_payer_addresses() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.sponsored_bundle_relays = Some(vec!["ws://relay.example".to_string()]);
-    ethereum.contracts.coinbase_payer = Some("not-an-address".to_string());
+    ethereum.railgun.sponsored_bundle_relays = Some(vec!["ws://relay.example".to_string()]);
+    ethereum.railgun.contracts.coinbase_payer = Some("not-an-address".to_string());
 
     let error = settings.validate().expect_err("invalid sponsored settings");
     assert!(error.messages.iter().any(|message| {
@@ -1663,7 +1774,7 @@ fn sponsored_settings_roundtrip_all_override_states() {
             .per_chain
             .get_mut(&1)
             .expect("ethereum settings");
-        ethereum.sponsored_bundle_relays = relays.clone();
+        ethereum.railgun.sponsored_bundle_relays = relays.clone();
 
         let encoded = encode_wallet_settings(&settings).expect("encode sponsored settings");
         let decoded = decode_wallet_settings(&encoded).expect("decode sponsored settings");
@@ -1672,7 +1783,7 @@ fn sponsored_settings_roundtrip_all_override_states() {
             .per_chain
             .get(&1)
             .expect("decoded ethereum settings");
-        assert_eq!(decoded.sponsored_bundle_relays, relays);
+        assert_eq!(decoded.railgun.sponsored_bundle_relays, relays);
     }
 
     let mut settings = WalletSettings::default();
@@ -1681,6 +1792,7 @@ fn sponsored_settings_roundtrip_all_override_states() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings")
+        .railgun
         .contracts
         .coinbase_payer = Some("0x0000000000000000000000000000000000000001".to_string());
     let encoded = encode_wallet_settings(&settings).expect("encode payer override");
@@ -1691,6 +1803,7 @@ fn sponsored_settings_roundtrip_all_override_states() {
             .per_chain
             .get(&1)
             .expect("decoded ethereum settings")
+            .railgun
             .contracts
             .coinbase_payer
             .as_deref(),
@@ -1716,8 +1829,13 @@ fn indexed_artifact_official_source_ignores_stored_custom_fields() {
         .expect("official mode ignores stored custom-only fields");
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let source = configs
-        .get(&1)
-        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .get(1)
+        .and_then(|config| {
+            config
+                .railgun
+                .as_ref()
+                .and_then(|private| private.sync.indexed_artifact_source.as_ref())
+        })
         .expect("official indexed artifact source");
 
     assert_eq!(
@@ -1726,7 +1844,7 @@ fn indexed_artifact_official_source_ignores_stored_custom_fields() {
     );
     assert!(matches!(
         &source.manifest_source,
-        super::IndexedArtifactManifestSource::IpnsName(name)
+        sync_service::IndexedArtifactManifestSource::IpnsName(name)
             if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
     ));
     assert_eq!(
@@ -1763,14 +1881,20 @@ fn indexed_artifact_custom_source_builds_effective_config() {
     settings.indexed_artifacts.max_manifest_age_secs = Some(3_600);
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let ethereum = configs.get(&1).expect("ethereum config");
+    let ethereum = configs.get(1).expect("ethereum config");
     let source = ethereum
+        .require_railgun()
+        .unwrap()
+        .sync
         .indexed_artifact_source
         .as_ref()
         .expect("indexed artifact source");
 
     assert_eq!(
-        ethereum.indexed_artifact_source_mode,
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .indexed_artifact_source_mode,
         IndexedArtifactSourceModeSetting::Custom
     );
     assert_eq!(
@@ -1779,7 +1903,7 @@ fn indexed_artifact_custom_source_builds_effective_config() {
     );
     assert!(matches!(
         &source.manifest_source,
-        super::IndexedArtifactManifestSource::Url(url)
+        sync_service::IndexedArtifactManifestSource::Url(url)
             if url.as_str() == "https://artifacts.example/manifest.json"
     ));
     assert_eq!(
@@ -1807,13 +1931,18 @@ fn indexed_artifact_ipns_source_is_trimmed_in_effective_config() {
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let source = configs
-        .get(&1)
-        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .get(1)
+        .and_then(|config| {
+            config
+                .railgun
+                .as_ref()
+                .and_then(|private| private.sync.indexed_artifact_source.as_ref())
+        })
         .expect("indexed artifact source");
 
     assert!(matches!(
         &source.manifest_source,
-        super::IndexedArtifactManifestSource::IpnsName(name)
+        sync_service::IndexedArtifactManifestSource::IpnsName(name)
             if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
     ));
 }
@@ -1830,8 +1959,13 @@ fn indexed_artifact_defaults_apply_to_custom_source_limits() {
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let source = configs
-        .get(&1)
-        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .get(1)
+        .and_then(|config| {
+            config
+                .railgun
+                .as_ref()
+                .and_then(|private| private.sync.indexed_artifact_source.as_ref())
+        })
         .expect("indexed artifact source");
 
     assert_eq!(source.concurrency, DEFAULT_INDEXED_ARTIFACT_CONCURRENCY);
@@ -1898,19 +2032,19 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
         "https://rpc-a.example".to_string(),
         "https://rpc-b.example".to_string(),
     ];
-    ethereum.quick_sync.endpoint = Some("https://quick.example/graphql".to_string());
+    ethereum.railgun.quick_sync.endpoint = Some("https://quick.example/graphql".to_string());
     ethereum.finality_depth = Some(64);
     ethereum.contracts.multicall_contract =
         Some("0x0000000000000000000000000000000000000001".to_string());
-    ethereum.deployment.deployment_block = Some(11);
-    ethereum.deployment.v2_start_block = Some(22);
-    ethereum.deployment.legacy_shield_block = Some(33);
-    ethereum.deployment.archive_until_block = Some(44);
-    ethereum.deployment.archive_rpc_url = Some("https://archive.example".to_string());
+    ethereum.railgun.deployment.deployment_block = Some(11);
+    ethereum.railgun.deployment.v2_start_block = Some(22);
+    ethereum.railgun.deployment.legacy_shield_block = Some(33);
+    ethereum.railgun.deployment.archive_until_block = Some(44);
+    ethereum.railgun.deployment.archive_rpc_url = Some("https://archive.example".to_string());
     ethereum.gas.gas_limit_buffer = Some(250_000);
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let ethereum = configs.get(&1).expect("ethereum config");
+    let ethereum = configs.get(1).expect("ethereum config");
 
     assert_eq!(
         ethereum.rpc_route.endpoint_urls(),
@@ -1920,17 +2054,52 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
         ]
     );
     assert_eq!(
-        ethereum.quick_sync_endpoint.as_deref(),
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .sync
+            .quick_sync_endpoint
+            .as_ref()
+            .map(Url::as_str),
         Some("https://quick.example/graphql")
     );
     assert_eq!(ethereum.finality_depth, 64);
-    assert_eq!(ethereum.deployment_block, 11);
-    assert_eq!(ethereum.v2_start_block, 22);
-    assert_eq!(ethereum.legacy_shield_block, 33);
-    assert_eq!(ethereum.archive_until_block, 44);
     assert_eq!(
-        ethereum.archive_rpc_url.as_deref(),
-        Some("https://archive.example")
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .deployment_block,
+        11
+    );
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .v2_start_block,
+        22
+    );
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .legacy_shield_block,
+        33
+    );
+    assert_eq!(
+        ethereum.require_railgun().unwrap().sync.archive_until_block,
+        44
+    );
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .archive_rpc_url
+            .as_ref()
+            .map(|url| url.expose_url().as_str()),
+        Some("https://archive.example/")
     );
     assert_eq!(
         ethereum.rpc_route.multicall(),
@@ -1947,6 +2116,7 @@ fn custom_railgun_contract_requires_deployment_metadata() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings")
+        .railgun
         .contracts
         .railgun_contract = Some("0x0000000000000000000000000000000000000001".to_string());
 
@@ -1972,10 +2142,10 @@ fn custom_railgun_contract_requires_deployment_metadata() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.deployment.deployment_block = Some(11);
-    ethereum.deployment.v2_start_block = Some(22);
-    ethereum.deployment.legacy_shield_block = Some(33);
-    ethereum.deployment.archive_until_block = Some(0);
+    ethereum.railgun.deployment.deployment_block = Some(11);
+    ethereum.railgun.deployment.v2_start_block = Some(22);
+    ethereum.railgun.deployment.legacy_shield_block = Some(33);
+    ethereum.railgun.deployment.archive_until_block = Some(0);
 
     settings.validate().expect("metadata supplied");
 }
@@ -1988,18 +2158,35 @@ fn effective_chain_configs_apply_quick_sync_bounds_and_disabled_state() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.quick_sync.enabled = false;
-    ethereum.quick_sync.indexed_wallet_block_range = Some(25_000);
-    ethereum.block_range = Some(2_000);
-    ethereum.poll_interval_secs = Some(30);
+    ethereum.railgun.quick_sync.enabled = false;
+    ethereum.railgun.quick_sync.indexed_wallet_block_range = Some(25_000);
+    ethereum.railgun.block_range = Some(2_000);
+    ethereum.railgun.poll_interval_secs = Some(30);
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let ethereum = configs.get(&1).expect("ethereum config");
+    let ethereum = configs.get(1).expect("ethereum config");
 
-    assert!(!ethereum.quick_sync_enabled);
-    assert_eq!(ethereum.indexed_wallet_block_range, 25_000);
-    assert_eq!(ethereum.block_range, Some(2_000));
-    assert_eq!(ethereum.poll_interval_secs, Some(30));
+    assert!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .sync
+            .quick_sync_endpoint
+            .is_none()
+    );
+    assert_eq!(
+        ethereum
+            .require_railgun()
+            .unwrap()
+            .sync
+            .indexed_wallet_block_range,
+        25_000
+    );
+    assert_eq!(ethereum.require_railgun().unwrap().sync.block_range, 2_000);
+    assert_eq!(
+        ethereum.require_railgun().unwrap().sync.poll_interval,
+        std::time::Duration::from_secs(30)
+    );
 }
 
 #[test]
@@ -2012,9 +2199,15 @@ fn chain_reset_restores_supported_chain_defaults() {
         .expect("ethereum settings")
         .enabled = false;
 
+    let custom = custom_evm_chain();
+    settings.chains.custom.insert(999_999, custom.clone());
     settings.reset_chains();
 
-    assert_eq!(settings.chains, super::ChainSettings::default());
+    assert_eq!(
+        settings.chains.per_chain,
+        super::ChainSettings::default().per_chain
+    );
+    assert_eq!(settings.chains.custom.get(&999_999), Some(&custom));
     assert!(settings.chains.enabled_chain_ids().contains(&1));
 }
 
@@ -2030,7 +2223,7 @@ fn effective_chain_configs_reject_unsupported_chain_ids() {
     assert!(
         err.messages
             .iter()
-            .any(|message| message.contains("custom chain IDs are out of scope"))
+            .any(|message| message.contains("provide a complete custom definition"))
     );
 }
 
@@ -2620,4 +2813,305 @@ fn encoded_settings_decode_without_db() {
     let data = encode_wallet_settings(&settings).expect("encode settings");
     let decoded = decode_wallet_settings(&data).expect("decode settings");
     assert_eq!(decoded, settings);
+}
+
+fn custom_evm_chain() -> super::CustomChainSettings {
+    super::CustomChainSettings {
+        name: "Test EVM".into(),
+        native_currency: super::NativeCurrency {
+            name: "Test coin".into(),
+            symbol: "TST".into(),
+            decimals: 6,
+        },
+        rpc_endpoints: vec!["http://127.0.0.1:8545".into()],
+        explorer_urls: vec![],
+        enabled: true,
+        contracts: super::ChainContractSettings::default(),
+        finality_depth: None,
+        gas: super::ChainGasSettings::default(),
+    }
+}
+
+#[test]
+fn custom_registry_retains_token_and_oracle_references_across_disable() {
+    const CHAIN: u64 = 9_007_199_254_740_993;
+    let mut settings = WalletSettings::default();
+    settings.chains.custom.insert(CHAIN, custom_evm_chain());
+    for chain in settings.chains.per_chain.values_mut() {
+        chain.enabled = false;
+    }
+    settings
+        .tokens
+        .custom_tokens
+        .push(super::CustomTokenSettings {
+            chain_id: CHAIN,
+            token_address: Address::repeat_byte(7).to_string(),
+            symbol: "TOKEN".into(),
+            decimals: 6,
+            icon_path: None,
+            price_anchor: Some(super::PriceAnchorSettings::Oracle {
+                chain_id: CHAIN,
+                oracle_address: Address::repeat_byte(8).to_string(),
+                token_decimals: 6,
+                oracle_decimals: 8,
+                is_inversed: false,
+            }),
+        });
+    let configs = build_effective_chain_configs(&settings).unwrap();
+    let custom = configs.get(CHAIN).unwrap();
+    assert_eq!(configs.enabled(CHAIN).unwrap(), custom);
+    assert!(
+        configs
+            .railgun(CHAIN)
+            .unwrap_err()
+            .to_string()
+            .contains("no Railgun deployment")
+    );
+    // Metadata survives disable, while both public and private admission reject it.
+    assert!(configs.get(1).is_some());
+    assert!(configs.get(999).is_none());
+    for (id, reason) in [(1, "disabled"), (999, "not configured")] {
+        assert!(
+            configs
+                .enabled(id)
+                .unwrap_err()
+                .to_string()
+                .contains(reason)
+        );
+        assert!(
+            configs
+                .railgun(id)
+                .unwrap_err()
+                .to_string()
+                .contains(reason)
+        );
+    }
+    assert_eq!(
+        configs
+            .enabled_chains()
+            .map(|chain| chain.chain_id)
+            .collect::<Vec<_>>(),
+        vec![CHAIN]
+    );
+    assert_eq!(configs.railgun_chains().count(), 0);
+    assert!(custom.railgun.is_none());
+    assert!(custom.block_time.is_none());
+    assert!(custom.wrapped_native_token.is_none());
+    assert!(custom.rpc_route.multicall().is_none());
+    assert!(custom.require_railgun().is_err());
+    assert_eq!(custom.native_currency.symbol, "TST");
+    assert_eq!(custom.native_currency.decimals, 6);
+    assert_eq!(settings.chains.enabled_chain_ids(), vec![CHAIN]);
+    assert_eq!(
+        resolve_effective_chain_rpc_route(CHAIN, custom)
+            .unwrap()
+            .chain_id(),
+        CHAIN
+    );
+    let token_registry = build_effective_token_registry(&settings).unwrap();
+    settings.chains.custom.get_mut(&CHAIN).unwrap().enabled = false;
+    assert!(settings.validate().is_err()); // Cannot disable the last available chain.
+    settings.chains.per_chain.get_mut(&1).unwrap().enabled = true;
+    settings.validate().unwrap();
+    assert_eq!(
+        build_effective_token_registry(&settings).unwrap(),
+        token_registry
+    );
+    let configs = build_effective_chain_configs(&settings).unwrap();
+    assert!(resolve_effective_chain_rpc_route(CHAIN, configs.get(CHAIN).unwrap()).is_err());
+    assert!(configs.enabled(CHAIN).is_err());
+    assert_eq!(configs.railgun(1).unwrap(), configs.get(1).unwrap());
+    assert_eq!(
+        configs
+            .railgun_chains()
+            .map(|chain| chain.chain_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    settings.chains.custom.get_mut(&CHAIN).unwrap().enabled = true;
+    assert_eq!(
+        build_effective_token_registry(&settings).unwrap(),
+        token_registry
+    );
+    let saved = settings.chains.custom.remove(&CHAIN).unwrap();
+    let error = settings.validate().unwrap_err();
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("tokens.custom_tokens[0].chain_id"))
+    );
+    settings.chains.custom.insert(CHAIN, saved);
+    settings.validate().unwrap();
+    settings.chains.custom.insert(1, custom_evm_chain());
+    assert!(settings.validate().is_err());
+    settings.chains.custom.remove(&1);
+    let mut oversized = custom_evm_chain();
+    oversized.rpc_endpoints = (0..=super::MAX_CHAIN_ENDPOINTS)
+        .map(|index| format!("https://rpc{index}.example"))
+        .collect();
+    assert!(
+        super::ChainMutation::Add {
+            chain_id: CHAIN + 1,
+            definition: oversized,
+        }
+        .prepare(&settings)
+        .is_err()
+    );
+    settings
+        .chains
+        .custom
+        .get_mut(&CHAIN)
+        .unwrap()
+        .rpc_endpoints
+        .clear();
+    assert!(settings.validate().is_err());
+}
+
+#[test]
+fn targeted_chain_and_whole_settings_commits_cannot_overwrite_each_other() {
+    use super::{ChainMutation, commit_wallet_settings, settings_revision};
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    let saved = load_wallet_settings(&store).unwrap();
+    let revision = settings_revision(&saved).unwrap();
+    let addition = ChainMutation::Add {
+        chain_id: 9_007_199_254_740_993,
+        definition: custom_evm_chain(),
+    }
+    .prepare(&saved)
+    .unwrap();
+    let mut whole = saved.clone();
+    whole.runtime.auto_lock_timeout_secs = Some(600);
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let targeted = scope.spawn(|| {
+            barrier.wait();
+            commit_wallet_settings(&store, revision, &addition)
+        });
+        let full = scope.spawn(|| {
+            barrier.wait();
+            commit_wallet_settings(&store, revision, &whole)
+        });
+        (targeted.join().unwrap(), full.join().unwrap())
+    });
+    let expected = match results {
+        (Ok(()), Err(WalletSettingsError::Conflict)) => addition,
+        (Err(WalletSettingsError::Conflict), Ok(())) => whole,
+        results => panic!("one stale writer must fail: {results:?}"),
+    };
+    assert_eq!(load_wallet_settings(&store).unwrap(), expected);
+    assert!(matches!(
+        commit_wallet_settings(&store, revision, &saved),
+        Err(WalletSettingsError::Conflict)
+    ));
+    let mut invalid = expected.clone();
+    for chain in invalid.chains.per_chain.values_mut() {
+        chain.enabled = false;
+    }
+    for chain in invalid.chains.custom.values_mut() {
+        chain.enabled = false;
+    }
+    assert!(matches!(
+        commit_wallet_settings(&store, settings_revision(&expected).unwrap(), &invalid),
+        Err(WalletSettingsError::Validation(_))
+    ));
+    drop(store);
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    assert_eq!(load_wallet_settings(&reopened).unwrap(), expected);
+    drop(reopened);
+    fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[test]
+fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings() {
+    let root_dir = temp_db_root();
+    let mut released = super::legacy::LegacyWalletSettings::default();
+    released.network.mode = super::NetworkModeSetting::Direct;
+    released.runtime.auto_lock_timeout_secs = Some(600);
+    released.poi.artifact.gateway_urls = vec![
+        "https://dweb.link".into(),
+        "https://ipfs.filebase.io".into(),
+        "https://ipfs.io".into(),
+    ];
+    let ethereum = released.chains.per_chain.get_mut(&1).unwrap();
+    ethereum.rpc_endpoints = vec!["https://user:secret@rpc.example/path".into()];
+    ethereum.sponsored_bundle_relays = Some(vec![]);
+    ethereum.contracts.multicall_contract = Some(Address::repeat_byte(2).to_string());
+    ethereum.contracts.railgun_contract = Some(Address::repeat_byte(3).to_string());
+    ethereum.contracts.coinbase_payer = Some(Address::repeat_byte(4).to_string());
+    ethereum.deployment.deployment_block = Some(11);
+    ethereum.deployment.v2_start_block = Some(22);
+    ethereum.deployment.legacy_shield_block = Some(33);
+    ethereum.deployment.archive_until_block = Some(44);
+    ethereum.deployment.archive_rpc_url = Some("https://archive.example".into());
+    ethereum.quick_sync.enabled = false;
+    ethereum.block_range = Some(0); // Released semantic error must remain repairable.
+    ethereum.gas.gas_limit_buffer = Some(123_456);
+    released.chains.per_chain.get_mut(&56).unwrap().enabled = false;
+    // Released built-in overrides had no endpoint count or URL-length cap.
+    let mut arbitrum_endpoints = (0..17)
+        .map(|index| format!("https://rpc{index}.example/"))
+        .collect::<Vec<_>>();
+    arbitrum_endpoints[0].push_str(&"a".repeat(4097));
+    released
+        .chains
+        .per_chain
+        .get_mut(&42161)
+        .unwrap()
+        .rpc_endpoints = arbitrum_endpoints.clone();
+    let payload = rmp_serde::to_vec_named(&released).unwrap();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .unwrap();
+    let mut migrated = load_wallet_settings(&store).unwrap();
+    assert!(migrated.validate().is_err());
+    assert_eq!(released_chains(&migrated.chains), released.chains);
+    assert_eq!(migrated.network, released.network);
+    assert_eq!(migrated.runtime, released.runtime);
+    assert_eq!(migrated.poi, released.poi);
+    drop(store);
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    assert_eq!(load_wallet_settings(&store).unwrap(), migrated);
+    migrated
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .unwrap()
+        .railgun
+        .block_range = Some(2_000);
+    save_wallet_settings(&store, &migrated).unwrap();
+    let configs = build_effective_chain_configs(&load_wallet_settings(&store).unwrap()).unwrap();
+    let private = configs.get(1).unwrap().require_railgun().unwrap();
+    assert_eq!(private.deployment.contract, Address::repeat_byte(3));
+    assert_eq!(private.sync.block_range, 2_000);
+    assert!(private.sync.quick_sync_endpoint.is_none());
+    assert!(private.sponsored_bundle_relays.is_empty());
+    assert_eq!(
+        configs.get(1).unwrap().rpc_route.multicall(),
+        Some(Address::repeat_byte(2))
+    );
+    assert_eq!(configs.get(1).unwrap().gas.gas_limit_buffer, 123_456);
+    assert_eq!(
+        configs.get(42161).unwrap().rpc_route.endpoint_urls(),
+        arbitrum_endpoints
+            .iter()
+            .map(|endpoint| Url::parse(endpoint).unwrap())
+            .collect::<Vec<_>>()
+    );
+    drop(store);
+    fs::remove_dir_all(root_dir).unwrap();
 }

@@ -331,6 +331,10 @@ impl ReadyScheduler {
 
     pub(super) fn partition_and_admit(&mut self, work: Vec<WorkItem>) {
         let mut groups: Vec<Vec<WorkItem>> = Vec::new();
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "route equality and hashing exclude the endpoint verification cache"
+        )]
         let mut group_indices: HashMap<(RpcChainRoute, Option<BlockKey>), usize> = HashMap::new();
         for item in work {
             let group_key = (

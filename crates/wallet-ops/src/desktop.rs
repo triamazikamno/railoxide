@@ -15,7 +15,7 @@ mod sync_helpers;
 
 pub async fn initialize_created_wallet_chain_metadata_for_session(
     view_session: Arc<vault::DesktopViewSession>,
-    effective_chains: BTreeMap<u64, settings::EffectiveChainConfig>,
+    effective_chains: settings::EffectiveChainRegistry,
     db: Arc<DbStore>,
     http: HttpContext,
     skip_chain_id: Option<u64>,

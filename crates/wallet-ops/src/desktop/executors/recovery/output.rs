@@ -65,7 +65,7 @@ impl ExecutorOwner {
         let source = record
             .address()
             .ok_or_else(|| eyre!("executor address is unavailable"))?;
-        let railgun = self.chain.railgun_contract.parse()?;
+        let railgun = self.chain.require_railgun()?.deployment.contract;
         let snapshot = session.handle.current_snapshot();
         let utxos = snapshot.as_ref().map(|snapshot| snapshot.utxos.as_ref());
         let mut statuses = Vec::new();

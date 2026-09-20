@@ -1434,3 +1434,99 @@ test('closing or revoking an unlock UI cancels ownership and reconnect never rep
   assert.equal(JSON.stringify(h.data).includes('transient secret'), false);
   assert.equal(JSON.stringify(h.data).includes('second secret'), false);
 });
+
+test('chain editor replies stay on live UI views without persistence, replay, or numeric chain rounding', async () => {
+  const h = await worker({ gatewayCredential: credential() });
+  const session = await established(h);
+  const popup = h.ui('chrome-extension://test/index.html');
+  const panel = h.ui('chrome-extension://test/index.html?mode=sidepanel');
+  const standalone = h.ui('chrome-extension://test/index.html?mode=window');
+  const page = h.provider(); await flush();
+  const sent = () => session.socket.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
+    .filter(message => message.type === 'chain_editor');
+  const base = { type: 'ui_snapshot', version: 1, generation: 1, locked: false, private_view_supported: true, accounts: [], pending_connects: [], pending_requests: [] };
+  const open = token => ({ type: 'chain_editor', generation: 1, command: { action: 'open', editor_token: token } });
+  await session.send(base);
+  popup.request(open('popup'));
+  assert.equal(sent().length, 0, 'older desktops keep their existing wallet UI');
+  await session.send({ ...base, chain_management_supported: true });
+  for (const [ui, token] of [[popup, 'popup'], [panel, 'panel'], [standalone, 'window']]) ui.request(open(token));
+  assert.equal(sent().length, 3);
+  const requests = sent().map(message => message.command);
+  assert.equal(new Set(requests.map(command => command.view_id)).size, 3);
+  assert.ok(requests.every((command, index) => index === 0 || BigInt(command.view_id) > BigInt(requests[index - 1].view_id)),
+    'view sequences increase across extension ports within the authenticated session');
+  const secret = 'https://synthetic:credential@rpc.example';
+  const id = '9007199254740993';
+  const snapshot = { revision: 'revision-one', chains: [{ chainId: id, name: 'Custom', builtIn: false, enabled: true }],
+    draft: { chainId: id, builtIn: false, enabled: true, fields: { rpcEndpoints: secret }, quickSyncEnabled: false, useDefaultRelays: false }, restartRequired: false };
+  const reply = (request, outcome = { status: 'ready', snapshot }) => ({ type: 'chain_editor', version: 1, generation: 1,
+    view_id: request.view_id, request_id: request.request_id, outcome });
+  await session.send(reply(requests[0]));
+  assert.equal(popup.port.messages.at(-1).outcome.snapshot.draft.chainId, id);
+  for (const other of [panel, standalone, page]) assert.equal(JSON.stringify(other.port.messages).includes(secret), false);
+  assert.equal(popup.port.messages.filter(message => message.type === 'ui_snapshot').some(message => JSON.stringify(message).includes(secret)), false);
+  const lastSnapshot = ui => ui.port.messages.filter(message => message.type === 'ui_snapshot').at(-1);
+  const railgun = { ...base, chain_management_supported: true, chains: [{ id: 1, name: 'Ethereum', railgun: true }],
+    public_view: { selected_account: 'first', selected_chain: 1, drafts: [] } };
+  const publicOnly = { ...base, chain_management_supported: true, chains: [{ id, name: 'Custom', railgun: false }],
+    public_view: { selected_account: 'first', selected_chain: id, drafts: [] } };
+  await session.send(railgun);
+  popup.request({ type: 'home_tab', generation: 1, value: 'private' });
+  assert.equal(lastSnapshot(popup).home_tab, 'private');
+  await session.send(publicOnly);
+  assert.equal(lastSnapshot(popup).home_tab, 'public');
+  popup.request({ type: 'home_tab', generation: 1, value: 'private' });
+  assert.equal(lastSnapshot(popup).home_tab, 'public', 'public-only chains cannot reopen Private');
+  await session.send(railgun);
+  assert.equal(lastSnapshot(popup).home_tab, 'public', 'returning to Railgun keeps the current tab');
+  await session.send(publicOnly);
+  popup.request({ type: 'public_view', generation: 1, command: { type: 'select_chain', chain_id: id } });
+  const input = { account: 'first', chain_id: id, kind: 'send', asset: 'native', amount: '1.25', recipient: '0x1111111111111111111111111111111111111111',
+    address_book_entry: null, fee: { mode: 'normal' }, max: false, mimic_railway: false };
+  popup.request({ type: 'public_view', generation: 1, command: { type: 'draft', command: { action: 'create', request_id: 'large-chain-send', input } } });
+  const publicMessages = session.socket.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
+    .filter(message => message.type === 'public_view');
+  assert.equal(publicMessages.at(-2).command.chain_id, id);
+  assert.equal(publicMessages.at(-1).command.command.input.chain_id, id);
+  const run = { type: 'chain_editor', generation: 1, command: { action: 'run', editor_token: 'popup', request_id: 'save',
+    revision: 'revision-one', command: { kind: 'save', existing: false, draft: snapshot.draft } } };
+  page.request({ id: 'page-save', method: 'chain_editor', params: run.command });
+  panel.request(run);
+  popup.request(run); popup.request(run);
+  await flush();
+  assert.equal(sent().length, 4, 'page, foreign-view and duplicate commands cannot repeat effects');
+  assert.equal(sent().at(-1).command.command.draft.chainId, id);
+  const saving = sent().at(-1).command;
+  await session.send(reply(saving, { status: 'failed', message: 'Settings changed. Reload before saving.' }));
+  assert.equal(popup.port.messages.at(-1).outcome.status, 'failed', 'conflicts are delivered only to the editing view');
+  const advanced = { ...snapshot.draft, chainId: '1', builtIn: true,
+    fields: { rpcEndpoints: secret, deploymentBlock: '123456', sponsoredBundleRelays: '' }, useDefaultRelays: false };
+  popup.request({ ...run, command: { ...run.command, request_id: 'advanced-edit', command: { kind: 'save', existing: true, draft: advanced } } });
+  assert.deepEqual(sent().at(-1).command.command.draft, advanced);
+  await session.send(reply(sent().at(-1).command, { status: 'ready', snapshot: { ...snapshot, draft: advanced, restartRequired: true } }));
+  assert.equal(popup.port.messages.at(-1).outcome.snapshot.restartRequired, true);
+  popup.request({ ...run, command: { ...run.command, request_id: 'reset', command: { kind: 'reset', chain_id: '1' } } });
+  const pending = sent().at(-1).command;
+  popup.request({ type: 'chain_editor', generation: 1, command: { action: 'close', editor_token: 'popup' } });
+  popup.request(open('replacement'));
+  assert.ok(BigInt(sent().at(-1).command.view_id) > BigInt(requests.at(-1).view_id),
+    'closing a view does not reset the session replay boundary');
+  const count = popup.port.messages.length;
+  await session.send(reply(pending));
+  assert.equal(popup.port.messages.length, count, 'old replies cannot fill a replacement editor');
+  panel.port.disconnect();
+  const panelCount = panel.port.messages.length;
+  await session.send(reply(requests[1]));
+  assert.equal(panel.port.messages.length, panelCount);
+  await session.send({ type: 'state', version: 1, generation: 2, locked: true });
+  assert.ok(standalone.port.messages.some(message => message.type === 'chain_editor' && message.outcome.status === 'retired'));
+  const lockedCount = standalone.port.messages.length;
+  await session.send(reply(requests[2]));
+  assert.equal(standalone.port.messages.length, lockedCount);
+  assert.equal(JSON.stringify(h.data).includes(secret), false, 'editor values never enter browser storage');
+  session.socket.close(); await flush(); await h.alarm();
+  const replacement = h.sockets.at(-1); replacement.open(); replacement.message(2); await flush();
+  assert.equal(replacement.sent.slice(1).map(bytes => JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))))
+    .some(message => message.type === 'chain_editor'), false);
+});

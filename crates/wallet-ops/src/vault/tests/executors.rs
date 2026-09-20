@@ -73,11 +73,12 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     let mut chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     // Unavailable RPC cannot erase restored accounts or report an empty address family.
-    chain.rpc_route = crate::RpcChainRoute::new(1, Vec::<url::Url>::new());
-    chain.enabled = false;
+    chain.rpc_route =
+        crate::RpcChainRoute::new(1, vec![url::Url::parse("http://127.0.0.1:1").unwrap()]);
     let owner = ExecutorOwner::new(
         0,
         db.clone(),
@@ -787,7 +788,8 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
         view.clone(),
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap(),
         crate::HttpContext::direct_for_tests(),
     )

@@ -73,6 +73,7 @@ impl Outbound {
             Some(GatewayServerMessage::ProviderState { .. }) => "ProviderState",
             Some(GatewayServerMessage::ProviderResponse { .. }) => "ProviderResponse",
             Some(GatewayServerMessage::UiSnapshot { .. }) => "UiSnapshot",
+            Some(GatewayServerMessage::ChainEditor { .. }) => "ChainEditor",
         };
         let now = Instant::now();
         let age_ms = now.duration_since(self.enqueued_at).as_millis();
@@ -682,6 +683,12 @@ impl Actor {
 
     async fn command(&mut self, command: Command) {
         match command {
+            Command::ChainEditorResult(request, outcome, done) => {
+                self.provider
+                    .complete_chain_editor_request(request, outcome);
+                self.flush_provider();
+                let _ = done.send(());
+            }
             Command::NetworkResult(request, outcome) => {
                 self.provider.complete_network_request(request, outcome);
                 self.flush_provider();
@@ -738,7 +745,11 @@ impl Actor {
                 let _ = reply.send(result);
             }
             Command::WalletState(wallet, generation, reply) => {
-                let result = if generation > self.generation
+                // Multiple publishers may queue the same epoch around a hot chain edit.
+                // A delayed snapshot cannot replace the synchronously published authority.
+                let result = if !self.provider.is_current_wallet_state(&wallet) {
+                    Err(GatewayError::Unavailable)
+                } else if generation > self.generation
                     || (generation == self.generation && self.provider.same_authority(&wallet))
                 {
                     self.locked = wallet.view.is_none();
@@ -1099,6 +1110,24 @@ impl Actor {
                         self.unlocks.sent.insert(id, view);
                     }
 
+                    Ok(GatewayClientMessage::ChainEditor {
+                        version: 1,
+                        generation,
+                        command,
+                    }) => {
+                        if let Some(request) = self.provider.chain_editor_command(
+                            id,
+                            session.peer().ok_or(GatewayError::Unavailable)?,
+                            generation,
+                            command,
+                        ) {
+                            self.emit_ui_event(
+                                id,
+                                generation,
+                                super::GatewayUiEventKind::ChainEditor { request },
+                            );
+                        }
+                    }
                     Ok(GatewayClientMessage::Network {
                         version: 1,
                         generation,
@@ -1324,6 +1353,7 @@ impl Actor {
         let (command, version) = match message {
             GatewayClientMessage::GetUnlockState { version } => ("get_unlock_state", version),
             GatewayClientMessage::Unlock { version, .. } => ("unlock", version),
+            GatewayClientMessage::ChainEditor { version, .. } => ("chain_editor", version),
             GatewayClientMessage::Network { version, .. } => ("network", version),
             GatewayClientMessage::PrivateView { version, .. } => ("private_view", version),
             GatewayClientMessage::PublicView { version, .. } => ("public_view", version),
@@ -1692,6 +1722,13 @@ mod integration_tests {
         }
         snapshot.as_object_mut().unwrap().remove("chains");
         snapshot.as_object_mut().unwrap().remove("permissions");
+        assert_eq!(
+            snapshot
+                .as_object_mut()
+                .unwrap()
+                .remove("chain_management_supported"),
+            (!locked).then_some(serde_json::Value::Bool(true))
+        );
         assert_eq!(
             snapshot,
             serde_json::json!({

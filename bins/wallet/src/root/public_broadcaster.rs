@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256, address};
@@ -10,7 +9,9 @@ use wallet_ops::{
     fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
-    settings::{EffectiveChainConfig, EffectiveTokenRegistry, ExecutorProfile},
+    settings::{
+        EffectiveChainConfig, EffectiveChainRegistry, EffectiveTokenRegistry, ExecutorProfile,
+    },
 };
 
 use crate::assets::WalletIconSource;
@@ -18,7 +19,6 @@ use crate::assets::WalletIconSource;
 use super::private_assets::format_private_asset_rows;
 use super::{
     DeliveryFormKind, DeliveryMode, SendFormState, UnshieldAssetKey, UnshieldFormState, WalletRoot,
-    parse_address,
 };
 
 const ETHEREUM_CHAIN_ID: u64 = 1;
@@ -92,7 +92,7 @@ impl WalletRoot {
     ) -> Option<ExecutorProfile> {
         if (unwrap || native_top_up) && !self.selected_wallet_source().is_hardware_derived() {
             self.effective_chain_configs
-                .get(&chain_id)
+                .get(chain_id)
                 .and_then(EffectiveChainConfig::accepted_executor_profile)
         } else {
             None
@@ -457,16 +457,19 @@ pub(super) fn should_show_fee_mode_toggle(
 }
 
 pub(super) fn required_relay_adapt_for_unshield(
-    effective_chain_configs: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chain_configs: &EffectiveChainRegistry,
     chain_id: u64,
     unwrap: bool,
     native_top_up: bool,
 ) -> Option<Address> {
     (unwrap || native_top_up)
         .then(|| {
-            effective_chain_configs
-                .get(&chain_id)
-                .and_then(|chain| parse_address(&chain.relay_adapt_contract))
+            effective_chain_configs.get(chain_id).and_then(|chain| {
+                chain
+                    .railgun
+                    .as_ref()
+                    .map(|private| private.deployment.relay_adapt_contract)
+            })
         })
         .flatten()
 }

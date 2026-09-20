@@ -135,7 +135,7 @@ impl WalletRoot {
                 }
             }
             GatewayPublicCommand::SelectChain { chain_id } => {
-                if self.effective_chain_configs.contains_key(&chain_id) {
+                if self.effective_chain_configs.get(chain_id).is_some() {
                     self.select_chain(chain_id, window, cx);
                 }
             }

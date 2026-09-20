@@ -2,6 +2,8 @@
 #![allow(clippy::unreadable_literal)]
 
 pub mod broadcaster_picker;
+pub mod chain_editor;
+pub mod chain_select;
 pub mod clipboard;
 pub mod controls;
 pub mod fees;

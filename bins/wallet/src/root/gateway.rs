@@ -1,3 +1,5 @@
+#[path = "gateway_chains.rs"]
+mod chains;
 use super::network::{query_exit_ip_through_tor, reset_tor_state_and_quit};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -252,6 +254,9 @@ impl GatewayUi {
                             wallet_ops::gateway::GatewayUiEventKind::Unlock { request } => {
                                 root.apply_gateway_unlock(&request, window, cx);
                             }
+                            wallet_ops::gateway::GatewayUiEventKind::ChainEditor { request } => {
+                                root.apply_gateway_chain_editor(request, window, cx);
+                            }
                             wallet_ops::gateway::GatewayUiEventKind::Network { request } => {
                                 root.apply_gateway_network_command(request, cx);
                             }
@@ -483,9 +488,9 @@ impl WalletRoot {
             return None;
         }
         let view = self.view_session.as_ref()?;
-        let config = self.effective_chain_configs.get(&chain_id)?;
+        let config = self.effective_chain_configs.get(chain_id)?;
         let route =
-            wallet_ops::settings::resolve_effective_chain_rpc_route(chain_id, Some(config)).ok()?;
+            wallet_ops::settings::resolve_effective_chain_rpc_route(chain_id, config).ok()?;
         Some(wallet_ops::PublicBalanceScope::new(
             view.wallet_id().to_owned(),
             self.active_wallet_generation,
@@ -539,8 +544,8 @@ impl WalletRoot {
             let mut snapshot = GatewayWalletState {
                 network_view: unlocked.then(|| self.gateway_network_view()),
                 private_view_supported: true,
-                private_actions_supported: unlocked,
-                private_self_broadcast_supported: unlocked,
+                private_actions_supported: unlocked && self.selected_chain_has_railgun(),
+                private_self_broadcast_supported: unlocked && self.selected_chain_has_railgun(),
                 private_view: unlocked.then(|| self.gateway_private_view()),
                 wallet_selection_generation: self.wallet_switch_generation,
                 wallet_transition: matches!(self.vault_state, VaultState::SwitchingWallet),
@@ -1682,7 +1687,7 @@ mod tests {
         };
         handle.set_wallet_authority(unlocked.clone());
         states
-            .send((unlocked, 1, Vec::new()))
+            .send((unlocked.clone(), 1, Vec::new()))
             .expect("publisher must still accept desktop updates");
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1691,6 +1696,20 @@ mod tests {
         .await
         .expect("later wallet state must reach the gateway")
         .unwrap();
+
+        // An explicit add completion may publish alongside the watch publisher.
+        // Both use the same epoch; an older queued route snapshot must be rejected.
+        let mut added = unlocked.clone();
+        added.routes.insert(
+            9_007_199_254_740_993,
+            wallet_ops::RpcChainRoute::new(
+                9_007_199_254_740_993,
+                vec![reqwest::Url::parse("https://custom.invalid").unwrap()],
+            ),
+        );
+        handle.set_wallet_authority(added.clone());
+        assert!(handle.publish_wallet_state(unlocked, 1).await.is_err());
+        handle.publish_wallet_state(added, 1).await.unwrap();
 
         drop(states);
         publisher.await.unwrap();

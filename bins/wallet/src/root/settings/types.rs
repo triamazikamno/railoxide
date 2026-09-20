@@ -89,9 +89,15 @@ pub(in crate::root) struct PreparedProverCacheBuild {
 }
 
 pub(in crate::root) struct WalletSettingsEditor {
+    pub(in crate::root) chain_editor: Entity<ui::chain_editor::ChainEditor>,
+    /// The chain editor owned the Settings body last frame.
+    pub(in crate::root) chain_editor_was_open: bool,
+    /// Reselect the Chains page when Settings remounts after the chain editor closes.
+    pub(in crate::root) reopen_chains_page: bool,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) runtime: Handle,
     pub(in crate::root) saved: WalletSettings,
+    pub(in crate::root) draft_base: WalletSettings,
     pub(in crate::root) draft: WalletSettings,
     pub(in crate::root) field_sync_revision: u64,
     pub(in crate::root) validation_error: Option<Arc<str>>,
@@ -131,8 +137,6 @@ pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables Wak
 
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {
-    ChainRpc { chain_id: u64, chain_label: String },
-    SponsoredRelay { chain_id: u64, chain_label: String },
     PoiGateway,
     WakuDnsEnrTree,
     WakuDohFallback,
@@ -141,10 +145,6 @@ pub(in crate::root) enum SettingsUrlListKind {
 impl SettingsUrlListKind {
     pub(in crate::root) const fn empty_text(&self) -> &'static str {
         match self {
-            Self::ChainRpc { .. } => "No RPC endpoints configured.",
-            Self::SponsoredRelay { .. } => {
-                "No sponsored relays configured. Sponsored self-broadcast is disabled."
-            }
             Self::PoiGateway => "No artifact gateways configured.",
             Self::WakuDnsEnrTree => "No DNS ENR trees configured. DNS bootstrap is disabled.",
             Self::WakuDohFallback => "No DoH fallback endpoints configured.",
@@ -153,10 +153,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) const fn dialog_help(&self) -> &'static str {
         match self {
-            Self::ChainRpc { .. } => "Enter an HTTP(S) RPC endpoint for this chain.",
-            Self::SponsoredRelay { .. } => {
-                "Enter a compatible HTTP(S) pending-block eth_sendBundle relay."
-            }
             Self::PoiGateway => {
                 "Enter an HTTP(S) gateway URL for POI, indexed artifact, and governance document reads."
             }
@@ -167,10 +163,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn add_id(&self) -> SharedString {
         SharedString::from(match self {
-            Self::ChainRpc { chain_id, .. } => format!("wallet-settings-rpc-add-{chain_id}"),
-            Self::SponsoredRelay { chain_id, .. } => {
-                format!("wallet-settings-sponsored-relay-add-{chain_id}")
-            }
             Self::PoiGateway => "wallet-settings-poi-gateway-add".to_string(),
             Self::WakuDnsEnrTree => "wallet-settings-waku-dns-enr-tree-add".to_string(),
             Self::WakuDohFallback => "wallet-settings-waku-doh-fallback-add".to_string(),
@@ -179,12 +171,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn row_id(&self, index: usize) -> SharedString {
         SharedString::from(match self {
-            Self::ChainRpc { chain_id, .. } => {
-                format!("wallet-settings-rpc-row-{chain_id}-{index}")
-            }
-            Self::SponsoredRelay { chain_id, .. } => {
-                format!("wallet-settings-sponsored-relay-row-{chain_id}-{index}")
-            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-row-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-row-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-row-{index}"),
@@ -193,12 +179,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn edit_id(&self, index: usize) -> SharedString {
         SharedString::from(match self {
-            Self::ChainRpc { chain_id, .. } => {
-                format!("wallet-settings-rpc-edit-{chain_id}-{index}")
-            }
-            Self::SponsoredRelay { chain_id, .. } => {
-                format!("wallet-settings-sponsored-relay-edit-{chain_id}-{index}")
-            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-edit-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-edit-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-edit-{index}"),
@@ -207,12 +187,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn remove_id(&self, index: usize) -> SharedString {
         SharedString::from(match self {
-            Self::ChainRpc { chain_id, .. } => {
-                format!("wallet-settings-rpc-remove-{chain_id}-{index}")
-            }
-            Self::SponsoredRelay { chain_id, .. } => {
-                format!("wallet-settings-sponsored-relay-remove-{chain_id}-{index}")
-            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-remove-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-remove-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-remove-{index}"),
@@ -221,20 +195,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn dialog_title(&self, is_edit: bool) -> String {
         match self {
-            Self::ChainRpc { chain_label, .. } => {
-                if is_edit {
-                    format!("Edit {chain_label} RPC")
-                } else {
-                    format!("Add {chain_label} RPC")
-                }
-            }
-            Self::SponsoredRelay { chain_label, .. } => {
-                if is_edit {
-                    format!("Edit {chain_label} sponsored relay")
-                } else {
-                    format!("Add {chain_label} sponsored relay")
-                }
-            }
             Self::PoiGateway => {
                 if is_edit {
                     "Edit artifact gateway".to_string()
@@ -261,10 +221,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn endpoints(&self, settings: &WalletSettings) -> Vec<String> {
         match self {
-            Self::ChainRpc { chain_id, .. } => display_chain_rpc_endpoints(settings, *chain_id),
-            Self::SponsoredRelay { chain_id, .. } => {
-                display_sponsored_bundle_relays(settings, *chain_id)
-            }
             Self::PoiGateway => settings.poi.artifact.gateway_urls.clone(),
             Self::WakuDnsEnrTree => display_waku_dns_enr_trees(settings),
             Self::WakuDohFallback => display_waku_doh_fallback_endpoints(settings),
@@ -278,12 +234,6 @@ impl SettingsUrlListKind {
         value: &str,
     ) {
         match self {
-            Self::ChainRpc { chain_id, .. } => {
-                set_chain_rpc_endpoint(settings, *chain_id, index, value);
-            }
-            Self::SponsoredRelay { chain_id, .. } => {
-                set_sponsored_bundle_relay(settings, *chain_id, index, value);
-            }
             Self::PoiGateway => set_poi_gateway_url(settings, index, value),
             Self::WakuDnsEnrTree => set_waku_dns_enr_tree(settings, index, value),
             Self::WakuDohFallback => set_waku_doh_fallback_endpoint(settings, index, value),
@@ -292,10 +242,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn add_endpoint(&self, settings: &mut WalletSettings, value: &str) {
         match self {
-            Self::ChainRpc { chain_id, .. } => add_chain_rpc_endpoint(settings, *chain_id, value),
-            Self::SponsoredRelay { chain_id, .. } => {
-                add_sponsored_bundle_relay(settings, *chain_id, value);
-            }
             Self::PoiGateway => add_poi_gateway_url(settings, value),
             Self::WakuDnsEnrTree => add_waku_dns_enr_tree(settings, value),
             Self::WakuDohFallback => add_waku_doh_fallback_endpoint(settings, value),
@@ -304,12 +250,6 @@ impl SettingsUrlListKind {
 
     pub(in crate::root) fn remove_endpoint(&self, settings: &mut WalletSettings, index: usize) {
         match self {
-            Self::ChainRpc { chain_id, .. } => {
-                remove_chain_rpc_endpoint(settings, *chain_id, index);
-            }
-            Self::SponsoredRelay { chain_id, .. } => {
-                remove_sponsored_bundle_relay(settings, *chain_id, index);
-            }
             Self::PoiGateway => remove_poi_gateway_url(settings, index),
             Self::WakuDnsEnrTree => remove_waku_dns_enr_tree(settings, index),
             Self::WakuDohFallback => remove_waku_doh_fallback_endpoint(settings, index),

@@ -28,7 +28,8 @@ fn sponsored_funding_choice_requires_a_configured_relay() {
     let settings = WalletSettings::default();
     let mut chain = build_effective_chain_configs(&settings)
         .expect("effective settings")
-        .remove(&1)
+        .get(1)
+        .cloned()
         .expect("Ethereum config");
     assert!(sponsored_funding_choice_visible(Some(&chain)));
     assert_eq!(
@@ -39,7 +40,12 @@ fn sponsored_funding_choice_requires_a_configured_relay() {
         SelfBroadcastFundingMode::PrivateSponsorship,
     );
 
-    chain.sponsored_bundle_relays.clear();
+    chain
+        .railgun
+        .as_mut()
+        .unwrap()
+        .sponsored_bundle_relays
+        .clear();
     assert!(!sponsored_funding_choice_visible(Some(&chain)));
     assert_eq!(
         effective_self_broadcast_funding_mode(
@@ -55,7 +61,8 @@ fn delivery_mode_isolates_sponsorship_funding() {
     let settings = WalletSettings::default();
     let chain = build_effective_chain_configs(&settings)
         .expect("effective settings")
-        .remove(&1)
+        .get(1)
+        .cloned()
         .expect("Ethereum config");
 
     assert_eq!(
@@ -88,23 +95,34 @@ fn sponsored_funding_reports_each_static_prerequisite() {
     let settings = WalletSettings::default();
     let mut chain = build_effective_chain_configs(&settings)
         .expect("effective settings")
-        .remove(&1)
+        .get(1)
+        .cloned()
         .expect("Ethereum config");
     assert_eq!(
         sponsored_self_broadcast_availability_reason(Some(&chain)),
         None
     );
 
-    chain.sponsored_bundle_relays.clear();
+    chain
+        .railgun
+        .as_mut()
+        .unwrap()
+        .sponsored_bundle_relays
+        .clear();
     assert!(sponsored_self_broadcast_availability_reason(Some(&chain)).is_some());
     chain = build_effective_chain_configs(&settings)
         .expect("effective settings")
-        .remove(&1)
+        .get(1)
+        .cloned()
         .expect("Ethereum config");
     chain.wrapped_native_token = None;
     assert!(sponsored_self_broadcast_availability_reason(Some(&chain)).is_some());
-    chain.wrapped_native_token = Some("0x0000000000000000000000000000000000000001".into());
-    chain.coinbase_payer = None;
+    chain.wrapped_native_token = Some(
+        "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap(),
+    );
+    chain.railgun.as_mut().unwrap().coinbase_payer = None;
     assert!(sponsored_self_broadcast_availability_reason(Some(&chain)).is_some());
 }
 

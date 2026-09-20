@@ -1,5 +1,8 @@
 use super::*;
 
+/// Position of the Chains page in the `ComponentSettings` page list below.
+const CHAINS_PAGE_INDEX: usize = 2;
+
 const INDEXED_ARTIFACT_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railgun-indexer/";
 
 fn indexed_artifact_repository_help_item() -> SettingItem {
@@ -38,6 +41,8 @@ impl Render for WalletSettingsEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let editor = cx.entity();
         let root_replacement_allowed = self.root_replacement_is_allowed(cx);
+        let chain_editing = self.chain_editor.read(cx).is_editing();
+        let reopen_chains_page = std::mem::take(&mut self.reopen_chains_page);
         let auto_lock_timeout = Self::dropdown_field(
             editor.clone(),
             auto_lock_timeout_options(),
@@ -291,12 +296,6 @@ impl Render for WalletSettingsEditor {
         let waku_doh_fallback_endpoints = waku_doh_fallback_kind.endpoints(&self.draft);
         let waku_doh_fallback_editor = editor.clone();
 
-        let mut chain_group = settings_group().item(settings_section_header("Enabled chains"));
-        for chain_id in railgun_ui::DEFAULT_CHAINS {
-            let chain_id = *chain_id;
-            chain_group = chain_group.item(Self::chain_enabled_item(editor.clone(), chain_id));
-        }
-
         let indexed_artifact_status = format!(
             "Current index source priority order: {}",
             indexed_artifact_source_status_message(&self.draft)
@@ -354,247 +353,12 @@ impl Render for WalletSettingsEditor {
                 poi_gateway_endpoints,
             ));
 
-        let mut chains_page = SettingPage::new("Chains")
-            .group(indexed_artifact_group)
-            .group(chain_group);
-        for chain_id in railgun_ui::DEFAULT_CHAINS {
-            let chain_id = *chain_id;
-            let label =
-                chain_name(chain_id).map_or_else(|| chain_id.to_string(), ToString::to_string);
-            let rpc_kind = SettingsUrlListKind::ChainRpc {
-                chain_id,
-                chain_label: label.clone(),
-            };
-            let endpoints = rpc_kind.endpoints(&self.draft);
-            let rpc_editor = editor.clone();
-            let sponsored_relay_kind = SettingsUrlListKind::SponsoredRelay {
-                chain_id,
-                chain_label: label.clone(),
-            };
-            let sponsored_relay_endpoints = sponsored_relay_kind.endpoints(&self.draft);
-            let sponsored_relay_editor = editor.clone();
-            let group = settings_group()
-                .item(settings_chain_section_header(
-                    chain_id,
-                    format!("{label} endpoints"),
-                ))
-                .item(
-                    SettingItem::new(
-                        "Quick-sync endpoint",
-                        Self::chain_quick_sync_endpoint_field(editor.clone(), chain_id),
-                    )
-                    .layout(Axis::Vertical),
-                )
-                .item(Self::settings_url_list_item(
-                    format!("{label} RPC endpoints"),
-                    rpc_editor,
-                    rpc_kind,
-                    endpoints,
-                ))
-                .item(Self::settings_url_list_item(
-                    format!("{label} sponsored bundle relays"),
-                    sponsored_relay_editor,
-                    sponsored_relay_kind,
-                    sponsored_relay_endpoints,
-                ));
-            chains_page = chains_page.group(group);
-        }
-
-        let mut contracts_page = SettingPage::new("Contracts")
-            .description("Advanced chain contract overrides. WARNING: Do not modify unless you know what you are doing. Modifying these can lead to unexpected behavior and loss of funds.");
-        for chain_id in railgun_ui::DEFAULT_CHAINS {
-            let chain_id = *chain_id;
-            let label =
-                chain_name(chain_id).map_or_else(|| chain_id.to_string(), ToString::to_string);
-            contracts_page = contracts_page.group(
-                settings_group()
-                    .item(settings_chain_section_header(
-                        chain_id,
-                        format!("{label} contracts"),
-                    ))
-                    .item(
-                        SettingItem::new(
-                            "Railgun contract",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-railgun-contract"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.railgun_contract.as_ref(),
-                                |chain, value| chain.contracts.railgun_contract = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Relay adapter",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-relay-adapter"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.relay_adapt_contract.as_ref(),
-                                |chain, value| chain.contracts.relay_adapt_contract = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Relay adapter 7702",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-relay-adapter-7702"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.relay_adapt_7702_contract.as_ref(),
-                                |chain, value| chain.contracts.relay_adapt_7702_contract = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Wrapped native token",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-wrapped-native-token"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.wrapped_native_token.as_ref(),
-                                |chain, value| chain.contracts.wrapped_native_token = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Multicall contract",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-multicall-contract"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.multicall_contract.as_ref(),
-                                |chain, value| chain.contracts.multicall_contract = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Coinbase payer",
-                            Self::chain_contract_field(
-                                format!("chain-{chain_id}-coinbase-payer"),
-                                editor.clone(),
-                                chain_id,
-                                |contracts| contracts.coinbase_payer.as_ref(),
-                                |chain, value| chain.contracts.coinbase_payer = value,
-                            ),
-                        )
-                        .layout(Axis::Vertical),
-                    ),
-            );
-            let show_deployment_metadata =
-                self.draft
-                    .chains
-                    .per_chain
-                    .get(&chain_id)
-                    .is_some_and(|chain| {
-                        should_show_chain_deployment_metadata_settings(chain_id, chain)
-                    });
-            if show_deployment_metadata {
-                let reset_editor = editor.clone();
-                contracts_page = contracts_page.group(
-                    settings_group()
-                        .item(settings_chain_section_header(
-                            chain_id,
-                            format!("{label} deployment metadata"),
-                        ))
-                        .item(
-                            SettingItem::new(
-                                "Deployment block",
-                                Self::chain_deployment_block_field(
-                                    format!("chain-{chain_id}-deployment-block"),
-                                    editor.clone(),
-                                    chain_id,
-                                    |deployment| deployment.deployment_block,
-                                    |deployment, value| deployment.deployment_block = value,
-                                ),
-                            )
-                            .layout(Axis::Vertical),
-                        )
-                        .item(
-                            SettingItem::new(
-                                "V2 start block",
-                                Self::chain_deployment_block_field(
-                                    format!("chain-{chain_id}-v2-start-block"),
-                                    editor.clone(),
-                                    chain_id,
-                                    |deployment| deployment.v2_start_block,
-                                    |deployment, value| deployment.v2_start_block = value,
-                                ),
-                            )
-                            .layout(Axis::Vertical),
-                        )
-                        .item(
-                            SettingItem::new(
-                                "Legacy shield block",
-                                Self::chain_deployment_block_field(
-                                    format!("chain-{chain_id}-legacy-shield-block"),
-                                    editor.clone(),
-                                    chain_id,
-                                    |deployment| deployment.legacy_shield_block,
-                                    |deployment, value| deployment.legacy_shield_block = value,
-                                ),
-                            )
-                            .layout(Axis::Vertical),
-                        )
-                        .item(
-                            SettingItem::new(
-                                "Archive until block",
-                                Self::chain_deployment_block_field(
-                                    format!("chain-{chain_id}-archive-until-block"),
-                                    editor.clone(),
-                                    chain_id,
-                                    |deployment| deployment.archive_until_block,
-                                    |deployment, value| deployment.archive_until_block = value,
-                                ),
-                            )
-                            .layout(Axis::Vertical),
-                        )
-                        .item(
-                            SettingItem::new(
-                                "Archive RPC URL",
-                                Self::chain_archive_rpc_field(editor.clone(), chain_id),
-                            )
-                            .layout(Axis::Vertical),
-                        )
-                        .item(SettingItem::new(
-                            "Clear deployment metadata",
-                            SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                                let reset_editor = reset_editor.clone();
-                                app_button(
-                                    SharedString::from(format!(
-                                        "wallet-settings-deployment-reset-{chain_id}"
-                                    )),
-                                    "Clear",
-                                )
-                                .on_click(
-                                    move |_event, _window, cx| {
-                                        reset_editor.update(cx, |editor, cx| {
-                                            editor
-                                                .draft
-                                                .chains
-                                                .per_chain
-                                                .entry(chain_id)
-                                                .or_default()
-                                                .deployment = ChainDeploymentSettings::default();
-                                            editor.programmatic_draft_changed(cx);
-                                        });
-                                    },
-                                )
-                            }),
-                        )),
-                );
-            }
-        }
+        let chain_editor = self.chain_editor.clone();
+        let chains_page = SettingPage::new("Chains")
+            .group(settings_group().item(SettingItem::render(move |_, _, _| {
+                div().w_full().child(chain_editor.clone())
+            })))
+            .group(indexed_artifact_group);
 
         let mut token_page = SettingPage::new("Tokens");
         let token_entries = display_token_entries(&self.draft);
@@ -809,7 +573,7 @@ impl Render for WalletSettingsEditor {
                         .layout(Axis::Vertical),
                     ),
             );
-        div()
+        let shell = div()
             .size_full()
             .min_h(px(0.0))
             .flex()
@@ -821,7 +585,19 @@ impl Render for WalletSettingsEditor {
             })
             .when_some(self.render_status_message(cx), |this, status| {
                 this.child(status)
-            })
+            });
+        if chain_editing {
+            // An open chain owns the body and its own footer until it returns to the list.
+            return shell.child(
+                div()
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.chain_editor.clone()),
+            );
+        }
+        shell
             .child(
                 div()
                     .w_full()
@@ -830,12 +606,17 @@ impl Render for WalletSettingsEditor {
                     .overflow_hidden()
                     .child(
                         ComponentSettings::new("wallet-settings-editor")
+                            .when(reopen_chains_page, |settings| {
+                                settings.default_selected_index(SelectIndex {
+                                    page_ix: CHAINS_PAGE_INDEX,
+                                    group_ix: None,
+                                })
+                            })
                             .sidebar_width(px(190.0))
                             .with_group_variant(GroupBoxVariant::Normal)
                             .page(security_page)
                             .page(privacy_page)
                             .page(chains_page)
-                            .page(contracts_page)
                             .page(token_page)
                             .page(public_broadcasters_page)
                             .page(walletconnect_page)

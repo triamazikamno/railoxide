@@ -13,17 +13,46 @@ impl WalletSettingsEditor {
         maintenance_controller: Entity<WalletMaintenanceController>,
         startup_root: Option<WeakEntity<WalletStartupRoot>>,
         active_root: Option<WeakEntity<WalletRoot>>,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         cx.observe(&maintenance_controller, |_editor, _controller, cx| {
             cx.notify();
         })
         .detach();
+        let snapshot =
+            wallet_ops::settings::chain_editor_snapshot(&settings, None).unwrap_or_default();
+        let chain_editor = cx.new(|cx| ui::chain_editor::ChainEditor::new(snapshot, cx));
+        // The Chains page hands its body to the editor while a chain is open.
+        cx.observe(&chain_editor, |editor, chain_editor, cx| {
+            // Settings unmounts while a chain is open, which drops its selected page.
+            let open = chain_editor.read(cx).is_editing();
+            if editor.chain_editor_was_open && !open {
+                editor.reopen_chains_page = true;
+            }
+            editor.chain_editor_was_open = open;
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe_in(
+            &chain_editor,
+            window,
+            |editor, view, event: &ui::chain_editor::ChainEditorEvent, window, cx| {
+                let result =
+                    editor.handle_chain_editor_command(&event.revision, &event.command, window, cx);
+                view.update(cx, |view, cx| view.receive(result, window, cx));
+            },
+        )
+        .detach();
         let mut editor = Self {
+            chain_editor,
             vault_store,
             runtime,
             saved: settings.clone(),
+            draft_base: settings.clone(),
             draft: settings,
+            chain_editor_was_open: false,
+            reopen_chains_page: false,
             field_sync_revision: 0,
             validation_error: None,
             status: None,
@@ -51,7 +80,7 @@ impl WalletSettingsEditor {
         cx.notify();
     }
 
-    const fn sync_fields_from_draft(&mut self) {
+    pub(super) const fn sync_fields_from_draft(&mut self) {
         self.field_sync_revision = self.field_sync_revision.wrapping_add(1);
     }
 
@@ -61,7 +90,7 @@ impl WalletSettingsEditor {
     }
 
     pub(in crate::root) fn is_dirty(&self) -> bool {
-        self.draft != self.saved
+        self.draft != self.draft_base
     }
 
     pub(in crate::root) fn root_replacement_is_allowed(&self, cx: &App) -> bool {
@@ -164,9 +193,17 @@ impl WalletSettingsEditor {
         control
             .ensure_current()
             .map_err(|_| "This request is no longer available.".to_owned())?;
-        save_wallet_settings(self.vault_store.db().as_ref(), &settings)
+        wallet_ops::settings::settings_revision(&self.saved)
+            .and_then(|revision| {
+                wallet_ops::settings::commit_wallet_settings(
+                    self.vault_store.db().as_ref(),
+                    revision,
+                    &settings,
+                )
+            })
             .map_err(|_| "Token settings could not be saved.".to_owned())?;
         self.saved = settings.clone();
+        self.draft_base = settings.clone();
         self.draft = settings;
         self.sync_fields_from_draft();
         self.refresh_validation();
@@ -209,10 +246,25 @@ impl WalletSettingsEditor {
             return false;
         }
         let apply_mode = classify_settings_apply_mode(&self.saved, &self.draft);
+        if self.saved.chains != self.draft.chains
+            && let Some(root) = self.active_root.as_ref()
+        {
+            let admission = root
+                .read_with(cx, |root, _cx| root.admit_chain_settings(&self.draft))
+                .unwrap_or_else(|_| Err("The active wallet is unavailable".to_owned()));
+            if let Err(message) = admission {
+                self.status = Some(Arc::from(message));
+                cx.notify();
+                return false;
+            }
+        }
         let db = self.vault_store.db();
-        match save_wallet_settings(db.as_ref(), &self.draft) {
+        match wallet_ops::settings::settings_revision(&self.draft_base).and_then(|revision| {
+            wallet_ops::settings::commit_wallet_settings(db.as_ref(), revision, &self.draft)
+        }) {
             Ok(()) => {
                 self.saved = self.draft.clone();
+                self.draft_base = self.saved.clone();
                 self.apply_saved_settings_to_active_root(apply_mode, cx);
                 self.status = Some(Arc::from("Settings saved"));
                 cx.notify();
@@ -228,6 +280,7 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn discard_changes(&mut self, cx: &mut Context<'_, Self>) {
         self.draft = settings_draft_after_discard(&self.saved);
+        self.draft_base = self.saved.clone();
         self.sync_fields_from_draft();
         self.refresh_validation();
         cx.notify();
@@ -811,31 +864,6 @@ impl WalletSettingsEditor {
                             }),
                     )
             }),
-        )
-    }
-
-    pub(in crate::root) fn chain_enabled_item(editor: Entity<Self>, chain_id: u64) -> SettingItem {
-        let label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), ToString::to_string);
-        Self::settings_switch_item(
-            format!("wallet-settings-chain-row-{chain_id}"),
-            label,
-            editor,
-            Some(chain_id),
-            move |settings| {
-                settings
-                    .chains
-                    .per_chain
-                    .get(&chain_id)
-                    .is_none_or(|chain| chain.enabled)
-            },
-            move |settings, enabled| {
-                settings
-                    .chains
-                    .per_chain
-                    .entry(chain_id)
-                    .or_default()
-                    .enabled = enabled;
-            },
         )
     }
 
@@ -1537,7 +1565,7 @@ impl WalletSettingsEditor {
         cx: &mut Context<'_, Self>,
     ) {
         let values = price_anchor_dialog_values(&self.draft, target);
-        let chain_items = price_anchor_chain_select_items();
+        let chain_items = price_anchor_chain_select_items(&self.draft);
         let selected_chain_index = chain_select_index(&chain_items, values.chain_id);
         let selected_oracle_chain_index = chain_select_index(&chain_items, values.oracle_chain_id);
         let anchor_type_items = price_anchor_type_select_items();
@@ -1983,98 +2011,5 @@ impl WalletSettingsEditor {
         }
 
         body.child(list)
-    }
-
-    pub(in crate::root) fn chain_quick_sync_endpoint_field(
-        editor: Entity<Self>,
-        chain_id: u64,
-    ) -> SettingField<SharedString> {
-        Self::shared_string_field(
-            format!("chain-{chain_id}-quick-sync-endpoint"),
-            editor,
-            move |settings| display_chain_quick_sync_endpoint(settings, chain_id),
-            move |settings, value| {
-                settings
-                    .chains
-                    .per_chain
-                    .entry(chain_id)
-                    .or_default()
-                    .quick_sync
-                    .endpoint = non_empty_setting(&value);
-            },
-        )
-    }
-
-    pub(in crate::root) fn chain_contract_field(
-        field_id: impl Into<String>,
-        editor: Entity<Self>,
-        chain_id: u64,
-        get: impl Fn(&ChainContractSettings) -> Option<&String> + 'static,
-        set: impl Fn(&mut ChainSettingsOverride, Option<String>) + 'static,
-    ) -> SettingField<SharedString> {
-        Self::shared_string_field(
-            field_id,
-            editor,
-            move |settings| {
-                let contracts = display_chain_contract_settings(settings, chain_id);
-                get(&contracts).cloned().unwrap_or_default()
-            },
-            move |settings, value| {
-                let chain = settings.chains.per_chain.entry(chain_id).or_default();
-                set(chain, non_empty_setting(&value));
-            },
-        )
-    }
-
-    pub(in crate::root) fn chain_deployment_block_field(
-        field_id: impl Into<String>,
-        editor: Entity<Self>,
-        chain_id: u64,
-        get: impl Fn(&ChainDeploymentSettings) -> Option<u64> + 'static,
-        set: impl Fn(&mut ChainDeploymentSettings, Option<u64>) + 'static,
-    ) -> SettingField<SharedString> {
-        Self::shared_string_field(
-            field_id,
-            editor,
-            move |settings| {
-                settings
-                    .chains
-                    .per_chain
-                    .get(&chain_id)
-                    .and_then(|chain| get(&chain.deployment))
-                    .map_or_else(String::new, |value| value.to_string())
-            },
-            move |settings, value| {
-                let chain = settings.chains.per_chain.entry(chain_id).or_default();
-                set(&mut chain.deployment, optional_u64_setting(&value));
-            },
-        )
-    }
-
-    pub(in crate::root) fn chain_archive_rpc_field(
-        editor: Entity<Self>,
-        chain_id: u64,
-    ) -> SettingField<SharedString> {
-        Self::shared_string_field(
-            format!("chain-{chain_id}-archive-rpc"),
-            editor,
-            move |settings| {
-                settings
-                    .chains
-                    .per_chain
-                    .get(&chain_id)
-                    .and_then(|chain| chain.deployment.archive_rpc_url.clone())
-                    .unwrap_or_default()
-            },
-            move |settings, value| {
-                settings
-                    .chains
-                    .per_chain
-                    .entry(chain_id)
-                    .or_default()
-                    .deployment
-                    .archive_rpc_url = non_empty_setting(&value);
-            },
-        )
     }
 }

@@ -1188,7 +1188,7 @@ pub(super) fn process_walletconnect_session_request_message(
                 session_identity: DappSessionIdentity::walletconnect(session.session_uuid.clone()),
                 parsed,
                 item,
-                account_source,
+                account_source: Some(account_source),
             },
         )));
     }

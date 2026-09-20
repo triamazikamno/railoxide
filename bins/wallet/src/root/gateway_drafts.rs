@@ -69,6 +69,17 @@ enum PreparedDraft {
 }
 
 impl GatewayDraftBook {
+    pub(super) fn retire_chain(&mut self, chain_id: u64) {
+        self.records.retain(|_, record| {
+            if record.view.input.chain_id() == chain_id {
+                retire_record(record);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn create(
         &mut self,
         peer_id: &str,
@@ -338,7 +349,7 @@ struct EstimationContext {
     balance: U256,
     native_balance: U256,
     recipient: Option<Address>,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
     ethereum: Option<EffectiveChainConfig>,
     registry: EffectiveTokenRegistry,
     anchors: Arc<TokenAnchorRateCache>,
@@ -613,8 +624,12 @@ impl WalletRoot {
             balance,
             native_balance,
             recipient,
-            effective_chain: self.effective_chain_configs.get(&input.chain_id).cloned(),
-            ethereum: self.effective_chain_configs.get(&1).cloned(),
+            effective_chain: self
+                .effective_chain_configs
+                .enabled(input.chain_id)
+                .cloned()
+                .map_err(|_| "Chain is unavailable")?,
+            ethereum: self.effective_chain_configs.get(1).cloned(),
             registry: self.effective_token_registry.clone(),
             anchors: self.public_broadcaster_anchor_cache.clone(),
             http: self.http.clone(),
@@ -1006,12 +1021,13 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
         && context.recipient.is_none()
         && !context.input.recipient.trim().is_empty()
     {
-        if let Ok(recipient) = resolve_public_ens_recipient(
-            context.input.recipient.trim(),
-            context.ethereum.as_ref(),
-            &context.http,
-        )
-        .await
+        if let Some(ethereum) = context.ethereum.as_ref()
+            && let Ok(recipient) = resolve_public_ens_recipient(
+                context.input.recipient.trim(),
+                ethereum,
+                &context.http,
+            )
+            .await
         {
             context.recipient = Some(recipient);
             None
@@ -1028,7 +1044,7 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
     };
     let Ok(bundle) = quote_public_action_gas_fee_bundle_with_profile(
         context.input.chain_id,
-        context.effective_chain.as_ref(),
+        &context.effective_chain,
         profile,
         &context.http,
     )
@@ -1092,7 +1108,7 @@ fn prepare_draft(
     };
     let costs = estimate_public_action_gas_cost_with_profile_and_ceiling(
         input.chain_id,
-        effective_chain.as_ref(),
+        &effective_chain,
         if input.kind == GatewayDraftKind::Shield {
             PublicActionKind::Shield
         } else {
@@ -1114,7 +1130,7 @@ fn prepare_draft(
         costs.maximum_cost,
     )?;
     let fee_display = PublicActionFeeDisplay::from_estimate(
-        input.chain_id,
+        Some(&effective_chain),
         Some(costs),
         (input.kind == GatewayDraftKind::Shield
             && asset == PublicAssetId::Native
@@ -1493,6 +1509,7 @@ mod tests {
             max: true,
         };
         let quote = PublicActionGasFeeQuote {
+            observed_fee_model: None,
             rpc_gas_price: 100,
             current_base_fee_per_gas: Some(80),
             suggested_max_fee_per_gas: 100,
@@ -1509,7 +1526,13 @@ mod tests {
                 draft_gas_fee(&fee, quote, PublicShieldTransactionProfile::Railoxide, 1).unwrap();
             let costs = estimate_public_action_gas_cost_with_profile_and_ceiling(
                 1,
-                None,
+                &wallet_ops::settings::build_effective_chain_configs(
+                    &wallet_ops::settings::WalletSettings::default(),
+                )
+                .unwrap()
+                .get(1)
+                .cloned()
+                .unwrap(),
                 PublicActionKind::Send,
                 PublicAssetId::Native,
                 PublicShieldTransactionProfile::Railoxide,

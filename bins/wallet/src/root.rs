@@ -9,7 +9,7 @@ use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
 use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
-    IndexPath, WindowExt,
+    WindowExt,
     input::{InputEvent, InputState, TextareaState},
     resizable::ResizableState,
     select::{SearchableVec, SelectEvent, SelectState},
@@ -28,7 +28,7 @@ use wallet_ops::{
     WakuDeliveryClient, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
-        EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
+        EffectiveChainRegistry, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
         save_wallet_ui_state,
     },
     subscribe_prover_cache_build,
@@ -260,22 +260,19 @@ use public_broadcaster_cost::{
 #[cfg(test)]
 use settings::{
     PriceAnchorComponentDialogValues, PriceAnchorDialogValues, SettingsApplyMode,
-    StartupSettingsActionState, add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer,
-    add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, auto_lock_timeout_from_value,
-    auto_lock_timeout_options, auto_lock_timeout_value, classify_settings_apply_mode,
-    display_chain_contract_settings, display_chain_quick_sync_endpoint,
-    display_chain_rpc_endpoints, display_price_anchor_entries, display_sponsored_bundle_relays,
+    StartupSettingsActionState, add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
+    add_waku_doh_fallback_endpoint, auto_lock_timeout_from_value, auto_lock_timeout_options,
+    auto_lock_timeout_value, classify_settings_apply_mode, display_price_anchor_entries,
     display_token_entries, display_waku_direct_peers, display_waku_dns_enr_trees,
     display_waku_doh_endpoint, display_waku_doh_fallback_endpoints, format_anchor_bps_exact_range,
     format_anchor_bps_percent, format_anchor_bps_percent_range, format_anchor_premium_range,
     price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
-    price_anchor_token_primary_label, remove_chain_rpc_endpoint, remove_poi_gateway_url,
-    remove_sponsored_bundle_relay, remove_waku_direct_peer, remove_waku_dns_enr_tree,
-    remove_waku_doh_fallback_endpoint, set_chain_rpc_endpoint, set_poi_gateway_url,
-    set_price_anchor_override, set_sponsored_bundle_relay, set_waku_direct_peer,
-    set_waku_dns_enr_tree, set_waku_doh_fallback_endpoint, settings_draft_after_discard,
-    settings_restart_action_enabled, settings_restart_reuses_active_network,
-    settings_save_action_enabled, should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
+    price_anchor_token_primary_label, remove_poi_gateway_url, remove_waku_direct_peer,
+    remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, set_poi_gateway_url,
+    set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
+    set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
+    settings_restart_reuses_active_network, settings_save_action_enabled,
+    should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
     startup_settings_action_state,
 };
 #[cfg(test)]
@@ -355,7 +352,7 @@ pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
     poi_read_source: PoiReadSource,
-    effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
+    effective_chain_configs: EffectiveChainRegistry,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
     auto_lock: AutoLockState,
@@ -456,7 +453,8 @@ pub(crate) struct WalletRoot {
     wallet_switch_delayed: bool,
     selected_chain: u64,
     ui_state: WalletUiState,
-    chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
+    chain_select: Entity<SelectState<ui::chain_select::ChainSelectItems>>,
+    window_handle: gpui::AnyWindowHandle,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
     private_pending_status_dialog_open: bool,
@@ -1041,7 +1039,7 @@ impl WalletRoot {
         chain_ids: &[u64],
         initial_chain_id: u64,
         ui_state: WalletUiState,
-        effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
+        effective_chain_configs: EffectiveChainRegistry,
         effective_token_registry: EffectiveTokenRegistry,
         public_balance_refresh_interval: Duration,
         auto_lock_timeout: Option<Duration>,
@@ -1065,15 +1063,23 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let initial_wallet_tab = if effective_chain_configs.railgun(initial_chain_id).is_ok() {
+            WalletTab::default()
+        } else {
+            WalletTab::Public
+        };
         let chain_select_items: Vec<_> = chain_ids
             .iter()
             .copied()
-            .map(|chain_id| ChainSelectItem { chain_id })
+            .filter_map(|chain_id| {
+                effective_chain_configs
+                    .get(chain_id)
+                    .map(|chain| ChainSelectItem {
+                        chain_id,
+                        label: chain.name.clone().into(),
+                    })
+            })
             .collect();
-        let selected_chain_index = chain_ids
-            .iter()
-            .position(|chain_id| *chain_id == initial_chain_id)
-            .map(|index| IndexPath::default().row(index));
         let mut chain_states = BTreeMap::new();
         for chain_id in chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
@@ -1099,7 +1105,7 @@ impl WalletRoot {
                             let startup_root = startup_root.clone();
                             let maintenance_controller = maintenance_controller.clone();
                             let active_root = active_root.clone();
-                            move |cx| {
+                            |cx| {
                                 WalletSettingsEditor::new(
                                     store,
                                     runtime,
@@ -1107,6 +1113,7 @@ impl WalletRoot {
                                     maintenance_controller,
                                     Some(startup_root),
                                     Some(active_root),
+                                    window,
                                     cx,
                                 )
                             }
@@ -1267,8 +1274,14 @@ impl WalletRoot {
         platform_attention.sync_badge_count(0);
         platform_attention.clear_attention();
         let walletconnect = walletconnect::WalletConnectUiState::new(window, cx);
-        let chain_select =
-            cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
+        let chain_select = cx.new(|cx| {
+            ui::chain_select::chain_select_state(
+                chain_select_items,
+                Some(initial_chain_id),
+                window,
+                cx,
+            )
+        });
         let wallet_select = cx.new(|cx| {
             SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
@@ -1417,7 +1430,7 @@ impl WalletRoot {
             maintenance_controller: maintenance_controller.clone(),
             settings_error,
             active_activity: Activity::Wallet,
-            active_wallet_tab: WalletTab::default(),
+            active_wallet_tab: initial_wallet_tab,
             sidebar_manually_collapsed: false,
             sidebar_narrow_expanded: false,
             sidebar_public_broadcaster_count,
@@ -1434,6 +1447,7 @@ impl WalletRoot {
             wallet_switch_delayed: false,
             ui_state,
             chain_select: chain_select.clone(),
+            window_handle: window.window_handle(),
             chain_states,
             pending_ppoi_validation_toast: None,
             private_pending_status_dialog_open: false,
@@ -1666,7 +1680,7 @@ impl WalletRoot {
         cx.subscribe_in(
             &chain_select,
             window,
-            |this, _select, event: &SelectEvent<Vec<ChainSelectItem>>, window, cx| {
+            |this, _select, event: &SelectEvent<ui::chain_select::ChainSelectItems>, window, cx| {
                 let SelectEvent::Confirm(Some(chain_id)) = event else {
                     return;
                 };

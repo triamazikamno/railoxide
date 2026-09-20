@@ -168,7 +168,7 @@ impl WalletRoot {
         let custom_fee_amount = form.custom_fee_amount;
         let self_broadcast_funding = effective_delivery_funding_mode(
             delivery_mode,
-            self.effective_chain_configs.get(&asset.chain_id),
+            self.effective_chain_configs.get(asset.chain_id),
             form.self_broadcast_funding,
         );
         let sponsored_incentive = if delivery_mode == DeliveryMode::SelfBroadcast
@@ -221,7 +221,7 @@ impl WalletRoot {
         if delivery_mode == DeliveryMode::SelfBroadcast
             && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
             && let Some(reason) = sponsored_self_broadcast_availability_reason(
-                self.effective_chain_configs.get(&asset.chain_id),
+                self.effective_chain_configs.get(asset.chain_id),
             )
         {
             self.set_send_form_error(key, reason, cx);
@@ -330,7 +330,7 @@ impl WalletRoot {
         let sponsored_authorization_limit = if self_broadcast_funding
             == SelfBroadcastFundingMode::PrivateSponsorship
         {
-            let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id) else {
+            let Some(effective_chain) = self.effective_chain_configs.get(asset.chain_id) else {
                 self.set_send_form_error(key, "Selected chain settings are unavailable", cx);
                 return None;
             };
@@ -460,6 +460,9 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self.effective_chain_configs.railgun(key.chain_id).cloned() else {
+            return;
+        };
         let Some(mut draft) = self.send_spend_draft(key, cx) else {
             return;
         };
@@ -673,7 +676,7 @@ impl WalletRoot {
             DeliveryMode::ManualCalldata => {
                 let request = DesktopSendCalldataRequest {
                     chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    effective_chain: resolved_chain,
                     view_session,
                     session,
                     vault_store,
@@ -685,7 +688,7 @@ impl WalletRoot {
                     verify_proof: true,
                     progress_tx: Some(progress_tx),
                 };
-                self.spawn_public_transaction_submission(async move {
+                self.spawn_public_transaction_submission(chain_id, async move {
                     prepare_desktop_send_calldata(request, &http)
                         .await
                         .map(SendResult::Manual)
@@ -695,7 +698,7 @@ impl WalletRoot {
                 let request = DesktopSendPublicBroadcasterRequest {
                     custom_fee_amount,
                     chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    effective_chain: resolved_chain,
                     view_session,
                     session,
                     vault_store,
@@ -719,7 +722,7 @@ impl WalletRoot {
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
                 };
-                self.spawn_public_transaction_submission(async move {
+                self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_send_public_broadcaster(request, &http))
                         .await
                         .map(|result| SendResult::PublicBroadcaster(Box::new(result)))
@@ -738,8 +741,7 @@ impl WalletRoot {
                 let public_account_uuid = self_broadcast_public_account_uuid
                     .expect("self-broadcast signer was validated");
                 if sponsored {
-                    let Some(effective_chain) =
-                        self.effective_chain_configs.get(&chain_id).cloned()
+                    let Some(effective_chain) = self.effective_chain_configs.get(chain_id).cloned()
                     else {
                         self.set_send_form_error(
                             key,
@@ -774,8 +776,8 @@ impl WalletRoot {
                             .expect("sponsored command receiver was created"),
                         event_tx: self_broadcast_event_tx,
                     };
-                    self.spawn_public_transaction_submission(async move {
-                        submit_desktop_sponsored_send_self_broadcast(request, &http)
+                    self.spawn_public_transaction_submission(chain_id, async move {
+                        Box::pin(submit_desktop_sponsored_send_self_broadcast(request, &http))
                             .await
                             .map(|result| SendResult::Sponsored(Box::new(result)))
                     })
@@ -783,7 +785,7 @@ impl WalletRoot {
                     let request = DesktopSendSelfBroadcastRequest {
                         transaction_tracking,
                         chain_id,
-                        effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                        effective_chain: resolved_chain,
                         view_session,
                         session,
                         vault_store,
@@ -802,7 +804,7 @@ impl WalletRoot {
                         command_rx: self_broadcast_command_rx,
                         event_tx: self_broadcast_event_tx,
                     };
-                    self.spawn_public_transaction_submission(async move {
+                    self.spawn_public_transaction_submission(chain_id, async move {
                         submit_desktop_send_self_broadcast(request, &http)
                             .await
                             .map(|result| SendResult::SelfBroadcast(Box::new(result)))
@@ -1137,7 +1139,7 @@ impl WalletRoot {
         let custom_fee_amount = form.custom_fee_amount;
         let self_broadcast_funding = effective_delivery_funding_mode(
             delivery_mode,
-            self.effective_chain_configs.get(&asset.chain_id),
+            self.effective_chain_configs.get(asset.chain_id),
             form.self_broadcast_funding,
         );
         let sponsored_incentive = if delivery_mode == DeliveryMode::SelfBroadcast
@@ -1190,7 +1192,7 @@ impl WalletRoot {
         if delivery_mode == DeliveryMode::SelfBroadcast
             && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
             && let Some(reason) = sponsored_self_broadcast_availability_reason(
-                self.effective_chain_configs.get(&asset.chain_id),
+                self.effective_chain_configs.get(asset.chain_id),
             )
         {
             self.set_unshield_form_error(key, reason, cx);
@@ -1299,7 +1301,7 @@ impl WalletRoot {
         let sponsored_authorization_limit = if self_broadcast_funding
             == SelfBroadcastFundingMode::PrivateSponsorship
         {
-            let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id) else {
+            let Some(effective_chain) = self.effective_chain_configs.get(asset.chain_id) else {
                 self.set_unshield_form_error(key, "Selected chain settings are unavailable", cx);
                 return None;
             };
@@ -1438,6 +1440,9 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self.effective_chain_configs.railgun(key.chain_id).cloned() else {
+            return;
+        };
         let Some(mut draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
@@ -1702,7 +1707,7 @@ impl WalletRoot {
             DeliveryMode::ManualCalldata => {
                 let request = DesktopUnshieldCalldataRequest {
                     chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    effective_chain: resolved_chain,
                     view_session,
                     session,
                     vault_store,
@@ -1717,7 +1722,7 @@ impl WalletRoot {
                     verify_proof: true,
                     progress_tx: Some(progress_tx),
                 };
-                self.spawn_public_transaction_submission(async move {
+                self.spawn_public_transaction_submission(chain_id, async move {
                     prepare_desktop_unshield_calldata(request, &http)
                         .await
                         .map(|result| UnshieldResult::Manual(Box::new(result)))
@@ -1736,7 +1741,7 @@ impl WalletRoot {
                         .as_ref()
                         .and_then(|review| review.broadcaster_min_gas_price()),
                     chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    effective_chain: resolved_chain,
                     view_session,
                     session,
                     vault_store,
@@ -1762,7 +1767,7 @@ impl WalletRoot {
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
                 };
-                self.spawn_public_transaction_submission(async move {
+                self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_unshield_public_broadcaster(request, &http))
                         .await
                         .map(|result| UnshieldResult::PublicBroadcaster(Box::new(result)))
@@ -1781,8 +1786,7 @@ impl WalletRoot {
                 let public_account_uuid = self_broadcast_public_account_uuid
                     .expect("self-broadcast signer was validated");
                 if sponsored {
-                    let Some(effective_chain) =
-                        self.effective_chain_configs.get(&chain_id).cloned()
+                    let Some(effective_chain) = self.effective_chain_configs.get(chain_id).cloned()
                     else {
                         self.set_unshield_form_error(
                             key,
@@ -1820,7 +1824,7 @@ impl WalletRoot {
                             .expect("sponsored command receiver was created"),
                         event_tx: self_broadcast_event_tx,
                     };
-                    self.spawn_public_transaction_submission(async move {
+                    self.spawn_public_transaction_submission(chain_id, async move {
                         Box::pin(submit_desktop_sponsored_unshield_self_broadcast(
                             request, &http,
                         ))
@@ -1837,7 +1841,7 @@ impl WalletRoot {
                             .and_then(|review| review.maximum_gas()),
                         transaction_tracking,
                         chain_id,
-                        effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                        effective_chain: resolved_chain,
                         view_session,
                         session,
                         vault_store,
@@ -1859,7 +1863,7 @@ impl WalletRoot {
                         command_rx: self_broadcast_command_rx,
                         event_tx: self_broadcast_event_tx,
                     };
-                    self.spawn_public_transaction_submission(async move {
+                    self.spawn_public_transaction_submission(chain_id, async move {
                         Box::pin(submit_desktop_unshield_self_broadcast(request, &http))
                             .await
                             .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))

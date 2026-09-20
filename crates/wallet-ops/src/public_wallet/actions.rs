@@ -6,7 +6,7 @@ use eyre::{Result, WrapErr, eyre};
 
 use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
 use super::gas::public_advanced_transaction_payload_fingerprint;
-use super::runtime::{public_chain_runtime_config, public_shield_token};
+use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
 use super::signer::admitted_public_signer;
 use super::submission::{
     emit_public_action_event, emit_refreshed_public_action_hardware_session,
@@ -58,7 +58,7 @@ pub async fn submit_public_send_with_progress(
                 "public-send",
                 "public send transaction",
                 request.chain_id,
-                request.effective_chain.as_ref(),
+                &request.effective_chain,
                 &request.intent,
                 &signer,
                 request.advanced_authorization,
@@ -84,7 +84,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     operation_label: &str,
     revert_subject: &str,
     chain_id: u64,
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     intent: &PublicTransactionIntent,
     signer: &super::signer::VaultedPublicSigner,
     advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
@@ -97,7 +97,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<crate::TxReceiptOutput> {
     validate_public_transaction_intent(intent)?;
-    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let chain = verified_public_chain_runtime_config(chain_id, effective_chain, http, None).await?;
     let from_address = signer.address();
     let authorized_gas_limit = public_action_authorized_gas_limit(
         chain_id,
@@ -225,7 +225,14 @@ pub async fn submit_public_shield_with_progress(
     if request.amount.is_zero() {
         return Err(eyre!("amount is required"));
     }
-    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    request.effective_chain.require_railgun()?;
+    let chain = verified_public_chain_runtime_config(
+        request.chain_id,
+        &request.effective_chain,
+        http,
+        None,
+    )
+    .await?;
     let token = public_shield_token(request.asset, &chain)?;
     let recipient = request
         .view_session
@@ -334,7 +341,7 @@ pub async fn submit_public_shield_with_progress(
                     http,
                     request.asset,
                     from_address,
-                    chain.railgun_contract,
+                    chain.require_railgun()?.contract,
                 )
                 .await
                 {
@@ -375,7 +382,7 @@ pub async fn submit_public_shield_with_progress(
                 let approval_amount =
                     public_shield_approval_amount(request.profile, request.amount);
                 let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
-                    chain.railgun_contract,
+                    chain.require_railgun()?.contract,
                     approval_amount,
                 );
                 let approve_tx = TransactionRequest::default()
@@ -433,7 +440,7 @@ pub async fn submit_public_shield_with_progress(
                 public_native_shield_transaction_request(
                     request.chain_id,
                     from_address,
-                    chain.relay_adapt_contract,
+                    chain.require_railgun()?.relay_adapt_contract,
                     request.amount,
                     shield_data,
                 )
@@ -441,7 +448,7 @@ pub async fn submit_public_shield_with_progress(
                 TransactionRequest::default()
                     .with_chain_id(request.chain_id)
                     .with_from(from_address)
-                    .with_to(chain.railgun_contract)
+                    .with_to(chain.require_railgun()?.contract)
                     .with_input(shield_data)
                     .with_nonce(0)
             };

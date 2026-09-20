@@ -16,15 +16,20 @@ use crate::{
     PoiArtifactSourceConfig, PoiProxyFallback, PoiReadSource, SensitiveUrl, WalletNetworkMode,
     public_balance_refresh_interval_secs,
 };
-use sync_service::ChainConfigDefaults;
+use broadcaster_core::deployment::RailgunDeployment;
+use sync_service::RailgunSyncOptions;
 use waku::{RAILGUN_TREE, parse_multiaddr, parse_peer_id};
 
+mod chain_editor;
 mod core;
 mod effective;
 mod executors;
 mod indexed_artifacts;
+mod legacy;
+mod mutation;
 mod network_chains;
 mod poi_broadcaster;
+mod presets;
 mod storage;
 mod tokens_gas_waku;
 mod validation;
@@ -36,10 +41,12 @@ use validation::{
     validate_url_scheme, validate_waku_direct_peer,
 };
 
+pub use chain_editor::*;
 pub use core::*;
 pub use effective::*;
 pub use executors::*;
 pub use indexed_artifacts::*;
+pub use mutation::*;
 pub use network_chains::*;
 pub use poi_broadcaster::*;
 pub use storage::*;

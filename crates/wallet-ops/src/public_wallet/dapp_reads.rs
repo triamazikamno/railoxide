@@ -107,6 +107,19 @@ impl DappRpcReadClient {
             .map(|value| value.to())
     }
 
+    pub(crate) async fn latest_block(
+        &self,
+        endpoint: SensitiveUrl,
+        chain_id: u64,
+    ) -> Result<Option<alloy::rpc::types::Block>, RpcBrokerError> {
+        self.read_typed(
+            endpoint,
+            chain_id,
+            RpcRead::get_block_by_number(BlockNumberOrTag::Latest, false),
+        )
+        .await
+    }
+
     pub(crate) async fn get_max_priority_fee_per_gas(
         &self,
         endpoint: SensitiveUrl,

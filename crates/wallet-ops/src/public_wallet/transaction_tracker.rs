@@ -80,6 +80,26 @@ pub struct PublicTransactionTrackingContext {
 }
 
 impl PublicTransactionTracker {
+    /// Whether an unresolved submitted transaction still needs this chain's observation route.
+    ///
+    /// # Panics
+    /// Panics if the transaction registry mutex is poisoned.
+    #[must_use]
+    pub fn has_pending_observation(&self, chain_id: u64) -> bool {
+        self.registry
+            .lock()
+            .expect("public transaction registry poisoned")
+            .hashes
+            .iter()
+            .any(|((chain, _), state)| {
+                *chain == chain_id
+                    && matches!(
+                        state,
+                        PublicTransactionLookup::Pending | PublicTransactionLookup::Unavailable
+                    )
+            })
+    }
+
     fn retain_observer(&self, mut observer: BlockObserver, runtime: &Handle) -> Result<()> {
         let mut jobs = self.jobs.lock().expect("public transaction jobs poisoned");
         if jobs.closed {

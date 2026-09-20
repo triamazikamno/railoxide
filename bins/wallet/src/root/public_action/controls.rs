@@ -203,21 +203,24 @@ pub(in crate::root) fn render_public_action_fee_estimate(
 }
 
 pub(in crate::root) fn render_public_advanced_transaction_estimate(
-    chain_id: u64,
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     estimate: &PublicAdvancedTransactionEstimate,
     expected_usd_micro_value: Option<U256>,
     maximum_usd_micro_value: Option<U256>,
 ) -> AnyElement {
-    let expected_token_value =
-        format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
-    let maximum_token_value =
-        format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
+    let Some(chain) = chain else {
+        return app_muted_text("Chain is unavailable").into_any_element();
+    };
+    let expected_token_value = chain
+        .native_currency
+        .format_amount(estimate.expected_gas_cost);
+    let maximum_token_value = chain.native_currency.format_amount(estimate.max_gas_cost);
     estimated_fees(
         Some(format_gas_limit(estimate.gas_limit)),
         format_value_with_usd_label(
             expected_token_value,
             estimate.expected_gas_cost,
-            Some(18),
+            Some(chain.native_currency.decimals),
             expected_usd_micro_value,
             false,
         ),
@@ -229,7 +232,7 @@ pub(in crate::root) fn render_public_advanced_transaction_estimate(
             format_value_with_usd_label(
                 maximum_token_value,
                 estimate.max_gas_cost,
-                Some(18),
+                Some(chain.native_currency.decimals),
                 maximum_usd_micro_value,
                 false,
             )
@@ -429,14 +432,11 @@ pub(in crate::root) fn public_action_max_amount_after_reserve(
 }
 
 pub(in crate::root) fn public_action_asset_label(
-    chain_id: u64,
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     asset: PublicAssetId,
     registry: Option<&wallet_ops::settings::EffectiveTokenRegistry>,
 ) -> String {
-    match asset {
-        PublicAssetId::Native => native_token_display_label(chain_id).to_string(),
-        PublicAssetId::Erc20(_) => public_asset_label(chain_id, asset, registry),
-    }
+    public_asset_label(chain, asset, registry)
 }
 
 #[cfg(test)]

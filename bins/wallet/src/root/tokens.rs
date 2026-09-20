@@ -1,11 +1,9 @@
-use std::collections::BTreeMap;
-
 use alloy::primitives::{Address, U256};
 use railgun_ui::{
     format_scaled_amount, format_token_amount, format_usd_micro_value, lookup_token,
     non_redundant_usd_micro_value, short_address, token_icon_asset_path,
 };
-use wallet_ops::settings::{EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry};
+use wallet_ops::settings::{EffectiveChainRegistry, EffectiveTokenInfo, EffectiveTokenRegistry};
 
 use crate::assets::WalletIconSource;
 
@@ -217,16 +215,12 @@ pub(super) fn parse_address(raw: &str) -> Option<Address> {
 }
 
 pub(super) fn is_effective_wrapped_native_token(
-    effective_chain_configs: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chain_configs: &EffectiveChainRegistry,
     chain_id: u64,
     token: Address,
 ) -> bool {
     effective_chain_configs
-        .get(&chain_id)
-        .and_then(|chain| chain.wrapped_native_token.as_deref())
-        .and_then(parse_address)
-        .map_or_else(
-            || wallet_ops::is_wrapped_native_token(chain_id, token),
-            |wrapped| wrapped == token,
-        )
+        .get(chain_id)
+        .and_then(|chain| chain.wrapped_native_token)
+        .is_some_and(|wrapped| wrapped == token)
 }

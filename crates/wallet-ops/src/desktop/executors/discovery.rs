@@ -80,7 +80,10 @@ impl ExecutorOwner {
             .invalidate();
         let profile = ExecutorProfile::accepted(
             self.chain.chain_id,
-            self.chain.relay_adapt_7702_contract.parse()?,
+            self.chain
+                .require_railgun()?
+                .deployment
+                .relay_adapt_7702_contract,
         )
         .ok_or_else(|| eyre!("executor recovery profile is unavailable for this configuration"))?;
         let addresses = self.vault.executor_addresses_for_session(

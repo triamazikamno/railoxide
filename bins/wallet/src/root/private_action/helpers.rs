@@ -565,9 +565,8 @@ impl WalletRoot {
 
     fn effective_wrapped_native_token(&self, chain_id: u64) -> Option<Address> {
         self.effective_chain_configs
-            .get(&chain_id)
-            .and_then(|chain| chain.wrapped_native_token.as_deref())
-            .and_then(parse_address)
+            .get(chain_id)
+            .and_then(|chain| chain.wrapped_native_token)
     }
 
     pub(in crate::root) fn set_unshield_native_top_up_enabled(

@@ -12,7 +12,6 @@ use super::{
     render::chain_label_for_caip2,
     *,
 };
-use crate::root::tokens::format_native_token_amount_for_display;
 
 pub(super) async fn approve_walletconnect_request_task(
     request: WalletConnectRequestUi,
@@ -22,7 +21,7 @@ pub(super) async fn approve_walletconnect_request_task(
     protected_software_seed_session: Option<Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>>,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
-    effective_chain: Option<EffectiveChainConfig>,
+    effective_chain: EffectiveChainConfig,
     executor_owner: Option<Arc<wallet_ops::ExecutorOwner>>,
     response_sender: DappResponseSender,
     http: HttpContext,
@@ -31,6 +30,9 @@ pub(super) async fn approve_walletconnect_request_task(
     event_tx: Option<PublicActionSessionEventSender>,
     transaction_tracking: Option<wallet_ops::PublicTransactionTrackingContext>,
 ) -> Result<WalletConnectRequestApprovalOutcome, DappApprovalTaskError> {
+    let account_binding = request.binding.account.clone().ok_or_else(|| {
+        DappApprovalTaskError::Failed("This request has no account authorization".to_owned())
+    })?;
     let chain_id = parse_caip2_chain_id(&request.item.chain_id)
         .ok_or_else(|| DappApprovalTaskError::Failed("Request chain is not EIP-155".to_owned()))?;
     let native = request.request_control.is_some();
@@ -61,7 +63,7 @@ pub(super) async fn approve_walletconnect_request_task(
                     protected_software_seed_session,
                     trezor_app_passphrase,
                     trezor_pin_matrix_provider,
-                    public_account_uuid: request.binding.public_account_uuid.clone(),
+                    public_account_uuid: account_binding.public_account_uuid.clone(),
                     message: walletconnect_personal_message_bytes(&message),
                     event_tx,
                 })
@@ -81,7 +83,7 @@ pub(super) async fn approve_walletconnect_request_task(
                         protected_software_seed_session,
                         trezor_app_passphrase,
                         trezor_pin_matrix_provider,
-                        public_account_uuid: request.binding.public_account_uuid.clone(),
+                        public_account_uuid: account_binding.public_account_uuid.clone(),
                         typed_data,
                         hash_fallback_confirmed,
                         event_tx,
@@ -121,7 +123,7 @@ pub(super) async fn approve_walletconnect_request_task(
                             protected_software_seed_session,
                             trezor_app_passphrase,
                             trezor_pin_matrix_provider,
-                            public_account_uuid: request.binding.public_account_uuid.clone(),
+                            public_account_uuid: account_binding.public_account_uuid.clone(),
                             tx_req,
                             decoded_transaction: request.item.decoded_transaction.clone(),
                             reviewed_transaction: reviewed_fee.reviewed_transaction(),
@@ -382,7 +384,7 @@ pub(super) fn walletconnect_request_approval_error_kind(
         WalletConnectRequestErrorKind::UserRejected
     } else if is_walletconnect_authorization_error(error) {
         WalletConnectRequestErrorKind::Unauthorized
-    } else if request.account_source == PublicAccountSource::HardwareDerived
+    } else if request.account_source == Some(PublicAccountSource::HardwareDerived)
         && matches!(
             request.item.method,
             WalletConnectSupportedMethod::EthSignTypedData
@@ -518,9 +520,11 @@ pub(super) fn walletconnect_request_authorization_summary_with_fee(
         "Chain",
         chain_label_for_caip2(&request.item.chain_id),
     ));
-    if walletconnect_selected_account_provenance_visible(request.item.account, &intent.parties) {
+    if let Some(account) = request.item.account.filter(|account| {
+        walletconnect_selected_account_provenance_visible(*account, &intent.parties)
+    }) {
         rows.push(
-            SpendAuthorizationSummaryRow::new("Account", request.item.account.to_string())
+            SpendAuthorizationSummaryRow::new("Account", account.to_string())
                 .with_shortened_copyable(),
         );
     }
@@ -557,13 +561,10 @@ pub(super) fn walletconnect_request_authorization_summary_with_fee(
             .with_shortened_copyable(),
         );
     }
-    if let (Some(chain_id), Some(maximum)) = (
-        parse_caip2_chain_id(&request.item.chain_id),
-        reviewed_fee.and_then(|reviewed_fee| reviewed_fee.maximum_gas_cost),
-    ) {
+    if let Some(maximum) = reviewed_fee.and_then(|reviewed_fee| reviewed_fee.maximum_gas_cost) {
         rows.push(SpendAuthorizationSummaryRow::new(
             "Maximum network cost",
-            format_native_token_amount_for_display(chain_id, maximum),
+            intent.native_currency.format_amount(maximum),
         ));
     }
     let mut warnings: Vec<Arc<str>> = intent

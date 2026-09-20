@@ -264,11 +264,9 @@ async fn execution_nonce_with_code(
 ) -> Option<U256> {
     // Ordinary inspection never interprets another delegate's storage. Recovery
     // explicitly installs this supported profile and must preserve its stored nonce.
-    let profile = chain
-        .relay_adapt_7702_contract
-        .parse()
-        .ok()
-        .and_then(|delegate| ExecutorProfile::accepted(chain.chain_id, delegate));
+    let profile = chain.railgun.as_ref().and_then(|railgun| {
+        ExecutorProfile::accepted(chain.chain_id, railgun.deployment.relay_adapt_7702_contract)
+    });
     match (profile, code) {
         (Some(_), Some(code))
             if code.is_empty() || recovery && executor_delegation(code).is_some() =>
@@ -508,7 +506,8 @@ mod tests {
         });
         let mut chain = build_effective_chain_configs(&WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
         chain.rpc_route = crate::RpcChainRoute::new(
             1,
@@ -548,7 +547,8 @@ mod tests {
     {
         let chain = build_effective_chain_configs(&WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
         let address = Address::repeat_byte(1);
         let token = ExecutorAsset::Erc20(Address::repeat_byte(2));
@@ -591,7 +591,8 @@ mod tests {
     async fn executor_inspection_reads_execution_nonce_only_for_the_accepted_delegation() {
         let mut chain = build_effective_chain_configs(&WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
         let profile = chain.accepted_executor_profile().unwrap();
         let responses = Asserter::new();
@@ -647,7 +648,8 @@ mod tests {
     async fn recovery_reads_target_nonce_without_calling_an_unrecognized_delegate() {
         let chain = build_effective_chain_configs(&WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
         let responses = Asserter::new();
         let provider = ProviderBuilder::new()

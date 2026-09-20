@@ -1,6 +1,6 @@
 use eyre::{Result, WrapErr, eyre};
 
-use super::runtime::public_chain_runtime_config;
+use super::runtime::verified_public_chain_runtime_config;
 use super::signer::{VaultedPublicSigner, admitted_public_signer, vaulted_public_signer};
 use super::submission::{
     PublicActionPreflightMode, emit_public_action_event,
@@ -242,7 +242,13 @@ pub async fn submit_walletconnect_send_transaction(
     if let Some(control) = request.request_control.as_ref() {
         control.ensure_current()?;
     }
-    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = verified_public_chain_runtime_config(
+        request.chain_id,
+        &request.effective_chain,
+        http,
+        request.rpc_reads.as_ref(),
+    )
+    .await?;
     let signer = admitted_public_signer(
         &request.vault_store,
         &request.view_session,

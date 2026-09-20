@@ -23,6 +23,11 @@ use tokio::{task::JoinSet, time::Instant};
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "chain_editor.rs"]
+mod chain_editor;
+pub use chain_editor::{
+    GatewayChainEditorCommand, GatewayChainEditorOutcome, GatewayChainEditorRequest,
+};
 #[path = "network.rs"]
 mod network;
 pub use network::{
@@ -33,8 +38,8 @@ pub use network::{
 #[path = "public_view.rs"]
 mod public_view;
 use crate::dapp_request::DappRequestControl;
-pub use approvals::GatewayApprovalRequest;
 use approvals::{ApprovalDelivery, PendingApproval};
+pub use approvals::{GatewayApprovalAccount, GatewayApprovalRequest};
 #[path = "wallet_switch.rs"]
 mod wallet_switch;
 use tokio::sync::{oneshot, watch};
@@ -71,34 +76,69 @@ pub struct GatewayWalletState {
     pub active_wallet_generation: u64,
     pub public_accounts: Vec<PublicAccountMetadata>,
     pub chain_ids: Vec<u64>,
+    pub configured_chain_ids: Vec<u64>,
     pub default_chain_id: Option<u64>,
     pub http: Option<HttpContext>,
     pub routes: BTreeMap<u64, RpcChainRoute>,
+    pub chain_choices: BTreeMap<u64, GatewayChainChoice>,
+    pub native_currencies: BTreeMap<u64, crate::settings::NativeCurrency>,
     pub token_registry: Option<Arc<crate::settings::EffectiveTokenRegistry>>,
     pub public_balance_cache: crate::PublicBalanceCache,
     pub public_transaction_tracker: crate::PublicTransactionTracker,
 }
 impl GatewayWalletState {
+    fn chain_choice(&self, id: u64) -> GatewayChainChoice {
+        self.chain_choices
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| GatewayChainChoice {
+                id,
+                name: format!("Chain {id}"),
+                railgun: false,
+            })
+    }
     /// Resolve routes with the same settings policy used by wallet operations.
     pub fn set_rpc_context(
         &mut self,
         http: HttpContext,
-        configs: &BTreeMap<u64, crate::settings::EffectiveChainConfig>,
+        configs: &crate::settings::EffectiveChainRegistry,
     ) {
         self.http = Some(http);
+        self.configured_chain_ids = configs.keys().copied().collect();
         self.routes = configs
             .iter()
             .filter_map(|(&chain, config)| {
-                crate::settings::resolve_effective_chain_rpc_route(chain, Some(config))
+                crate::settings::resolve_effective_chain_rpc_route(chain, config)
                     .ok()
                     .map(|route| (chain, route))
             })
             .collect();
         self.chain_ids = self.routes.keys().copied().collect();
+        self.chain_choices = configs
+            .enabled_chains()
+            .map(|chain| {
+                (
+                    chain.chain_id,
+                    GatewayChainChoice {
+                        id: chain.chain_id,
+                        name: chain.name.clone(),
+                        railgun: chain.railgun.is_some(),
+                    },
+                )
+            })
+            .collect();
+        self.native_currencies = configs
+            .enabled_chains()
+            .map(|chain| (chain.chain_id, chain.native_currency.clone()))
+            .collect();
     }
     #[must_use]
     pub fn same_state(&self, other: &Self) -> bool {
         self.same_authority(other)
+            && self.chain_ids == other.chain_ids
+            && self.configured_chain_ids == other.configured_chain_ids
+            && self.chain_choices == other.chain_choices
+            && self.routes == other.routes
             && self.network_view == other.network_view
             && self.public_view == other.public_view
             && self.private_actions_supported == other.private_actions_supported
@@ -111,6 +151,7 @@ impl GatewayWalletState {
             && self.public_accounts == other.public_accounts
             && self.default_chain_id == other.default_chain_id
             && self.token_registry == other.token_registry
+            && self.native_currencies == other.native_currencies
     }
     fn same_accounts(&self, other: &Self) -> bool {
         self.public_accounts.len() == other.public_accounts.len()
@@ -131,14 +172,19 @@ impl GatewayWalletState {
         self.waiting_unlock == other.waiting_unlock
             && self.active_wallet_generation == other.active_wallet_generation
             && self.same_accounts(other)
-            && self.chain_ids == other.chain_ids
-            && self.routes == other.routes
             && same_http(self.http.as_ref(), other.http.as_ref())
             && match (&self.view, &other.view) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
                 _ => false,
             }
+    }
+
+    #[must_use]
+    pub fn same_chain_authority(&self, other: &Self, chain_id: u64) -> bool {
+        self.same_authority(other)
+            && self.routes.get(&chain_id) == other.routes.get(&chain_id)
+            && self.native_currencies.get(&chain_id) == other.native_currencies.get(&chain_id)
     }
 }
 
@@ -150,8 +196,10 @@ pub struct GatewayAccountChoice {
 }
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayChainChoice {
+    #[serde(serialize_with = "railgun_ui::chain_id::serialize")]
     pub id: u64,
     pub name: String,
+    pub railgun: bool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayConnectPrompt {
@@ -162,6 +210,7 @@ pub struct GatewayConnectPrompt {
     pub wrong_wallet: bool,
     pub accounts: Vec<GatewayAccountChoice>,
     pub chains: Vec<GatewayChainChoice>,
+    #[serde(serialize_with = "railgun_ui::chain_id::optional::serialize")]
     pub default_chain_id: Option<u64>,
 }
 /// Desktop-local list, never included in the peer's general state snapshot.
@@ -208,6 +257,8 @@ struct ReadOwner {
     wallet: GatewayWalletState,
     permission: Option<GatewayPermission>,
     local_balance: Option<LocalBalanceAnswer>,
+    /// Selected-chain snapshot for an accountless `eth_chainId` query.
+    unconnected_chain: Option<u64>,
 }
 enum ReadWork {
     Accounts,
@@ -253,6 +304,7 @@ pub(super) struct Delivery {
     read: Option<(ReadTicket, ReadOwner, bool)>,
     approval: Option<ApprovalDelivery>,
     incarnation: Option<u64>,
+    chain_editor: Option<GatewayChainEditorRequest>,
 }
 impl Delivery {
     pub(super) const fn control(message: GatewayServerMessage) -> Self {
@@ -263,6 +315,7 @@ impl Delivery {
             read: None,
             approval: None,
             incarnation: None,
+            chain_editor: None,
         }
     }
     pub(super) fn ticket_id(&self) -> Option<u64> {
@@ -310,6 +363,7 @@ pub(super) struct DappProvider {
     ui_peers: HashMap<u64, PeerId>,
     ui_errors: HashMap<u64, String>,
     network_views: network::NetworkViews,
+    chain_editor_views: chain_editor::ChainEditorViews,
 }
 impl DappProvider {
     pub(super) fn new(store: DesktopVaultStore, generation: u64) -> Self {
@@ -336,6 +390,7 @@ impl DappProvider {
             ui_peers: HashMap::new(),
             ui_errors: HashMap::new(),
             network_views: network::NetworkViews::default(),
+            chain_editor_views: chain_editor::ChainEditorViews::default(),
         }
     }
     pub(super) const fn wallet_transition(&self) -> bool {
@@ -343,6 +398,7 @@ impl DappProvider {
     }
     pub(super) fn retire_sessions(&mut self, live: impl Fn(u64) -> bool) {
         self.network_views.retire_sessions(&live);
+        self.chain_editor_views.retire_sessions(&live);
         self.ui_snapshots.retain(|session, _| live(*session));
         self.ui_peers.retain(|session, _| live(*session));
         self.ui_errors.retain(|session, _| live(*session));
@@ -406,6 +462,10 @@ impl DappProvider {
             }),
         })
     }
+    pub(super) fn is_current_wallet_state(&self, wallet: &GatewayWalletState) -> bool {
+        wallet.same_state(&self.authority.borrow())
+    }
+
     pub(super) fn same_authority(&self, wallet: &GatewayWalletState) -> bool {
         self.wallet.same_authority(wallet)
     }
@@ -443,6 +503,9 @@ impl DappProvider {
             wallet.routes.clear();
         }
         self.retire_network_context(&wallet);
+        if !self.wallet.same_authority(&wallet) {
+            self.chain_editor_views.retire_context();
+        }
         if let Some(authority) = &self.authority_fallback {
             authority.send_replace(wallet.clone());
         }
@@ -507,6 +570,7 @@ impl DappProvider {
                 key.0,
                 Delivery {
                     incarnation: Some(document.incarnation),
+                    chain_editor: None,
                     local_error: false,
                     registration_rejection: false,
                     read: None,
@@ -710,11 +774,28 @@ impl DappProvider {
         let origin = doc.origin.clone();
         let permission = match self.resolve(&origin) {
             Ok((permission, _)) => Some(permission),
-            Err(_) if method == "eth_accounts" => None,
+            Err(_) if matches!(method, "eth_accounts" | "eth_chainId") => None,
             Err(code) => {
                 self.respond(session, &document, &request_id, Err(code));
                 return;
             }
+        };
+        let unconnected_chain = if method == "eth_chainId" && permission.is_none() {
+            if self.wallet.view.is_none() {
+                self.respond(session, &document, &request_id, Err(4100));
+                return;
+            }
+            let Some(chain_id) = self
+                .wallet
+                .default_chain_id
+                .filter(|chain| self.wallet.chain_ids.contains(chain))
+            else {
+                self.respond(session, &document, &request_id, Err(4901));
+                return;
+            };
+            Some(chain_id)
+        } else {
+            None
         };
         if permission
             .as_ref()
@@ -763,6 +844,7 @@ impl DappProvider {
             wallet: self.wallet.clone(),
             permission,
             local_balance: None,
+            unconnected_chain,
         };
         let (ticket, phase) = match self.admission.admit(origin, now) {
             Ok(ReadAdmissionDecision::Ready(ticket)) => (ticket, ReadPhase::Delivery),
@@ -844,6 +926,14 @@ impl DappProvider {
                 -32002
             });
         }
+        if owner.unconnected_chain.is_some_and(|chain| {
+            self.wallet.default_chain_id != Some(chain)
+                || authority.default_chain_id != Some(chain)
+                || !self.wallet.chain_ids.contains(&chain)
+                || !authority.chain_ids.contains(&chain)
+        }) {
+            return Err(-32002);
+        }
         drop(authority);
         let resolved = self.resolve(&owner.origin).ok();
         if resolved.as_ref().map(|(permission, _)| permission) != owner.permission.as_ref() {
@@ -852,6 +942,16 @@ impl DappProvider {
         if let Some(permission) = &owner.permission {
             if !self.wallet.chain_ids.contains(&permission.chain_id) {
                 return Err(4901);
+            }
+            if !self
+                .wallet
+                .same_chain_authority(&owner.wallet, permission.chain_id)
+                || !self
+                    .authority
+                    .borrow()
+                    .same_chain_authority(&owner.wallet, permission.chain_id)
+            {
+                return Err(-32002);
             }
             if remote {
                 if self.wallet.http.is_none() {
@@ -982,13 +1082,14 @@ impl DappProvider {
             local => {
                 let outcome = match local {
                     ReadWork::Accounts => Ok(json!(self.disclosure(&read.owner.origin).accounts)),
-                    ReadWork::Chain => Ok(json!(chain_hex(
-                        read.owner
-                            .permission
-                            .as_ref()
-                            .expect("authorized chain read")
-                            .chain_id
-                    ))),
+                    ReadWork::Chain => read
+                        .owner
+                        .permission
+                        .as_ref()
+                        .map(|permission| permission.chain_id)
+                        .or(read.owner.unconnected_chain)
+                        .map(|chain| json!(chain_hex(chain)))
+                        .ok_or(4901),
                     ReadWork::Remote { .. } => unreachable!(),
                 };
                 read.phase = ReadPhase::Delivery;
@@ -1203,6 +1304,13 @@ impl DappProvider {
         delivery: &mut Delivery,
         authority: &GatewayWalletState,
     ) -> DeliveryStatus {
+        if let Some(request) = &delivery.chain_editor {
+            return if request.session == session && request.is_current_authority(authority) {
+                DeliveryStatus::Current
+            } else {
+                DeliveryStatus::Discard
+            };
+        }
         match &mut delivery.message {
             GatewayServerMessage::ProviderResponse {
                 document,
@@ -1557,6 +1665,7 @@ impl DappProvider {
                     .documents
                     .get(&(session, document.to_owned()))
                     .map(|doc| doc.incarnation),
+                chain_editor: None,
                 local_error: false,
                 registration_rejection: false,
                 read: None,
@@ -1623,7 +1732,7 @@ impl DappProvider {
                 request_id: pending.approval_id.clone(), url: pending.origin.web_origin().expect("dapp origin").as_str().to_owned(), paired_peer_id: pending.origin.paired_peer_id().expect("dapp peer").to_owned(),
                 needs_unlock: self.wallet.view.is_none(), wrong_wallet,
                 accounts: accounts.iter().map(|account| GatewayAccountChoice { uuid: account.public_account_uuid.clone(), label: account.label.clone(), address: account.address.to_string() }).collect(),
-                chains: self.wallet.chain_ids.iter().map(|&id| GatewayChainChoice { id, name: railgun_ui::chains::chain_name(id).map_or_else(|| format!("Chain {id}"), str::to_owned) }).collect(), default_chain_id: self.wallet.default_chain_id,
+                chains: self.wallet.chain_ids.iter().map(|&id| self.wallet.chain_choice(id)).collect(), default_chain_id: self.wallet.default_chain_id,
             }
         }).collect();
         // The unlocked wallet's own accounts, so the peer can list them without a prompt.
@@ -1663,6 +1772,7 @@ impl DappProvider {
             private_view_supported: self.wallet.private_view_supported,
             private_actions_supported: self.wallet.private_actions_supported,
             private_self_broadcast_supported: self.wallet.private_self_broadcast_supported,
+            chain_management_supported: peer_id.is_some() && self.wallet.view.is_some(),
             network_control_supported: self.wallet.network_view.is_some() && peer_id.is_some(),
             network_view: peer_id
                 .as_ref()
@@ -1678,11 +1788,7 @@ impl DappProvider {
                 .wallet
                 .chain_ids
                 .iter()
-                .map(|&id| GatewayChainChoice {
-                    id,
-                    name: railgun_ui::chain_name(id)
-                        .map_or_else(|| format!("Chain {id}"), str::to_owned),
-                })
+                .map(|&id| self.wallet.chain_choice(id))
                 .collect(),
             permissions: self.ui_peers.get(&session).map_or_else(Vec::new, |peer| {
                 let peer = alloy::hex::encode(peer.to_bytes());

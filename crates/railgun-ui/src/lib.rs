@@ -1,8 +1,12 @@
+pub mod chain_editor;
+pub mod chain_id;
 pub mod chains;
 pub mod governance;
 pub mod tokens;
 
-pub use chains::{DEFAULT_CHAINS, chain_icon_asset_path, chain_icon_path, chain_name};
+pub use chains::{
+    DEFAULT_CHAINS, NativeCurrency, chain_icon_asset_path, chain_icon_path, chain_name,
+};
 pub use governance::{
     GovernanceContracts, GovernanceRewardToken, governance_contracts, governance_treasury,
 };

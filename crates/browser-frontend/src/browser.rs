@@ -1,3 +1,4 @@
+mod chains;
 mod network;
 mod unlock;
 use std::{
@@ -30,6 +31,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::{
+    chain_select::{ChainSelectItem, ChainSelectItems, chain_select, chain_select_state},
     controls::{
         app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
         app_text,
@@ -82,6 +84,8 @@ extern "C" {
     fn host_pair(code: &str, endpoint: &str);
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = subscribeConnect)]
     fn host_subscribe_connect(callback: &js_sys::Function);
+    #[wasm_bindgen(js_namespace = railoxideHost, js_name = subscribeChainEditor)]
+    fn host_subscribe_chain_editor(callback: &js_sys::Function);
     #[wasm_bindgen(js_namespace = railoxideHost, js_name = resolveConnect)]
     fn host_resolve_connect(request_id: &str, account: Option<&str>, chain_id: &JsValue);
 }
@@ -208,6 +212,7 @@ struct ConnectAccount {
 struct ChainChoice {
     id: u64,
     name: String,
+    railgun: bool,
 }
 
 struct ConnectPrompt {
@@ -226,7 +231,7 @@ struct ConnectRequestForm {
     account_uuids: Vec<String>,
     chain_ids: Vec<u64>,
     account: Entity<SelectState<SearchableVec<AccountSelectItem>>>,
-    chain: Entity<SelectState<SearchableVec<ChainSelectItem>>>,
+    chain: Entity<SelectState<ChainSelectItems>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -296,39 +301,6 @@ fn account_select_row(item: &AccountSelectItem) -> Div {
         )
 }
 
-#[derive(Clone)]
-struct ChainSelectItem {
-    id: u64,
-    name: String,
-}
-
-impl SelectItem for ChainSelectItem {
-    type Value = u64;
-
-    fn title(&self) -> SharedString {
-        SharedString::from(self.name.clone())
-    }
-
-    fn display_title(&self) -> Option<AnyElement> {
-        Some(
-            ui::wallet_identity::chain_label_row(
-                self.name.clone(),
-                railgun_ui::chain_icon_asset_path(self.id),
-            )
-            .into_any_element(),
-        )
-    }
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        ui::wallet_identity::chain_label_row(
-            self.name.clone(),
-            railgun_ui::chain_icon_asset_path(self.id),
-        )
-    }
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
 struct PendingRequest {
     url: String,
     needs_unlock: bool,
@@ -370,15 +342,47 @@ fn flag_field(value: &JsValue, key: &str) -> bool {
     field(value, key).as_bool().unwrap_or(false)
 }
 
-/// Chain ids cross the host boundary as JSON numbers; the desktop only sends non-negative integers.
+/// New desktops send large chain IDs as decimal strings; legacy numeric IDs must be exact.
 #[allow(clippy::cast_sign_loss)]
 fn chain_id_field(value: &JsValue, key: &str) -> Option<u64> {
-    field(value, key).as_f64().map(|id| id.max(0.0) as u64)
+    let value = field(value, key);
+    if let Some(text) = value.as_string() {
+        return text.parse().ok();
+    }
+    value
+        .as_f64()
+        .filter(|id| {
+            id.is_finite() && *id >= 0.0 && *id <= 9_007_199_254_740_991.0 && id.fract() == 0.0
+        })
+        .map(|id| id as u64)
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn chain_value(chain_id: u64) -> JsValue {
-    JsValue::from_f64(chain_id as f64)
+    if chain_id <= railgun_ui::chain_id::MAX_SAFE_INTEGER {
+        JsValue::from_f64(chain_id as f64)
+    } else {
+        JsValue::from_str(&chain_id.to_string())
+    }
+}
+
+fn chain_json(chain_id: u64) -> serde_json::Value {
+    if chain_id <= railgun_ui::chain_id::MAX_SAFE_INTEGER {
+        chain_id.into()
+    } else {
+        chain_id.to_string().into()
+    }
+}
+
+fn json_chain_id(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            value
+                .as_u64()
+                .filter(|id| *id <= railgun_ui::chain_id::MAX_SAFE_INTEGER)
+        })
 }
 
 fn chain_field(value: &JsValue, key: &str) -> Vec<ChainChoice> {
@@ -388,9 +392,12 @@ fn chain_field(value: &JsValue, key: &str) -> Vec<ChainChoice> {
     }
     js_sys::Array::from(&values)
         .iter()
-        .map(|chain| ChainChoice {
-            id: chain_id_field(&chain, "id").unwrap_or_default(),
-            name: text_field(&chain, "name"),
+        .filter_map(|chain| {
+            Some(ChainChoice {
+                id: chain_id_field(&chain, "id")?,
+                name: text_field(&chain, "name"),
+                railgun: field(&chain, "railgun").as_bool().unwrap_or(true),
+            })
         })
         .collect()
 }
@@ -519,6 +526,7 @@ fn version_signature(version: &str) -> String {
 struct GatewayView {
     unlock: unlock::UnlockForm,
     network: network::NetworkControl,
+    chain_management: chains::ChainManagement,
     code: Entity<OtpState>,
     endpoint: Entity<InputState>,
     status: String,
@@ -657,6 +665,11 @@ impl GatewayView {
                         view.handoff_open = keep_handoff;
                     }
                     view.network.sync(&snapshot);
+                    view.chain_management.supported =
+                        !locked && flag_field(&snapshot, "chain_management_supported");
+                    if !view.chain_management.supported {
+                        view.retire_chain_editor(cx);
+                    }
                     view.generation = generation;
                     if view.private_sheet.as_ref().is_some_and(|(wallet, chain)| {
                         private.selected_wallet.as_ref() != Some(wallet)
@@ -665,7 +678,11 @@ impl GatewayView {
                         window.close_sheet(cx);
                         view.private_sheet = None;
                     }
-                    view.home_tab = if private.supported && home_tab == "private" {
+                    view.home_tab = if private.supported
+                        && home_tab == "private"
+                        && chains.iter().any(|chain| {
+                            Some(chain.id) == presentation.selected_chain && chain.railgun
+                        }) {
                         "private"
                     } else {
                         "public"
@@ -697,6 +714,7 @@ impl GatewayView {
         Self {
             unlock,
             network: network::NetworkControl::new(cx),
+            chain_management: chains::ChainManagement::new(window, cx),
             code,
             endpoint,
             status: "disconnected".into(),
@@ -753,6 +771,9 @@ impl GatewayView {
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let (label, color) = self.transport_tag();
         let selected_view = self.view.clone();
+        let chain_management_supported =
+            self.chain_management.supported && self.status == "unlocked";
+        let chain_owner = cx.entity().downgrade();
         let takeover = self.takeover;
         let metamask = self.metamask;
         let version = self.version.clone();
@@ -820,6 +841,17 @@ impl GatewayView {
                     .tooltip("Settings")
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
                         menu.min_w(px(200.0))
+                            .when(chain_management_supported, |menu| {
+                                menu.item(PopupMenuItem::new("Manage chains").on_click({
+                                    let owner = chain_owner.clone();
+                                    move |_, window, cx| {
+                                        let _ = owner.update(cx, |view, cx| {
+                                            view.open_chain_editor(None, window, cx);
+                                        });
+                                    }
+                                }))
+                                .item(PopupMenuItem::separator())
+                            })
                             .item(
                                 PopupMenuItem::new("Open as popup")
                                     .checked(selected_view == "popup")
@@ -1064,8 +1096,8 @@ impl GatewayView {
             .chains
             .iter()
             .map(|chain| ChainSelectItem {
-                id: chain.id,
-                name: chain.name.clone(),
+                chain_id: chain.id,
+                label: chain.name.clone().into(),
             })
             .collect();
         let default_chain_id = prompt.default_chain_id;
@@ -1078,20 +1110,14 @@ impl GatewayView {
                     .unwrap_or_default(),
             )
         });
-        let chain_index = (!chains.is_empty()).then(|| {
-            IndexPath::default().row(
-                default_chain_id
-                    .and_then(|id| chains.iter().position(|chain| chain.id == id))
-                    .unwrap_or_default(),
-            )
-        });
+        let selected_chain = default_chain_id
+            .filter(|id| chains.iter().any(|chain| chain.chain_id == *id))
+            .or_else(|| chains.first().map(|chain| chain.chain_id));
         let account = cx.new(|cx| {
             SelectState::new(SearchableVec::new(accounts), account_index, window, cx)
                 .searchable(true)
         });
-        let chain = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(chains), chain_index, window, cx).searchable(true)
-        });
+        let chain = cx.new(|cx| chain_select_state(chains, selected_chain, window, cx));
         let subscriptions = vec![
             cx.observe(&account, |_, _, cx| cx.notify()),
             cx.observe(&chain, |_, _, cx| cx.notify()),
@@ -1205,10 +1231,8 @@ impl GatewayView {
                         .min_w_0()
                         .child(note("Network"))
                         .child(match form {
-                            Some(form) => Select::new(&form.chain)
-                                .accessibility_label("Network")
+                            Some(form) => chain_select(&form.chain)
                                 .w_full()
-                                .search_placeholder("Search networks")
                                 .into_any_element(),
                             None => unavailable_select().into_any_element(),
                         }),
@@ -1331,6 +1355,9 @@ impl Render for GatewayWindow {
 
 impl Render for GatewayView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        if self.chain_management.token.is_some() {
+            return self.render_chain_management(cx);
+        }
         let connecting = self.paired
             && matches!(self.status.as_str(), "paired" | "locked" | "unlocked")
             && !self.connect_prompts.is_empty();
@@ -1349,6 +1376,16 @@ impl Render for GatewayView {
             .id("gateway-scroll")
             .track_focus(&self.focus)
             .key_context("GatewayView")
+            .when(
+                self.status == "unlocked" && self.chain_management.supported,
+                |this| {
+                    this.on_action(cx.listener(
+                        |this, action: &ui::chain_select::EditChain, window, cx| {
+                            this.open_chain_editor(Some(action.chain_id), window, cx);
+                        },
+                    ))
+                },
+            )
             .on_action(cx.listener(|this, _: &public_view::Back, window, cx| {
                 this.navigate_back(window, cx);
             }))
@@ -1403,5 +1440,6 @@ impl Render for GatewayView {
                             ),
                     ),
             )
+            .into_any_element()
     }
 }

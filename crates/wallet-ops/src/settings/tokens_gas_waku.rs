@@ -4,10 +4,10 @@ use super::{
     Address, BTreeMap, DEFAULT_WAKU_CLUSTER_ID, DEFAULT_WAKU_MAX_PEERS,
     DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS, DEFAULT_WAKU_SHARD_ID, Deserialize,
     GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR, GAS_PRICE_BUFFER_NUMERATOR,
-    IndexedArtifactSourceConfig, IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, SensitiveUrl,
-    Serialize, U256, normalize_address_string, public_balance_refresh_interval_secs,
-    supported_chain_id, validate_address, validate_enr_tree, validate_optional_non_empty,
-    validate_optional_range, validate_range, validate_url_scheme, validate_waku_direct_peer,
+    IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, SensitiveUrl, Serialize, U256,
+    normalize_address_string, public_balance_refresh_interval_secs, validate_address,
+    validate_enr_tree, validate_optional_non_empty, validate_optional_range, validate_range,
+    validate_url_scheme, validate_waku_direct_peer,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,18 +20,26 @@ pub struct TokenSettings {
 }
 
 impl TokenSettings {
-    pub(super) fn validate(&self, errors: &mut Vec<String>) {
+    pub(super) fn validate(&self, chains: &super::ChainSettings, errors: &mut Vec<String>) {
         for (index, override_settings) in self.built_in_overrides.iter().enumerate() {
-            override_settings.validate(&format!("tokens.built_in_overrides[{index}]"), errors);
+            override_settings.validate(
+                &format!("tokens.built_in_overrides[{index}]"),
+                chains,
+                errors,
+            );
         }
         for (index, key) in self.built_in_tombstones.iter().enumerate() {
-            key.validate(&format!("tokens.built_in_tombstones[{index}]"), errors);
+            key.validate(
+                &format!("tokens.built_in_tombstones[{index}]"),
+                chains,
+                errors,
+            );
         }
         for (index, token) in self.custom_tokens.iter().enumerate() {
-            token.validate(&format!("tokens.custom_tokens[{index}]"), errors);
+            token.validate(&format!("tokens.custom_tokens[{index}]"), chains, errors);
         }
         for (index, anchor) in self.price_anchors.iter().enumerate() {
-            anchor.validate(&format!("tokens.price_anchors[{index}]"), errors);
+            anchor.validate(&format!("tokens.price_anchors[{index}]"), chains, errors);
         }
     }
 }
@@ -53,8 +61,13 @@ impl Default for TokenKey {
 }
 
 impl TokenKey {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
-        if !supported_chain_id(self.chain_id) {
+    pub(super) fn validate(
+        &self,
+        field: &str,
+        chains: &super::ChainSettings,
+        errors: &mut Vec<String>,
+    ) {
+        if !chains.contains(self.chain_id) {
             errors.push(format!("{field}.chain_id is not supported"));
         }
         validate_address(
@@ -76,11 +89,16 @@ pub struct BuiltInTokenOverride {
 }
 
 impl BuiltInTokenOverride {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
-        self.key.validate(&format!("{field}.key"), errors);
+    pub(super) fn validate(
+        &self,
+        field: &str,
+        chains: &super::ChainSettings,
+        errors: &mut Vec<String>,
+    ) {
+        self.key.validate(&format!("{field}.key"), chains, errors);
         validate_optional_non_empty(&format!("{field}.symbol"), self.symbol.as_deref(), errors);
         if let Some(anchor) = &self.price_anchor {
-            anchor.validate(&format!("{field}.price_anchor"), errors);
+            anchor.validate(&format!("{field}.price_anchor"), chains, errors);
         }
     }
 }
@@ -110,8 +128,13 @@ impl Default for CustomTokenSettings {
 }
 
 impl CustomTokenSettings {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
-        if !supported_chain_id(self.chain_id) {
+    pub(super) fn validate(
+        &self,
+        field: &str,
+        chains: &super::ChainSettings,
+        errors: &mut Vec<String>,
+    ) {
+        if !chains.contains(self.chain_id) {
             errors.push(format!("{field}.chain_id is not supported"));
         }
         validate_address(
@@ -123,7 +146,7 @@ impl CustomTokenSettings {
             errors.push(format!("{field}.symbol must not be empty"));
         }
         if let Some(anchor) = &self.price_anchor {
-            anchor.validate(&format!("{field}.price_anchor"), errors);
+            anchor.validate(&format!("{field}.price_anchor"), chains, errors);
         }
     }
 }
@@ -136,10 +159,15 @@ pub struct TokenPriceAnchorOverride {
 }
 
 impl TokenPriceAnchorOverride {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
-        self.key.validate(&format!("{field}.key"), errors);
+    pub(super) fn validate(
+        &self,
+        field: &str,
+        chains: &super::ChainSettings,
+        errors: &mut Vec<String>,
+    ) {
+        self.key.validate(&format!("{field}.key"), chains, errors);
         self.price_anchor
-            .validate(&format!("{field}.price_anchor"), errors);
+            .validate(&format!("{field}.price_anchor"), chains, errors);
     }
 }
 
@@ -178,7 +206,12 @@ impl Default for PriceAnchorSettings {
 }
 
 impl PriceAnchorSettings {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
+    pub(super) fn validate(
+        &self,
+        field: &str,
+        chains: &super::ChainSettings,
+        errors: &mut Vec<String>,
+    ) {
         match self {
             Self::Fixed { rate } => {
                 if U256::from_str_radix(rate, 10).is_err() {
@@ -192,7 +225,7 @@ impl PriceAnchorSettings {
                 oracle_decimals,
                 is_inversed: _,
             } => {
-                if !supported_chain_id(*chain_id) {
+                if !chains.contains(*chain_id) {
                     errors.push(format!("{field}.chain_id is not supported"));
                 }
                 validate_address(&format!("{field}.oracle_address"), oracle_address, errors);
@@ -239,7 +272,7 @@ impl PriceAnchorSettings {
                     errors.push(format!("{field}.scale_decimals must be at most 36"));
                 }
                 for (index, component) in components.iter().enumerate() {
-                    component.validate(&format!("{field}.components[{index}]"), errors);
+                    component.validate(&format!("{field}.components[{index}]"), chains, errors);
                 }
             }
         }
@@ -354,37 +387,46 @@ pub struct WakuDirectPeerSetting {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveChainConfig {
     pub chain_id: u64,
+    pub name: String,
+    pub native_currency: super::NativeCurrency,
+    pub explorer_urls: Vec<String>,
+    pub built_in: bool,
     pub enabled: bool,
     pub rpc_route: crate::RpcChainRoute,
-    pub sponsored_bundle_relays: Vec<SensitiveUrl>,
-    pub archive_rpc_url: Option<String>,
-    pub quick_sync_enabled: bool,
-    pub quick_sync_endpoint: Option<String>,
-    pub indexed_artifact_source_mode: IndexedArtifactSourceModeSetting,
-    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
-    pub indexed_wallet_block_range: u64,
-    pub deployment_block: u64,
-    pub v2_start_block: u64,
-    pub legacy_shield_block: u64,
-    pub archive_until_block: u64,
-    pub railgun_contract: String,
-    pub relay_adapt_contract: String,
-    pub relay_adapt_7702_contract: String,
-    pub wrapped_native_token: Option<String>,
-    pub coinbase_payer: Option<Address>,
+    pub wrapped_native_token: Option<Address>,
     pub finality_depth: u64,
-    pub block_time: Duration,
-    pub block_range: Option<u64>,
-    pub poll_interval_secs: Option<u64>,
+    pub block_time: Option<Duration>,
     pub gas: EffectiveChainGasSettings,
+    pub railgun: Option<EffectiveRailgunConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveRailgunConfig {
+    pub deployment: broadcaster_core::deployment::RailgunDeployment,
+    pub sync: sync_service::RailgunSyncOptions,
+    pub archive_rpc_url: Option<SensitiveUrl>,
+    pub indexed_artifact_source_mode: IndexedArtifactSourceModeSetting,
+    pub sponsored_bundle_relays: Vec<SensitiveUrl>,
+    pub coinbase_payer: Option<Address>,
 }
 
 impl EffectiveChainConfig {
+    pub fn require_railgun(&self) -> eyre::Result<&EffectiveRailgunConfig> {
+        if !self.enabled {
+            return Err(eyre::eyre!("chain {} is disabled", self.chain_id));
+        }
+        self.railgun
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("chain {} has no Railgun deployment", self.chain_id))
+    }
+
     #[must_use]
-    pub const fn has_sponsorship_prerequisites(&self) -> bool {
-        !self.sponsored_bundle_relays.is_empty()
+    pub fn has_sponsorship_prerequisites(&self) -> bool {
+        self.enabled
             && self.wrapped_native_token.is_some()
-            && self.coinbase_payer.is_some()
+            && self.railgun.as_ref().is_some_and(|railgun| {
+                !railgun.sponsored_bundle_relays.is_empty() && railgun.coinbase_payer.is_some()
+            })
     }
 }
 

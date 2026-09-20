@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 6;
+pub const WALLET_SETTINGS_VERSION: u32 = 7;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 4;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
@@ -34,6 +34,10 @@ pub(super) const SUPPORTED_PROXY_SCHEMES: &[&str] = &["http", "https", "socks5",
 
 #[derive(Debug, Error)]
 pub enum WalletSettingsError {
+    #[error("Settings changed in another editor. Reload before saving; your draft has been kept.")]
+    Conflict,
+    #[error("Settings writes are unavailable")]
+    WriteUnavailable,
     #[error(transparent)]
     Db(#[from] local_db::DbError),
     #[error("encode wallet settings: {0}")]
@@ -161,7 +165,7 @@ impl WalletSettings {
         self.indexed_artifacts.validate(&mut errors);
         self.poi.validate(&mut errors);
         self.broadcaster.validate(&mut errors);
-        self.tokens.validate(&mut errors);
+        self.tokens.validate(&self.chains, &mut errors);
         self.gas.validate(&mut errors);
         self.runtime.validate(&mut errors);
         self.waku.validate(&mut errors);
@@ -188,7 +192,7 @@ impl WalletSettings {
     }
 
     pub fn reset_chains(&mut self) {
-        self.chains = ChainSettings::default();
+        self.chains.per_chain = ChainSettings::default().per_chain;
     }
 
     pub fn reset_indexed_artifacts(&mut self) {

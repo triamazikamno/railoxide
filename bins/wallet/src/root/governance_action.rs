@@ -468,6 +468,10 @@ impl WalletRoot {
         window: &Window,
         cx: &Context<'_, Self>,
     ) {
+        let chain_id = draft.context.chain_id;
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let target = draft.target.clone();
         let operation_generation = {
             self.governance.action_flow.generation =
@@ -479,11 +483,9 @@ impl WalletRoot {
                 self.governance.action_flow.pending = true;
             }
         }
-        let chain_id = draft.context.chain_id;
         let actor = draft.actor;
         let raw = draft.resolved.raw.clone();
         let gas_fee = draft.gas_fee;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
         let http = self.http.clone();
         let expected_draft = draft.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -646,7 +648,9 @@ impl WalletRoot {
             amount,
         });
         let chain_id = self.selected_chain;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         let actor_uuid: Arc<str> = Arc::from(account.public_account_uuid.clone());
         let actor_source = account.source;
@@ -704,6 +708,13 @@ impl WalletRoot {
         #[cfg(not(feature = "hardware"))] window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self
+            .effective_chain_configs
+            .enabled(self.selected_chain)
+            .cloned()
+        else {
+            return;
+        };
         if self.public_form.sending {
             return;
         }
@@ -827,7 +838,7 @@ impl WalletRoot {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
             chain_id,
-            effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+            effective_chain: resolved_chain,
             view_session,
             vault_store,
             vault_password,
@@ -853,7 +864,7 @@ impl WalletRoot {
         };
         let http = self.http.clone();
         let submitted_target = target;
-        let join = self.spawn_public_transaction_submission(async move {
+        let join = self.spawn_public_transaction_submission(chain_id, async move {
             if let Some(workflow) = workflow {
                 Box::pin(wallet_ops::submit_governance_workflow_with_progress(
                     GovernanceWorkflowRequest {
@@ -1039,21 +1050,18 @@ async fn build_governance_spend_draft(
     actor_source: PublicAccountSource,
     view_session: Arc<wallet_ops::vault::DesktopViewSession>,
     vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
-    effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: wallet_ops::HttpContext,
     gas_fee_selection: PublicActionGasFeeSelection,
 ) -> Result<GovernanceSpendDraft, String> {
     let recipe_proposal = proposal.clone();
     let recipe_key = key.clone();
     let recipe_amount = amount;
-    let overview = wallet_ops::fetch_governance_overview(
-        key.context.chain_id,
-        effective_chain.as_ref(),
-        &http,
-    )
-    .await
-    .map_err(|error| format_report_chain(&error))?
-    .ok_or_else(|| "Governance is not deployed on this chain".to_owned())?;
+    let overview =
+        wallet_ops::fetch_governance_overview(key.context.chain_id, &effective_chain, &http)
+            .await
+            .map_err(|error| format_report_chain(&error))?
+            .ok_or_else(|| "Governance is not deployed on this chain".to_owned())?;
     let v2_count = usize::try_from(overview.v2.proposal_count)
         .map_err(|_| "Governance proposal count is too large".to_owned())?;
     let (global_index, expected_address) = match proposal.contract_version {
@@ -1093,7 +1101,7 @@ async fn build_governance_spend_draft(
         &overview,
         page,
         NonZeroUsize::new(super::proposals::PROPOSALS_PAGE_SIZE).expect("nonzero page size"),
-        effective_chain.as_ref(),
+        &effective_chain,
         &http,
     )
     .await
@@ -1117,18 +1125,15 @@ async fn build_governance_spend_draft(
             .rules
             .clone(),
     };
-    let chain_time = wallet_ops::fetch_governance_chain_time(
-        key.context.chain_id,
-        effective_chain.as_ref(),
-        &http,
-    )
-    .await
-    .map_err(|error| format_report_chain(&error))?;
+    let chain_time =
+        wallet_ops::fetch_governance_chain_time(key.context.chain_id, &effective_chain, &http)
+            .await
+            .map_err(|error| format_report_chain(&error))?;
     let rows = wallet_ops::fetch_governance_participation(
         key.context.chain_id,
         &fresh,
         &[selection.actor],
-        effective_chain.as_ref(),
+        &effective_chain,
         &http,
     )
     .await
@@ -1588,7 +1593,7 @@ pub(super) async fn build_typed_governance_spend_draft(
     action: GovernanceActionIntent,
     view_session: Arc<wallet_ops::vault::DesktopViewSession>,
     vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
-    effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: wallet_ops::HttpContext,
     gas_fee_selection: PublicActionGasFeeSelection,
     workflow: Option<GovernanceWorkflow>,

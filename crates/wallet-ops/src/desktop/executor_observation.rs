@@ -173,7 +173,7 @@ async fn observe_history_at_provider(
         }
         NonceSource::HistoryOnly => None,
     };
-    let railgun = chain.railgun_contract.parse()?;
+    let railgun = chain.require_railgun()?.deployment.contract;
     let mut numbers = range.clone().collect::<BTreeSet<_>>();
     // Revalidate previous inclusions, even outside this discovery page. An old
     // cached winner must not survive a reorg or an unavailable receipt read.
@@ -497,7 +497,8 @@ mod tests {
             &crate::settings::WalletSettings::default(),
         )
         .unwrap()
-        .remove(&1)
+        .get(1)
+        .cloned()
         .unwrap();
         chain.rpc_route = crate::RpcChainRoute::new(1, Vec::<url::Url>::new());
         let http = HttpContext::direct_for_tests();
@@ -554,7 +555,8 @@ mod tests {
             &crate::settings::WalletSettings::default(),
         )
         .unwrap()
-        .remove(&1)
+        .get(1)
+        .cloned()
         .unwrap();
         let record = empty_record(&chain);
         let pinned = BlockNumHash::new(50, B256::repeat_byte(50));
@@ -603,7 +605,8 @@ mod tests {
             &crate::settings::WalletSettings::default(),
         )
         .unwrap()
-        .remove(&1)
+        .get(1)
+        .cloned()
         .unwrap();
         let record = empty_record(&chain);
         for (confirmed, reorg) in [(true, false), (false, false), (true, true)] {

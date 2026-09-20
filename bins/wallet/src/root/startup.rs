@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +25,7 @@ use wallet_ops::{
     WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage,
     build_wallet_network_context_with_progress, request_tor_state_reset,
     settings::{
-        EffectiveChainConfig, EffectiveTokenRegistry, WalletSettings,
+        EffectiveChainRegistry, EffectiveTokenRegistry, WalletSettings,
         build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
         load_wallet_settings, load_wallet_ui_state, save_wallet_settings,
     },
@@ -50,7 +49,7 @@ struct WalletStartupReady {
     chain_ids: Vec<u64>,
     initial_chain_id: u64,
     ui_state: wallet_ops::settings::WalletUiState,
-    effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
+    effective_chain_configs: EffectiveChainRegistry,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
     auto_lock_timeout: Option<Duration>,
@@ -331,12 +330,17 @@ impl WalletStartupRoot {
         let monitor_state = self.monitor_state.clone();
         let public_broadcaster_anchor_cache = Arc::new(TokenAnchorRateCache::new());
         let enabled_chain_ids = ready.chain_ids.clone();
+        let private_chain_ids: Vec<u64> = ready
+            .effective_chain_configs
+            .railgun_chains()
+            .map(|chain| chain.chain_id)
+            .collect();
         let anchor_effective_chains = ready.effective_chain_configs.clone();
         let anchor_token_registry = ready.effective_token_registry.clone();
         let public_broadcaster_anchor_refresh = spawn_token_anchor_refresh_worker(
             &self.runtime,
             Arc::clone(&public_broadcaster_anchor_cache),
-            enabled_chain_ids.clone(),
+            private_chain_ids.clone(),
             anchor_effective_chains,
             anchor_token_registry,
             ready.http.clone(),
@@ -353,8 +357,6 @@ impl WalletStartupRoot {
             .filter_map(|chain| {
                 chain
                     .wrapped_native_token
-                    .as_deref()
-                    .and_then(|token| token.parse().ok())
                     .map(|token| (chain.chain_id, token))
             })
             .collect();
@@ -362,7 +364,7 @@ impl WalletStartupRoot {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
                 self.monitor_state.clone(),
                 event_rx,
-                &enabled_chain_ids,
+                &private_chain_ids,
                 initial_chain_id,
                 monitor_default_fee_tokens,
                 fee_anchor_lookup,
@@ -629,7 +631,7 @@ impl WalletStartupRoot {
                         let startup_root = root.downgrade();
                         let maintenance_controller = self.maintenance_controller.clone();
                         (
-                            Some(cx.new(move |cx| {
+                            Some(cx.new(|cx| {
                                 WalletSettingsEditor::new(
                                     store,
                                     runtime,
@@ -637,6 +639,7 @@ impl WalletStartupRoot {
                                     maintenance_controller,
                                     Some(startup_root),
                                     None,
+                                    window,
                                     cx,
                                 )
                             })),
@@ -1095,7 +1098,10 @@ async fn build_wallet_startup(
         WalletNetworkMode::Direct => RelayNetworkConfig::direct(),
     };
     let waku_config = WakuMonitorConfig {
-        chain_ids: chain_ids.clone(),
+        chain_ids: effective_chain_configs
+            .railgun_chains()
+            .map(|chain| chain.chain_id)
+            .collect(),
         cluster_id: Some(settings.waku.cluster_id),
         shard_id: Some(settings.waku.shard_id),
         dns_enr_trees: settings.waku.dns_enr_trees.clone(),

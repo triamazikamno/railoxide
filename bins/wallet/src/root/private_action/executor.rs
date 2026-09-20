@@ -259,7 +259,7 @@ impl WalletRoot {
             && draft.self_broadcast_funding != SelfBroadcastFundingMode::PrivateSponsorship
             && self
                 .effective_chain_configs
-                .get(&draft.asset.chain_id)
+                .get(draft.asset.chain_id)
                 .and_then(wallet_ops::settings::EffectiveChainConfig::accepted_executor_profile)
                 .is_some()
     }
@@ -333,7 +333,7 @@ impl WalletRoot {
                 }
             }
         };
-        let Some(chain) = self.effective_chain_configs.get(&key.chain_id).cloned() else {
+        let Some(chain) = self.effective_chain_configs.get(key.chain_id).cloned() else {
             return;
         };
         if let Err(error) = delivery.admit(
@@ -425,7 +425,7 @@ impl WalletRoot {
                                 approved_fee_amount,
                                 executor: Some(Arc::clone(&prepared)),
                                 chain_id: key.chain_id,
-                                effective_chain: Some(chain),
+                                effective_chain: chain,
                                 session: Arc::clone(&draft.session),
                                 token: draft.asset.token,
                                 fee_token: draft.fee_token,
@@ -451,7 +451,7 @@ impl WalletRoot {
                     }
                     ExecutorDelivery::SelfBroadcast { .. } => {
                         let quote =
-                            quote_desktop_self_broadcast_gas_fee(key.chain_id, Some(&chain), &http)
+                            quote_desktop_self_broadcast_gas_fee(key.chain_id, &chain, &http)
                                 .await?;
                         let (max_fee_per_gas, max_priority_fee_per_gas) =
                             self_broadcast_initial_gas_values(

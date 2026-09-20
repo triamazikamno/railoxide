@@ -45,3 +45,22 @@ pub const fn chain_icon_asset_path(chain_id: u64) -> Option<&'static str> {
         _ => None,
     }
 }
+/// Configured native-currency metadata, shared by desktop and browser presentation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCurrency {
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+impl NativeCurrency {
+    #[must_use]
+    pub fn format_amount(&self, amount: alloy::primitives::U256) -> String {
+        format!(
+            "{} {}",
+            crate::format_token_amount(amount, self.decimals),
+            self.symbol
+        )
+    }
+}

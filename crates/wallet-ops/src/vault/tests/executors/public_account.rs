@@ -9,7 +9,8 @@ fn chain() -> crate::settings::EffectiveChainConfig {
     let mut chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     chain.rpc_route = crate::RpcChainRoute::new(1, Vec::<url::Url>::new());
     chain
@@ -89,7 +90,7 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
     let snapshot = crate::refresh_public_balances(
         137,
         std::slice::from_ref(&first),
-        Some(&other_chain),
+        &other_chain,
         None,
         &HttpContext::direct_for_tests(),
     )

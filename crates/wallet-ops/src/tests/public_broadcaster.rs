@@ -48,7 +48,8 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
     let chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     reserved.relay_adapt_7702 = Some(chain.accepted_executor_profile().unwrap().delegate());
     let rows = [fee_row_with_broadcaster_seed(
@@ -1446,7 +1447,8 @@ async fn executor_submission_keeps_reviewed_gas_price_without_a_gas_quote_rpc() 
     let chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     // Submission must not need a gas-price endpoint once the quote is reviewed.
     let pool = QueryRpcPool::with_http_client(
@@ -1662,7 +1664,8 @@ fn public_broadcaster_transact_payload_preserves_executor_authorization_and_all_
     let chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
-            .remove(&1)
+            .get(1)
+            .cloned()
             .unwrap();
     let delegate = chain.accepted_executor_profile().unwrap().delegate();
     candidate.version = "alternative-implementation".to_owned();

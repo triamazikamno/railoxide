@@ -12,7 +12,6 @@ use gpui_component::{
     separator::Separator,
     tooltip::Tooltip,
 };
-use railgun_ui::{chain_icon_asset_path, chain_name};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::{icons, theme};
@@ -73,32 +72,7 @@ impl SelectItem for WalletSelectItem {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct ChainSelectItem {
-    pub(super) chain_id: u64,
-}
-
-impl SelectItem for ChainSelectItem {
-    type Value = u64;
-
-    fn title(&self) -> SharedString {
-        SharedString::from(
-            chain_name(self.chain_id).map_or_else(|| self.chain_id.to_string(), str::to_owned),
-        )
-    }
-
-    fn display_title(&self) -> Option<gpui::AnyElement> {
-        Some(chain_label_row(self.chain_id).into_any_element())
-    }
-
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        chain_label_row(self.chain_id)
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.chain_id
-    }
-}
+pub(super) use ui::chain_select::ChainSelectItem;
 
 impl WalletRoot {
     pub(super) fn repair_wallet_cache_from_input(&mut self, cx: &mut Context<'_, Self>) -> bool {
@@ -387,12 +361,12 @@ impl WalletRoot {
 
     pub(super) fn render_chain_selector(&self) -> impl IntoElement {
         div().h(px(24.0)).w(px(130.0)).flex().items_center().child(
-            Select::new(&self.chain_select)
+            ui::chain_select::chain_select(&self.chain_select)
                 .appearance(false)
                 .small()
                 .w(px(130.0))
                 .h(px(24.0))
-                .menu_width(px(150.0)),
+                .menu_width(px(240.0)),
         )
     }
 }
@@ -434,13 +408,6 @@ impl WalletRoot {
         let _ = wallet;
         None
     }
-}
-
-fn chain_label_row(chain_id: u64) -> impl IntoElement {
-    ui::wallet_identity::chain_label_row(
-        chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned),
-        chain_icon_asset_path(chain_id),
-    )
 }
 
 fn wallet_label_row(label: SharedString, device_kind: Option<HardwareDeviceKind>) -> gpui::Div {

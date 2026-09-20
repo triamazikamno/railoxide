@@ -109,7 +109,7 @@ impl ExecutorOwner {
                     eyre!("this historical delegate does not support broadcaster recovery")
                 })?;
         ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone())).admit(profile)?;
-        let chain = effective_desktop_chain_config(self.chain.chain_id, Some(&self.chain))?;
+        let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
         let min_gas_price = self
             .while_active(buffered_gas_price_from_rpc_pool(&pool, &chain.gas))
@@ -194,7 +194,7 @@ impl ExecutorOwner {
             return Err(eyre!("this recovery selected another funding route"));
         };
         preparation.require_broadcaster(candidate)?;
-        let chain = effective_desktop_chain_config(self.chain.chain_id, Some(&self.chain))?;
+        let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
         let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
         let bound_min_gas_price =

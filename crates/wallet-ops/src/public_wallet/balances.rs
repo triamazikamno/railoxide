@@ -30,19 +30,17 @@ pub const fn public_balance_refresh_interval_secs() -> u64 {
 }
 
 #[must_use]
-pub fn public_balance_assets_for_chain(chain_id: u64) -> Vec<PublicBalanceAsset> {
-    public_balance_assets_for_chain_with_registry(chain_id, None)
+pub fn public_balance_assets_for_chain(chain: &EffectiveChainConfig) -> Vec<PublicBalanceAsset> {
+    public_balance_assets_for_chain_with_registry(chain, None)
 }
 
 #[must_use]
 pub(super) fn public_balance_assets_for_chain_with_registry(
-    chain_id: u64,
+    chain: &EffectiveChainConfig,
     token_registry: Option<&EffectiveTokenRegistry>,
 ) -> Vec<PublicBalanceAsset> {
-    let mut assets = Vec::new();
-    if let Some(native) = native_asset_for_chain(chain_id) {
-        assets.push(native);
-    }
+    let chain_id = chain.chain_id;
+    let mut assets = vec![native_asset_for_chain(chain)];
     if let Some(token_registry) = token_registry {
         assets.extend(
             token_registry
@@ -72,12 +70,13 @@ pub(super) fn public_balance_assets_for_chain_with_registry(
 }
 
 pub(super) fn plan_public_balance_calls(
-    chain_id: u64,
+    chain: &EffectiveChainConfig,
     accounts: &[PublicAccountMetadata],
     token_registry: Option<&EffectiveTokenRegistry>,
     block: BlockId,
 ) -> Result<Vec<PlannedPublicBalanceCall>> {
-    let assets = public_balance_assets_for_chain_with_registry(chain_id, token_registry);
+    let chain_id = chain.chain_id;
+    let assets = public_balance_assets_for_chain_with_registry(chain, token_registry);
     let mut calls = Vec::with_capacity(accounts.len().saturating_mul(assets.len()));
     for account in accounts {
         for asset in &assets {
@@ -112,7 +111,7 @@ pub(super) fn plan_public_balance_calls(
 pub async fn refresh_public_balances(
     chain_id: u64,
     accounts: &[PublicAccountMetadata],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
 ) -> Result<PublicBalanceSnapshot> {
@@ -130,7 +129,7 @@ pub async fn refresh_public_balances(
 pub async fn refresh_public_balances_at_least(
     chain_id: u64,
     accounts: &[PublicAccountMetadata],
-    effective_chain: Option<&EffectiveChainConfig>,
+    effective_chain: &EffectiveChainConfig,
     token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
     minimum: Option<BlockNumHash>,
@@ -143,7 +142,7 @@ pub async fn refresh_public_balances_at_least(
     let accounts = accounts.as_slice();
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     if accounts.is_empty()
-        || public_balance_assets_for_chain_with_registry(chain_id, token_registry).is_empty()
+        || public_balance_assets_for_chain_with_registry(effective_chain, token_registry).is_empty()
     {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
@@ -173,7 +172,7 @@ pub async fn refresh_public_balances_at_least(
         ));
     }
     let planned_calls = plan_public_balance_calls(
-        chain_id,
+        effective_chain,
         accounts,
         token_registry,
         BlockId::hash_canonical(observed_block.hash),
@@ -313,16 +312,10 @@ fn empty_public_balance_snapshot(
     }
 }
 
-pub(crate) fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
-    let symbol = match chain_id {
-        1 | 42161 => "ETH",
-        56 => "BNB",
-        137 => "MATIC",
-        _ => return None,
-    };
-    Some(PublicBalanceAsset {
+pub(crate) fn native_asset_for_chain(chain: &EffectiveChainConfig) -> PublicBalanceAsset {
+    PublicBalanceAsset {
         id: PublicAssetId::Native,
-        symbol: symbol.to_string(),
-        decimals: 18,
-    })
+        symbol: chain.native_currency.symbol.clone(),
+        decimals: chain.native_currency.decimals,
+    }
 }

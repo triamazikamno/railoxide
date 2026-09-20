@@ -898,7 +898,7 @@ impl WalletRoot {
         let revision = record.view.revision;
         let wallet = record.wallet.clone();
         let generation = record.wallet_generation;
-        let ethereum = self.effective_chain_configs.get(&1).cloned();
+        let ethereum = self.effective_chain_configs.get(1).cloned();
         let http = self.http.clone();
         let join = self.runtime.spawn(async move {
             let recipient = recipient?;
@@ -906,12 +906,18 @@ impl WalletRoot {
                 && !recipient.trim().is_empty()
                 && recipient.trim().parse::<Address>().is_err()
             {
-                resolve_public_ens_recipient(recipient.trim(), ethereum.as_ref(), &http)
-                    .await
-                    .map(|recipient| recipient.to_checksum(None))
-                    .map_err(|_| {
-                        "Recipient could not be resolved. Check the address or ENS name.".to_owned()
-                    })
+                resolve_public_ens_recipient(
+                    recipient.trim(),
+                    ethereum
+                        .as_ref()
+                        .ok_or_else(|| "Ethereum is unavailable".to_string())?,
+                    &http,
+                )
+                .await
+                .map(|recipient| recipient.to_checksum(None))
+                .map_err(|_| {
+                    "Recipient could not be resolved. Check the address or ENS name.".to_owned()
+                })
             } else {
                 Ok(recipient)
             }
@@ -941,7 +947,7 @@ impl WalletRoot {
                 let result = resolved.map_err(|_| "Recipient resolution was interrupted.".to_owned())
                     .and_then(std::convert::identity)
                     .and_then(|recipient| root.private_draft_recipient(input).and_then(|_| root.private_draft_inputs(input, recipient)));
-                let result = result.and_then(|input| root.prepare_private_broadcaster_estimate(&input).map(|request| (input, request)));
+                let result = result.map_err(eyre::Report::msg).and_then(|input| root.prepare_private_broadcaster_estimate(&input).map(|request| (input, request)));
                 let (input, request) = match result {
                     Ok((input, Some(request))) => (input, request),
                     Ok(_) => {
@@ -953,7 +959,7 @@ impl WalletRoot {
                     }
                     Err(error) => {
                         record.view.status = GatewayDraftStatus::Editing;
-                        record.view.message = error;
+                        record.view.message = error.to_string();
                         return;
                     }
                 };

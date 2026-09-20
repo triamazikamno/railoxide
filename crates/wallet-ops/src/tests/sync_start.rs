@@ -165,7 +165,7 @@ fn new_wallet_chain_metadata_initializer_resumes_from_deployment_and_retains_dis
             },
         ))
         .expect("direct HTTP context");
-    let contract = ChainConfigDefaults::for_chain(1)
+    let contract = RailgunDeployment::for_chain(1)
         .expect("ethereum defaults")
         .contract
         .to_checksum(None);
@@ -186,17 +186,13 @@ fn new_wallet_chain_metadata_initializer_resumes_from_deployment_and_retains_dis
         .expect("persist chain metadata before pending completion");
     let mut disabled_chain = effective_chain_config_with_rpc_endpoints(137, Vec::new(), 12_345);
     disabled_chain.enabled = false;
-    let configs = BTreeMap::from([
-        (
-            1,
-            effective_chain_config_with_rpc_endpoints(1, Vec::new(), 12_345),
-        ),
-        (
-            56,
-            effective_chain_config_with_rpc_endpoints(56, Vec::new(), 5_000),
-        ),
-        (137, disabled_chain),
-    ]);
+    let configs: crate::settings::EffectiveChainRegistry = [
+        effective_chain_config_with_rpc_endpoints(1, Vec::new(), 12_345),
+        effective_chain_config_with_rpc_endpoints(56, Vec::new(), 5_000),
+        disabled_chain,
+    ]
+    .into_iter()
+    .collect();
 
     drop(session);
     drop(store);
@@ -238,7 +234,7 @@ fn new_wallet_chain_metadata_initializer_resumes_from_deployment_and_retains_dis
     );
     assert_eq!(chain_metadata.start_block, 251);
     assert_eq!(chain_metadata.last_scanned_block, 250);
-    let resumed_chain_contract = ChainConfigDefaults::for_chain(56)
+    let resumed_chain_contract = RailgunDeployment::for_chain(56)
         .expect("bsc defaults")
         .contract
         .to_checksum(None);
@@ -350,69 +346,49 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
             },
         ))
         .expect("direct HTTP context");
-    let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
-    let effective = crate::settings::EffectiveChainConfig {
-        chain_id: 1,
-        enabled: true,
-        rpc_route: RpcChainRoute::new(
-            1,
-            vec![
-                reqwest::Url::parse("https://rpc-a.example").unwrap(),
-                reqwest::Url::parse("https://rpc-b.example").unwrap(),
-            ],
-        )
-        .with_multicall(defaults.multicall_contract),
-        sponsored_bundle_relays: crate::settings::default_sponsored_bundle_relays(1),
-        archive_rpc_url: Some("https://archive.example".to_string()),
-        quick_sync_enabled: false,
-        quick_sync_endpoint: Some("https://quick.example/graphql".to_string()),
-        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
-        indexed_artifact_source: None,
-        indexed_wallet_block_range: 12_345,
-        deployment_block: 12_000,
-        v2_start_block: 13_000,
-        legacy_shield_block: 14_000,
-        archive_until_block: 12_500,
-        railgun_contract: defaults.contract.to_string(),
-        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
-        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-        wrapped_native_token: wrapped_native_token_for_chain(1).map(|token| token.to_string()),
-        coinbase_payer: crate::settings::default_coinbase_payer(1),
-        finality_depth: 99,
-        block_time: Duration::from_secs(7),
-        block_range: Some(2_000),
-        poll_interval_secs: Some(30),
-        gas: crate::settings::EffectiveChainGasSettings {
-            gas_limit_buffer: 250_000,
-            gas_price_buffer_numerator: 110,
-            gas_price_buffer_denominator: 100,
-        },
-    };
+    let mut effective = effective_chain_config_with_rpc_endpoints(
+        1,
+        vec![
+            "https://rpc-a.example".into(),
+            "https://rpc-b.example".into(),
+        ],
+        12_000,
+    );
+    effective.finality_depth = 99;
+    effective.block_time = Some(Duration::from_secs(7));
+    effective.gas.gas_limit_buffer = 250_000;
+    effective.gas.gas_price_buffer_numerator = 110;
+    let private = effective.railgun.as_mut().unwrap();
+    private.archive_rpc_url = Some(
+        reqwest::Url::parse("https://archive.example")
+            .unwrap()
+            .into(),
+    );
+    private.sync.quick_sync_endpoint = None;
+    private.sync.indexed_wallet_block_range = 12_345;
+    private.deployment.v2_start_block = 13_000;
+    private.deployment.legacy_shield_block = 14_000;
+    private.sync.archive_until_block = 12_500;
+    private.sync.block_range = 2_000;
+    private.sync.poll_interval = Duration::from_secs(30);
 
-    let cfg = crate::chain_config(
-        &defaults,
-        Some(reqwest::Url::parse("https://ignored.example").expect("url")),
-        Some(&effective),
-        &http,
-        None,
-    )
-    .expect("chain config");
+    let cfg = crate::chain_config(&effective, &http, None).expect("chain config");
 
-    assert_eq!(cfg.quick_sync_endpoint, None);
-    assert!(cfg.indexed_artifact_source.is_none());
-    assert_eq!(cfg.indexed_wallet_block_range, 12_345);
+    assert_eq!(cfg.sync.quick_sync_endpoint, None);
+    assert!(cfg.sync.indexed_artifact_source.is_none());
+    assert_eq!(cfg.sync.indexed_wallet_block_range, 12_345);
     assert_eq!(cfg.finality_depth, 99);
     assert_eq!(cfg.block_time, Duration::from_secs(7));
-    assert_eq!(cfg.block_range, 2_000);
-    assert_eq!(cfg.poll_interval, Duration::from_secs(30));
+    assert_eq!(cfg.sync.block_range, 2_000);
+    assert_eq!(cfg.sync.poll_interval, Duration::from_secs(30));
     assert_eq!(
         cfg.archive_rpc_url.as_ref().map(reqwest::Url::as_str),
         Some("https://archive.example/")
     );
-    assert_eq!(cfg.deployment_block, 12_000);
-    assert_eq!(cfg.v2_start_block, 13_000);
-    assert_eq!(cfg.legacy_shield_block, 14_000);
-    assert_eq!(cfg.archive_until_block, 12_500);
+    assert_eq!(cfg.deployment.deployment_block, 12_000);
+    assert_eq!(cfg.deployment.v2_start_block, 13_000);
+    assert_eq!(cfg.deployment.legacy_shield_block, 14_000);
+    assert_eq!(cfg.sync.archive_until_block, 12_500);
 
     let first = cfg.rpcs.random_provider().expect("first provider");
     cfg.rpcs.mark_bad_provider(&first);
@@ -439,28 +415,37 @@ fn chain_config_threads_indexed_artifact_source() {
             },
         ))
         .expect("direct HTTP context");
-    let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
+    let defaults = RailgunDeployment::for_chain(1).expect("ethereum defaults");
     let mut effective = effective_chain_config_with_rpc_endpoints(
         1,
         vec!["https://rpc.example".to_string()],
         defaults.deployment_block,
     );
-    effective.indexed_artifact_source_mode =
-        crate::settings::IndexedArtifactSourceModeSetting::Custom;
-    effective.indexed_artifact_source = Some(crate::settings::IndexedArtifactSourceConfig {
+    effective
+        .railgun
+        .as_mut()
+        .unwrap()
+        .indexed_artifact_source_mode = crate::settings::IndexedArtifactSourceModeSetting::Custom;
+    effective
+        .railgun
+        .as_mut()
+        .unwrap()
+        .sync
+        .indexed_artifact_source = Some(sync_service::IndexedArtifactSourceConfig {
         trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
-        manifest_source: crate::settings::IndexedArtifactManifestSource::IpnsName(
+        manifest_source: sync_service::IndexedArtifactManifestSource::IpnsName(
             "k51qzi5uqu5artifact".to_string(),
         ),
         gateway_urls: vec![reqwest::Url::parse("https://gateway.example").expect("url")],
+        gateway_pool: None,
         max_manifest_age: Some(Duration::from_mins(10)),
         concurrency: 5,
         max_in_flight_bytes: 8 * 1024 * 1024,
     });
 
-    let cfg =
-        crate::chain_config(&defaults, None, Some(&effective), &http, None).expect("chain config");
+    let cfg = crate::chain_config(&effective, &http, None).expect("chain config");
     let source = cfg
+        .sync
         .indexed_artifact_source
         .as_ref()
         .expect("indexed artifact source");

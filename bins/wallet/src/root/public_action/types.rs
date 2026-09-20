@@ -208,18 +208,28 @@ pub(in crate::root) struct PublicActionFeeDisplay {
 
 impl PublicActionFeeDisplay {
     pub(in crate::root) fn from_estimate(
-        chain_id: u64,
+        chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
         gas_cost: Option<Eip1559GasCostProjection>,
         gas_limit: Option<u64>,
         protocol_fee: Option<(PublicAssetId, U256)>,
         registry: &wallet_ops::settings::EffectiveTokenRegistry,
         anchors: &wallet_ops::TokenAnchorRateCache,
     ) -> Self {
+        let Some(chain) = chain else {
+            return Self {
+                gas_limit: None,
+                expected_gas_cost: None,
+                maximum_gas_cost: None,
+                show_maximum_gas_cost: false,
+                protocol_fee: None,
+            };
+        };
+        let chain_id = chain.chain_id;
         let format_gas_cost = |cost| {
             format_value_with_usd_label(
-                format_native_token_amount_for_display(chain_id, cost),
+                chain.native_currency.format_amount(cost),
                 cost,
-                Some(18),
+                Some(chain.native_currency.decimals),
                 anchors.cached_native_usd_micro_value(chain_id, cost),
                 false,
             )
@@ -234,7 +244,7 @@ impl PublicActionFeeDisplay {
             protocol_fee: protocol_fee.map(|(asset, amount)| {
                 let (token_value, usd_micro_value) = match asset {
                     PublicAssetId::Native => (
-                        format_native_token_amount_for_display(chain_id, amount),
+                        chain.native_currency.format_amount(amount),
                         anchors.cached_native_usd_micro_value(chain_id, amount),
                     ),
                     PublicAssetId::Erc20(token) => (
@@ -245,7 +255,7 @@ impl PublicActionFeeDisplay {
                 format_value_with_usd_label(
                     token_value,
                     amount,
-                    public_asset_decimals(chain_id, asset, Some(registry)),
+                    public_asset_decimals(Some(chain), asset, Some(registry)),
                     usd_micro_value,
                     false,
                 )

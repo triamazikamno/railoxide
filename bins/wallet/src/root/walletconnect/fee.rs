@@ -405,7 +405,7 @@ pub(super) fn walletconnect_fee_projection(
 pub(super) fn walletconnect_transaction_estimate_request(
     request: &WalletConnectRequestUi,
     chain_id: u64,
-    effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
 ) -> Result<PublicAdvancedTransactionEstimateRequest, String> {
     let WalletConnectParsedRequest::EthSendTransaction { transaction } = &request.parsed else {
         return Err("WalletConnect request is not a transaction".to_owned());
@@ -433,7 +433,7 @@ pub(super) fn walletconnect_transaction_estimate_request(
 
 pub(super) async fn quote_walletconnect_fee_with_retry(
     chain_id: u64,
-    effective_chain: Option<wallet_ops::settings::EffectiveChainConfig>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: HttpContext,
     expiry_timestamp: Option<u64>,
     rpc_reads: Option<wallet_ops::DappRpcReadClient>,
@@ -472,7 +472,7 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
                         remaining,
                         quote_public_action_gas_fee_with_reads(
                             chain_id,
-                            effective_chain.as_ref(),
+                            &effective_chain,
                             &http,
                             rpc_reads.as_ref(),
                         ),
@@ -495,7 +495,7 @@ pub(super) async fn quote_walletconnect_fee_with_retry(
                 None => {
                     quote_public_action_gas_fee_with_reads(
                         chain_id,
-                        effective_chain.as_ref(),
+                        &effective_chain,
                         &http,
                         rpc_reads.as_ref(),
                     )
@@ -646,7 +646,7 @@ impl WalletRoot {
         let raw_gas_limit = walletconnect_request_raw_gas(request);
         let gas_limit_buffer = self
             .effective_chain_configs
-            .get(&chain_id)
+            .get(chain_id)
             .map_or(0, |chain| chain.gas.gas_limit_buffer);
         let projection = state_projection.or_else(|| {
             let raw_gas_limit = raw_gas_limit?;
@@ -1031,7 +1031,7 @@ impl WalletRoot {
         };
         let gas_limit_buffer = self
             .effective_chain_configs
-            .get(&chain_id)
+            .get(chain_id)
             .map_or(0, |chain| chain.gas.gas_limit_buffer);
         match walletconnect_fee_projection(
             chain_id,
@@ -1085,7 +1085,9 @@ impl WalletRoot {
         if self.walletconnect.walletconnect_gas_fee.refreshing {
             return;
         }
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         if !request.is_current() {
             return;
         }
@@ -1310,7 +1312,9 @@ impl WalletRoot {
         let payload_fingerprint = state.payload_fingerprint;
         let review_token = state.review_token;
         let request_generation = state.request_generation;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let mut estimate_request =
             match walletconnect_transaction_estimate_request(&request, chain_id, effective_chain) {
                 Ok(request) => request,
@@ -1327,7 +1331,7 @@ impl WalletRoot {
         let retry_attempt = state.retry_attempt;
         let request_key = Arc::<str>::from(request_key);
         cx.spawn(async move |this, cx| {
-            let result = walletconnect_await_before_request_expiry(
+            let result = Box::pin(walletconnect_await_before_request_expiry(
                 request.timeout_timestamp(),
                 async {
                     if !request.is_current() {
@@ -1341,7 +1345,7 @@ impl WalletRoot {
                         }
                     } else { simulation.await }
                 },
-            )
+            ))
             .await
             .unwrap_or_else(|_| {
                 WalletConnectSimulationResult::Error(WalletConnectSimulationError::Unavailable(
@@ -1468,7 +1472,13 @@ mod tests {
         let http = wallet_ops::build_http_client(None).unwrap();
         let task = tokio::spawn(quote_walletconnect_fee_with_retry(
             1,
-            None,
+            wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap(),
             http,
             None,
             Some(reads),
@@ -1508,7 +1518,13 @@ mod tests {
                 std::time::Duration::from_millis(250),
                 quote_walletconnect_fee_with_retry(
                     1,
-                    None,
+                    wallet_ops::settings::build_effective_chain_configs(
+                        &wallet_ops::settings::WalletSettings::default(),
+                    )
+                    .unwrap()
+                    .get(1)
+                    .cloned()
+                    .unwrap(),
                     wallet_ops::build_http_client(None).unwrap(),
                     None,
                     Some(reads),

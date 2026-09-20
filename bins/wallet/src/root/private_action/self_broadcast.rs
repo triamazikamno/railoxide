@@ -429,13 +429,13 @@ impl WalletRoot {
         let funding = match kind {
             DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| {
                 effective_self_broadcast_funding_mode(
-                    self.effective_chain_configs.get(&form.asset.chain_id),
+                    self.effective_chain_configs.get(form.asset.chain_id),
                     form.self_broadcast_funding,
                 )
             }),
             DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| {
                 effective_self_broadcast_funding_mode(
-                    self.effective_chain_configs.get(&form.asset.chain_id),
+                    self.effective_chain_configs.get(form.asset.chain_id),
                     form.self_broadcast_funding,
                 )
             }),
@@ -638,7 +638,7 @@ impl WalletRoot {
             enabled_native_top_up_plan(form.native_top_up_enabled, form.native_top_up.as_ref());
         let executor_gas = self
             .effective_chain_configs
-            .get(&asset.chain_id)
+            .get(asset.chain_id)
             .filter(|chain| {
                 (unwrap || native_top_up.is_some())
                     && session.executor_owner().is_some()
@@ -862,7 +862,7 @@ impl WalletRoot {
                         uuid,
                     )
                 });
-        let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id).cloned()
+        let Some(effective_chain) = self.effective_chain_configs.get(asset.chain_id).cloned()
         else {
             self.clear_sponsored_funding_estimate_if_current(
                 DeliveryFormKind::Send,
@@ -876,10 +876,7 @@ impl WalletRoot {
         else {
             return;
         };
-        let wrapped_native_token = effective_chain
-            .wrapped_native_token
-            .as_deref()
-            .and_then(parse_address);
+        let wrapped_native_token = effective_chain.wrapped_native_token;
         let session = Arc::clone(session);
         let join = self.runtime.spawn_blocking(move || {
             let limit = match quote_sponsored_send_authorization_limit(
@@ -1041,7 +1038,7 @@ impl WalletRoot {
                         uuid,
                     )
                 });
-        let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id).cloned()
+        let Some(effective_chain) = self.effective_chain_configs.get(asset.chain_id).cloned()
         else {
             self.clear_sponsored_funding_estimate_if_current(
                 DeliveryFormKind::Unshield,
@@ -1055,10 +1052,7 @@ impl WalletRoot {
         else {
             return;
         };
-        let wrapped_native_token = effective_chain
-            .wrapped_native_token
-            .as_deref()
-            .and_then(parse_address);
+        let wrapped_native_token = effective_chain.wrapped_native_token;
         let session = Arc::clone(session);
         let unwrap = form.unwrap;
         let native_top_up =
@@ -1452,13 +1446,16 @@ pub(in crate::root) const fn sponsored_self_broadcast_availability_reason(
     let Some(chain) = chain else {
         return Some("Selected chain settings are unavailable.");
     };
-    if chain.sponsored_bundle_relays.is_empty() {
+    let Some(private) = &chain.railgun else {
+        return Some("This chain does not support Railgun.");
+    };
+    if private.sponsored_bundle_relays.is_empty() {
         return Some("No compatible sponsored relay is configured for this chain.");
     }
     if chain.wrapped_native_token.is_none() {
         return Some("This chain has no configured wrapped-native token.");
     }
-    if chain.coinbase_payer.is_none() {
+    if private.coinbase_payer.is_none() {
         return Some("This chain has no configured reviewed coinbase payer.");
     }
     None
@@ -1467,7 +1464,12 @@ pub(in crate::root) const fn sponsored_self_broadcast_availability_reason(
 pub(in crate::root) fn sponsored_funding_choice_visible(
     chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
 ) -> bool {
-    chain.is_some_and(|chain| !chain.sponsored_bundle_relays.is_empty())
+    chain.is_some_and(|chain| {
+        chain
+            .railgun
+            .as_ref()
+            .is_some_and(|private| !private.sponsored_bundle_relays.is_empty())
+    })
 }
 
 pub(in crate::root) const fn sponsored_funding_enabled(

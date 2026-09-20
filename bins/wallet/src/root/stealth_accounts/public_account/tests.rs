@@ -77,13 +77,13 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
     let http = wallet_ops::build_http_client(None).unwrap();
     let mut chain = build_effective_chain_configs(&WalletSettings::default())
         .unwrap()
-        .remove(&1)
+        .get(1)
+        .cloned()
         .unwrap();
-    chain.rpc_route = wallet_ops::RpcChainRoute::new(1, vec![rpc_url.clone()]);
-    chain.archive_rpc_url = None;
-    chain.quick_sync_enabled = false;
-    chain.quick_sync_endpoint = None;
-    chain.indexed_artifact_source = None;
+    chain.rpc_route = wallet_ops::RpcChainRoute::new(1, vec![rpc_url]);
+    chain.railgun.as_mut().unwrap().archive_rpc_url = None;
+    chain.railgun.as_mut().unwrap().sync.quick_sync_endpoint = None;
+    chain.railgun.as_mut().unwrap().sync.indexed_artifact_source = None;
     let sessions = WalletSessionStore::from_db(vault.db(), poi.clone()).unwrap();
     let session = Arc::new(
         runtime
@@ -92,7 +92,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                     view_session: view_session.clone(),
                     wallet_scope_generation: 0,
                     chain_id: 1,
-                    effective_chain: Some(chain.clone()),
+                    effective_chain: chain.clone(),
                     sync_start_policy: DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
                     init_block_number: Some(0),
                     sync_to_block: Some(0),
@@ -101,7 +101,6 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                     rewind_wallet_cache: false,
                     progress_tx: None,
                 },
-                Some(rpc_url),
                 &http,
             ))
             .unwrap(),
@@ -153,7 +152,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             runtime.handle(),
             cache.clone(),
             Vec::new(),
-            BTreeMap::new(),
+            std::iter::empty().collect(),
             tokens.clone(),
             http.clone(),
         );
@@ -182,7 +181,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                 &[1],
                 1,
                 WalletUiState::default(),
-                BTreeMap::from([(1, chain)]),
+                std::iter::once(chain).collect(),
                 tokens,
                 Duration::from_mins(1),
                 None,

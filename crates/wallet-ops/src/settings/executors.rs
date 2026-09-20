@@ -48,7 +48,10 @@ impl EffectiveChainConfig {
         if !self.enabled {
             return None;
         }
-        ExecutorProfile::accepted(self.chain_id, self.relay_adapt_7702_contract.parse().ok()?)
+        ExecutorProfile::accepted(
+            self.chain_id,
+            self.railgun.as_ref()?.deployment.relay_adapt_7702_contract,
+        )
     }
 }
 
@@ -61,12 +64,22 @@ mod tests {
     fn effective_overrides_cannot_admit_an_unknown_executor_profile() {
         let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
         for chain_id in [1, 56, 137, 42161] {
-            let chain = chains.get_mut(&chain_id).unwrap();
+            let chain = chains.get_mut(chain_id).unwrap();
             let accepted = chain.accepted_executor_profile().unwrap();
             assert_eq!(accepted.chain_id(), chain_id);
-            chain.relay_adapt_7702_contract = Address::repeat_byte(7).to_string();
+            chain
+                .railgun
+                .as_mut()
+                .unwrap()
+                .deployment
+                .relay_adapt_7702_contract = Address::repeat_byte(7);
             assert!(chain.accepted_executor_profile().is_none());
-            chain.relay_adapt_7702_contract = accepted.delegate().to_string();
+            chain
+                .railgun
+                .as_mut()
+                .unwrap()
+                .deployment
+                .relay_adapt_7702_contract = accepted.delegate();
             chain.enabled = false;
             assert!(chain.accepted_executor_profile().is_none());
         }

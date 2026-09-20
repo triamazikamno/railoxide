@@ -819,7 +819,7 @@ fn validates_aave_style_approve_send_transaction_as_pending_request() {
     assert_eq!(approval.id, 2_526);
     assert_eq!(approval.method.as_str(), "eth_sendTransaction");
     assert_eq!(approval.chain_id, "eip155:1");
-    assert_eq!(approval.account, account.address);
+    assert_eq!(approval.account, Some(account.address));
     assert_eq!(
         approval.raw_details["to"],
         json!("0xdAC17F958D2ee523a2206206994597C13D831ec7")
@@ -1029,7 +1029,7 @@ fn gateway_policy_parsing_does_not_enable_walletconnect_methods() {
     )
     .unwrap();
     assert!(
-        matches!(&parsed, WalletConnectParsedRequest::WalletAddEthereumChain { chain_id: 1, raw: retained } if retained == &raw)
+        matches!(&parsed, WalletConnectParsedRequest::WalletAddEthereumChain { chain_id: 1, raw: retained, .. } if retained == &raw)
     );
     assert!(parse_walletconnect_session_request(1, "wallet_addEthereumChain", &raw).is_err());
     let watch = json!({ "type": "ERC20", "options": { "address": account.to_string(), "image": "https://ignored.invalid", "decimals": "untrusted" }, "unknown": 7 });

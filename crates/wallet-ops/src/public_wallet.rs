@@ -27,6 +27,7 @@ pub use balance_cache::{
     PublicBalanceCache, PublicBalanceRefreshCompletion, PublicBalanceRefreshTicket,
     PublicBalanceScope,
 };
+#[cfg(test)]
 pub(crate) use balances::native_asset_for_chain;
 pub use balances::{
     public_balance_assets_for_chain, public_balance_refresh_interval_secs, refresh_public_balances,
@@ -65,7 +66,7 @@ pub use transaction_tracker::{
     PublicTransactionLookup, PublicTransactionTracker, PublicTransactionTrackingContext,
 };
 pub use types::{
-    HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
+    EvmFeeModel, HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,
     PublicActionCommandSender, PublicActionFeeProjection, PublicActionFeeSource,
     PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
@@ -116,7 +117,7 @@ use gas::{
     railway_standard_gas_fee_quote_bundle,
 };
 #[cfg(test)]
-use runtime::{chain_defaults_for_public_chain, public_chain_runtime_config};
+use runtime::public_chain_runtime_config;
 #[cfg(test)]
 use signer::{HardwarePublicEvmSigner, verify_hardware_typed_data_signature_address};
 #[cfg(test)]

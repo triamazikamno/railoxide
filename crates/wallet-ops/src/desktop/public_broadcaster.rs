@@ -227,7 +227,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     /// Buffered gas price from the same reviewed quote as the maximum private fee.
     pub executor_min_gas_price: Option<u128>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -255,7 +255,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     /// Exact total payment in fee-token base units; `None` uses automatic estimation.
     pub custom_fee_amount: Option<U256>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -284,7 +284,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub approved_fee_amount: Option<U256>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub session: Arc<WalletSession>,
     pub token: Address,
     pub fee_token: Address,
@@ -303,7 +303,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
 pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub custom_fee_amount: Option<U256>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub session: Arc<WalletSession>,
     pub token: Address,
     pub fee_token: Address,
@@ -612,7 +612,7 @@ pub(super) struct PreparedBlockedShieldRescuePlan {
 pub(super) struct DesktopUnshieldPlanRequest<'a> {
     pub(super) executor: Option<&'a PreparedExecutorOperation>,
     pub(super) chain_id: u64,
-    pub(super) effective_chain: Option<&'a settings::EffectiveChainConfig>,
+    pub(super) effective_chain: &'a settings::EffectiveChainConfig,
     pub(super) view_session: &'a vault::DesktopViewSession,
     pub(super) session: &'a WalletSession,
     pub(super) vault_store: &'a vault::DesktopVaultStore,
@@ -629,7 +629,7 @@ pub(super) struct DesktopUnshieldPlanRequest<'a> {
 
 pub(super) struct DesktopSendPlanRequest<'a> {
     pub(super) chain_id: u64,
-    pub(super) effective_chain: Option<&'a settings::EffectiveChainConfig>,
+    pub(super) effective_chain: &'a settings::EffectiveChainConfig,
     pub(super) view_session: &'a vault::DesktopViewSession,
     pub(super) session: &'a WalletSession,
     pub(super) vault_store: &'a vault::DesktopVaultStore,
@@ -925,7 +925,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
 
     let origin = match resolve_source_tx_origin(
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         utxo.source.block_number,
         utxo.source.tx_hash,
         http,
@@ -954,7 +954,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
 
 pub async fn resolve_source_tx_origin(
     chain_id: u64,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
+    effective_chain: &settings::EffectiveChainConfig,
     source_block_number: u64,
     source_tx_hash: FixedBytes<32>,
     http: &HttpContext,
@@ -1046,7 +1046,8 @@ pub fn eligible_public_broadcasters_for_asset(
     token: Address,
     required_relay_adapt: Option<Address>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    chain_defaults_for_chain(chain_id)?;
+    broadcaster_core::deployment::RailgunDeployment::for_chain(chain_id)
+        .ok_or_else(|| eyre!("chain {chain_id} has no Railgun deployment"))?;
     Ok(eligible_public_broadcasters(
         rows,
         chain_id,
@@ -1064,7 +1065,8 @@ pub fn public_broadcaster_candidates_for_asset(
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    chain_defaults_for_chain(chain_id)?;
+    broadcaster_core::deployment::RailgunDeployment::for_chain(chain_id)
+        .ok_or_else(|| eyre!("chain {chain_id} has no Railgun deployment"))?;
     Ok(public_broadcaster_candidates(
         rows,
         chain_id,
@@ -1736,52 +1738,18 @@ pub(super) struct EffectiveDesktopChainConfig {
 
 pub(super) fn effective_desktop_chain_config(
     chain_id: u64,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
+    effective_chain: &settings::EffectiveChainConfig,
 ) -> Result<EffectiveDesktopChainConfig> {
-    let defaults = chain_defaults_for_chain(chain_id)?;
+    let private = effective_chain.require_railgun()?;
     let rpc_route = settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
-    let Some(effective_chain) = effective_chain else {
-        return Ok(EffectiveDesktopChainConfig {
-            rpc_urls: rpc_route.endpoint_urls(),
-            railgun_contract: defaults.contract,
-            relay_adapt_contract: defaults.relay_adapt_contract,
-            wrapped_native_token: wrapped_native_token_for_chain(chain_id),
-            finality_depth: defaults.finality_depth,
-            gas: settings::EffectiveChainGasSettings {
-                gas_limit_buffer: GAS_LIMIT_BUFFER,
-                gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
-                gas_price_buffer_denominator: GAS_PRICE_BUFFER_DENOMINATOR as u64,
-            },
-        });
-    };
-    let rpc_urls = rpc_route.endpoint_urls();
-    let railgun_contract =
-        parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
-    let relay_adapt_contract = parse_effective_address(
-        "relay adapt contract",
-        &effective_chain.relay_adapt_contract,
-    )?;
-    let wrapped_native_token = effective_chain
-        .wrapped_native_token
-        .as_deref()
-        .map(|value| parse_effective_address("wrapped native token", value))
-        .transpose()?
-        .or_else(|| wrapped_native_token_for_chain(chain_id));
     Ok(EffectiveDesktopChainConfig {
-        rpc_urls,
-        railgun_contract,
-        relay_adapt_contract,
-        wrapped_native_token,
+        rpc_urls: rpc_route.endpoint_urls(),
+        railgun_contract: private.deployment.contract,
+        relay_adapt_contract: private.deployment.relay_adapt_contract,
+        wrapped_native_token: effective_chain.wrapped_native_token,
         finality_depth: effective_chain.finality_depth,
         gas: effective_chain.gas.clone(),
     })
-}
-
-pub(crate) fn effective_rpc_urls_for_chain(
-    chain_id: u64,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
-) -> Result<Vec<Url>> {
-    Ok(settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)?.endpoint_urls())
 }
 
 pub(crate) fn query_rpc_pool_with_http_client(
@@ -1893,7 +1861,7 @@ pub(crate) fn public_broadcaster_for_request(
 pub(super) async fn public_broadcaster_setup(
     session: &WalletSession,
     chain_id: u64,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
+    effective_chain: &settings::EffectiveChainConfig,
     token: Address,
     fee_rows: &[FeeRow],
     selection: &PublicBroadcasterSelection,

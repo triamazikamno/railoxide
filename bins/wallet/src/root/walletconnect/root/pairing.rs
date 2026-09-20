@@ -166,10 +166,7 @@ impl WalletRoot {
         &self,
         chain_id: u64,
     ) -> Option<EffectiveChainConfig> {
-        self.effective_chain_configs
-            .get(&chain_id)
-            .filter(|config| config.enabled)
-            .cloned()
+        self.effective_chain_configs.enabled(chain_id).ok().cloned()
     }
 
     pub(in crate::root::walletconnect) fn ensure_walletconnect_chain_enabled(

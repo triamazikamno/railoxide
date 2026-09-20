@@ -228,16 +228,31 @@ impl GatewayView {
             ("public", "Public", ui::icons::eye_icon_path()),
         ] {
             group = group.child(
-                ui::controls::app_segment_button(tab, label, self.home_tab == tab, false, None)
-                    .icon(Icon::empty().path(icon))
-                    .flex_1()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        window.close_sheet(cx);
-                        this.private_sheet = None;
-                        this.home_tab = tab.into();
-                        host_command("home_tab", tab);
-                        cx.notify();
-                    })),
+                ui::controls::app_segment_button(
+                    tab,
+                    label,
+                    self.home_tab == tab,
+                    tab == "private" && !self.selected_chain_has_railgun(),
+                    None,
+                )
+                .when(
+                    tab == "private" && !self.selected_chain_has_railgun(),
+                    |button| {
+                        button.tooltip("Private balances are unavailable on public-only chains")
+                    },
+                )
+                .icon(Icon::empty().path(icon))
+                .flex_1()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    window.close_sheet(cx);
+                    this.private_sheet = None;
+                    if tab == "private" && !this.selected_chain_has_railgun() {
+                        return;
+                    }
+                    this.home_tab = tab.into();
+                    host_command("home_tab", tab);
+                    cx.notify();
+                })),
             );
         }
         group
@@ -340,13 +355,11 @@ impl GatewayView {
                     .flex()
                     .flex_col()
                     .child(ui::wallet_balance::wallet_balance_network(
-                        div().w_full().children(self.home_form.as_ref().map(|form| {
-                            Select::new(&form.chain)
-                                .small()
-                                .w_full()
-                                .accessibility_label("Network")
-                                .search_placeholder("Search networks")
-                        })),
+                        div().w_full().children(
+                            self.home_form
+                                .as_ref()
+                                .map(|form| chain_select(&form.chain).small().w_full()),
+                        ),
                     ))
                     .child(self.render_private_sync()),
             ))

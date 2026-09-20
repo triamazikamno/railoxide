@@ -94,3 +94,5 @@ pub(crate) use request::WrappedNative;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use request::parse_dapp_chain_request;

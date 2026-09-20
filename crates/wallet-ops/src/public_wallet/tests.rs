@@ -26,9 +26,7 @@ use crate::hardware::{
     synthetic_entropy_from_hardware_output,
 };
 use crate::hardware_typed_data::HardwareEip712Model;
-use crate::settings::{
-    EffectiveChainConfig, EffectiveChainGasSettings, IndexedArtifactSourceModeSetting,
-};
+use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings};
 use crate::signer::SoftwareEvmSigner;
 use crate::vault::{
     CreateSoftwareContextResult, DesktopVaultStore, DesktopViewSession, HardwareProfileBinding,
@@ -214,6 +212,11 @@ async fn handle_mock_rpc_connection(
         })
     } else {
         let result = match method.as_str() {
+            "eth_getBlockByNumber" => {
+                let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                block.header.inner.base_fee_per_gas = Some(5);
+                serde_json::to_value(block).unwrap()
+            }
             "eth_gasPrice" => json!("0x64"),
             "eth_maxPriorityFeePerGas" => json!("0x2"),
             "eth_feeHistory" => json!({
@@ -261,39 +264,29 @@ async fn handle_mock_rpc_connection(
     stream.write_all(&response).await
 }
 
+fn default_effective_chain(id: u64) -> EffectiveChainConfig {
+    crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap()
+}
+
 fn effective_chain_for_rpc(rpc_url: &str, gas_limit_buffer: u64) -> EffectiveChainConfig {
-    let defaults = chain_defaults_for_public_chain(1).expect("Ethereum defaults");
-    EffectiveChainConfig {
-        chain_id: 1,
-        enabled: true,
-        rpc_route: RpcChainRoute::new(1, vec![Url::parse(rpc_url).expect("RPC URL")])
-            .with_multicall(defaults.multicall_contract),
-        sponsored_bundle_relays: Vec::new(),
-        archive_rpc_url: None,
-        quick_sync_enabled: false,
-        quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
-        indexed_artifact_source_mode: IndexedArtifactSourceModeSetting::Disabled,
-        indexed_artifact_source: None,
-        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
-        deployment_block: defaults.deployment_block,
-        v2_start_block: defaults.v2_start_block,
-        legacy_shield_block: defaults.legacy_shield_block,
-        archive_until_block: defaults.archive_until_block,
-        railgun_contract: defaults.contract.to_string(),
-        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
-        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-        wrapped_native_token: None,
-        coinbase_payer: None,
-        finality_depth: defaults.finality_depth,
-        block_time: defaults.block_time,
-        block_range: None,
-        poll_interval_secs: None,
-        gas: EffectiveChainGasSettings {
-            gas_limit_buffer,
-            gas_price_buffer_numerator: 0,
-            gas_price_buffer_denominator: 1,
-        },
-    }
+    let mut config =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+    config.rpc_route = RpcChainRoute::new(1, vec![Url::parse(rpc_url).unwrap()])
+        .with_multicall(config.rpc_route.multicall().unwrap());
+    config.gas = EffectiveChainGasSettings {
+        gas_limit_buffer,
+        gas_price_buffer_numerator: 0,
+        gas_price_buffer_denominator: 1,
+    };
+    config
 }
 
 fn http_context_for_route(mode: WalletNetworkMode, route: &str) -> HttpContext {
@@ -465,9 +458,13 @@ fn balance_plan_batches_native_and_known_tokens_per_account() {
         status: PublicAccountStatus::Active,
         display_order: 0,
     };
-    let calls =
-        plan_public_balance_calls(1, std::slice::from_ref(&account), None, BlockId::latest())
-            .unwrap();
+    let calls = plan_public_balance_calls(
+        &effective_chain_for_rpc("http://127.0.0.1:1", 0),
+        std::slice::from_ref(&account),
+        None,
+        BlockId::latest(),
+    )
+    .unwrap();
 
     let native = calls.first().expect("native call");
     assert_eq!(native.asset.id, PublicAssetId::Native);
@@ -507,7 +504,13 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
             display_order: u32::from(index),
         })
         .collect::<Vec<_>>();
-    let planned = plan_public_balance_calls(1, &accounts, None, BlockId::latest()).unwrap();
+    let planned = plan_public_balance_calls(
+        &effective_chain_for_rpc("http://127.0.0.1:1", 0),
+        &accounts,
+        None,
+        BlockId::latest(),
+    )
+    .unwrap();
     assert!(
         planned.len() > 64,
         "a three-account chain 1 refresh must exceed the dapp read cap, planned {}",
@@ -599,7 +602,7 @@ async fn balance_refresh_pins_canonical_hash_and_rejects_unsatisfied_minimum() {
         let result = refresh_public_balances_at_least(
             1,
             std::slice::from_ref(&account),
-            Some(&chain),
+            &chain,
             Some(&registry),
             &http,
             Some(minimum),
@@ -633,7 +636,8 @@ async fn balance_refresh_pins_canonical_hash_and_rejects_unsatisfied_minimum() {
 }
 
 #[tokio::test]
-async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_accepting_short_abi() {
+async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
+    const CHAIN: u64 = 999_999;
     let account = PublicAccountMetadata {
         public_account_uuid: "public-1".to_string(),
         address: address!("1111111111111111111111111111111111111111"),
@@ -658,9 +662,9 @@ async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_acceptin
             .map(|token| {
                 let address = token.to_string();
                 (
-                    (1, address.clone()),
+                    (CHAIN, address.clone()),
                     crate::settings::EffectiveTokenInfo {
-                        chain_id: 1,
+                        chain_id: CHAIN,
                         token_address: address,
                         symbol: "TEST".to_string(),
                         decimals: 18,
@@ -674,7 +678,9 @@ async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_acceptin
     };
     let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
         Arc::new(move |request| {
-            let result = if request["method"] == "eth_getBlockByNumber" {
+            let result = if request["method"] == "eth_chainId" {
+                json!(alloy::primitives::U64::from(CHAIN))
+            } else if request["method"] == "eth_getBlockByNumber" {
                 public_balance_block_for_test(BlockNumHash::new(10, B256::repeat_byte(10)))
             } else if request["method"] == "eth_getBalance" {
                 json!("0x7")
@@ -691,13 +697,43 @@ async fn balance_refresh_decodes_native_quantity_and_erc20_data_without_acceptin
         Arc::default(),
         Arc::default(),
     ).await;
-    let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
-    chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+    let mut settings = crate::settings::WalletSettings::default();
+    settings.chains.custom.insert(
+        CHAIN,
+        crate::settings::CustomChainSettings {
+            name: "Custom test network".into(),
+            native_currency: crate::settings::NativeCurrency {
+                name: "Custom coin".into(),
+                symbol: "CUSTOM".into(),
+                decimals: 6,
+            },
+            rpc_endpoints: vec![endpoint.to_string()],
+            explorer_urls: vec![],
+            enabled: true,
+            contracts: crate::settings::ChainContractSettings::default(),
+            finality_depth: None,
+            gas: crate::settings::ChainGasSettings::default(),
+        },
+    );
+    let chain = crate::settings::build_effective_chain_configs(&settings)
+        .unwrap()
+        .get(CHAIN)
+        .cloned()
+        .unwrap();
+    assert!(chain.railgun.is_none());
+    assert!(chain.rpc_route.multicall().is_none());
     let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
-    let snapshot = refresh_public_balances(1, &[account], Some(&chain), Some(&registry), &http)
+    let snapshot = refresh_public_balances(CHAIN, &[account], &chain, Some(&registry), &http)
         .await
         .unwrap();
     let balances = &snapshot.accounts[0].balances;
+    let native = &balances
+        .iter()
+        .find(|balance| balance.asset.id == PublicAssetId::Native)
+        .unwrap()
+        .asset;
+    assert_eq!(native.symbol, "CUSTOM");
+    assert_eq!(native.decimals, 6);
     let amount = |asset| {
         &balances
             .iter()
@@ -1154,7 +1190,10 @@ fn balance_assets_use_effective_token_registry_overlays() {
     let registry = crate::settings::build_effective_token_registry(&settings)
         .expect("effective token registry");
 
-    let assets = public_balance_assets_for_chain_with_registry(1, Some(&registry));
+    let assets = public_balance_assets_for_chain_with_registry(
+        &effective_chain_for_rpc("http://127.0.0.1:1", 0),
+        Some(&registry),
+    );
 
     assert!(assets.iter().any(|asset| asset.id == PublicAssetId::Native));
     assert!(!assets.iter().any(|asset| {
@@ -1299,6 +1338,7 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
 fn public_action_gas_cost_separates_execution_and_signed_units() {
     let token = address!("0x3333333333333333333333333333333333333333");
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 2,
         current_base_fee_per_gas: Some(1),
         suggested_max_fee_per_gas: 3,
@@ -1307,7 +1347,7 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
 
     let native_send = estimate_public_action_gas_cost(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Send,
         PublicAssetId::Native,
         PublicActionGasFeeSelection::Auto,
@@ -1325,7 +1365,7 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
 
     let erc20_send = estimate_public_action_gas_cost(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Send,
         PublicAssetId::Erc20(token),
         PublicActionGasFeeSelection::Auto,
@@ -1340,7 +1380,7 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
 
     let native_shield = estimate_public_action_gas_cost(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Shield,
         PublicAssetId::Native,
         PublicActionGasFeeSelection::Custom {
@@ -1360,7 +1400,7 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
     );
     let erc20_shield = estimate_public_action_gas_cost(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Shield,
         PublicAssetId::Erc20(token),
         PublicActionGasFeeSelection::Custom {
@@ -1461,6 +1501,7 @@ fn walletconnect_decoded_intents_use_only_the_fixed_operation_table() {
 #[test]
 fn walletconnect_fee_projection_keeps_raw_buffered_source_and_optional_usd() {
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(200),
         suggested_max_fee_per_gas: 120,
@@ -1670,7 +1711,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         (WalletNetworkMode::Direct, "direct"),
     ] {
         let http = http_context_for_route(mode, route);
-        quote_public_action_gas_fee(1, Some(&chain), &http)
+        quote_public_action_gas_fee(1, &chain, &http)
             .await
             .expect("request-independent fee quote");
     }
@@ -1680,7 +1721,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     assert!(quote_calls.iter().all(|call| {
         matches!(
             call.method.as_str(),
-            "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory"
+            "eth_getBlockByNumber" | "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory"
         ) && !contains_transaction_field(&call.params)
     }));
     for route in ["tor", "proxy", "direct"] {
@@ -1767,7 +1808,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     let simulation_http = http_context_for_route(WalletNetworkMode::Direct, "direct");
     let simulation_request = PublicAdvancedTransactionEstimateRequest {
         chain_id: 1,
-        effective_chain: Some(simulation_chain),
+        effective_chain: simulation_chain,
         from,
         intent: PublicTransactionIntent::Raw {
             to: Some(to),
@@ -1778,6 +1819,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         access_list: None,
     };
     let simulation_quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(80),
         suggested_max_fee_per_gas: 100,
@@ -1810,7 +1852,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         let failed_server = MockRpcServer::spawn(true, 50_000).await;
         let failed_chain = effective_chain_for_rpc(&failed_server.url, 0);
         let failed_http = http_context_for_route(mode, route);
-        let _ = quote_public_action_gas_fee(1, Some(&failed_chain), &failed_http).await;
+        let _ = quote_public_action_gas_fee(1, &failed_chain, &failed_http).await;
         let failed_calls = failed_server.calls();
         assert!(!failed_calls.is_empty());
         assert!(
@@ -1850,7 +1892,7 @@ async fn advanced_simulation_uses_each_provider_once_and_selects_revert_pluralit
     .with_multicall(chain.rpc_route.multicall().expect("multicall"));
     let request = PublicAdvancedTransactionEstimateRequest {
         chain_id: 1,
-        effective_chain: Some(chain),
+        effective_chain: chain,
         from,
         intent: PublicTransactionIntent::Raw {
             to: Some(to),
@@ -1864,6 +1906,7 @@ async fn advanced_simulation_uses_each_provider_once_and_selects_revert_pluralit
         access_list: None,
     };
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(80),
         suggested_max_fee_per_gas: 100,
@@ -1909,6 +1952,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
     );
 
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 1,
         current_base_fee_per_gas: Some(1),
         suggested_max_fee_per_gas: 1,
@@ -1916,7 +1960,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
     };
     let native = estimate_public_action_gas_cost_with_profile(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Shield,
         PublicAssetId::Native,
         PublicShieldTransactionProfile::Railway,
@@ -1928,7 +1972,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
     assert_eq!(native.maximum_cost, U256::from(6_000_000_u64));
     let native_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Shield,
         PublicAssetId::Native,
         PublicShieldTransactionProfile::Railway,
@@ -1949,7 +1993,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
     let token = address!("0x3333333333333333333333333333333333333333");
     let erc20 = estimate_public_action_gas_cost_with_profile(
         1,
-        None,
+        &default_effective_chain(1),
         PublicActionKind::Shield,
         PublicAssetId::Erc20(token),
         PublicShieldTransactionProfile::Railway,
@@ -1964,6 +2008,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
 #[test]
 fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 7,
         current_base_fee_per_gas: Some(5),
         suggested_max_fee_per_gas: 12,
@@ -2004,7 +2049,7 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
 
     let projection = estimate_public_action_gas_cost_with_profile(
         56,
-        None,
+        &default_effective_chain(56),
         PublicActionKind::Shield,
         PublicAssetId::Native,
         PublicShieldTransactionProfile::Railway,
@@ -2018,7 +2063,7 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
     assert_eq!(projection.maximum_cost, U256::from(6_000_000_u64 * 7));
     let projection_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
         56,
-        None,
+        &default_effective_chain(56),
         PublicActionKind::Shield,
         PublicAssetId::Native,
         PublicShieldTransactionProfile::Railway,
@@ -2209,40 +2254,17 @@ fn public_shield_protocol_fee_amount_uses_floor_rounding() {
 
 #[test]
 fn effective_public_chain_config_uses_settings_overrides() {
-    let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
-    let effective = EffectiveChainConfig {
-        chain_id: 1,
-        enabled: true,
-        rpc_route: RpcChainRoute::new(1, vec![Url::parse("https://rpc.example").expect("RPC URL")])
-            .with_multicall(address!("0x0000000000000000000000000000000000000003")),
-        sponsored_bundle_relays: Vec::new(),
-        archive_rpc_url: None,
-        quick_sync_enabled: true,
-        quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
-        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
-        indexed_artifact_source: None,
-        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
-        deployment_block: defaults.deployment_block,
-        v2_start_block: defaults.v2_start_block,
-        legacy_shield_block: defaults.legacy_shield_block,
-        archive_until_block: defaults.archive_until_block,
-        railgun_contract: "0x0000000000000000000000000000000000000001".to_string(),
-        relay_adapt_contract: "0x0000000000000000000000000000000000000004".to_string(),
-        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-        wrapped_native_token: Some("0x0000000000000000000000000000000000000002".to_string()),
-        coinbase_payer: None,
-        finality_depth: defaults.finality_depth,
-        block_time: defaults.block_time,
-        block_range: None,
-        poll_interval_secs: None,
-        gas: EffectiveChainGasSettings {
-            gas_limit_buffer: 42,
-            gas_price_buffer_numerator: 111,
-            gas_price_buffer_denominator: 100,
-        },
-    };
+    let mut effective = effective_chain_for_rpc("https://rpc.example", 42);
+    effective.rpc_route = effective
+        .rpc_route
+        .with_multicall(address!("0x0000000000000000000000000000000000000003"));
+    let private = effective.railgun.as_mut().unwrap();
+    private.deployment.contract = address!("0x0000000000000000000000000000000000000001");
+    private.deployment.relay_adapt_contract =
+        address!("0x0000000000000000000000000000000000000004");
+    effective.wrapped_native_token = Some(address!("0x0000000000000000000000000000000000000002"));
 
-    let config = public_chain_runtime_config(1, Some(&effective)).expect("effective config");
+    let config = public_chain_runtime_config(1, &effective).expect("effective config");
 
     assert_eq!(config.rpc_route.endpoint_urls().len(), 1);
     assert_eq!(
@@ -2250,11 +2272,11 @@ fn effective_public_chain_config_uses_settings_overrides() {
         "https://rpc.example/"
     );
     assert_eq!(
-        config.railgun_contract,
+        config.require_railgun().unwrap().contract,
         address!("0x0000000000000000000000000000000000000001")
     );
     assert_eq!(
-        config.relay_adapt_contract,
+        config.require_railgun().unwrap().relay_adapt_contract,
         address!("0x0000000000000000000000000000000000000004")
     );
     assert_eq!(
@@ -2270,53 +2292,14 @@ fn effective_public_chain_config_uses_settings_overrides() {
 
 #[test]
 fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
-    let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
-    let effective = EffectiveChainConfig {
-        chain_id: 1,
-        enabled: false,
-        rpc_route: RpcChainRoute::new(1, vec![Url::parse("https://rpc.example").expect("RPC URL")])
-            .with_multicall(defaults.multicall_contract),
-        sponsored_bundle_relays: Vec::new(),
-        archive_rpc_url: None,
-        quick_sync_enabled: true,
-        quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
-        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
-        indexed_artifact_source: None,
-        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
-        deployment_block: defaults.deployment_block,
-        v2_start_block: defaults.v2_start_block,
-        legacy_shield_block: defaults.legacy_shield_block,
-        archive_until_block: defaults.archive_until_block,
-        railgun_contract: defaults.contract.to_string(),
-        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
-        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-        wrapped_native_token: None,
-        coinbase_payer: None,
-        finality_depth: defaults.finality_depth,
-        block_time: defaults.block_time,
-        block_range: None,
-        poll_interval_secs: None,
-        gas: EffectiveChainGasSettings {
-            gas_limit_buffer: 42,
-            gas_price_buffer_numerator: 111,
-            gas_price_buffer_denominator: 100,
-        },
-    };
+    let mut effective = effective_chain_for_rpc("https://rpc.example", 42);
+    effective.enabled = false;
 
-    let Err(error) = public_chain_runtime_config(1, Some(&effective)) else {
+    let Err(error) = public_chain_runtime_config(1, &effective) else {
         panic!("disabled chain was accepted")
     };
 
     assert!(error.to_string().contains("disabled"));
-}
-
-#[test]
-fn effective_public_chain_config_uses_default_rpc_fallbacks() {
-    let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
-    let config = public_chain_runtime_config(1, None).expect("default config");
-
-    assert_eq!(config.rpc_route.endpoint_urls(), defaults.rpc_urls);
-    assert!(config.rpc_route.endpoint_urls().len() > 1);
 }
 
 #[test]
@@ -2673,7 +2656,7 @@ fn public_action_tip_fallback_uses_rpc_gas_price_only_for_bnb() {
 }
 
 #[test]
-fn public_actions_reject_zero_amount_before_signing() {
+fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2687,7 +2670,7 @@ fn public_actions_reject_zero_amount_before_signing() {
             executor_owner: None,
             transaction_tracking: None,
             chain_id: 1,
-            effective_chain: None,
+            effective_chain: default_effective_chain(1),
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
@@ -2712,36 +2695,50 @@ fn public_actions_reject_zero_amount_before_signing() {
         Err(error) => assert!(error.to_string().contains("amount is required")),
     }
 
-    let shield_result = runtime.block_on(submit_public_shield(
-        PublicShieldRequest {
-            executor_owner: None,
-            transaction_tracking: None,
-            chain_id: 1,
-            effective_chain: None,
-            view_session,
-            vault_store: store,
-            vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
-            protected_software_seed_session: None,
-            trezor_app_passphrase: None,
-            trezor_pin_matrix_provider: None,
-            public_account_uuid: "unused".to_string(),
-            asset: PublicAssetId::Native,
-            amount: U256::ZERO,
-            profile: PublicShieldTransactionProfile::Railoxide,
-            gas_fee: PublicActionGasFeeSelection::Auto,
-            gas_fee_mode: PublicActionGasFeeMode::Auto,
-            authorized_fee_ceiling: PublicActionGasFeeSelection::Custom {
-                max_fee_per_gas: 1,
-                max_priority_fee_per_gas: 1,
+    for public_only in [false, true] {
+        let mut chain = default_effective_chain(1);
+        if public_only {
+            chain.railgun = None;
+        }
+        let shield_result = runtime.block_on(submit_public_shield(
+            PublicShieldRequest {
+                executor_owner: None,
+                transaction_tracking: None,
+                chain_id: 1,
+                effective_chain: chain,
+                view_session: view_session.clone(),
+                vault_store: store.clone(),
+                vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
+                protected_software_seed_session: None,
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: "unused".to_string(),
+                asset: PublicAssetId::Native,
+                amount: if public_only {
+                    U256::from(1)
+                } else {
+                    U256::ZERO
+                },
+                profile: PublicShieldTransactionProfile::Railoxide,
+                gas_fee: PublicActionGasFeeSelection::Auto,
+                gas_fee_mode: PublicActionGasFeeMode::Auto,
+                authorized_fee_ceiling: PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: 1,
+                    max_priority_fee_per_gas: 1,
+                },
+                command_rx: None,
+                event_tx: None,
             },
-            command_rx: None,
-            event_tx: None,
-        },
-        &http,
-    ));
-    match shield_result {
-        Ok(_) => panic!("zero-value public shield unexpectedly succeeded"),
-        Err(error) => assert!(error.to_string().contains("amount is required")),
+            &http,
+        ));
+        match shield_result {
+            Ok(_) => panic!("zero-value public shield unexpectedly succeeded"),
+            Err(error) => assert!(error.to_string().contains(if public_only {
+                "Railgun"
+            } else {
+                "amount is required"
+            })),
+        }
     }
 
     drop(db);
@@ -3245,15 +3242,13 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
             results.remove(0).map(crate::RpcResult::into_value)
         })
     });
-    let native_quote = quote_public_action_gas_fee(1, Some(&chain), &http)
-        .await
-        .unwrap();
+    let native_quote = quote_public_action_gas_fee(1, &chain, &http).await.unwrap();
     let before = server.calls().len();
-    let quote = quote_public_action_gas_fee_with_reads(1, Some(&chain), &http, Some(&reads))
+    let quote = quote_public_action_gas_fee_with_reads(1, &chain, &http, Some(&reads))
         .await
         .unwrap();
     assert_eq!(quote, native_quote);
-    assert_eq!(callback_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 4);
     assert!(
         server.calls()[before..]
             .iter()
@@ -3275,7 +3270,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     .unwrap();
     let request = || PublicAdvancedTransactionEstimateRequest {
         chain_id: 1,
-        effective_chain: Some(chain.clone()),
+        effective_chain: chain.clone(),
         from,
         intent: PublicTransactionIntent::Raw {
             to: Some(to),
@@ -3329,16 +3324,17 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     )
     .await
     .expect("admitted post-approval preflight");
-    assert_eq!(callback_calls.load(Ordering::SeqCst) - before_callbacks, 6);
+    assert_eq!(callback_calls.load(Ordering::SeqCst) - before_callbacks, 7);
     let calls = server.calls();
     let preflight = &calls[before..];
-    assert_eq!(preflight.len(), 6);
+    assert_eq!(preflight.len(), 7);
     assert!(
         preflight
             .iter()
             .all(|call| call.route.as_deref() == Some("admitted"))
     );
     for method in [
+        "eth_getBlockByNumber",
         "eth_gasPrice",
         "eth_maxPriorityFeePerGas",
         "eth_feeHistory",
@@ -3423,6 +3419,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
         max_priority_fee_per_gas: 2,
     };
     let quote = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(80),
         suggested_max_fee_per_gas: 100,
@@ -3449,7 +3446,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             let error = error.clone();
             Box::pin(async move { Err(error) })
         });
-        let error = quote_public_action_gas_fee_with_reads(1, Some(&chain), &http, Some(&reads))
+        let error = quote_public_action_gas_fee_with_reads(1, &chain, &http, Some(&reads))
             .await
             .unwrap_err();
         assert_eq!(error.downcast_ref::<RpcBrokerError>(), Some(&rejection));
@@ -3457,7 +3454,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
         let error = simulate_public_advanced_transaction_with_fee_and_reads(
             PublicAdvancedTransactionEstimateRequest {
                 chain_id: 1,
-                effective_chain: Some(chain.clone()),
+                effective_chain: chain.clone(),
                 from,
                 intent: PublicTransactionIntent::Raw {
                     to: Some(to),
@@ -3514,6 +3511,16 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
     ] {
         let expected = rejection.clone();
         let reads = DappRpcReadClient::new(move |_, read| {
+            match read.method() {
+                "eth_getBlockByNumber" => {
+                    let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                    block.header.inner.base_fee_per_gas = Some(5);
+                    return Box::pin(async move { Ok(serde_json::to_value(block).unwrap()) });
+                }
+                "eth_gasPrice" | "eth_maxPriorityFeePerGas" => return Box::pin(async { Ok(json!("0x64")) }),
+                "eth_feeHistory" => return Box::pin(async { Err(RpcBrokerError::InvalidResponse) }),
+                _ => {}
+            }
             assert_eq!(read, RpcRead::from_method_params("eth_getTransactionCount", serde_json::json!([from, "latest"]), 1).unwrap());
             let error = rejection.clone();
             Box::pin(async move { Err(error) })
@@ -3666,7 +3673,7 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
                 rpc_reads: Some(reads),
                 transaction_tracking: Some(tracking),
                 chain_id: 1,
-                effective_chain: Some(chain),
+                effective_chain: chain,
                 view_session: view_session.clone(),
                 vault_store: store.clone(),
                 vault_password: Zeroizing::new(
@@ -3821,18 +3828,18 @@ async fn ens_recipient_uses_normalized_alloy_calls_on_the_configured_desktop_rou
     chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
     let http = HttpContext::direct_for_tests();
     assert_eq!(
-        resolve_public_ens_recipient("RaFFY.eth", Some(&chain), &http)
+        resolve_public_ens_recipient("RaFFY.eth", &chain, &http)
             .await
             .unwrap(),
         target
     );
     assert!(
-        resolve_public_ens_recipient("Unassigned.eth", Some(&chain), &http)
+        resolve_public_ens_recipient("Unassigned.eth", &chain, &http)
             .await
             .is_err()
     );
     assert!(
-        resolve_public_ens_recipient("a\u{200d}b.eth", Some(&chain), &http)
+        resolve_public_ens_recipient("a\u{200d}b.eth", &chain, &http)
             .await
             .is_err()
     );

@@ -1918,6 +1918,9 @@ impl WalletRoot {
         force: bool,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self.effective_chain_configs.railgun(chain_id).cloned() else {
+            return;
+        };
         if !chain_load_start_is_allowed(
             self.manage_wallets.deleting_wallet_id.as_deref(),
             self.selected_wallet_id.as_deref(),
@@ -2000,7 +2003,7 @@ impl WalletRoot {
             view_session,
             wallet_scope_generation: lifecycle_generation,
             chain_id,
-            effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+            effective_chain: resolved_chain,
             sync_start_policy: overrides
                 .sync_start_policy
                 .unwrap_or_else(|| self.selected_wallet_sync_start_policy()),
@@ -2048,9 +2051,8 @@ impl WalletRoot {
                 {
                     return Err(wallet_sync_startup_superseded_error());
                 }
-                let session = store
-                    .start_view_wallet_session_immediate(request, None, &http)
-                    .await?;
+                let session =
+                    Box::pin(store.start_view_wallet_session_immediate(request, &http)).await?;
                 if wallet_sync_startup_superseded(&lifecycle_generation_token, lifecycle_generation)
                 {
                     if let Err(error) = session.stop().await {
@@ -2805,6 +2807,9 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.effective_chain_configs.enabled(chain_id).is_err() {
+            return;
+        }
         if self.chain_select.read(cx).selected_value() != Some(&chain_id) {
             self.chain_select.update(cx, |select, cx| {
                 select.set_selected_value(&chain_id, window, cx);
@@ -2816,6 +2821,9 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        if !self.selected_chain_has_railgun() {
+            self.active_wallet_tab = WalletTab::Public;
+        }
         self.invalidate_proposals_chain(chain_id);
         self.invalidate_governance_context();
         self.ui_state.last_chain_id = Some(chain_id);

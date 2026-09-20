@@ -27,7 +27,6 @@ use crate::root::gas_fee::{
     Eip1559GasFeeEditorState, Eip1559GasFeeTarget, format_gwei, render_eip1559_gas_fee_editor,
 };
 use crate::root::public_action::format_gas_limit;
-use crate::root::tokens::format_native_token_amount_for_display;
 use alloy::primitives::Address;
 use gpui::relative;
 use gpui_component::collapsible::Collapsible;
@@ -78,16 +77,27 @@ pub(in crate::root::walletconnect) fn gateway_pending_request(
         &key,
         "Browser dapp",
         &chain_id,
-        approval.account.address,
+        approval
+            .authorization
+            .as_ref()
+            .map(|authorization| authorization.account.address),
         Some(expiry),
     );
     Some(WalletConnectRequestUi {
         key,
         review_token: walletconnect_request_id_seed(),
         binding: DappRequestBinding {
-            public_account_uuid: approval.permission.public_account_uuid.clone(),
-            public_account_scope: approval.permission.public_account_scope.clone(),
-            owning_private_wallet_uuid: approval.permission.owning_private_wallet_uuid.clone(),
+            account: approval
+                .authorization
+                .as_ref()
+                .map(|authorization| DappRequestAccount {
+                    public_account_uuid: authorization.permission.public_account_uuid.clone(),
+                    public_account_scope: authorization.permission.public_account_scope.clone(),
+                    owning_private_wallet_uuid: authorization
+                        .permission
+                        .owning_private_wallet_uuid
+                        .clone(),
+                }),
             peer_name: approval.origin.paired_peer_id()?.to_owned(),
             peer_url: approval.origin.web_origin()?.as_str().to_owned(),
         },
@@ -97,9 +107,12 @@ pub(in crate::root::walletconnect) fn gateway_pending_request(
         },
         parsed: approval.parsed.clone(),
         item,
-        account_source: approval.account.source,
+        account_source: approval
+            .authorization
+            .as_ref()
+            .map(|authorization| authorization.account.source),
         request_control: Some(approval.control.clone()),
-        rpc_reads: Some(rpc_reads),
+        rpc_reads: approval.authorization.as_ref().map(|_| rpc_reads),
     })
 }
 
@@ -147,14 +160,22 @@ impl WalletRoot {
                 else {
                     continue;
                 };
-                let resolution = store.resolve_dapp_session_account(
-                    view,
-                    &request.binding.public_account_uuid,
-                    &request.binding.public_account_scope,
-                    request.binding.owning_private_wallet_uuid.as_deref(),
-                );
-                if !matches!(resolution, Ok(WalletConnectSessionAccountResolution::Usable(account)) if account == approval.account)
-                {
+                if let Some(authorization) = &approval.authorization {
+                    let permission = &authorization.permission;
+                    let resolution = store.resolve_dapp_session_account(
+                        view,
+                        &permission.public_account_uuid,
+                        &permission.public_account_scope,
+                        permission.owning_private_wallet_uuid.as_deref(),
+                    );
+                    if !matches!(resolution, Ok(WalletConnectSessionAccountResolution::Usable(account)) if account == authorization.account)
+                    {
+                        continue;
+                    }
+                } else if !matches!(
+                    approval.parsed,
+                    WalletConnectParsedRequest::WalletAddEthereumChain { .. }
+                ) {
                     continue;
                 }
                 self.walletconnect.request_routes.insert(
@@ -182,6 +203,63 @@ impl WalletRoot {
         request: &WalletConnectRequestUi,
         content_width: Pixels,
     ) -> gpui::Div {
+        if let WalletConnectParsedRequest::WalletAddEthereumChain {
+            chain_id,
+            definition,
+            ..
+        } = &request.parsed
+        {
+            let mut content = div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(walletconnect_kv_row(
+                    "Site",
+                    request.binding.peer_url.clone(),
+                ))
+                .child(
+                    Alert::info(
+                        "gateway-chain-add-account-access",
+                        "This confirmation grants no account access.",
+                    )
+                    .small(),
+                );
+            if let Some(chain) = definition {
+                content = content
+                    .child(walletconnect_kv_row(
+                        "Network",
+                        format!("{} ({chain_id})", chain.name),
+                    ))
+                    .child(walletconnect_kv_row(
+                        "Native currency",
+                        format!(
+                            "{} ({}, {} decimals)",
+                            chain.native_currency.name,
+                            chain.native_currency.symbol,
+                            chain.native_currency.decimals
+                        ),
+                    ));
+                for endpoint in &chain.rpc_endpoints {
+                    if let Ok(url) = reqwest::Url::parse(endpoint) {
+                        content = content.child(walletconnect_kv_row(
+                            "RPC destination",
+                            url.origin().ascii_serialization(),
+                        ));
+                    }
+                }
+            } else {
+                content = content.child(walletconnect_kv_row("Configured chain", chain_id.to_string()))
+                    .child(app_muted_text("This network is already configured. This confirms that the network is available with the wallet's saved settings. Supplied network metadata is ignored."));
+            }
+
+            if let Some(error) = &self.walletconnect.error {
+                content = content
+                    .child(Alert::error("gateway-chain-add-error", error.to_string()).small());
+            }
+            return content;
+        }
         let intent_context = match self.walletconnect_intent_context(request) {
             Ok(context) => context,
             Err(message) => {
@@ -242,10 +320,6 @@ impl WalletRoot {
                 };
                 content = content.child(app_muted_text(description));
             }
-            WalletConnectParsedRequest::WalletAddEthereumChain { chain_id, .. } => {
-                content = content.child(walletconnect_kv_row("Configured chain", chain_id.to_string()))
-                    .child(app_muted_text("This network is already configured. This confirms that the network is available with the wallet's saved settings. Supplied network metadata is ignored."));
-            }
             WalletConnectParsedRequest::WalletWatchAsset { address, .. } => {
                 content = content
                     .child(walletconnect_kv_row(
@@ -275,6 +349,7 @@ impl WalletRoot {
             .child(render_walletconnect_intent_card(
                 &request.key,
                 &intent,
+                &self.effective_chain_configs,
                 content_width,
             ))
             .child(render_walletconnect_request_provenance(
@@ -286,6 +361,7 @@ impl WalletRoot {
                 walletconnect_request_fee_eligible(&request.parsed),
                 |this| {
                     this.child(render_walletconnect_network_fee(
+                        &intent.native_currency,
                         root,
                         request,
                         fee_state,
@@ -342,8 +418,10 @@ impl WalletRoot {
                 .small(),
             );
         }
-        if matches!(request.account_source, PublicAccountSource::HardwareDerived)
-            && !request.parsed.desktop_policy()
+        if matches!(
+            request.account_source,
+            Some(PublicAccountSource::HardwareDerived)
+        ) && !request.parsed.desktop_policy()
         {
             content = content.child(
                 Alert::warning(
@@ -401,8 +479,9 @@ impl WalletRoot {
         };
         let in_flight = self.walletconnect.request_actions.contains(request_key);
         let locally_expired = !request.approval_admitted(current_unix_seconds());
-        let (intent_context_available, unlimited_allowance) =
-            match self.walletconnect_intent_context(request) {
+        let (intent_context_available, unlimited_allowance) = match &request.parsed {
+            WalletConnectParsedRequest::WalletAddEthereumChain { .. } => (true, false),
+            _ => match self.walletconnect_intent_context(request) {
                 Ok(context) => {
                     let intent = build_walletconnect_intent(request, context);
                     (
@@ -413,8 +492,9 @@ impl WalletRoot {
                     )
                 }
                 Err(_) => (false, false),
-            };
-        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived
+            },
+        };
+        let hardware_request = request.account_source == Some(PublicAccountSource::HardwareDerived)
             && !request.parsed.desktop_policy();
         let hardware_typed_data_hash_fallback =
             walletconnect_request_uses_hardware_typed_data_hash_fallback(
@@ -511,6 +591,20 @@ impl WalletRoot {
                 if !request.is_current() {
                     return None;
                 }
+                if let WalletConnectParsedRequest::WalletAddEthereumChain {
+                    chain_id,
+                    definition,
+                    ..
+                } = &request.parsed
+                {
+                    return Some((
+                        approval_id.clone(),
+                        definition.as_ref().map_or_else(
+                            || format!("Confirm configured chain {chain_id}. No account access."),
+                            |chain| format!("Add {} ({chain_id}). No account access.", chain.name),
+                        ),
+                    ));
+                }
                 let context = self.walletconnect_intent_context(request).ok()?;
                 Some((
                     approval_id.clone(),
@@ -528,7 +622,7 @@ impl WalletRoot {
             .ok_or("This request does not identify a supported EVM chain.")?;
         let chain = self
             .effective_chain_configs
-            .get(&chain_id)
+            .get(chain_id)
             .ok_or("The request chain is not available in the current wallet settings.")?;
         Ok(WalletConnectIntentContext {
             chain,
@@ -586,10 +680,10 @@ impl WalletRoot {
             method = request.item.method.as_str(),
             chain_id = request.item.chain_id.as_str(),
             dapp = request.item.dapp_name.as_str(),
-            hardware = request.account_source == PublicAccountSource::HardwareDerived,
+            hardware = request.account_source == Some(PublicAccountSource::HardwareDerived),
             "walletconnect request approval selected"
         );
-        if request.account_source == PublicAccountSource::HardwareDerived {
+        if request.account_source == Some(PublicAccountSource::HardwareDerived) {
             self.submit_walletconnect_request_authorized(
                 request_key,
                 request.review_token,
@@ -685,8 +779,13 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        let effective_chain = parse_caip2_chain_id(&request.item.chain_id)
-            .and_then(|chain_id| self.walletconnect_effective_chain_config(chain_id));
+        let Some(effective_chain) = parse_caip2_chain_id(&request.item.chain_id)
+            .and_then(|chain_id| self.walletconnect_effective_chain_config(chain_id))
+        else {
+            self.walletconnect.error = Some(Arc::from("Request chain is unavailable"));
+            cx.notify();
+            return;
+        };
         let request = match self.revalidate_walletconnect_pending_request(
             &request,
             vault_store.as_ref(),
@@ -735,7 +834,12 @@ impl WalletRoot {
                 .and_then(|chain_id| {
                     self.public_transaction_tracking_context(
                         chain_id,
-                        &request.binding.public_account_uuid,
+                        &request
+                            .binding
+                            .account
+                            .as_ref()
+                            .ok_or("Request has no account authorization")?
+                            .public_account_uuid,
                     )
                 });
             match tracking {
@@ -751,7 +855,7 @@ impl WalletRoot {
         };
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase =
-            if request.account_source == PublicAccountSource::HardwareDerived {
+            if request.account_source == Some(PublicAccountSource::HardwareDerived) {
                 view_session.hardware_profile_session().and_then(|session| {
                     self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
                 })
@@ -762,7 +866,7 @@ impl WalletRoot {
         let trezor_app_passphrase = None;
         #[cfg(feature = "hardware")]
         let trezor_pin_matrix_provider =
-            if request.account_source == PublicAccountSource::HardwareDerived {
+            if request.account_source == Some(PublicAccountSource::HardwareDerived) {
                 Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
             } else {
                 None
@@ -770,7 +874,7 @@ impl WalletRoot {
         #[cfg(not(feature = "hardware"))]
         let trezor_pin_matrix_provider = None;
         let http = self.http.clone();
-        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived;
+        let hardware_request = request.account_source == Some(PublicAccountSource::HardwareDerived);
         let hash_fallback_confirmed = walletconnect_request_uses_hardware_typed_data_hash_fallback(
             &request,
             self.walletconnect_request_hardware_typed_data_mode(&request),
@@ -816,7 +920,7 @@ impl WalletRoot {
         let native_control = request.request_control.clone();
         let executor_owner = parse_caip2_chain_id(&request.item.chain_id)
             .and_then(|chain_id| self.executor_owner_for_public_chain(chain_id));
-        let join = self.spawn_public_transaction_submission(async move {
+        let join = self.spawn_public_transaction_submission(effective_chain.chain_id, async move {
             Box::pin(approve_walletconnect_request_task(
                 request,
                 vault_store,
@@ -1112,19 +1216,21 @@ impl WalletRoot {
                 .iter()
                 .find(|ready| &ready.id == approval_id)
                 .ok_or_else(failure)?;
+            let authorization = ready.authorization.as_ref().ok_or_else(failure)?;
+            let binding = request.binding.account.as_ref().ok_or_else(failure)?;
             let account = store
                 .resolve_dapp_session_account(
                     view_session,
-                    &request.binding.public_account_uuid,
-                    &request.binding.public_account_scope,
-                    request.binding.owning_private_wallet_uuid.as_deref(),
+                    &binding.public_account_uuid,
+                    &binding.public_account_scope,
+                    binding.owning_private_wallet_uuid.as_deref(),
                 )
                 .map_err(|_| failure())?;
             let WalletConnectSessionAccountResolution::Usable(account) = account else {
                 return Err(failure());
             };
-            if account != ready.account
-                || request.item.account != account.address
+            if account != authorization.account
+                || request.item.account != Some(account.address)
                 || request.item.chain_id != format!("eip155:{}", ready.chain_id)
             {
                 return Err(failure());
@@ -1166,12 +1272,20 @@ impl WalletRoot {
                 message: format!("Could not reload WalletConnect session: {error}"),
             })?;
         let binding = DappRequestBinding::from_walletconnect_session(&session);
+        let account_binding =
+            binding
+                .account
+                .as_ref()
+                .ok_or_else(|| WalletConnectSessionRequestFailure {
+                    kind: WalletConnectRequestErrorKind::Unauthorized,
+                    message: "Request has no account authorization".to_owned(),
+                })?;
         let resolution = store
             .resolve_dapp_session_account(
                 view_session,
-                &binding.public_account_uuid,
-                &binding.public_account_scope,
-                binding.owning_private_wallet_uuid.as_deref(),
+                &account_binding.public_account_uuid,
+                &account_binding.public_account_scope,
+                account_binding.owning_private_wallet_uuid.as_deref(),
             )
             .map_err(|error| WalletConnectSessionRequestFailure {
                 kind: WalletConnectRequestErrorKind::Internal,
@@ -1245,7 +1359,7 @@ impl WalletRoot {
                 session_identity: request.session_identity.clone(),
                 parsed: request.parsed.clone(),
                 item,
-                account_source,
+                account_source: Some(account_source),
             },
             route,
         ))
@@ -1465,6 +1579,7 @@ fn render_walletconnect_intent_risk(
 fn render_walletconnect_intent_card(
     request_key: &str,
     intent: &WalletConnectIntentView<'_>,
+    chains: &EffectiveChainRegistry,
     content_width: Pixels,
 ) -> gpui::Div {
     let mut card = div()
@@ -1496,14 +1611,15 @@ fn render_walletconnect_intent_card(
                     intent.action != WalletConnectIntentAction::ChainSwitch,
                     |this| {
                         this.child(walletconnect_approved_chain_chip(
-                            &approved_chain_display_item(&format!("eip155:{}", intent.chain_id)),
+                            &walletconnect_intent_chain_display(intent.chain_id, chains),
                         ))
                     },
                 ),
         )
-        .when_some(render_walletconnect_intent_hero(intent), |this, hero| {
-            this.child(hero)
-        });
+        .when_some(
+            render_walletconnect_intent_hero(intent, chains),
+            gpui::ParentElement::child,
+        );
 
     if walletconnect_should_render_token_contract(intent.action)
         && let Some(token) = walletconnect_intent_token_contract(&intent.amount)
@@ -1572,7 +1688,21 @@ fn render_walletconnect_intent_card(
     card
 }
 
-fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Option<gpui::Div> {
+fn walletconnect_intent_chain_display(
+    chain_id: u64,
+    chains: &EffectiveChainRegistry,
+) -> WalletConnectApprovedChainDisplay {
+    let mut display = approved_chain_display_item(&format!("eip155:{chain_id}"));
+    if let Some(chain) = chains.get(chain_id) {
+        display.label.clone_from(&chain.name);
+    }
+    display
+}
+
+fn render_walletconnect_intent_hero(
+    intent: &WalletConnectIntentView<'_>,
+    chains: &EffectiveChainRegistry,
+) -> Option<gpui::Div> {
     let mut hero = div().w_full().min_w(px(0.0)).flex().items_center().gap_3();
     if let Some(path) = intent.icon.clone() {
         hero = hero.child(img(path).size(px(34.0)).rounded_full().flex_none());
@@ -1648,7 +1778,7 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Opt
                     .items_center()
                     .gap_2()
                     .child(walletconnect_approved_chain_chip(
-                        &approved_chain_display_item(&format!("eip155:{from_chain_id}")),
+                        &walletconnect_intent_chain_display(*from_chain_id, chains),
                     ))
                     .child(
                         div()
@@ -1657,7 +1787,7 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Opt
                             .gap_2()
                             .child(app_muted_text("→"))
                             .child(walletconnect_approved_chain_chip(
-                                &approved_chain_display_item(&format!("eip155:{to_chain_id}")),
+                                &walletconnect_intent_chain_display(*to_chain_id, chains),
                             )),
                     ),
             );
@@ -1817,18 +1947,14 @@ fn render_walletconnect_request_provenance(
                 this.child(walletconnect_provenance_dapp_row(name))
             })
         })
-        .when(
-            walletconnect_selected_account_provenance_visible(
-                request.item.account,
-                &intent.parties,
-            ),
-            |this| {
+        .when_some(
+            request.item.account.filter(|account| {
+                walletconnect_selected_account_provenance_visible(*account, &intent.parties)
+            }),
+            |this, account| {
                 this.child(walletconnect_kv_row(
                     "Public account",
-                    walletconnect_public_account_provenance_label(
-                        request.item.account,
-                        public_accounts,
-                    ),
+                    walletconnect_public_account_provenance_label(account, public_accounts),
                 ))
             },
         )
@@ -2025,6 +2151,7 @@ fn render_walletconnect_transaction_details(
 }
 
 fn render_walletconnect_network_fee(
+    native_currency: &railgun_ui::NativeCurrency,
     root: &Entity<WalletRoot>,
     request: &WalletConnectRequestUi,
     fee_state: Option<&super::super::fee::WalletConnectFeeState>,
@@ -2055,7 +2182,7 @@ fn render_walletconnect_network_fee(
         fee_state.and_then(|state| walletconnect_fee_state_projection(state, refreshing))
     {
         value = value.child(walletconnect_fee_cost_value(
-            parse_display_chain_id(&request.item.chain_id),
+            native_currency,
             projection.expected_gas_cost,
             projection.expected_native_usd_micro_value,
             significance,
@@ -2197,6 +2324,7 @@ fn render_walletconnect_network_fee(
                     .child(right_group),
             )
             .content(render_walletconnect_fee_details(
+                native_currency,
                 root.clone(),
                 request,
                 fee_state,
@@ -2229,6 +2357,7 @@ fn render_walletconnect_network_fee(
 }
 
 fn render_walletconnect_fee_details(
+    native_currency: &railgun_ui::NativeCurrency,
     root: Entity<WalletRoot>,
     request: &WalletConnectRequestUi,
     fee_state: Option<&super::super::fee::WalletConnectFeeState>,
@@ -2236,7 +2365,6 @@ fn render_walletconnect_fee_details(
     fee_editor: &Eip1559GasFeeEditorState,
     significance: Option<super::super::intent::WalletConnectFeeSignificance>,
 ) -> gpui::Div {
-    let chain_id = parse_display_chain_id(&request.item.chain_id);
     let raw_gas_limit = walletconnect_request_raw_gas(request);
     let mut details = div().w_full().min_w(px(0.0)).flex().flex_col().gap_1();
     if let Some(projection) =
@@ -2250,7 +2378,7 @@ fn render_walletconnect_fee_details(
             .child(walletconnect_kv_element_row(
                 "Expected cost",
                 walletconnect_fee_cost_value(
-                    chain_id,
+                    native_currency,
                     projection.expected_gas_cost,
                     projection.expected_native_usd_micro_value,
                     significance,
@@ -2266,7 +2394,7 @@ fn render_walletconnect_fee_details(
                     this.child(walletconnect_kv_element_row(
                         "Maximum cost",
                         walletconnect_fee_cost_value(
-                            chain_id,
+                            native_currency,
                             projection.maximum_gas_cost,
                             projection.maximum_native_usd_micro_value,
                             None,
@@ -2309,13 +2437,13 @@ fn walletconnect_dapp_gas_price(value: U256) -> String {
 }
 
 fn walletconnect_fee_cost_value(
-    chain_id: u64,
+    native_currency: &railgun_ui::NativeCurrency,
     cost: alloy::primitives::U256,
     usd: Option<alloy::primitives::U256>,
     significance: Option<super::super::intent::WalletConnectFeeSignificance>,
     muted_all: bool,
 ) -> gpui::Div {
-    let native = format_native_token_amount_for_display(chain_id, cost);
+    let native = native_currency.format_amount(cost);
     let warning = significance.is_some_and(|significance| {
         matches!(
             significance,

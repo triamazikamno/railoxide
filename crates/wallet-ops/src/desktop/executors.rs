@@ -239,7 +239,12 @@ impl ExecutorOwner {
         range: Range<u64>,
     ) -> Result<super::executor_observation::ExecutorHistoryObservation> {
         let mut historical_chain = self.chain.clone();
-        historical_chain.relay_adapt_7702_contract = previous.delegate().to_string();
+        historical_chain
+            .railgun
+            .as_mut()
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?
+            .deployment
+            .relay_adapt_7702_contract = previous.delegate();
         historical_chain.enabled = true;
         self.while_active(super::executor_observation::observe_executor_history(
             &historical_chain,
@@ -330,7 +335,12 @@ impl ExecutorOwner {
             eyre!("executor address is unavailable; authorize its derivation first")
         })?;
         let mut historical_chain = self.chain.clone();
-        historical_chain.relay_adapt_7702_contract = record.delegate().to_string();
+        historical_chain
+            .railgun
+            .as_mut()
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?
+            .deployment
+            .relay_adapt_7702_contract = record.delegate();
         historical_chain.enabled = true;
         self.while_active(inspect_executor(
             &historical_chain,

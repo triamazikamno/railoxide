@@ -219,7 +219,10 @@ fn fee_token_options_and_selection_follow_execution_route() {
     assert_eq!(matching[0].eligible_broadcaster_count, 1);
     assert_eq!(mismatched[0].eligible_broadcaster_count, 0);
 
-    let profile = build_effective_chain_configs(&WalletSettings::default()).unwrap()[&1]
+    let profile = build_effective_chain_configs(&WalletSettings::default())
+        .unwrap()
+        .get(1)
+        .unwrap()
         .accepted_executor_profile()
         .unwrap();
     let trust = wallet_ops::PublicBroadcasterTrustFilter::default();
@@ -270,7 +273,7 @@ fn effective_chain_overrides_drive_unwrap_ui_filters() {
     let other = Address::from([0x44; 20]);
     let mut settings = WalletSettings::default();
     let chain = settings.chains.per_chain.entry(1).or_default();
-    chain.contracts.relay_adapt_contract = Some(relay.to_string());
+    chain.railgun.contracts.relay_adapt_contract = Some(relay.to_string());
     chain.contracts.wrapped_native_token = Some(wrapped.to_string());
     let configs = build_effective_chain_configs(&settings).expect("effective chains");
 

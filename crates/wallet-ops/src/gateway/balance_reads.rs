@@ -1,9 +1,7 @@
 //! Local balance eligibility after shared RPC parsing and individual read admission.
 
 use super::provider::GatewayWalletState;
-use crate::public_wallet::{
-    PublicAssetId, PublicBalanceAsset, PublicBalanceScope, native_asset_for_chain,
-};
+use crate::public_wallet::{PublicAssetId, PublicBalanceAsset, PublicBalanceScope};
 use crate::rpc_broker::BalanceRead;
 use crate::vault::PublicAccountMetadata;
 use alloy::primitives::U256;
@@ -103,7 +101,14 @@ fn balance_asset(
     candidate: BalanceRead,
 ) -> Option<PublicBalanceAsset> {
     match candidate {
-        BalanceRead::Native { .. } => native_asset_for_chain(chain_id),
+        BalanceRead::Native { .. } => {
+            let native = wallet.native_currencies.get(&chain_id)?;
+            Some(PublicBalanceAsset {
+                id: PublicAssetId::Native,
+                symbol: native.symbol.clone(),
+                decimals: native.decimals,
+            })
+        }
         BalanceRead::Token { token, .. } => {
             let token_info = wallet.token_registry.as_ref()?.get(chain_id, &token)?;
             Some(PublicBalanceAsset {

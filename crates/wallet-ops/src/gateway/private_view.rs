@@ -8,6 +8,7 @@ pub struct GatewayPrivateView {
     pub selected_wallet_choice: Option<String>,
     pub receive_address: Option<String>,
     pub wallets: Vec<GatewayPrivateWallet>,
+    #[serde(serialize_with = "railgun_ui::chain_id::optional::serialize")]
     pub selected_chain: Option<u64>,
     pub selection_message: Option<String>,
     pub state: GatewayPrivateChainState,

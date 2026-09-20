@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+railgun-ui = { path = "../railgun-ui" }
 ruint = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 qrcodegen = { workspace = true }

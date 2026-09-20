@@ -9,7 +9,6 @@ pub(crate) use crate::poi_contexts::{
 };
 pub(crate) use crate::utxos::utxo_outputs_from_utxos;
 
-pub(crate) use crate::amounts::wrapped_native_token_for_chain;
 #[cfg(test)]
 pub(crate) use crate::poi_contexts::{
     build_pending_output_poi_context_records, pending_send_output_role_plans,
@@ -217,7 +216,7 @@ pub struct ViewWalletChainSessionRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub wallet_scope_generation: u64,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub sync_start_policy: DesktopWalletSyncStartPolicy,
     pub init_block_number: Option<u64>,
     pub sync_to_block: Option<u64>,
@@ -229,7 +228,7 @@ pub struct ViewWalletChainSessionRequest {
 
 pub struct DesktopUnshieldCalldataRequest {
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -247,7 +246,7 @@ pub struct DesktopUnshieldCalldataRequest {
 
 pub struct DesktopSendCalldataRequest {
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -281,6 +280,8 @@ pub(crate) enum SelfBroadcastTipFallback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfBroadcastGasFeeQuote {
+    /// Set only after a successful public-chain header observation. None is not legacy evidence.
+    pub observed_fee_model: Option<crate::EvmFeeModel>,
     pub rpc_gas_price: u128,
     pub current_base_fee_per_gas: Option<u128>,
     pub suggested_max_fee_per_gas: u128,
@@ -373,6 +374,7 @@ impl SelfBroadcastGasFeeQuote {
         };
         Self {
             rpc_gas_price,
+            observed_fee_model: None,
             current_base_fee_per_gas: None,
             suggested_max_fee_per_gas,
             suggested_max_priority_fee_per_gas: SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS,
@@ -431,7 +433,7 @@ pub const fn self_broadcast_replacement_bumped_fee(value: u128) -> u128 {
 
 pub async fn quote_desktop_self_broadcast_gas_fee(
     chain_id: u64,
-    effective_chain: Option<&settings::EffectiveChainConfig>,
+    effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<SelfBroadcastGasFeeQuote> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
@@ -444,7 +446,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub executor_maximum_gas: Option<u64>,
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -470,7 +472,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
 pub struct DesktopSendSelfBroadcastRequest {
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -616,7 +618,7 @@ pub struct BlockedShieldRescueEligibility {
 
 pub struct BlockedShieldRescueEligibilityRequest {
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -625,7 +627,7 @@ pub struct BlockedShieldRescueEligibilityRequest {
 
 pub struct BlockedShieldRescuePreviewRequest {
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -647,7 +649,7 @@ pub struct BlockedShieldRescuePreview {
 pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub transaction_tracking: Option<crate::PublicTransactionTrackingContext>,
     pub chain_id: u64,
-    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,

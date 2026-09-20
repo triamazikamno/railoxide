@@ -10,7 +10,11 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         self.set_public_selected_balance(public_account_uuid, asset, window, cx);
-        self.public_form.action_mode = PublicActionMode::Shield;
+        self.public_form.action_mode = if self.selected_chain_has_railgun() {
+            PublicActionMode::Shield
+        } else {
+            PublicActionMode::Send
+        };
         self.reset_public_action_gas_fee_quotes();
         self.clear_public_action_dialog_inputs(window, cx);
         let root = cx.entity();
@@ -18,7 +22,7 @@ impl WalletRoot {
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let asset_label = public_asset_label(
-            self.selected_chain,
+            self.effective_chain_configs.get(self.selected_chain),
             asset,
             Some(&self.effective_token_registry),
         );
@@ -49,7 +53,7 @@ impl WalletRoot {
                     cx,
                 ))
         });
-        self.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
+        self.refresh_public_action_gas_fee_quote(self.public_form.action_mode, cx);
         cx.defer_in(window, |root, window, cx| {
             root.focus_public_action_dialog_input(window, cx);
         });
@@ -92,7 +96,7 @@ impl WalletRoot {
             || "selected asset".to_string(),
             |asset| {
                 public_asset_label(
-                    self.selected_chain,
+                    self.effective_chain_configs.get(self.selected_chain),
                     asset,
                     Some(&self.effective_token_registry),
                 )
@@ -117,7 +121,7 @@ impl WalletRoot {
                 format!(
                     "Amount ({})",
                     public_action_asset_label(
-                        self.selected_chain,
+                        self.effective_chain_configs.get(self.selected_chain),
                         asset,
                         Some(&self.effective_token_registry),
                     )
@@ -136,7 +140,7 @@ impl WalletRoot {
                 PublicActionMode::Send => &self.public_form.send_amount_input,
             };
             let decimals = public_asset_decimals(
-                self.selected_chain,
+                self.effective_chain_configs.get(self.selected_chain),
                 asset,
                 Some(&self.effective_token_registry),
             );
@@ -173,7 +177,7 @@ impl WalletRoot {
         .child(ui::controls::public_action_mode_group(
             "wallet-public-action-mode-toggle",
             mode == PublicActionMode::Shield,
-            submitting,
+            submitting || !self.selected_chain_has_railgun(),
             move |shield, window, cx| {
                 let mode = if *shield {
                     PublicActionMode::Shield
@@ -184,7 +188,12 @@ impl WalletRoot {
                     root.set_public_action_mode(mode, window, cx);
                 });
             },
-        ));
+        ))
+        .when(!self.selected_chain_has_railgun(), |content| {
+            content.child(app_muted_text(
+                "Shield is unavailable: this chain has no Railgun deployment.",
+            ))
+        });
 
         match mode {
             PublicActionMode::Shield => {
@@ -312,7 +321,7 @@ impl WalletRoot {
                                 labeled_field(
                                     format!(
                                         "Value ({})",
-                                        native_token_display_label(self.selected_chain)
+                                        self.configured_native_symbol(self.selected_chain)
                                     ),
                                     app_input(&self.public_form.advanced_send_value_input)
                                         .disabled(disabled || self.public_form.sending),
@@ -367,7 +376,7 @@ impl WalletRoot {
                             ))
                             .child(match self.public_form.advanced_send_estimate.as_ref() {
                                 Some(estimate) => render_public_advanced_transaction_estimate(
-                                    self.selected_chain,
+                                    self.effective_chain_configs.get(self.selected_chain),
                                     estimate,
                                     self.public_broadcaster_anchor_cache
                                         .cached_native_usd_micro_value(
@@ -589,7 +598,7 @@ impl WalletRoot {
         let from = account.address;
         let public_account_uuid: Arc<str> = Arc::from(account.public_account_uuid.as_str());
         let native_decimals = public_asset_decimals(
-            self.selected_chain,
+            self.effective_chain_configs.get(self.selected_chain),
             PublicAssetId::Native,
             Some(&self.effective_token_registry),
         );
@@ -627,14 +636,16 @@ impl WalletRoot {
                 return;
             }
         };
+        let chain_id = self.selected_chain;
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         self.invalidate_advanced_public_send_estimate();
         self.public_form.advanced_send_estimate_pending = true;
         self.public_form.send_error = None;
         let generation = self.public_form.advanced_send_estimate_generation;
         let send_kind = self.public_form.public_send_kind;
-        let chain_id = self.selected_chain;
         let selected_wallet_id = self.selected_wallet_id.clone();
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
         let http = self.http.clone();
         cx.spawn(async move |this, cx| {
             let result = estimate_public_advanced_transaction(
@@ -740,6 +751,9 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if mode == PublicActionMode::Shield && !self.selected_chain_has_railgun() {
+            return;
+        }
         if self.public_form.action_mode == mode {
             return;
         }
@@ -869,7 +883,9 @@ impl WalletRoot {
         gas_fee.quote_error = None;
         let refresh_id = gas_fee.refresh_id;
         let chain_id = self.selected_chain;
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let http = self.http.clone();
         let profile =
             if action_mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
@@ -880,7 +896,7 @@ impl WalletRoot {
         cx.spawn(async move |this, cx| {
             let result = quote_public_action_gas_fee_bundle_with_profile(
                 chain_id,
-                effective_chain.as_ref(),
+                &effective_chain,
                 profile,
                 &http,
             )
@@ -1678,7 +1694,9 @@ impl WalletRoot {
         } else {
             PublicShieldTransactionProfile::Railoxide
         };
-        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
         let gas_fee = match self.public_action_gas_fee_selection(mode, cx) {
             Ok(selection) => selection,
             Err(error) => {
@@ -1692,7 +1710,7 @@ impl WalletRoot {
                 chain_id,
                 &steps,
                 profile,
-                effective_chain.as_ref(),
+                &effective_chain,
                 gas_fee,
                 &http,
                 None,
@@ -1823,7 +1841,7 @@ impl WalletRoot {
             };
         };
         PublicActionFeeDisplay::from_estimate(
-            self.selected_chain,
+            self.effective_chain_configs.get(self.selected_chain),
             self.public_action_estimated_gas_cost(mode, asset, cx),
             (mode == PublicActionMode::Shield
                 && asset == PublicAssetId::Native
@@ -1864,7 +1882,7 @@ impl WalletRoot {
                 .flatten();
         estimate_public_action_gas_cost_with_profile_and_ceiling(
             self.selected_chain,
-            self.effective_chain_configs.get(&self.selected_chain),
+            self.effective_chain_configs.get(self.selected_chain)?,
             kind,
             asset,
             profile,
@@ -1945,10 +1963,16 @@ impl WalletRoot {
             return None;
         };
         let chain_id = self.selected_chain;
-        let asset_decimals =
-            public_asset_decimals(chain_id, asset, Some(&self.effective_token_registry));
-        let asset_label =
-            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_decimals = public_asset_decimals(
+            self.effective_chain_configs.get(chain_id),
+            asset,
+            Some(&self.effective_token_registry),
+        );
+        let asset_label = public_action_asset_label(
+            self.effective_chain_configs.get(chain_id),
+            asset,
+            Some(&self.effective_token_registry),
+        );
         let asset_icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
         let Some(public_account) = self.public_account_for_uuid(Some(public_account_uuid.as_ref()))
@@ -2008,12 +2032,12 @@ impl WalletRoot {
                     unreachable!("advanced parser returns a raw intent")
                 };
                 let expected_token_value =
-                    format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
+                    self.configured_native_amount_label(chain_id, estimate.expected_gas_cost);
                 let expected_usd_micro_value = self
                     .public_broadcaster_anchor_cache
                     .cached_native_usd_micro_value(chain_id, estimate.expected_gas_cost);
                 let maximum_token_value =
-                    format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
+                    self.configured_native_amount_label(chain_id, estimate.max_gas_cost);
                 let maximum_usd_micro_value = self
                     .public_broadcaster_anchor_cache
                     .cached_native_usd_micro_value(chain_id, estimate.max_gas_cost);
@@ -2022,14 +2046,18 @@ impl WalletRoot {
                     expected_gas_cost: Some(format_value_with_usd_label(
                         expected_token_value,
                         estimate.expected_gas_cost,
-                        Some(18),
+                        self.effective_chain_configs
+                            .get(chain_id)
+                            .map(|chain| chain.native_currency.decimals),
                         expected_usd_micro_value,
                         false,
                     )),
                     maximum_gas_cost: Some(format_value_with_usd_label(
                         maximum_token_value,
                         estimate.max_gas_cost,
-                        Some(18),
+                        self.effective_chain_configs
+                            .get(chain_id)
+                            .map(|chain| chain.native_currency.decimals),
                         maximum_usd_micro_value,
                         false,
                     )),
@@ -2150,6 +2178,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self
+            .effective_chain_configs
+            .enabled(self.selected_chain)
+            .cloned()
+        else {
+            return;
+        };
         if self.public_form.sending {
             if let Some(execution) = &draft.gateway_execution {
                 execution.finish(false);
@@ -2259,7 +2294,7 @@ impl WalletRoot {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
             chain_id,
-            effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+            effective_chain: resolved_chain,
             view_session,
             vault_store,
             vault_password,
@@ -2279,7 +2314,7 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.spawn_public_transaction_submission(async move {
+        let join = self.spawn_public_transaction_submission(chain_id, async move {
             submit_public_send_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })
@@ -2397,10 +2432,16 @@ impl WalletRoot {
             return None;
         };
         let chain_id = self.selected_chain;
-        let asset_decimals =
-            public_asset_decimals(chain_id, asset, Some(&self.effective_token_registry));
-        let asset_label =
-            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_decimals = public_asset_decimals(
+            self.effective_chain_configs.get(chain_id),
+            asset,
+            Some(&self.effective_token_registry),
+        );
+        let asset_label = public_action_asset_label(
+            self.effective_chain_configs.get(chain_id),
+            asset,
+            Some(&self.effective_token_registry),
+        );
         let asset_icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
         let Some(public_account) = self.public_account_for_uuid(Some(public_account_uuid.as_ref()))
@@ -2513,6 +2554,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self
+            .effective_chain_configs
+            .railgun(self.selected_chain)
+            .cloned()
+        else {
+            return;
+        };
         if self.public_form.shielding {
             if let Some(execution) = &draft.gateway_execution {
                 execution.finish(false);
@@ -2623,7 +2671,7 @@ impl WalletRoot {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
             chain_id,
-            effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+            effective_chain: resolved_chain,
             view_session,
             vault_store,
             vault_password,
@@ -2641,7 +2689,7 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
-        let join = self.spawn_public_transaction_submission(async move {
+        let join = self.spawn_public_transaction_submission(chain_id, async move {
             submit_public_shield_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
             })

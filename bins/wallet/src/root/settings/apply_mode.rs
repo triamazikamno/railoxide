@@ -66,13 +66,14 @@ pub(in crate::root) fn classify_settings_apply_mode(
         return SettingsApplyMode::Clean;
     }
     if draft.network != saved.network
-        || draft.chains != saved.chains
+        || draft.chains.per_chain != saved.chains.per_chain
         || draft.indexed_artifacts != saved.indexed_artifacts
         || draft.poi != saved.poi
         || draft.waku != saved.waku
     {
         SettingsApplyMode::NetworkingRestart
-    } else if draft.privacy != saved.privacy
+    } else if draft.chains.custom != saved.chains.custom
+        || draft.privacy != saved.privacy
         || draft.broadcaster != saved.broadcaster
         || draft.gas != saved.gas
         || draft.walletconnect != saved.walletconnect

@@ -187,6 +187,7 @@ fn self_broadcast_fee_samples_include_fee_history_base_fee_cap() {
 #[test]
 fn eip1559_projection_uses_cushioned_current_base_and_caps_at_max_fee() {
     let quote = SelfBroadcastGasFeeQuote {
+        observed_fee_model: None,
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(100),
         suggested_max_fee_per_gas: 120,
@@ -259,6 +260,7 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
     let token = address(0x42);
     let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
     let quote = SelfBroadcastGasFeeQuote {
+        observed_fee_model: None,
         rpc_gas_price: 100,
         current_base_fee_per_gas: Some(100),
         suggested_max_fee_per_gas: 120,

@@ -1,3 +1,4 @@
+pub(super) use crate::amounts::wrapped_native_token_for_chain;
 pub(super) use std::collections::{BTreeMap, BTreeSet};
 pub(super) use std::fs;
 pub(super) use std::path::PathBuf;
@@ -11,6 +12,7 @@ pub(super) use alloy::uint;
 pub(super) use broadcaster_core::crypto::railgun::{
     Address as RailgunAddress, AddressData, ViewingKeyData,
 };
+pub(super) use broadcaster_core::deployment::RailgunDeployment;
 pub(super) use broadcaster_core::notes::Note;
 pub(super) use broadcaster_core::transact::{
     EncryptedTransactRequest, PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash,
@@ -30,7 +32,6 @@ pub(super) use railgun_wallet::{
     PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo,
 };
 pub(super) use serde_json::json;
-pub(super) use sync_service::ChainConfigDefaults;
 
 pub(super) use crate::desktop::random_eligible_public_broadcasters;
 pub(super) use crate::hardware::{
@@ -78,7 +79,7 @@ pub(super) use crate::{
     self_broadcast_quote_from_fee_samples, self_broadcast_quote_from_fee_samples_with_tip_fallback,
     self_broadcast_transaction_request, send_approximate_shape, sort_specific_public_broadcasters,
     transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
-    validate_self_broadcast_gas_fee, vault, wrapped_native_token_for_chain,
+    validate_self_broadcast_gas_fee, vault,
 };
 
 pub(super) static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -137,48 +138,26 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
     rpc_endpoints: Vec<String>,
     deployment_block: u64,
 ) -> crate::settings::EffectiveChainConfig {
-    let defaults = ChainConfigDefaults::for_chain(chain_id).expect("chain defaults");
-    crate::settings::EffectiveChainConfig {
+    let mut config =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(chain_id)
+            .cloned()
+            .unwrap();
+    config.rpc_route = RpcChainRoute::new(
         chain_id,
-        enabled: true,
-        rpc_route: RpcChainRoute::new(
-            chain_id,
-            rpc_endpoints
-                .into_iter()
-                .map(|endpoint| reqwest::Url::parse(&endpoint).expect("RPC URL"))
-                .collect(),
-        )
-        .with_multicall(defaults.multicall_contract),
-        sponsored_bundle_relays: crate::settings::default_sponsored_bundle_relays(chain_id),
-        archive_rpc_url: None,
-        quick_sync_enabled: true,
-        quick_sync_endpoint: defaults
-            .quick_sync_endpoint
-            .as_ref()
-            .map(ToString::to_string),
-        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
-        indexed_artifact_source: None,
-        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
-        deployment_block,
-        v2_start_block: defaults.v2_start_block,
-        legacy_shield_block: defaults.legacy_shield_block,
-        archive_until_block: defaults.archive_until_block,
-        railgun_contract: defaults.contract.to_string(),
-        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
-        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-        wrapped_native_token: wrapped_native_token_for_chain(chain_id)
-            .map(|token| token.to_string()),
-        coinbase_payer: crate::settings::default_coinbase_payer(chain_id),
-        finality_depth: defaults.finality_depth,
-        block_time: defaults.block_time,
-        block_range: None,
-        poll_interval_secs: None,
-        gas: crate::settings::EffectiveChainGasSettings {
-            gas_limit_buffer: crate::GAS_LIMIT_BUFFER,
-            gas_price_buffer_numerator: 105,
-            gas_price_buffer_denominator: 100,
-        },
-    }
+        rpc_endpoints
+            .into_iter()
+            .map(|url| reqwest::Url::parse(&url).unwrap())
+            .collect(),
+    )
+    .with_multicall(config.rpc_route.multicall().unwrap());
+    let private = config.railgun.as_mut().unwrap();
+    private.deployment.deployment_block = deployment_block;
+    private.indexed_artifact_source_mode =
+        crate::settings::IndexedArtifactSourceModeSetting::Disabled;
+    private.sync.indexed_artifact_source = None;
+    config
 }
 
 pub(super) fn selection_info(

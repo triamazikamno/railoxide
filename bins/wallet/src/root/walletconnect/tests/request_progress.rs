@@ -20,7 +20,7 @@ fn walletconnect_transaction_progress_uses_request_specific_steps() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.parsed = WalletConnectParsedRequest::EthSendTransaction {
         transaction: WalletConnectEvmTransaction {
-            from: request.item.account,
+            from: request.item.account.unwrap(),
             to: None,
             value: None,
             data: None,
@@ -65,7 +65,7 @@ fn walletconnect_personal_sign_progress_starts_at_device_approval() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.parsed = WalletConnectParsedRequest::PersonalSign {
         message: "0x68656c6c6f".to_owned(),
-        account: request.item.account,
+        account: request.item.account.unwrap(),
     };
 
     let progress = WalletConnectApprovalProgress::new(2, &request);
@@ -88,10 +88,10 @@ fn walletconnect_personal_sign_progress_starts_at_device_approval() {
 #[test]
 fn walletconnect_typed_data_hardware_progress_starts_at_device_approval() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
-    request.account_source = PublicAccountSource::HardwareDerived;
+    request.account_source = Some(PublicAccountSource::HardwareDerived);
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
     request.parsed = WalletConnectParsedRequest::EthSignTypedDataV4 {
-        account: request.item.account,
+        account: request.item.account.unwrap(),
         typed_data: json!({}),
         domain_chain_id: Some(U256::from(1_u64)),
     };
@@ -114,7 +114,7 @@ fn walletconnect_typed_data_hardware_progress_starts_at_device_approval() {
 
     request.item.method = WalletConnectSupportedMethod::EthSignTypedData;
     request.parsed = WalletConnectParsedRequest::EthSignTypedData {
-        account: request.item.account,
+        account: request.item.account.unwrap(),
         typed_data: json!({}),
         domain_chain_id: Some(U256::from(1_u64)),
     };
@@ -135,7 +135,7 @@ fn walletconnect_typed_data_hardware_progress_starts_at_device_approval() {
 #[test]
 fn walletconnect_hash_fallback_warning_uses_explicit_continue_label() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
-    request.account_source = PublicAccountSource::HardwareDerived;
+    request.account_source = Some(PublicAccountSource::HardwareDerived);
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
 
     assert!(
@@ -180,7 +180,7 @@ fn walletconnect_personal_sign_progress_fails_response_after_device_approval() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.parsed = WalletConnectParsedRequest::PersonalSign {
         message: "0x68656c6c6f".to_owned(),
-        account: request.item.account,
+        account: request.item.account.unwrap(),
     };
     let mut progress = WalletConnectApprovalProgress::new(3, &request);
 

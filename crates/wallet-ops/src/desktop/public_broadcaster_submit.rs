@@ -18,7 +18,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             request.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let executor =
         validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
     if executor.is_some()
@@ -45,7 +45,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         request.fee_token,
         &request.fee_rows,
         &request.selection,
@@ -555,7 +555,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
-        request.effective_chain.as_ref(),
+        &request.effective_chain,
         request.fee_token,
         &request.fee_rows,
         &request.selection,

@@ -46,7 +46,7 @@ impl WalletRoot {
         let amount_submit_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
-        let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
+        let effective_chain = self.effective_chain_configs.get(asset.chain_id);
         let show_sponsored_funding_choice = sponsored_funding_choice_visible(effective_chain);
         let sponsorship_unavailable_reason = show_sponsored_funding_choice
             .then(|| sponsored_self_broadcast_availability_reason(effective_chain))
@@ -472,7 +472,7 @@ impl WalletRoot {
         let amount_submit_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
-        let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
+        let effective_chain = self.effective_chain_configs.get(asset.chain_id);
         let show_sponsored_funding_choice = sponsored_funding_choice_visible(effective_chain);
         let sponsorship_unavailable_reason = show_sponsored_funding_choice
             .then(|| sponsored_self_broadcast_availability_reason(effective_chain))

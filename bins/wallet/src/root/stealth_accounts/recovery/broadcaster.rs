@@ -165,9 +165,8 @@ impl StealthAccountsView {
             Some(ExecutorAsset::Erc20(token)) => token,
             _ => root
                 .effective_chain_configs
-                .get(&self.session.chain_id)
-                .and_then(|chain| chain.wrapped_native_token.as_ref())
-                .and_then(|token| token.parse().ok())
+                .get(self.session.chain_id)
+                .and_then(|chain| chain.wrapped_native_token)
                 .unwrap_or_default(),
         };
         let token = (!options.is_empty()).then(|| {
@@ -250,7 +249,7 @@ impl StealthAccountsView {
         let root = root.read(cx);
         let Some(chain) = root
             .effective_chain_configs
-            .get(&self.session.chain_id)
+            .get(self.session.chain_id)
             .cloned()
         else {
             return;
@@ -296,7 +295,7 @@ impl StealthAccountsView {
                     } else {
                         wallet_ops::quote_desktop_self_broadcast_gas_fee(
                             chain.chain_id,
-                            Some(&chain),
+                            &chain,
                             &http,
                         )
                         .await

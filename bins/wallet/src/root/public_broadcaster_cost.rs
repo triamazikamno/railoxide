@@ -640,7 +640,7 @@ impl WalletRoot {
                 return;
             }
             Err(error) => {
-                self.set_send_form_error(key, error, cx);
+                self.set_send_form_error(key, error.to_string(), cx);
                 return;
             }
         };
@@ -757,7 +757,7 @@ impl WalletRoot {
                 return;
             }
             Err(error) => {
-                self.set_unshield_form_error(key, error, cx);
+                self.set_unshield_form_error(key, error.to_string(), cx);
                 return;
             }
         };

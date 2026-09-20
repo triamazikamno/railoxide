@@ -152,7 +152,12 @@ impl ExecutorOwner {
             .nonce
             .ok_or_else(|| eyre!("retained account nonce is unavailable"))?;
         let mut chain = self.chain.clone();
-        chain.relay_adapt_7702_contract = record.delegate().to_string();
+        chain
+            .railgun
+            .as_mut()
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?
+            .deployment
+            .relay_adapt_7702_contract = record.delegate();
         chain.enabled = true;
         let (inspection, nonce) = self
             .while_active(inspect_for_recovery_signing(

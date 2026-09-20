@@ -87,7 +87,7 @@ impl WalletRoot {
     pub(in crate::root) fn prepare_private_broadcaster_estimate(
         &self,
         input: &PrivateEstimateInput,
-    ) -> Result<Option<PrivateEstimateRequest>, String> {
+    ) -> eyre::Result<Option<PrivateEstimateRequest>> {
         let asset = &input.asset;
         let recipient = input.recipient.trim();
         // A blank amount is the untouched form, not an input error.
@@ -114,7 +114,7 @@ impl WalletRoot {
             }
         };
         if let Some(error) = error {
-            return Err(error);
+            return Err(eyre::eyre!(error));
         }
         if recipient.is_empty() {
             return Ok(None);
@@ -152,7 +152,10 @@ impl WalletRoot {
             return Ok(None);
         }
         let fee_rows = self.monitor_fee_rows();
-        let effective_chain = self.effective_chain_configs.get(&asset.chain_id).cloned();
+        let effective_chain = self
+            .effective_chain_configs
+            .railgun(asset.chain_id)
+            .cloned()?;
         let anchor_cache = Some(Arc::clone(&self.public_broadcaster_anchor_cache));
         let session = Arc::clone(session);
         Ok(Some(match kind {

@@ -239,7 +239,8 @@ pub fn app_inline_control_row(label: impl Into<SharedString>, control: impl Into
 pub fn app_button_label(label: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
-        .font_weight(FontWeight::LIGHT)
+        .text_size(APP_TEXT_SIZE)
+        .font_weight(FontWeight::NORMAL)
         .line_height(relative(APP_TEXT_LINE_HEIGHT))
         .child(label.into())
 }

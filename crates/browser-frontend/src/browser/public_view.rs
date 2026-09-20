@@ -161,7 +161,7 @@ pub(super) struct HomeForm {
     accounts: Vec<ConnectAccount>,
     chains: Vec<ChainChoice>,
     account: Entity<SelectState<SearchableVec<AccountSelectItem>>>,
-    pub(super) chain: Entity<SelectState<SearchableVec<ChainSelectItem>>>,
+    pub(super) chain: Entity<SelectState<ChainSelectItems>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -273,8 +273,15 @@ impl ListDelegate for PickerList {
 }
 
 impl GatewayView {
+    pub(super) fn selected_chain_has_railgun(&self) -> bool {
+        self.chains
+            .iter()
+            .any(|chain| Some(chain.id) == self.public_view.selected_chain && chain.railgun)
+    }
+
     pub(super) fn clear_public_ui(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.network.retire();
+        self.retire_chain_editor(cx);
         window.close_sheet(cx);
         self.clear_draft_ui();
         self.accounts.clear();
@@ -314,15 +321,7 @@ impl GatewayView {
                 )
                 .searchable(true)
             });
-            let chain = cx.new(|cx| {
-                SelectState::new(
-                    SearchableVec::new(Vec::<ChainSelectItem>::new()),
-                    None,
-                    window,
-                    cx,
-                )
-                .searchable(true)
-            });
+            let chain = cx.new(|cx| chain_select_state(Vec::new(), None, window, cx));
             let subscriptions = vec![
                 cx.subscribe_in(
                     &account,
@@ -348,13 +347,11 @@ impl GatewayView {
                 cx.subscribe_in(
                     &chain,
                     window,
-                    |this,
-                     select,
-                     event: &SelectEvent<SearchableVec<ChainSelectItem>>,
-                     window,
-                     cx| {
+                    |this, select, event: &SelectEvent<ChainSelectItems>, window, cx| {
                         if let SelectEvent::Confirm(Some(id)) = event {
-                            command(&json!({ "type": "select_chain", "chain_id": id }));
+                            command(
+                                &json!({ "type": "select_chain", "chain_id": chain_json(*id) }),
+                            );
                         }
                         if let Some(id) = this.public_view.selected_chain {
                             select.update(cx, |select, cx| {
@@ -408,12 +405,12 @@ impl GatewayView {
                 .chains
                 .iter()
                 .map(|chain| ChainSelectItem {
-                    id: chain.id,
-                    name: chain.name.clone(),
+                    chain_id: chain.id,
+                    label: chain.name.clone().into(),
                 })
                 .collect();
             form.chain.update(cx, |select, cx| {
-                select.set_items(SearchableVec::new(items), window, cx);
+                select.set_items(ChainSelectItems::new(items), window, cx);
             });
         }
         if let Some(id) = &self
@@ -541,11 +538,7 @@ impl GatewayView {
                 "Public balance",
                 rgb(theme::TEXT).into(),
                 ui::wallet_balance::wallet_balance_network(
-                    Select::new(&form.chain)
-                        .small()
-                        .w_full()
-                        .accessibility_label("Network")
-                        .search_placeholder("Search networks"),
+                    chain_select(&form.chain).small().w_full(),
                 ),
             ))
             .child(
@@ -555,7 +548,13 @@ impl GatewayView {
                     .child(
                         app_button("shield", "Shield")
                             .icon(Icon::empty().path("ui/icons/shield.svg").small())
-                            .disabled(!self.public_view.drafts_supported)
+                            .disabled(
+                                !self.public_view.drafts_supported
+                                    || !self.selected_chain_has_railgun(),
+                            )
+                            .when(!self.selected_chain_has_railgun(), |button| {
+                                button.tooltip("Shield is unavailable on public-only chains")
+                            })
                             .primary()
                             .flex_1()
                             .on_click(cx.listener(|this, _, window, cx| {

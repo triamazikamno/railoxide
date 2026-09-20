@@ -13,6 +13,7 @@ mod actor;
 mod broker;
 mod cache;
 mod execution;
+mod identity;
 mod model;
 mod operation;
 mod profile;

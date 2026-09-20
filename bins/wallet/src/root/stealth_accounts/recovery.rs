@@ -744,11 +744,18 @@ impl StealthAccountsView {
 
     pub(super) fn asset_decimals(&self, asset: ExecutorAsset, cx: &App) -> Option<u8> {
         match asset {
-            ExecutorAsset::Native => Some(18),
+            ExecutorAsset::Native => self.root.upgrade().and_then(|root| {
+                root.read(cx)
+                    .effective_chain_configs
+                    .get(self.session.chain_id)
+                    .map(|chain| chain.native_currency.decimals)
+            }),
             ExecutorAsset::Erc721 { .. } => Some(0),
             ExecutorAsset::Erc20(token) => self.root.upgrade().and_then(|root| {
                 public_asset_decimals(
-                    self.session.chain_id,
+                    root.read(cx)
+                        .effective_chain_configs
+                        .get(self.session.chain_id),
                     wallet_ops::PublicAssetId::Erc20(token),
                     Some(&root.read(cx).effective_token_registry),
                 )

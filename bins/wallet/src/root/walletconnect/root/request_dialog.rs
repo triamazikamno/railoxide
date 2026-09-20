@@ -441,10 +441,12 @@ impl WalletRoot {
                     &completed.request.item.chain_id,
                 )),
             ))
-            .child(walletconnect_kv_row(
-                "Public account",
-                short_address(&completed.request.item.account),
-            ));
+            .when_some(completed.request.item.account, |this, account| {
+                this.child(walletconnect_kv_row(
+                    "Public account",
+                    short_address(&account),
+                ))
+            });
         if let Some(tx_hash) = completed.submitted_tx_hash.as_ref() {
             card = card.child(walletconnect_completed_tx_hash_row(
                 &completed.request.key,

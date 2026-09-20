@@ -22,11 +22,11 @@ pub(super) fn walletconnect_transaction_selector(
 }
 
 pub(super) fn walletconnect_enabled_chain_ids(
-    effective_chain_configs: &BTreeMap<u64, EffectiveChainConfig>,
+    effective_chain_configs: &EffectiveChainRegistry,
 ) -> BTreeSet<u64> {
     effective_chain_configs
-        .iter()
-        .filter_map(|(chain_id, config)| config.enabled.then_some(*chain_id))
+        .enabled_chains()
+        .map(|chain| chain.chain_id)
         .collect()
 }
 
@@ -73,15 +73,18 @@ pub(super) fn walletconnect_hardware_typed_data_mode_for_request(
     public_accounts: &[PublicAccountMetadata],
     view_session: Option<&DesktopViewSession>,
 ) -> HardwareTypedDataSigningMode {
-    if request.account_source != PublicAccountSource::HardwareDerived {
+    if request.account_source != Some(PublicAccountSource::HardwareDerived) {
         return HardwareTypedDataSigningMode::Unsupported;
     }
+    let Some(binding) = &request.binding.account else {
+        return HardwareTypedDataSigningMode::Unsupported;
+    };
     public_accounts
         .iter()
         .find(|account| {
-            account.public_account_uuid == request.binding.public_account_uuid
+            account.public_account_uuid == binding.public_account_uuid
                 && account.status == PublicAccountStatus::Active
-                && account.scope == request.binding.public_account_scope
+                && account.scope == binding.public_account_scope
         })
         .map_or(HardwareTypedDataSigningMode::Unsupported, |account| {
             walletconnect_namespace_account_support(account, view_session)

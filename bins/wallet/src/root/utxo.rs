@@ -160,7 +160,7 @@ impl WalletRoot {
             sync_tip.and_then(|tip| tip.head_block),
             sync_tip.and_then(|tip| tip.safe_head_block),
             self.effective_chain_configs
-                .get(&self.selected_chain)
+                .get(self.selected_chain)
                 .map(|config| config.finality_depth),
         )
     }
@@ -348,10 +348,13 @@ impl WalletRoot {
             tracing::warn!("blocked Shield refund origin resolution requested without vault store");
             return;
         };
-        let effective_chain = self
+        let Ok(effective_chain) = self
             .effective_chain_configs
-            .get(&self.selected_chain)
-            .cloned();
+            .enabled(self.selected_chain)
+            .cloned()
+        else {
+            return;
+        };
         let lookup_generation = self.next_blocked_shield_rescue_lookup_generation();
         self.blocked_shield_rescue_rows.insert(
             utxo_id,
@@ -411,6 +414,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Ok(resolved_chain) = self
+            .effective_chain_configs
+            .railgun(self.selected_chain)
+            .cloned()
+        else {
+            return;
+        };
         let password = if let Some(password) = vault_password {
             password
         } else {
@@ -487,10 +497,7 @@ impl WalletRoot {
         let request = BlockedShieldRescueSelfBroadcastRequest {
             transaction_tracking: Some(transaction_tracking),
             chain_id: self.selected_chain,
-            effective_chain: self
-                .effective_chain_configs
-                .get(&self.selected_chain)
-                .cloned(),
+            effective_chain: resolved_chain,
             view_session,
             session,
             vault_store,
@@ -506,7 +513,7 @@ impl WalletRoot {
             command_rx: None,
             event_tx: Some(event_tx),
         };
-        let submit = self.spawn_public_transaction_submission(async move {
+        let submit = self.spawn_public_transaction_submission(request.chain_id, async move {
             wallet_ops::submit_blocked_shield_rescue_self_broadcast(request, &http).await
         });
         cx.spawn(async move |this, cx| {

@@ -7,6 +7,56 @@ use super::{
 use crate::root::PublicActionMode;
 
 impl WalletRoot {
+    pub(in crate::root) fn configured_native_symbol(&self, chain_id: u64) -> &str {
+        self.effective_chain_configs
+            .get(chain_id)
+            .map_or("Unavailable", |chain| chain.native_currency.symbol.as_str())
+    }
+
+    pub(in crate::root) fn configured_native_amount_label(
+        &self,
+        chain_id: u64,
+        amount: alloy::primitives::U256,
+    ) -> String {
+        self.effective_chain_configs.get(chain_id).map_or_else(
+            || "Unavailable".to_owned(),
+            |chain| chain.native_currency.format_amount(amount),
+        )
+    }
+
+    pub(in crate::root) fn selected_chain_has_railgun(&self) -> bool {
+        self.effective_chain_configs
+            .railgun(self.selected_chain)
+            .is_ok()
+    }
+
+    pub(in crate::root) fn admit_chain_settings(
+        &self,
+        settings: &WalletSettings,
+    ) -> Result<(), String> {
+        let next = build_effective_chain_configs(settings).map_err(|error| error.to_string())?;
+        if !self.root_replacement_is_allowed()
+            || self.public_transaction_cleanup.is_some()
+            || self.public_sync_cache_resetting
+            || self.merkle_forest_cache_resetting
+        {
+            return Err("Wait for wallet cleanup before changing chains".to_owned());
+        }
+        for (&id, previous) in self.effective_chain_configs.iter() {
+            if next.get(id) == Some(previous) {
+                continue;
+            }
+            if self.public_transaction_submissions.is_busy_on_chain(id)
+                || self.public_transaction_tracker.has_pending_observation(id)
+            {
+                return Err(format!(
+                    "Chain {id} has an active submission or transaction observation"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::root) fn apply_saved_auto_lock_policy(&mut self, settings: &WalletSettings) {
         self.auto_lock.apply_policy(
             settings
@@ -190,7 +240,65 @@ impl WalletRoot {
             || self.public_broadcaster_policy.max_anchor_bps != new_policy.max_anchor_bps;
 
         if let Ok(effective_chain_configs) = build_effective_chain_configs(settings) {
+            let previous_selection = self.selected_chain;
+            let changed: Vec<_> = self
+                .effective_chain_configs
+                .iter()
+                .filter_map(|(&id, previous)| {
+                    (effective_chain_configs.get(id) != Some(previous)).then_some(id)
+                })
+                .collect();
+            for &id in &changed {
+                self.http.rpc_broker().invalidate_block(id);
+                self.gateway.drafts.borrow_mut().retire_chain(id);
+            }
             self.effective_chain_configs = effective_chain_configs;
+            if self
+                .effective_chain_configs
+                .enabled(self.selected_chain)
+                .is_err()
+                && let Some(chain) = self.effective_chain_configs.enabled_chains().next()
+            {
+                self.selected_chain = chain.chain_id;
+                self.ui_state.last_chain_id = Some(chain.chain_id);
+                self.save_ui_state();
+            }
+            let items = self
+                .effective_chain_configs
+                .enabled_chains()
+                .map(|chain| crate::root::wallet_header::ChainSelectItem {
+                    chain_id: chain.chain_id,
+                    label: chain.name.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            let selected = self.selected_chain;
+            let select = self.chain_select.clone();
+            let window = self.window_handle;
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    select.update(cx, |select, cx| {
+                        select.set_items(
+                            ui::chain_select::ChainSelectItems::new(items),
+                            window,
+                            cx,
+                        );
+                        select.set_selected_value(&selected, window, cx);
+                    });
+                });
+            });
+            if changed.contains(&previous_selection) || previous_selection != self.selected_chain {
+                self.clear_public_chain_balance_state();
+                self.invalidate_advanced_public_send_estimate();
+                self.invalidate_public_action_gas_fee_quote(PublicActionMode::Send);
+                self.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+                self.schedule_public_balance_refresh(cx);
+            }
+            if !self.selected_chain_has_railgun() {
+                self.active_wallet_tab = crate::root::shell::WalletTab::Public;
+                self.send_forms.clear();
+                self.unshield_forms.clear();
+                self.private_action_form = None;
+            }
             self.publish_gateway_desktop_state();
         }
         self.public_broadcaster_policy = new_policy;

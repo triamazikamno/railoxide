@@ -82,7 +82,10 @@ pub(super) fn run_job(
     endpoints: Vec<SensitiveUrl>,
 ) -> BoxFuture<'static, JobOutput> {
     Box::pin(async move {
-        match job {
+        let mut identity_events = Vec::new();
+        let endpoints =
+            verify_job_endpoints(&client, &semaphore, &job, endpoints, &mut identity_events).await;
+        let mut output = match job {
             ExecutionJob::Aggregate(group) => {
                 let Some(route) = group.first().map(|item| item.execution_route.clone()) else {
                     return JobOutput::noop();
@@ -136,8 +139,81 @@ pub(super) fn run_job(
                         .collect(),
                 }
             }
-        }
+        };
+        output.requests.extend(identity_events);
+        output
     })
+}
+
+async fn verify_job_endpoints(
+    client: &reqwest::Client,
+    semaphore: &Arc<Semaphore>,
+    job: &ExecutionJob,
+    endpoints: Vec<SensitiveUrl>,
+    events: &mut Vec<RequestEvent>,
+) -> Vec<SensitiveUrl> {
+    let items: &[WorkItem] = match job {
+        ExecutionJob::Aggregate(items) => items,
+        ExecutionJob::Individual(item) => std::slice::from_ref(item),
+    };
+    let Some(route) = items.first().map(|item| &item.execution_route) else {
+        return endpoints;
+    };
+    if !route.chain_route().requires_identity_verification() {
+        return endpoints;
+    }
+    let members: Vec<_> = items
+        .iter()
+        .map(|item| AggregateMember {
+            read: item.read.clone(),
+            waiters: item.waiters.clone(),
+        })
+        .collect();
+    let indices: Vec<_> = (0..members.len()).collect();
+    let mut verified = Vec::new();
+    for endpoint in endpoints {
+        if route.chain_route().endpoint_identity_verified(&endpoint) {
+            verified.push(endpoint);
+            continue;
+        }
+        let permit = loop {
+            let current = ScopedView::new(&members, &indices, Instant::now());
+            if current.members.is_empty() {
+                return verified;
+            }
+            match acquire_permit(semaphore, current.earliest_permit_deadline()).await {
+                PermitAcquisition::Acquired(permit) => break permit,
+                PermitAcquisition::DeadlineElapsed => {}
+                PermitAcquisition::Closed => return verified,
+            }
+        };
+        let now = Instant::now();
+        let current = ScopedView::new(&members, &indices, now);
+        if current.members.is_empty() {
+            return verified;
+        }
+        let timeout = current.min_attempt_timeout(route.attempt_timeout);
+        let timeout = current
+            .latest_physical_deadline()
+            .map_or(timeout, |deadline| {
+                timeout.min(deadline.saturating_duration_since(now))
+            });
+        let result = route
+            .chain_route()
+            .verify_endpoint_identity(client, &endpoint, timeout)
+            .await;
+        if result.is_ok() {
+            verified.push(endpoint);
+        } else {
+            events.push(RequestEvent::new(
+                route.chain_id(),
+                endpoint.expose_url().clone(),
+                EndpointHealthOutcome::for_result(&result),
+            ));
+        }
+        drop(permit);
+    }
+    verified
 }
 
 async fn execute_aggregate_with_failover_attempt(

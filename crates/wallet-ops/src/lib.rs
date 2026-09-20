@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -65,10 +64,10 @@ pub use sync_service::types::{
     WalletReadinessWaitError,
 };
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource,
-    PendingOutputPoiContextIntent, PoiArtifactCacheRetry as CorePoiArtifactCacheRetry,
-    PublicDataPlaneHandle, SyncManager, SyncProgressSender, WalletConfig, WalletHandle,
-    WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome, WalletViewState,
+    ChainConfig, ChainKey, LocalPoiMerkleProofSource, PendingOutputPoiContextIntent,
+    PoiArtifactCacheRetry as CorePoiArtifactCacheRetry, PublicDataPlaneHandle, SyncManager,
+    SyncProgressSender, WalletConfig, WalletHandle, WalletPendingOverlay, WalletPendingSpent,
+    WalletPendingSpentMarkOutcome, WalletViewState,
 };
 pub use sync_service::{
     ChainPublicSyncCacheReset, ChainPublicSyncCacheResetResult, GlobalPoiPolicy as PoiReadSource,
@@ -205,21 +204,21 @@ pub(crate) use native_topup::{
 pub(crate) use protocol_fee::{FEE_BASIS_POINTS_DENOMINATOR, railgun_protocol_fee_amount};
 pub use protocol_fee::{RAILGUN_PROTOCOL_FEE_BPS, format_protocol_fee_percentage};
 pub use public_wallet::{
-    DappRpcReadClient, HardwareTrezorPinMatrixProvider, PUBLIC_NATIVE_UNWRAP_GAS_UNITS,
-    PublicAccountBalance, PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
-    PublicActionCommandReceiver, PublicActionCommandSender, PublicActionFeeProjection,
-    PublicActionFeeSource, PublicActionGasFeeMode, PublicActionGasFeeQuote,
-    PublicActionGasFeeQuoteBundle, PublicActionGasFeeSelection, PublicActionKind,
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicActionResolvedGasFee, PublicActionSessionEvent, PublicActionSessionEventSender,
-    PublicActionStepFeePolicy, PublicAdvancedTransactionAuthorization,
-    PublicAdvancedTransactionEstimate, PublicAdvancedTransactionEstimateRequest,
-    PublicAdvancedTransactionSimulationError, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceAsset, PublicBalanceCache, PublicBalanceEntry, PublicBalanceRefreshCompletion,
-    PublicBalanceRefreshCoordinator, PublicBalanceRefreshTicket, PublicBalanceScope,
-    PublicBalanceSnapshot, PublicSendRequest, PublicSendResult, PublicShieldRequest,
-    PublicShieldTransactionProfile, PublicTransactionIntent, PublicTransactionLookup,
-    PublicTransactionTracker, PublicTransactionTrackingContext,
+    DappRpcReadClient, EvmFeeModel, HardwareTrezorPinMatrixProvider,
+    PUBLIC_NATIVE_UNWRAP_GAS_UNITS, PublicAccountBalance, PublicActionAttemptInfo,
+    PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,
+    PublicActionCommandSender, PublicActionFeeProjection, PublicActionFeeSource,
+    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
+    PublicActionGasFeeSelection, PublicActionKind, PublicActionProgressStatus,
+    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionResolvedGasFee,
+    PublicActionSessionEvent, PublicActionSessionEventSender, PublicActionStepFeePolicy,
+    PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
+    PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceCache, PublicBalanceEntry,
+    PublicBalanceRefreshCompletion, PublicBalanceRefreshCoordinator, PublicBalanceRefreshTicket,
+    PublicBalanceScope, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
+    PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent,
+    PublicTransactionLookup, PublicTransactionTracker, PublicTransactionTrackingContext,
     WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,

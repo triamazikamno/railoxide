@@ -38,7 +38,12 @@ impl ExecutorOwner {
             .get(step)
             .ok_or_else(|| eyre!("recovery step is unavailable"))?;
         let mut chain = self.chain.clone();
-        chain.relay_adapt_7702_contract = record.delegate().to_string();
+        chain
+            .railgun
+            .as_mut()
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?
+            .deployment
+            .relay_adapt_7702_contract = record.delegate();
         chain.enabled = true;
         let mut assets = vec![prepared.asset];
         if prepared.asset == ExecutorAsset::Native {

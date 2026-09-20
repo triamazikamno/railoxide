@@ -438,7 +438,12 @@ impl ExecutorOwner {
         let record = self.validate_preparation(prepared)?;
         let mut chain = Box::new(self.chain.clone());
         if prepared.recovery.is_some() {
-            chain.relay_adapt_7702_contract = record.delegate().to_string();
+            chain
+                .railgun
+                .as_mut()
+                .ok_or_else(|| eyre!("chain does not support Railgun"))?
+                .deployment
+                .relay_adapt_7702_contract = record.delegate();
             chain.enabled = true;
         }
         let profile = chain

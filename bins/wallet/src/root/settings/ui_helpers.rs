@@ -14,16 +14,6 @@ pub(in crate::root) fn settings_section_header(title: impl Into<String>) -> Sett
     })
 }
 
-pub(in crate::root) fn settings_chain_section_header(
-    chain_id: u64,
-    title: impl Into<String>,
-) -> SettingItem {
-    let title = title.into();
-    SettingItem::render(move |_options, _window, _cx| {
-        settings_section_header_element(&title, None, Some(chain_id))
-    })
-}
-
 pub(in crate::root) fn settings_section_header_element(
     title: &str,
     description: Option<&str>,
@@ -705,13 +695,28 @@ pub(in crate::root) fn product_component_type_select_items() -> Vec<PriceAnchorT
     ]
 }
 
-pub(in crate::root) fn price_anchor_chain_select_items() -> Vec<ChainSelectItem> {
-    railgun_ui::DEFAULT_CHAINS
+pub(in crate::root) fn price_anchor_chain_select_items(
+    settings: &WalletSettings,
+) -> Vec<ChainSelectItem> {
+    let mut items: Vec<_> = railgun_ui::DEFAULT_CHAINS
         .iter()
-        .map(|chain_id| ChainSelectItem {
-            chain_id: *chain_id,
+        .map(|&chain_id| ChainSelectItem {
+            chain_id,
+            label: chain_name(chain_id).unwrap_or("Chain").into(),
         })
-        .collect()
+        .collect();
+    items.extend(
+        settings
+            .chains
+            .custom
+            .iter()
+            .map(|(&chain_id, chain)| ChainSelectItem {
+                chain_id,
+                label: chain.name.clone().into(),
+            }),
+    );
+    items.sort_by_key(|item| item.chain_id);
+    items
 }
 
 pub(in crate::root) fn bool_select_items() -> Vec<BoolSelectItem> {

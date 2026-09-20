@@ -20,7 +20,7 @@ use gpui_component::{
     label::Label,
     select::{Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
     setting::{
-        NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
+        NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings as ComponentSettings,
     },
     slider::{Slider, SliderEvent, SliderState},
@@ -37,17 +37,13 @@ use wallet_ops::{
     WalletNetworkConfig, WalletNetworkMode, begin_prover_cache_build,
     build_cache_with_context_and_progress_with_session, build_wallet_network_context,
     settings::{
-        AUTO_LOCK_TIMEOUT_PRESETS_SECS, BuiltInTokenOverride, ChainContractSettings,
-        ChainDeploymentSettings, ChainSettingsOverride, CustomTokenSettings,
+        AUTO_LOCK_TIMEOUT_PRESETS_SECS, BuiltInTokenOverride, CustomTokenSettings,
         IndexedArtifactManifestSourceSetting, IndexedArtifactSettings,
         IndexedArtifactSourceModeSetting, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WakuDirectPeerSetting,
         WalletSettings, build_effective_chain_configs, build_effective_token_registry,
-        default_chain_contract_settings, default_chain_quick_sync_endpoint,
-        default_chain_rpc_endpoints, default_sponsored_bundle_relay_endpoints,
         default_token_price_anchor_overrides, default_waku_direct_peers,
-        default_waku_dns_enr_trees, save_wallet_settings,
-        should_show_chain_deployment_metadata_settings,
+        default_waku_dns_enr_trees,
     },
     vault::DesktopVaultStore,
 };
@@ -64,6 +60,7 @@ use super::ui_helpers::{
 use super::wallet_header::ChainSelectItem;
 
 mod apply_mode;
+mod chains;
 mod editor;
 mod network;
 mod render;
