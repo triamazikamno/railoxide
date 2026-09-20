@@ -6061,8 +6061,7 @@ mod tests {
     };
 
     use gpui::{
-        AppContext as _, Bounds, InteractiveElement as _, Render, TestAppContext,
-        VisualTestContext, WindowBounds, WindowOptions, point, size,
+        Bounds, Render, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, size,
     };
 
     use super::*;
