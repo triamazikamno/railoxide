@@ -81,6 +81,8 @@ pub enum DesktopPrivateSpendAuthorization {
         session: Arc<vault::ProtectedSoftwareSeedSession>,
     },
     PreauthorizedSigner(vault::SoftwareRailgunSpendSigner),
+    HardwareExecutor(Box<super::executors::HardwareExecutorAuthorization>),
+    HardwarePublic,
 }
 
 pub(crate) enum DesktopPrivateSpendSigner<'a> {
@@ -105,6 +107,22 @@ impl RailgunSpendSigner for DesktopPrivateSpendSigner<'_> {
 }
 
 impl DesktopPrivateSpendAuthorization {
+    pub(super) fn split_hardware_gas_payment(
+        self,
+        view: &vault::DesktopViewSession,
+    ) -> Result<(Self, Option<Self>)> {
+        match self {
+            Self::HardwareExecutor(mut hardware) if hardware.is_gas_payment() => {
+                let private = hardware.take_private_signer(view)?;
+                Ok((
+                    Self::PreauthorizedSigner(private),
+                    Some(Self::HardwareExecutor(hardware)),
+                ))
+            }
+            other => Ok((other, None)),
+        }
+    }
+
     pub(crate) fn executor_spend_grant<'a>(
         &'a self,
         store: &vault::DesktopVaultStore,
@@ -115,7 +133,7 @@ impl DesktopPrivateSpendAuthorization {
         let (password, seed) = match self {
             Self::VaultPassword(password) => (password, None),
             Self::ProtectedSoftwareSeed { password, session } => (password, Some(session.as_ref())),
-            Self::PreauthorizedSigner(_) => {
+            Self::PreauthorizedSigner(_) | Self::HardwareExecutor(_) | Self::HardwarePublic => {
                 return Err(eyre!(
                     "executor signing requires authorization for the original software seed"
                 ));
@@ -131,6 +149,9 @@ impl DesktopPrivateSpendAuthorization {
         operation: &'static str,
     ) -> Result<DesktopPrivateSpendSigner<'a>> {
         match self {
+            Self::HardwarePublic => Err(eyre!(
+                "native Public approval cannot authorize private spending"
+            )),
             Self::VaultPassword(password) => {
                 let mut grant = vault_store
                     .create_spend_grant(password.as_str())
@@ -154,6 +175,9 @@ impl DesktopPrivateSpendAuthorization {
                 Ok(DesktopPrivateSpendSigner::Owned(Box::new(signer)))
             }
             Self::PreauthorizedSigner(signer) => Ok(DesktopPrivateSpendSigner::Borrowed(signer)),
+            Self::HardwareExecutor(authorization) => Ok(DesktopPrivateSpendSigner::Borrowed(
+                authorization.private_signer(view_session)?,
+            )),
         }
     }
 
@@ -164,6 +188,9 @@ impl DesktopPrivateSpendAuthorization {
         operation: &'static str,
     ) -> Result<vault::SoftwareRailgunSpendSigner> {
         match self {
+            Self::HardwarePublic => Err(eyre!(
+                "native Public approval cannot authorize private spending"
+            )),
             Self::VaultPassword(password) => {
                 let mut grant = vault_store
                     .create_spend_grant(password.as_str())
@@ -185,21 +212,20 @@ impl DesktopPrivateSpendAuthorization {
                     .wrap_err_with(|| format!("load {operation} spend signer"))
             }
             Self::PreauthorizedSigner(signer) => Ok(signer),
+            Self::HardwareExecutor(authorization) => {
+                authorization.into_private_signer(view_session)
+            }
         }
     }
 
-    pub fn public_signing_parts(
-        self,
-    ) -> Result<(
-        Zeroizing<String>,
-        Option<Arc<vault::ProtectedSoftwareSeedSession>>,
-    )> {
-        match self {
-            Self::VaultPassword(password) => Ok((password, None)),
-            Self::ProtectedSoftwareSeed { password, session } => Ok((password, Some(session))),
-            Self::PreauthorizedSigner(_) => Err(eyre!(
-                "preauthorized Railgun signer cannot authorize a Public action"
-            )),
+    #[must_use]
+    pub fn from_software_credentials(
+        password: Zeroizing<String>,
+        session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
+    ) -> Self {
+        match session {
+            Some(session) => Self::ProtectedSoftwareSeed { password, session },
+            None => Self::VaultPassword(password),
         }
     }
 
@@ -207,7 +233,8 @@ impl DesktopPrivateSpendAuthorization {
     pub fn protected_seed_session(&self) -> Option<Arc<vault::ProtectedSoftwareSeedSession>> {
         match self {
             Self::ProtectedSoftwareSeed { session, .. } => Some(Arc::clone(session)),
-            Self::VaultPassword(_) | Self::PreauthorizedSigner(_) => None,
+            Self::HardwareExecutor(hardware) => hardware.gas_payer_seed_session(),
+            Self::VaultPassword(_) | Self::PreauthorizedSigner(_) | Self::HardwarePublic => None,
         }
     }
 }
@@ -538,6 +565,7 @@ pub struct DesktopPreparedSponsoredSelfBroadcastRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub gas_payer_authorization: Option<DesktopPrivateSpendAuthorization>,
     pub vault_password: Option<Zeroizing<String>>,
     pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,

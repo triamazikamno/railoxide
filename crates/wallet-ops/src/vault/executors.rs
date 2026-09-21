@@ -607,9 +607,6 @@ impl ExecutorStore {
         view: Arc<DesktopViewSession>,
         chain_id: u64,
     ) -> Result<Self, ExecutorStoreError> {
-        if view.hardware_profile_session().is_some() {
-            return Err(ExecutorStoreError::SoftwareWalletRequired);
-        }
         let store = Self {
             vault: DesktopVaultStore::from_db(db),
             view,
@@ -1157,6 +1154,7 @@ impl ExecutorStore {
         {
             return Err(ExecutorStoreError::Unavailable);
         }
+        self.vault.validate_executor_source(&self.view)?;
         Ok(())
     }
 

@@ -117,6 +117,17 @@ pub(in crate::root::walletconnect) fn gateway_pending_request(
 }
 
 impl WalletRoot {
+    pub(in crate::root) fn walletconnect_hardware_executor_action(
+        &self,
+        key: &str,
+        review_token: u64,
+    ) -> Option<(u64, wallet_ops::HardwareExecutorAction)> {
+        self.walletconnect
+            .pending_requests
+            .get(key)?
+            .hardware_executor_action(review_token)
+    }
+
     pub(in crate::root) fn reconcile_gateway_approvals(
         &mut self,
         handle: &wallet_ops::gateway::GatewayHandle,
@@ -688,8 +699,7 @@ impl WalletRoot {
                 request_key,
                 request.review_token,
                 reviewed_fee,
-                Zeroizing::new(String::new()),
-                None,
+                wallet_ops::DesktopPrivateSpendAuthorization::HardwarePublic,
                 window,
                 cx,
             );
@@ -730,10 +740,7 @@ impl WalletRoot {
         request_key: &str,
         review_token: u64,
         reviewed_fee: Option<WalletConnectReviewedFeeProjection>,
-        vault_password: Zeroizing<String>,
-        protected_software_seed_session: Option<
-            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
-        >,
+        spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -925,8 +932,7 @@ impl WalletRoot {
                 request,
                 vault_store,
                 view_session,
-                vault_password,
-                protected_software_seed_session,
+                spend_authorization,
                 trezor_app_passphrase,
                 trezor_pin_matrix_provider,
                 effective_chain,

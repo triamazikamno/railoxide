@@ -2,7 +2,7 @@ use super::*;
 use std::time::Instant;
 use wallet_ops::{
     DesktopUnshieldPublicBroadcasterEstimateRequest, ExecutorAsset, ExecutorDelivery,
-    PreparedExecutorOperation, PublicBroadcasterSelection,
+    PreparedExecutorOperation, PublicBroadcasterApprovalBounds, PublicBroadcasterSelection,
     estimate_desktop_unshield_public_broadcaster_cost, vault::ExecutorOperationId,
 };
 
@@ -85,7 +85,28 @@ pub(in crate::root) enum ExecutorUnshieldQuote {
 }
 
 impl ExecutorUnshieldQuote {
-    pub(in crate::root) fn covers(&self, prepared: &Self) -> bool {
+    pub(in crate::root) fn approval_bounds(
+        &self,
+        custom_fee: Option<U256>,
+    ) -> eyre::Result<Option<PublicBroadcasterApprovalBounds>> {
+        match self {
+            Self::Broadcaster(quote) => {
+                let maximum = custom_fee.unwrap_or_else(|| {
+                    quote
+                        .fee_amount
+                        .saturating_add(quote.fee_amount / U256::from(4))
+                });
+                quote.approval_bounds(maximum).map(Some)
+            }
+            Self::SelfBroadcast { .. } => Ok(None),
+        }
+    }
+
+    pub(in crate::root) fn covers(
+        &self,
+        prepared: &Self,
+        bounds: Option<PublicBroadcasterApprovalBounds>,
+    ) -> bool {
         match (self, prepared) {
             (Self::Broadcaster(approved), Self::Broadcaster(current)) => {
                 approved.broadcaster.railgun_address == current.broadcaster.railgun_address
@@ -93,9 +114,7 @@ impl ExecutorUnshieldQuote {
                     && approved.fee_token == current.fee_token
                     && approved.fee_mode == current.fee_mode
                     && approved.native_top_up == current.native_top_up
-                    && current.fee_amount <= approved.fee_amount
-                    && current.total_private_spend <= approved.total_private_spend
-                    && current.recipient_amount >= approved.recipient_amount
+                    && bounds.is_some_and(|bounds| bounds.covers(current))
             }
             (
                 Self::SelfBroadcast {
@@ -132,8 +151,10 @@ impl ExecutorUnshieldQuote {
 }
 
 pub(in crate::root) struct ExecutorUnshieldApproval {
+    pub(in crate::root) operation: ExecutorOperationId,
     binding: ExecutorUnshieldBinding,
     quote: ExecutorUnshieldQuote,
+    bounds: Option<PublicBroadcasterApprovalBounds>,
     session: Arc<WalletSession>,
     view: Arc<DesktopViewSession>,
     form_identity: gpui::EntityId,
@@ -143,13 +164,14 @@ impl ExecutorUnshieldApproval {
     fn matches(&self, draft: &UnshieldSpendDraft) -> bool {
         self.binding == ExecutorUnshieldBinding::from_draft(draft)
             && Arc::ptr_eq(&self.session, &draft.session)
-            && Arc::ptr_eq(&self.view, &draft.view_session)
+            && self.view.is_same_wallet_session(&draft.view_session)
     }
 }
 
 pub(in crate::root) struct ExecutorUnshieldReview {
     pub(in crate::root) prepared: Arc<PreparedExecutorOperation>,
     pub(in crate::root) quote: ExecutorUnshieldQuote,
+    bounds: Option<PublicBroadcasterApprovalBounds>,
     binding: ExecutorUnshieldBinding,
     session: Arc<WalletSession>,
     view: Arc<DesktopViewSession>,
@@ -159,7 +181,7 @@ impl ExecutorUnshieldReview {
     pub(in crate::root) fn matches(&self, draft: &UnshieldSpendDraft) -> bool {
         self.binding == ExecutorUnshieldBinding::from_draft(draft)
             && Arc::ptr_eq(&self.session, &draft.session)
-            && Arc::ptr_eq(&self.view, &draft.view_session)
+            && self.view.is_same_wallet_session(&draft.view_session)
             && self
                 .session
                 .executor_owner()
@@ -167,17 +189,8 @@ impl ExecutorUnshieldReview {
     }
 
     pub(in crate::root) fn maximum_private_fee(&self) -> Option<U256> {
-        match &self.quote {
-            ExecutorUnshieldQuote::Broadcaster(quote) => Some(quote.fee_amount),
-            ExecutorUnshieldQuote::SelfBroadcast { .. } => None,
-        }
-    }
-
-    pub(in crate::root) fn broadcaster_min_gas_price(&self) -> Option<u128> {
-        match &self.quote {
-            ExecutorUnshieldQuote::Broadcaster(quote) => Some(quote.min_gas_price),
-            ExecutorUnshieldQuote::SelfBroadcast { .. } => None,
-        }
+        self.bounds
+            .map(PublicBroadcasterApprovalBounds::maximum_fee)
     }
 
     pub(in crate::root) const fn maximum_gas(&self) -> Option<u64> {
@@ -236,10 +249,29 @@ impl WalletRoot {
             );
             return;
         };
-        let summary = self.executor_unshield_summary(draft, &quote, None);
+        let bounds = match quote.approval_bounds(draft.custom_fee_amount) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                self.set_unshield_form_error(key, error.to_string(), cx);
+                return;
+            }
+        };
+        let summary = self.executor_unshield_summary(draft, &quote, bounds, None);
+        let operation = match ExecutorUnshieldOperation::for_action(
+            form.executor_operation.as_ref(),
+            ExecutorUnshieldBinding::from_draft(draft),
+        ) {
+            Ok(operation) => operation.id,
+            Err(error) => {
+                self.set_unshield_form_error(key, error.to_string(), cx);
+                return;
+            }
+        };
         let approval = Arc::new(ExecutorUnshieldApproval {
+            operation,
             binding: ExecutorUnshieldBinding::from_draft(draft),
             quote,
+            bounds,
             session: Arc::clone(&draft.session),
             view: Arc::clone(&draft.view_session),
             form_identity: form.recipient_input.entity_id(),
@@ -255,7 +287,7 @@ impl WalletRoot {
 
     pub(in crate::root) fn unshield_requires_executor(&self, draft: &UnshieldSpendDraft) -> bool {
         (draft.unwrap || draft.native_top_up.is_some())
-            && !self.selected_wallet_source().is_hardware_derived()
+            && draft.session.executor_owner().is_some()
             && draft.self_broadcast_funding != SelfBroadcastFundingMode::PrivateSponsorship
             && self
                 .effective_chain_configs
@@ -346,15 +378,9 @@ impl WalletRoot {
         }
         let form = self.unshield_forms.get_mut(&key).expect("validated form");
         let binding = ExecutorUnshieldBinding::from_draft(&draft);
-        let reservation = match ExecutorUnshieldOperation::for_action(
-            form.executor_operation.as_ref(),
-            binding.clone(),
-        ) {
-            Ok(operation) => operation,
-            Err(error) => {
-                self.set_unshield_form_error(key, error.to_string(), cx);
-                return;
-            }
+        let reservation = ExecutorUnshieldOperation {
+            id: approval.operation,
+            binding: binding.clone(),
         };
         let operation = reservation.id;
         let execution = form.gateway_execution.clone();
@@ -379,10 +405,6 @@ impl WalletRoot {
         let anchor_cache = Arc::clone(&self.public_broadcaster_anchor_cache);
         let queued_at = Instant::now();
         tracing::info!(target: "executor_preparation", step = "runtime_dispatch", "started");
-        let approved_fee_amount = match &approval.quote {
-            ExecutorUnshieldQuote::Broadcaster(quote) => Some(quote.fee_amount),
-            ExecutorUnshieldQuote::SelfBroadcast { .. } => None,
-        };
         let join = self.runtime.spawn(async move {
             tracing::info!(
                 target: "executor_preparation",
@@ -422,7 +444,6 @@ impl WalletRoot {
                         let quote = estimate_desktop_unshield_public_broadcaster_cost(
                             DesktopUnshieldPublicBroadcasterEstimateRequest {
                                 custom_fee_amount: draft.custom_fee_amount,
-                                approved_fee_amount,
                                 executor: Some(Arc::clone(&prepared)),
                                 chain_id: key.chain_id,
                                 effective_chain: chain,
@@ -489,9 +510,11 @@ impl WalletRoot {
                     elapsed_ms = quote_started.elapsed().as_millis(),
                     "finished"
                 );
+                let bounds = quote.approval_bounds(draft.custom_fee_amount)?;
                 Ok::<_, eyre::Report>(ExecutorUnshieldReview {
                     prepared,
                     quote,
+                    bounds,
                     binding,
                     session: draft.session,
                     view: draft.view_session,
@@ -541,8 +564,8 @@ impl WalletRoot {
                     }
                     return;
                 };
-                let review = match result {
-                    Ok(review) => Arc::new(review),
+                let mut review = match result {
+                    Ok(review) => review,
                     Err(error) => {
                         root.set_unshield_form_error(key, error, cx);
                         if let Some(execution) = &execution {
@@ -574,6 +597,13 @@ impl WalletRoot {
                     }
                     return;
                 }
+                let covered = approval.matches(&current)
+                    && approval.quote.covers(&review.quote, approval.bounds);
+                if covered {
+                    // Refreshes may consume the original allowance, never raise it.
+                    review.bounds = approval.bounds;
+                }
+                let review = Arc::new(review);
                 let form = root.unshield_forms.get_mut(&key).expect("current form");
                 match &review.quote {
                     ExecutorUnshieldQuote::Broadcaster(quote) => {
@@ -595,7 +625,7 @@ impl WalletRoot {
                 current.executor_review = Some(Arc::clone(&review));
                 let intent =
                     SpendAuthorizationIntent::ExecutorUnshield(key, Arc::clone(&review), execution);
-                if approval.matches(&current) && approval.quote.covers(&review.quote) {
+                if covered {
                     if intent.approve_gateway_review(root) {
                         root.continue_authorized_spend(intent, authorization, window, cx);
                     }
@@ -603,9 +633,21 @@ impl WalletRoot {
                     let summary = root.executor_unshield_summary(
                         &current,
                         &review.quote,
-                        Some((review.prepared.context().executor, &approval.quote)),
+                        review.bounds,
+                        Some((
+                            review.prepared.context().executor,
+                            &approval.quote,
+                            approval.bounds,
+                        )),
                     );
-                    root.open_prepared_spend_review(intent, summary, authorization, window, cx);
+                    if matches!(
+                        authorization,
+                        DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                    ) {
+                        root.request_spend_authorization(intent, summary, window, cx);
+                    } else {
+                        root.open_prepared_spend_review(intent, summary, authorization, window, cx);
+                    }
                 }
                 tracing::info!(
                     target: "executor_preparation",
@@ -624,9 +666,14 @@ impl WalletRoot {
         &self,
         draft: &UnshieldSpendDraft,
         quote: &ExecutorUnshieldQuote,
-        previous: Option<(Address, &ExecutorUnshieldQuote)>,
+        bounds: Option<PublicBroadcasterApprovalBounds>,
+        previous: Option<(
+            Address,
+            &ExecutorUnshieldQuote,
+            Option<PublicBroadcasterApprovalBounds>,
+        )>,
     ) -> SpendAuthorizationSummary {
-        let previous_quote = previous.map(|(_, quote)| quote);
+        let previous_quote = previous.map(|(_, quote, _)| quote);
         let exact_native_amount = |amount| {
             format!(
                 "{} {}",
@@ -645,22 +692,6 @@ impl WalletRoot {
         let mut rows = vec![
             SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None))
                 .with_shortened_copyable(),
-            SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
-            SpendAuthorizationSummaryRow::new(
-                "Chain",
-                railgun_ui::chain_name(draft.asset.chain_id).unwrap_or("Chain"),
-            )
-            .with_icon(
-                railgun_ui::chain_icon_asset_path(draft.asset.chain_id)
-                    .map(WalletIconSource::embedded),
-            ),
-            SpendAuthorizationSummaryRow::new(
-                "Fees",
-                match draft.fee_mode {
-                    FeeHandlingMode::AddToAmount => "Added to the entered amount",
-                    FeeHandlingMode::DeductFromAmount => "Deducted from the entered amount",
-                },
-            ),
         ];
         match quote {
             ExecutorUnshieldQuote::Broadcaster(quote) => {
@@ -668,42 +699,88 @@ impl WalletRoot {
                     Some(ExecutorUnshieldQuote::Broadcaster(quote)) => Some(quote),
                     _ => None,
                 };
-                rows.push(
-                    SpendAuthorizationSummaryRow::new(
-                        "Maximum broadcaster fee",
+                let minimum_recipient = bounds.map_or(
+                    quote.recipient_amount,
+                    PublicBroadcasterApprovalBounds::minimum_recipient_amount,
+                );
+                let maximum_fee = bounds.map_or(
+                    quote.fee_amount,
+                    PublicBroadcasterApprovalBounds::maximum_fee,
+                );
+                let previous_bounds = previous.and_then(|(_, _, bounds)| bounds);
+                let fee_value = |amount| {
+                    format_value_with_usd_label(
                         format_token_amount_ceiling_for_display(
                             draft.asset.chain_id,
                             draft.fee_token,
-                            quote.fee_amount,
+                            amount,
                             Some(&self.effective_token_registry),
+                        ),
+                        amount,
+                        token_display_metadata(
+                            Some(&self.effective_token_registry),
+                            draft.asset.chain_id,
+                            &draft.fee_token,
+                        )
+                        .map(|metadata| metadata.decimals),
+                        self.public_broadcaster_anchor_cache
+                            .cached_token_usd_micro_value(
+                                draft.asset.chain_id,
+                                draft.fee_token,
+                                amount,
+                            ),
+                        false,
+                    )
+                };
+                rows.push(SpendAuthorizationSummaryRow::new(
+                    "Estimated transaction fee",
+                    fee_value(quote.fee_amount),
+                ));
+                rows.push(
+                    SpendAuthorizationSummaryRow::new(
+                        "Minimum recipient amount",
+                        format_value_with_usd_label(
+                            if draft.unwrap {
+                                format_native_token_amount_for_display(
+                                    draft.asset.chain_id,
+                                    minimum_recipient,
+                                )
+                            } else {
+                                private_amount_label(minimum_recipient, &draft.asset, false)
+                            },
+                            minimum_recipient,
+                            if draft.unwrap {
+                                Some(18)
+                            } else {
+                                draft.asset.decimals
+                            },
+                            if draft.unwrap {
+                                self.public_broadcaster_anchor_cache
+                                    .cached_native_usd_micro_value(
+                                        draft.asset.chain_id,
+                                        minimum_recipient,
+                                    )
+                            } else {
+                                self.public_broadcaster_anchor_cache
+                                    .cached_token_usd_micro_value(
+                                        draft.asset.chain_id,
+                                        draft.asset.token,
+                                        minimum_recipient,
+                                    )
+                            },
+                            false,
                         ),
                     )
                     .with_amount_change(
                         approved
-                            .filter(|approved| approved.fee_token == quote.fee_token)
-                            .map(|approved| approved.fee_amount),
-                        quote.fee_amount,
-                        true,
-                        |amount| exact_token_amount(quote.fee_token, amount),
-                    ),
-                );
-                rows.push(
-                    SpendAuthorizationSummaryRow::new(
-                        "Minimum recipient amount",
-                        if draft.unwrap {
-                            format_native_token_amount_for_display(
-                                draft.asset.chain_id,
-                                quote.recipient_amount,
-                            )
-                        } else {
-                            private_amount_label(quote.recipient_amount, &draft.asset, false)
-                        },
-                    )
-                    .with_amount_change(
-                        approved
                             .filter(|approved| approved.action_token == quote.action_token)
-                            .map(|approved| approved.recipient_amount),
-                        quote.recipient_amount,
+                            .map(|approved| {
+                                previous_bounds.map_or(
+                                    approved.recipient_amount,
+                                    PublicBroadcasterApprovalBounds::minimum_recipient_amount,
+                                )
+                            }),
+                        minimum_recipient,
                         false,
                         |amount| {
                             if draft.unwrap {
@@ -712,6 +789,32 @@ impl WalletRoot {
                                 private_amount_label(amount, &draft.asset, false)
                             }
                         },
+                    ),
+                );
+                rows.push(
+                    SpendAuthorizationSummaryRow::new(
+                        match draft.fee_mode {
+                            FeeHandlingMode::DeductFromAmount => {
+                                "Maximum transaction fee (deducted from amount)"
+                            }
+                            FeeHandlingMode::AddToAmount => {
+                                "Maximum transaction fee (added to amount)"
+                            }
+                        },
+                        fee_value(maximum_fee),
+                    )
+                    .with_amount_change(
+                        approved
+                            .filter(|approved| approved.fee_token == quote.fee_token)
+                            .map(|approved| {
+                                previous_bounds.map_or(
+                                    approved.fee_amount,
+                                    PublicBroadcasterApprovalBounds::maximum_fee,
+                                )
+                            }),
+                        maximum_fee,
+                        true,
+                        |amount| exact_token_amount(quote.fee_token, amount),
                     ),
                 );
                 rows.push(
@@ -739,7 +842,12 @@ impl WalletRoot {
                 for fee in &cost.protocol_fees {
                     rows.push(
                         SpendAuthorizationSummaryRow::new(
-                            "Protocol fee",
+                            match draft.fee_mode {
+                                FeeHandlingMode::DeductFromAmount => {
+                                    "Protocol fee (deducted from amount)"
+                                }
+                                FeeHandlingMode::AddToAmount => "Protocol fee (added to amount)",
+                            },
                             format_token_amount_ceiling_for_display(
                                 draft.asset.chain_id,
                                 fee.token,
@@ -877,7 +985,7 @@ impl WalletRoot {
                 ),
             ));
         }
-        let (title, detail) = if let Some((executor, _)) = previous {
+        let (title, detail) = if let Some((executor, _, _)) = previous {
             rows.push(
                 SpendAuthorizationSummaryRow::new("Stealth account", executor.to_checksum(None))
                     .with_shortened_copyable(),
@@ -889,8 +997,13 @@ impl WalletRoot {
         } else {
             ("Private unshield", "")
         };
-        let summary =
-            SpendAuthorizationSummary::new(title, detail, rows).requiring_explicit_review();
+        let summary = SpendAuthorizationSummary::new(title, detail, rows)
+            .with_context(format!(
+                "{} on {}",
+                draft.delivery_mode.label(),
+                railgun_ui::chain_name(draft.asset.chain_id).unwrap_or("Chain"),
+            ))
+            .requiring_explicit_review();
         if let Some(amount) = draft.custom_fee_amount {
             summary.with_custom_transaction_fee(super::fee_editor::custom_fee_label(
                 draft.asset.chain_id,

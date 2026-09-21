@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::DeliveryMode;
 use alloy::primitives::U256;
 use gpui::{
     AnyElement, App, AppContext, Axis, ClickEvent, Context, Entity, Focusable, InteractiveElement,
@@ -34,7 +35,9 @@ use wallet_ops::hardware::{
 use wallet_ops::vault::{
     DesktopVaultStore, DesktopViewSession, HardwareProfileSession, VaultError,
 };
-use wallet_ops::vault::{SoftwareSeedSessionBinding, WalletSoftwareContextKind};
+use wallet_ops::vault::{
+    PublicAccountSource, SoftwareSeedSessionBinding, WalletSoftwareContextKind,
+};
 use wallet_ops::{
     BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, SponsoredAuthorizationLimit,
 };
@@ -156,6 +159,11 @@ impl SpendAuthorizationCache {
 
 #[derive(Clone)]
 pub(super) enum SpendAuthorizationIntent {
+    ExecutorGasPassword {
+        intent: Box<Self>,
+        summary: SpendAuthorizationSummary,
+        payer: String,
+    },
     StealthAccounts(
         Entity<super::stealth_accounts::StealthAccountsView>,
         Arc<super::stealth_accounts::StealthAuthorization>,
@@ -205,8 +213,77 @@ pub(super) enum SpendAuthorizationIntent {
 }
 
 impl SpendAuthorizationIntent {
+    fn hardware_executor_action(
+        &self,
+        root: &WalletRoot,
+    ) -> Option<wallet_ops::HardwareExecutorAction> {
+        use wallet_ops::HardwareExecutorAction;
+        let (source, account) = match self {
+            Self::PrepareExecutorUnshield(_, approval, _) => {
+                return Some(HardwareExecutorAction::Execute(approval.operation));
+            }
+            Self::ExecutorUnshield(_, review, _) => {
+                return Some(HardwareExecutorAction::Execute(review.prepared.operation()));
+            }
+            Self::StealthAccounts(_, command) => return Some(command.hardware_executor_action()),
+            Self::PrivateSend(key, ..) | Self::PrivateUnshield(key, ..) => {
+                let (delivery, uuid) = if let Self::PrivateSend(..) = self {
+                    let form = root.send_forms.get(key)?;
+                    (
+                        form.delivery_mode,
+                        form.self_broadcast_gas_payer_uuid.as_deref(),
+                    )
+                } else {
+                    let form = root.unshield_forms.get(key)?;
+                    (
+                        form.delivery_mode,
+                        form.self_broadcast_gas_payer_uuid.as_deref(),
+                    )
+                };
+                if delivery != DeliveryMode::SelfBroadcast {
+                    return None;
+                }
+                let account = root.selected_self_broadcast_gas_payer_account(uuid)?;
+                let PublicAccountSource::ExecutorDerived(source) = account.source else {
+                    return None;
+                };
+                return Some(HardwareExecutorAction::GasPayment {
+                    account: account.public_account_uuid.clone(),
+                    operation: source.operation(),
+                });
+            }
+            Self::PublicSend(draft) => (
+                draft.public_account_source,
+                draft.public_account_uuid.to_string(),
+            ),
+            Self::PublicShield(draft) => (
+                draft.public_account_source,
+                draft.public_account_uuid.to_string(),
+            ),
+            Self::Governance(draft) => (draft.actor_source, draft.actor_uuid.to_string()),
+            Self::WalletConnectRequest {
+                request_key,
+                review_token,
+                ..
+            } => {
+                return root
+                    .walletconnect_hardware_executor_action(request_key, *review_token)
+                    .map(|(_, action)| action);
+            }
+            _ => return None,
+        };
+        let wallet_ops::vault::PublicAccountSource::ExecutorDerived(source) = source else {
+            return None;
+        };
+        Some(HardwareExecutorAction::Public {
+            account,
+            operation: source.operation(),
+        })
+    }
+
     fn gateway_execution(&self) -> Option<&wallet_ops::gateway::GatewayDraftExecution> {
         match self {
+            Self::ExecutorGasPassword { intent, .. } => intent.gateway_execution(),
             Self::PrivateSend(_, _, execution, _)
             | Self::PrepareExecutorUnshield(_, _, execution)
             | Self::ExecutorUnshield(_, _, execution)
@@ -234,6 +311,9 @@ impl SpendAuthorizationIntent {
     }
 
     fn private_review_current(&self, root: &WalletRoot) -> bool {
+        if let Self::ExecutorGasPassword { intent, .. } = self {
+            return intent.private_review_current(root);
+        }
         let custom_fee_matches = match self {
             Self::PrivateSend(key, _, _, expected) => {
                 root.send_forms.get(key).is_some_and(|form| {
@@ -299,6 +379,7 @@ impl SpendAuthorizationIntent {
         matches!(
             self,
             Self::PrivateSend(..)
+                | Self::StealthAccounts(..)
                 | Self::PrivateUnshield(..)
                 | Self::PrepareExecutorUnshield(..)
                 | Self::ExecutorUnshield(..)
@@ -311,6 +392,12 @@ impl SpendAuthorizationIntent {
 #[cfg_attr(not(feature = "hardware"), allow(dead_code))]
 pub(super) enum HardwareSpendAuthorizationCompletion {
     Continue(SpendAuthorizationIntent),
+    ExecutorWithGasPayer {
+        intent: SpendAuthorizationIntent,
+        payer: String,
+        password: Zeroizing<String>,
+        seed_session: Option<Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>>,
+    },
     PrivateSendSelfBroadcast {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
@@ -332,7 +419,9 @@ pub(super) enum HardwareSpendAuthorizationCompletion {
 impl HardwareSpendAuthorizationCompletion {
     fn private_intent(&self) -> Option<SpendAuthorizationIntent> {
         match self {
-            Self::Continue(intent) => Some(intent.clone()),
+            Self::Continue(intent) | Self::ExecutorWithGasPayer { intent, .. } => {
+                Some(intent.clone())
+            }
             Self::PrivateSendSelfBroadcast {
                 key,
                 authorization_limit,
@@ -364,6 +453,7 @@ impl HardwareSpendAuthorizationCompletion {
 enum HardwareSpendAuthorizationError {
     Hardware(HardwareDerivationError),
     Vault(VaultError),
+    Executor(String),
 }
 
 #[cfg(feature = "hardware")]
@@ -391,6 +481,7 @@ pub(super) struct SpendAuthorizationSummary {
     title: Arc<str>,
     detail: Arc<str>,
     confirm_label: Arc<str>,
+    context: Option<Arc<str>>,
     rows: Vec<SpendAuthorizationSummaryRow>,
     warnings: Vec<Arc<str>>,
     payload: Option<SpendAuthorizationPayload>,
@@ -407,6 +498,7 @@ impl SpendAuthorizationSummary {
             title: title.into(),
             detail: detail.into(),
             confirm_label: "Authorize and continue".into(),
+            context: None,
             rows,
             warnings: Vec::new(),
             payload: None,
@@ -416,6 +508,11 @@ impl SpendAuthorizationSummary {
 
     pub(super) fn with_confirm_label(mut self, label: impl Into<Arc<str>>) -> Self {
         self.confirm_label = label.into();
+        self
+    }
+
+    pub(super) fn with_context(mut self, context: impl Into<Arc<str>>) -> Self {
+        self.context = Some(context.into());
         self
     }
 
@@ -580,10 +677,25 @@ struct SpendAuthorizationDialogContent {
     review_focus: gpui::FocusHandle,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct HardwareGasPaymentReview {
+    form: gpui::EntityId,
+    recipient: String,
+    amount: U256,
+    payer: Option<String>,
+    funding: super::private_action::SelfBroadcastFundingMode,
+    gas_fee: wallet_ops::SelfBroadcastGasFeeSelection,
+    incentive: wallet_ops::SponsoredIncentive,
+    fee_mode: wallet_ops::FeeHandlingMode,
+    unwrap: bool,
+    top_up: Option<wallet_ops::DesktopNativeTopUpPlan>,
+}
+
 #[cfg_attr(not(feature = "hardware"), allow(dead_code))]
 struct HardwareSpendAuthorizationDialogContent {
     root: Entity<WalletRoot>,
     completion: HardwareSpendAuthorizationCompletion,
+    gas_review: Option<HardwareGasPaymentReview>,
     summary: SpendAuthorizationSummary,
     device_label: &'static str,
     pending: bool,
@@ -598,12 +710,14 @@ impl HardwareSpendAuthorizationDialogContent {
     fn new(
         root: Entity<WalletRoot>,
         completion: HardwareSpendAuthorizationCompletion,
+        gas_review: Option<HardwareGasPaymentReview>,
         summary: SpendAuthorizationSummary,
         device_label: &'static str,
     ) -> Self {
         Self {
             root,
             completion,
+            gas_review,
             summary,
             device_label,
             pending: false,
@@ -660,8 +774,21 @@ impl HardwareSpendAuthorizationDialogContent {
         {
             let root = self.root.clone();
             let completion = self.completion.clone();
+            let gas_review = self.gas_review.clone();
+            if root.update(cx, |root, cx| {
+                root.hardware_gas_payment_review(&completion, cx)
+            }) != gas_review
+            {
+                self.pending = false;
+                self.error =
+                    Some("The action changed. Close this dialog and review it again.".into());
+                cx.notify();
+                return;
+            }
+            let approved_view = root.read(cx).view_session.clone();
+            let approved_generation = root.read(cx).active_wallet_generation;
             let task = root.update(cx, |root, cx| {
-                root.start_hardware_spend_authorization_task(window, cx)
+                root.start_hardware_spend_authorization_task(&completion, window, cx)
             });
             match task {
                 Ok(join) => {
@@ -675,6 +802,19 @@ impl HardwareSpendAuthorizationDialogContent {
                             match result {
                                 Ok(Ok((authorization, hardware_session))) => {
                                     let root = dialog.root.clone();
+                                    if root.read(cx).active_wallet_generation != approved_generation
+                                        || !approved_view.as_ref().zip(root.read(cx).view_session.as_ref())
+                                            .is_some_and(|(approved, current)| approved.is_same_wallet_session(current))
+                                    {
+                                        dialog.error = Some("The wallet session changed. Close this dialog and authorize the action again.".into());
+                                        cx.notify();
+                                        return;
+                                    }
+                                    if root.update(cx, |root, cx| root.hardware_gas_payment_review(&completion, cx)) != gas_review {
+                                        dialog.error = Some("The action changed while awaiting the device. Review it again.".into());
+                                        cx.notify();
+                                        return;
+                                    }
                                     if completion.private_intent().is_some_and(|intent| !intent.approve_gateway_review(root.read(cx))) {
                                         return;
                                     }
@@ -686,7 +826,7 @@ impl HardwareSpendAuthorizationDialogContent {
                                             cx,
                                         );
                                         match completion {
-                                            HardwareSpendAuthorizationCompletion::Continue(intent) => {
+                                            HardwareSpendAuthorizationCompletion::Continue(intent) | HardwareSpendAuthorizationCompletion::ExecutorWithGasPayer { intent, .. } => {
                                                 root.continue_authorized_spend(
                                                     intent,
                                                     authorization,
@@ -891,6 +1031,9 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
             .child(render_spend_authorization_summary(&self.summary, cx))
+            .when_some(self.summary.context.as_ref(), |this, context| {
+                this.child(app_muted_text(context.to_string()).whitespace_normal())
+            })
             .children(
                 self.summary
                     .warnings
@@ -975,12 +1118,11 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             })
         });
         let pending = self.pending;
-        let submit_label = if pending {
-            "Waiting for device..."
-        } else if self.error.is_some() {
-            "Try again"
+        let device = self.device_label;
+        let submit_label = if pending || self.error.is_none() {
+            format!("Approve on {device}")
         } else {
-            "Approve on device"
+            "Try again".to_owned()
         };
         let show_trezor_app_passphrase = self
             .root
@@ -1007,9 +1149,13 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .child(app_strong_text(self.summary.title.to_string()))
-            .child(app_muted_text(hardware_spend_authorization_detail()).whitespace_normal())
+            .when(!self.summary.detail.is_empty(), |this| {
+                this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
+            })
             .child(render_spend_authorization_summary(&self.summary, cx))
+            .when_some(self.summary.context.as_ref(), |this, context| {
+                this.child(app_muted_text(context.to_string()).whitespace_normal())
+            })
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(
                     SharedString::from(format!("wallet-hardware-spend-auth-warning-{index}")),
@@ -1020,7 +1166,9 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .children(payload)
             .child(Alert::warning(
                 "wallet-hardware-spend-custody-warning",
-                "This is hardware-derived software custody, not true hardware signing. The device derives a temporary seed, and the desktop app signs this Railgun spend in memory.",
+                format!(
+                    "Your {device} will not show the details of this action. Check them here before you approve."
+                ),
             ).small())
             .child(
                 app_muted_text(hardware_spend_authorization_instruction(self.device_label))
@@ -1032,18 +1180,13 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                     this.child(
                         div()
                             .w_full()
-                            .p(px(12.0))
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme::BORDER))
-                            .bg(rgb(theme::SURFACE))
                             .child(app_strong_text("Trezor app passphrase"))
                             .child(
                                 app_muted_text(
-                                    "If the Trezor session expired, enter the app passphrase for this request.",
+                                    "The Trezor session expired. Enter the passphrase for the wallet you intend to spend from.",
                                 )
                                 .whitespace_normal(),
                             )
@@ -1063,7 +1206,7 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                         .items_center()
                         .gap_2()
                         .child(Spinner::new().small())
-                        .child(app_muted_text("Waiting for device approval...")),
+                        .child(app_muted_text(format!("Waiting for {device}…"))),
                 )
             })
             .when_some(self.error.as_ref(), |this, error| {
@@ -1347,17 +1490,60 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let summary = if self.selected_wallet_source().is_hardware_derived()
+            && intent.hardware_executor_action(self).is_some()
+        {
+            summary.requiring_explicit_review()
+        } else {
+            summary
+        };
         let summary = if intent.gateway_execution().is_some() {
             summary.requiring_explicit_review()
         } else {
             summary
         };
-        if intent.uses_private_wallet() && self.selected_wallet_source().is_hardware_derived() {
+        if self.selected_wallet_source().is_hardware_derived()
+            && (intent.uses_private_wallet() || intent.hardware_executor_action(self).is_some())
+        {
             intent.private_attention(
                 "Approve on your hardware wallet",
                 "Use the desktop app to approve this private spend on your device.",
             );
             self.clear_spend_authorization(cx);
+            let key = match &intent {
+                SpendAuthorizationIntent::PrepareExecutorUnshield(key, ..)
+                | SpendAuthorizationIntent::ExecutorUnshield(key, ..) => Some(*key),
+                _ => None,
+            };
+            if let Some(key) = key
+                && let Some(draft) = self.unshield_spend_draft(key, cx)
+                && draft.delivery_mode == DeliveryMode::SelfBroadcast
+            {
+                let Some(payer) = self.selected_self_broadcast_gas_payer_account(
+                    draft.self_broadcast_public_account_uuid.as_deref(),
+                ) else {
+                    return;
+                };
+                if !matches!(
+                    payer.source,
+                    PublicAccountSource::Derived | PublicAccountSource::Imported
+                ) {
+                    self.set_unshield_form_error(key, "Select a software or imported gas payer, or a broadcaster, for this executor action.", cx);
+                    return;
+                }
+                let payer = payer.public_account_uuid.clone();
+                self.open_spend_authorization_dialog(
+                    SpendAuthorizationIntent::ExecutorGasPassword {
+                        intent: Box::new(intent),
+                        summary: summary.clone(),
+                        payer,
+                    },
+                    summary.requiring_explicit_review(),
+                    window,
+                    cx,
+                );
+                return;
+            }
             self.open_hardware_spend_authorization_dialog(
                 HardwareSpendAuthorizationCompletion::Continue(intent),
                 summary,
@@ -1520,9 +1706,7 @@ impl WalletRoot {
                         submit_root.update(cx, |root, cx| {
                             root.continue_authorized_spend(
                                 intent,
-                                DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
-                                    String::new(),
-                                )),
+                                DesktopPrivateSpendAuthorization::HardwarePublic,
                                 window,
                                 cx,
                             );
@@ -1584,6 +1768,53 @@ impl WalletRoot {
         });
     }
 
+    fn hardware_gas_payment_review(
+        &mut self,
+        completion: &HardwareSpendAuthorizationCompletion,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<HardwareGasPaymentReview> {
+        let intent = completion.private_intent()?;
+        if !matches!(
+            intent.hardware_executor_action(self),
+            Some(wallet_ops::HardwareExecutorAction::GasPayment { .. })
+        ) {
+            return None;
+        }
+        match intent {
+            SpendAuthorizationIntent::PrivateSend(key, ..) => {
+                let draft = self.send_spend_draft(key, cx)?;
+                Some(HardwareGasPaymentReview {
+                    form: self.send_forms.get(&key)?.recipient_input.entity_id(),
+                    recipient: draft.recipient,
+                    amount: draft.amount,
+                    payer: draft.self_broadcast_public_account_uuid,
+                    funding: draft.self_broadcast_funding,
+                    gas_fee: draft.self_broadcast_gas_fee,
+                    incentive: draft.sponsored_incentive,
+                    fee_mode: draft.fee_mode,
+                    unwrap: false,
+                    top_up: None,
+                })
+            }
+            SpendAuthorizationIntent::PrivateUnshield(key, ..) => {
+                let draft = self.unshield_spend_draft(key, cx)?;
+                Some(HardwareGasPaymentReview {
+                    form: self.unshield_forms.get(&key)?.recipient_input.entity_id(),
+                    recipient: draft.recipient.to_string(),
+                    amount: draft.amount,
+                    payer: draft.self_broadcast_public_account_uuid,
+                    funding: draft.self_broadcast_funding,
+                    gas_fee: draft.self_broadcast_gas_fee,
+                    incentive: draft.sponsored_incentive,
+                    fee_mode: draft.fee_mode,
+                    unwrap: draft.unwrap,
+                    top_up: draft.native_top_up,
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn open_hardware_spend_authorization_dialog(
         &mut self,
         completion: HardwareSpendAuthorizationCompletion,
@@ -1604,10 +1835,13 @@ impl WalletRoot {
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
+        let gas_review = self.hardware_gas_payment_review(&completion, cx);
+        let dialog_title = summary.title.to_string();
         let content = cx.new(|_cx| {
             HardwareSpendAuthorizationDialogContent::new(
                 root.clone(),
                 completion,
+                gas_review,
                 summary,
                 device_label,
             )
@@ -1618,7 +1852,7 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(app_strong_text("Authorize hardware spend"))
+                .title(app_strong_text(dialog_title.clone()))
                 .on_ok({
                     let content = content.clone();
                     move |_event, window, cx| {
@@ -1648,6 +1882,7 @@ impl WalletRoot {
     #[cfg(feature = "hardware")]
     fn start_hardware_spend_authorization_task(
         &mut self,
+        completion: &HardwareSpendAuthorizationCompletion,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Result<tokio::task::JoinHandle<HardwareSpendAuthorizationTaskOutput>, Arc<str>> {
@@ -1669,6 +1904,49 @@ impl WalletRoot {
                 "Unlock the matching hardware profile before authorizing a spend",
             ));
         };
+        let executor_action = match completion.private_intent() {
+            Some(SpendAuthorizationIntent::WalletConnectRequest {
+                request_key,
+                review_token,
+                ..
+            }) => {
+                let action = self
+                    .walletconnect_hardware_executor_action(&request_key, review_token)
+                    .ok_or_else(|| {
+                        Arc::<str>::from(
+                            "The request changed or its chain is unavailable. Review it again.",
+                        )
+                    })?;
+                Some(action)
+            }
+            Some(intent) => intent
+                .hardware_executor_action(self)
+                .map(|action| (self.selected_chain, action)),
+            None => None,
+        };
+        let executor_request = executor_action
+            .map(|(chain_id, action)| {
+                self.executor_owner_for_public_chain(chain_id)
+                    .ok_or_else(|| {
+                        Arc::<str>::from(
+                            "Open the wallet and chain before authorizing this account",
+                        )
+                    })?
+                    .hardware_authorization_request(Arc::clone(&view_session), action)
+                    .map_err(|error| Arc::<str>::from(error.to_string()))
+            })
+            .transpose()?;
+        let gas_payer = if let HardwareSpendAuthorizationCompletion::ExecutorWithGasPayer {
+            payer,
+            password,
+            seed_session,
+            ..
+        } = completion
+        {
+            Some((payer.clone(), password.clone(), seed_session.clone()))
+        } else {
+            None
+        };
         let trezor_app_passphrase =
             self.read_trezor_app_passphrase_for_hardware_session(&hardware_session, window, cx);
         let trezor_pin_matrix_provider =
@@ -1677,14 +1955,41 @@ impl WalletRoot {
             } else {
                 None
             };
-        Ok(self.runtime.spawn(derive_hardware_spend_authorization(
-            store,
-            view_session,
-            hardware_session,
-            descriptor,
-            trezor_app_passphrase,
-            trezor_pin_matrix_provider,
-        )))
+        Ok(self.runtime.spawn(async move {
+            let executor_request = if let Some((payer, password, seed_session)) = gas_payer {
+                let request = executor_request.ok_or_else(|| {
+                    HardwareSpendAuthorizationError::Executor(
+                        "Executor approval is unavailable".into(),
+                    )
+                })?;
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        request.with_gas_payer(payer, password, seed_session)
+                    })
+                    .await
+                    .map_err(|_| {
+                        HardwareSpendAuthorizationError::Executor(
+                            "Gas-payer authorization task failed. Try again.".into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        HardwareSpendAuthorizationError::Executor(error.to_string())
+                    })?,
+                )
+            } else {
+                executor_request
+            };
+            derive_hardware_spend_authorization(
+                store,
+                view_session,
+                hardware_session,
+                descriptor,
+                trezor_app_passphrase,
+                trezor_pin_matrix_provider,
+                executor_request,
+            )
+            .await
+        }))
     }
 
     fn valid_spend_authorization_password(
@@ -1839,6 +2144,35 @@ impl WalletRoot {
             return;
         }
         match intent {
+            SpendAuthorizationIntent::ExecutorGasPassword {
+                intent,
+                summary,
+                payer,
+            } => {
+                let seed_session = authorization.protected_seed_session();
+                let (DesktopPrivateSpendAuthorization::VaultPassword(password)
+                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. }) =
+                    authorization
+                else {
+                    self.set_vault_error(
+                        "Authorize the selected software gas payer with its vault password",
+                        cx,
+                    );
+                    return;
+                };
+                self.clear_spend_authorization(cx);
+                self.open_hardware_spend_authorization_dialog(
+                    HardwareSpendAuthorizationCompletion::ExecutorWithGasPayer {
+                        intent: *intent,
+                        payer,
+                        password,
+                        seed_session,
+                    },
+                    summary,
+                    window,
+                    cx,
+                );
+            }
             SpendAuthorizationIntent::StealthAccounts(view, command) => {
                 // The panel reads WalletRoot to validate its session. Release this update first.
                 window.defer(cx, move |window, cx| {
@@ -1970,53 +2304,24 @@ impl WalletRoot {
                 );
             }
             SpendAuthorizationIntent::PublicSend(draft) => {
-                let Ok((password, session)) = authorization.public_signing_parts() else {
-                    self.set_vault_error(
-                        "Public account spend authorization requires the vault password",
-                        cx,
-                    );
-                    return;
-                };
-                self.submit_public_send_authorized(*draft, password, session, window, cx);
+                self.submit_public_send_authorized(*draft, authorization, window, cx);
             }
             SpendAuthorizationIntent::PublicShield(draft) => {
-                let Ok((password, session)) = authorization.public_signing_parts() else {
-                    self.set_vault_error(
-                        "Public account spend authorization requires the vault password",
-                        cx,
-                    );
-                    return;
-                };
-                self.submit_public_shield_authorized(*draft, password, session, window, cx);
+                self.submit_public_shield_authorized(*draft, authorization, window, cx);
             }
             SpendAuthorizationIntent::Governance(draft) => {
-                let Ok((password, session)) = authorization.public_signing_parts() else {
-                    self.set_vault_error(
-                        "Governance Public-account authorization could not be retained safely",
-                        cx,
-                    );
-                    return;
-                };
-                self.revalidate_governance_authorized(&draft, password, session, window, cx);
+                self.revalidate_governance_authorized(&draft, authorization, window, cx);
             }
             SpendAuthorizationIntent::WalletConnectRequest {
                 request_key,
                 review_token,
                 reviewed_fee,
             } => {
-                let Ok((password, session)) = authorization.public_signing_parts() else {
-                    self.set_vault_error(
-                        "WalletConnect Public account authorization requires the vault password",
-                        cx,
-                    );
-                    return;
-                };
                 self.submit_walletconnect_request_authorized(
                     &request_key,
                     review_token,
                     reviewed_fee,
-                    password,
-                    session,
+                    authorization,
                     window,
                     cx,
                 );
@@ -2107,13 +2412,7 @@ impl WalletRoot {
 }
 
 pub(in crate::root) fn hardware_spend_authorization_instruction(device_label: &str) -> String {
-    format!(
-        "Use the intended {device_label} passphrase wallet, then approve the Railgun derivation request."
-    )
-}
-
-pub(in crate::root) const fn hardware_spend_authorization_detail() -> &'static str {
-    "Approve the Railgun derivation request on your hardware wallet to authorize this private spend."
+    format!("Approve the Railgun derivation request on your {device_label}.")
 }
 
 #[cfg(feature = "hardware")]
@@ -2123,6 +2422,7 @@ fn hardware_spend_authorization_error_message(error: &HardwareSpendAuthorization
             format!("Hardware spend authorization failed: {error}")
         }
         HardwareSpendAuthorizationError::Vault(error) => format!("Vault error: {error}"),
+        HardwareSpendAuthorizationError::Executor(error) => error.clone(),
     }
 }
 
@@ -2134,10 +2434,16 @@ async fn derive_hardware_spend_authorization(
     descriptor: HardwareDerivationDescriptor,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
+    executor_request: Option<wallet_ops::HardwareExecutorAuthorizationRequest>,
 ) -> Result<
     (DesktopPrivateSpendAuthorization, HardwareProfileSession),
     HardwareSpendAuthorizationError,
 > {
+    if let Some(request) = &executor_request {
+        request
+            .ensure_active()
+            .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
+    }
     hardware_session.verify_descriptor(&descriptor)?;
     let entropy = match descriptor.device_kind {
         HardwareDeviceKind::Ledger => {
@@ -2168,6 +2474,15 @@ async fn derive_hardware_spend_authorization(
             synthetic_entropy_from_hardware_output(&descriptor, output)?
         }
     };
+    if let Some(request) = executor_request {
+        let authorization = request
+            .complete(&descriptor, entropy.expose_secret())
+            .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
+        return Ok((
+            DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(authorization)),
+            hardware_session,
+        ));
+    }
     let signer = store.hardware_railgun_spend_signer_from_entropy(
         view_session.as_ref(),
         &descriptor,

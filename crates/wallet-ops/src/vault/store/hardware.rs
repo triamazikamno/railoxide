@@ -22,6 +22,46 @@ fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultE
 }
 
 impl DesktopVaultStore {
+    /// Validate the retained root without requesting spend material or creating allocation state.
+    pub(crate) fn validate_executor_source(
+        &self,
+        view: &DesktopViewSession,
+    ) -> Result<(), VaultError> {
+        let metadata = self.load_wallet_metadata_for_session(view)?;
+        if metadata.derivation_index != view.derivation_index() {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        if metadata.source.is_hardware_derived() {
+            let account = metadata
+                .hardware_account
+                .as_ref()
+                .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+            Self::ensure_supported_hardware_account(account)?;
+            let profile = view
+                .hardware_profile_session()
+                .ok_or(VaultError::HardwareWalletViewRequiresDevice)?;
+            profile.verify_account(account)?;
+            if metadata.source
+                != WalletSource::from_hardware_device_kind(account.descriptor.device_kind)
+                || metadata.hardware_descriptor.as_ref() != Some(&account.descriptor)
+                || account.account_index != view.derivation_index()
+                || account.account_identity.spending_public_key
+                    != view.spending_public_key().map(|key| key.to_be_bytes())
+                || account.account_identity.viewing_public_key
+                    != view.scan_keys().viewing_public_key
+            {
+                return Err(VaultError::HardwareWalletIdentityMismatch);
+            }
+        } else if view.hardware_profile_session().is_some()
+            || metadata.hardware_account.is_some()
+            || metadata.hardware_descriptor.is_some()
+            || metadata.software_context.is_none()
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        Ok(())
+    }
+
     pub fn store_hardware_derived_wallet_with_metadata(
         &self,
         password: &str,
@@ -163,17 +203,53 @@ impl DesktopVaultStore {
         descriptor: &HardwareDerivationDescriptor,
         entropy: &[u8],
     ) -> Result<SoftwareRailgunSpendSigner, VaultError> {
+        self.hardware_seed_and_signer_for_session(view_session, descriptor, entropy)
+            .map(|(_seed, signer)| signer)
+    }
+
+    /// Reconstruct the existing synthetic BIP-39 root after checking its custody
+    /// and identity. Native authorization owns the seed until account selection.
+    pub(crate) fn hardware_seed_and_signer_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        descriptor: &HardwareDerivationDescriptor,
+        entropy: &[u8],
+    ) -> Result<(zeroize::Zeroizing<[u8; 64]>, SoftwareRailgunSpendSigner), VaultError> {
         descriptor
             .validate()
             .map_err(|_| VaultError::InvalidHardwareWalletDescriptor)?;
-        if descriptor.account_index != view_session.derivation_index() {
+        let metadata =
+            self.load_wallet_metadata_with_view(&view_session.view, view_session.wallet_id())?;
+        let account = metadata
+            .hardware_account
+            .as_ref()
+            .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+        Self::ensure_supported_hardware_account(account)?;
+        let profile = view_session
+            .hardware_profile_session()
+            .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+        profile.verify_account(account)?;
+        if metadata.source != WalletSource::from_hardware_device_kind(descriptor.device_kind)
+            || metadata.hardware_descriptor.as_ref() != Some(descriptor)
+            || account.descriptor != *descriptor
+            || descriptor.account_index != view_session.derivation_index()
+        {
             return Err(VaultError::HardwareWalletIdentityMismatch);
         }
-        let wallet = WalletKeys::from_bip39_entropy(entropy, descriptor.account_index)?;
-        if wallet.spending_public_key != view_session.spending_public_key() {
+        // The hardware passphrase is already part of the device context.
+        let mnemonic =
+            zeroize::Zeroizing::new(railgun_wallet::bip39_mnemonic_from_entropy(entropy)?);
+        let seed = crate::vault::bip39_seed_from_mnemonic(&mnemonic, "")?;
+        let signer = SoftwareRailgunSpendSigner {
+            wallet: WalletKeys::from_seed(&seed, descriptor.account_index)?,
+        };
+        if signer.wallet.spending_public_key != view_session.spending_public_key()
+            || HardwareRailgunAccountIdentity::from_wallet_keys(&signer.wallet)
+                != account.account_identity
+        {
             return Err(VaultError::HardwareWalletIdentityMismatch);
         }
-        Ok(SoftwareRailgunSpendSigner { wallet })
+        Ok((seed, signer))
     }
 
     pub fn list_hardware_wallet_profiles(

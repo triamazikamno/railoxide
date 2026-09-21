@@ -16,7 +16,7 @@ use crate::public_wallet::{
     PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
     PublicSendRequest, PublicSendResult, PublicTransactionIntent, VaultedPublicSigner,
-    admitted_public_signer, estimate_public_advanced_transaction_with_fee,
+    admitted_public_signer_authorized, estimate_public_advanced_transaction_with_fee,
     simulate_public_advanced_transaction_with_fee, submit_public_action_step_with_signer,
 };
 use crate::settings::EffectiveChainConfig;
@@ -663,15 +663,11 @@ pub async fn submit_governance_action_with_progress(
         Some(&request.estimate),
     )
     .map_err(|error| eyre!(error))?;
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.public_send.vault_store,
         &request.public_send.view_session,
-        Some(request.public_send.vault_password.as_str()),
+        request.public_send.authorization.as_ref(),
         &request.public_send.public_account_uuid,
-        request
-            .public_send
-            .protected_software_seed_session
-            .as_deref(),
         request.public_send.trezor_app_passphrase,
         request.public_send.trezor_pin_matrix_provider,
         request.public_send.executor_owner.as_ref(),
@@ -787,15 +783,11 @@ pub async fn submit_governance_workflow_with_progress(
     validate_governance_workflow(&request.initial, &request.workflow)
         .map_err(|error| eyre!(error))?;
     let GovernanceWorkflowRequest { initial, workflow } = request;
-    let signer: VaultedPublicSigner = admitted_public_signer(
+    let signer: VaultedPublicSigner = admitted_public_signer_authorized(
         &initial.public_send.vault_store,
         &initial.public_send.view_session,
-        Some(initial.public_send.vault_password.as_str()),
+        initial.public_send.authorization.as_ref(),
         &initial.public_send.public_account_uuid,
-        initial
-            .public_send
-            .protected_software_seed_session
-            .as_deref(),
         initial.public_send.trezor_app_passphrase,
         initial.public_send.trezor_pin_matrix_provider,
         initial.public_send.executor_owner.as_ref(),

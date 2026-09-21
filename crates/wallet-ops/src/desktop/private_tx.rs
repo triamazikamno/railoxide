@@ -105,8 +105,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         let transaction = issue_desktop_executor_plan(
             request.session,
             request.executor,
-            &request.spend_authorization,
-            request.vault_store,
+            request.spend_authorization,
             &plan,
         )
         .await?;
@@ -159,7 +158,6 @@ pub(super) async fn issue_desktop_executor_plan(
     session: &WalletSession,
     prepared: Option<&PreparedExecutorOperation>,
     authorization: &DesktopPrivateSpendAuthorization,
-    vault: &vault::DesktopVaultStore,
     plan: &DesktopUnshieldPreparedPlan,
 ) -> Result<Option<TransactionRequest>> {
     let Some(prepared) = prepared else {
@@ -168,7 +166,6 @@ pub(super) async fn issue_desktop_executor_plan(
     let owner = session
         .executor_owner()
         .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?;
-    let (mut grant, protected_seed) = authorization.executor_spend_grant(vault)?;
     let issued = owner
         .issue_operation(
             prepared,
@@ -177,8 +174,7 @@ pub(super) async fn issue_desktop_executor_plan(
                 data: plan.call_data(),
             },
             &plan.input_utxos(),
-            &mut grant,
-            protected_seed,
+            authorization,
         )
         .await?;
     Ok(Some(issued.transaction().clone()))
@@ -692,11 +688,10 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
     let selection_info = send_selection_info(&utxos, request.token, request.amount, false)
         .wrap_err("select POI-verified send notes")?;
 
-    let signer = request.spend_authorization.into_signer(
-        request.vault_store,
-        request.view_session,
-        "send",
-    )?;
+    let signer =
+        request
+            .spend_authorization
+            .signer(request.vault_store, request.view_session, "send")?;
 
     let tx_builder = TransactionBuilder {
         chain_type: 0,
@@ -876,7 +871,7 @@ pub async fn prepare_desktop_unshield_calldata(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            spend_authorization: request.spend_authorization,
+            spend_authorization: &request.spend_authorization,
             token: request.token,
             amount: request.amount,
             fee_mode: request.fee_mode,
@@ -931,7 +926,7 @@ pub async fn prepare_desktop_send_calldata(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            spend_authorization: request.spend_authorization,
+            spend_authorization: &request.spend_authorization,
             token: request.token,
             amount: request.amount,
             recipient: &recipient,
@@ -2053,6 +2048,9 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
     request: DesktopSponsoredSendSelfBroadcastRequest,
     http: &HttpContext,
 ) -> Result<DesktopSponsoredSelfBroadcastResult> {
+    let (spend_authorization, gas_payer_authorization) = request
+        .spend_authorization
+        .split_hardware_gas_payment(&request.view_session)?;
     let prepared = prepare_desktop_sponsored_send_calldata(
         DesktopSponsoredSendCalldataRequest {
             chain_id: request.chain_id,
@@ -2060,7 +2058,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             view_session: Arc::clone(&request.view_session),
             session: Arc::clone(&request.session),
             vault_store: Arc::clone(&request.vault_store),
-            spend_authorization: request.spend_authorization,
+            spend_authorization,
             public_account_uuid: request.public_account_uuid.clone(),
             token: request.token,
             amount: request.amount,
@@ -2082,6 +2080,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             view_session: request.view_session,
             session: request.session,
             vault_store: request.vault_store,
+            gas_payer_authorization,
             vault_password: request.vault_password,
             protected_software_seed_session: request.protected_software_seed_session,
             trezor_pin_matrix_provider: request.trezor_pin_matrix_provider,
@@ -2101,6 +2100,9 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
     request: DesktopSponsoredUnshieldSelfBroadcastRequest,
     http: &HttpContext,
 ) -> Result<DesktopSponsoredSelfBroadcastResult> {
+    let (spend_authorization, gas_payer_authorization) = request
+        .spend_authorization
+        .split_hardware_gas_payment(&request.view_session)?;
     let prepared = prepare_desktop_sponsored_unshield_calldata(
         DesktopSponsoredUnshieldCalldataRequest {
             chain_id: request.chain_id,
@@ -2108,7 +2110,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             view_session: Arc::clone(&request.view_session),
             session: Arc::clone(&request.session),
             vault_store: Arc::clone(&request.vault_store),
-            spend_authorization: request.spend_authorization,
+            spend_authorization,
             public_account_uuid: request.public_account_uuid.clone(),
             token: request.token,
             amount: request.amount,
@@ -2133,6 +2135,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             view_session: request.view_session,
             session: request.session,
             vault_store: request.vault_store,
+            gas_payer_authorization,
             vault_password: request.vault_password,
             protected_software_seed_session: request.protected_software_seed_session,
             trezor_pin_matrix_provider: request.trezor_pin_matrix_provider,
@@ -2299,7 +2302,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.fee_mode,
         RAILGUN_PROTOCOL_FEE_BPS,
         min_gas_price,
-        request.approved_fee_amount.unwrap_or(initial_fee_amount),
+        initial_fee_amount,
         request.custom_fee_amount,
         |split| {
             if let Some(native_top_up) = &native_top_up {
@@ -2723,7 +2726,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            spend_authorization: request.spend_authorization,
+            spend_authorization: &request.spend_authorization,
             token: request.token,
             amount: request.amount,
             fee_mode: request.fee_mode,
@@ -2781,6 +2784,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             .as_ref()
             .map(|password| password.as_str()),
         request.protected_software_seed_session.as_deref(),
+        Some(request.spend_authorization),
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
@@ -2830,6 +2834,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.vault_store.as_ref(),
         Some(request.vault_password.as_str()),
         request.protected_software_seed_session.as_deref(),
+        None,
         request.trezor_pin_matrix_provider,
         prepared.public_account_uuid,
         Arc::clone(&request.session),
@@ -2859,7 +2864,7 @@ pub async fn submit_desktop_send_self_broadcast(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            spend_authorization: request.spend_authorization,
+            spend_authorization: &request.spend_authorization,
             token: request.token,
             amount: request.amount,
             recipient: &recipient,
@@ -2901,6 +2906,7 @@ pub async fn submit_desktop_send_self_broadcast(
             .as_ref()
             .map(|password| password.as_str()),
         request.protected_software_seed_session.as_deref(),
+        Some(request.spend_authorization),
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),

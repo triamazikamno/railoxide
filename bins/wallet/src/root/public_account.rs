@@ -2017,6 +2017,11 @@ impl WalletRoot {
             );
 
         if let PublicAccountSource::ExecutorDerived(source) = account.source {
+            if self.selected_wallet_source().is_hardware_derived() {
+                account_content = account_content.child(
+                    app_muted_text("Signing requires fresh hardware derivation. This app then uses a temporary software EVM key; the device does not sign the EVM transaction.").whitespace_normal(),
+                );
+            }
             let history_root = root.clone();
             account_content = account_content.child(
                 app_button(

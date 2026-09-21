@@ -60,18 +60,19 @@ impl ExecutorOwner {
             .into_iter()
             .find(|record| record.operation() == operation)
             .ok_or_else(|| eyre!("saved account is unavailable"))?;
-        let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
-        let (_, signer) = self.vault.executor_spend_signers_for_session(
-            &mut grant,
-            &self.view,
-            seed,
-            self.chain.chain_id,
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &super::HardwareExecutorAction::Register(record.operation()),
+            record.operation(),
             record.index(),
         )?;
         self.ensure_active()?;
         let account = self
             .store
             .register_public_account(operation, signer.address())?;
+        if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+            hardware.consume()?;
+        }
         self.notify_change();
         Ok(account)
     }
@@ -82,6 +83,79 @@ impl ExecutorOwner {
         account: &PublicAccountMetadata,
         grant: &mut crate::vault::SpendGrant,
         seed: Option<&crate::vault::ProtectedSoftwareSeedSession>,
+    ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
+        self.admit_public_signer_with(view, account, |source| {
+            self.vault
+                .executor_spend_signers_for_session(
+                    grant,
+                    &self.view,
+                    seed,
+                    source.chain_id(),
+                    source.index(),
+                )
+                .map(|(_, signer)| signer)
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub(crate) async fn admit_authorized_public_signer(
+        self: &Arc<Self>,
+        view: &DesktopViewSession,
+        account: &PublicAccountMetadata,
+        authorization: &DesktopPrivateSpendAuthorization,
+    ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
+        let admitted = self
+            .admit_public_signer_with(view, account, |source| {
+                self.authorized_executor_signer(
+                    authorization,
+                    &super::HardwareExecutorAction::Public {
+                        account: account.public_account_uuid.clone(),
+                        operation: source.operation(),
+                    },
+                    source.operation(),
+                    source.index(),
+                )
+            })
+            .await?;
+        if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+            hardware.consume()?;
+        }
+        Ok(admitted)
+    }
+
+    pub(crate) async fn admit_authorized_gas_signer(
+        self: &Arc<Self>,
+        view: &DesktopViewSession,
+        account: &PublicAccountMetadata,
+        authorization: &DesktopPrivateSpendAuthorization,
+    ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
+        let admitted = self
+            .admit_public_signer_with(view, account, |source| {
+                self.authorized_executor_signer(
+                    authorization,
+                    &super::HardwareExecutorAction::GasPayment {
+                        account: account.public_account_uuid.clone(),
+                        operation: source.operation(),
+                    },
+                    source.operation(),
+                    source.index(),
+                )
+            })
+            .await?;
+        if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+            hardware.consume()?;
+        }
+        Ok(admitted)
+    }
+
+    async fn admit_public_signer_with(
+        self: &Arc<Self>,
+        view: &DesktopViewSession,
+        account: &PublicAccountMetadata,
+        derive: impl FnOnce(
+            crate::vault::ExecutorPublicAccountSource,
+        ) -> Result<alloy::signers::local::PrivateKeySigner>,
     ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
         self.ensure_active()?;
         let activity = self.activity.clone().lock_owned().await;
@@ -97,7 +171,7 @@ impl ExecutorOwner {
         let PublicAccountSource::ExecutorDerived(source) = account.source else {
             return Err(eyre!("Public account has no saved derivation reference"));
         };
-        if !std::ptr::eq(view, self.view.as_ref())
+        if !view.is_same_wallet_session(&self.view)
             || source.chain_id() != self.chain.chain_id
             || account.scope
                 != (PublicAccountScope::PrivateWallet {
@@ -147,13 +221,7 @@ impl ExecutorOwner {
                 .await?;
             require_resolved_public_work(&current)?;
         }
-        let (_, signer) = self.vault.executor_spend_signers_for_session(
-            grant,
-            &self.view,
-            seed,
-            source.chain_id(),
-            source.index(),
-        )?;
+        let signer = derive(source)?;
         if signer.address() != account.address {
             return Err(eyre!("Public account signing identity changed"));
         }

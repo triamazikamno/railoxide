@@ -2171,10 +2171,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_send_authorized(
         &mut self,
         draft: PublicSendDraft,
-        vault_password: Zeroizing<String>,
-        protected_software_seed_session: Option<
-            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
-        >,
+        spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2198,7 +2195,7 @@ impl WalletRoot {
                 || !self
                     .view_session
                     .as_ref()
-                    .is_some_and(|wallet| Arc::ptr_eq(wallet, &draft.view_session))
+                    .is_some_and(|wallet| wallet.is_same_wallet_session(&draft.view_session))
             {
                 execution.finish(false);
                 return;
@@ -2297,8 +2294,7 @@ impl WalletRoot {
             effective_chain: resolved_chain,
             view_session,
             vault_store,
-            vault_password,
-            protected_software_seed_session,
+            authorization: Some(spend_authorization),
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),
@@ -2547,10 +2543,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_shield_authorized(
         &mut self,
         draft: PublicShieldDraft,
-        vault_password: Zeroizing<String>,
-        protected_software_seed_session: Option<
-            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
-        >,
+        spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2574,7 +2567,7 @@ impl WalletRoot {
                 || !self
                     .view_session
                     .as_ref()
-                    .is_some_and(|wallet| Arc::ptr_eq(wallet, &draft.view_session))
+                    .is_some_and(|wallet| wallet.is_same_wallet_session(&draft.view_session))
             {
                 execution.finish(false);
                 return;
@@ -2674,8 +2667,7 @@ impl WalletRoot {
             effective_chain: resolved_chain,
             view_session,
             vault_store,
-            vault_password,
-            protected_software_seed_session,
+            authorization: Some(spend_authorization),
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),

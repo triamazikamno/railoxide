@@ -783,8 +783,12 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
-            vault_password: Zeroizing::new("wrong password".to_owned()),
-            protected_software_seed_session: None,
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new("wrong password".to_owned()),
+                    None,
+                ),
+            ),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: account.public_account_uuid.clone(),
@@ -802,8 +806,12 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
-                vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-                protected_software_seed_session: None,
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_owned()),
+                        None,
+                    ),
+                ),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -867,8 +875,12 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
-                vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-                protected_software_seed_session: None,
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_owned()),
+                        None,
+                    ),
+                ),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -936,8 +948,12 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
                 request_control: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
-                vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-                protected_software_seed_session: None,
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_owned()),
+                        None,
+                    ),
+                ),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -985,8 +1001,12 @@ fn walletconnect_typed_data_signing_error_preserves_method_label() {
                     request_control: None,
                     view_session: Arc::clone(&view_session),
                     vault_store: Arc::clone(&store),
-                    vault_password: Zeroizing::new("wrong password".to_owned()),
-                    protected_software_seed_session: None,
+                    authorization: Some(
+                        crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                            Zeroizing::new("wrong password".to_owned()),
+                            None,
+                        ),
+                    ),
                     trezor_app_passphrase: None,
                     trezor_pin_matrix_provider: None,
                     public_account_uuid: account.public_account_uuid.clone(),
@@ -2684,8 +2704,12 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
             effective_chain: default_effective_chain(1),
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
-            vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
-            protected_software_seed_session: None,
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new(TEST_PASSWORD.to_string()),
+                    None,
+                ),
+            ),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: "unused".to_string(),
@@ -2719,8 +2743,12 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                 effective_chain: chain,
                 view_session: view_session.clone(),
                 vault_store: store.clone(),
-                vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
-                protected_software_seed_session: None,
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_string()),
+                        None,
+                    ),
+                ),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: "unused".to_string(),
@@ -2921,8 +2949,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
             request_control: None,
             vault_store: store.clone(),
             view_session: Arc::new(hardware_view_session),
-            vault_password: Zeroizing::new(TEST_PASSWORD.into()),
-            protected_software_seed_session: None,
+            authorization: Some(crate::DesktopPrivateSpendAuthorization::from_software_credentials(Zeroizing::new(TEST_PASSWORD.into()), None)),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: hardware_public.public_account_uuid,
@@ -3021,8 +3048,12 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
-            vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-            protected_software_seed_session: None,
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    None,
+                ),
+            ),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: public_account.public_account_uuid.clone(),
@@ -3059,8 +3090,12 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
             request_control: None,
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
-            vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-            protected_software_seed_session: Some(wrong_session),
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    Some(wrong_session),
+                ),
+            ),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: public_account.public_account_uuid.clone(),
@@ -3078,8 +3113,12 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
                 request_control: None,
                 view_session,
                 vault_store: store,
-                vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
-                protected_software_seed_session: Some(protected_seed_session),
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_owned()),
+                        Some(protected_seed_session),
+                    ),
+                ),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: public_account.public_account_uuid,
@@ -3565,8 +3604,12 @@ async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
         request_control: Some(control.clone()),
         view_session: view_session.clone(),
         vault_store: store.clone(),
-        vault_password: Zeroizing::new("wrong password".into()),
-        protected_software_seed_session: None,
+        authorization: Some(
+            crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                Zeroizing::new("wrong password".into()),
+                None,
+            ),
+        ),
         trezor_app_passphrase: None,
         trezor_pin_matrix_provider: None,
         public_account_uuid: "missing".into(),
@@ -3581,8 +3624,12 @@ async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
         request_control: Some(control),
         view_session: view_session.clone(),
         vault_store: store.clone(),
-        vault_password: Zeroizing::new("wrong password".into()),
-        protected_software_seed_session: None,
+        authorization: Some(
+            crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                Zeroizing::new("wrong password".into()),
+                None,
+            ),
+        ),
         trezor_app_passphrase: None,
         trezor_pin_matrix_provider: None,
         public_account_uuid: "missing".into(),
@@ -3687,15 +3734,16 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
                 effective_chain: chain,
                 view_session: view_session.clone(),
                 vault_store: store.clone(),
-                vault_password: Zeroizing::new(
-                    if matches!(phase, InvalidateAt::Entry) {
-                        "wrong password"
-                    } else {
-                        TEST_PASSWORD
-                    }
-                    .into(),
-                ),
-                protected_software_seed_session: None,
+                authorization: Some(crate::DesktopPrivateSpendAuthorization::VaultPassword(
+                    Zeroizing::new(
+                        if matches!(phase, InvalidateAt::Entry) {
+                            "wrong password"
+                        } else {
+                            TEST_PASSWORD
+                        }
+                        .into(),
+                    ),
+                )),
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid.clone(),

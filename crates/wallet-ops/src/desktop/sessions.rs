@@ -203,29 +203,27 @@ impl WalletSessionStore {
 
         let mut session =
             wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await?;
-        if executor_view.hardware_profile_session().is_none() {
-            let chain = executor_chain;
-            if chain.chain_id != chain_id {
-                session.stop().await?;
-                return Err(eyre!(
-                    "executor configuration does not match the wallet chain"
-                ));
+        let chain = executor_chain;
+        if chain.chain_id != chain_id {
+            session.stop().await?;
+            return Err(eyre!(
+                "executor configuration does not match the wallet chain"
+            ));
+        }
+        let owner =
+            self.create_executor_owner(executor_generation, executor_view, chain, http.clone());
+        match owner {
+            Ok(owner) => {
+                owner.start_tip_observation(session.sync_tip_rx.clone());
+                owner.start_confirmation_observation(
+                    session.handle.clone(),
+                    session.sync_tip_rx.clone(),
+                );
+                session.executor_owner = Some(owner);
             }
-            let owner =
-                self.create_executor_owner(executor_generation, executor_view, chain, http.clone());
-            match owner {
-                Ok(owner) => {
-                    owner.start_tip_observation(session.sync_tip_rx.clone());
-                    owner.start_confirmation_observation(
-                        session.handle.clone(),
-                        session.sync_tip_rx.clone(),
-                    );
-                    session.executor_owner = Some(owner);
-                }
-                Err(error) => {
-                    session.stop().await?;
-                    return Err(error);
-                }
+            Err(error) => {
+                session.stop().await?;
+                return Err(error);
             }
         }
         Ok(session)

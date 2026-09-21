@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr, eyre};
 use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
 use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
-use super::signer::admitted_public_signer;
+use super::signer::admitted_public_signer_authorized;
 use super::submission::{
     emit_public_action_event, emit_refreshed_public_action_hardware_session,
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
@@ -38,12 +38,11 @@ pub async fn submit_public_send_with_progress(
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_public_transaction_intent(&request.intent)?;
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
-        Some(request.vault_password.as_str()),
+        request.authorization.as_ref(),
         &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
@@ -241,12 +240,11 @@ pub async fn submit_public_shield_with_progress(
     let railgun_addr = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
     let addr_data = broadcaster_core::crypto::railgun::AddressData::try_from(&railgun_addr)
         .wrap_err("invalid selected private wallet receive address")?;
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
-        Some(request.vault_password.as_str()),
+        request.authorization.as_ref(),
         &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),

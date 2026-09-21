@@ -886,7 +886,7 @@ fn public_broadcaster_fee_stabilization_buffers_retries() {
 }
 
 #[test]
-fn executor_quote_refresh_consumes_approved_fee_cushion_before_increasing_the_quote() {
+fn executor_quote_refresh_keeps_payment_separate_from_approval_allowance() {
     let token = address(0x25);
     let entered = uint!(10_000_000_000_000_U256);
     for (fee_token, mode) in [
@@ -928,21 +928,36 @@ fn executor_quote_refresh_consumes_approved_fee_cushion_before_increasing_the_qu
             .unwrap()
         };
         let approved = estimate(100_000, U256::ZERO);
-        // Re-applying the cushion after a 0.5% price move needlessly exceeds approval.
-        assert!(estimate(100_500, U256::ZERO).fee_amount > approved.fee_amount);
-        for price in [100_500, 101_000] {
-            let refreshed = estimate(price, approved.fee_amount);
-            assert_eq!(refreshed.fee_amount, approved.fee_amount);
-            assert_eq!(refreshed.recipient_amount, approved.recipient_amount);
-            assert_eq!(refreshed.total_private_spend, approved.total_private_spend);
+        let maximum = approved.fee_amount + approved.fee_amount / U256::from(4);
+        let bounds = approved.approval_bounds(maximum).unwrap();
+        for price in [90_000, 100_000, 112_500, 125_000] {
+            let refreshed = estimate(price, U256::ZERO);
+            assert!(bounds.covers(&refreshed));
+            if price == 100_000 {
+                // Merely approving more must not increase either the fee or the debit.
+                assert_eq!(refreshed.fee_amount, approved.fee_amount);
+                assert_eq!(refreshed.recipient_amount, approved.recipient_amount);
+                assert_eq!(refreshed.total_private_spend, approved.total_private_spend);
+                assert!(refreshed.fee_amount < bounds.maximum_fee());
+            }
+            let required = broadcaster_fee_amount(
+                refreshed.broadcaster.fee,
+                refreshed.gas_limit,
+                crate::public_broadcaster_service_gas_price(refreshed.min_gas_price),
+            );
+            assert_eq!(
+                crate::desktop::bounded_public_broadcaster_fee(
+                    required,
+                    Some(bounds.maximum_fee())
+                )
+                .unwrap(),
+                refreshed.fee_amount,
+            );
         }
-        let exceeded = estimate(101_001, approved.fee_amount);
-        assert!(exceeded.fee_amount > approved.fee_amount);
-        if fee_token == token && mode == FeeHandlingMode::DeductFromAmount {
-            assert!(exceeded.recipient_amount < approved.recipient_amount);
-        } else if mode == FeeHandlingMode::AddToAmount {
-            assert!(exceeded.total_private_spend > approved.total_private_spend);
-        }
+        let exceeded = estimate(125_001, U256::ZERO);
+        assert!(!bounds.covers(&exceeded));
+        // A refresh near the limit must not grant a second 25% increase.
+        assert!(!bounds.covers(&estimate(140_000, U256::ZERO)));
     }
 }
 
@@ -1437,38 +1452,6 @@ fn public_broadcaster_bound_min_gas_price_is_zero_on_arbitrum() {
     assert_eq!(
         public_broadcaster_bound_min_gas_price(1, 21_000_000),
         21_000_000
-    );
-}
-
-#[tokio::test]
-async fn executor_submission_keeps_reviewed_gas_price_without_a_gas_quote_rpc() {
-    use broadcaster_core::query_rpc_pool::QueryRpcPool;
-
-    let chain =
-        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
-            .unwrap()
-            .get(1)
-            .cloned()
-            .unwrap();
-    // Submission must not need a gas-price endpoint once the quote is reviewed.
-    let pool = QueryRpcPool::with_http_client(
-        Vec::new(),
-        Duration::from_secs(30),
-        crate::HttpContext::direct_for_tests().rpc_client,
-    );
-    let price =
-        crate::desktop::public_broadcaster_submission_gas_price(Some(100), &pool, &chain.gas)
-            .await
-            .unwrap();
-    assert_eq!(
-        price, 100,
-        "the reviewed price must not be refreshed or buffered again"
-    );
-    assert!(
-        crate::desktop::public_broadcaster_submission_gas_price(None, &pool, &chain.gas)
-            .await
-            .is_err(),
-        "a new quote still requires a gas-price endpoint"
     );
 }
 

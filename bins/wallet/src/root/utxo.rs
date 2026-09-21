@@ -429,7 +429,9 @@ impl WalletRoot {
                 | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
                     password
                 }
-                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
+                | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                | DesktopPrivateSpendAuthorization::HardwarePublic => {
                     tracing::warn!(
                         "blocked Shield refund self-broadcast requested without gas-payer password"
                     );

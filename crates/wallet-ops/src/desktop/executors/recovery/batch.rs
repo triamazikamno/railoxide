@@ -34,6 +34,8 @@ impl ExecutorOwner {
         self.ensure_active()?;
         let guard = self.lock_activity().await;
         let record = self.validate_recovery(prepared)?;
+        let action = self.recovery_authorization_action(authorization, prepared)?;
+        self.require_executor_authorization(authorization, &action)?;
         let ExecutorRecoveryExecution::SignedMulticall { nonce } = prepared.execution else {
             return Err(eyre!(
                 "this recovery was not reviewed as a signed multicall"
@@ -77,12 +79,10 @@ impl ExecutorOwner {
             &prepared.funding,
             &prepared.gas_limits,
         )?;
-        let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
-        let (_, signer) = self.vault.executor_spend_signers_for_session(
-            &mut grant,
-            &self.view,
-            seed,
-            self.chain.chain_id,
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &action,
+            record.operation(),
             record.index(),
         )?;
         if signer.address() != prepared.source {
@@ -124,6 +124,9 @@ impl ExecutorOwner {
                 ExecutorPayloadContext::new(calldata.into(), observed, Vec::new()),
             ),
         )?;
+        if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+            hardware.consume()?;
+        }
         self.notify_change();
         let mut handoff = |transaction_hash, _: &TransactionRequest| {
             self.validate_recovery(prepared)?;

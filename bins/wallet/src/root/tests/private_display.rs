@@ -333,13 +333,11 @@ fn reusable_spend_authorization_warning_matches_lifetime() {
 #[test]
 fn hardware_spend_authorization_copy_uses_concise_device_language() {
     let copy = crate::root::spend_authorization::hardware_spend_authorization_instruction("Ledger");
-    let detail = crate::root::spend_authorization::hardware_spend_authorization_detail();
 
-    assert!(copy.contains("intended Ledger passphrase wallet"));
-    assert!(copy.contains("approve the Railgun derivation request"));
+    assert!(copy.contains("Ledger"));
+    assert!(copy.contains("Railgun derivation request"));
+    assert!(!copy.contains("passphrase wallet"));
     assert!(!copy.contains("Remembered spend authorization"));
-    assert!(detail.contains("hardware wallet"));
-    assert!(!detail.contains("vault password"));
 }
 
 #[test]

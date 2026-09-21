@@ -391,8 +391,12 @@ async fn executor_public_message_signing_requires_the_original_passphrase_sessio
             request_control: None,
             view_session: view.clone(),
             vault_store: vault.clone(),
-            vault_password: Zeroizing::new(TEST_PASSWORD.into()),
-            protected_software_seed_session: with_seed.then(|| protected.clone()),
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new(TEST_PASSWORD.into()),
+                    with_seed.then(|| protected.clone()),
+                ),
+            ),
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: account.public_account_uuid.clone(),

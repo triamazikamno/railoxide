@@ -224,8 +224,6 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub custom_fee_amount: Option<U256>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
     pub executor_maximum_private_fee: Option<U256>,
-    /// Buffered gas price from the same reviewed quote as the maximum private fee.
-    pub executor_min_gas_price: Option<u128>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -279,9 +277,6 @@ pub struct DesktopSendPublicBroadcasterRequest {
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub custom_fee_amount: Option<U256>,
-    /// Start automatic preparation estimates at this approved fee, consuming its
-    /// existing cushion. An insufficient fee produces a higher quote for review.
-    pub approved_fee_amount: Option<U256>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
@@ -342,6 +337,65 @@ pub struct PublicBroadcasterCostEstimate {
     pub relay_call_count: usize,
     pub uses_relay_adapt: bool,
     pub native_top_up: Option<DesktopNativeTopUpPlan>,
+}
+
+/// Reviewed spending limits, separate from the fee placed in the transaction.
+#[derive(Clone, Copy)]
+pub struct PublicBroadcasterApprovalBounds {
+    maximum_fee: U256,
+    minimum_recipient_amount: U256,
+    maximum_private_spend: U256,
+}
+
+impl PublicBroadcasterApprovalBounds {
+    #[must_use]
+    pub const fn maximum_fee(self) -> U256 {
+        self.maximum_fee
+    }
+
+    #[must_use]
+    pub const fn minimum_recipient_amount(self) -> U256 {
+        self.minimum_recipient_amount
+    }
+
+    #[must_use]
+    pub fn covers(self, quote: &PublicBroadcasterCostEstimate) -> bool {
+        quote.fee_amount <= self.maximum_fee
+            && quote.recipient_amount >= self.minimum_recipient_amount
+            && quote.total_private_spend <= self.maximum_private_spend
+    }
+}
+
+impl PublicBroadcasterCostEstimate {
+    /// Calculate approval limits without changing this quote or its payment amount.
+    pub fn approval_bounds(&self, maximum_fee: U256) -> Result<PublicBroadcasterApprovalBounds> {
+        let same_token_fee = self.action_token == self.fee_token;
+        // Deducted fees must leave a positive unshield amount.
+        let maximum_fee = if same_token_fee && self.fee_mode == FeeHandlingMode::DeductFromAmount {
+            maximum_fee.min(self.entered_amount.saturating_sub(U256::ONE))
+        } else {
+            maximum_fee
+        };
+        let split = public_broadcaster_amount_split_for_tokens_and_protocol(
+            self.entered_amount,
+            maximum_fee,
+            self.fee_mode,
+            same_token_fee,
+            self.protocol_fee_bps,
+        )?;
+        let amounts = public_broadcaster_reported_amounts(
+            self.action_token,
+            self.fee_token,
+            split,
+            self.protocol_fee_bps,
+            self.native_top_up.as_ref(),
+        );
+        Ok(PublicBroadcasterApprovalBounds {
+            maximum_fee,
+            minimum_recipient_amount: amounts.recipient_amount,
+            maximum_private_spend: amounts.total_private_spend,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,7 +670,7 @@ pub(super) struct DesktopUnshieldPlanRequest<'a> {
     pub(super) view_session: &'a vault::DesktopViewSession,
     pub(super) session: &'a WalletSession,
     pub(super) vault_store: &'a vault::DesktopVaultStore,
-    pub(super) spend_authorization: DesktopPrivateSpendAuthorization,
+    pub(super) spend_authorization: &'a DesktopPrivateSpendAuthorization,
     pub(super) token: Address,
     pub(super) amount: U256,
     pub(super) fee_mode: FeeHandlingMode,
@@ -633,7 +687,7 @@ pub(super) struct DesktopSendPlanRequest<'a> {
     pub(super) view_session: &'a vault::DesktopViewSession,
     pub(super) session: &'a WalletSession,
     pub(super) vault_store: &'a vault::DesktopVaultStore,
-    pub(super) spend_authorization: DesktopPrivateSpendAuthorization,
+    pub(super) spend_authorization: &'a DesktopPrivateSpendAuthorization,
     pub(super) token: Address,
     pub(super) amount: U256,
     pub(super) recipient: &'a str,
@@ -1867,7 +1921,6 @@ pub(super) async fn public_broadcaster_setup(
     selection: &PublicBroadcasterSelection,
     require_relay_adapt: bool,
     executor_delivery: Option<&ExecutorDelivery>,
-    reviewed_min_gas_price: Option<u128>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
@@ -1891,12 +1944,8 @@ pub(super) async fn public_broadcaster_setup(
         executor_delivery,
     )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
-    let min_gas_price = public_broadcaster_submission_gas_price(
-        reviewed_min_gas_price,
-        &query_rpc_pool,
-        &chain.gas,
-    )
-    .await?;
+    // Refresh after approval, then keep this price stable while building the proof.
+    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let artifact_source = artifact_source(http, session.db.as_ref())?;
     let prover = ProverService::new_with_db(&artifact_source, &session.db);
     let chain_handle = session
@@ -1917,19 +1966,6 @@ pub(super) async fn public_broadcaster_setup(
         forest,
         utxos,
     })
-}
-
-/// Keep the price approved with the fee ceiling through proving and gas estimation.
-/// Requests without a reviewed quote retain automatic gas pricing.
-pub(crate) async fn public_broadcaster_submission_gas_price(
-    reviewed: Option<u128>,
-    query_rpc_pool: &QueryRpcPool,
-    gas: &settings::EffectiveChainGasSettings,
-) -> Result<u128> {
-    match reviewed {
-        Some(price) => Ok(price),
-        None => buffered_gas_price_from_rpc_pool(query_rpc_pool, gas).await,
-    }
 }
 
 pub(crate) const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {

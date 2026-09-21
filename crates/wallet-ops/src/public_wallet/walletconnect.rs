@@ -1,7 +1,9 @@
 use eyre::{Result, WrapErr, eyre};
 
 use super::runtime::verified_public_chain_runtime_config;
-use super::signer::{VaultedPublicSigner, admitted_public_signer, vaulted_public_signer};
+use super::signer::{
+    VaultedPublicSigner, admitted_public_signer_authorized, vaulted_public_signer,
+};
 use super::submission::{
     PublicActionPreflightMode, emit_public_action_event,
     emit_refreshed_public_action_hardware_session,
@@ -29,12 +31,11 @@ pub async fn walletconnect_sign_personal_message(
     if let Some(control) = request.request_control.as_ref() {
         control.ensure_current()?;
     }
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
-        Some(request.vault_password.as_str()),
+        request.authorization.as_ref(),
         &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
@@ -102,12 +103,11 @@ pub async fn walletconnect_sign_typed_data(
     if let Some(control) = request.request_control.as_ref() {
         control.ensure_current()?;
     }
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
-        Some(request.vault_password.as_str()),
+        request.authorization.as_ref(),
         &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
@@ -249,12 +249,11 @@ pub async fn submit_walletconnect_send_transaction(
         request.rpc_reads.as_ref(),
     )
     .await?;
-    let signer = admitted_public_signer(
+    let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
-        Some(request.vault_password.as_str()),
+        request.authorization.as_ref(),
         &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),

@@ -12,7 +12,7 @@ use eyre::{Result, eyre};
 
 use super::ExecutorOwner;
 use crate::settings::ExecutorProfile;
-use crate::vault::{ExecutorUseObservation, ProtectedSoftwareSeedSession, SpendGrant};
+use crate::vault::ExecutorUseObservation;
 use crate::{DesktopPrivateSpendAuthorization, WalletSession};
 
 /// Counts describe this request, not previous observations or transaction outcomes.
@@ -59,16 +59,14 @@ impl ExecutorOwner {
                 "account restoration belongs to a different wallet session"
             ));
         }
-        let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
-        self.discover_range(&mut grant, seed, range).await
+        self.discover_range(authorization, range).await
     }
 
     /// Retain an explicitly authorized range, then check use in one aggregate.
     /// This never queries holdings or reconstructs unavailable operation history.
     pub async fn discover_range(
         &self,
-        grant: &mut SpendGrant,
-        protected_seed: Option<&ProtectedSoftwareSeedSession>,
+        authorization: &DesktopPrivateSpendAuthorization,
         range: Range<u32>,
     ) -> Result<ExecutorDiscoveryReport> {
         self.ensure_active()?;
@@ -86,13 +84,23 @@ impl ExecutorOwner {
                 .relay_adapt_7702_contract,
         )
         .ok_or_else(|| eyre!("executor recovery profile is unavailable for this configuration"))?;
-        let addresses = self.vault.executor_addresses_for_session(
-            grant,
-            &self.view,
-            protected_seed,
-            self.chain.chain_id,
-            range.clone(),
+        self.require_executor_source(
+            authorization,
+            &super::HardwareExecutorAction::Restore(range.clone()),
         )?;
+        let addresses =
+            if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+                hardware.restore(self, range.clone())?
+            } else {
+                let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
+                self.vault.executor_addresses_for_session(
+                    &mut grant,
+                    &self.view,
+                    seed,
+                    self.chain.chain_id,
+                    range.clone(),
+                )?
+            };
         // Stop and RPC failure must not discard already derived accounts.
         let records = addresses
             .iter()

@@ -13,12 +13,36 @@ use super::{
     *,
 };
 
+impl WalletConnectRequestUi {
+    pub(in crate::root) fn hardware_executor_action(
+        &self,
+        review_token: u64,
+    ) -> Option<(u64, wallet_ops::HardwareExecutorAction)> {
+        if self.review_token != review_token {
+            return None;
+        }
+        let PublicAccountSource::ExecutorDerived(source) = self.account_source? else {
+            return None;
+        };
+        let chain_id = parse_caip2_chain_id(&self.item.chain_id)?;
+        if chain_id != source.chain_id() {
+            return None;
+        }
+        Some((
+            chain_id,
+            wallet_ops::HardwareExecutorAction::Public {
+                account: self.binding.account.as_ref()?.public_account_uuid.clone(),
+                operation: source.operation(),
+            },
+        ))
+    }
+}
+
 pub(super) async fn approve_walletconnect_request_task(
     request: WalletConnectRequestUi,
     vault_store: Arc<DesktopVaultStore>,
     view_session: Arc<DesktopViewSession>,
-    vault_password: Zeroizing<String>,
-    protected_software_seed_session: Option<Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>>,
+    spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     effective_chain: EffectiveChainConfig,
@@ -59,8 +83,7 @@ pub(super) async fn approve_walletconnect_request_task(
                     request_control: request.request_control.clone(),
                     view_session,
                     vault_store,
-                    vault_password,
-                    protected_software_seed_session,
+                    authorization: Some(spend_authorization),
                     trezor_app_passphrase,
                     trezor_pin_matrix_provider,
                     public_account_uuid: account_binding.public_account_uuid.clone(),
@@ -79,8 +102,7 @@ pub(super) async fn approve_walletconnect_request_task(
                         request_control: request.request_control.clone(),
                         view_session,
                         vault_store,
-                        vault_password,
-                        protected_software_seed_session,
+                        authorization: Some(spend_authorization),
                         trezor_app_passphrase,
                         trezor_pin_matrix_provider,
                         public_account_uuid: account_binding.public_account_uuid.clone(),
@@ -119,8 +141,7 @@ pub(super) async fn approve_walletconnect_request_task(
                             effective_chain,
                             view_session,
                             vault_store,
-                            vault_password,
-                            protected_software_seed_session,
+                            authorization: Some(spend_authorization),
                             trezor_app_passphrase,
                             trezor_pin_matrix_provider,
                             public_account_uuid: account_binding.public_account_uuid.clone(),

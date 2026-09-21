@@ -53,7 +53,9 @@ pub use gas::{
 };
 #[cfg(test)]
 use signer::vaulted_public_signer;
-pub(crate) use signer::{VaultedPublicSigner, admitted_public_signer};
+pub(crate) use signer::{
+    VaultedPublicSigner, admitted_public_signer, admitted_public_signer_authorized,
+};
 pub use submission::public_action_replacement_bumped_fee;
 pub use submission::{
     sanitize_walletconnect_transaction_request, validate_walletconnect_reviewed_transaction,

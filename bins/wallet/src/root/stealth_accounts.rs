@@ -70,6 +70,31 @@ enum StealthAction {
 }
 
 impl StealthAuthorization {
+    pub(super) fn hardware_executor_action(&self) -> wallet_ops::HardwareExecutorAction {
+        use wallet_ops::HardwareExecutorAction;
+        match &self.action {
+            StealthAction::Discover { range } => HardwareExecutorAction::Restore(range.clone()),
+            StealthAction::AddToPublic { operation } => {
+                HardwareExecutorAction::Register(*operation)
+            }
+            StealthAction::Recover(recovery) => match recovery {
+                RecoveryAuthorization::Retry { prepared } => HardwareExecutorAction::Retry {
+                    operation: prepared.operation(),
+                    transaction: prepared.original().hash(),
+                },
+                RecoveryAuthorization::Prepare { approval } => {
+                    HardwareExecutorAction::Recover(approval.operation())
+                }
+                RecoveryAuthorization::Submit { prepared, .. } => {
+                    HardwareExecutorAction::RecoverPrepared {
+                        operation: prepared.operation(),
+                        recovery: prepared.recovery(),
+                    }
+                }
+            },
+        }
+    }
+
     pub(super) const fn session(&self) -> &Arc<WalletSession> {
         &self.session
     }
@@ -194,7 +219,7 @@ impl WalletRoot {
             });
         }
         section.child(app_muted_text(
-            "Stealth accounts will be available after a software wallet's chain session starts.",
+            "Stealth accounts will be available after the wallet’s chain session starts.",
         ))
     }
 

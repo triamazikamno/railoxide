@@ -19,11 +19,19 @@ fn executor_broadcaster_approval_only_continues_within_the_displayed_terms() {
     .pop()
     .unwrap();
     let mut quote = public_broadcaster_cost_estimate(candidate);
+    quote.action_token = token;
+    quote.fee_token = token;
+    quote.fee_mode = FeeHandlingMode::DeductFromAmount;
+    quote.protocol_fee_bps = U256::ZERO;
+    quote.entered_amount = U256::from(1_000);
+    quote.receiver_amount = U256::from(900);
     quote.fee_amount = U256::from(100);
     quote.recipient_amount = U256::from(900);
     quote.total_private_spend = U256::from(1_000);
     let approved = ExecutorUnshieldQuote::Broadcaster(Box::new(quote.clone()));
-    let covered = |quote| approved.covers(&ExecutorUnshieldQuote::Broadcaster(Box::new(quote)));
+    let exact = approved.approval_bounds(Some(quote.fee_amount)).unwrap();
+    let covered =
+        |quote| approved.covers(&ExecutorUnshieldQuote::Broadcaster(Box::new(quote)), exact);
     assert!(covered(quote.clone()));
 
     let mut cheaper = quote.clone();
@@ -43,6 +51,27 @@ fn executor_broadcaster_approval_only_continues_within_the_displayed_terms() {
     let mut another_broadcaster = quote.clone();
     another_broadcaster.broadcaster.railgun_address = "another broadcaster".into();
     assert!(!covered(another_broadcaster));
+    let allowance = approved.approval_bounds(None).unwrap();
+    let mut increased = quote.clone();
+    increased.fee_amount = U256::from(125);
+    increased.recipient_amount = U256::from(875);
+    assert!(approved.covers(
+        &ExecutorUnshieldQuote::Broadcaster(Box::new(increased.clone())),
+        allowance
+    ));
+    assert!(!covered(increased.clone())); // An explicit custom fee has no allowance.
+    increased.fee_amount += U256::ONE;
+    increased.recipient_amount -= U256::ONE;
+    assert!(!approved.covers(
+        &ExecutorUnshieldQuote::Broadcaster(Box::new(increased)),
+        allowance
+    ));
+    let mut changed_broadcaster = quote.clone();
+    changed_broadcaster.broadcaster.railgun_address = "another broadcaster".into();
+    assert!(!approved.covers(
+        &ExecutorUnshieldQuote::Broadcaster(Box::new(changed_broadcaster)),
+        allowance
+    ));
     let mut another_fee_token = quote;
     another_fee_token.fee_token = Address::repeat_byte(3);
     assert!(!covered(another_fee_token));
@@ -67,8 +96,12 @@ fn executor_self_funded_approval_bounds_gas_and_protocol_fees() {
         cost: cost.clone(),
         gas_fee,
     };
-    let covered =
-        |cost, gas_fee| approved.covers(&ExecutorUnshieldQuote::SelfBroadcast { cost, gas_fee });
+    let covered = |cost, gas_fee| {
+        approved.covers(
+            &ExecutorUnshieldQuote::SelfBroadcast { cost, gas_fee },
+            None,
+        )
+    };
     assert!(covered(cost.clone(), gas_fee));
     let mut cheaper = cost.clone();
     cheaper.gas_limit -= 1;

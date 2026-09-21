@@ -2,10 +2,19 @@ use super::fixtures::*;
 use super::*;
 
 #[test]
-fn walletconnect_review_token_detects_replaced_request() {
+fn hardware_walletconnect_executor_approval_binds_review_and_source_chain() {
     let mut reviewed = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     reviewed.review_token = 10;
-    let mut replacement = test_walletconnect_request("session-topic:7", Some(1_700_000_600));
+    let operation = wallet_ops::vault::ExecutorOperationId::random().unwrap();
+    let source = serde_json::from_value(json!({
+        "chain_id": 137,
+        "index": 5,
+        "operation": operation,
+    }))
+    .unwrap();
+    reviewed.account_source = Some(PublicAccountSource::ExecutorDerived(source));
+    reviewed.item.chain_id = "eip155:137".into();
+    let mut replacement = reviewed.clone();
     replacement.review_token = 11;
 
     assert!(walletconnect_request_matches_review_token(&reviewed, 10));
@@ -13,6 +22,18 @@ fn walletconnect_review_token_detects_replaced_request() {
         &replacement,
         10
     ));
+    // Approval carries the request's chain with its action, independent of UI navigation.
+    let (chain, action) = reviewed.hardware_executor_action(10).unwrap();
+    assert_eq!(chain, 137);
+    assert!(
+        matches!(action, wallet_ops::HardwareExecutorAction::Public { account, operation: approved }
+        if account == reviewed.binding.account.as_ref().unwrap().public_account_uuid && approved == operation)
+    );
+    assert!(replacement.hardware_executor_action(10).is_none());
+    reviewed.item.chain_id = "eip155:1".into();
+    assert!(reviewed.hardware_executor_action(10).is_none());
+    reviewed.item.chain_id = "not-a-chain".into();
+    assert!(reviewed.hardware_executor_action(10).is_none());
 }
 
 #[test]

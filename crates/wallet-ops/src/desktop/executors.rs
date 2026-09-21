@@ -13,6 +13,10 @@ use crate::vault::{
 };
 use crate::{ExecutorAsset, ExecutorInspection, HttpContext, inspect_executor};
 
+mod authorization;
+pub use authorization::{
+    HardwareExecutorAction, HardwareExecutorAuthorization, HardwareExecutorAuthorizationRequest,
+};
 mod confirmations;
 mod discovery;
 mod execution;

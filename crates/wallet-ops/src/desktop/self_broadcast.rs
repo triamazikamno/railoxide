@@ -63,6 +63,7 @@ pub(super) async fn submit_self_broadcast_plan(
     vault_store: &vault::DesktopVaultStore,
     vault_password: Option<&str>,
     protected_seed_session: Option<&vault::ProtectedSoftwareSeedSession>,
+    spend_authorization: Option<DesktopPrivateSpendAuthorization>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     public_account_uuid: String,
     session: Arc<WalletSession>,
@@ -78,18 +79,42 @@ pub(super) async fn submit_self_broadcast_plan(
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let signer = admitted_public_signer(
-        vault_store,
-        view_session,
-        vault_password,
-        &public_account_uuid,
-        protected_seed_session,
-        None,
-        trezor_pin_matrix_provider,
-        session.executor_owner().as_ref(),
-        chain_id,
-    )
-    .await?;
+    let signer =
+        if let Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)) =
+            spend_authorization.as_ref()
+            && hardware.is_gas_payment_for(&public_account_uuid)
+        {
+            let account = vault_store
+                .list_public_accounts_for_session(view_session, true)?
+                .into_iter()
+                .find(|account| {
+                    account.public_account_uuid == public_account_uuid
+                        && account.is_available_on_chain(chain_id)
+                })
+                .ok_or_else(|| eyre!("reviewed gas payer is unavailable"))?;
+            let owner = session
+                .executor_owner()
+                .ok_or_else(|| eyre!("Open the owning wallet and chain before signing"))?;
+            let (signer, guard) =
+                Box::pin(owner.admit_authorized_gas_signer(view_session, &account, authorization))
+                    .await?;
+            VaultedPublicSigner::Executor(signer, guard)
+        } else {
+            admitted_public_signer(
+                vault_store,
+                view_session,
+                vault_password,
+                &public_account_uuid,
+                protected_seed_session,
+                None,
+                trezor_pin_matrix_provider,
+                session.executor_owner().as_ref(),
+                chain_id,
+            )
+            .await?
+        };
+    // Gas-signer admission is the last consumer of the private/executor approval.
+    drop(spend_authorization);
     signer.while_active(async {
     if signer.address() != gas_payer {
         return Err(eyre!(
@@ -1752,18 +1777,45 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
     }
 
     let vault_password = request.vault_password.take();
-    let signer = admitted_public_signer(
-        &request.vault_store,
-        &request.view_session,
-        vault_password.as_ref().map(|password| password.as_str()),
-        &request.public_account_uuid,
-        request.protected_software_seed_session.as_deref(),
-        None,
-        request.trezor_pin_matrix_provider,
-        request.session.executor_owner().as_ref(),
-        request.chain_id,
-    )
-    .await?;
+    let signer =
+        if let Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)) =
+            request.gas_payer_authorization.as_ref()
+            && hardware.is_gas_payment_for(&request.public_account_uuid)
+        {
+            let account = request
+                .vault_store
+                .list_public_accounts_for_session(&request.view_session, true)?
+                .into_iter()
+                .find(|account| {
+                    account.public_account_uuid == request.public_account_uuid
+                        && account.is_available_on_chain(request.chain_id)
+                })
+                .ok_or_else(|| eyre!("reviewed gas payer is unavailable"))?;
+            let owner = request
+                .session
+                .executor_owner()
+                .ok_or_else(|| eyre!("Open the owning wallet and chain before signing"))?;
+            let (signer, guard) = Box::pin(owner.admit_authorized_gas_signer(
+                &request.view_session,
+                &account,
+                authorization,
+            ))
+            .await?;
+            VaultedPublicSigner::Executor(signer, guard)
+        } else {
+            admitted_public_signer(
+                &request.vault_store,
+                &request.view_session,
+                vault_password.as_ref().map(|password| password.as_str()),
+                &request.public_account_uuid,
+                request.protected_software_seed_session.as_deref(),
+                None,
+                request.trezor_pin_matrix_provider,
+                request.session.executor_owner().as_ref(),
+                request.chain_id,
+            )
+            .await?
+        };
     signer
         .while_active(async {
             drop(vault_password);

@@ -669,6 +669,14 @@ fn unsupported_hardware_custody_backend_fails_closed() {
         HardwareRailgunAccountCustodyBackend::Unsupported("future_native".to_owned())
     );
     assert!(!backend.is_supported());
+    let view_session = Arc::new(view_session);
+    assert!(ExecutorStore::new(db.clone(), view_session.clone(), 1).is_err());
+    metadata.hardware_account.as_mut().unwrap().custody_backend =
+        HardwareRailgunAccountCustodyBackend::NativeRailgunV1;
+    store
+        .store_wallet_metadata(TEST_PASSWORD, &metadata)
+        .unwrap();
+    assert!(ExecutorStore::new(db.clone(), view_session, 1).is_err());
 
     drop(store);
     drop(db);
@@ -1001,6 +1009,120 @@ fn view_session_clone_with_hardware_profile_session_refreshes_trezor_session() {
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
+#[test]
+fn hardware_executor_root_preserves_synthetic_identity_and_canonical_branch() {
+    use crate::hardware::{HardwareOperationOutput, synthetic_entropy_from_hardware_output};
+    use railgun_wallet::keys::derive_executor_signer;
+
+    // Public synthetic fixtures, computed with BIP-39 and hardened BIP-32 from
+    // a mock device output of [42; 32]. These are never funded wallet secrets.
+    let fixtures = [
+        (
+            test_hardware_descriptor(1),
+            "a76e2c4d7ae6d5225ff27dab9d0baf8ef7aa80a534b8cc9b432fddd049fcae54d7ba5f4367a07f1fab8bbc16477aa2ae71bdfcef329ab8ba10910311524edec3",
+            [
+                "8a83a282b414c840db359a65378cbfe518a00fa00139c2bd042102d609013741",
+                "ce25beeab7abc2766f2d121823e72c2974d71ed769c2ee2fd5b4ebb851b83fc2",
+                "fe787d4bb12428cfb7201f078130c6493d013a474e81ec75b8acbfc589d1f826",
+            ],
+        ),
+        (
+            test_trezor_hardware_descriptor(1),
+            "fd0c4b8195ee5c498010a0fb792481ac52608dd33939247450f7ce885c7debe5d7f035f8d84f038ab3d9ac85c600d25f8928fc89f691b867938c7c87add502e8",
+            [
+                "a49f938be48128805e59d5743802dfbe7b1b303a67c96fc1ce2b3b279c04e0c6",
+                "117e17869a4f3e82f3023f02651a605c1a550f711eaf3fade73266bd53c56da1",
+                "67a9b6f74895e8debc93b293d153a917d98f4699a80e92a31800dad006f7bcfb",
+            ],
+        ),
+    ];
+    let (root_dir, db, store) = desktop_store_with_vault();
+    for (descriptor, expected_seed, keys) in fixtures {
+        let wallet_id = descriptor.device_kind.as_str();
+        let entropy = synthetic_entropy_from_hardware_output(
+            &descriptor,
+            HardwareOperationOutput::new([42; 32]),
+        )
+        .unwrap();
+        let wallet = WalletKeys::from_bip39_entropy(entropy.expose_secret(), 1).unwrap();
+        let metadata = store
+            .new_hardware_wallet_metadata(TEST_PASSWORD, wallet_id, wallet_id, descriptor.clone())
+            .unwrap();
+        store
+            .store_hardware_derived_wallet_with_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                1,
+                &wallet,
+                &metadata,
+                &test_hardware_view_access_key(1),
+            )
+            .unwrap();
+        let view = load_test_hardware_view_session(&store, wallet_id, &descriptor);
+        let refreshed = view
+            .clone_with_hardware_profile_session(view.hardware_profile_session().unwrap().clone());
+        assert!(view.is_same_wallet_session(&refreshed));
+        let reopened = load_test_hardware_view_session(&store, wallet_id, &descriptor);
+        assert!(!view.is_same_wallet_session(&reopened));
+        let (seed, signer) = store
+            .hardware_seed_and_signer_for_session(&view, &descriptor, entropy.expose_secret())
+            .unwrap();
+        assert_eq!(seed.as_ref(), alloy::hex::decode(expected_seed).unwrap());
+        assert_eq!(signer.spending_public_key(), wallet.spending_public_key);
+        for ((chain, index), expected_key) in [(1, 0), (137, 0), (1, 1)].into_iter().zip(keys) {
+            let expected: alloy::signers::local::PrivateKeySigner = expected_key.parse().unwrap();
+            let actual =
+                derive_executor_signer(&seed, view.derivation_index(), chain, index).unwrap();
+            assert_eq!(actual.address(), expected.address());
+            assert_ne!(
+                actual.address(),
+                derive_executor_signer(&seed, 0, chain, index)
+                    .unwrap()
+                    .address()
+            );
+        }
+        for (wallet_index, chain, index) in [
+            (1 << 31, 1, 0),
+            (1, 1 << 31, 0),
+            (1, 1, 1 << 31),
+            (1, u64::MAX, 0),
+        ] {
+            assert!(derive_executor_signer(&seed, wallet_index, chain, index).is_err());
+        }
+        let mut wrong_descriptor = descriptor.clone();
+        wrong_descriptor.profile_fingerprint.push_str("-other");
+        assert!(matches!(
+            store.hardware_seed_and_signer_for_session(
+                &view,
+                &wrong_descriptor,
+                entropy.expose_secret()
+            ),
+            Err(VaultError::HardwareWalletIdentityMismatch)
+        ));
+        assert!(matches!(
+            store.hardware_seed_and_signer_for_session(&view, &descriptor, &[43; 32]),
+            Err(VaultError::HardwareWalletIdentityMismatch)
+        ));
+        let mut wrong_view = load_test_hardware_view_session(&store, wallet_id, &descriptor);
+        wrong_view
+            .hardware_profile_session
+            .as_mut()
+            .unwrap()
+            .profile_id = Some("other-profile".to_owned());
+        assert!(matches!(
+            store.hardware_seed_and_signer_for_session(
+                &wrong_view,
+                &descriptor,
+                entropy.expose_secret()
+            ),
+            Err(VaultError::HardwareWalletIdentityMismatch)
+        ));
+    }
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).unwrap();
+}
+
 #[test]
 fn hardware_spend_signer_rejects_wrong_derived_key() {
     let (root_dir, db, store) = desktop_store_with_vault();

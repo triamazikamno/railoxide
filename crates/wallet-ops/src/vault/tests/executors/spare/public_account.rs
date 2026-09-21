@@ -29,8 +29,9 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
         .prepare_operation(
             operation,
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -58,8 +59,9 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
                 &prepared,
                 &call,
                 &[],
-                &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-                None
+                &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                    TEST_PASSWORD.into()
+                ))
             )
             .await
             .is_err()
@@ -69,8 +71,9 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
             .prepare_operation(
                 operation,
                 delivery(),
-                &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-                None,
+                &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                    TEST_PASSWORD.into()
+                )),
                 &[],
                 None
             )
@@ -170,8 +173,12 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
         request_control: None,
         view_session: view.clone(),
         vault_store: vault.clone(),
-        vault_password: Zeroizing::new(TEST_PASSWORD.into()),
-        protected_software_seed_session: None,
+        authorization: Some(
+            crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                Zeroizing::new(TEST_PASSWORD.into()),
+                None,
+            ),
+        ),
         trezor_app_passphrase: None,
         trezor_pin_matrix_provider: None,
         public_account_uuid: account.public_account_uuid.clone(),

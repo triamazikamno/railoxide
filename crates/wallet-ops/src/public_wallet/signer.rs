@@ -867,6 +867,72 @@ pub(crate) fn vaulted_public_signer(
 
 /// Resolve the Public source under its native owner before exposing any signer.
 /// The returned executor signer owns the activity guard for its entire lifetime.
+pub(crate) async fn admitted_public_signer_authorized(
+    vault_store: &DesktopVaultStore,
+    view_session: &DesktopViewSession,
+    authorization: Option<&crate::DesktopPrivateSpendAuthorization>,
+    public_account_uuid: &str,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
+    chain_id: u64,
+) -> Result<VaultedPublicSigner> {
+    use crate::DesktopPrivateSpendAuthorization;
+    let (password, seed) = match authorization {
+        Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(_)) => {
+            let account = vault_store
+                .list_public_accounts_for_session(view_session, true)?
+                .into_iter()
+                .find(|account| account.public_account_uuid == public_account_uuid)
+                .ok_or_else(|| eyre!("Public account is unavailable"))?;
+            if !account.is_available_on_chain(chain_id)
+                || !matches!(
+                    account.source,
+                    crate::vault::PublicAccountSource::ExecutorDerived(_)
+                )
+            {
+                return Err(eyre!(
+                    "hardware executor approval does not authorize this Public source"
+                ));
+            }
+            let owner = executor_owner.ok_or_else(|| {
+                eyre!("Open the owning wallet and chain before spending from this account.")
+            })?;
+            let (signer, guard) = Box::pin(owner.admit_authorized_public_signer(
+                view_session,
+                &account,
+                authorization,
+            ))
+            .await?;
+            return Ok(VaultedPublicSigner::Executor(signer, guard));
+        }
+        Some(DesktopPrivateSpendAuthorization::VaultPassword(password)) => {
+            (Some(password.as_str()), None)
+        }
+        Some(DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, session }) => {
+            (Some(password.as_str()), Some(session.as_ref()))
+        }
+        Some(DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)) => {
+            return Err(eyre!(
+                "private spending authorization cannot authorize a Public action"
+            ));
+        }
+        None | Some(DesktopPrivateSpendAuthorization::HardwarePublic) => (None, None),
+    };
+    admitted_public_signer(
+        vault_store,
+        view_session,
+        password,
+        public_account_uuid,
+        seed,
+        trezor_app_passphrase,
+        trezor_pin_matrix_provider,
+        executor_owner,
+        chain_id,
+    )
+    .await
+}
+
 pub(crate) async fn admitted_public_signer(
     vault_store: &DesktopVaultStore,
     view_session: &DesktopViewSession,

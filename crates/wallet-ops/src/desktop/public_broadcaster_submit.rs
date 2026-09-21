@@ -21,10 +21,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let executor =
         validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
-    if executor.is_some()
-        && (request.executor_maximum_private_fee.is_none()
-            || request.executor_min_gas_price.is_none())
-    {
+    if executor.is_some() && request.executor_maximum_private_fee.is_none() {
         return Err(eyre!(
             "review the executor fee limit before proving this operation"
         ));
@@ -54,7 +51,6 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             .executor
             .as_ref()
             .map(|prepared| prepared.delivery()),
-        executor.and(request.executor_min_gas_price),
         request.fee_policy,
         &request.trust_filter,
         request.anchor_cache.as_ref(),
@@ -362,7 +358,6 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             &request.session,
             request.executor.as_deref(),
             &request.spend_authorization,
-            &request.vault_store,
             &plan,
         )
         .await?
@@ -403,6 +398,9 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             "estimated public broadcaster unshield fee"
         );
         if broadcaster_fee_covers(fee_amount, computed_fee) {
+            // No more proof or executor signatures are needed after fee convergence.
+            drop(signer);
+            drop(request.spend_authorization);
             transaction.gas = Some(gas_limit);
             let reported_amounts = public_broadcaster_reported_amounts(
                 request.token,
@@ -560,7 +558,6 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         &request.fee_rows,
         &request.selection,
         false,
-        None,
         None,
         request.fee_policy,
         &request.trust_filter,

@@ -519,7 +519,10 @@ impl WalletRoot {
                 }
             });
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
-            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
+            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived)
+                || matches!(&spend_authorization, DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)
+                    if self_broadcast_public_account_uuid.as_deref().is_some_and(|uuid| hardware.is_gas_payment_for(uuid)))
+            {
                 None
             } else if let Some(password) = gas_payer_password {
                 Some(password)
@@ -531,7 +534,9 @@ impl WalletRoot {
                     DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
                         password, ..
                     } => Some(password.clone()),
-                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
+                    | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                    | DesktopPrivateSpendAuthorization::HardwarePublic => {
                         self.set_send_form_error(
                             key,
                             SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED,
@@ -1529,7 +1534,10 @@ impl WalletRoot {
             self_broadcast_initial_gas_values(&self_broadcast_gas_fee, None)
                 .or(self_broadcast_initial_gas_fee);
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
-            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
+            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived)
+                || matches!(&spend_authorization, DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)
+                    if self_broadcast_public_account_uuid.as_deref().is_some_and(|uuid| hardware.is_gas_payment_for(uuid)))
+            {
                 None
             } else if let Some(password) = gas_payer_password {
                 Some(password)
@@ -1541,7 +1549,21 @@ impl WalletRoot {
                     DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
                         password, ..
                     } => Some(password.clone()),
-                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                    DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) => {
+                        match self_broadcast_public_account_uuid
+                            .as_deref()
+                            .ok_or_else(|| eyre::eyre!("Select the reviewed gas payer"))
+                            .and_then(|uuid| hardware.gas_payer_password(uuid))
+                        {
+                            Ok(password) => Some(password),
+                            Err(error) => {
+                                self.set_unshield_form_error(key, error.to_string(), cx);
+                                return;
+                            }
+                        }
+                    }
+                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
+                    | DesktopPrivateSpendAuthorization::HardwarePublic => {
                         self.set_unshield_form_error(
                             key,
                             SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED,
@@ -1737,9 +1759,6 @@ impl WalletRoot {
                     executor_maximum_private_fee: executor_review
                         .as_ref()
                         .and_then(|review| review.maximum_private_fee()),
-                    executor_min_gas_price: executor_review
-                        .as_ref()
-                        .and_then(|review| review.broadcaster_min_gas_price()),
                     chain_id,
                     effective_chain: resolved_chain,
                     view_session,

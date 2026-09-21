@@ -90,7 +90,7 @@ impl WalletRoot {
         unwrap: bool,
         native_top_up: bool,
     ) -> Option<ExecutorProfile> {
-        if (unwrap || native_top_up) && !self.selected_wallet_source().is_hardware_derived() {
+        if unwrap || native_top_up {
             self.effective_chain_configs
                 .get(chain_id)
                 .and_then(EffectiveChainConfig::accepted_executor_profile)

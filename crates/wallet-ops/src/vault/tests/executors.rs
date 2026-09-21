@@ -88,9 +88,11 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     )
     .unwrap();
     let records = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
-    let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
+    let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        TEST_PASSWORD.into(),
+    ));
     let report = owner
-        .discover_range(&mut grant, None, 5_000_000..5_000_002)
+        .discover_range(&authorization, 5_000_000..5_000_002)
         .await
         .unwrap();
     assert_eq!(report.unavailable(), 2);
@@ -123,9 +125,11 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
         HttpContext::direct_for_tests(),
     )
     .unwrap();
-    let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
+    let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        TEST_PASSWORD.into(),
+    ));
     let restored = owner
-        .discover_range(&mut grant, None, 5_000_000..5_000_001)
+        .discover_range(&authorization, 5_000_000..5_000_001)
         .await
         .unwrap();
     assert_eq!(restored.unavailable(), 1);
@@ -133,17 +137,16 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     assert_eq!(restored[0].operation(), identities[0].0);
     assert_eq!(restored[0].restored_at(), restored_at);
     assert!(restored[0].assets().is_empty());
-    let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
-    owner.discover_range(&mut grant, None, 2..3).await.unwrap();
+    let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        TEST_PASSWORD.into(),
+    ));
+    owner.discover_range(&authorization, 2..3).await.unwrap();
     assert_eq!(records.next_index().unwrap(), 5_000_002);
     let count = records.records().unwrap().len();
-    let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
-    assert!(
-        owner
-            .discover_range(&mut grant, None, 10..75)
-            .await
-            .is_err()
-    );
+    let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        TEST_PASSWORD.into(),
+    ));
+    assert!(owner.discover_range(&authorization, 10..75).await.is_err());
     assert_eq!(records.records().unwrap().len(), count);
     owner.shutdown().await;
     drop(owner);
@@ -420,155 +423,165 @@ fn executor_ordinary_recovery_handoff_survives_restart_and_reorg_without_recycli
 }
 
 #[test]
-fn executor_reservations_survive_restart_and_never_recycle_or_enter_position_range() {
-    let (root, db, vault) = desktop_store_with_vault();
-    let view = Arc::new(import_wallet_with_metadata(
-        &vault,
-        TEST_WALLET_ID,
-        "Wallet",
-    ));
-    let namespace = namespace(&vault, &view, 1);
-    let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
-    let operation = ExecutorOperationId::random().unwrap();
-    let assets = [
-        ExecutorAsset::Native,
-        ExecutorAsset::Erc20(Address::repeat_byte(7)),
-    ];
-    let first = store
-        .reserve(operation, Address::ZERO, Some("Unshield 0.5 WETH"), &assets)
-        .unwrap();
-    assert!(first.created_at().is_some());
-    assert!(first.restored_at().is_none());
-    let barrier = std::sync::Barrier::new(2);
-    let highest_index = std::thread::scope(|scope| {
-        let next = scope.spawn(|| {
-            barrier.wait();
-            store
-                .reserve(
-                    ExecutorOperationId::random().unwrap(),
-                    Address::ZERO,
-                    None,
-                    &[],
-                )
-                .unwrap()
+fn hardware_executor_reservations_survive_restart_and_never_recycle_or_enter_position_range() {
+    for descriptor in [
+        None,
+        Some(test_hardware_descriptor(0)),
+        Some(test_trezor_hardware_descriptor(0)),
+    ] {
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = match &descriptor {
+            Some(descriptor) => spare::hardware::hardware_view(&vault, descriptor),
+            None => Arc::new(import_wallet_with_metadata(
+                &vault,
+                TEST_WALLET_ID,
+                "Wallet",
+            )),
+        };
+        let namespace = namespace(&vault, &view, 1);
+        let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
+        let operation = ExecutorOperationId::random().unwrap();
+        let assets = [
+            ExecutorAsset::Native,
+            ExecutorAsset::Erc20(Address::repeat_byte(7)),
+        ];
+        let first = store
+            .reserve(operation, Address::ZERO, Some("Unshield 0.5 WETH"), &assets)
+            .unwrap();
+        assert!(first.created_at().is_some());
+        assert!(first.restored_at().is_none());
+        let barrier = std::sync::Barrier::new(2);
+        let highest_index = std::thread::scope(|scope| {
+            let next = scope.spawn(|| {
+                barrier.wait();
+                store
+                    .reserve(
+                        ExecutorOperationId::random().unwrap(),
+                        Address::ZERO,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+            });
+            let concurrent = scope.spawn(|| {
+                barrier.wait();
+                store
+                    .reserve(
+                        ExecutorOperationId::random().unwrap(),
+                        Address::ZERO,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+            });
+            assert_eq!(
+                store.reserve(operation, Address::ZERO, None, &[]).unwrap(),
+                first
+            );
+            let second = next.join().unwrap();
+            let third = concurrent.join().unwrap();
+            assert_ne!(second.index(), third.index());
+            assert_ne!(first.index(), second.index());
+            assert_ne!(first.index(), third.index());
+            second.index().max(third.index())
         });
-        let concurrent = scope.spawn(|| {
-            barrier.wait();
-            store
-                .reserve(
-                    ExecutorOperationId::random().unwrap(),
-                    Address::ZERO,
-                    None,
-                    &[],
-                )
-                .unwrap()
-        });
-        assert_eq!(
-            store.reserve(operation, Address::ZERO, None, &[]).unwrap(),
-            first
-        );
-        let second = next.join().unwrap();
-        let third = concurrent.join().unwrap();
-        assert_ne!(second.index(), third.index());
-        assert_ne!(first.index(), second.index());
-        assert_ne!(first.index(), third.index());
-        second.index().max(third.index())
-    });
-    store.set_hidden(operation, true).unwrap();
-    store.retire(operation).unwrap();
-    drop(store);
-    drop(view);
-    drop(vault);
-    drop(db);
+        store.set_hidden(operation, true).unwrap();
+        store.retire(operation).unwrap();
+        drop(store);
+        drop(view);
+        drop(vault);
+        drop(db);
 
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root.clone(),
-        })
-        .unwrap(),
-    );
-    let vault = DesktopVaultStore::from_db(db.clone());
-    let view = Arc::new(
-        vault
-            .load_view_session(TEST_PASSWORD, TEST_WALLET_ID)
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root.clone(),
+            })
             .unwrap(),
-    );
-    let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
-    let retained = store
-        .records()
-        .unwrap()
-        .into_iter()
-        .find(|record| record.operation() == operation)
-        .unwrap();
-    assert!(retained.is_retired() && retained.is_hidden());
-    assert_eq!(retained.created_at(), first.created_at());
-    assert_eq!(retained.purpose_summary(), first.purpose_summary());
-    assert_eq!(retained.assets(), assets);
-    let restored = store
-        .restore_index(first.index(), Address::repeat_byte(4), Address::ZERO, &[])
-        .unwrap();
-    assert_eq!(restored.created_at(), first.created_at());
-    assert_eq!(restored.purpose_summary(), first.purpose_summary());
-    assert!(restored.restored_at().is_some());
-    assert_eq!(
-        store
+        );
+        let vault = DesktopVaultStore::from_db(db.clone());
+        let view = Arc::new(match &descriptor {
+            Some(descriptor) => load_test_hardware_view_session(&vault, TEST_WALLET_ID, descriptor),
+            None => vault
+                .load_view_session(TEST_PASSWORD, TEST_WALLET_ID)
+                .unwrap(),
+        });
+        let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
+        let retained = store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap();
+        assert!(retained.is_retired() && retained.is_hidden());
+        assert_eq!(retained.created_at(), first.created_at());
+        assert_eq!(retained.purpose_summary(), first.purpose_summary());
+        assert_eq!(retained.assets(), assets);
+        let restored = store
             .restore_index(first.index(), Address::repeat_byte(4), Address::ZERO, &[])
-            .unwrap(),
-        restored
-    );
-    assert!(
+            .unwrap();
+        assert_eq!(restored.created_at(), first.created_at());
+        assert_eq!(restored.purpose_summary(), first.purpose_summary());
+        assert!(restored.restored_at().is_some());
+        assert_eq!(
+            store
+                .restore_index(first.index(), Address::repeat_byte(4), Address::ZERO, &[])
+                .unwrap(),
+            restored
+        );
+        assert!(
+            store
+                .reserve(
+                    ExecutorOperationId::random().unwrap(),
+                    Address::ZERO,
+                    None,
+                    &[]
+                )
+                .unwrap()
+                .index()
+                > highest_index
+        );
+        store.raise_floor(1_000_000).unwrap();
+        assert_eq!(
+            store
+                .reserve(
+                    ExecutorOperationId::random().unwrap(),
+                    Address::ZERO,
+                    None,
+                    &[]
+                )
+                .unwrap()
+                .index(),
+            1_000_064
+        );
+        store.raise_floor(4).unwrap();
+        assert_eq!(store.next_index().unwrap(), 1_000_065);
+        let recovered = store
+            .restore_index(5_000_000, Address::repeat_byte(9), Address::ZERO, &[])
+            .unwrap();
+        assert!(recovered.is_retired());
+        assert!(matches!(
+            store.reserve(recovered.operation(), Address::ZERO, None, &[]),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
         store
-            .reserve(
-                ExecutorOperationId::random().unwrap(),
-                Address::ZERO,
-                None,
-                &[]
-            )
-            .unwrap()
-            .index()
-            > highest_index
-    );
-    store.raise_floor(1_000_000).unwrap();
-    assert_eq!(
-        store
-            .reserve(
-                ExecutorOperationId::random().unwrap(),
-                Address::ZERO,
-                None,
-                &[]
-            )
-            .unwrap()
-            .index(),
-        1_000_064
-    );
-    store.raise_floor(4).unwrap();
-    assert_eq!(store.next_index().unwrap(), 1_000_065);
-    let recovered = store
-        .restore_index(5_000_000, Address::repeat_byte(9), Address::ZERO, &[])
+            .restore_index(4, Address::repeat_byte(8), Address::ZERO, &[])
+            .unwrap();
+        db.update_desktop_wallet_vault_records(
+            &[super::super::executors::executor_allocation_key(
+                view.wallet_id(),
+                1,
+            )],
+            &[],
+        )
         .unwrap();
-    assert!(recovered.is_retired());
-    assert!(matches!(
-        store.reserve(recovered.operation(), Address::ZERO, None, &[]),
-        Err(ExecutorStoreError::OperationMismatch)
-    ));
-    store
-        .restore_index(4, Address::repeat_byte(8), Address::ZERO, &[])
-        .unwrap();
-    db.update_desktop_wallet_vault_records(
-        &[super::super::executors::executor_allocation_key(
-            view.wallet_id(),
-            1,
-        )],
-        &[],
-    )
-    .unwrap();
-    // Retained history establishes a floor even when the allocation record was lost.
-    assert_eq!(store.next_index().unwrap(), 5_000_001);
-    drop(store);
-    drop(view);
-    drop(vault);
-    drop(db);
-    std::fs::remove_dir_all(root).unwrap();
+        // Retained history establishes a floor even when the allocation record was lost.
+        assert_eq!(store.next_index().unwrap(), 5_000_001);
+        drop(store);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test]

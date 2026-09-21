@@ -19,7 +19,7 @@ use crate::desktop::executor_discovery::{inspect_for_signing, matches_executor_d
 use crate::settings::ExecutorProfile;
 use crate::vault::{
     ExecutorInputIdentity, ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose,
-    IssuedExecutorPayload, ProtectedSoftwareSeedSession, SpendGrant,
+    IssuedExecutorPayload,
 };
 use crate::{ExecutorActivity, ExecutorAsset, ExecutorInspection, PublicBroadcasterCandidate};
 
@@ -168,26 +168,8 @@ impl ExecutorOwner {
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
     ) -> Result<PreparedExecutorOperation> {
-        let started = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "vault_unlock", "started");
-        let result = authorization.executor_spend_grant(&self.vault);
-        tracing::info!(
-            target: "executor_preparation",
-            step = "vault_unlock",
-            elapsed_ms = started.elapsed().as_millis(),
-            success = result.is_ok(),
-            "finished"
-        );
-        let (mut grant, seed) = result?;
-        self.prepare_operation(
-            operation,
-            delivery,
-            &mut grant,
-            seed,
-            assets,
-            purpose_summary,
-        )
-        .await
+        self.prepare_operation(operation, delivery, authorization, assets, purpose_summary)
+            .await
     }
 
     /// Recheck native ownership before quoting or proving an existing preparation.
@@ -288,12 +270,14 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         delivery: ExecutorDelivery,
-        grant: &mut SpendGrant,
-        protected_seed: Option<&ProtectedSoftwareSeedSession>,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
     ) -> Result<PreparedExecutorOperation> {
-        self.ensure_active()?;
+        self.require_executor_authorization(
+            authorization,
+            &super::HardwareExecutorAction::Execute(operation),
+        )?;
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "activity_lock", "started");
         let guard = self.lock_activity().await;
@@ -309,6 +293,27 @@ impl ExecutorOwner {
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
         delivery.admit(profile)?;
+        if let ExecutorDelivery::SelfBroadcast { sender, .. } = &delivery
+            && self
+                .vault
+                .list_public_accounts_for_session(&self.view, true)?
+                .iter()
+                .any(|account| {
+                    account.address == *sender
+                        && account.source == crate::vault::PublicAccountSource::HardwareDerived
+                })
+        {
+            return Err(eyre!(
+                "Hardware-native Public accounts cannot pay gas for executor actions. Select a software or imported payer, or a broadcaster."
+            ));
+        }
+        if let (
+            crate::DesktopPrivateSpendAuthorization::HardwareExecutor(hardware),
+            ExecutorDelivery::SelfBroadcast { sender, .. },
+        ) = (authorization, &delivery)
+        {
+            hardware.require_gas_payer(*sender)?;
+        }
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "reserve_and_derive", "started");
         let record = self
@@ -332,11 +337,9 @@ impl ExecutorOwner {
         let spare_index = spare
             .as_ref()
             .and_then(|spare| spare.address().is_none().then_some(spare.index()));
-        let (address, spare_address) = self.vault.executor_preparation_addresses_for_session(
-            grant,
-            &self.view,
-            protected_seed,
-            self.chain.chain_id,
+        let (address, spare_address) = self.authorized_executor_addresses(
+            authorization,
+            operation,
             record.index(),
             spare_index,
         )?;
@@ -429,8 +432,7 @@ impl ExecutorOwner {
         prepared: &PreparedExecutorOperation,
         call: &TransactionCall,
         inputs: &[Utxo],
-        grant: &mut SpendGrant,
-        protected_seed: Option<&ProtectedSoftwareSeedSession>,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
     ) -> Result<IssuedExecutorTransaction> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -596,11 +598,15 @@ impl ExecutorOwner {
         if prepared.recovery.is_none() {
             require_unfinished_operation(&reconciled)?;
         }
-        let (_private_signer, signer) = self.vault.executor_spend_signers_for_session(
-            grant,
-            &self.view,
-            protected_seed,
-            self.chain.chain_id,
+        let action = if let Some(recovery) = &prepared.recovery {
+            self.recovery_authorization_action(authorization, recovery)?
+        } else {
+            super::HardwareExecutorAction::Execute(record.operation())
+        };
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &action,
+            record.operation(),
             record.index(),
         )?;
         if signer.address() != prepared.context.executor {

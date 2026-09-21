@@ -363,6 +363,7 @@ pub struct GeneratedSeedMaterial {
 }
 
 pub struct DesktopViewSession {
+    pub(super) session_identity: Arc<()>,
     pub(super) wallet_id: String,
     pub(super) derivation_index: u32,
     pub(super) spending_public_key: [U256; 2],

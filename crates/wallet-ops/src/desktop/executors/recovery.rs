@@ -283,12 +283,10 @@ impl ExecutorOwner {
         {
             return Err(eyre!("select a positive token amount or exactly one NFT"));
         }
-        let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
-        let (_, signer) = self.vault.executor_spend_signers_for_session(
-            &mut grant,
-            &self.view,
-            seed,
-            self.chain.chain_id,
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &super::HardwareExecutorAction::Recover(record.operation()),
+            record.operation(),
             record.index(),
         )?;
         if signer.address() != source {
@@ -404,9 +402,13 @@ impl ExecutorOwner {
         let maximum_native_fee =
             recovery_funding_admission(&inspection, asset, amount, &funding, &gas_limits)?;
         self.ensure_active()?;
+        let recovery = ExecutorOperationId::random()?;
+        if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
+            hardware.bind_recovery(recovery)?;
+        }
         Ok(PreparedExecutorRecovery {
             operation,
-            recovery: ExecutorOperationId::random()?,
+            recovery,
             generation: self.generation,
             owner: self.closed.clone(),
             source,

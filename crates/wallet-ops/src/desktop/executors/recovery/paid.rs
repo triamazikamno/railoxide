@@ -269,7 +269,6 @@ impl ExecutorOwner {
                 )
                 .await
                 .map_err(recovery_fee_build_error)?;
-            let (mut grant, seed) = request.authorization.executor_spend_grant(&self.vault)?;
             let inputs = plan
                 .inputs
                 .iter()
@@ -277,7 +276,7 @@ impl ExecutorOwner {
                 .collect::<Vec<_>>();
             // Even simulation exposes a usable signed payload. Persist it first.
             let issued = self
-                .issue_operation(&preparation, &plan.call, &inputs, &mut grant, seed)
+                .issue_operation(&preparation, &plan.call, &inputs, &request.authorization)
                 .await?;
             let mut transaction = issued.transaction().clone();
             if transaction.transaction_type == Some(4) {
@@ -303,6 +302,9 @@ impl ExecutorOwner {
                 require_recovery_fee_limit(fee_amount, *maximum_private_fee)?;
                 continue;
             }
+            // Keep approval through fee retries, then release it before POI and submission.
+            drop(signer);
+            drop(request.authorization);
             transaction.gas = Some(gas_limit);
             update_transaction_generation_stage(
                 request.progress_tx.as_ref(),

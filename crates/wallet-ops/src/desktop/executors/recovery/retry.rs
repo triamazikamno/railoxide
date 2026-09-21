@@ -212,12 +212,13 @@ impl ExecutorOwner {
                 "insufficient native balance for the retry and remaining recovery gas; fund this executor before retrying"
             ));
         }
-        let (mut grant, seed) = authorization.executor_spend_grant(&self.vault)?;
-        let (_, signer) = self.vault.executor_spend_signers_for_session(
-            &mut grant,
-            &self.view,
-            seed,
-            self.chain.chain_id,
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &crate::desktop::executors::HardwareExecutorAction::Retry {
+                operation: record.operation(),
+                transaction: prepared.original.hash(),
+            },
+            record.operation(),
             record.index(),
         )?;
         if signer.address() != prepared.source {
@@ -250,6 +251,11 @@ impl ExecutorOwner {
                 )
                 .with_remaining_gas_limit(prepared.remaining_gas_limit),
             )?;
+            if let crate::DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) =
+                authorization
+            {
+                hardware.consume()?;
+            }
             self.notify_change();
             Ok(())
         };

@@ -677,7 +677,7 @@ impl GatewayView {
                             .and_then(|value| serde_json::from_str(&value).ok())
                             .unwrap_or_default()
                     } else {
-                        Default::default()
+                        std::collections::BTreeMap::default()
                     };
                     if view.chain_management.token.is_some() {
                         let status = view.chain_management.pricing_status.clone();

@@ -22,6 +22,7 @@ impl DesktopViewSession {
     pub fn from_bundle(wallet_id: String, bundle: &WalletViewBundle, view: ViewUnlock) -> Self {
         let private_view = view.clone_unlock();
         Self {
+            session_identity: Arc::new(()),
             wallet_id,
             derivation_index: bundle.derivation_index,
             spending_public_key: bundle.spending_public_key(),
@@ -33,7 +34,7 @@ impl DesktopViewSession {
     }
 
     #[must_use]
-    pub const fn from_hardware_bundle(
+    pub fn from_hardware_bundle(
         wallet_id: String,
         bundle: &WalletViewBundle,
         view: ViewUnlock,
@@ -41,6 +42,7 @@ impl DesktopViewSession {
         hardware_profile_session: HardwareProfileSession,
     ) -> Self {
         Self {
+            session_identity: Arc::new(()),
             wallet_id,
             derivation_index: bundle.derivation_index,
             spending_public_key: bundle.spending_public_key(),
@@ -87,6 +89,7 @@ impl DesktopViewSession {
         hardware_profile_session: HardwareProfileSession,
     ) -> Self {
         Self {
+            session_identity: Arc::clone(&self.session_identity),
             wallet_id: self.wallet_id.clone(),
             derivation_index: self.derivation_index,
             spending_public_key: self.spending_public_key,
@@ -95,6 +98,24 @@ impl DesktopViewSession {
             private_view: self.private_view.clone_unlock(),
             hardware_profile_session: Some(hardware_profile_session),
         }
+    }
+
+    /// Metadata refresh preserves this lifecycle; reopening the wallet does not.
+    #[must_use]
+    pub fn is_same_wallet_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session_identity, &other.session_identity)
+            && match (
+                &self.hardware_profile_session,
+                &other.hardware_profile_session,
+            ) {
+                (None, None) => true,
+                (Some(current), Some(other)) => {
+                    current.profile_id == other.profile_id
+                        && current.device_kind == other.device_kind
+                        && current.binding == other.binding
+                }
+                _ => false,
+            }
     }
 
     pub fn receive_address(&self) -> Result<String, RailgunError> {

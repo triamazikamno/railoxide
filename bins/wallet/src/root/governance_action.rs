@@ -20,7 +20,6 @@ use wallet_ops::{
     derive_governance_proposal_status, guard_call_vote, guard_nay_vote, guard_sponsor,
     guard_unsponsor, guard_yay_vote,
 };
-use zeroize::Zeroizing;
 
 use super::governance::GovernanceContextKey;
 use super::public_action::{
@@ -432,10 +431,7 @@ impl WalletRoot {
     pub(super) fn revalidate_governance_authorized(
         &mut self,
         draft: &GovernanceSpendDraft,
-        vault_password: Zeroizing<String>,
-        protected_software_seed_session: Option<
-            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
-        >,
+        spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
         #[cfg(feature = "hardware")] window: &mut Window,
         #[cfg(not(feature = "hardware"))] window: &Window,
         cx: &mut Context<'_, Self>,
@@ -450,13 +446,7 @@ impl WalletRoot {
         }
         let age = Instant::now().saturating_duration_since(draft.estimate_completed_at);
         if governance_authorization_estimate_is_fresh(age) {
-            self.submit_governance_authorized(
-                draft.clone(),
-                vault_password,
-                protected_software_seed_session,
-                window,
-                cx,
-            );
+            self.submit_governance_authorized(draft.clone(), spend_authorization, window, cx);
             return;
         }
         self.refresh_expired_governance_authorization(draft, window, cx);
@@ -700,10 +690,7 @@ impl WalletRoot {
     pub(super) fn submit_governance_authorized(
         &mut self,
         draft: GovernanceSpendDraft,
-        vault_password: Zeroizing<String>,
-        protected_software_seed_session: Option<
-            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
-        >,
+        spend_authorization: wallet_ops::DesktopPrivateSpendAuthorization,
         #[cfg(feature = "hardware")] window: &mut Window,
         #[cfg(not(feature = "hardware"))] window: &Window,
         cx: &mut Context<'_, Self>,
@@ -841,8 +828,7 @@ impl WalletRoot {
             effective_chain: resolved_chain,
             view_session,
             vault_store,
-            vault_password,
-            protected_software_seed_session,
+            authorization: Some(spend_authorization),
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: actor_uuid.to_string(),

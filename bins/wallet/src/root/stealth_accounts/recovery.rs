@@ -715,15 +715,19 @@ impl StealthAccountsView {
             let view = cx.entity();
             let _ = self.root.update(cx, |root, cx| {
                 if root.stealth_session_is_current(&command.session) {
-                    root.open_prepared_spend_review(
+                    let intent =
                         crate::root::spend_authorization::SpendAuthorizationIntent::StealthAccounts(
                             view, command,
-                        ),
-                        summary.requiring_explicit_review(),
+                        );
+                    let summary = summary.requiring_explicit_review();
+                    if matches!(
                         authorization,
-                        window,
-                        cx,
-                    );
+                        DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                    ) {
+                        root.request_spend_authorization(intent, summary, window, cx);
+                    } else {
+                        root.open_prepared_spend_review(intent, summary, authorization, window, cx);
+                    }
                 }
             });
         } else {

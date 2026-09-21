@@ -38,7 +38,6 @@ use wallet_ops::{
     submit_public_send_with_progress, submit_public_shield_with_progress,
     vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource, PublicAccountStatus},
 };
-use zeroize::Zeroizing;
 
 use super::gas_fee::{
     Eip1559GasFeeEditTarget, Eip1559GasFeeMode, Eip1559GasFeeTarget, GasRetryInputs, format_gwei,

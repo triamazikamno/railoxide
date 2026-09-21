@@ -166,8 +166,9 @@ async fn expired_approval_task_publishes_expired_response() {
             request,
             task_store,
             task_view_session,
-            Zeroizing::new(TEST_PASSWORD.to_owned()),
-            None,
+            wallet_ops::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.to_owned(),
+            )),
             None,
             None,
             wallet_ops::settings::build_effective_chain_configs(

@@ -1,5 +1,6 @@
 use super::*;
 
+pub(super) mod hardware;
 mod public_account;
 use crate::{ExecutorDelivery, ExecutorOwner, HttpContext, WalletSyncTip};
 use alloy::providers::bindings::IMulticall3;
@@ -121,6 +122,7 @@ struct RpcState {
     requests: Mutex<Vec<Value>>,
     used: Mutex<BTreeSet<Address>>,
     head: AtomicU64,
+    native_balance: AtomicU64,
     changed: Notify,
     aggregate_response: Mutex<Option<Value>>,
 }
@@ -230,7 +232,7 @@ async fn serve(
     }
     let used = address.is_some_and(|address| state.used.lock().unwrap().contains(&address));
     let result = match request["method"].as_str().unwrap() {
-        "eth_chainId" => json!("0x1"),
+        "eth_chainId" | "eth_gasPrice" => json!("0x1"),
         "eth_blockNumber" => json!(format!("0x{:x}", state.head.load(Ordering::Relaxed))),
         "eth_getBlockByNumber" => {
             let mut block = Block::<alloy::rpc::types::Transaction>::default();
@@ -243,13 +245,27 @@ async fn serve(
             serde_json::to_value(block).unwrap()
         }
         "eth_getTransactionCount" => json!(if used { "0x1" } else { "0x0" }),
-        "eth_getBalance" => json!("0x0"),
+        "eth_getBalance" => json!(format!(
+            "0x{:x}",
+            state.native_balance.load(Ordering::Relaxed)
+        )),
         "eth_getCode" => json!("0x"),
         "eth_getStorageAt" => json!(B256::from(U256::from(u8::from(used)))),
         "eth_call" => json!(B256::ZERO),
+        "eth_maxPriorityFeePerGas" => json!("0x0"),
+        "eth_feeHistory" => json!({
+            "oldestBlock": "0x0", "baseFeePerGas": ["0x1", "0x1"],
+            "gasUsedRatio": [0.5], "reward": [["0x0"]]
+        }),
+        "eth_getLogs" => json!([]),
+        "eth_estimateGas" => Value::Null,
         method => panic!("unexpected RPC method {method}"),
     };
-    let mut response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+    let mut response = if request["method"] == "eth_estimateGas" {
+        json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "test submission rejected"}})
+    } else {
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    };
     if request["method"] == "eth_call" && address == Some(multicall()) {
         let response_fields = state.aggregate_response.lock().unwrap().clone().unwrap_or_else(|| {
             let input: Bytes = serde_json::from_value(request["params"][0]["input"].clone()).unwrap();
@@ -316,12 +332,30 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
         ..Default::default()
     });
     owner.start_tip_observation(tip_rx);
+    let wrong_password = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        "wrong password".into(),
+    ));
+    assert!(
+        owner
+            .prepare_operation(
+                ExecutorOperationId::random().unwrap(),
+                delivery(),
+                &wrong_password,
+                &[],
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(store.records().unwrap().is_empty());
+    assert!(rpc.state.requests.lock().unwrap().is_empty());
     let first = owner
         .prepare_operation(
             ExecutorOperationId::random().unwrap(),
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -339,8 +373,9 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
         .prepare_operation(
             operation,
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -375,8 +410,9 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
         .prepare_operation(
             operation,
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -402,8 +438,9 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
         .prepare_operation(
             operation,
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -463,8 +500,9 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
             &prepared,
             &call,
             std::slice::from_ref(&input),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
         )
         .await
         .unwrap();
@@ -512,8 +550,9 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
                 &prepared,
                 &call,
                 &[input],
-                &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-                None
+                &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                    TEST_PASSWORD.into()
+                ))
             )
             .await
             .is_err(),
@@ -628,12 +667,13 @@ async fn executor_spare_restart_stays_idle_until_preparation_and_shutdown_cancel
     tokio::time::resume();
     let operation = ExecutorOperationId::random().unwrap();
     {
-        let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
+        let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+            TEST_PASSWORD.into(),
+        ));
         let prepare = owner.prepare_operation(
             operation,
             delivery(),
-            &mut grant,
-            None,
+            &authorization,
             &[ExecutorAsset::Native],
             Some("Unshield 0.5 ETH"),
         );
@@ -677,8 +717,9 @@ async fn executor_spare_restart_stays_idle_until_preparation_and_shutdown_cancel
         .prepare_operation(
             operation,
             delivery(),
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
             &[],
             None,
         )
@@ -706,175 +747,226 @@ async fn executor_spare_restart_stays_idle_until_preparation_and_shutdown_cancel
 }
 
 #[tokio::test]
-async fn stopping_restore_keeps_the_derived_range_without_applying_a_late_reply() {
-    let rpc = Rpc::start().await;
-    let (root, db, vault) = desktop_store_with_vault();
-    let view = Arc::new(import_wallet_with_metadata(
-        &vault,
-        TEST_WALLET_ID,
-        "Wallet",
-    ));
-    let records = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
-    rpc.hold.send_replace(Some(multicall()));
-    let owner = ExecutorOwner::new(
-        0,
-        db.clone(),
-        view.clone(),
-        chain(&rpc),
-        HttpContext::direct_for_tests(),
-    )
-    .unwrap();
-    {
-        let mut grant = vault.create_spend_grant(TEST_PASSWORD).unwrap();
-        let restore = owner.discover_range(&mut grant, None, 10..12);
-        tokio::pin!(restore);
-        tokio::select! {
-            result = &mut restore => panic!("aggregate should still be blocked: {}", result.is_ok()),
-            () = rpc.wait_for(|requests| requests.iter().any(|request| request["method"] == "eth_call")) => {},
+async fn hardware_stopping_restore_keeps_the_derived_range_without_applying_a_late_reply() {
+    for descriptor in [
+        None,
+        Some(test_hardware_descriptor(0)),
+        Some(test_trezor_hardware_descriptor(0)),
+    ] {
+        let rpc = Rpc::start().await;
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = match descriptor.as_ref() {
+            Some(descriptor) => hardware::hardware_view(&vault, descriptor),
+            None => Arc::new(import_wallet_with_metadata(
+                &vault,
+                TEST_WALLET_ID,
+                "Wallet",
+            )),
+        };
+        let records = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+        rpc.hold.send_replace(Some(multicall()));
+        let owner = Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain(&rpc),
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
+        );
+        {
+            let authorization = match descriptor.as_ref() {
+                Some(descriptor) => hardware::authorize(
+                    &owner,
+                    &view,
+                    descriptor,
+                    crate::HardwareExecutorAction::Restore(10..12),
+                ),
+                None => crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                    TEST_PASSWORD.into(),
+                )),
+            };
+            let restore = owner.discover_range(&authorization, 10..12);
+            tokio::pin!(restore);
+            tokio::select! {
+                result = &mut restore => panic!("aggregate should still be blocked: {}", result.is_ok()),
+                () = rpc.wait_for(|requests| requests.iter().any(|request| request["method"] == "eth_call")) => {},
+            }
+            // Dropping the future is the same cancellation boundary as the panel's Stop.
         }
-        // Dropping the future is the same cancellation boundary as the panel's Stop.
+        rpc.hold.send_replace(None);
+        owner.shutdown().await;
+        let retained = records.records().unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(ExecutorRecord::index)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        assert!(retained.iter().all(|record| record.address().is_some()
+            && record.restored_at().is_some()
+            && record.use_check().observation().is_none()
+            && !record.use_check().is_unavailable()));
+        drop(owner);
+        drop(records);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
-    rpc.hold.send_replace(None);
-    owner.shutdown().await;
-    let retained = records.records().unwrap();
-    assert_eq!(
-        retained
-            .iter()
-            .map(ExecutorRecord::index)
-            .collect::<Vec<_>>(),
-        vec![10, 11]
-    );
-    assert!(retained.iter().all(|record| record.address().is_some()
-        && record.restored_at().is_some()
-        && record.use_check().observation().is_none()
-        && !record.use_check().is_unavailable()));
-    drop(owner);
-    drop(records);
-    drop(view);
-    drop(vault);
-    drop(db);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
-async fn restore_batches_64_use_checks_and_preserves_success_after_failure_and_restart() {
-    let rpc = Rpc::start().await;
-    let results = (0..64)
-        .map(|index| IMulticall3::Result {
-            success: index != 3,
-            returnData: match index {
-                0 => U256::ONE.to_be_bytes::<32>().to_vec().into(),
-                1 => U256::ZERO.to_be_bytes::<32>().to_vec().into(),
-                4 => Bytes::from_static(&[1]),
-                _ => Bytes::new(),
-            },
-        })
-        .collect::<Vec<_>>();
-    *rpc.state.aggregate_response.lock().unwrap() = Some(
-        json!({"result": Bytes::from(IMulticall3::tryAggregateCall::abi_encode_returns(&results))}),
-    );
-    let (root, db, vault) = desktop_store_with_vault();
-    let view = Arc::new(import_wallet_with_metadata(
-        &vault,
-        TEST_WALLET_ID,
-        "Wallet",
-    ));
-    let owner = ExecutorOwner::new(
-        0,
-        db.clone(),
-        view.clone(),
-        chain(&rpc),
-        HttpContext::direct_for_tests(),
-    )
-    .unwrap();
-    let report = owner
-        .discover_range(
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
-            0..64,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        (report.used(), report.unused(), report.unavailable()),
-        (2, 60, 2)
-    );
-    let saved = owner.records().unwrap();
-    assert!(saved[0].use_check().observation().unwrap().was_used());
-    assert!(
-        saved[1].use_check().observation().unwrap().was_used(),
-        "zero nonce is still delegated"
-    );
-    assert!(!saved[2].use_check().observation().unwrap().was_used());
-    assert!(saved[3].use_check().is_unavailable() && saved[4].use_check().is_unavailable());
-    {
-        let requests = rpc.state.requests.lock().unwrap();
-        assert_eq!(
-            requests
-                .iter()
-                .map(|request| request["method"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["eth_chainId", "eth_getBlockByNumber", "eth_call"],
-            "Restore must not query balances, account nonces, code, storage or history per address"
+async fn hardware_restore_batches_64_use_checks_and_preserves_success_after_failure_and_restart() {
+    for descriptor in [
+        None,
+        Some(test_hardware_descriptor(0)),
+        Some(test_trezor_hardware_descriptor(0)),
+    ] {
+        let rpc = Rpc::start().await;
+        let results = (0..64)
+            .map(|index| IMulticall3::Result {
+                success: index != 3,
+                returnData: match index {
+                    0 => U256::ONE.to_be_bytes::<32>().to_vec().into(),
+                    1 => U256::ZERO.to_be_bytes::<32>().to_vec().into(),
+                    4 => Bytes::from_static(&[1]),
+                    _ => Bytes::new(),
+                },
+            })
+            .collect::<Vec<_>>();
+        *rpc.state.aggregate_response.lock().unwrap() = Some(
+            json!({"result": Bytes::from(IMulticall3::tryAggregateCall::abi_encode_returns(&results))}),
         );
-        let request = &requests[2];
-        assert_eq!(request["params"][0]["to"], json!(multicall()));
-        assert_eq!(
-            request["params"][1],
-            json!({"blockHash": B256::repeat_byte(10), "requireCanonical": true})
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = match descriptor.as_ref() {
+            Some(descriptor) => hardware::hardware_view(&vault, descriptor),
+            None => Arc::new(import_wallet_with_metadata(
+                &vault,
+                TEST_WALLET_ID,
+                "Wallet",
+            )),
+        };
+        let owner = Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain(&rpc),
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
         );
-        let input: Bytes = serde_json::from_value(request["params"][0]["input"].clone()).unwrap();
-        let aggregate = IMulticall3::tryAggregateCall::abi_decode(&input).unwrap();
-        assert!(!aggregate.requireSuccess);
-        assert_eq!(aggregate.calls.len(), 64);
-        for (call, record) in aggregate.calls.iter().zip(&saved) {
-            assert_eq!(Some(call.target), record.address());
-            assert_eq!(call.callData, RelayAdapt7702::nonceCall {}.abi_encode());
+        let report = owner
+            .discover_range(
+                &match descriptor.as_ref() {
+                    Some(descriptor) => hardware::authorize(
+                        &owner,
+                        &view,
+                        descriptor,
+                        crate::HardwareExecutorAction::Restore(0..64),
+                    ),
+                    None => crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                        TEST_PASSWORD.into(),
+                    )),
+                },
+                0..64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.used(), report.unused(), report.unavailable()),
+            (2, 60, 2)
+        );
+        let saved = owner.records().unwrap();
+        assert!(saved[0].use_check().observation().unwrap().was_used());
+        assert!(
+            saved[1].use_check().observation().unwrap().was_used(),
+            "zero nonce is still delegated"
+        );
+        assert!(!saved[2].use_check().observation().unwrap().was_used());
+        assert!(saved[3].use_check().is_unavailable() && saved[4].use_check().is_unavailable());
+        {
+            let requests = rpc.state.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request["method"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["eth_chainId", "eth_getBlockByNumber", "eth_call"],
+                "Restore must not query balances, account nonces, code, storage or history per address"
+            );
+            let request = &requests[2];
+            assert_eq!(request["params"][0]["to"], json!(multicall()));
+            assert_eq!(
+                request["params"][1],
+                json!({"blockHash": B256::repeat_byte(10), "requireCanonical": true})
+            );
+            let input: Bytes =
+                serde_json::from_value(request["params"][0]["input"].clone()).unwrap();
+            let aggregate = IMulticall3::tryAggregateCall::abi_decode(&input).unwrap();
+            assert!(!aggregate.requireSuccess);
+            assert_eq!(aggregate.calls.len(), 64);
+            for (call, record) in aggregate.calls.iter().zip(&saved) {
+                assert_eq!(Some(call.target), record.address());
+                assert_eq!(call.callData, RelayAdapt7702::nonceCall {}.abi_encode());
+            }
         }
-    }
-    *rpc.state.aggregate_response.lock().unwrap() =
-        Some(json!({"error": {"code": -32000, "message": "aggregate failed"}}));
-    let report = owner
-        .discover_range(
-            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
-            None,
-            0..64,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        (report.used(), report.unused(), report.unavailable()),
-        (0, 0, 64)
-    );
-    assert_eq!(
-        rpc.state.requests.lock().unwrap().len(),
-        6,
-        "failed aggregate must not fan out"
-    );
-    owner.shutdown().await;
-    drop(owner);
-    let restarted = ExecutorOwner::new(
-        1,
-        db.clone(),
-        view.clone(),
-        chain(&rpc),
-        HttpContext::direct_for_tests(),
-    )
-    .unwrap();
-    let reloaded = restarted.records().unwrap();
-    for (before, after) in saved.iter().zip(&reloaded) {
+        *rpc.state.aggregate_response.lock().unwrap() =
+            Some(json!({"error": {"code": -32000, "message": "aggregate failed"}}));
+        let report = owner
+            .discover_range(
+                &match descriptor.as_ref() {
+                    Some(descriptor) => hardware::authorize(
+                        &owner,
+                        &view,
+                        descriptor,
+                        crate::HardwareExecutorAction::Restore(0..64),
+                    ),
+                    None => crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                        TEST_PASSWORD.into(),
+                    )),
+                },
+                0..64,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            before.use_check().observation(),
-            after.use_check().observation()
+            (report.used(), report.unused(), report.unavailable()),
+            (0, 0, 64)
         );
-        assert!(after.use_check().is_unavailable());
-        assert!(after.assets().is_empty());
-        assert_eq!(before.operation(), after.operation());
+        assert_eq!(
+            rpc.state.requests.lock().unwrap().len(),
+            6,
+            "failed aggregate must not fan out"
+        );
+        owner.shutdown().await;
+        drop(owner);
+        let restarted = ExecutorOwner::new(
+            1,
+            db.clone(),
+            view.clone(),
+            chain(&rpc),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap();
+        let reloaded = restarted.records().unwrap();
+        for (before, after) in saved.iter().zip(&reloaded) {
+            assert_eq!(
+                before.use_check().observation(),
+                after.use_check().observation()
+            );
+            assert!(after.use_check().is_unavailable());
+            assert!(after.assets().is_empty());
+            assert_eq!(before.operation(), after.operation());
+        }
+        restarted.shutdown().await;
+        drop(restarted);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
-    restarted.shutdown().await;
-    drop(restarted);
-    drop(view);
-    drop(vault);
-    drop(db);
-    std::fs::remove_dir_all(root).unwrap();
 }

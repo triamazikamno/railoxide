@@ -194,7 +194,12 @@ pub(in crate::root) fn self_broadcast_requires_software_gas_payer_password(
     gas_payer_source: Option<PublicAccountSource>,
 ) -> bool {
     delivery_mode == DeliveryMode::SelfBroadcast
-        && gas_payer_source.is_some_and(|source| source != PublicAccountSource::HardwareDerived)
+        && gas_payer_source.is_some_and(|source| {
+            matches!(
+                source,
+                PublicAccountSource::Derived | PublicAccountSource::Imported
+            )
+        })
 }
 
 #[derive(Clone, Eq, PartialEq)]

@@ -38,6 +38,8 @@ pub(in crate::root) struct PrivateEstimateInput {
 impl PrivateEstimateInput {
     fn for_picker(mut self, recipient: String) -> Self {
         self.recipient = recipient;
+        // Comparison estimates must work even if the form's chosen broadcaster is unavailable.
+        self.broadcaster = BroadcasterChoice::Random;
         if self.amount.trim().is_empty() {
             // Blank forms still need a representative amount for this display estimate.
             self.amount = format_send_amount_input(self.asset.max_batched, self.asset.decimals);
@@ -183,7 +185,6 @@ impl WalletRoot {
                 };
                 PrivateEstimateRequest::Unshield(DesktopUnshieldPublicBroadcasterEstimateRequest {
                     custom_fee_amount: input.custom_fee_amount,
-                    approved_fee_amount: None,
                     executor: None,
                     chain_id: asset.chain_id,
                     effective_chain,
@@ -240,7 +241,9 @@ mod tests {
                 },
                 recipient: String::new(),
                 amount: " ".into(),
-                broadcaster: BroadcasterChoice::Random,
+                broadcaster: BroadcasterChoice::Specific {
+                    railgun_address: "unavailable broadcaster".into(),
+                },
                 fee_token: Address::ZERO,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_out_of_range: false,
@@ -253,6 +256,35 @@ mod tests {
             assert_eq!(
                 parse_send_amount(&picker.amount, picker.asset.decimals).unwrap(),
                 input.asset.max_batched
+            );
+            let policy = wallet_ops::BroadcasterFeePolicy::default();
+            let candidates = wallet_ops::public_broadcaster_candidates_for_asset(
+                &[crate::root::tests::fee_row(1, input.fee_token, "available")],
+                1,
+                input.fee_token,
+                None,
+                policy,
+                None,
+            )
+            .unwrap();
+            let trust = wallet_ops::PublicBroadcasterTrustFilter::default();
+            assert!(
+                select_public_broadcaster_with_policy_and_trust(
+                    &candidates,
+                    &WalletRoot::public_broadcaster_selection(&input.broadcaster),
+                    policy,
+                    &trust,
+                )
+                .is_err()
+            );
+            assert!(
+                select_public_broadcaster_with_policy_and_trust(
+                    &candidates,
+                    &WalletRoot::public_broadcaster_selection(&picker.broadcaster),
+                    policy,
+                    &trust,
+                )
+                .is_ok()
             );
             input.amount = "1.123456789012345678".into();
             let picker = input.clone().for_picker(String::new());
