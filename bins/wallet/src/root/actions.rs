@@ -5,6 +5,12 @@ use gpui::{App, Entity, Global, KeyBinding, WeakEntity, Window, WindowId};
 use super::TABLE_KEY_CONTEXT;
 use super::startup::WalletStartupRoot;
 
+pub(super) const PRIVATE_ACTION_FORM_KEY_CONTEXT: &str = "PrivateActionForm";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct RefreshBroadcasterEstimate;
+
 #[cfg(feature = "hardware")]
 pub(super) const TREZOR_PASSPHRASE_MODE_KEY_CONTEXT: &str = "TrezorPassphraseMode";
 
@@ -52,8 +58,13 @@ enum WalletShortcutAction {
 
 pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     app.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-l", LockVault, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-l", LockVault, None),
+        KeyBinding::new(
+            "ctrl-r",
+            RefreshBroadcasterEstimate,
+            Some(PRIVATE_ACTION_FORM_KEY_CONTEXT),
+        ),
     ]);
     app.on_action(|_: &OpenSettings, cx| {
         dispatch_wallet_shortcut(WalletShortcutAction::OpenSettings, cx);

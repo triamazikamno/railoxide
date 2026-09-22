@@ -51,3 +51,41 @@ mod executor_approval;
 
 use helpers::*;
 pub(super) use helpers::{fee_row, unshield_utxo_output};
+
+#[gpui_kit::test]
+fn global_shortcuts_use_secondary_modifier(cx: &mut gpui::TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::actions::{LockVault, OpenSettings, install_wallet_action_bindings};
+
+    let settings_dispatches = Rc::new(Cell::new(0));
+    let lock_dispatches = Rc::new(Cell::new(0));
+    cx.update(|app| {
+        install_wallet_action_bindings(app);
+        let settings_dispatches = Rc::clone(&settings_dispatches);
+        app.on_action(move |_: &OpenSettings, _| {
+            settings_dispatches.set(settings_dispatches.get() + 1);
+        });
+        let lock_dispatches = Rc::clone(&lock_dispatches);
+        app.on_action(move |_: &LockVault, _| {
+            lock_dispatches.set(lock_dispatches.get() + 1);
+        });
+    });
+    let cx = cx.add_empty_window();
+
+    // On Windows and Linux, the Super/Windows key must not dispatch either action.
+    #[cfg(not(target_os = "macos"))]
+    {
+        cx.simulate_keystrokes("super-, super-l");
+        assert_eq!(settings_dispatches.get(), 0);
+        assert_eq!(lock_dispatches.get(), 0);
+    }
+
+    cx.simulate_keystrokes("secondary-,");
+    assert_eq!(settings_dispatches.get(), 1);
+    assert_eq!(lock_dispatches.get(), 0);
+
+    cx.simulate_keystrokes("secondary-l");
+    assert_eq!(settings_dispatches.get(), 1);
+    assert_eq!(lock_dispatches.get(), 1);
+}

@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::actions::{PRIVATE_ACTION_FORM_KEY_CONTEXT, RefreshBroadcasterEstimate};
 
 impl WalletRoot {
     pub(in crate::root) fn close_send_form(
@@ -73,6 +74,7 @@ impl WalletRoot {
             let max_height = window.viewport_size().height * 0.88;
             let close_root = root.clone();
             let content_root = root.clone();
+            let refresh_root = root.clone();
             root.update(cx, |root, cx| {
                 root.sync_private_action_asset_select_for_dialog(kind, key, window, cx);
             });
@@ -111,6 +113,38 @@ impl WalletRoot {
                 })
                 .child(
                     div()
+                        .key_context(PRIVATE_ACTION_FORM_KEY_CONTEXT)
+                        .on_action(move |_: &RefreshBroadcasterEstimate, _, cx| {
+                            refresh_root.update(cx, |root, cx| {
+                                let can_refresh = match kind {
+                                    DeliveryFormKind::Send => {
+                                        root.send_forms.get(&key).is_some_and(|form| {
+                                            form.cost_estimate.is_some()
+                                                && !form.estimating_cost
+                                                && should_render_public_broadcaster_cost_preview(
+                                                    form.delivery_mode,
+                                                    form.result.is_some(),
+                                                    form.error.is_some(),
+                                                )
+                                        })
+                                    }
+                                    DeliveryFormKind::Unshield => {
+                                        root.unshield_forms.get(&key).is_some_and(|form| {
+                                            form.cost_estimate.is_some()
+                                                && !form.estimating_cost
+                                                && should_render_public_broadcaster_cost_preview(
+                                                    form.delivery_mode,
+                                                    form.result.is_some(),
+                                                    form.error.is_some(),
+                                                )
+                                        })
+                                    }
+                                };
+                                if can_refresh {
+                                    root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                                }
+                            });
+                        })
                         .when_some(content.private_action_form.as_ref(), |this, form| {
                             this.track_focus(&form.focus)
                         })
