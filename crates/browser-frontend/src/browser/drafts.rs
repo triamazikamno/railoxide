@@ -1,4 +1,5 @@
 //! Editable inputs and peer-scoped desktop progress. This view never signs.
+mod defaults;
 mod private;
 use super::*;
 use gpui::{Focusable as _, Task};
@@ -411,11 +412,15 @@ impl GatewayView {
             || {
                 json!({"account":account, "chain_id":chain_json(chain), "kind":kind,
             "asset":"native", "amount":"", "recipient":"", "address_book_entry":null,
-            "fee":{"mode":"normal"}, "mimic_railway":true, "max":false})
+            "fee":{"mode":"normal"}, "max":false})
             },
             |draft| draft.input.clone(),
         );
-        input["kind"] = kind.into();
+        defaults::select_public_mode(
+            &mut input,
+            kind,
+            self.public_view.mimic_railway_shields_by_default,
+        );
         if let Some(asset) = asset {
             input["asset"] = asset.into();
         }
@@ -1097,7 +1102,11 @@ impl GatewayView {
                 false,
                 cx.listener(|this, shield, _, cx| {
                     if let Some(form) = &mut this.draft_form {
-                        form.input["kind"] = if *shield { "shield" } else { "send" }.into();
+                        defaults::select_public_mode(
+                            &mut form.input,
+                            if *shield { "shield" } else { "send" },
+                            this.public_view.mimic_railway_shields_by_default,
+                        );
                         this.draft_changed(cx);
                     }
                 }),

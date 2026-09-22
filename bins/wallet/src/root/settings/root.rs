@@ -330,6 +330,7 @@ impl WalletRoot {
             .allow_suspicious_broadcasters_by_default;
         let saved_mimic_railway_shield = settings.privacy.mimic_railway_shields_by_default;
         self.mimic_railway_shields_by_default = saved_mimic_railway_shield;
+        self.unwrap_unshields_by_default = settings.privacy.unwrap_unshields_by_default;
         if !self.public_form.shielding && self.public_form.action_progress.is_empty() {
             let shield_profile_changed =
                 self.public_form.mimic_railway_shield != saved_mimic_railway_shield;
@@ -355,6 +356,7 @@ impl WalletRoot {
         }
 
         self.ensure_walletconnect_relay_processing(cx);
+        self.publish_gateway_desktop_state();
         cx.notify();
     }
 }

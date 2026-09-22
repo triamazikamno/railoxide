@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 9;
+pub const WALLET_SETTINGS_VERSION: u32 = 10;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 4;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
@@ -103,6 +103,7 @@ pub struct WalletSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct PrivacySettings {
     pub mimic_railway_shields_by_default: bool,
+    pub unwrap_unshields_by_default: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

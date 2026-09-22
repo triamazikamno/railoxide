@@ -10,6 +10,8 @@ pub struct GatewayPrivateView {
     pub wallets: Vec<GatewayPrivateWallet>,
     #[serde(serialize_with = "railgun_ui::chain_id::optional::serialize")]
     pub selected_chain: Option<u64>,
+    /// Asset to unwrap by default on the selected chain, when the preference is enabled.
+    pub default_unwrap_asset: Option<String>,
     pub selection_message: Option<String>,
     pub state: GatewayPrivateChainState,
     pub message: Option<String>,

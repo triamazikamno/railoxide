@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RailOxide Gateway",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAveWXH3MCIcmngZkJy1K/WNeXN3VeCnQC8xvicIZktpMlif4LSiQDQSdORidG2lgh3sYX+qof6FBegyIR2NT2iYJm1KalvEJ0+UOxFRvSGWXSUTCFq6HEF+Nq3G9E9yUlX9AZFy/+Md1IdtPTfgPUYZysy6kidy9mYAF9mjtTMV0CVkNpJ5cRCAnocoWzubkZ054Yk2VTcLcpssL48IxkJmQUdHosF+msg3kQ8uA1P+ZADSJEfFW1z4ZcGwomeerfdI93YZPFJDtbLRFjSu0zSnepWm8JL9gflOGKHNA5lUUH/uCvfN6c1GLeMjdgrTZJkqi9oa6xU296eTuka08tCQIDAQAB",
   "description": "RailOxide desktop gateway and EIP-1193 provider.",
   "icons": {

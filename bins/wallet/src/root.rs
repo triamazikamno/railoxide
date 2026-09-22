@@ -362,6 +362,7 @@ pub(crate) struct WalletRoot {
     public_broadcaster_republish_interval: Duration,
     default_allow_suspicious_broadcasters: bool,
     mimic_railway_shields_by_default: bool,
+    unwrap_unshields_by_default: bool,
     vault_state: VaultState,
     wallet_setup_mode: WalletSetupMode,
     vault_error: Option<Arc<str>>,
@@ -1124,6 +1125,9 @@ impl WalletRoot {
             }
             None => (None, Some(Arc::from("Wallet database is unavailable"))),
         };
+        let unwrap_unshields_by_default = settings_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).saved.privacy.unwrap_unshields_by_default);
         let (vault_state, vault_error) = match vault_store.as_ref() {
             Some(store) => match store.vault_exists() {
                 Ok(true) => (VaultState::UnlockVault, None),
@@ -1363,6 +1367,7 @@ impl WalletRoot {
             public_broadcaster_republish_interval,
             default_allow_suspicious_broadcasters,
             mimic_railway_shields_by_default,
+            unwrap_unshields_by_default,
             vault_state,
             wallet_setup_mode: WalletSetupMode::Choose,
             vault_error,

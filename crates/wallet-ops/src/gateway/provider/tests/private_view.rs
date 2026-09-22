@@ -128,6 +128,46 @@ fn private_selection_requires_capability_visible_target_live_peer_and_current_tr
 }
 
 #[test]
+fn draft_defaults_refresh_the_extension_without_replacing_wallet_authority() {
+    let (path, mut provider, view) = fixture();
+    provider.attach_ui_peer(1, PeerId::from_bytes([7; 16]));
+    let mut wallet = provider.wallet.clone();
+    wallet.private_view_supported = true;
+    wallet.private_view = Some(GatewayPrivateView::default());
+    provider.update_wallet(wallet.clone(), 1);
+    messages(&mut provider);
+
+    for enabled in [true, false] {
+        let unwrap_asset =
+            enabled.then(|| alloy::primitives::Address::repeat_byte(0x11).to_string());
+        wallet.private_view.as_mut().unwrap().default_unwrap_asset = unwrap_asset.clone();
+        wallet.public_view.mimic_railway_shields_by_default = enabled;
+        assert!(provider.wallet.same_authority(&wallet));
+        assert!(!provider.wallet.same_state(&wallet));
+        provider.update_wallet(wallet.clone(), 1);
+
+        let snapshots = messages(&mut provider);
+        let (_, snapshot) = snapshots
+            .iter()
+            .find(|(session, message)| *session == 1 && message["type"] == "ui_snapshot")
+            .expect("preferences publish to the connected extension");
+        assert_eq!(
+            snapshot["private_view"]["default_unwrap_asset"],
+            json!(unwrap_asset)
+        );
+        assert_eq!(
+            snapshot["public_view"]["mimic_railway_shields_by_default"],
+            enabled
+        );
+        assert_eq!(snapshot["generation"], 1);
+    }
+
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn private_command_keeps_the_existing_public_wire_input_compatible() {
     assert!(matches!(
         serde_json::from_value::<GatewayClientMessage>(json!({

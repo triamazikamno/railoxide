@@ -100,6 +100,13 @@ impl WalletRoot {
             }
         }
         presentation.selected_chain = Some(self.selected_chain);
+        if self.unwrap_unshields_by_default {
+            presentation.default_unwrap_asset = self
+                .effective_chain_configs
+                .get(self.selected_chain)
+                .and_then(|chain| chain.wrapped_native_token)
+                .map(|token| token.to_string());
+        }
         if !self.selected_chain_has_railgun() {
             presentation.receive_address = None;
             presentation.selection_message = Some(

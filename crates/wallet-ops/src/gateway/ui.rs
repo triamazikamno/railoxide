@@ -11,6 +11,7 @@ pub struct GatewayPublicView {
     pub selected_account: Option<String>,
     #[serde(serialize_with = "railgun_ui::chain_id::optional::serialize")]
     pub selected_chain: Option<u64>,
+    pub mimic_railway_shields_by_default: bool,
     pub balances: Vec<GatewayAccountBalances>,
     pub refreshing: bool,
     pub balance_error: bool,

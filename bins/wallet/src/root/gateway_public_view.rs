@@ -21,6 +21,7 @@ impl WalletRoot {
             return GatewayPublicView::default();
         };
         let mut presentation = GatewayPublicView::default();
+        presentation.mimic_railway_shields_by_default = self.mimic_railway_shields_by_default;
         presentation.drafts = self.gateway.drafts.borrow().views(self);
         presentation.selected_account = self
             .selected_public_account()

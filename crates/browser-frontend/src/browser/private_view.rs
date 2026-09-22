@@ -57,6 +57,7 @@ pub(super) struct PrivateView {
     selected_wallet_choice: Option<String>,
     receive_address: Option<String>,
     pub(super) selected_chain: Option<u64>,
+    pub(super) default_unwrap_asset: Option<String>,
     wallets: Vec<PrivateWallet>,
     pub(super) selection_message: Option<String>,
     state: String,
@@ -83,6 +84,7 @@ impl PrivateView {
             selected_wallet_choice: field(&value, "selected_wallet_choice").as_string(),
             receive_address: field(&value, "receive_address").as_string(),
             selected_chain: chain_id_field(&value, "selected_chain"),
+            default_unwrap_asset: field(&value, "default_unwrap_asset").as_string(),
             wallets: array(&value, "wallets")
                 .iter()
                 .map(|wallet| PrivateWallet {

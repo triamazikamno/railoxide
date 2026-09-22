@@ -663,7 +663,6 @@ impl WalletRoot {
             allow_suspicious,
             favorites_only,
             delivery_mode,
-            unwrap,
         )) = self.unshield_forms.get(&key).map(|form| {
             (
                 form.asset.token,
@@ -673,7 +672,6 @@ impl WalletRoot {
                 form.allow_suspicious_broadcasters,
                 form.favorites_only_broadcasters,
                 form.delivery_mode,
-                form.unwrap,
             )
         })
         else {
@@ -683,12 +681,7 @@ impl WalletRoot {
             return;
         }
 
-        let unwrap_supported = is_effective_wrapped_native_token(
-            &self.effective_chain_configs,
-            asset.chain_id,
-            asset.token,
-        );
-        let unwrap = unwrap && unwrap_supported;
+        let unwrap = self.default_unshield_unwrap(&asset);
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
         let asset_options =
             self.private_action_asset_options(DeliveryFormKind::Unshield, asset.chain_id);
@@ -1555,6 +1548,15 @@ impl WalletRoot {
         cx.notify();
     }
 
+    fn default_unshield_unwrap(&self, asset: &UnshieldAsset) -> bool {
+        self.unwrap_unshields_by_default
+            && is_effective_wrapped_native_token(
+                &self.effective_chain_configs,
+                asset.chain_id,
+                asset.token,
+            )
+    }
+
     pub(in crate::root) fn initialize_unshield_form(
         &mut self,
         asset: UnshieldAsset,
@@ -1728,8 +1730,9 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
+        let unwrap = self.default_unshield_unwrap(&asset);
         let selected_fee_token =
-            self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
+            self.default_public_broadcaster_fee_token(key.chain_id, key.token, unwrap, false);
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
@@ -1747,7 +1750,7 @@ impl WalletRoot {
                 amount_input,
                 asset_select,
                 asset_select_items,
-                unwrap: false,
+                unwrap,
                 native_top_up: None,
                 native_top_up_enabled: false,
                 delivery_mode: DeliveryMode::PublicBroadcaster,

@@ -30,6 +30,7 @@ pub(super) struct PublicView {
     pub(super) drafts_supported: bool,
     pub selected_account: Option<String>,
     pub(super) selected_chain: Option<u64>,
+    pub(super) mimic_railway_shields_by_default: bool,
     balances: Vec<AccountBalances>,
     refreshing: bool,
     error: bool,
@@ -73,6 +74,10 @@ impl PublicView {
             drafts_supported: js_sys::Array::is_array(&field(&value, "drafts")),
             selected_account: field(&value, "selected_account").as_string(),
             selected_chain: chain_id_field(&value, "selected_chain"),
+            mimic_railway_shields_by_default: flag_field(
+                &value,
+                "mimic_railway_shields_by_default",
+            ),
             refreshing: flag_field(&value, "refreshing"),
             error: flag_field(&value, "balance_error"),
             balances: array(&value, "balances")

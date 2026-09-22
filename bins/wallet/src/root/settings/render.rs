@@ -422,6 +422,21 @@ impl Render for WalletSettingsEditor {
                 .description(
                     "Preselects Mimic Railway for new shields. ERC-20 shields may grant an unlimited token allowance.",
                 ),
+            )
+            .item(
+                Self::settings_switch_item(
+                    "wallet-settings-unwrap-by-default",
+                    "Unwrap by default",
+                    editor.clone(),
+                    None,
+                    |settings| settings.privacy.unwrap_unshields_by_default,
+                    |settings, value| {
+                        settings.privacy.unwrap_unshields_by_default = value;
+                    },
+                )
+                .description(
+                    "Preselects native token output when unshielding wrapped native tokens. You can change the output in each unshield form.",
+                ),
             );
         if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
             privacy_group = privacy_group.item(SettingItem::render(|_options, _window, _cx| {

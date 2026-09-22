@@ -1,6 +1,6 @@
 [package]
 name = "browser-frontend"
-version = "0.2.1"
+version = "0.2.2"
 publish = false
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,7 @@ wasm-bindgen = "=0.2.126"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

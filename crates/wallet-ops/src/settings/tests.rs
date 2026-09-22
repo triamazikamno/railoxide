@@ -872,12 +872,51 @@ fn settings_roundtrip_through_local_db() {
     let mut settings = WalletSettings::default();
     settings.network.mode = super::NetworkModeSetting::Direct;
     settings.privacy.mimic_railway_shields_by_default = true;
+    settings.privacy.unwrap_unshields_by_default = true;
     settings.poi.read_source = PoiReadSourceSetting::PoiProxy;
 
     save_wallet_settings(&store, &settings).expect("save settings");
     let loaded = load_wallet_settings(&store).expect("load settings");
     assert!(loaded.privacy.mimic_railway_shields_by_default);
     assert_eq!(loaded, settings);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_9_settings_migrate_with_unwrap_disabled_and_preserve_preferences() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut expected = WalletSettings::default();
+    expected.privacy.mimic_railway_shields_by_default = true;
+    expected.waku.direct_peers = Some(Vec::new());
+    expected.waku.backup_peers = Some(vec![WakuDirectPeerSetting {
+        peer_id: super::DEFAULT_WAKU_BACKUP_PEER_ID.into(),
+        addr: "/dns4/custom.example/tcp/8000/wss".into(),
+    }]);
+    let released = json!({
+        "version": 9,
+        "privacy": { "mimic_railway_shields_by_default": true },
+        "waku": expected.waku,
+    });
+    let payload = rmp_serde::to_vec_named(&released).expect("encode released settings");
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .expect("store released settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate settings");
+    assert!(!migrated.privacy.unwrap_unshields_by_default);
+    assert_eq!(migrated, expected);
+    let rewritten = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .unwrap()
+        .unwrap();
+    assert_ne!(rewritten, payload);
+    assert_eq!(load_wallet_settings(&store).unwrap(), expected);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

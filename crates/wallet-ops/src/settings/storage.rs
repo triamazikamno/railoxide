@@ -252,7 +252,7 @@ fn decode_wallet_settings_with_migration(
     let version: Version = rmp_serde::from_slice(data)?;
     let (mut settings, migrated) = match version.version {
         WALLET_SETTINGS_VERSION => Ok((rmp_serde::from_slice(data)?, None)),
-        7..=8 => {
+        7..=9 => {
             let mut settings: WalletSettings = rmp_serde::from_slice(data)?;
             settings.version = WALLET_SETTINGS_VERSION;
             Ok((settings, Some(version.version)))
@@ -269,7 +269,7 @@ fn decode_wallet_settings_with_migration(
         }
         version => Err(WalletSettingsError::UnsupportedVersion { version }),
     }?;
-    if migrated.is_some() {
+    if migrated.is_some_and(|version| version < 9) {
         settings.waku.backup_peers = settings.waku.direct_peers.as_ref().map(|_| Vec::new());
         // Freeze the released default so future endpoint changes cannot change this migration.
         if let Some([peer]) = settings.waku.direct_peers.as_deref()

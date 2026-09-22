@@ -186,19 +186,19 @@ impl GatewayView {
         let mut input = existing.map_or_else(|| json!({
             "wallet":wallet,"chain_id":chain_json(chain),"kind":kind,"asset":default_asset,"amount":"","max":false,
             "recipient":"","address_book_entry":null,"fee_token":default_asset,"fee_mode":"deduct",
-            "broadcaster":{"mode":"random"},"allow_out_of_range":false,"favorites_only":false,
-            "unwrap":false,"native_top_up":false
+            "broadcaster":{"mode":"random"},"allow_out_of_range":false,"favorites_only":false
         }), |draft| draft.input.clone());
         if input["kind"] != kind {
             input["recipient"] = "".into();
             input["address_book_entry"] = Value::Null;
-            input["unwrap"] = false.into();
-            input["native_top_up"] = false.into();
         }
-        input["kind"] = kind.into();
-        if let Some(asset) = asset {
-            input["asset"] = asset.into();
-        }
+        let selected_asset = asset.unwrap_or_else(|| text(&input, "asset"));
+        defaults::select_private_output(
+            &mut input,
+            kind,
+            &selected_asset,
+            self.private_view.default_unwrap_asset.as_deref(),
+        );
         let request = existing.map_or_else(
             || format!("{}-{}", js_sys::Date::now(), js_sys::Math::random()),
             |draft| draft.request_id.clone(),
@@ -244,9 +244,13 @@ impl GatewayView {
                     && let Some(form) = &mut this.draft_form
                     && form.input["asset"] != *id
                 {
-                    form.input["asset"] = id.clone().into();
-                    form.input["unwrap"] = false.into();
-                    form.input["native_top_up"] = false.into();
+                    let kind = text(&form.input, "kind");
+                    defaults::select_private_output(
+                        &mut form.input,
+                        &kind,
+                        id,
+                        this.private_view.default_unwrap_asset.as_deref(),
+                    );
                     this.draft_changed(cx);
                 }
             },
@@ -409,11 +413,15 @@ impl GatewayView {
         if form.input["kind"] == kind {
             return;
         }
-        form.input["kind"] = kind.into();
+        let asset = text(&form.input, "asset");
+        defaults::select_private_output(
+            &mut form.input,
+            kind,
+            &asset,
+            self.private_view.default_unwrap_asset.as_deref(),
+        );
         form.input["recipient"] = recipient.clone().into();
         form.input["address_book_entry"] = Value::Null;
-        form.input["unwrap"] = false.into();
-        form.input["native_top_up"] = false.into();
         form.setting_recipient = Some(recipient.clone());
         form.recipient
             .update(cx, |state, cx| state.set_value(recipient, window, cx));
