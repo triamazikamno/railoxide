@@ -417,11 +417,12 @@ mod tests {
             .get(1)
             .unwrap()
             .clone();
-        chain.chain_id = 999;
+        chain.chain_id = 31337;
         chain.native_currency.decimals = 6;
         chain.railgun = None;
         chain.wrapped_native_token = None;
-        chain.rpc_route = crate::RpcChainRoute::new(999, vec![endpoint]).with_multicall(multicall);
+        chain.rpc_route =
+            crate::RpcChainRoute::new(31337, vec![endpoint]).with_multicall(multicall);
         let mut configs: EffectiveChainRegistry = std::iter::once(chain).collect();
         let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
             network_mode: Some(crate::WalletNetworkMode::Direct),
@@ -443,34 +444,34 @@ mod tests {
         );
         for replacement in [None, Some(Address::repeat_byte(7))] {
             if let Some(address) = replacement {
-                configs.get_mut(999).unwrap().native_usd_oracle = Some(address);
+                configs.get_mut(31337).unwrap().native_usd_oracle = Some(address);
                 worker.reconcile_native_sources(&configs, &[]);
-                assert_eq!(cache.cached_native_usd_rate(999), None);
+                assert_eq!(cache.cached_native_usd_rate(31337), None);
             }
             tokio::time::timeout(Duration::from_secs(3), async {
-                while cache.cached_native_usd_rate(999).is_none() {
+                while cache.cached_native_usd_rate(31337).is_none() {
                     updates.changed().await.unwrap();
                 }
             })
             .await
             .expect("startup and replacement refresh promptly");
             assert_eq!(
-                cache.cached_native_usd_micro_value(999, U256::from(1_500_000)),
+                cache.cached_native_usd_micro_value(31337, U256::from(1_500_000)),
                 Some(U256::from(3_000_000))
             );
         }
         assert_eq!(batches.load(Ordering::SeqCst), 2);
         // A Test reads the same source through the broker and publishes nothing.
         let published = cache.native_usd_statuses();
-        let quote = probe_native_usd_quote(configs.get(999).unwrap(), &probe_http)
+        let quote = probe_native_usd_quote(configs.get(31337).unwrap(), &probe_http)
             .await
             .unwrap();
         assert_eq!(quote.micro_usd, "2000000");
         assert_eq!(quote.feed_decimals, 8);
         assert_eq!(cache.native_usd_statuses(), published);
-        configs.get_mut(999).unwrap().enabled = false;
+        configs.get_mut(31337).unwrap().enabled = false;
         worker.reconcile_native_sources(&configs, &[]);
-        assert_eq!(cache.cached_native_usd_rate(999), None);
+        assert_eq!(cache.cached_native_usd_rate(31337), None);
         assert!(cache.native_reads().is_empty());
         drop(worker);
         server.abort();
@@ -543,49 +544,50 @@ mod tests {
             finality_depth: None,
             gas: crate::settings::ChainGasSettings::default(),
         };
-        settings.chains.custom.insert(999, definition);
+        settings.chains.custom.insert(31337, definition);
         let mut configs = build_effective_chain_configs(&settings).unwrap();
         cache.reconcile_native_sources(&configs, &[]);
         let read = cache
             .native_reads()
             .into_iter()
-            .find(|read| read.chain.chain_id == 999)
+            .find(|read| read.chain.chain_id == 31337)
             .unwrap();
         assert!(read.chain.railgun.is_none());
         assert!(read.chain.wrapped_native_token.is_none());
         cache.publish_native(&read, Ok((U256::from(2_000_000), 8)));
         assert_eq!(
-            cache.cached_native_usd_micro_value(999, U256::from(1_500_000)),
+            cache.cached_native_usd_micro_value(31337, U256::from(1_500_000)),
             Some(U256::from(3_000_000))
         );
         settings
             .chains
             .custom
-            .get_mut(&999)
+            .get_mut(&31337)
             .unwrap()
             .native_currency
             .decimals = 3;
         configs = build_effective_chain_configs(&settings).unwrap();
         cache.reconcile_native_sources(&configs, &[]);
         assert_eq!(
-            cache.cached_native_usd_micro_value(999, U256::from(1500)),
+            cache.cached_native_usd_micro_value(31337, U256::from(1500)),
             Some(U256::from(3_000_000))
         );
         cache.publish_native(&read, Err("Old precision".to_owned()));
         assert_eq!(
-            cache.native_usd_statuses()["999"].state,
+            cache.native_usd_statuses()["31337"].state,
             NativeUsdState::Pending
         );
         let current = cache
             .native_reads()
             .into_iter()
-            .find(|read| read.chain.chain_id == 999)
+            .find(|read| read.chain.chain_id == 31337)
             .unwrap();
-        settings.chains.custom.remove(&999);
-        cache.reconcile_native_sources(&build_effective_chain_configs(&settings).unwrap(), &[999]);
+        settings.chains.custom.remove(&31337);
+        cache
+            .reconcile_native_sources(&build_effective_chain_configs(&settings).unwrap(), &[31337]);
         cache.publish_native(&current, Ok((U256::MAX, 77)));
-        assert_eq!(cache.cached_native_usd_rate(999), None);
-        assert!(!cache.native_usd_statuses().contains_key("999"));
+        assert_eq!(cache.cached_native_usd_rate(31337), None);
+        assert!(!cache.native_usd_statuses().contains_key("31337"));
     }
 
     #[tokio::test]

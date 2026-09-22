@@ -1,8 +1,9 @@
 use super::{
-    DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore, OFFICIAL_INDEXED_ARTIFACT_GATEWAYS,
-    OFFICIAL_POI_ARTIFACT_GATEWAYS, RememberedWalletKind, Url, WALLET_SETTINGS_KEY,
-    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WalletSettings,
-    WalletSettingsError, WalletUiState, WalletUiStateError,
+    ChainSettingsOverride, DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore,
+    OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_GATEWAYS, RailgunSettingsOverride,
+    RememberedWalletKind, Url, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY,
+    WALLET_UI_STATE_VERSION, WalletSettings, WalletSettingsError, WalletUiState,
+    WalletUiStateError,
 };
 
 // All application settings writers share this lock, including startup repair and migration.
@@ -46,15 +47,61 @@ pub(super) fn load_wallet_settings_with_writer(
         && migrate_legacy_indexed_artifact_gateways(&mut settings);
     let poi_gateway_migrated = version_migrated.is_some_and(|version| version < 6)
         && migrate_previous_official_poi_gateways(&mut settings);
+    // Not version gated: a chain id added to the built-in presets later needs the same fold.
+    let custom_chain_migrated = migrate_custom_chains_to_public_presets(&mut settings);
     if version_migrated.is_some()
         || identity_migrated
         || poi_gateway_migrated
         || indexed_gateway_migrated
+        || custom_chain_migrated
     {
         let payload = encode_wallet_settings(&settings)?;
         write(&payload)?;
     }
     Ok(settings)
+}
+
+/// Folds a custom chain into the built-in preset that has taken over its id. The preset owns
+/// name, native currency and explorer URLs from here on; the saved endpoints, contracts, gas
+/// and enabled state survive as a per-chain override.
+fn migrate_custom_chains_to_public_presets(settings: &mut WalletSettings) -> bool {
+    let adopted: Vec<u64> = settings
+        .chains
+        .custom
+        .keys()
+        .copied()
+        .filter(|chain_id| railgun_ui::is_built_in_chain(*chain_id))
+        .collect();
+    if adopted.is_empty() {
+        return false;
+    }
+    for chain_id in adopted {
+        let Some(custom) = settings.chains.custom.remove(&chain_id) else {
+            continue;
+        };
+        if settings
+            .chains
+            .per_chain
+            .get(&chain_id)
+            .is_some_and(|existing| *existing != ChainSettingsOverride::default())
+        {
+            // An edited built-in override already owns this chain.
+            continue;
+        }
+        settings.chains.per_chain.insert(
+            chain_id,
+            ChainSettingsOverride {
+                native_usd_pricing: custom.native_usd_pricing,
+                enabled: custom.enabled,
+                rpc_endpoints: custom.rpc_endpoints,
+                contracts: custom.contracts,
+                finality_depth: custom.finality_depth,
+                gas: custom.gas,
+                railgun: RailgunSettingsOverride::default(),
+            },
+        );
+    }
+    true
 }
 
 fn migrate_previous_official_poi_gateways(settings: &mut WalletSettings) -> bool {

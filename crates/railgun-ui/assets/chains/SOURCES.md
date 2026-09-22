@@ -4,3 +4,29 @@ Chain icon sources:
 - `bsc.svg`: `https://www.bnbchain.org/images/brand-guidelines/svg/BNB%20Chain_Symbol_Yellow.svg`
 - `polygon.svg`: extracted from `https://polygon.technology/brand-guidelines`
 - `arbitrum.svg`: normalized from `https://arbitrum.io/brand-kit#icons`
+- `arc.svg`: `https://cdn.prod.website-files.com/685311a976e7c248b5dfde95/699e21e934a48439675361dc_arc-icon.svg`
+- `plasma.svg`: `https://www.plasma.org/brand/logo/plasma-symbol-dark.svg`
+- `mantle.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/mantle.svg` (MIT, `0xa3k5/web3icons`)
+- `etherlink.svg`: `https://www.etherlink.com/EtherlinkBrandAssets.zip` (`Etherlink Brand Assets/Logos/Social Avatar/Etherlink logo SVG.svg`)
+- `stable.svg`: `ipfs://bafkreiegvgr6qwavexa5koda4wfqdqomn7h44niwufhgw4nkof5yugizvi` (contributed to MIT-licensed `ethereum-lists/chains`)
+- `monad.svg`: `ipfs://bafkreia4vjioitvcrm5umefahnp4wttswooykroarjo5itdvohvk6epiya` (contributed to MIT-licensed `ethereum-lists/chains`)
+- `robinhood.svg`: `https://cdn.robinhood.com/assets/generated_assets/hoodchain_docsite/feather-dark.svg`
+- `sonic.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/sonic.svg` (MIT, `0xa3k5/web3icons`)
+- `unichain.svg`: `https://www.unichain.org/assets/zip/unichain-brand-kit.zip` (`Unichain Logo Assets/Unichain Icon - Vibrant.svg`)
+- `ink.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/ink.svg` (MIT, `0xa3k5/web3icons`)
+- `base.svg`: `https://raw.githubusercontent.com/base/brand-kit/main/logo/TheSquare/Digital/Base_square_blue.svg`
+- `fraxtal.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/fraxtal.svg` (MIT, `0xa3k5/web3icons`)
+- `optimism.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/optimism.svg` (MIT, `0xa3k5/web3icons`)
+- `avax.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/avalanche.svg` (MIT, `0xa3k5/web3icons`)
+- `gnosis.svg`: `https://raw.githubusercontent.com/gnosischain/media-kit/main/Logos/Owl_Logo%20-%20Mark.svg`
+- `blast.svg`: `https://cdn.prod.website-files.com/65a6baa1a3f8ed336f415cb4/65a6cee39aadb0fa7418aa77_Blast%20Logo%20Icon%20Yellow.svg`
+- `linea.svg`: `https://linea.build/_next/static/media/logomark.0ccyr1l-g8qzu.svg`
+- `katana.svg`: `https://docs.katana.network/img/katana/katana-social-icon.svg`
+- `rootstock.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/rootstock.svg` (MIT, `0xa3k5/web3icons`)
+- `cronos.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/cronos.svg` (MIT, `0xa3k5/web3icons`)
+- `megaeth.svg`: `https://static.megaeth.com/brand-kit/megaeth%20main%20logo.zip` (`main logo/ICON.svg`)
+- `berachain.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/berachain.svg` (MIT, `0xa3k5/web3icons`)
+- `tempo.svg`: `https://tempo.xyz/images/logo.svg`
+- `worldchain.svg`: `https://worldcoin-company-website.cdn.prismic.io/worldcoin-company-website/agMW8KYofJOwHH3v_Logomark.zip` (`Logomark (Digital _ RGB)/Logomark-Black/SVG/[World] Logomark-Black-RGB.svg`)
+- `pharosmainnet.png`: `https://cdn.prod.website-files.com/67dbfb55a03319f79c3c7c12/68c299c220615696c95a3ba2_Webclip%20_symbol%20icon_blue.png`
+- `hyperevm.svg`: `https://hyperliquid.gitbook.io/hyperliquid-docs/brand-kit` (`Hyperliquid SVG format.zip`, `Hyperliquid_Blob_Green.svg`; official brand kit, no stated licence)

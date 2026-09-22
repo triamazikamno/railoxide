@@ -85,9 +85,9 @@ pub(in crate::root) fn classify_settings_apply_mode(
 }
 
 fn built_in_operations_changed(saved: &WalletSettings, draft: &WalletSettings) -> bool {
-    railgun_ui::DEFAULT_CHAINS.iter().any(|id| {
-        let previous = saved.chains.per_chain.get(id).cloned().unwrap_or_default();
-        let mut next = draft.chains.per_chain.get(id).cloned().unwrap_or_default();
+    railgun_ui::built_in_chain_ids().any(|id| {
+        let previous = saved.chains.per_chain.get(&id).cloned().unwrap_or_default();
+        let mut next = draft.chains.per_chain.get(&id).cloned().unwrap_or_default();
         next.native_usd_pricing = previous.native_usd_pricing;
         next != previous
     })

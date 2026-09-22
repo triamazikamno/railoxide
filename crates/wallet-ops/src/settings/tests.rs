@@ -1606,7 +1606,7 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
         ethereum.require_railgun().unwrap().sync.quick_sync_endpoint,
         sync.quick_sync_endpoint
     );
-    assert_eq!(ethereum.rpc_route.multicall(), Some(defaults.multicall));
+    assert_eq!(ethereum.rpc_route.multicall(), defaults.multicall);
     assert_eq!(
         ethereum
             .require_railgun()
@@ -1640,6 +1640,55 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             .iter()
             .map(|gateway| format!("{gateway}/"))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
+    let mut settings = WalletSettings::default();
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let base = configs.get(8453).expect("base config");
+    assert!(base.built_in);
+    assert!(base.railgun.is_none());
+    assert!(base.enabled, "built-in presets ship enabled");
+    assert!(base.rpc_route.multicall().is_some());
+    assert_eq!(
+        base.native_usd_oracle,
+        super::presets::EvmPreset::for_chain(8453)
+            .expect("base preset")
+            .native_usd_oracle,
+        "default pricing resolves to the preset oracle"
+    );
+    assert!(settings.chains.enabled_chain_ids().contains(&8453));
+
+    settings.chains.per_chain.insert(
+        8453,
+        super::ChainSettingsOverride {
+            enabled: false,
+            ..super::ChainSettingsOverride::default()
+        },
+    );
+    settings
+        .validate()
+        .expect("a disabled public preset is a valid override");
+    assert!(!settings.chains.enabled_chain_ids().contains(&8453));
+
+    settings
+        .chains
+        .per_chain
+        .get_mut(&8453)
+        .expect("base override")
+        .railgun
+        .block_range = Some(1_000);
+    let error = settings
+        .validate()
+        .expect_err("Railgun settings on a public preset");
+    assert!(
+        error
+            .messages
+            .iter()
+            .any(|message| message.contains("chains.per_chain.8453.railgun")
+                && message.contains("no Railgun deployment"))
     );
 }
 
@@ -2217,7 +2266,7 @@ fn effective_chain_configs_reject_unsupported_chain_ids() {
     settings
         .chains
         .per_chain
-        .insert(999, super::ChainSettingsOverride::default());
+        .insert(31337, super::ChainSettingsOverride::default());
 
     let err = build_effective_chain_configs(&settings).expect_err("unsupported chain rejected");
     assert!(
@@ -2483,7 +2532,7 @@ fn legacy_anchor_settings_remain_compatible_and_rail_twap_override_resets() {
         json!({"type":"fixed", "rate":"1000000000000000000"}),
         json!({"type":"oracle", "chain_id":1, "oracle_address":"0x0000000000000000000000000000000000000003", "token_decimals":18, "oracle_decimals":8, "is_inversed":false}),
         json!({"type":"product", "components":[{"type":"fixed", "rate":"2"}], "scale_decimals":18}),
-        json!({"type":"uniswap-v3-twap", "chain_id":999, "pool_address":"0x0000000000000000000000000000000000000400", "base_token_address":"0x0000000000000000000000000000000000000401", "quote_token_address":"0x0000000000000000000000000000000000000402", "base_token_decimals":18, "window_seconds":1800}),
+        json!({"type":"uniswap-v3-twap", "chain_id":31337, "pool_address":"0x0000000000000000000000000000000000000400", "base_token_address":"0x0000000000000000000000000000000000000401", "quote_token_address":"0x0000000000000000000000000000000000000402", "base_token_decimals":18, "window_seconds":1800}),
     ];
     for value in legacy {
         serde_json::from_value::<super::PriceAnchorSettings>(value).expect("legacy anchor");
@@ -2923,6 +2972,51 @@ pub(super) fn custom_evm_chain() -> super::CustomChainSettings {
 }
 
 #[test]
+fn custom_chains_fold_into_built_in_presets_on_load() {
+    let root_dir = temp_db_root();
+    let mut saved = WalletSettings::default();
+    let mut adopted = custom_evm_chain();
+    adopted.rpc_endpoints = vec!["https://base.example".into()];
+    adopted.enabled = true;
+    adopted.finality_depth = Some(32);
+    saved.chains.custom.insert(8453, adopted);
+    let payload = encode_wallet_settings(&saved).unwrap();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .unwrap();
+
+    let mut written = None;
+    let migrated = super::storage::load_wallet_settings_with_writer(&store, |payload| {
+        written = Some(payload.to_vec());
+        Ok(())
+    })
+    .unwrap();
+
+    migrated
+        .validate()
+        .expect("a chain id covered by a preset no longer duplicates a custom chain");
+    assert!(!migrated.chains.custom.contains_key(&8453));
+    let adopted = migrated.chains.per_chain.get(&8453).expect("base override");
+    assert_eq!(
+        adopted.rpc_endpoints,
+        vec!["https://base.example".to_owned()]
+    );
+    assert!(adopted.enabled);
+    assert_eq!(adopted.finality_depth, Some(32));
+    assert_eq!(
+        decode_wallet_settings(&written.expect("the fold is written back")).unwrap(),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[test]
 fn custom_registry_retains_token_and_oracle_references_across_disable() {
     const CHAIN: u64 = 9_007_199_254_740_993;
     let mut settings = WalletSettings::default();
@@ -2959,8 +3053,8 @@ fn custom_registry_retains_token_and_oracle_references_across_disable() {
     );
     // Metadata survives disable, while both public and private admission reject it.
     assert!(configs.get(1).is_some());
-    assert!(configs.get(999).is_none());
-    for (id, reason) in [(1, "disabled"), (999, "not configured")] {
+    assert!(configs.get(31337).is_none());
+    for (id, reason) in [(1, "disabled"), (31337, "not configured")] {
         assert!(
             configs
                 .enabled(id)
@@ -3210,7 +3304,7 @@ fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings
 fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
     let root_dir = temp_db_root();
     let mut expected = WalletSettings::default();
-    expected.chains.custom.insert(999, custom_evm_chain());
+    expected.chains.custom.insert(31337, custom_evm_chain());
     expected.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
         vec!["https://rpc.example".into()];
     expected.chains.per_chain.get_mut(&56).unwrap().enabled = false;
@@ -3219,7 +3313,7 @@ fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
         .tokens
         .custom_tokens
         .push(super::CustomTokenSettings {
-            chain_id: 999,
+            chain_id: 31337,
             token_address: Address::repeat_byte(7).to_string(),
             symbol: "TOKEN".into(),
             decimals: 6,

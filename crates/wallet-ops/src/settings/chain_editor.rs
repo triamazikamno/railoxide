@@ -17,9 +17,7 @@ pub fn chain_editor_snapshot(
     snapshot.revision = settings_revision(settings)
         .map_err(|error| error.to_string())?
         .to_string();
-    snapshot.chains = railgun_ui::DEFAULT_CHAINS
-        .iter()
-        .copied()
+    snapshot.chains = railgun_ui::built_in_chain_ids()
         .chain(settings.chains.custom.keys().copied())
         .map(|id| {
             let mut summary = ChainSummary::default();
@@ -30,6 +28,7 @@ pub fn chain_editor_snapshot(
                 summary.rpc_endpoints = chain.rpc_endpoints.len();
             } else {
                 summary.built_in = true;
+                summary.railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
                 railgun_ui::chain_name(id)
                     .unwrap_or("Chain")
                     .clone_into(&mut summary.name);
@@ -119,6 +118,7 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
     let mut draft = ChainDraft::new();
     draft.chain_id = id.to_string();
     draft.built_in = true;
+    draft.railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
     fill_native_pricing(&mut draft, chain.native_usd_pricing);
     fill_general_draft(
         &mut draft,
@@ -131,6 +131,10 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
         chain.finality_depth,
         &chain.gas,
     );
+    if !draft.railgun {
+        // Public presets carry no Railgun fields, exactly like a custom chain.
+        return Ok(draft);
+    }
     let private = &chain.railgun;
     draft.quick_sync_enabled = private.quick_sync.enabled;
     draft.use_default_relays = private.sponsored_bundle_relays.is_none();
@@ -268,7 +272,9 @@ fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Str
     ] {
         draft.fields.insert(field, value);
     }
-    let private = chain.railgun.expect("built-in Railgun configuration");
+    let Some(private) = chain.railgun else {
+        return Ok(draft);
+    };
     for (field, value) in [
         (
             ChainField::RailgunContract,
@@ -549,8 +555,12 @@ fn draft_mutation(
     existing: bool,
 ) -> Result<ChainMutation, String> {
     let id = editor_chain_id(&draft.chain_id)?;
-    let built_in = railgun_ui::DEFAULT_CHAINS.contains(&id);
-    if draft.built_in != built_in || settings.chains.contains(id) != existing {
+    let built_in = railgun_ui::is_built_in_chain(id);
+    let has_railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
+    if draft.built_in != built_in
+        || draft.railgun != has_railgun
+        || settings.chains.contains(id) != existing
+    {
         return Err("Chain identity changed. Reload the chain list before saving".to_owned());
     }
     let mut normalized = draft.clone();
@@ -590,36 +600,50 @@ fn draft_mutation(
         {
             return Err("Built-in chain identity cannot be changed".to_owned());
         }
-        let railgun = RailgunSettingsOverride {
-            sponsored_bundle_relays: (!draft.use_default_relays)
-                .then(|| lines(draft, ChainField::SponsoredBundleRelays)),
-            quick_sync: QuickSyncSettings {
-                enabled: draft.quick_sync_enabled,
-                endpoint: optional_text(draft, ChainField::QuickSyncEndpoint),
+        let railgun = if has_railgun {
+            RailgunSettingsOverride {
+                sponsored_bundle_relays: (!draft.use_default_relays)
+                    .then(|| lines(draft, ChainField::SponsoredBundleRelays)),
+                quick_sync: QuickSyncSettings {
+                    enabled: draft.quick_sync_enabled,
+                    endpoint: optional_text(draft, ChainField::QuickSyncEndpoint),
+                    indexed_wallet_block_range: optional_number(
+                        draft,
+                        ChainField::QuickSyncIndexedWalletBlockRange,
+                    )?,
+                },
+                contracts: RailgunContractSettings {
+                    railgun_contract: optional_text(draft, ChainField::RailgunContract),
+                    relay_adapt_contract: optional_text(draft, ChainField::RelayAdaptContract),
+                    relay_adapt_7702_contract: optional_text(
+                        draft,
+                        ChainField::RelayAdapt7702Contract,
+                    ),
+                    coinbase_payer: optional_text(draft, ChainField::CoinbasePayer),
+                },
+                deployment: ChainDeploymentSettings {
+                    deployment_block: optional_number(draft, ChainField::DeploymentBlock)?,
+                    v2_start_block: optional_number(draft, ChainField::V2StartBlock)?,
+                    legacy_shield_block: optional_number(draft, ChainField::LegacyShieldBlock)?,
+                    archive_until_block: optional_number(draft, ChainField::ArchiveUntilBlock)?,
+                    archive_rpc_url: optional_text(draft, ChainField::ArchiveRpcUrl),
+                },
+                block_range: optional_number(draft, ChainField::BlockRange)?,
+                poll_interval_secs: optional_number(draft, ChainField::PollIntervalSecs)?,
                 indexed_wallet_block_range: optional_number(
                     draft,
-                    ChainField::QuickSyncIndexedWalletBlockRange,
+                    ChainField::IndexedWalletBlockRange,
                 )?,
-            },
-            contracts: RailgunContractSettings {
-                railgun_contract: optional_text(draft, ChainField::RailgunContract),
-                relay_adapt_contract: optional_text(draft, ChainField::RelayAdaptContract),
-                relay_adapt_7702_contract: optional_text(draft, ChainField::RelayAdapt7702Contract),
-                coinbase_payer: optional_text(draft, ChainField::CoinbasePayer),
-            },
-            deployment: ChainDeploymentSettings {
-                deployment_block: optional_number(draft, ChainField::DeploymentBlock)?,
-                v2_start_block: optional_number(draft, ChainField::V2StartBlock)?,
-                legacy_shield_block: optional_number(draft, ChainField::LegacyShieldBlock)?,
-                archive_until_block: optional_number(draft, ChainField::ArchiveUntilBlock)?,
-                archive_rpc_url: optional_text(draft, ChainField::ArchiveRpcUrl),
-            },
-            block_range: optional_number(draft, ChainField::BlockRange)?,
-            poll_interval_secs: optional_number(draft, ChainField::PollIntervalSecs)?,
-            indexed_wallet_block_range: optional_number(
-                draft,
-                ChainField::IndexedWalletBlockRange,
-            )?,
+            }
+        } else {
+            if draft
+                .fields
+                .iter()
+                .any(|(field, value)| field.is_railgun() && !value.is_empty())
+            {
+                return Err("Built-in public chains support public EVM operations only".to_owned());
+            }
+            RailgunSettingsOverride::default()
         };
         Ok(ChainMutation::EditBuiltIn {
             chain_id: id,
@@ -685,9 +709,10 @@ mod tests {
         settings
             .chains
             .custom
-            .insert(999, super::super::tests::custom_evm_chain());
-        for id in [1, 999] {
-            let preset = presets::EvmPreset::for_chain(id).map(|preset| preset.native_usd_oracle);
+            .insert(31337, super::super::tests::custom_evm_chain());
+        for id in [1, 31337] {
+            let preset =
+                presets::EvmPreset::for_chain(id).and_then(|preset| preset.native_usd_oracle);
             for choice in [
                 NativeUsdChoice::Disabled,
                 NativeUsdChoice::Oracle,
@@ -717,7 +742,7 @@ mod tests {
                             Some(alloy::primitives::Address::with_last_byte(1)),
                     }
                 );
-                if id == 999 {
+                if id == 31337 {
                     assert!(chain.railgun.is_none());
                     assert!(chain.wrapped_native_token.is_none());
                 }
@@ -858,6 +883,35 @@ mod tests {
             );
             assert_eq!(save_draft(&changed, restored), settings);
         }
+    }
+
+    #[test]
+    fn public_preset_drafts_carry_no_railgun_settings() {
+        let settings = WalletSettings::default();
+        let draft = chain_editor_draft(&settings, 8453).unwrap();
+        assert!(draft.built_in && !draft.railgun);
+        assert!(draft.enabled, "built-in presets ship enabled");
+        assert_eq!(
+            lines(&draft, ChainField::RpcEndpoints),
+            presets::EvmPreset::for_chain(8453)
+                .unwrap()
+                .rpc_endpoints
+                .iter()
+                .map(|endpoint| url::Url::parse(endpoint).unwrap().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let mut private = draft;
+        private.fields.insert(
+            ChainField::RailgunContract,
+            "0x0000000000000000000000000000000000000001".into(),
+        );
+        assert!(
+            draft_mutation(&settings, &private, true)
+                .err()
+                .unwrap()
+                .contains("public EVM operations only")
+        );
     }
 
     #[test]

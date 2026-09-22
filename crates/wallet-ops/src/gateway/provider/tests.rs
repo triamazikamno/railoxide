@@ -3677,7 +3677,7 @@ async fn chain_addition_without_account_access_requires_current_confirmation() {
         );
         assert_eq!(result(&chain)["result"], "0x1", "{chain:?}");
         provider.request(1, "doc".into(), "add".into(), "wallet_addEthereumChain", json!([{
-            "chainId": "0x2105", "chainName": "Base Mainnet",
+            "chainId": "0x7a69", "chainName": "Anvil",
             "nativeCurrency": {"name": "ETH", "symbol": "ETH", "decimals": 18},
             "rpcUrls": ["https://mainnet.base.org"], "blockExplorerUrls": ["https://basescan.org"]
         }]), Instant::now()).unwrap();
@@ -3693,7 +3693,7 @@ async fn chain_addition_without_account_access_requires_current_confirmation() {
         provider.approval_read(
             &ready.id,
             url::Url::parse("https://mainnet.base.org").unwrap().into(),
-            RpcRead::from_method_params("eth_blockNumber", json!([]), 8453).unwrap(),
+            RpcRead::from_method_params("eth_blockNumber", json!([]), 31337).unwrap(),
             Instant::now(),
             reply,
         );
@@ -3715,12 +3715,12 @@ async fn chain_addition_without_account_access_requires_current_confirmation() {
             "added" | "added_before_publication" => {
                 provider.begin_approval(&ready.id).unwrap();
                 let mut wallet = provider.wallet.clone();
-                wallet.chain_ids.push(8453);
-                wallet.configured_chain_ids.push(8453);
+                wallet.chain_ids.push(31337);
+                wallet.configured_chain_ids.push(31337);
                 wallet.routes.insert(
-                    8453,
+                    31337,
                     RpcChainRoute::new(
-                        8453,
+                        31337,
                         vec![url::Url::parse("https://mainnet.base.org").unwrap()],
                     ),
                 );
@@ -3779,7 +3779,7 @@ async fn chain_addition_without_account_access_requires_current_confirmation() {
                 json!([])
             );
             for (method, params) in [
-                ("wallet_switchEthereumChain", json!([{"chainId":"0x2105"}])),
+                ("wallet_switchEthereumChain", json!([{"chainId":"0x7a69"}])),
                 (
                     "personal_sign",
                     json!(["0x6869", "0x0000000000000000000000000000000000000001"]),

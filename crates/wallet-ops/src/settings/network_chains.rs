@@ -69,9 +69,7 @@ pub struct ChainSettings {
 
 impl Default for ChainSettings {
     fn default() -> Self {
-        let per_chain = railgun_ui::DEFAULT_CHAINS
-            .iter()
-            .copied()
+        let per_chain = railgun_ui::built_in_chain_ids()
             .map(|chain_id| (chain_id, ChainSettingsOverride::default()))
             .collect();
         Self {
@@ -84,9 +82,7 @@ impl Default for ChainSettings {
 impl ChainSettings {
     #[must_use]
     pub fn enabled_chain_ids(&self) -> Vec<u64> {
-        railgun_ui::DEFAULT_CHAINS
-            .iter()
-            .copied()
+        railgun_ui::built_in_chain_ids()
             .filter(|chain_id| {
                 self.per_chain
                     .get(chain_id)
@@ -220,7 +216,13 @@ impl ChainSettingsOverride {
             errors,
         );
         self.gas.validate(&format!("{field}.gas"), errors);
-        self.railgun.validate(chain_id, errors);
+        if !railgun_ui::PUBLIC_CHAINS.contains(&chain_id) {
+            self.railgun.validate(chain_id, errors);
+        } else if self.railgun != RailgunSettingsOverride::default() {
+            errors.push(format!(
+                "{field}.railgun is not supported: chain has no Railgun deployment"
+            ));
+        }
     }
 }
 

@@ -92,12 +92,12 @@ fn approved_chain_display_items_fall_back_to_raw_unknown_chain() {
         .approved_namespaces
         .get_mut("eip155")
         .expect("eip155 namespace")
-        .chains = vec!["eip155:10".to_owned()];
+        .chains = vec!["eip155:31337".to_owned()];
 
     let items = approved_chain_display_items(&session);
 
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].label, "eip155:10");
+    assert_eq!(items[0].label, "eip155:31337");
     assert_eq!(items[0].icon_path, None);
 }
 

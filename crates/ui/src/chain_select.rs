@@ -66,13 +66,13 @@ impl ChainSelectItems {
     pub fn new(mut items: Vec<ChainSelectItem>) -> Self {
         items.sort_by_key(|item| {
             (
-                railgun_ui::DEFAULT_CHAINS
-                    .iter()
-                    .position(|id| *id == item.chain_id)
+                railgun_ui::built_in_chain_ids()
+                    .position(|id| id == item.chain_id)
                     .unwrap_or(usize::MAX),
                 item.chain_id,
             )
         });
+        // The divider separates Railgun chains from public-only ones, preset or custom.
         let groups: (Vec<_>, Vec<_>) = items
             .into_iter()
             .partition(|item| railgun_ui::DEFAULT_CHAINS.contains(&item.chain_id));
@@ -224,7 +224,7 @@ mod tests {
 
     fn items() -> Vec<ChainSelectItem> {
         [
-            (8453, "Base"),
+            (31337, "Anvil"),
             (42161, "Arbitrum"),
             (LARGE_CHAIN, "Custom"),
             (1, "Ethereum"),
@@ -245,12 +245,12 @@ mod tests {
             let mut choices = ChainSelectItems::new(items());
             assert_eq!(choices.sections_count(cx), 2);
             assert_eq!(choices.item(IndexPath::new(1)).unwrap().chain_id, 42161);
-            assert_eq!(choices.position(&8453), Some(IndexPath::new(0).section(1)));
+            assert_eq!(choices.position(&31337), Some(IndexPath::new(0).section(1)));
             assert!(choices.render_section_header(1, window, cx).is_some());
-            choices.perform_search("bAsE", window, cx).detach();
+            choices.perform_search("aNvIl", window, cx).detach();
             assert_eq!(choices.sections_count(cx), 1);
             assert_eq!(choices.items_count(0), 1);
-            assert_eq!(choices.position(&8453), Some(IndexPath::new(0)));
+            assert_eq!(choices.position(&31337), Some(IndexPath::new(0)));
             assert!(choices.render_section_header(0, window, cx).is_none());
             choices
                 .perform_search("no such network", window, cx)
@@ -293,7 +293,7 @@ mod tests {
         cx.update(gpui_component::init);
         let mut select = None;
         let handle = cx.add_window(|window, cx| {
-            let state = cx.new(|cx| chain_select_state(items(), Some(8453), window, cx));
+            let state = cx.new(|cx| chain_select_state(items(), Some(31337), window, cx));
             select = Some(state.clone());
             let view = cx.new(|cx| SelectorProbe {
                 select: state,
@@ -306,7 +306,7 @@ mod tests {
         let select = select.unwrap();
         let cx = VisualTestContext::from_window(*handle, cx).into_mut();
         cx.update(|window, cx| {
-            assert_eq!(select.read(cx).selected_value(), Some(&8453));
+            assert_eq!(select.read(cx).selected_value(), Some(&31337));
             select.update(cx, |state, cx| state.focus(window, cx));
         });
         cx.refresh().unwrap();
@@ -317,7 +317,7 @@ mod tests {
             cx.refresh().unwrap();
             let ethereum = cx.debug_bounds("chain-option-1").unwrap();
             let arbitrum = cx.debug_bounds("chain-option-42161").unwrap();
-            let base = cx.debug_bounds("chain-option-8453").unwrap();
+            let base = cx.debug_bounds("chain-option-31337").unwrap();
             let row_gap = arbitrum.top() - ethereum.bottom();
             let group_gap = base.top() - arbitrum.bottom();
             assert!(
@@ -333,7 +333,7 @@ mod tests {
         cx.update(|window, cx| {
             select.update(cx, |state, cx| {
                 let mut updated = items();
-                updated.retain(|chain| chain.chain_id != 8453);
+                updated.retain(|chain| chain.chain_id != 31337);
                 state.set_items(ChainSelectItems::new(updated), window, cx);
                 state.set_selected_value(&LARGE_CHAIN, window, cx);
             });
@@ -356,7 +356,7 @@ mod tests {
         cx.update(gpui_component::init);
         let mut probe = None;
         let handle = cx.add_window(|window, cx| {
-            let select = cx.new(|cx| chain_select_state(items(), Some(8453), window, cx));
+            let select = cx.new(|cx| chain_select_state(items(), Some(31337), window, cx));
             let view = cx.new(|cx| SelectorProbe {
                 select,
                 editing_enabled: true,
@@ -385,7 +385,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.read(|cx| {
             assert_eq!(probe.read(cx).edited_chain, Some(LARGE_CHAIN));
-            assert_eq!(select.read(cx).selected_value(), Some(&8453));
+            assert_eq!(select.read(cx).selected_value(), Some(&31337));
         });
         assert!(cx.debug_bounds("chain-option-9007199254740993").is_none());
         cx.update(|window, cx| assert!(probe.read(cx).editor_focus.is_focused(window)));

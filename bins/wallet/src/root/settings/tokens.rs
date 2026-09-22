@@ -48,9 +48,8 @@ pub(in crate::root) fn display_token_entries(settings: &WalletSettings) -> Vec<D
 }
 
 pub(in crate::root) fn default_token_entries() -> Vec<DisplayTokenEntry> {
-    railgun_ui::DEFAULT_CHAINS
-        .iter()
-        .flat_map(|chain_id| railgun_ui::known_tokens_for_chain(*chain_id))
+    railgun_ui::built_in_chain_ids()
+        .flat_map(railgun_ui::known_tokens_for_chain)
         .map(|token| DisplayTokenEntry {
             chain_id: token.chain_id,
             token_address: token.token.to_string(),

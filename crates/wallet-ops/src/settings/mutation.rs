@@ -85,13 +85,13 @@ impl ChainMutation {
                 *current = definition.clone();
             }
             Self::EditBuiltIn { overrides, .. } => {
-                if !railgun_ui::DEFAULT_CHAINS.contains(&id) {
+                if !railgun_ui::is_built_in_chain(id) {
                     return Err(invalid("Chain has no built-in preset"));
                 }
                 next.chains.per_chain.insert(id, overrides.clone());
             }
             Self::SetEnabled { enabled, .. } => {
-                if railgun_ui::DEFAULT_CHAINS.contains(&id) {
+                if railgun_ui::is_built_in_chain(id) {
                     next.chains.per_chain.entry(id).or_default().enabled = *enabled;
                 } else {
                     next.chains
@@ -107,7 +107,7 @@ impl ChainMutation {
                 }
             }
             Self::ResetBuiltIn { .. } => {
-                if !railgun_ui::DEFAULT_CHAINS.contains(&id) {
+                if !railgun_ui::is_built_in_chain(id) {
                     return Err(invalid("Chain has no built-in preset"));
                 }
                 next.chains.per_chain.remove(&id);

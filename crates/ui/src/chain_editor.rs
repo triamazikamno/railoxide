@@ -261,7 +261,7 @@ impl ChainEditor {
         self.fields = ChainField::ALL
             .iter()
             .copied()
-            .filter(|field| draft.built_in || !field.is_railgun())
+            .filter(|field| draft.railgun || !field.is_railgun())
             .map(|field| {
                 let value = draft.value(field);
                 let input = if field.is_url_list() {
@@ -287,12 +287,12 @@ impl ChainEditor {
             chain_id.update(cx, |input, cx| input.focus(window, cx));
         }
         self.chain_id = Some(chain_id);
-        let built_in = draft.built_in;
+        let has_railgun = draft.railgun;
         self.draft = Some(draft);
         self.existing = existing;
         self.error = None;
         let advanced_open = self.override_count(ChainField::is_advanced_evm, cx) > 0;
-        let railgun_open = built_in && self.railgun_override_count(cx) > 0;
+        let railgun_open = has_railgun && self.railgun_override_count(cx) > 0;
         // Existing deployment overrides stay editable; untouched presets start locked.
         let edit_deployment = ChainField::ALL
             .iter()
@@ -468,6 +468,8 @@ impl ChainEditor {
             .chains
             .iter()
             .partition(|chain| chain.built_in);
+        let (railgun, public): (Vec<_>, Vec<_>) =
+            built_in.into_iter().partition(|chain| chain.railgun);
         root.gap_3()
             .p_3()
             .when(self.stale, |body| {
@@ -494,11 +496,20 @@ impl ChainEditor {
                         })),
                 ),
             )
-            .when(!built_in.is_empty(), |body| {
+            .when(!railgun.is_empty(), |body| {
                 body.child(Self::render_group(
                     "Railgun",
                     "Private and public",
-                    &built_in,
+                    &railgun,
+                    unavailable,
+                    cx,
+                ))
+            })
+            .when(!public.is_empty(), |body| {
+                body.child(Self::render_group(
+                    "Public only",
+                    "Built-in EVM chains",
+                    &public,
                     unavailable,
                     cx,
                 ))
@@ -733,8 +744,14 @@ impl ChainEditor {
             .child(if draft.built_in {
                 Alert::info(
                     "chain-built-in",
-                    "Built-in chain. Name, currency and explorer come from the preset. \
-                     Only values you change are saved.",
+                    if draft.railgun {
+                        "Built-in chain. Name, currency and explorer come from the preset. \
+                         Only values you change are saved."
+                    } else {
+                        "Built-in chain. Name, currency and explorer come from the preset. \
+                         Only values you change are saved. Public only: private balances and \
+                         Shield are unavailable on this chain."
+                    },
                 )
                 .small()
             } else {
@@ -761,7 +778,7 @@ impl ChainEditor {
             .child(self.render_endpoints_section(cx))
             .child(self.render_pricing_section(draft, cx))
             .child(self.render_advanced_section(cx));
-        if draft.built_in {
+        if draft.railgun {
             body = body.child(self.render_railgun_section(draft, cx));
         }
         body
@@ -774,7 +791,7 @@ impl ChainEditor {
         } else {
             "New chain".to_owned()
         };
-        let capability = if draft.built_in {
+        let capability = if draft.railgun {
             "Railgun"
         } else {
             "Public only"
@@ -1721,6 +1738,7 @@ mod pricing_tests {
                 let mut draft = ChainDraft::new();
                 draft.chain_id = "1".into();
                 draft.built_in = true;
+                draft.railgun = true;
                 draft.fields.insert(ChainField::NativeSymbol, "ETH".into());
                 draft.fields.insert(ChainField::Name, "Ethereum".into());
                 draft.fields.insert(

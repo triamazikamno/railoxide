@@ -36,6 +36,23 @@ pub(crate) const fn wrapped_native_token_for_chain(chain_id: u64) -> Option<Addr
         56 => Some(address!("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")),
         137 => Some(address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")),
         42161 => Some(address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")),
+        9745 => Some(address!("0x6100E367285b01F48D07953803A2d8dCA5D19873")),
+        5000 => Some(address!("0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8")),
+        42793 => Some(address!("0xc9B53AB2679f573e480d01e0f49e2B5CFB7a3EAb")),
+        146 => Some(address!("0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38")),
+        // OP-stack chains share the predeploy WETH address.
+        10 | 130 | 480 | 4326 | 8453 | 57073 => {
+            Some(address!("0x4200000000000000000000000000000000000006"))
+        }
+        43114 => Some(address!("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7")),
+        100 => Some(address!("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d")),
+        81457 => Some(address!("0x4300000000000000000000000000000000000004")),
+        59144 => Some(address!("0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f")),
+        747_474 => Some(address!("0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62")),
+        30 => Some(address!("0x542fDA317318eBF1d3DEAf76E0b632741A7e677d")),
+        25 => Some(address!("0x5C7F8A570d578ED84E63fdFA7b1eE72dEae1AE23")),
+        80094 => Some(address!("0x6969696969696969696969696969696969696969")),
+        999 => Some(address!("0x5555555555555555555555555555555555555555")),
         _ => None,
     }
 }

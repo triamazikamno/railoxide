@@ -110,19 +110,7 @@ pub fn build_effective_chain_configs(
             .per_chain
             .get(&chain_id)
             .unwrap_or(&defaults);
-        let rpc_values = if saved.rpc_endpoints.is_empty() {
-            &preset.rpc_endpoints
-        } else {
-            &saved.rpc_endpoints
-        };
-        let mut rpc_route = route(
-            chain_id,
-            rpc_values,
-            parse_address(saved.contracts.multicall_contract.as_deref()).or(Some(preset.multicall)),
-        );
-        if !saved.rpc_endpoints.is_empty() {
-            rpc_route = rpc_route.with_identity_verification();
-        }
+        let mut config = built_in_chain_config(chain_id, preset, saved, settings);
         let private = &saved.railgun;
         let mut deployment =
             super::RailgunDeployment::for_chain(chain_id).expect("built-in Railgun deployment");
@@ -198,50 +186,42 @@ pub fn build_effective_chain_configs(
                 concurrency: source.concurrency,
                 max_in_flight_bytes: source.max_in_flight_bytes,
             });
+        config.railgun = Some(super::EffectiveRailgunConfig {
+            deployment,
+            sync,
+            archive_rpc_url: private
+                .deployment
+                .archive_rpc_url
+                .as_deref()
+                .map(|url| SensitiveUrl::from(Url::parse(url).expect("validated archive URL"))),
+            indexed_artifact_source_mode: settings.indexed_artifacts.source_mode,
+            sponsored_bundle_relays: private.sponsored_bundle_relays.as_ref().map_or_else(
+                || default_sponsored_bundle_relays(chain_id),
+                |relays| {
+                    relays
+                        .iter()
+                        .map(|url| {
+                            SensitiveUrl::from(Url::parse(url).expect("validated relay URL"))
+                        })
+                        .collect()
+                },
+            ),
+            coinbase_payer: parse_address(private.contracts.coinbase_payer.as_deref())
+                .or_else(|| default_coinbase_payer(chain_id)),
+        });
+        configs.insert(chain_id, config);
+    }
+    for &chain_id in railgun_ui::PUBLIC_CHAINS {
+        let preset = super::presets::EvmPreset::for_chain(chain_id).expect("built-in EVM preset");
+        let defaults = super::ChainSettingsOverride::default();
+        let saved = settings
+            .chains
+            .per_chain
+            .get(&chain_id)
+            .unwrap_or(&defaults);
         configs.insert(
             chain_id,
-            EffectiveChainConfig {
-                chain_id,
-                native_usd_oracle: saved
-                    .native_usd_pricing
-                    .resolve(Some(preset.native_usd_oracle)),
-                name: preset.name.to_owned(),
-                native_currency: preset.native_currency,
-                explorer_urls: Vec::new(),
-                built_in: true,
-                enabled: saved.enabled,
-                rpc_route,
-                wrapped_native_token: parse_address(
-                    saved.contracts.wrapped_native_token.as_deref(),
-                )
-                .or(preset.wrapped_native),
-                finality_depth: saved.finality_depth.unwrap_or(preset.finality_depth),
-                block_time: Some(preset.block_time),
-                gas: resolved_gas(&saved.gas, settings),
-                railgun: Some(super::EffectiveRailgunConfig {
-                    deployment,
-                    sync,
-                    archive_rpc_url: private.deployment.archive_rpc_url.as_deref().map(|url| {
-                        SensitiveUrl::from(Url::parse(url).expect("validated archive URL"))
-                    }),
-                    indexed_artifact_source_mode: settings.indexed_artifacts.source_mode,
-                    sponsored_bundle_relays: private.sponsored_bundle_relays.as_ref().map_or_else(
-                        || default_sponsored_bundle_relays(chain_id),
-                        |relays| {
-                            relays
-                                .iter()
-                                .map(|url| {
-                                    SensitiveUrl::from(
-                                        Url::parse(url).expect("validated relay URL"),
-                                    )
-                                })
-                                .collect()
-                        },
-                    ),
-                    coinbase_payer: parse_address(private.contracts.coinbase_payer.as_deref())
-                        .or_else(|| default_coinbase_payer(chain_id)),
-                }),
-            },
+            built_in_chain_config(chain_id, preset, saved, settings),
         );
     }
     for (&chain_id, saved) in &settings.chains.custom {
@@ -272,6 +252,48 @@ pub fn build_effective_chain_configs(
         );
     }
     Ok(EffectiveChainRegistry { chains: configs })
+}
+
+/// Shared resolution for every built-in preset. Railgun capability is layered on afterwards.
+fn built_in_chain_config(
+    chain_id: u64,
+    preset: super::presets::EvmPreset,
+    saved: &super::ChainSettingsOverride,
+    settings: &WalletSettings,
+) -> EffectiveChainConfig {
+    let rpc_values = if saved.rpc_endpoints.is_empty() {
+        &preset.rpc_endpoints
+    } else {
+        &saved.rpc_endpoints
+    };
+    let mut rpc_route = route(
+        chain_id,
+        rpc_values,
+        parse_address(saved.contracts.multicall_contract.as_deref()).or(preset.multicall),
+    );
+    if !saved.rpc_endpoints.is_empty() {
+        rpc_route = rpc_route.with_identity_verification();
+    }
+    EffectiveChainConfig {
+        chain_id,
+        native_usd_oracle: saved.native_usd_pricing.resolve(preset.native_usd_oracle),
+        name: preset.name.to_owned(),
+        native_currency: preset.native_currency,
+        explorer_urls: preset
+            .explorer_urls
+            .iter()
+            .map(|url| (*url).to_owned())
+            .collect(),
+        built_in: true,
+        enabled: saved.enabled,
+        rpc_route,
+        wrapped_native_token: parse_address(saved.contracts.wrapped_native_token.as_deref())
+            .or(preset.wrapped_native),
+        finality_depth: saved.finality_depth.unwrap_or(preset.finality_depth),
+        block_time: Some(preset.block_time),
+        gas: resolved_gas(&saved.gas, settings),
+        railgun: None,
+    }
 }
 
 fn parse_address(value: Option<&str>) -> Option<Address> {
@@ -409,7 +431,7 @@ pub fn default_chain_contract_settings(chain_id: u64) -> Option<ChainContractSet
     let preset = super::presets::EvmPreset::for_chain(chain_id)?;
     Some(ChainContractSettings {
         wrapped_native_token: preset.wrapped_native.map(|address| address.to_string()),
-        multicall_contract: Some(preset.multicall.to_string()),
+        multicall_contract: preset.multicall.map(|address| address.to_string()),
     })
 }
 
@@ -441,20 +463,17 @@ pub fn build_effective_token_registry(
 ) -> Result<EffectiveTokenRegistry, WalletSettingsValidationError> {
     settings.validate()?;
     let mut tokens = BTreeMap::new();
-    for chain_id in railgun_ui::DEFAULT_CHAINS {
-        for token in railgun_ui::known_tokens_for_chain(*chain_id) {
+    for chain_id in railgun_ui::built_in_chain_ids() {
+        for token in railgun_ui::known_tokens_for_chain(chain_id) {
             tokens.insert(
-                (
-                    *chain_id,
-                    normalize_address_string(&token.token.to_string()),
-                ),
+                (chain_id, normalize_address_string(&token.token.to_string())),
                 EffectiveTokenInfo {
-                    chain_id: *chain_id,
+                    chain_id,
                     token_address: token.token.to_string(),
                     symbol: token.symbol.to_string(),
                     decimals: token.decimals,
                     icon_path: None,
-                    price_anchor: price_anchor_from_static_sources(*chain_id, token.anchor_sources),
+                    price_anchor: price_anchor_from_static_sources(chain_id, token.anchor_sources),
                     built_in: true,
                 },
             );
@@ -510,7 +529,7 @@ pub fn build_effective_token_registry(
 }
 
 pub(super) fn supported_chain_id(chain_id: u64) -> bool {
-    railgun_ui::DEFAULT_CHAINS.contains(&chain_id)
+    railgun_ui::is_built_in_chain(chain_id)
 }
 
 fn token_key_tuple(key: &TokenKey) -> (u64, String) {

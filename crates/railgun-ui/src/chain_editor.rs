@@ -201,7 +201,11 @@ pub struct ChainDraft {
     pub native_usd_pricing: NativeUsdChoice,
     /// Decimal u64, kept as a string across JavaScript and JSON.
     pub chain_id: String,
+    /// The chain ships with a built-in preset, so its identity is not editable.
     pub built_in: bool,
+    /// The chain has a Railgun deployment. Public-only presets and custom chains do not.
+    #[serde(default)]
+    pub railgun: bool,
     pub enabled: bool,
     pub fields: BTreeMap<ChainField, String>,
     pub quick_sync_enabled: bool,
@@ -237,6 +241,9 @@ pub struct ChainSummary {
     pub name: String,
     pub enabled: bool,
     pub built_in: bool,
+    /// The chain has a Railgun deployment. Public-only presets and custom chains do not.
+    #[serde(default)]
+    pub railgun: bool,
     /// Built-in chain whose saved overrides differ from the preset, ignoring `enabled`.
     #[serde(default)]
     pub modified: bool,

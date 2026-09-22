@@ -209,13 +209,13 @@ mod tests {
     #[test]
     fn dapp_chain_metadata_cannot_install_native_pricing() {
         let metadata = serde_json::json!([{
-            "chainId": "0x2105", "chainName": "Custom",
+            "chainId": "0x7a69", "chainName": "Custom",
             "nativeCurrency": { "name": "Coin", "symbol": "COIN", "decimals": 6, "extension": true },
             "rpcUrls": ["https://rpc.example"],
             "native_usd_pricing": { "type": "oracle", "contract_address": Address::repeat_byte(7).to_string() },
             "nativeUsdPricing": { "type": "oracle", "contractAddress": Address::repeat_byte(7).to_string() }
         }]);
-        let definition = proposed_chain(8453, &metadata).unwrap();
+        let definition = proposed_chain(31337, &metadata).unwrap();
         assert_eq!(
             definition.native_usd_pricing,
             crate::settings::NativeUsdPricing::Default

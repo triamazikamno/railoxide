@@ -698,9 +698,8 @@ pub(in crate::root) fn product_component_type_select_items() -> Vec<PriceAnchorT
 pub(in crate::root) fn price_anchor_chain_select_items(
     settings: &WalletSettings,
 ) -> Vec<ChainSelectItem> {
-    let mut items: Vec<_> = railgun_ui::DEFAULT_CHAINS
-        .iter()
-        .map(|&chain_id| ChainSelectItem {
+    let mut items: Vec<_> = railgun_ui::built_in_chain_ids()
+        .map(|chain_id| ChainSelectItem {
             chain_id,
             label: chain_name(chain_id).unwrap_or("Chain").into(),
         })

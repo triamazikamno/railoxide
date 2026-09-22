@@ -1289,12 +1289,14 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     });
     let owner = owner_slot.borrow_mut().take().unwrap();
     let cx = VisualTestContext::from_window(*handle, cx).into_mut();
-    cx.simulate_resize(gpui::size(px(600.0), px(720.0)));
+    // The host has no scroll container, so the window must fit every built-in row plus the
+    // custom chain at the bottom of the list.
+    cx.simulate_resize(gpui::size(px(600.0), px(2000.0)));
     let click = |cx: &mut VisualTestContext, id: &'static str| {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let bounds = cx
             .debug_bounds(id)
-            .expect("chain editor control is rendered");
+            .unwrap_or_else(|| panic!("chain editor control {id} is rendered"));
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
