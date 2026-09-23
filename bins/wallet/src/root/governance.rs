@@ -5623,7 +5623,7 @@ fn render_reward_claim_selection_form(
             )
             .into_any_element()
         });
-    // Totals read as label left, value right, like the authorization summary rows in the mockup.
+    // Totals read as label left, value right, like the authorization summary rows.
     let totals_value = |value: AnyElement| {
         div()
             .w_full()

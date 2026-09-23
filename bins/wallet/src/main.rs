@@ -99,6 +99,7 @@ fn main() -> Result<()> {
     let application = gpui_kit::application().with_assets(WalletAssets);
     application.run(move |app: &mut App| {
         gpui_kit::init(app);
+        assets::init_fonts(app).expect("load bundled fonts");
         ui::theme::apply_zenburn_component_theme(app);
         install_quit_behavior(app);
         #[cfg(all(target_os = "macos", feature = "heap-profiling"))]

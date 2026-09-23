@@ -13,14 +13,18 @@ impl WalletRoot {
             .count()
     }
 
-    pub(in crate::root) fn walletconnect_account_has_session(
+    pub(in crate::root) fn walletconnect_account_session_count(
         &self,
         public_account_uuid: &str,
-    ) -> bool {
-        self.walletconnect.sessions.iter().any(|session| {
-            session.selected_public_account_uuid == public_account_uuid
-                && walletconnect_session_visible_in_management(session)
-        })
+    ) -> usize {
+        self.walletconnect
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.selected_public_account_uuid == public_account_uuid
+                    && walletconnect_session_visible_in_management(session)
+            })
+            .count()
     }
 
     pub(in crate::root) fn render_walletconnect_toolbar_button(
@@ -39,18 +43,18 @@ impl WalletRoot {
             .when(!disabled, gpui::Styled::cursor_pointer)
             .disabled(disabled)
             .accessibility_label(if pending_count > 0 {
-                "Review dapp request"
+                "Review dapp request".to_owned()
             } else if session_count > 0 {
-                "Manage WalletConnect sessions"
+                format!("WalletConnect sessions · {session_count}")
             } else {
-                "Connect dapp with WalletConnect"
+                "Connect dapp".to_owned()
             })
             .tooltip(if pending_count > 0 {
-                "Review dapp request"
+                "Review dapp request".to_owned()
             } else if session_count > 0 {
-                "Manage WalletConnect sessions"
+                format!("WalletConnect sessions · {session_count}")
             } else {
-                "Connect dapp with WalletConnect"
+                "Connect dapp".to_owned()
             })
             .child(walletconnect_logo_with_badges(
                 px(24.0),

@@ -1189,6 +1189,8 @@ fn ui_state_roundtrip_through_local_db() {
     ]);
     let state = WalletUiState {
         version: 0,
+        public_account_sort: super::PublicAccountSort::Added,
+        public_hide_empty_accounts: true,
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
         last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -1211,6 +1213,8 @@ fn ui_state_roundtrip_through_local_db() {
         loaded,
         WalletUiState {
             version: WALLET_UI_STATE_VERSION,
+            public_account_sort: super::PublicAccountSort::Added,
+            public_hide_empty_accounts: true,
             last_wallet_id: Some("wallet-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -1231,6 +1235,7 @@ fn ui_state_roundtrip_through_local_db() {
             last_wallet_kind: RememberedWalletKind::HardwareWallet,
             governance_participants: std::collections::BTreeMap::new(),
             last_public_accounts: std::collections::BTreeMap::new(),
+            ..WalletUiState::default()
         },
     )
     .expect("save hardware UI state");
@@ -1243,6 +1248,7 @@ fn ui_state_roundtrip_through_local_db() {
             last_wallet_kind: RememberedWalletKind::HardwareWallet,
             governance_participants: std::collections::BTreeMap::new(),
             last_public_accounts: std::collections::BTreeMap::new(),
+            ..WalletUiState::default()
         }
     );
 
@@ -1388,6 +1394,7 @@ fn unsupported_future_ui_state_version_falls_back_to_empty() {
         last_wallet_kind: RememberedWalletKind::Unknown,
         governance_participants: std::collections::BTreeMap::new(),
         last_public_accounts: std::collections::BTreeMap::new(),
+        ..WalletUiState::default()
     };
     let data = rmp_serde::to_vec_named(&state).expect("encode future UI state");
     store
@@ -3424,4 +3431,21 @@ fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
     assert_eq!(load_wallet_settings(&reopened).unwrap(), expected);
     drop(reopened);
     fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[test]
+fn released_v4_ui_state_preserves_account_memory_and_defaults_public_preferences() {
+    let payload = rmp_serde::to_vec_named(&serde_json::json!({
+        "version": 4,
+        "last_wallet_id": "wallet-123",
+        "last_public_accounts": {"wallet-123": "account-1"},
+        "governance_participants": {"wallet-123": ["account-1"]}
+    }))
+    .unwrap();
+    let state = decode_wallet_ui_state(&payload).unwrap();
+    assert_eq!(state.version, WALLET_UI_STATE_VERSION);
+    assert_eq!(state.public_account_sort, super::PublicAccountSort::Value);
+    assert!(!state.public_hide_empty_accounts);
+    assert_eq!(state.last_public_accounts["wallet-123"], "account-1");
+    assert_eq!(state.governance_participants["wallet-123"], ["account-1"]);
 }

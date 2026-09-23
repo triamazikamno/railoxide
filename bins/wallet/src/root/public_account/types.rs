@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
@@ -81,6 +83,14 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) importing_account: bool,
     pub(in crate::root) sending: bool,
     pub(in crate::root) shielding: bool,
-    pub(in crate::root) active_accounts_open: bool,
-    pub(in crate::root) inactive_accounts_open: bool,
+    pub(in crate::root) list_scroll: gpui::ScrollHandle,
+    /// Window bounds of the selected row from its last paint; keyboard
+    /// selection scrolls it into view from here.
+    pub(in crate::root) selected_row_bounds: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub(in crate::root) list_focus: gpui::FocusHandle,
+    pub(in crate::root) focused_asset_index: Option<usize>,
+    pub(in crate::root) asset_menu:
+        Option<(PublicAssetId, Entity<gpui_component::menu::PopupMenu>)>,
+    pub(in crate::root) asset_menu_subscription: Option<gpui::Subscription>,
+    pub(in crate::root) open_section: wallet_ops::vault::PublicAccountStatus,
 }

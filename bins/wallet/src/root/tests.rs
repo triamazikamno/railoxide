@@ -40,6 +40,7 @@ mod key_export;
 mod private_assets;
 mod private_display;
 mod progress;
+mod public_accounts;
 mod public_actions;
 mod settings;
 mod sponsored_self_broadcast;

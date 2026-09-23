@@ -208,19 +208,30 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(super) fn render_stealth_accounts_section(&self, root: &Entity<Self>) -> gpui::Div {
-        let section = div().w_full().min_w_0();
+    pub(super) fn render_stealth_accounts_button(
+        &self,
+        root: &Entity<Self>,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
+        use gpui_component::ActiveTheme as _;
         if let Some(panel) = &self.stealth_accounts
             && self.stealth_session_is_current(&panel.session)
         {
-            return section.child(view::StealthSummary {
+            return view::StealthAccountsButton {
                 view: panel.view.clone(),
                 root: root.clone(),
-            });
+            }
+            .into_any_element();
         }
-        section.child(app_muted_text(
-            "Stealth accounts will be available after the wallet’s chain session starts.",
-        ))
+        app_button("stealth-open", "Stealth accounts")
+            .ghost()
+            .small()
+            .icon(crate::assets::RailgunActionIcon::HatGlasses)
+            .text_color(cx.theme().primary)
+            .disabled(true)
+            .opacity(0.5)
+            .tooltip("Available after the chain session starts")
+            .into_any_element()
     }
 
     pub(super) fn stealth_accounts_body(&self) -> Option<Entity<StealthAccountsView>> {

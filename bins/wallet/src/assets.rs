@@ -5,6 +5,15 @@ use gpui::{AssetSource, ImageSource, Result, SharedString};
 use gpui_component::IconNamed;
 use rust_embed::RustEmbed;
 
+pub(crate) const KEYCAP_FONT_FAMILY: &str = "Inter";
+
+pub(crate) fn init_fonts(app: &gpui::App) -> Result<()> {
+    app.text_system()
+        .add_fonts(vec![Cow::Borrowed(include_bytes!(
+            "../assets/fonts/Inter-Regular.ttf"
+        ))])
+}
+
 pub(crate) const LOGO_ICON_PATH: &str = "railgun/icons/logo.svg";
 pub(crate) const SIDEBAR_WORDMARK_PATH: &str = "railgun/icons/wordmark.svg";
 pub(crate) const HERO_WORDMARK_PATH: &str = "railgun/icons/hero-wordmark.svg";
@@ -38,6 +47,8 @@ pub(crate) const USERS_ICON_PATH: &str = "railgun/icons/users.svg";
 pub(crate) const PIGGY_BANK_ICON_PATH: &str = "railgun/icons/piggy-bank.svg";
 pub(crate) const CHEVRONS_DOWN_ICON_PATH: &str = "railgun/icons/chevrons-down.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
+const HAT_GLASSES_ICON_PATH: &str = "railgun/icons/hat-glasses.svg";
+const LIST_SORT_DESCENDING_ICON_PATH: &str = "railgun/icons/list-sort-descending.svg";
 const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
 const FILE_PEN_LINE_ICON_PATH: &str = "railgun/icons/file-pen-line.svg";
 const FOLDER_COG_ICON_PATH: &str = "railgun/icons/folder-cog.svg";
@@ -80,6 +91,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     PIGGY_BANK_ICON_PATH,
     CHEVRONS_DOWN_ICON_PATH,
     KEY_ROUND_ICON_PATH,
+    HAT_GLASSES_ICON_PATH,
+    LIST_SORT_DESCENDING_ICON_PATH,
     WRENCH_ICON_PATH,
     FILE_PEN_LINE_ICON_PATH,
     FOLDER_COG_ICON_PATH,
@@ -124,6 +137,9 @@ const USERS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/users.svg");
 const PIGGY_BANK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/piggy-bank.svg");
 const CHEVRONS_DOWN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/chevrons-down.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
+const HAT_GLASSES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/hat-glasses.svg");
+const LIST_SORT_DESCENDING_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/list-sort-descending.svg");
 const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
 const FILE_PEN_LINE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/file-pen-line.svg");
 const FOLDER_COG_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/folder-cog.svg");
@@ -308,6 +324,8 @@ pub(crate) enum RailgunActionIcon {
     BookUser,
     Save,
     KeyRound,
+    HatGlasses,
+    ListSortDescending,
     Wrench,
     FilePenLine,
     FolderCog,
@@ -328,28 +346,12 @@ impl IconNamed for RailgunActionIcon {
             Self::BookUser => BOOK_USER_ICON_PATH,
             Self::Save => SAVE_ICON_PATH,
             Self::KeyRound => KEY_ROUND_ICON_PATH,
+            Self::HatGlasses => HAT_GLASSES_ICON_PATH,
+            Self::ListSortDescending => LIST_SORT_DESCENDING_ICON_PATH,
             Self::Wrench => WRENCH_ICON_PATH,
             Self::FilePenLine => FILE_PEN_LINE_ICON_PATH,
             Self::FolderCog => FOLDER_COG_ICON_PATH,
             Self::Sparkles => SPARKLES_ICON_PATH,
-        }
-        .into()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RailgunPublicAccountIcon {
-    Derived,
-    Global,
-    Imported,
-}
-
-impl IconNamed for RailgunPublicAccountIcon {
-    fn path(self) -> SharedString {
-        match self {
-            Self::Derived => NETWORK_ICON_PATH,
-            Self::Global => PIN_ICON_PATH,
-            Self::Imported => KEY_ROUND_ICON_PATH,
         }
         .into()
     }
@@ -427,6 +429,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         PIGGY_BANK_ICON_PATH => Some(PIGGY_BANK_ICON_BYTES),
         CHEVRONS_DOWN_ICON_PATH => Some(CHEVRONS_DOWN_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
+        HAT_GLASSES_ICON_PATH => Some(HAT_GLASSES_ICON_BYTES),
+        LIST_SORT_DESCENDING_ICON_PATH => Some(LIST_SORT_DESCENDING_ICON_BYTES),
         WRENCH_ICON_PATH => Some(WRENCH_ICON_BYTES),
         FILE_PEN_LINE_ICON_PATH => Some(FILE_PEN_LINE_ICON_BYTES),
         FOLDER_COG_ICON_PATH => Some(FOLDER_COG_ICON_BYTES),

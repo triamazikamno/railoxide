@@ -1747,6 +1747,7 @@ mod integration_tests {
                     "drafts": [],
                     "refreshing": false,
                     "balance_error": false,
+                    "mimic_railway_shields_by_default": false,
                 },
                 "ui_error": null,
                 "pending_connects": [],
@@ -1778,66 +1779,74 @@ mod integration_tests {
                 }
             }
         }
-        let mut random = [0; 8];
-        getrandom::fill(&mut random).unwrap();
-        let root =
-            std::env::temp_dir().join(format!("gateway-unlock-{}", alloy::hex::encode(random)));
-        let db = Arc::new(
-            DbStore::open(DbConfig {
-                root_dir: root.clone(),
-            })
-            .unwrap(),
-        );
-        let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
-        handle
-            .configure(GatewayConfig {
-                enabled: true,
-                bind_address: Ipv4Addr::LOCALHOST.into(),
-                port: available_port().await,
-            })
-            .await
-            .unwrap();
-        let code = handle.issue_pairing_code_with_unlock(true).await.unwrap();
-        let mut socket = socket(handle.snapshots().borrow().listener_addr.unwrap()).await;
-        let (mut protocol, peer, _) = pair(&mut socket, code.code).await;
-        state(&mut socket, &mut protocol).await;
-        assert!(handle.snapshots().borrow().peers[0].allow_unlock);
-        let mut events = handle.ui_events();
-        handle.set_peer_allow_unlock(peer, false).await.unwrap();
-        application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"denied", "command":{"action":"password", "password":"synthetic password"}})).await;
-        assert_eq!(
-            unlock_state(&mut socket, &mut protocol).await["view"]["allowed"],
-            false
-        );
-        assert!(
-            events.try_recv().is_err(),
-            "unpermitted input never reaches the vault owner"
-        );
-        handle.set_peer_allow_unlock(peer, true).await.unwrap();
-        assert!(Registry::load(&db).unwrap().peers[0].allow_unlock);
-        application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"accepted", "command":{"action":"password", "password":"synthetic password"}})).await;
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let super::super::GatewayUiEventKind::Unlock { request } = event.kind else {
-            panic!("unlock request");
-        };
-        let (_, guard) = request.take().unwrap();
-        guard.finish(super::super::GatewayUnlockPhase::Passphrase);
-        handle.set_peer_allow_unlock(peer, false).await.unwrap();
-        assert!(!guard.is_current());
-        guard.finish(super::super::GatewayUnlockPhase::Complete);
-        assert!(
-            !guard.is_current(),
-            "revoked work cannot regain installation authority"
-        );
-        drop(guard);
-        handle.shutdown().await.unwrap();
-        drop(socket);
-        drop(handle);
-        drop(db);
-        std::fs::remove_dir_all(root).unwrap();
+        // Fail instead of hanging if an expected frame or event never arrives.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut random = [0; 8];
+            getrandom::fill(&mut random).unwrap();
+            let root =
+                std::env::temp_dir().join(format!("gateway-unlock-{}", alloy::hex::encode(random)));
+            let db = Arc::new(
+                DbStore::open(DbConfig {
+                    root_dir: root.clone(),
+                })
+                .unwrap(),
+            );
+            let handle = GatewayHandle::start(db.clone(), true, 1, GatewayInstallBundle::default());
+            handle
+                .configure(GatewayConfig {
+                    enabled: true,
+                    bind_address: Ipv4Addr::LOCALHOST.into(),
+                    port: available_port().await,
+                })
+                .await
+                .unwrap();
+            let code = handle.issue_pairing_code_with_unlock(true).await.unwrap();
+            // Copy the address out first: holding the watch guard across the await deadlocks
+            // this single-threaded runtime when the actor publishes a snapshot meanwhile.
+            let address = handle.snapshots().borrow().listener_addr.unwrap();
+            let mut socket = socket(address).await;
+            let (mut protocol, peer, _) = pair(&mut socket, code.code).await;
+            state(&mut socket, &mut protocol).await;
+            assert!(handle.snapshots().borrow().peers[0].allow_unlock);
+            let mut events = handle.ui_events();
+            handle.set_peer_allow_unlock(peer, false).await.unwrap();
+            application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"denied", "command":{"action":"password", "password":"synthetic password"}})).await;
+            assert_eq!(
+                unlock_state(&mut socket, &mut protocol).await["view"]["allowed"],
+                false
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "unpermitted input never reaches the vault owner"
+            );
+            handle.set_peer_allow_unlock(peer, true).await.unwrap();
+            assert!(Registry::load(&db).unwrap().peers[0].allow_unlock);
+            application(&mut socket, &mut protocol, serde_json::json!({"type":"unlock", "version":1, "generation":1, "attempt_id":"accepted", "command":{"action":"password", "password":"synthetic password"}})).await;
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let super::super::GatewayUiEventKind::Unlock { request } = event.kind else {
+                panic!("unlock request");
+            };
+            let (_, guard) = request.take().unwrap();
+            guard.finish(super::super::GatewayUnlockPhase::Passphrase);
+            handle.set_peer_allow_unlock(peer, false).await.unwrap();
+            assert!(!guard.is_current());
+            guard.finish(super::super::GatewayUnlockPhase::Complete);
+            assert!(
+                !guard.is_current(),
+                "revoked work cannot regain installation authority"
+            );
+            drop(guard);
+            handle.shutdown().await.unwrap();
+            drop(socket);
+            drop(handle);
+            drop(db);
+            std::fs::remove_dir_all(root).unwrap();
+        })
+        .await
+        .expect("paired unlock scenario timed out");
     }
 
     async fn pairing_attempt(address: std::net::SocketAddr, admitted: bool) {

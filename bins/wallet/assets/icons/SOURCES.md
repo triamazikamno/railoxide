@@ -3,6 +3,8 @@
 - `square.svg`: Lucide `square`, ISC License, https://lucide.dev/icons/square
 - `square-asterisk.svg`: Lucide `square-asterisk`, ISC License, https://lucide.dev/icons/square-asterisk
 - `key-round.svg`: Lucide `key-round`, ISC License, https://lucide.dev/icons/key-round
+- `hat-glasses.svg`: Lucide `hat-glasses`, ISC License, https://lucide.dev/icons/hat-glasses
+- `list-sort-descending.svg`: Lucide `list-sort-descending`, ISC License, https://lucide.dev/icons/list-sort-descending
 - `wrench.svg`: Lucide `wrench`, ISC License, https://lucide.dev/icons/wrench
 - `file-pen-line.svg`: Lucide `file-pen-line`, ISC License, https://lucide.dev/icons/file-pen-line
 - `folder-cog.svg`: Lucide `folder-cog`, ISC License, https://lucide.dev/icons/folder-cog

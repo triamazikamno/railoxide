@@ -7,9 +7,62 @@ use super::startup::WalletStartupRoot;
 
 pub(super) const PRIVATE_ACTION_FORM_KEY_CONTEXT: &str = "PrivateActionForm";
 
+pub(super) const PUBLIC_ACCOUNT_LIST_KEY_CONTEXT: &str = "PublicAccountList";
+pub(super) const PUBLIC_ACCOUNT_SEARCH_KEY_CONTEXT: &str = "PublicAccountSearch";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct FocusPublicAccountSearch;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct SelectPreviousAccount;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct SelectNextAccount;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct FocusPreviousAsset;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct FocusNextAsset;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct ActivateFocusedAsset;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct CopySelectedAddress;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct RenameSelectedAccount;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub(super) struct RefreshBroadcasterEstimate;
+
+pub(super) const WALLET_WORKSPACE_KEY_CONTEXT: &str = "WalletWorkspace";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct NextWalletTab;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct PreviousWalletTab;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct OpenWalletSelector;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct OpenChainSelector;
 
 #[cfg(feature = "hardware")]
 pub(super) const TREZOR_PASSPHRASE_MODE_KEY_CONTEXT: &str = "TrezorPassphraseMode";
@@ -56,14 +109,98 @@ enum WalletShortcutAction {
     LockVault,
 }
 
+pub(super) const PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT: &str = "PublicAccountSection";
+
 pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     app.bind_keys([
+        KeyBinding::new(
+            "enter",
+            gpui_kit::base::actions::Confirm { secondary: false },
+            Some(PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "space",
+            gpui_kit::base::actions::Confirm { secondary: false },
+            Some(PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "/",
+            FocusPublicAccountSearch,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "up",
+            SelectPreviousAccount,
+            Some(PUBLIC_ACCOUNT_SEARCH_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "down",
+            SelectNextAccount,
+            Some(PUBLIC_ACCOUNT_SEARCH_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "up",
+            SelectPreviousAccount,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "down",
+            SelectNextAccount,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "left",
+            FocusPreviousAsset,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "right",
+            FocusNextAsset,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "enter",
+            ActivateFocusedAsset,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "c",
+            CopySelectedAddress,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "secondary-e",
+            RenameSelectedAccount,
+            Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+        ),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-l", LockVault, None),
         KeyBinding::new(
             "ctrl-r",
             RefreshBroadcasterEstimate,
             Some(PRIVATE_ACTION_FORM_KEY_CONTEXT),
+        ),
+        // Literal ctrl: cmd-tab is the macOS application switcher.
+        KeyBinding::new(
+            "ctrl-tab",
+            NextWalletTab,
+            Some(WALLET_WORKSPACE_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-tab",
+            PreviousWalletTab,
+            Some(WALLET_WORKSPACE_KEY_CONTEXT),
+        ),
+        // Literal ctrl: cmd-shift-w closes the window on macOS.
+        KeyBinding::new(
+            "ctrl-shift-w",
+            OpenWalletSelector,
+            Some(WALLET_WORKSPACE_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-c",
+            OpenChainSelector,
+            Some(WALLET_WORKSPACE_KEY_CONTEXT),
         ),
     ]);
     app.on_action(|_: &OpenSettings, cx| {

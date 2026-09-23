@@ -79,12 +79,12 @@ pub(super) enum AccountFilter {
 }
 
 #[derive(IntoElement)]
-pub(super) struct StealthSummary {
+pub(super) struct StealthAccountsButton {
     pub view: Entity<StealthAccountsView>,
     pub root: Entity<WalletRoot>,
 }
 
-impl RenderOnce for StealthSummary {
+impl RenderOnce for StealthAccountsButton {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let view = self.view.read(cx);
         let attention = view
@@ -121,45 +121,30 @@ impl RenderOnce for StealthSummary {
                 }
             )
         };
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(app_strong_text("Stealth accounts"))
-            .child(
-                account_caption(
-                    "Public one-time accounts your private operations execute through.",
-                )
-                .whitespace_normal(),
-            )
-            .child(
+        let tooltip =
+            format!("Public one-time accounts your private operations execute through.\n{summary}");
+        app_button(
+            "stealth-open",
+            format!("Stealth accounts · {}", view.records.len()),
+        )
+        .ghost()
+        .small()
+        .icon(crate::assets::RailgunActionIcon::HatGlasses)
+        .text_color(cx.theme().primary)
+        .tooltip(tooltip)
+        .when(attention > 0, |button| {
+            button.child(
                 div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .p_3()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded_md()
-                    .bg(cx.theme().background)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(account_caption(summary).whitespace_normal()),
-                    )
-                    .child(
-                        app_button("stealth-open", "Show")
-                            .outline()
-                            .small()
-                            .on_click(move |_, window, cx| {
-                                self.root
-                                    .update(cx, |root, cx| root.open_stealth_accounts(window, cx));
-                            }),
-                    ),
+                    .size(rems(0.375))
+                    .rounded_full()
+                    .bg(cx.theme().warning),
             )
+        })
+        .child(Icon::new(IconName::ChevronRight).xsmall())
+        .on_click(move |_, window, cx| {
+            self.root
+                .update(cx, |root, cx| root.open_stealth_accounts(window, cx));
+        })
     }
 }
 

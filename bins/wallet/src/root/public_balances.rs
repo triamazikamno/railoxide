@@ -3,7 +3,8 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use gpui::{Context, Window};
 use railgun_ui::{
-    chain_icon_asset_path, format_token_amount, format_usd_micro_value, short_address,
+    chain_icon_asset_path, format_scaled_amount, format_token_amount, format_usd_micro_value,
+    short_address,
 };
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceRefreshTicket,
@@ -70,15 +71,117 @@ pub(super) fn public_balance_usd_label(
     amount: &PublicBalanceAmount,
     anchor_cache: Option<&TokenAnchorRateCache>,
 ) -> Option<String> {
+    public_balance_usd_value(chain_id, asset, amount, anchor_cache).map(format_usd_micro_value)
+}
+
+pub(super) fn public_balance_usd_value(
+    chain_id: u64,
+    asset: PublicAssetId,
+    amount: &PublicBalanceAmount,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> Option<U256> {
     let PublicBalanceAmount::Available(amount) = amount else {
         return None;
     };
     let cache = anchor_cache?;
-    let usd_micro_value = match asset {
+    match asset {
         PublicAssetId::Native => cache.cached_native_usd_micro_value(chain_id, *amount),
         PublicAssetId::Erc20(token) => cache.cached_token_usd_micro_value(chain_id, token, *amount),
-    }?;
-    Some(format_usd_micro_value(usd_micro_value))
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct PublicUsdTotal {
+    pub(super) value: Option<U256>,
+    pub(super) partial: bool,
+}
+
+pub(super) fn public_balances_usd_total(
+    balances: &[PublicBalanceEntry],
+    chain_id: u64,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> PublicUsdTotal {
+    let mut total = PublicUsdTotal::default();
+    for entry in balances {
+        if !matches!(entry.amount, PublicBalanceAmount::Available(amount) if !amount.is_zero()) {
+            continue;
+        }
+        if let Some(value) =
+            public_balance_usd_value(chain_id, entry.asset.id, &entry.amount, anchor_cache)
+        {
+            total.value = Some(total.value.unwrap_or_default().saturating_add(value));
+        } else {
+            total.partial = true;
+        }
+    }
+    total
+}
+
+pub(super) fn public_active_usd_total(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    accounts: &[wallet_ops::vault::PublicAccountMetadata],
+    chain_id: u64,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> PublicUsdTotal {
+    let mut total = PublicUsdTotal::default();
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.chain_id == chain_id) else {
+        return total;
+    };
+    for account in accounts.iter().filter(|account| {
+        account.status == PublicAccountStatus::Active && account.is_available_on_chain(chain_id)
+    }) {
+        let balances = public_account_visible_balances_for_chain(
+            Some(snapshot),
+            chain_id,
+            &account.public_account_uuid,
+            account.status,
+        );
+        let account_total = public_balances_usd_total(&balances, chain_id, anchor_cache);
+        if let Some(value) = account_total.value {
+            total.value = Some(total.value.unwrap_or_default().saturating_add(value));
+        }
+        total.partial |= account_total.partial;
+    }
+    total
+}
+
+/// Whole-dollar USD label for the compact tile line, such as `$494` or `<$1`.
+pub(super) fn public_balance_compact_usd(value: U256) -> String {
+    const USD_MICRO_PER_DOLLAR: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
+    let dollars = (value + USD_MICRO_PER_DOLLAR / U256::from(2)) / USD_MICRO_PER_DOLLAR;
+    if dollars.is_zero() {
+        return "<$1".to_owned();
+    }
+    let mut label = format_usd_micro_value(dollars * USD_MICRO_PER_DOLLAR);
+    if label.ends_with(".00") {
+        label.truncate(label.len() - 3);
+    }
+    label
+}
+
+/// Compact list presentation only; transaction inputs retain full precision.
+pub(super) fn public_balance_tile_amount(amount: &PublicBalanceAmount, decimals: u8) -> String {
+    let PublicBalanceAmount::Available(amount) = amount else {
+        return "unavailable".to_owned();
+    };
+    let full = format_scaled_amount(*amount, decimals);
+    let (whole, fraction) = full.split_once('.').unwrap_or((&full, ""));
+    if !amount.is_zero() && whole == "0" && fraction.starts_with("0000") {
+        return "<0.0001".to_owned();
+    }
+    // Keep up to four decimal places, reducing precision before abbreviating large integers.
+    if whole.len() > 8 {
+        return format!("{}.{}e{}", &whole[..1], &whole[1..4], whole.len() - 1);
+    }
+    let precision = 4
+        .min(8_usize.saturating_sub(whole.len() + 1))
+        .min(fraction.len());
+    let fraction = fraction[..precision].trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_owned()
+    } else {
+        format!("{whole}.{fraction}")
+    }
 }
 
 pub(super) fn public_account_usd_total_label_for_chain(
@@ -200,6 +303,7 @@ impl WalletRoot {
         self.public_inactive_balance_error = None;
         self.public_inactive_balance_refreshing = false;
         self.public_form.selected_asset = None;
+        self.reset_public_asset_focus();
         self.clear_public_action_progress_state();
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
@@ -326,21 +430,29 @@ impl WalletRoot {
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let mut completion = Some((ticket, result));
-            let sync_window = this
+            let (sync_window, focus_window) = this
                 .update(cx, |root, cx| {
                     let (ticket, result) = completion.take().expect("refresh completion available");
-                    let sync_selects =
+                    let (sync_selects, restore_focus) =
                         root.apply_public_balance_refresh_result(ticket, result, window, cx);
-                    sync_selects
-                        .then(|| window.or_else(|| cx.windows().first().copied()))
-                        .flatten()
+                    let target = window.or_else(|| cx.windows().first().copied());
+                    (
+                        target.filter(|_| sync_selects),
+                        target.filter(|_| restore_focus),
+                    )
                 })
-                .ok()
-                .flatten();
+                .unwrap_or_default();
             if let Some((ticket, _)) = completion {
                 let _ = cache.finish_refresh(ticket, None);
                 // The owner has gone away; discard any admitted follow-up as well.
                 cache.clear();
+            }
+            if let Some(window) = focus_window {
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |root, cx| {
+                        root.public_form.list_focus.focus(window, cx);
+                    });
+                });
             }
             if let Some(window) = sync_window {
                 let _ = window.update(cx, |_, window, cx| {
@@ -359,7 +471,7 @@ impl WalletRoot {
         result: Result<Result<PublicBalanceSnapshot, eyre::Report>, tokio::task::JoinError>,
         window: Option<gpui::AnyWindowHandle>,
         cx: &mut Context<'_, Self>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let scope = ticket.scope().clone();
         let active = ticket.includes_status(PublicAccountStatus::Active);
         let inactive = ticket.includes_status(PublicAccountStatus::Inactive);
@@ -371,9 +483,14 @@ impl WalletRoot {
         let succeeded = snapshot.is_some();
         let completion = self.public_balance_cache.finish_refresh(ticket, snapshot);
         let selected = scope.chain_id() == self.selected_chain;
+        let mut restore_focus = false;
         if completion.accepted && selected {
+            // Keep the focused tile and any open asset menu across a background
+            // refresh; dropping a focused menu would strand keyboard focus.
+            let focused_asset = self.public_focused_asset();
             let previous = self.public_balance_snapshot.clone();
             self.public_balance_snapshot = self.public_balance_cache.snapshot(&scope).map(Arc::new);
+            restore_focus = self.revalidate_public_asset_focus(focused_asset);
             if active {
                 self.public_balance_refreshing = false;
                 self.public_balance_error = error.as_ref().map(|error| {
@@ -407,6 +524,9 @@ impl WalletRoot {
         }
         self.publish_gateway_desktop_state();
         cx.notify();
-        completion.accepted && selected && active && succeeded
+        (
+            completion.accepted && selected && active && succeeded,
+            restore_focus,
+        )
     }
 }

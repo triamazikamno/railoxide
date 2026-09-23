@@ -7,6 +7,7 @@ use gpui::{
 };
 use gpui_component::{
     Icon, IconName, Sizable, WindowExt,
+    kbd::Kbd,
     menu::{DropdownMenu, PopupMenuItem},
     select::{Select, SelectItem},
     separator::Separator,
@@ -21,6 +22,7 @@ use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSou
 use crate::assets::RailgunActionIcon;
 use crate::root::ui_helpers::dialog_footer;
 
+use super::actions::{OpenChainSelector, OpenWalletSelector};
 use super::key_export::WALLET_EXPORT_MENU_LABEL;
 use super::utxo::short_hash;
 use super::vault::{
@@ -348,26 +350,59 @@ impl WalletRoot {
     }
 
     pub(super) fn render_wallet_selector(&self) -> impl IntoElement {
-        div().h(px(24.0)).w(px(180.0)).flex().items_center().child(
-            Select::new(&self.wallet_select)
-                .appearance(false)
-                .small()
-                .w(px(180.0))
-                .h(px(24.0))
-                .menu_width(px(220.0))
-                .search_placeholder("Search wallets"),
-        )
+        let wallet_focus = self.wallet_focus.clone();
+        div()
+            .id("wallet-selector")
+            .h(px(24.0))
+            .w(px(180.0))
+            .flex()
+            .items_center()
+            // The key is shown only where the wallet view binding applies.
+            .tooltip(move |window, cx| {
+                Tooltip::new("Switch wallet")
+                    .key_binding(Kbd::binding_for_action_in(
+                        &OpenWalletSelector,
+                        &wallet_focus,
+                        window,
+                    ))
+                    .build(window, cx)
+            })
+            .child(
+                Select::new(&self.wallet_select)
+                    .appearance(false)
+                    .small()
+                    .w(px(180.0))
+                    .h(px(24.0))
+                    .menu_width(px(220.0))
+                    .search_placeholder("Search wallets"),
+            )
     }
 
     pub(super) fn render_chain_selector(&self) -> impl IntoElement {
-        div().h(px(24.0)).w(px(130.0)).flex().items_center().child(
-            ui::chain_select::chain_select(&self.chain_select)
-                .appearance(false)
-                .small()
-                .w(px(130.0))
-                .h(px(24.0))
-                .menu_width(px(240.0)),
-        )
+        let wallet_focus = self.wallet_focus.clone();
+        div()
+            .id("chain-selector")
+            .h(px(24.0))
+            .w(px(130.0))
+            .flex()
+            .items_center()
+            .tooltip(move |window, cx| {
+                Tooltip::new("Switch network")
+                    .key_binding(Kbd::binding_for_action_in(
+                        &OpenChainSelector,
+                        &wallet_focus,
+                        window,
+                    ))
+                    .build(window, cx)
+            })
+            .child(
+                ui::chain_select::chain_select(&self.chain_select)
+                    .appearance(false)
+                    .small()
+                    .w(px(130.0))
+                    .h(px(24.0))
+                    .menu_width(px(240.0)),
+            )
     }
 }
 

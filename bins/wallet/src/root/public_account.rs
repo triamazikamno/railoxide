@@ -1,51 +1,45 @@
 use std::sync::Arc;
 
 use alloy::primitives::Address;
+#[cfg(feature = "hardware")]
+use gpui::rgb;
 use gpui::{
-    Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
-    prelude::FluentBuilder as _, px, rgb,
+    Context, Entity, Focusable, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Sizable, WindowExt,
+    Disableable, Sizable, WindowExt,
     alert::Alert,
     button::ButtonVariants,
     checkbox::Checkbox,
-    collapsible::Collapsible,
     menu::{DropdownMenu, PopupMenuItem},
-    scroll::ScrollableElement,
-    tooltip::Tooltip,
 };
 use railgun_ui::{chain_name, short_address};
-use ui::controls::{
-    app_button, app_button_base, app_input, app_masked_input, app_muted_text, app_strong_text,
-};
-use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::controls::{app_button, app_input, app_masked_input, app_muted_text, app_strong_text};
+#[cfg(feature = "hardware")]
+use ui::theme;
 use wallet_ops::{
     PublicAssetId, PublicBalanceEntry,
     hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor},
     vault::{
-        DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource,
-        PublicAccountStatus, WalletSource, public_account_default_label,
+        DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountStatus,
+        WalletSource, public_account_default_label,
     },
 };
 use zeroize::Zeroizing;
 
-use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon};
-
+mod assets;
+mod commands;
 mod components;
 mod hardware;
 mod identicon;
+pub(super) mod list;
 mod qr;
 mod types;
 
 pub(super) use components::{
     next_public_account_label_number, public_account_display_label, public_account_matches_search,
-    public_account_source_icon, public_account_source_label,
-};
-use components::{
-    public_account_icon_button, public_account_metadata_badge, public_account_status_id,
-    public_account_walletconnect_button,
+    public_account_source_label,
 };
 #[cfg(feature = "hardware")]
 use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
@@ -56,7 +50,6 @@ use hardware::{
     hardware_public_device_label, render_hardware_public_account_checking,
     render_hardware_public_account_confirmation_wait,
 };
-pub(super) use identicon::render_public_account_identicon;
 #[cfg(test)]
 pub(super) use identicon::{
     PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
@@ -72,18 +65,11 @@ pub(super) use ui::public_address::{
 use super::dialogs::PublicAccountDialogKind;
 use super::participant::{remove_global_participant, remove_scoped_participant};
 use super::public_action::{PublicActionMode, PublicSendKind};
-use super::public_balances::{
-    public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
-};
 use super::{
     ConfirmationDialogProps, PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH,
     WalletRoot, confirmation_dialog, dialog_max_height, public_account_visible_balances_for_chain,
     secondary_dialog_content_width, vault_error_kind,
 };
-
-const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
-const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
-const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
 
 pub(super) fn restored_public_account_selection(
     accounts: &[PublicAccountMetadata],
@@ -297,7 +283,12 @@ impl WalletRoot {
         }
     }
 
-    pub(super) fn render_public_wallet_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
+    pub(super) fn render_public_wallet_body(
+        &self,
+        root: &Entity<Self>,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
         if let Some(view) = self.stealth_accounts_body() {
             return view.into_any_element();
         }
@@ -307,33 +298,42 @@ impl WalletRoot {
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
-            .overflow_y_scrollbar()
+            .flex()
+            .flex_col()
             .child(
                 div()
-                    .w(px(980.0))
+                    .w(list::dimension(list::CONTENT_WIDTH))
                     .max_w_full()
+                    .h_full()
+                    .min_h(px(0.0))
                     .mx_auto()
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .gap_3()
                     .child(
                         div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_3()
+                            .child(self.render_public_list_controls(root))
                             .child(div().flex_1().min_w(px(0.0)))
                             .child(self.render_walletconnect_toolbar_button(root))
                             .child(
                                 app_button(
                                     "wallet-public-refresh",
                                     if self.public_balance_refreshing {
-                                        "Refreshing..."
+                                        "Refreshing…"
                                     } else {
                                         "Refresh"
                                     },
                                 )
                                 .outline()
                                 .small()
+                                .icon(
+                                    gpui_component::Icon::empty()
+                                        .path(ui::icons::refresh_ccw_icon_path()),
+                                )
                                 .loading(self.public_balance_refreshing)
                                 .disabled(
                                     self.public_balance_refreshing
@@ -349,16 +349,13 @@ impl WalletRoot {
                             )
                             .child(self.render_public_add_account_dropdown(root)),
                     )
-                    .children(self.public_balance_error.as_ref().map(|message| {
-                        Alert::warning("wallet-public-balance-error", message.to_string())
-                            .title("Public balances unavailable")
-                            .small()
-                    }))
+                    .child(self.render_public_accounts_summary(root, cx))
                     .children(self.public_form.error.as_ref().map(|message| {
-                        Alert::error("wallet-public-error", message.to_string()).small()
+                        div()
+                            .flex_none()
+                            .child(Alert::error("wallet-public-error", message.to_string()).small())
                     }))
-                    .child(self.render_public_account_list(root))
-                    .child(self.render_stealth_accounts_section(root)),
+                    .child(self.render_public_account_list(root, window, cx)),
             )
             .into_any_element()
     }
@@ -394,8 +391,8 @@ impl WalletRoot {
         self.public_form.importing_account = false;
         self.public_form.sending = false;
         self.public_form.shielding = false;
-        self.public_form.active_accounts_open = true;
-        self.public_form.inactive_accounts_open = false;
+        self.reset_public_asset_focus();
+        self.public_form.open_section = PublicAccountStatus::Active;
     }
 
     pub(super) fn reset_public_wallet_state(
@@ -511,9 +508,13 @@ impl WalletRoot {
                 }
                 self.public_accounts = accounts;
                 self.public_form.selected_account_uuid = selected;
+                if let Some(account) = self.selected_public_account() {
+                    self.public_form.open_section = account.status;
+                }
                 self.public_form.next_derived_index = store
                     .next_derived_public_account_index_for_session(view_session.as_ref())
                     .ok();
+                self.reconcile_public_account_selection();
                 self.remember_public_account_selection();
                 self.publish_gateway_desktop_state();
                 self.sync_self_broadcast_gas_payer_selects(window, cx);
@@ -619,17 +620,16 @@ impl WalletRoot {
     pub(super) fn set_public_account_section_open(
         &mut self,
         status: PublicAccountStatus,
-        open: bool,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let current = match status {
-            PublicAccountStatus::Active => &mut self.public_form.active_accounts_open,
-            PublicAccountStatus::Inactive => &mut self.public_form.inactive_accounts_open,
-        };
-        if *current != open {
-            *current = open;
-            cx.notify();
-        }
+        self.public_form.open_section = status;
+        self.public_form
+            .list_scroll
+            .set_offset(gpui::Point::default());
+        self.reconcile_public_account_selection();
+        self.public_form.list_focus.focus(window, cx);
+        cx.notify();
     }
 
     pub(super) fn has_active_public_accounts(&self) -> bool {
@@ -995,14 +995,17 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
+        let neighbour = self.public_account_neighbour(public_account_uuid);
         match store
             .deactivate_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
         {
             Ok(_) => {
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
-                    self.public_form.selected_account_uuid = None;
+                    self.public_form.selected_account_uuid = neighbour;
                 }
                 self.reload_public_accounts(window, cx);
+                self.reset_public_asset_focus();
+                self.scroll_selected_public_row_into_view(window);
                 self.schedule_public_balance_refresh(cx);
             }
             Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
@@ -1100,6 +1103,7 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
+        let neighbour = self.public_account_neighbour(public_account_uuid);
         let account_is_global = account.is_global();
         let owning_wallet_uuid = view_session.wallet_id().to_owned();
         match store
@@ -1123,9 +1127,11 @@ impl WalletRoot {
                     self.invalidate_governance_context();
                 }
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
-                    self.public_form.selected_account_uuid = None;
+                    self.public_form.selected_account_uuid = neighbour;
                 }
                 self.reload_public_accounts(window, cx);
+                self.reset_public_asset_focus();
+                self.scroll_selected_public_row_into_view(window);
                 self.schedule_public_balance_refresh(cx);
             }
             Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
@@ -1467,748 +1473,5 @@ impl WalletRoot {
                     )
             }
         }
-    }
-
-    pub(super) fn render_public_account_list(&self, root: &Entity<Self>) -> gpui::Div {
-        let search_query = self.public_form.search_query.as_ref();
-        let search_active = !search_query.is_empty();
-        let clear_search_input = self.public_form.search_input.clone();
-        let search_input =
-            app_input(&self.public_form.search_input)
-                .small()
-                .when(search_active, |input| {
-                    input.suffix(
-                        app_button_base("wallet-public-account-search-clear")
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label("Clear search")
-                            .tooltip("Clear search")
-                            .icon(IconName::Close)
-                            .on_click(move |_event, window, cx| {
-                                clear_search_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                            }),
-                    )
-                });
-        let mut card = div().w_full().flex().flex_col().gap_4();
-        let controls = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_start()
-            .gap_2()
-            .child(div().w(px(260.0)).child(search_input));
-        card = card.child(controls);
-        if self.public_accounts.is_empty() {
-            return card.child(app_muted_text(
-                "No Public accounts yet. Add a derived account or import a private key.",
-            ));
-        }
-        let accounts = self
-            .public_accounts
-            .iter()
-            .filter(|account| account.is_available_on_chain(self.selected_chain))
-            .filter(|account| {
-                !search_active || public_account_matches_search(account, search_query)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if accounts.is_empty() {
-            return card.child(app_muted_text("No Public accounts match this search."));
-        }
-
-        let active_accounts = accounts
-            .iter()
-            .filter(|account| account.status == PublicAccountStatus::Active)
-            .cloned()
-            .collect::<Vec<_>>();
-        let inactive_accounts = accounts
-            .into_iter()
-            .filter(|account| account.status == PublicAccountStatus::Inactive)
-            .collect::<Vec<_>>();
-        let active_open =
-            self.public_form.active_accounts_open || (search_active && !active_accounts.is_empty());
-        let inactive_open = self.public_form.inactive_accounts_open
-            || (search_active && !inactive_accounts.is_empty());
-        card = card
-            .child(self.render_public_account_section(
-                root,
-                PublicAccountStatus::Active,
-                "Active",
-                &active_accounts,
-                active_open,
-            ))
-            .child(self.render_public_account_section(
-                root,
-                PublicAccountStatus::Inactive,
-                "Inactive",
-                &inactive_accounts,
-                inactive_open,
-            ));
-        card
-    }
-
-    fn render_public_account_section(
-        &self,
-        root: &Entity<Self>,
-        status: PublicAccountStatus,
-        title: &'static str,
-        accounts: &[PublicAccountMetadata],
-        open: bool,
-    ) -> impl IntoElement {
-        let section_id = public_account_status_id(status);
-        let toggle_root = root.clone();
-        let fetch_root = root.clone();
-        let toggle_button_root = root.clone();
-        let count = accounts.len();
-        let mut header_actions = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .gap_2();
-        if status == PublicAccountStatus::Inactive && open && count > 0 {
-            header_actions = header_actions.child(
-                app_button(
-                    "wallet-public-inactive-fetch-balances",
-                    if self.public_inactive_balance_refreshing {
-                        "Fetching..."
-                    } else {
-                        "Fetch balances"
-                    },
-                )
-                .outline()
-                .xsmall()
-                .loading(self.public_inactive_balance_refreshing)
-                .disabled(self.public_inactive_balance_refreshing)
-                .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    fetch_root.update(cx, |root, cx| {
-                        root.schedule_inactive_public_balance_refresh(cx);
-                    });
-                }),
-            );
-        }
-        header_actions = header_actions.child(
-            app_button_base(SharedString::from(format!(
-                "wallet-public-{section_id}-accounts-toggle"
-            )))
-            .ghost()
-            .xsmall()
-            .text_color(rgb(theme::PRIMARY))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(if open { "Hide" } else { "Show" })
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronUp
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .xsmall()
-                        .text_color(rgb(theme::PRIMARY)),
-                    ),
-            )
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .on_click(move |_event, _window, cx| {
-                cx.stop_propagation();
-                toggle_button_root.update(cx, |root, cx| {
-                    root.set_public_account_section_open(status, !open, cx);
-                });
-            }),
-        );
-        let header = div()
-            .id(SharedString::from(format!(
-                "wallet-public-{section_id}-accounts-header"
-            )))
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px(px(10.0))
-            .py(px(3.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::SURFACE))
-            .cursor_pointer()
-            .on_click(move |_event, _window, cx| {
-                toggle_root.update(cx, |root, cx| {
-                    root.set_public_account_section_open(status, !open, cx);
-                });
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(12.0))
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(SharedString::from(format!(
-                        "{} · {count}",
-                        title.to_ascii_uppercase()
-                    ))),
-            )
-            .child(header_actions);
-
-        let mut content = div().w_full().flex().flex_col().gap_3().pt(px(4.0));
-        if status == PublicAccountStatus::Inactive {
-            content =
-                content.children(self.public_inactive_balance_error.as_ref().map(|message| {
-                    Alert::warning("wallet-public-inactive-balance-error", message.to_string())
-                        .title("Inactive balances unavailable")
-                        .small()
-                }));
-        }
-        if accounts.is_empty() {
-            content = content.child(app_muted_text(if status == PublicAccountStatus::Active {
-                "No active Public accounts."
-            } else {
-                "No inactive Public accounts."
-            }));
-        } else {
-            for account in accounts {
-                content = content.child(self.render_public_account_card(root, account));
-            }
-        }
-
-        Collapsible::new()
-            .open(open)
-            .w_full()
-            .child(header)
-            .content(content)
-    }
-
-    fn render_public_account_card(
-        &self,
-        root: &Entity<Self>,
-        account: &PublicAccountMetadata,
-    ) -> gpui::Div {
-        let selected = self
-            .public_form
-            .selected_account_uuid
-            .as_ref()
-            .is_some_and(|selected| selected.as_ref() == account.public_account_uuid);
-        let account_uuid = Arc::from(account.public_account_uuid.as_str());
-        let row_group = SharedString::from(format!(
-            "wallet-public-account-row-{}",
-            account.public_account_uuid
-        ));
-        let edit_root = root.clone();
-        let walletconnect_root = root.clone();
-        let address_dialog_root = root.clone();
-        let deactivate_root = root.clone();
-        let activate_root = root.clone();
-        let delete_root = root.clone();
-        let address_display = short_address(&account.address);
-        let edit_uuid = Arc::clone(&account_uuid);
-        let address_dialog_uuid = Arc::clone(&account_uuid);
-        let address_dialog_address = account.address;
-        let address_copy_root = root.clone();
-        let address_copy_value = SharedString::from(public_address_qr_payload(account.address));
-        let address_copy_button = div()
-            .group(row_group.clone())
-            .flex_none()
-            .opacity(0.0)
-            .group_hover(row_group.clone(), |this| this.opacity(1.0))
-            .hover(|this| this.opacity(1.0))
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .child(
-                public_account_icon_button(
-                    SharedString::from(format!(
-                        "wallet-public-address-copy-{}",
-                        account.public_account_uuid
-                    )),
-                    IconName::Copy,
-                    "Copy address",
-                )
-                .on_click(move |_event, window, cx| {
-                    cx.stop_propagation();
-                    if address_copy_root.read(cx).view_session.is_some() {
-                        ui::clipboard::copy_to_clipboard_with_toast(
-                            address_copy_value.clone(),
-                            window,
-                            cx,
-                        );
-                    }
-                }),
-            );
-        let has_walletconnect_session =
-            self.walletconnect_account_has_session(&account.public_account_uuid);
-        let source_badge = public_account_metadata_badge(
-            SharedString::from(format!(
-                "wallet-public-account-source-{}",
-                account.public_account_uuid
-            )),
-            Icon::new(public_account_source_icon(account.source)),
-            public_account_source_label(account.source),
-        );
-        let mut metadata_badges = div().flex().items_center().gap_1().child(source_badge);
-        if account.is_global() {
-            metadata_badges = metadata_badges.child(public_account_metadata_badge(
-                SharedString::from(format!(
-                    "wallet-public-account-scope-{}",
-                    account.public_account_uuid
-                )),
-                Icon::new(RailgunPublicAccountIcon::Global),
-                "Available across wallets",
-            ));
-        }
-        let account_label = public_account_display_label(account);
-        let address_dialog_label = account_label.clone();
-        let mut action_buttons = div()
-            .group(row_group.clone())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .opacity(0.0)
-            .group_hover(row_group.clone(), |this| this.opacity(1.0))
-            .hover(|this| this.opacity(1.0))
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                cx.stop_propagation();
-            });
-        if account.status == PublicAccountStatus::Active {
-            let walletconnect_uuid = Arc::clone(&account_uuid);
-            let walletconnect_button = public_account_walletconnect_button(
-                SharedString::from(format!(
-                    "wallet-public-walletconnect-{}",
-                    account.public_account_uuid
-                )),
-                has_walletconnect_session,
-            )
-            .on_click(move |_event, window, cx| {
-                cx.stop_propagation();
-                let account_uuid = Arc::clone(&walletconnect_uuid);
-                walletconnect_root.update(cx, |root, cx| {
-                    root.open_walletconnect_connection_dialog(account_uuid, window, cx);
-                });
-            });
-            if !has_walletconnect_session {
-                action_buttons = action_buttons.child(walletconnect_button);
-            }
-        }
-        action_buttons = action_buttons.child(
-            public_account_icon_button(
-                SharedString::from(format!(
-                    "wallet-public-edit-{}",
-                    account.public_account_uuid
-                )),
-                Icon::new(RailgunActionIcon::Pencil),
-                "Edit label",
-            )
-            .on_click(move |_event, window, cx| {
-                let account_uuid = Arc::clone(&edit_uuid);
-                edit_root.update(cx, |root, cx| {
-                    root.open_public_account_edit_dialog(account_uuid, window, cx);
-                });
-            }),
-        );
-        let mut persistent_action_buttons = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                cx.stop_propagation();
-            });
-        if account.status == PublicAccountStatus::Active && has_walletconnect_session {
-            let walletconnect_uuid = Arc::clone(&account_uuid);
-            let walletconnect_root = root.clone();
-            persistent_action_buttons = persistent_action_buttons.child(
-                public_account_walletconnect_button(
-                    SharedString::from(format!(
-                        "wallet-public-walletconnect-{}",
-                        account.public_account_uuid
-                    )),
-                    true,
-                )
-                .on_click(move |_event, window, cx| {
-                    cx.stop_propagation();
-                    let account_uuid = Arc::clone(&walletconnect_uuid);
-                    walletconnect_root.update(cx, |root, cx| {
-                        root.open_walletconnect_account_sessions_dialog(account_uuid, window, cx);
-                    });
-                }),
-            );
-        }
-        let action_buttons = match account.source {
-            PublicAccountSource::Derived
-            | PublicAccountSource::HardwareDerived
-            | PublicAccountSource::ExecutorDerived(_) => {
-                let status_uuid = Arc::clone(&account_uuid);
-                let inactive = account.status == PublicAccountStatus::Inactive;
-                action_buttons.child(
-                    public_account_icon_button(
-                        SharedString::from(format!(
-                            "wallet-public-{}-{}",
-                            if inactive { "activate" } else { "deactivate" },
-                            account.public_account_uuid
-                        )),
-                        if inactive {
-                            IconName::Eye
-                        } else {
-                            IconName::EyeOff
-                        },
-                        if inactive {
-                            "Activate account"
-                        } else {
-                            "Deactivate account"
-                        },
-                    )
-                    .on_click(move |_event, window, cx| {
-                        let account_uuid = Arc::clone(&status_uuid);
-                        if inactive {
-                            activate_root.update(cx, |root, cx| {
-                                root.activate_public_account(&account_uuid, window, cx);
-                            });
-                        } else {
-                            deactivate_root.update(cx, |root, cx| {
-                                root.deactivate_public_account(&account_uuid, window, cx);
-                            });
-                        }
-                    }),
-                )
-            }
-            PublicAccountSource::Imported => {
-                let delete_uuid = Arc::clone(&account_uuid);
-                action_buttons.child(
-                    public_account_icon_button(
-                        SharedString::from(format!(
-                            "wallet-public-delete-{}",
-                            account.public_account_uuid
-                        )),
-                        Icon::new(RailgunActionIcon::Trash2),
-                        "Delete account",
-                    )
-                    .danger()
-                    .on_click(move |_event, window, cx| {
-                        let account_uuid = Arc::clone(&delete_uuid);
-                        delete_root.update(cx, |root, cx| {
-                            root.delete_public_account(&account_uuid, window, cx);
-                        });
-                    }),
-                )
-            }
-        };
-        let account_label = account_label.map_or_else(
-            || {
-                app_strong_text(" ")
-                    .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
-                    .whitespace_nowrap()
-                    .opacity(0.0)
-            },
-            |label| {
-                app_strong_text(label)
-                    .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
-                    .whitespace_nowrap()
-            },
-        );
-        let mut account_content = div()
-            .w_full()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w(px(0.0)).child(account_label))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
-                            .child(persistent_action_buttons)
-                            .child(action_buttons),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "wallet-public-address-qr-action-{}",
-                                        account.public_account_uuid
-                                    )))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .rounded_sm()
-                                    .px(px(2.0))
-                                    .py(px(1.0))
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new("Show address QR code").build(window, cx)
-                                    })
-                                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(move |_event, window, cx| {
-                                        cx.stop_propagation();
-                                        let account_uuid = Arc::clone(&address_dialog_uuid);
-                                        let label = address_dialog_label.clone();
-                                        address_dialog_root.update(cx, |root, cx| {
-                                            root.open_public_address_qr_dialog(
-                                                account_uuid.as_ref(),
-                                                label,
-                                                address_dialog_address,
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    })
-                                    .child(
-                                        app_muted_text(address_display)
-                                            .font_family(APP_MONO_FONT_FAMILY)
-                                            .text_size(theme::ACCOUNT_ADDRESS_TEXT_SIZE)
-                                            .text_color(rgb(theme::TEXT_SUBTLE))
-                                            .whitespace_nowrap(),
-                                    )
-                                    .child(
-                                        div()
-                                            .group(row_group.clone())
-                                            .flex_none()
-                                            .opacity(0.0)
-                                            .group_hover(row_group.clone(), |this| {
-                                                this.opacity(1.0)
-                                            })
-                                            .child(
-                                                Icon::new(RailgunActionIcon::QrCode)
-                                                    .xsmall()
-                                                    .text_color(rgb(theme::TEXT)),
-                                            ),
-                                    ),
-                            )
-                            .child(address_copy_button),
-                    )
-                    .child(metadata_badges),
-            );
-
-        if let PublicAccountSource::ExecutorDerived(source) = account.source {
-            if self.selected_wallet_source().is_hardware_derived() {
-                account_content = account_content.child(
-                    app_muted_text("Signing requires fresh hardware derivation. This app then uses a temporary software EVM key; the device does not sign the EVM transaction.").whitespace_normal(),
-                );
-            }
-            let history_root = root.clone();
-            account_content = account_content.child(
-                app_button(
-                    SharedString::from(format!(
-                        "public-stealth-history-{}",
-                        account.public_account_uuid
-                    )),
-                    "View stealth account",
-                )
-                .small()
-                .ghost()
-                .on_click(move |_, window, cx| {
-                    history_root.update(cx, |root, cx| {
-                        let session = match root.chain_states.get(&source.chain_id()) {
-                            Some(
-                                super::ChainUtxoState::Ready { session, .. }
-                                | super::ChainUtxoState::Syncing { session, .. },
-                            ) => Some(session.clone()),
-                            _ => None,
-                        };
-                        if let Some(session) = session {
-                            let target = super::stealth_accounts::StealthAccountTarget::new(
-                                &session,
-                                source.operation(),
-                            );
-                            root.open_stealth_account(&target, window, cx);
-                        }
-                    });
-                }),
-            );
-        }
-        let visible_balances =
-            self.public_account_visible_balances(&account.public_account_uuid, account.status);
-        if !visible_balances.is_empty() {
-            let mut balance_chips = div().w_full().flex().flex_wrap().gap_2().pt(px(2.0));
-            for (balance_index, entry) in visible_balances.iter().enumerate() {
-                balance_chips = balance_chips.child(self.render_public_account_balance_chip(
-                    root,
-                    Arc::clone(&account_uuid),
-                    selected,
-                    balance_index,
-                    entry,
-                ));
-            }
-            account_content = account_content.child(balance_chips);
-        }
-        div()
-            .group(row_group)
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p(px(14.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::SURFACE))
-            .hover(|row| row.border_color(rgb(theme::PRIMARY)))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_4()
-                    .child(render_public_account_identicon(&account.address))
-                    .child(account_content),
-            )
-    }
-
-    fn render_public_account_balance_chip(
-        &self,
-        root: &Entity<Self>,
-        account_uuid: Arc<str>,
-        selected_account: bool,
-        index: usize,
-        entry: &PublicBalanceEntry,
-    ) -> impl IntoElement {
-        let select_root = root.clone();
-        let asset = entry.asset.id;
-        let selected = selected_account && self.public_form.selected_asset == Some(asset);
-        let icon_path = public_asset_icon_path(
-            self.selected_chain,
-            asset,
-            Some(&self.effective_token_registry),
-        );
-        let amount_label = public_balance_amount_label(&entry.amount, entry.asset.decimals);
-        let usd_label = public_balance_usd_label(
-            self.selected_chain,
-            entry.asset.id,
-            &entry.amount,
-            Some(&self.public_broadcaster_anchor_cache),
-        );
-        let symbol = entry.asset.symbol.clone();
-        let tooltip = SharedString::from(format!("Shield/send {symbol}"));
-        let balance_id = SharedString::from(format!(
-            "wallet-public-account-balance-{}-{index}",
-            account_uuid.as_ref()
-        ));
-        let balance_group = SharedString::from(format!(
-            "wallet-public-account-balance-group-{}-{index}",
-            account_uuid.as_ref()
-        ));
-        let mut asset_label = div().flex().items_center().gap_1();
-        if let Some(path) = icon_path {
-            asset_label = asset_label.child(img(path).size(px(16.0)).rounded_full().flex_none());
-        }
-        div()
-            .id(balance_id)
-            .group(balance_group.clone())
-            .min_w(PUBLIC_BALANCE_CHIP_MIN_WIDTH)
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded_md()
-            .border_1()
-            .border_color(if selected {
-                rgb(theme::PRIMARY)
-            } else {
-                rgb(theme::BORDER_SUBTLE)
-            })
-            .bg(if selected {
-                rgb(theme::SURFACE_HOVER_SUBTLE)
-            } else {
-                rgb(theme::SURFACE)
-            })
-            .text_size(APP_TEXT_SIZE)
-            .cursor_pointer()
-            .hover(|this| {
-                this.bg(rgb(theme::SURFACE_ELEVATED))
-                    .border_color(if selected {
-                        rgb(theme::PRIMARY)
-                    } else {
-                        rgb(theme::BORDER)
-                    })
-            })
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .on_click(move |_event, window, cx| {
-                let account_uuid = Arc::clone(&account_uuid);
-                select_root.update(cx, |root, cx| {
-                    root.open_public_action_dialog(account_uuid, asset, window, cx);
-                });
-            })
-            .child(
-                asset_label
-                    .flex_none()
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child(SharedString::from(symbol)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .text_color(rgb(theme::WARNING))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(SharedString::from(amount_label))
-                    .when_some(usd_label, |column, usd_label| {
-                        column.child(
-                            app_muted_text(usd_label)
-                                .whitespace_nowrap()
-                                .text_align(gpui::TextAlign::Right),
-                        )
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .group(balance_group.clone())
-                    .size(PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE)
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .opacity(0.0)
-                    .group_hover(balance_group, |this| this.opacity(1.0))
-                    .hover(|this| this.opacity(1.0))
-                    .child(
-                        Icon::new(RailgunActionIcon::Shield)
-                            .with_size(PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE)
-                            .text_color(rgb(theme::WARNING_STRONG)),
-                    ),
-            )
     }
 }

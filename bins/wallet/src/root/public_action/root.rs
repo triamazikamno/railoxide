@@ -195,6 +195,13 @@ impl WalletRoot {
             ))
         });
 
+        if account.is_some_and(|account| {
+            matches!(account.source, PublicAccountSource::ExecutorDerived(_))
+        }) && self.selected_wallet_source().is_hardware_derived()
+        {
+            content = content.child(app_muted_text("Signing requires fresh hardware derivation. This app then uses a temporary software EVM key; the device does not sign the EVM transaction.").whitespace_normal());
+        }
+
         match mode {
             PublicActionMode::Shield => {
                 content = content

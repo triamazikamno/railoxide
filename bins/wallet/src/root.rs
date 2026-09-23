@@ -524,6 +524,7 @@ pub(crate) struct WalletRoot {
     focus_vault_input_on_render: bool,
     focus_utxo_table_on_render: bool,
     focus_public_account_search_on_render: bool,
+    wallet_focus: FocusHandle,
     logs_open: bool,
     drawer_split: Entity<ResizableState>,
 }
@@ -1173,7 +1174,7 @@ impl WalletRoot {
                 .auto_grow(3, 6)
                 .placeholder("paste recovery phrase")
         });
-        let public_account_search_input = new_text_input(window, cx, "search accounts");
+        let public_account_search_input = new_text_input(window, cx, "Search accounts");
         let governance_participant_picker = cx.new(|cx| {
             gpui_component::combobox::ComboboxState::new(
                 SearchableVec::<governance::ParticipantChoice>::new(Vec::new()),
@@ -1201,6 +1202,7 @@ impl WalletRoot {
             editing_entry: None,
             error: None,
         };
+        let public_list_scroll = gpui::ScrollHandle::new();
         let public_form = PublicAccountFormState {
             add_label_input: new_text_input(window, cx, "account label"),
             add_password_input: new_masked_input(window, cx, "vault password"),
@@ -1268,8 +1270,13 @@ impl WalletRoot {
             importing_account: false,
             sending: false,
             shielding: false,
-            active_accounts_open: true,
-            inactive_accounts_open: false,
+            list_scroll: public_list_scroll,
+            selected_row_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            list_focus: cx.focus_handle(),
+            focused_asset_index: None,
+            asset_menu: None,
+            asset_menu_subscription: None,
+            open_section: wallet_ops::vault::PublicAccountStatus::Active,
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
@@ -1534,6 +1541,7 @@ impl WalletRoot {
             focus_vault_input_on_render,
             focus_utxo_table_on_render: false,
             focus_public_account_search_on_render: false,
+            wallet_focus: cx.focus_handle(),
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
         };
@@ -1543,6 +1551,10 @@ impl WalletRoot {
                 root.enforce_auto_lock(window, cx);
             }
             root.sync_walletconnect_attention_for_window(window);
+        })
+        .detach();
+        cx.on_focus_lost(window, |root, window, cx| {
+            root.focus_wallet_view_after_focus_loss(window, cx);
         })
         .detach();
         cx.subscribe(&tx_search_input, |this, input, event: &InputEvent, cx| {
@@ -1560,6 +1572,10 @@ impl WalletRoot {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value().trim().to_ascii_lowercase();
                     this.public_form.search_query = Arc::from(query);
+                    this.public_form
+                        .list_scroll
+                        .set_offset(gpui::Point::default());
+                    this.reconcile_public_account_selection();
                     cx.notify();
                 }
             },

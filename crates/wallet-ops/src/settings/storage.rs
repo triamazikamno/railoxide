@@ -317,6 +317,10 @@ fn decode_wallet_ui_state_with_migration(
             state.last_public_accounts.clear();
             true
         }
+        4 => {
+            state.version = WALLET_UI_STATE_VERSION;
+            true
+        }
         version => {
             return Err(WalletUiStateError::UnsupportedVersion { version });
         }

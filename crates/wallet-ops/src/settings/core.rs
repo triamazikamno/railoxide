@@ -11,7 +11,7 @@ pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 10;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
-pub const WALLET_UI_STATE_VERSION: u32 = 4;
+pub const WALLET_UI_STATE_VERSION: u32 = 5;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
@@ -124,6 +124,18 @@ pub struct WalletUiState {
     #[serde(default)]
     pub governance_participants: BTreeMap<String, Vec<String>>,
     pub last_public_accounts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub public_account_sort: PublicAccountSort,
+    #[serde(default)]
+    pub public_hide_empty_accounts: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PublicAccountSort {
+    #[default]
+    Value,
+    Name,
+    Added,
 }
 
 impl Default for WalletUiState {
@@ -135,6 +147,8 @@ impl Default for WalletUiState {
             last_wallet_kind: RememberedWalletKind::Unknown,
             governance_participants: BTreeMap::new(),
             last_public_accounts: BTreeMap::new(),
+            public_account_sort: PublicAccountSort::default(),
+            public_hide_empty_accounts: false,
         }
     }
 }

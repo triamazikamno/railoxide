@@ -9,15 +9,16 @@ use alloy::hex;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    MouseButton, ParentElement, Point, Render, SharedString, StatefulInteractiveElement, Styled,
     StyledImage as _, Window, WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _,
     px, rgb, size,
 };
 use gpui::{FontWeight, ObjectFit};
 use gpui_component::{
-    Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     badge::Badge,
     button::ButtonVariants,
+    kbd::Kbd,
     notification::Notification,
     progress::Progress as UiProgress,
     resizable::{resizable_panel, v_resizable},
@@ -41,7 +42,10 @@ use crate::assets::{
     HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, RailgunSocialIcon, WARM_GLOW_PATH,
 };
 
-use super::actions::register_wallet_shortcut_root;
+use super::actions::{
+    NextWalletTab, OpenChainSelector, OpenWalletSelector, PreviousWalletTab,
+    WALLET_WORKSPACE_KEY_CONTEXT, register_wallet_shortcut_root,
+};
 use super::chain_load::{
     BalanceSyncIssue, PresenceStatus, SyncStatusContext, SyncStatusLabels, WalletStatusCounts,
     balance_sync_issue, balances_presence_status, ppoi_presence_status,
@@ -269,6 +273,45 @@ impl WalletRoot {
             self.schedule_public_balance_refresh(cx);
         }
         cx.notify();
+    }
+
+    /// Selects the next (or previous) wallet tab with wrap-around, skipping tabs
+    /// the selected chain cannot show.
+    pub(super) fn cycle_wallet_tab(&mut self, forward: bool, cx: &mut Context<'_, Self>) {
+        let tabs = WalletTab::ALL;
+        let count = tabs.len();
+        let current = tabs
+            .iter()
+            .position(|tab| *tab == self.active_wallet_tab)
+            .unwrap_or(0);
+        let has_railgun = self.selected_chain_has_railgun();
+        let next = (1..count)
+            .map(|step| {
+                if forward {
+                    tabs[(current + step) % count]
+                } else {
+                    tabs[(current + count - step) % count]
+                }
+            })
+            .find(|tab| *tab == WalletTab::Public || has_railgun);
+        if let Some(tab) = next {
+            self.select_wallet_tab(tab, cx);
+        }
+    }
+
+    /// Keeps wallet shortcuts reachable when the focused element disappears, such as the
+    /// vault password input after unlock or the public search input after a tab switch.
+    pub(super) fn focus_wallet_view_after_focus_loss(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if matches!(self.vault_state, VaultState::ViewUnlocked)
+            && self.active_activity == Activity::Wallet
+            && should_apply_background_focus(window.has_active_dialog(cx))
+        {
+            self.wallet_focus.focus(window, cx);
+        }
     }
 
     pub(super) fn focus_public_account_search_if_requested(
@@ -721,7 +764,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> gpui::AnyElement {
         match self.active_activity {
-            Activity::Wallet => self.render_wallet_view(root, window).into_any_element(),
+            Activity::Wallet => self.render_wallet_view(root, window, cx).into_any_element(),
             Activity::Broadcaster => self.render_broadcaster_view(root).into_any_element(),
             Activity::AddressBook => self.render_address_book_view(root),
             Activity::Proposals => self
@@ -758,8 +801,53 @@ impl WalletRoot {
             .child(div().flex_1().min_h(px(0.0)).child(content))
     }
 
-    fn render_wallet_view(&self, root: &Entity<Self>, window: &Window) -> impl IntoElement {
+    pub(super) fn render_wallet_view(
+        &self,
+        root: &Entity<Self>,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> impl IntoElement {
+        let wallet_focus = self.wallet_focus.clone();
         div()
+            .key_context(WALLET_WORKSPACE_KEY_CONTEXT)
+            .track_focus(&self.wallet_focus)
+            // Clicking empty wallet space claims focus only when it is outside the view,
+            // so an inner input keeps focus.
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                if wallet_focus.contains_focused(window, cx) {
+                    window.prevent_default();
+                }
+            })
+            .on_action({
+                let root = root.clone();
+                move |_: &NextWalletTab, _, cx| {
+                    root.update(cx, |root, cx| root.cycle_wallet_tab(true, cx));
+                }
+            })
+            .on_action({
+                let root = root.clone();
+                move |_: &PreviousWalletTab, _, cx| {
+                    root.update(cx, |root, cx| root.cycle_wallet_tab(false, cx));
+                }
+            })
+            // SelectState has no public open method, so focus the trigger and send it the
+            // key that opens it. The dispatch is deferred and targets the trigger focused here.
+            .on_action({
+                let root = root.clone();
+                move |_: &OpenWalletSelector, window, cx| {
+                    let select = root.read(cx).wallet_select.clone();
+                    select.update(cx, |select, cx| select.focus(window, cx));
+                    window.dispatch_action(Box::new(gpui_kit::base::actions::SelectDown), cx);
+                }
+            })
+            .on_action({
+                let root = root.clone();
+                move |_: &OpenChainSelector, window, cx| {
+                    let select = root.read(cx).chain_select.clone();
+                    select.update(cx, |select, cx| select.focus(window, cx));
+                    window.dispatch_action(Box::new(gpui_kit::base::actions::SelectDown), cx);
+                }
+            })
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
@@ -767,14 +855,14 @@ impl WalletRoot {
             .flex_col()
             .bg(rgb(theme::SURFACE_ELEVATED))
             .child(self.render_wallet_header(root))
-            .child(self.render_wallet_tabs(root))
+            .child(self.render_wallet_tabs(root, window, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .p(px(12.0))
-                    .child(self.render_wallet_content(root, window)),
+                    .child(self.render_wallet_content(root, window, cx)),
             )
             .children(self.render_wallet_status_bar(root))
     }
@@ -1061,7 +1149,12 @@ impl WalletRoot {
             .into_any_element()
     }
 
-    fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
+    fn render_wallet_tabs(
+        &self,
+        root: &Entity<Self>,
+        window: &Window,
+        cx: &App,
+    ) -> impl IntoElement {
         let selected_index = WalletTab::ALL
             .iter()
             .position(|tab| *tab == self.active_wallet_tab)
@@ -1075,6 +1168,9 @@ impl WalletRoot {
             .flex_none()
             .px(px(14.0))
             .selected_index(selected_index)
+            .when_some(self.render_wallet_tab_hint(window, cx), |tabs, hint| {
+                tabs.suffix(hint)
+            })
             .on_click(move |index, _window, cx| {
                 let Some(tab) = WalletTab::ALL.get(*index).copied() else {
                     return;
@@ -1110,10 +1206,39 @@ impl WalletRoot {
             }))
     }
 
-    fn render_wallet_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
+    fn render_wallet_tab_hint(&self, window: &Window, cx: &App) -> Option<gpui::Div> {
+        let key = Kbd::binding_for_action_in(&NextWalletTab, &self.wallet_focus, window)?;
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    key.outline()
+                        .font_family(crate::assets::KEYCAP_FONT_FAMILY)
+                        .font_weight(FontWeight::NORMAL)
+                        .font_features(gpui::FontFeatures(Arc::new(vec![("case".into(), 1)]))),
+                )
+                .child(
+                    div()
+                        .text_size(gpui::rems(11.0 / 16.0))
+                        .line_height(gpui::rems(14.0 / 16.0))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("switch tab"),
+                ),
+        )
+    }
+
+    fn render_wallet_content(
+        &self,
+        root: &Entity<Self>,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
         match self.active_wallet_tab {
             WalletTab::Private => self.render_private_assets_body(root),
-            WalletTab::Public => self.render_public_wallet_body(root),
+            WalletTab::Public => self.render_public_wallet_body(root, window, cx),
             WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
         }
     }
