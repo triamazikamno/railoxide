@@ -309,6 +309,22 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
         SettingsApplyMode::Clean
     );
 
+    // Each build creates its own manifest reuse handle, which is not a
+    // configuration change.
+    let mut official = saved.clone();
+    official.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Official;
+    let first_build = build_effective_chain_configs(&official).unwrap();
+    let second_build = build_effective_chain_configs(&official).unwrap();
+    let (first, second) = (first_build.get(1).unwrap(), second_build.get(1).unwrap());
+    assert!(
+        first
+            .railgun
+            .as_ref()
+            .is_some_and(|railgun| railgun.sync.indexed_artifact_source.is_some())
+    );
+    assert_eq!(first, second);
+    assert!(first.operationally_matches(second));
+
     let mut pricing = saved.clone();
     pricing
         .chains

@@ -312,8 +312,13 @@ async fn fetch_effective_chain_head(
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<u64> {
-    let chain_cfg = verified_chain_config(effective_chain, http, None).await?;
-    let providers = chain_cfg.rpcs.available_providers();
+    // A one-shot read verifies every endpoint so the fallback covers all of them.
+    let route =
+        settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?
+            .verify_identity(&http.rpc_client)
+            .await?;
+    let rpcs = query_rpc_pool_with_http_client(route.endpoint_urls(), http);
+    let providers = rpcs.available_providers();
     if providers.is_empty() {
         return Err(eyre!(
             "no RPC providers configured for chain {}",
@@ -329,7 +334,7 @@ async fn fetch_effective_chain_head(
             chain_id = effective_chain.chain_id,
             "failed to fetch effective chain head"
         );
-        chain_cfg.rpcs.mark_bad_provider(&provider);
+        rpcs.mark_bad_provider(&provider);
     }
 
     Err(eyre!(
@@ -576,17 +581,23 @@ async fn verified_chain_config(
     progress_tx: Option<SyncProgressSender>,
 ) -> Result<ChainConfig> {
     let mut config = chain_config(effective_chain, http, progress_tx)?;
-    let route = effective_chain
-        .rpc_route
-        .verify_identity(&http.rpc_client)
-        .await?;
-    config.rpcs = query_rpc_pool_with_http_client(route.endpoint_urls(), http);
-    if let Some(archive) = &config.archive_rpc_url {
-        crate::RpcChainRoute::new(effective_chain.chain_id, vec![archive.clone()])
-            .with_identity_verification()
-            .verify_identity(&http.rpc_client)
-            .await?;
+    let archive = config.archive_rpc_url.clone().map(SensitiveUrl::from);
+    // Endpoints join the pool as their identity checks pass; the session starts with the first.
+    let mut pool = QueryRpcPool::with_http_client(
+        effective_chain.rpc_route.endpoint_urls(),
+        DEFAULT_QUERY_RPC_COOLDOWN,
+        http.rpc_client.clone(),
+    )
+    .with_pending_admission();
+    if archive.is_some() {
+        pool = pool.with_pending_archive();
     }
+    let pool = Arc::new(pool);
+    effective_chain
+        .rpc_route
+        .admit_sync_pool(&http.rpc_client, &pool, archive)
+        .await?;
+    config.rpcs = pool;
     Ok(config)
 }
 

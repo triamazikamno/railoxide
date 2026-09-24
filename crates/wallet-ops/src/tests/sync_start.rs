@@ -438,6 +438,7 @@ fn chain_config_threads_indexed_artifact_source() {
         ),
         gateway_urls: vec![reqwest::Url::parse("https://gateway.example").expect("url")],
         gateway_pool: None,
+        manifest_reuse: sync_service::IndexedArtifactManifestReuse::default(),
         max_manifest_age: Some(Duration::from_mins(10)),
         concurrency: 5,
         max_in_flight_bytes: 8 * 1024 * 1024,

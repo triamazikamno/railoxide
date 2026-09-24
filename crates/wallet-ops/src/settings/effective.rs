@@ -182,6 +182,7 @@ pub fn build_effective_chain_configs(
                 },
                 gateway_urls: source.gateway_urls,
                 gateway_pool: None,
+                manifest_reuse: sync_service::IndexedArtifactManifestReuse::default(),
                 max_manifest_age: source.max_manifest_age,
                 concurrency: source.concurrency,
                 max_in_flight_bytes: source.max_in_flight_bytes,
