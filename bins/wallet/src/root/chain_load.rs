@@ -2631,6 +2631,7 @@ impl WalletRoot {
                                 ));
                             }
                             root.refresh_open_form_assets_for_snapshot(&snapshot, cx);
+                            root.refresh_private_swap_assets(chain_id, cx);
                             if became_ready {
                                 root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
                             }

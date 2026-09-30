@@ -26,12 +26,15 @@ use crate::{
     TransactionGenerationProgressSender, WakuClient, WalletSession,
 };
 
+mod bridge;
+mod destination;
 mod gas;
 mod observation;
 mod order;
 mod recovery;
 mod settlement;
 mod simulation;
+pub use bridge::{BridgeLegPrice, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute};
 pub use observation::{SwapOrderState, swap_order_state};
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapInputPlan, SwapOrderOutcome,

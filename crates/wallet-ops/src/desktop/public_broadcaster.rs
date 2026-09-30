@@ -1828,17 +1828,26 @@ pub(crate) async fn buffered_gas_price_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     gas: &settings::EffectiveChainGasSettings,
 ) -> Result<u128> {
+    gas_price_from_rpc_pool_with_policy(
+        query_rpc_pool,
+        u128::from(gas.gas_price_buffer_numerator),
+        u128::from(gas.gas_price_buffer_denominator),
+    )
+    .await
+}
+
+pub(crate) async fn gas_price_from_rpc_pool_with_policy(
+    query_rpc_pool: &QueryRpcPool,
+    numerator: u128,
+    denominator: u128,
+) -> Result<u128> {
     let mut last_error = None;
     for _ in 0..query_rpc_pool.len() {
         let Some(provider_handle) = query_rpc_pool.random_provider() else {
             break;
         };
-        match buffered_gas_price_with_policy(
-            &provider_handle.provider,
-            u128::from(gas.gas_price_buffer_numerator),
-            u128::from(gas.gas_price_buffer_denominator),
-        )
-        .await
+        match buffered_gas_price_with_policy(&provider_handle.provider, numerator, denominator)
+            .await
         {
             Ok(gas_price) => return Ok(gas_price),
             Err(error) => {

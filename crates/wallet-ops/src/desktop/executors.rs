@@ -42,10 +42,11 @@ pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;
 pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
 pub use swap::{
-    DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapExecutor,
-    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice, SwapReview,
-    SwapReviewChange, SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, is_swap_record,
-    swap_order_state, swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
+    BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
+    SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapExecutor, SwapInputPlan,
+    SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice, SwapReview, SwapReviewChange,
+    SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, is_swap_record, swap_order_state,
+    swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
 };
 #[cfg(test)]
 pub(crate) use swap::{

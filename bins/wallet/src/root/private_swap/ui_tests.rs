@@ -231,6 +231,8 @@ fn swap_quote_error_wraps_within_its_column(cx: &mut TestAppContext) {
                         revision,
                         Some(QuoteResult {
                             orderbook: None,
+                            bridge_clients: None,
+                            bridge: None,
                             outcome: Err(error),
                         }),
                         window,
@@ -287,6 +289,8 @@ fn quote_retry_discards_the_old_route_and_ignores_its_late_response(cx: &mut Tes
                         old_revision,
                         Some(QuoteResult {
                             orderbook: Some(old_client.clone()),
+                            bridge_clients: None,
+                            bridge: None,
                             outcome: Err(eyre::eyre!("connection failed")),
                         }),
                         window,
@@ -306,6 +310,8 @@ fn quote_retry_discards_the_old_route_and_ignores_its_late_response(cx: &mut Tes
                         old_revision,
                         Some(QuoteResult {
                             orderbook: Some(old_client.clone()),
+                            bridge_clients: None,
+                            bridge: None,
                             outcome: Err(eyre::eyre!("late connection failure")),
                         }),
                         window,
@@ -1101,6 +1107,7 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
                         ExecutorPayloadPurpose::SwapPostHook,
                         Vec::new(),
                     )),
+                    bridge: None,
                 },
             )
             .unwrap();
@@ -1284,6 +1291,7 @@ fn test_approval() -> SwapApproval {
             post_hook_gas_limit: Some(1_000_000),
             hook_cost: Some(U256::ONE),
             anchors: Vec::new(),
+            destination_minimum: None,
         },
         price_verified: Some(false),
         price_acknowledged: true,
@@ -1541,6 +1549,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                     &approval,
                     QuoteResult {
                         orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
                         outcome: Err(eyre::eyre!("initial quote unavailable")),
                     },
                     window,
@@ -1577,6 +1587,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
         });
         send.send(QuoteResult {
             orderbook: None,
+            bridge_clients: None,
+            bridge: None,
             outcome: Err(eyre::eyre!("quote unavailable")),
         })
         .ok()
@@ -1607,6 +1619,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                     &approval,
                     QuoteResult {
                         orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
                         outcome: Ok(QuoteOutcome::PriceBlocked(PriceBlock::Deviates)),
                     },
                     window,
@@ -1620,6 +1634,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                     &approval,
                     QuoteResult {
                         orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
                         outcome: Err(eyre::eyre!("quote failed again")),
                     },
                     window,
@@ -1643,6 +1659,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                     &approval,
                     QuoteResult {
                         orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
                         outcome: Ok(QuoteOutcome::PriceBlocked(PriceBlock::Deviates)),
                     },
                     window,
@@ -1764,8 +1782,9 @@ fn stranded_swap(executors: &ExecutorStore, operation: ExecutorOperationId) {
 }
 
 /// An order of Address 1 for Address 2 delivered as `delivery`, placed from a set-up stealth
-/// account at `Address::repeat_byte(3)`, with nothing observed yet. Returns its UID and the
-/// account's observation.
+/// account at `Address::repeat_byte(3)`, with nothing observed yet. A Bridge order deposits its
+/// 99 bought for [`BRIDGE_MINIMUM`] on the destination network, and a NEAR Intents one pays
+/// [`NEAR_DEPOSIT_ADDRESS`]. Returns its UID and the account's observation.
 fn placed_swap(
     executors: &ExecutorStore,
     operation: ExecutorOperationId,
@@ -1778,9 +1797,10 @@ fn placed_swap(
     use alloy::primitives::{B256, Bytes};
     use broadcaster_core::contracts::cow::OrderUid;
     use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorInputIdentity, ExecutorNonceObservation,
-        ExecutorPayloadContext, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
-        IssuedExecutorPayload, SwapAttempt, SwapDelivery, SwapProof, SwapRecipient, SwapTerms,
+        AcrossOrderTerms, BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult,
+        ExecutorInputIdentity, ExecutorNonceObservation, ExecutorPayloadContext,
+        ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
+        NearIntentsOrderTerms, SwapAttempt, SwapDelivery, SwapProof, SwapRecipient, SwapTerms,
     };
     let setup = pending_setup(executors, operation);
     let setup_hash = setup.issued()[0].hash();
@@ -1815,17 +1835,45 @@ fn placed_swap(
         )
     };
     let mut bounds = test_approval().bounds;
-    // Only a Private delivery shields the output with a post-hook.
-    let post_hook = match delivery {
-        SwapDelivery::Reshield => Some(hook(
-            2_u64,
-            8,
-            ExecutorPayloadPurpose::SwapPostHook,
-            Vec::new(),
-        )),
+    let post_hook = hook(2_u64, 8, ExecutorPayloadPurpose::SwapPostHook, Vec::new());
+    // A Private delivery shields the output with a post-hook, and an Across one deposits it.
+    let (post_hook, bridge) = match delivery {
+        SwapDelivery::Reshield => (Some(post_hook), None),
         SwapDelivery::External { .. } => {
             bounds.post_hook_gas_limit = None;
-            None
+            (None, None)
+        }
+        SwapDelivery::Bridge(delivery) => {
+            bounds.destination_minimum = Some(BRIDGE_MINIMUM);
+            match delivery.provider {
+                BridgeProvider::Across => (
+                    Some(post_hook),
+                    Some(BridgeOrderTerms::Across(AcrossOrderTerms {
+                        spoke_pool: Address::repeat_byte(0x55),
+                        input_token: Address::repeat_byte(2),
+                        output_token: delivery.destination_token,
+                        input_amount: bounds.buy_amount,
+                        output_amount: BRIDGE_MINIMUM,
+                        quote_timestamp: 1_790_000_000,
+                        fill_deadline: 1_790_007_200,
+                        exclusive_relayer: Address::ZERO,
+                        exclusivity_parameter: 0,
+                    })),
+                ),
+                BridgeProvider::NearIntents => {
+                    bounds.post_hook_gas_limit = None;
+                    (
+                        None,
+                        Some(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+                            deposit_address: NEAR_DEPOSIT_ADDRESS,
+                            min_amount_out: BRIDGE_MINIMUM,
+                            amount_out: BRIDGE_MINIMUM,
+                            deadline: "2026-09-30T01:00:00.000Z".into(),
+                            signed_quote: "{}".into(),
+                        })),
+                    )
+                }
+            }
         }
     };
     executors
@@ -1846,6 +1894,7 @@ fn placed_swap(
                 invalidates: None,
                 pre_hook: hook(1_u64, 7, ExecutorPayloadPurpose::SwapPreHook, vec![input]),
                 post_hook,
+                bridge,
             },
         )
         .unwrap();
@@ -2041,6 +2090,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                         ExecutorPayloadPurpose::SwapPostHook,
                         Vec::new(),
                     )),
+                    bridge: None,
                 },
             )
             .unwrap();
@@ -2178,6 +2228,7 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
                         },
                         Some(block),
                     )),
+                    bridges: Vec::new(),
                 };
                 swaps.apply_order_hints(vec![result(confirmed + 1)], cx);
                 assert!(
@@ -2468,7 +2519,11 @@ fn swap_receiver_rejects_addresses_that_would_lose_the_proceeds(cx: &mut TestApp
                 for (entered, problem) in &rejected {
                     set_receiver_text(swaps, entered, window, cx);
                     let form = swaps.form.as_ref().unwrap();
-                    assert_eq!(form.delivery, Err(*problem), "{entered}");
+                    assert_eq!(
+                        form.delivery,
+                        Err(DeliveryProblem::Receiver((*problem).into())),
+                        "{entered}"
+                    );
                     assert!(
                         matches!(form.quote, QuoteState::Idle) && form.quote_task.is_none(),
                         "{entered} must not be quoted"
@@ -2646,7 +2701,8 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
                 (saved, Some("Cold wallet"), None, false),
                 (unknown, None, Some("Not a saved address"), false),
             ] {
-                let (row, warning) = swaps.external_receiver_review(receiver, dai, cx);
+                let (row, warning) =
+                    swaps.external_receiver_review(receiver, &swaps.token_symbol(dai, cx), cx);
                 assert_eq!(
                     row.values_for_test(),
                     ("Receiver".to_owned(), receiver.to_checksum(None))
@@ -3051,19 +3107,944 @@ fn reopened_external_swap_keeps_its_delivery_and_names_a_receiver_change(cx: &mu
     );
 }
 
+/// Another network's Buy list holds what either provider delivers. Across is the default
+/// where it delivers; a token only NEAR Intents delivers switches to it, says so, and quotes
+/// again; and the sell token's own asset offers no provider.
+#[gpui::test]
+fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            (
+                cx.debug_bounds("swap-provider-disclaimer").is_some(),
+                cx.debug_bounds("swap-provider-switched").is_some(),
+                cx.debug_bounds("swap-bridge-same-token").is_some(),
+            )
+        };
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            let items = swaps
+                .buy_select_items(form, cx)
+                .into_iter()
+                .map(|item| (item.asset.token, item.near_only))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items,
+                [
+                    (Address::ZERO, true),
+                    (STUB_POLYGON_USDC, false),
+                    (STUB_POLYGON_USDT, false),
+                ],
+                "native POL first with its NEAR Intents tag; USDC stays listed"
+            );
+        });
+
+        // Both deliver USDT: Across.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(matches!(
+                    form.bridge_state(),
+                    BridgeState::Ready {
+                        provider: BridgeProvider::Across,
+                        near: true,
+                        switched: false,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    form.provider_select.read(cx).selected_value(),
+                    Some(&BridgeProvider::Across)
+                );
+            });
+        });
+        assert_eq!(shown(cx), (true, false, false));
+
+        // Only NEAR Intents delivers POL: it switches, says so and quotes again.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let form = swaps.form.as_mut().unwrap();
+                form.price_acknowledged = true;
+                form.high_costs_acknowledged = true;
+                swaps.set_form_buy(Address::ZERO, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(matches!(
+                    form.bridge_state(),
+                    BridgeState::Ready {
+                        provider: BridgeProvider::NearIntents,
+                        switched: true,
+                        ..
+                    }
+                ));
+                assert!(matches!(form.quote, QuoteState::Loading));
+                assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                assert!(matches!(
+                    form.delivery,
+                    Ok(SwapDelivery::Bridge(BridgeDelivery {
+                        provider: BridgeProvider::NearIntents,
+                        destination_chain: 137,
+                        destination_token: Address::ZERO,
+                        surplus: BridgeSurplus::BridgedByProvider,
+                        ..
+                    }))
+                ));
+            });
+        });
+        assert_eq!(shown(cx), (true, true, false));
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| {
+                !matches!(swaps.form.as_ref().unwrap().quote, QuoteState::Loading)
+            })
+        });
+        assert!(
+            stubs
+                .bridge_requests()
+                .iter()
+                .any(|path| path.starts_with("/near/v0/quote")),
+            "the swap is quoted with NEAR Intents"
+        );
+
+        // USDT goes back to Across; USDC is the sell token's asset.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+                assert!(matches!(
+                    swaps.form.as_ref().unwrap().bridge_state(),
+                    BridgeState::Ready {
+                        provider: BridgeProvider::Across,
+                        ..
+                    }
+                ));
+                swaps.set_form_buy(STUB_POLYGON_USDC, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(matches!(form.bridge_state(), BridgeState::SameToken));
+                assert!(form.provider_select.read(cx).selected_value().is_none());
+                assert!(
+                    matches!(form.quote, QuoteState::Idle) && form.quote_task.is_none(),
+                    "a same-token pair isn't quoted"
+                );
+            });
+        });
+        assert_eq!(shown(cx), (false, false, true));
+    });
+}
+
+/// On Arbitrum One, Across's WETH route is listed as ETH, which its `SpokePool` pays wallets,
+/// together with NEAR Intents' native ETH. Picking ETH bridges WETH with Across.
+#[gpui::test]
+fn across_weth_to_arbitrum_is_listed_and_bridged_as_eth(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            root.update(cx, |root, _| enable_stub_chain(root, &stubs, 42161));
+            swaps.update(cx, |swaps, cx| swaps.set_form_network(42161, window, cx));
+        });
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                form.bridge.routes.contains_key(&(STUB_USDC, 42161))
+            })
+        });
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            let items = swaps
+                .buy_select_items(form, cx)
+                .into_iter()
+                .map(|item| {
+                    (
+                        item.asset.token,
+                        item.asset.label.to_string(),
+                        item.near_only,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items,
+                [(Address::ZERO, "ETH".to_owned(), false)],
+                "one ETH item both providers deliver, and no separate WETH"
+            );
+        });
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(Address::ZERO, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(matches!(
+                    form.bridge_state(),
+                    BridgeState::Ready {
+                        provider: BridgeProvider::Across,
+                        across: true,
+                        near: true,
+                        switched: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    form.delivery,
+                    Ok(SwapDelivery::Bridge(BridgeDelivery {
+                        provider: BridgeProvider::Across,
+                        destination_chain: 42161,
+                        destination_token: STUB_ARBITRUM_WETH,
+                        ..
+                    }))
+                ));
+            });
+        });
+    });
+}
+
+/// An Across review names the destination, provider, bridge fee and surplus, delivers exactly
+/// the deposit's output on Polygon, and discloses the cross-chain link. The confirm-only step
+/// repeats the terms the approval binds, with the approved minimum and no bridge fee.
+#[gpui::test]
+fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, operation, runtime, cx| {
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+                });
+            });
+            let review = ready_review(swaps, runtime, cx);
+            let bridge = *review.bridge().unwrap();
+            let receiver = Address::repeat_byte(4).to_checksum(None);
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.bridge_total_usd_value(&review, cx),
+                    None,
+                    "missing destination prices must not reuse the source quote's dollars"
+                );
+            });
+            root.read_with(cx, |root, _| {
+                let cache = &root.public_broadcaster_anchor_cache;
+                cache.store_rate(1, STUB_USDT, U256::from(3_000_000_000_u64));
+                cache.store_native_usd_rate(1, U256::from(3_000_000_000_u64), 18);
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                // Across delivers the same asset. Its fixed deposit less the fee can be
+                // valued on the source chain even before destination prices are loaded.
+                let payout = review.suggested_private_minimum() - bridge.fee.unwrap();
+                assert_eq!(swaps.bridge_usd_value(&review, cx), Some(payout));
+                assert_eq!(
+                    swaps.bridge_total_usd_value(&review, cx),
+                    Some(payout + review.estimated_source_surplus().unwrap())
+                );
+            });
+            root.read_with(cx, |root, _| {
+                let cache = &root.public_broadcaster_anchor_cache;
+                // A destination price, when present, takes precedence over the fallback.
+                cache.store_rate(137, STUB_POLYGON_USDT, U256::from(500_000));
+                cache.store_native_usd_rate(137, U256::from(1_000_000), 18);
+            });
+            // The stub's 0.1% bridge fee leaves the costs low.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("swap-high-costs").is_none());
+            let source = cx.debug_bounds("swap-source-return").unwrap();
+            let total = cx.debug_bounds("swap-total-received").unwrap();
+            assert!(total.left() >= source.left() && total.right() <= source.right());
+            assert!(total.bottom() <= source.bottom());
+            assert!(cx.debug_bounds("swap-destination-usd").is_some());
+            swaps.read_with(cx, |swaps, cx| {
+                let on_polygon = |amount| {
+                    format!(
+                        "{} on Polygon",
+                        swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx)
+                    )
+                };
+                let surplus = review.estimated_source_surplus().unwrap();
+                let destination_usd = bridge.expected_output * U256::from(2);
+                let total_usd = destination_usd + surplus;
+                assert_eq!(swaps.bridge_usd_value(&review, cx), Some(destination_usd));
+                assert_eq!(swaps.bridge_total_usd_value(&review, cx), Some(total_usd));
+                let summary = swaps.swap_summary(&review, None, None, cx);
+                let rows = summary.rows_for_test();
+                assert_eq!(
+                    rows[..8],
+                    [
+                        (
+                            "You receive".to_owned(),
+                            on_polygon(bridge.destination_minimum)
+                        ),
+                        (
+                            "Estimated return on Ethereum".to_owned(),
+                            swaps.with_usd(format!("≈ {}", swaps.token_amount(STUB_USDT, surplus, cx)),
+                                STUB_USDT, surplus, cx)
+                        ),
+                        (
+                            "Estimated total received".to_owned(),
+                            format!("≈ {}", railgun_ui::format_usd_micro_value(total_usd))
+                        ),
+                        ("Destination".to_owned(), "Polygon".to_owned()),
+                        ("Receiver".to_owned(), receiver.clone()),
+                        ("Provider".to_owned(), "Across".to_owned()),
+                        (
+                            "Bridge fee".to_owned(),
+                            swaps.token_amount(STUB_USDT, bridge.fee.unwrap(), cx)
+                        ),
+                        ("Surplus".to_owned(), "Reshield on Ethereum".to_owned()),
+                    ],
+                    "Across delivers exactly its output, without ≈"
+                );
+                let deposit = swaps.token_amount(STUB_USDT, review.suggested_private_minimum(), cx);
+                let details = summary.details_for_test();
+                for row in [
+                    ("Railgun fees", "0.25% unshield, shield on surplus".to_owned()),
+                    ("Deposit to Across", format!("{deposit} on Ethereum")),
+                ] {
+                    assert!(
+                        details.contains(&(row.0.to_owned(), row.1)),
+                        "{details:?}"
+                    );
+                }
+                let warnings = summary.warnings_for_test();
+                assert!(
+                    warnings.iter().any(|warning| warning.starts_with(&format!(
+                        "If the deposit isn't filled before it expires, Across refunds the {deposit} to the stealth account on Ethereum"
+                    ))),
+                    "{warnings:?}"
+                );
+                let context = summary.context_for_test().unwrap();
+                assert!(
+                    context.contains("The deposit names the receiver, Polygon and the amounts, so the receiver's funds on Polygon can be traced to this swap."),
+                    "{context}"
+                );
+                assert!(!context.contains(EXTERNAL_DELIVERY_DISCLOSURE));
+
+                // The approval saved with the setup binds a lower minimum than this requote.
+                let approved = bridge.destination_minimum / U256::from(2);
+                let approval = OrderApproval {
+                    operation,
+                    review: Arc::clone(&review),
+                    private_minimum: review.suggested_private_minimum(),
+                    price_acknowledged: true,
+                    orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
+                    bridge: None,
+                    destination_minimum: Some(approved),
+                    full_review: false,
+                };
+                assert_eq!(
+                    swaps.place_summary(&approval, cx).rows_for_test(),
+                    [
+                        ("You receive".to_owned(), on_polygon(approved)),
+                        ("Destination".to_owned(), "Polygon".to_owned()),
+                        ("Receiver".to_owned(), receiver),
+                        ("Provider".to_owned(), "Across".to_owned()),
+                        ("Surplus".to_owned(), "Reshield on Ethereum".to_owned()),
+                    ],
+                    "the bound terms, without a bridge fee"
+                );
+            });
+        },
+    );
+}
+
+/// A NEAR Intents review of native POL shows 1Click's estimate in POL's own decimals, no
+/// Surplus row, a fee it can't value without anchors, its disclaimer, and what 1Click learns.
+#[gpui::test]
+fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(Address::ZERO, window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let summary = swaps.swap_summary(&review, None, None, cx);
+            let pol = swaps.network_token_symbol(137, Address::ZERO, cx);
+            let rows = summary.rows_for_test();
+            assert_eq!(
+                rows[..5],
+                [
+                    ("You receive".to_owned(), format!("≈ 12.6 {pol} on Polygon")),
+                    ("Destination".to_owned(), "Polygon".to_owned()),
+                    (
+                        "Receiver".to_owned(),
+                        Address::repeat_byte(4).to_checksum(None)
+                    ),
+                    ("Provider".to_owned(), "NEAR Intents".to_owned()),
+                    (
+                        "Bridge fee".to_owned(),
+                        "Included in the minimum".to_owned()
+                    ),
+                ]
+            );
+            assert!(rows.iter().all(|(label, _)| label != "Surplus"), "{rows:?}");
+            let deposit = swaps.token_amount(STUB_USDT, review.suggested_private_minimum(), cx);
+            assert!(
+                summary
+                    .details_for_test()
+                    .contains(&("Deposit to 1Click".to_owned(), format!("{deposit} on Ethereum")))
+            );
+            let warnings = summary.warnings_for_test();
+            assert!(
+                warnings.iter().any(|warning| warning == NEAR_INTENTS_DISCLAIMER)
+                    && warnings.iter().all(|warning| !warning.contains("Across")),
+                "{warnings:?}"
+            );
+            let context = summary.context_for_test().unwrap();
+            assert!(
+                context.contains("1Click learns the receiver when the order is signed, so the receiver's funds on Polygon can be traced to this swap."),
+                "{context}"
+            );
+        });
+    });
+}
+
+/// The bridge fee counts toward the swap's costs: one that takes them past 10% raises the
+/// high-cost warning, and the review waits for Swap anyway.
+#[gpui::test]
+fn high_bridge_fee_requires_swap_anyway(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    stubs.set_across_fee_bps(2_000);
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-high-costs").is_some());
+        let bps = high_cost_bps(&review).expect("the bridge fee takes the costs past 10%");
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                assert!(
+                    swaps
+                        .swap_summary(&review, None, None, cx)
+                        .warnings_for_test()
+                        .contains(&high_cost_message(bps))
+                );
+                let form = swaps.form.as_mut().unwrap();
+                form.price_acknowledged = true;
+                assert_eq!(
+                    form.review_problem(&review)
+                        .map(|problem| problem.to_string()),
+                    Some("Confirm Swap anyway to accept the high swap costs.".to_owned())
+                );
+                form.high_costs_acknowledged = true;
+                assert!(form.review_problem(&review).is_none());
+            });
+        });
+    });
+}
+
+/// The destination minimum of the Bridge orders [`placed_swap`] places: 248.71 of a 6-decimal
+/// token.
+const BRIDGE_MINIMUM: U256 = U256::from_limbs([248_710_000, 0, 0, 0]);
+/// The 1Click deposit address of the NEAR Intents orders [`placed_swap`] places.
+const NEAR_DEPOSIT_ADDRESS: Address =
+    alloy::primitives::address!("4444444444444444444444444444444444444444");
+
+/// A traded Bridge order's observations at the account's `observed` block: its settlement
+/// handed off to the bridge, with an Across `deposit_id` or none for NEAR Intents, and the
+/// bridge reported `outcome` so far.
+fn bridge_observations(
+    observed: wallet_ops::vault::ExecutorNonceObservation,
+    deposit_id: Option<U256>,
+    outcome: Option<wallet_ops::vault::SwapBridgeOutcome>,
+) -> wallet_ops::vault::SwapOrderObservations {
+    use wallet_ops::vault::{
+        SwapBridgeHandoff, SwapObservation, SwapOrderObservations, SwapTradeAmounts,
+    };
+    let seen = SwapObservation {
+        block: observed.block(),
+        transaction_hash: Some(alloy::primitives::B256::repeat_byte(40)),
+    };
+    SwapOrderObservations {
+        pre_hook_executed: Some(seen),
+        traded: Some(seen),
+        trade_amounts: Some(SwapTradeAmounts {
+            sell_amount: U256::from(100),
+            buy_amount: U256::from(99),
+            fee_amount: U256::ZERO,
+        }),
+        delivered: Some(seen),
+        bridge_handoff: Some(SwapBridgeHandoff {
+            observation: seen,
+            deposit_id,
+        }),
+        bridge_outcome: outcome,
+        ..Default::default()
+    }
+}
+
+/// An Across Bridge swap names its destination and provider from the hand-off through each
+/// outcome, and its detail shows the bridge's facts rather than a private-balance outcome.
+/// Recover… for a refund waits until a check verified the refund and finds funds in the
+/// stealth account, and recovery opens with that check's balance.
+#[gpui::test]
+fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContext) {
+    use crate::root::public_action::PublicActionStepStatus::{Done, Pending, Warning};
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::B256;
+    use wallet_ops::vault::{
+        BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome, SwapOrderObservations,
+    };
+
+    let receiver = Address::repeat_byte(0x51);
+    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                root.public_address_book = vec![cold_wallet_entry(receiver)];
+            });
+        });
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver,
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+        });
+        let (uid, observed) = placed_swap(executors, operation, delivery);
+        let handed_off = |outcome| bridge_observations(observed, Some(U256::from(7)), outcome);
+        let verified = SwapBridgeOutcome::DeliveredVerified {
+            block: BlockNumHash::new(71_904_233, B256::repeat_byte(60)),
+            transaction_hash: B256::repeat_byte(61),
+            output_amount: BRIDGE_MINIMUM,
+        };
+        // The post-hook didn't deposit: the trade's payout is still in the stealth account.
+        let not_sent = SwapOrderObservations {
+            delivered: None,
+            bridge_handoff: None,
+            undelivered: handed_off(None).traded,
+            ..handed_off(None)
+        };
+        for (observations, state, last, status) in [
+            (
+                handed_off(None),
+                SwapOrderState::Bridging,
+                ("Delivered on Polygon", Pending),
+                "Sent to the bridge",
+            ),
+            (
+                handed_off(Some(verified)),
+                SwapOrderState::Done,
+                ("Delivered on Polygon · verified", Done),
+                "Delivered",
+            ),
+            (
+                not_sent,
+                SwapOrderState::NotDelivered,
+                ("Not sent to the bridge", Warning),
+                "Needs recovery",
+            ),
+            (
+                handed_off(Some(SwapBridgeOutcome::Refunding)),
+                SwapOrderState::Refunding,
+                ("Refunding on Ethereum", Warning),
+                "Refunding",
+            ),
+        ] {
+            executors
+                .record_swap_observations(operation, uid, observations)
+                .unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    let record = swaps.record(operation).unwrap();
+                    let stage = swaps.stage(record);
+                    assert_eq!(stage, SwapStage::Order(state));
+                    let labels = swaps.labels(record, cx);
+                    let steps = model::swap_steps(stage, &labels);
+                    let shown = steps.last().unwrap();
+                    assert_eq!((shown.label.as_str(), shown.status), last, "{state:?}");
+                    // The swap's destination is another network, never the private balance.
+                    let card = model::swap_card_line(stage, &labels);
+                    assert!(
+                        steps
+                            .iter()
+                            .flat_map(|step| [&step.label, &step.detail])
+                            .chain([&card.title, &card.detail])
+                            .all(|text| !text.contains("private balance")),
+                        "{state:?}"
+                    );
+                    // My orders adds the network and provider after the receiver.
+                    let rows = swaps.order_rows_for_test(cx);
+                    assert!(
+                        rows.iter().any(|(meta, shown)| {
+                            meta.ends_with(" · to Cold wallet on Polygon · Across")
+                                && shown == status
+                        }),
+                        "{rows:?}"
+                    );
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("swap-bridge-facts").is_some(), "{state:?}");
+            assert!(cx.debug_bounds("swap-outcome").is_none(), "{state:?}");
+            assert!(
+                cx.debug_bounds("swap-detail-receiver").is_some(),
+                "{state:?}"
+            );
+        }
+        // Delivered, the swap is labelled with the verified amount on Polygon.
+        executors
+            .record_swap_observations(operation, uid, handed_off(Some(verified)))
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(
+                    swaps.labels(record, cx).received,
+                    Some(swaps.network_token_amount(137, STUB_POLYGON_USDC, BRIDGE_MINIMUM, cx))
+                );
+            });
+        });
+
+        // A refund is recovered only once an explicit check finds it in the stealth account.
+        // Kept surplus can be there before Across refunds, so the check must also have verified
+        // the refund.
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                handed_off(Some(SwapBridgeOutcome::Refunding)),
+            )
+            .unwrap();
+        let refunding = SwapStage::Order(SwapOrderState::Refunding);
+        press_swap_recover(swaps, operation, refunding, cx);
+        assert!(cx.debug_bounds("stealth-recovery-form").is_none());
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                swaps.tracking.entry(operation).or_default().stealth_balance =
+                    Some((U256::from(99), observed.block()));
+            });
+        });
+        press_swap_recover(swaps, operation, refunding, cx);
+        assert!(cx.debug_bounds("stealth-recovery-form").is_none());
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                SwapOrderObservations {
+                    bridge_refund: Some(wallet_ops::vault::SwapObservation {
+                        block: observed.block(),
+                        transaction_hash: Some(B256::repeat_byte(62)),
+                    }),
+                    ..handed_off(Some(SwapBridgeOutcome::Refunding))
+                },
+            )
+            .unwrap();
+        press_swap_recover(swaps, operation, refunding, cx);
+        assert!(cx.debug_bounds("stealth-recovery-form").is_some());
+    });
+}
+
+/// Across can keep the swap's surplus in the stealth account, and it can exceed the deposit.
+/// Recovering it while the deposit is bridging, or before Across's refund, doesn't complete the
+/// swap once the deposit refunds; only a recovery after the verified refund does.
+#[gpui::test]
+fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestAppContext) {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::{B256, Bytes};
+    use wallet_ops::vault::{
+        BridgeDelivery, BridgeProvider, BridgeSurplus, ExecutorExecutionResult,
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadInclusion,
+        ExecutorPayloadPurpose, IssuedExecutorPayload, SwapBridgeOutcome, SwapObservation,
+        SwapOrderObservations,
+    };
+
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::KeepInAccount,
+        });
+        let (uid, observed) = placed_swap(executors, operation, delivery);
+        let record = || {
+            executors
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap()
+        };
+        let setup = record().issued()[0].clone();
+        let mut won = vec![(setup.hash(), setup.inclusion().unwrap())];
+        let at = |number: u64| {
+            BlockNumHash::new(number, B256::repeat_byte(u8::try_from(number).unwrap()))
+        };
+        // A recovery shield at `nonce` confirmed in block `number`, and the account reconciled
+        // past it.
+        let mut recover = |nonce: u64, number: u64| {
+            let before = ExecutorNonceObservation::new(at(number - 1), U256::from(nonce));
+            executors.reconcile(operation, before, &won).unwrap();
+            let hash = B256::repeat_byte(0x70 + u8::try_from(nonce).unwrap());
+            executors
+                .record_issued(
+                    operation,
+                    IssuedExecutorPayload::new(
+                        U256::from(nonce),
+                        setup.delegate(),
+                        hash,
+                        ExecutorPayloadPurpose::Recovery,
+                        ExecutorPayloadContext::new(
+                            Bytes::from_static(b"recover"),
+                            before,
+                            Vec::new(),
+                        ),
+                    ),
+                )
+                .unwrap();
+            won.push((
+                hash,
+                ExecutorPayloadInclusion::new(
+                    at(number),
+                    B256::repeat_byte(0x80 + u8::try_from(nonce).unwrap()),
+                    ExecutorExecutionResult::Executed,
+                ),
+            ));
+            executors
+                .reconcile(
+                    operation,
+                    ExecutorNonceObservation::new(at(number + 1), U256::from(nonce + 1)),
+                    &won,
+                )
+                .unwrap();
+        };
+        let handed_off = |outcome, bridge_refund| SwapOrderObservations {
+            bridge_refund,
+            ..bridge_observations(observed, Some(U256::from(7)), outcome)
+        };
+        let stage = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, _| {
+                    swaps.reload_records();
+                    swaps.stage(swaps.record(operation).unwrap())
+                })
+            })
+        };
+        executors
+            .record_swap_observations(operation, uid, handed_off(None, None))
+            .unwrap();
+        // The surplus is recovered while the deposit is bridging.
+        recover(3, 40);
+        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Bridging));
+        let refunding = Some(SwapBridgeOutcome::Refunding);
+        executors
+            .record_swap_observations(operation, uid, handed_off(refunding, None))
+            .unwrap();
+        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Refunding));
+        // The refund arrives after that recovery.
+        let refund = SwapObservation {
+            block: at(41),
+            transaction_hash: Some(B256::repeat_byte(0x90)),
+        };
+        executors
+            .record_swap_observations(operation, uid, handed_off(refunding, Some(refund)))
+            .unwrap();
+        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Refunding));
+        recover(4, 55);
+        assert_eq!(stage(cx), SwapStage::Recovered);
+    });
+}
+
+/// Check status on an Across refund asks Across about the deposit again, on the swap's own
+/// route, since the deposit may have been filled after all. The refund is on this network, so
+/// a failed provider check still leaves the balance check to run.
+#[gpui::test]
+fn checking_an_across_refund_asks_across_before_the_balance(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome};
+
+    let stubs = SwapStubs::start();
+    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+        });
+        let (uid, observed) = placed_swap(executors, operation, delivery);
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                bridge_observations(
+                    observed,
+                    Some(U256::from(7)),
+                    Some(SwapBridgeOutcome::Refunding),
+                ),
+            )
+            .unwrap();
+        let orderbook = stub_orderbook(&stubs, runtime);
+        cx.update(|window, cx| {
+            root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137));
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let tracking = swaps.tracking.entry(operation).or_default();
+                tracking.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                tracking.orderbook = Some(orderbook);
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let check = cx.debug_bounds("swap-progress-check").unwrap();
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+        });
+        assert!(
+            stubs
+                .bridge_requests()
+                .iter()
+                .any(|path| path.starts_with("/across/deposit"))
+        );
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(
+                    swaps.stage(record),
+                    SwapStage::Order(SwapOrderState::Refunding)
+                );
+                // The stub's deposit record is invalid, and the unreachable RPC then fails the
+                // balance check, whose error is the one shown.
+                let error = swaps.tracking[&operation].error.clone().unwrap();
+                assert!(!error.contains("Across"), "{error}");
+            });
+        });
+    });
+}
+
+/// A NEAR Intents deposit that needs attention has its own My orders group, apart from
+/// recovery, and shows its deposit address in full. Check status asks 1Click again on the
+/// swap's own route and records the delivery it reports.
+#[gpui::test]
+fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome};
+
+    let stubs = SwapStubs::start();
+    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: Address::ZERO,
+            surplus: BridgeSurplus::BridgedByProvider,
+        });
+        let (uid, observed) = placed_swap(executors, operation, delivery);
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                bridge_observations(observed, None, Some(SwapBridgeOutcome::NeedsAttention)),
+            )
+            .unwrap();
+        let orderbook = stub_orderbook(&stubs, runtime);
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137));
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                let stage = swaps.stage(record);
+                assert_eq!(stage, SwapStage::Order(SwapOrderState::NeedsAttention));
+                assert!(model::swap_card_line(stage, &swaps.labels(record, cx)).attention);
+                let tracking = swaps.tracking.entry(operation).or_default();
+                tracking.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                tracking.orderbook = Some(orderbook);
+            });
+        });
+        // The wallet can't recover the deposit, so it isn't listed as needing recovery.
+        let row: &'static str = format!("swap-order-row-{}", operation.opaque_id()).leak();
+        for (filter, listed) in [
+            (model::SwapOrderGroup::NeedsAttention, true),
+            (model::SwapOrderGroup::NeedsRecovery, false),
+        ] {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.orders_filter = Some(filter);
+                    swaps.show_view(dialog::SwapDialogView::Orders, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert_eq!(cx.debug_bounds(row).is_some(), listed, "{filter:?}");
+        }
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| swaps.show_detail(operation, window, cx));
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("swap-detail-deposit-address").is_some());
+        assert!(cx.debug_bounds("swap-progress-recover").is_none());
+        let check = cx.debug_bounds("swap-progress-check").unwrap();
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+        });
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let record = swaps.record(operation).unwrap();
+                let stage = swaps.stage(record);
+                assert_eq!(
+                    stage,
+                    SwapStage::Order(SwapOrderState::Done),
+                    "{:?}",
+                    swaps.tracking[&operation].error
+                );
+                let labels = swaps.labels(record, cx);
+                assert_eq!(
+                    model::swap_steps(stage, &labels).last().unwrap().label,
+                    "Delivered on Polygon · reported by NEAR Intents"
+                );
+                assert_eq!(
+                    labels.received,
+                    Some(swaps.network_token_amount(
+                        137,
+                        Address::ZERO,
+                        STUB_NEAR_EXPECTED.parse().unwrap(),
+                        cx
+                    ))
+                );
+            });
+        });
+        assert!(
+            stubs
+                .bridge_requests()
+                .iter()
+                .any(|path| path.starts_with("/near/v0/status"))
+        );
+    });
+}
+
 const STUB_USDC: Address = alloy::primitives::address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 /// What the stub orderbook quotes for any sell amount: 0.0004 ETH.
 const STUB_BUY_AMOUNT: u64 = 400_000_000_000_000;
 
-/// Local stand-ins for the chain RPC and the `CoW` orderbook, served from their own thread, so
-/// a quote goes through the real planning and review without live services. The RPC answers
-/// `eth_gasPrice` and fails everything else, like the unreachable RPC of other tests. The
-/// orderbook quotes [`STUB_BUY_AMOUNT`] for any order and keeps each request's body.
+/// Local stand-ins for the chain RPC, the `CoW` orderbook and the bridge providers, served from
+/// their own thread, so a quote goes through the real planning and review without live
+/// services. The RPC answers `eth_gasPrice` and fails everything else, like the unreachable RPC
+/// of other tests. The orderbook quotes [`STUB_BUY_AMOUNT`] for any order and keeps each
+/// request's body. Across and 1Click list the routes of [`stub_bridge_list`] and quote as
+/// [`stub_bridge_reply`] describes.
 struct SwapStubs {
     url: reqwest::Url,
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the stub providers quote with: Across deposits into the swap chain's `spoke_pool` and
+/// keeps `across_fee_bps` of the amount.
+#[derive(Clone)]
+struct StubBridge {
+    spoke_pool: Address,
+    across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SwapStubs {
@@ -3074,7 +4055,22 @@ impl SwapStubs {
             .parse()
             .unwrap();
         let quotes = Arc::<std::sync::Mutex<Vec<serde_json::Value>>>::default();
+        let bridge_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let across_fee_bps = Arc::new(std::sync::atomic::AtomicU64::new(10));
         let recorded = Arc::clone(&quotes);
+        let recorded_bridge = Arc::clone(&bridge_requests);
+        let bridge = StubBridge {
+            spoke_pool: wallet_ops::settings::build_effective_chain_configs(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .bridge_profile()
+            .unwrap()
+            .spoke_pool(),
+            across_fee_bps: Arc::clone(&across_fee_bps),
+        };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3085,7 +4081,12 @@ impl SwapStubs {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 let serve = async {
                     while let Ok((stream, _)) = listener.accept().await {
-                        tokio::spawn(stub_response(stream, Arc::clone(&recorded)));
+                        tokio::spawn(stub_response(
+                            stream,
+                            Arc::clone(&recorded),
+                            Arc::clone(&recorded_bridge),
+                            bridge.clone(),
+                        ));
                     }
                 };
                 tokio::select! {
@@ -3097,9 +4098,17 @@ impl SwapStubs {
         Self {
             url,
             quotes,
+            bridge_requests,
+            across_fee_bps,
             stop: Some(stop),
             thread: Some(thread),
         }
+    }
+
+    /// Have Across keep `bps` of the amount from now on.
+    fn set_across_fee_bps(&self, bps: u64) {
+        self.across_fee_bps
+            .store(bps, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn rpc(&self) -> reqwest::Url {
@@ -3113,6 +4122,11 @@ impl SwapStubs {
     /// The bodies of the quote requests so far.
     fn quotes(&self) -> Vec<serde_json::Value> {
         self.quotes.lock().unwrap().clone()
+    }
+
+    /// The paths of the bridge provider requests so far.
+    fn bridge_requests(&self) -> Vec<String> {
+        self.bridge_requests.lock().unwrap().clone()
     }
 }
 
@@ -3131,6 +4145,8 @@ impl Drop for SwapStubs {
 async fn stub_response(
     stream: tokio::net::TcpStream,
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    bridge: StubBridge,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
     let mut stream = tokio::io::BufReader::new(stream);
@@ -3156,7 +4172,11 @@ async fn stub_response(
         return;
     }
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-    let reply = if request_line.contains("/api/v1/quote") {
+    let path = request_line.split(' ').nth(1).unwrap_or_default();
+    let reply = if path.starts_with("/across/") || path.starts_with("/near/") {
+        bridge_requests.lock().unwrap().push(path.to_owned());
+        stub_bridge_reply(path, &body, &bridge)
+    } else if request_line.contains("/api/v1/quote") {
         // Price the sell token so that one buy-token base unit is worth one wei, which keeps
         // the hook allowance far below the quoted output for any sell amount.
         #[allow(clippy::cast_precision_loss)]
@@ -3198,6 +4218,212 @@ async fn stub_response(
             .as_bytes(),
         )
         .await;
+}
+
+/// Mainnet USDT and Polygon's USDC and USDT, all in the default token list.
+const STUB_USDT: Address = alloy::primitives::address!("dac17f958d2ee523a2206206994597c13d831ec7");
+const STUB_POLYGON_USDC: Address =
+    alloy::primitives::address!("3c499c542cef5e3811e1192ce70d8cc03d5c3359");
+const STUB_POLYGON_USDT: Address =
+    alloy::primitives::address!("c2132d05d31c914a87c6611c10748aeb04b58e8f");
+
+/// WETH on Ethereum and on Arbitrum One, where it is the wrapped native token.
+const STUB_WETH: Address = alloy::primitives::address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+const STUB_ARBITRUM_WETH: Address =
+    alloy::primitives::address!("82af49447d8a07e3bd95bd0d56f35241523fbab1");
+
+/// The stub providers' lists from Ethereum. Across bridges USDC and USDT to Polygon, and WETH
+/// to Arbitrum One. 1Click lists both stablecoins on Ethereum and Polygon, native POL on
+/// Polygon, and native ETH on Arbitrum One.
+fn stub_bridge_list(path: &str) -> serde_json::Value {
+    let route = |chain: u64, origin: Address, destination: Address, symbol: &str| {
+        serde_json::json!({
+            "originChainId": 1, "originToken": origin, "destinationChainId": chain,
+            "destinationToken": destination, "originTokenSymbol": symbol,
+            "destinationTokenSymbol": symbol, "isNative": false
+        })
+    };
+    let token = |blockchain: &str, symbol: &str, contract: Option<Address>| {
+        serde_json::json!({
+            "assetId": format!("nep141:{blockchain}-{symbol}"), "decimals": 6,
+            "blockchain": blockchain, "symbol": symbol, "contractAddress": contract
+        })
+    };
+    if path.starts_with("/across/available-routes") {
+        serde_json::json!([
+            route(137, STUB_USDC, STUB_POLYGON_USDC, "USDC"),
+            route(137, STUB_USDT, STUB_POLYGON_USDT, "USDT"),
+            route(42161, STUB_WETH, STUB_ARBITRUM_WETH, "WETH"),
+        ])
+    } else if path.starts_with("/near/v0/tokens") {
+        serde_json::json!([
+            token("eth", "USDC", Some(STUB_USDC)),
+            token("eth", "USDT", Some(STUB_USDT)),
+            token("pol", "POL", None),
+            token("pol", "USDC", Some(STUB_POLYGON_USDC)),
+            token("pol", "USDT", Some(STUB_POLYGON_USDT)),
+            token("arb", "ETH", None),
+        ])
+    } else {
+        serde_json::json!({})
+    }
+}
+
+/// The seed of the key that stands in for 1Click's quote signer.
+const STUB_QUOTE_SEED: u8 = 7;
+/// What 1Click's stub quotes deliver, in base units of the destination token: about 12.6 and
+/// at least 12.5 of an 18-decimal token.
+const STUB_NEAR_EXPECTED: &str = "12600000000000000000";
+const STUB_NEAR_MINIMUM: &str = "12500000000000000000";
+
+/// A stub provider's answer. Across quotes a fee of the configured share of the amount; 1Click
+/// signs a dry quote of [`STUB_NEAR_EXPECTED`] and [`STUB_NEAR_MINIMUM`] for the request it was
+/// sent with the stand-in key, and reports every deposit delivered with [`STUB_NEAR_EXPECTED`].
+/// Other requests get the lists of [`stub_bridge_list`].
+fn stub_bridge_reply(
+    path: &str,
+    body: &serde_json::Value,
+    bridge: &StubBridge,
+) -> serde_json::Value {
+    if path.starts_with("/across/suggested-fees") {
+        let amount = reqwest::Url::parse(&format!("http://stub{path}"))
+            .ok()
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(key, _)| key == "amount")
+                    .and_then(|(_, amount)| amount.parse::<U256>().ok())
+            })
+            .unwrap_or_default();
+        let bps = bridge
+            .across_fee_bps
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let fee = amount * U256::from(bps) / U256::from(10_000_u32);
+        serde_json::json!({
+            "outputAmount": (amount - fee).to_string(),
+            "totalRelayFee": {"pct": "0", "total": fee.to_string()},
+            "lpFee": {"pct": "0", "total": "0"},
+            "timestamp": "1790718359", "fillDeadline": "1790725559",
+            "exclusiveRelayer": Address::ZERO, "exclusivityDeadline": 0,
+            "spokePoolAddress": bridge.spoke_pool,
+            "destinationSpokePoolAddress": Address::repeat_byte(0x55),
+            "isAmountTooLow": false,
+            "limits": {"minDeposit": "1", "maxDeposit": U256::MAX.to_string()},
+            "estimatedFillTimeSec": 2
+        })
+    } else if path.starts_with("/near/v0/quote") {
+        let response = serde_json::json!({
+            "quote": {
+                "amountIn": body["amount"], "minAmountIn": body["amount"],
+                "amountOut": STUB_NEAR_EXPECTED, "minAmountOut": STUB_NEAR_MINIMUM,
+                "timeEstimate": 20
+            },
+            "quoteRequest": body,
+            "timestamp": "2026-09-30T00:00:00.000Z"
+        });
+        serde_json::from_str(&wallet_ops::bridge::sign_quote_response_with_stand_in(
+            response,
+            STUB_QUOTE_SEED,
+        ))
+        .unwrap()
+    } else if path.starts_with("/near/v0/status") {
+        serde_json::json!({
+            "status": "SUCCESS",
+            "swapDetails": {
+                "amountOut": STUB_NEAR_EXPECTED,
+                "destinationChainTxHashes": [
+                    {"hash": alloy::primitives::B256::repeat_byte(0x5c), "explorerUrl": ""}
+                ]
+            }
+        })
+    } else {
+        stub_bridge_list(path)
+    }
+}
+
+/// Bridge clients for the stub providers, on `orderbook`'s route.
+fn stub_bridge_clients(stubs: &SwapStubs, orderbook: &CowOrderbookClient) -> SwapBridgeClients {
+    SwapBridgeClients {
+        across: wallet_ops::bridge::AcrossClient::new(
+            orderbook.http().clone(),
+            stubs.url.join("across").unwrap(),
+        )
+        .unwrap(),
+        near: wallet_ops::bridge::NearIntentsClient::new(
+            orderbook.http().clone(),
+            stubs.url.join("near").unwrap(),
+            &wallet_ops::bridge::stand_in_quote_key(STUB_QUOTE_SEED),
+        )
+        .unwrap(),
+    }
+}
+
+/// A new swap of 1 USDC, planned from a 10 USDC stub note, to `Address::repeat_byte(4)` on
+/// Polygon through the stub providers, once their routes are listed. Polygon is enabled with
+/// the stub's RPC.
+fn open_bridge_form(
+    root: &Entity<WalletRoot>,
+    swaps: &Entity<PrivateSwapsView>,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let orderbook = stub_orderbook(stubs, runtime);
+    cx.update(|window, cx| {
+        root.update(cx, |root, _| {
+            root.effective_token_registry = wallet_ops::settings::build_effective_token_registry(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap();
+            enable_stub_chain(root, stubs, 137);
+        });
+        swaps.update(cx, |swaps, cx| {
+            swaps
+                .owner
+                .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
+            swaps.open_form(
+                None,
+                STUB_USDC,
+                None,
+                Some(U256::from(1_000_000)),
+                None,
+                SwapDelivery::Reshield,
+                window,
+                cx,
+            );
+            let form = swaps.form.as_mut().unwrap();
+            form.bridge_clients = Some(stub_bridge_clients(stubs, &orderbook));
+            form.orderbook = Some(orderbook);
+            swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+            set_receiver_text(swaps, &Address::repeat_byte(4).to_string(), window, cx);
+            swaps.set_form_network(137, window, cx);
+        });
+    });
+    drive_until(cx, runtime, |cx| {
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            form.bridge.routes.contains_key(&(STUB_USDC, 137))
+        })
+    });
+}
+
+/// Enable the built-in `chain_id` with the stub's RPC.
+fn enable_stub_chain(root: &mut WalletRoot, stubs: &SwapStubs, chain_id: u64) {
+    let mut enabled = wallet_ops::settings::build_effective_chain_configs(
+        &wallet_ops::settings::WalletSettings::default(),
+    )
+    .unwrap()
+    .get(chain_id)
+    .unwrap()
+    .clone();
+    enabled.enabled = true;
+    enabled.rpc_route = wallet_ops::RpcChainRoute::new(chain_id, vec![stubs.rpc()]);
+    root.effective_chain_configs = root
+        .effective_chain_configs
+        .clone()
+        .into_values()
+        .filter(|chain| chain.chain_id != chain_id)
+        .chain(std::iter::once(enabled))
+        .collect();
 }
 
 /// An orderbook client for the stub orderbook, on a direct route.

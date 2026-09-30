@@ -30,8 +30,8 @@ use wallet_ops::{
 };
 
 use super::model::{
-    SwapLabels, SwapOrderGroup, SwapStage, record_swap_ranges, swap_delivery, swap_order_group,
-    swap_order_stage, swap_order_status, swap_private_minimum,
+    SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount, provider_name, record_swap_ranges,
+    swap_delivery, swap_order_group, swap_order_stage, swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -464,6 +464,14 @@ impl PrivateSwapsView {
         entries
     }
 
+    /// How many swaps My orders lists as open.
+    pub(super) fn open_order_count(&self, cx: &App) -> usize {
+        self.order_entries(cx)
+            .iter()
+            .filter(|entry| entry.group == SwapOrderGroup::Open)
+            .count()
+    }
+
     /// When a swap started: its first order's `validTo` less the profile's order window, or for
     /// a swap without orders, when its stealth account was reserved. Without a profile, the
     /// first order's expiry, labeled as such.
@@ -600,7 +608,7 @@ impl PrivateSwapsView {
                 // delivered to its receiver.
                 let label = match delivery {
                     SwapDelivery::Reshield => "Completed",
-                    SwapDelivery::External { .. } => "Delivered",
+                    SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => "Delivered",
                 };
                 row.child(
                     app_text(label)
@@ -620,11 +628,7 @@ impl PrivateSwapsView {
 
     /// My orders, labeled with the count of open swaps.
     fn render_orders_button(&self, cx: &Context<'_, Self>) -> gpui_component::button::Button {
-        let open = self
-            .order_entries(cx)
-            .iter()
-            .filter(|entry| entry.group == SwapOrderGroup::Open)
-            .count();
+        let open = self.open_orders;
         app_button_base("swap-my-orders")
             .outline()
             .small()
@@ -675,9 +679,10 @@ impl PrivateSwapsView {
         let app: &App = cx;
         let entries = self.order_entries(app);
         let count = |group| entries.iter().filter(|entry| entry.group == group).count();
-        let (open, recovery) = (
+        let (open, recovery, attention) = (
             count(SwapOrderGroup::Open),
             count(SwapOrderGroup::NeedsRecovery),
+            count(SwapOrderGroup::NeedsAttention),
         );
         let filter = self.orders_filter;
         let rows = entries
@@ -700,9 +705,19 @@ impl PrivateSwapsView {
                         "recovery",
                         recovery,
                     ),
+                    (
+                        Some(SwapOrderGroup::NeedsAttention),
+                        "Needs attention",
+                        "attention",
+                        attention,
+                    ),
                     (Some(SwapOrderGroup::Ended), "Ended", "ended", 0),
                 ]
                 .into_iter()
+                // Only a bridge deposit needs attention, so its group shows while one does.
+                .filter(|&(group, _, _, count)| {
+                    group != Some(SwapOrderGroup::NeedsAttention) || count > 0 || filter == group
+                })
                 .map(|(group, label, id, count)| {
                     app_segment_button(
                         SharedString::from(format!("swap-orders-filter-{id}")),
@@ -765,6 +780,7 @@ impl PrivateSwapsView {
             let title = match filter {
                 Some(SwapOrderGroup::Open) => "No open swaps",
                 Some(SwapOrderGroup::NeedsRecovery) => "No swaps need recovery",
+                Some(SwapOrderGroup::NeedsAttention) => "No swaps need attention",
                 Some(SwapOrderGroup::Ended) => "No ended swaps",
                 None => "No swaps yet",
             };
@@ -811,27 +827,45 @@ impl PrivateSwapsView {
             _ => self.labels(record, cx),
         };
         let amount = match entry.group {
-            SwapOrderGroup::Open => tokens
-                .zip(entry.order.map_or_else(
-                    || {
-                        pending
-                            .map(|pending| pending.private_minimum)
-                            .or_else(|| swap_private_minimum(record))
-                    },
-                    |order| Some(order.bounds().private_minimum),
-                ))
-                .map_or(OrderRowAmount::None, |((_, buy), minimum)| {
-                    OrderRowAmount::Value {
-                        value: format!("≥ {}", self.token_amount(buy, minimum, cx)),
-                        note: None,
-                    }
-                }),
+            SwapOrderGroup::Open => match &labels.bridge {
+                // A Bridge swap's minimum is on its destination network.
+                Some(bridge) => bridge.minimum.clone(),
+                None => tokens
+                    .zip(entry.order.map_or_else(
+                        || {
+                            pending
+                                .map(|pending| pending.private_minimum)
+                                .or_else(|| swap_private_minimum(record))
+                        },
+                        |order| Some(order.bounds().private_minimum),
+                    ))
+                    .map(|((_, buy), minimum)| self.token_amount(buy, minimum, cx)),
+            }
+            .map_or(OrderRowAmount::None, |minimum| OrderRowAmount::Value {
+                value: format!("≥ {minimum}"),
+                note: None,
+            }),
             SwapOrderGroup::NeedsRecovery => tokens
                 .zip(entry.order)
                 .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
                 .map_or(OrderRowAmount::None, |value| OrderRowAmount::Value {
                     value,
-                    note: Some("in stealth account"),
+                    note: Some(
+                        if entry.stage == SwapStage::Order(SwapOrderState::Refunding) {
+                            "refunding"
+                        } else {
+                            "in stealth account"
+                        },
+                    ),
+                }),
+            // What the provider holds.
+            SwapOrderGroup::NeedsAttention => tokens
+                .zip(entry.order.and_then(bridge_sent_amount))
+                .map_or(OrderRowAmount::None, |((_, buy), sent)| {
+                    OrderRowAmount::Value {
+                        value: self.token_amount(buy, sent, cx),
+                        note: Some("deposit failed"),
+                    }
                 }),
             SwapOrderGroup::Ended => match labels.received.clone() {
                 Some(value) if entry.stage == SwapStage::Order(SwapOrderState::Done) => {
@@ -849,11 +883,20 @@ impl PrivateSwapsView {
                 _ => OrderRowAmount::None,
             },
         };
-        let title = if labels.buy_symbol.is_empty() {
+        // A Bridge swap is named after the token its receiver gets.
+        let bought = labels
+            .bridge
+            .as_ref()
+            .map_or(&labels.buy_symbol, |bridge| &bridge.token);
+        let title = if bought.is_empty() {
             labels.sell.clone()
         } else {
-            format!("{} → {}", labels.sell, labels.buy_symbol)
+            format!("{} → {bought}", labels.sell)
         };
+        let delivery = pending
+            .map(|pending| pending.delivery)
+            .or_else(|| entry.order.map(SwapOrderRecord::delivery))
+            .unwrap_or_else(|| swap_delivery(record));
         let started = entry.started.map(|(label, at)| {
             if label == "Started" {
                 local_date_time_label(at)
@@ -861,7 +904,8 @@ impl PrivateSwapsView {
                 format!("valid until {}", local_date_time_label(at))
             }
         });
-        // A Public address swap names its receiver; Private swaps return to the private balance.
+        // A Public address swap names its receiver, and a Bridge swap also its network and
+        // provider. Private swaps return to the private balance.
         let meta = [
             started,
             Some(format!("#{}", record.index())),
@@ -869,6 +913,14 @@ impl PrivateSwapsView {
                 .receiver
                 .as_ref()
                 .map(|receiver| format!("to {receiver}")),
+            labels.bridge.as_ref().map(|bridge| {
+                format!(
+                    "to {} on {} · {}",
+                    bridge.receiver,
+                    bridge.network,
+                    provider_name(bridge.provider)
+                )
+            }),
         ]
         .into_iter()
         .flatten()
@@ -881,9 +933,24 @@ impl PrivateSwapsView {
             amount,
             meta,
             status: swap_order_status(entry.stage, stopped, &labels),
-            attention: entry.group == SwapOrderGroup::NeedsRecovery,
+            attention: matches!(
+                entry.group,
+                SwapOrderGroup::NeedsRecovery | SwapOrderGroup::NeedsAttention
+            ),
             icons: tokens.map_or([None, None], |(sell, buy)| {
-                [self.token_icon(sell, cx), self.token_icon(buy, cx)]
+                [
+                    self.token_icon(sell, cx),
+                    match delivery {
+                        SwapDelivery::Bridge(bridge) => self
+                            .chain_token_metadata(
+                                bridge.destination_chain,
+                                self.bridge_received_token(bridge, cx),
+                                cx,
+                            )
+                            .and_then(|metadata| metadata.icon_path),
+                        _ => self.token_icon(buy, cx),
+                    },
+                ]
             }),
         }
     }
@@ -901,7 +968,8 @@ impl PrivateSwapsView {
     }
 
     /// What waits in the stealth account after `order`: the unshielded sell amount before a
-    /// trade, the traded buy amount after one. The symbol alone when the amount wasn't recorded.
+    /// trade, the traded buy amount after one, and what a bridge refunds. The symbol alone when
+    /// the amount wasn't recorded.
     fn stranded_amount(
         &self,
         (sell, buy): (Address, Address),
@@ -917,6 +985,7 @@ impl PrivateSwapsView {
                     .trade_amounts
                     .map(|trade| trade.buy_amount),
             ),
+            SwapStage::Order(SwapOrderState::Refunding) => (buy, bridge_sent_amount(order)),
             _ => (sell, Some(order.bounds().sell_amount)),
         };
         amount.map_or_else(

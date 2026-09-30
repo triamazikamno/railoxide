@@ -103,6 +103,114 @@ const ARBITRUM_SWAP_PROFILE: SwapProfile = SwapProfile {
     ..MAINNET_SWAP_PROFILE
 };
 
+/// Built-in cross-chain delivery parameters for one chain: the bridge providers' API roots,
+/// Across's `SpokePool` and 1Click's pinned quote-signing key. Not user-editable and not
+/// persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeProfile {
+    chain_id: u64,
+    across_api_base: &'static str,
+    spoke_pool: Address,
+    one_click_api_base: &'static str,
+    one_click_blockchain: &'static str,
+    one_click_quote_key: &'static str,
+}
+
+// SpokePools are the Across proxies whose implementations contain `depositV3`, checked on-chain
+// on 2026-09-29.
+const MAINNET_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
+    chain_id: 1,
+    across_api_base: "https://app.across.to/api",
+    spoke_pool: address!("5c7BCd6E7De5423a257D81B442095A1a6ced35C5"),
+    one_click_api_base: "https://1click.chaindefuser.com",
+    one_click_blockchain: "eth",
+    // `ONE_CLICK_MANAGER_PUB_KEY` in 1Click's TypeScript SDK 0.1.26.
+    one_click_quote_key: "ed25519:reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc",
+};
+const BNB_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
+    chain_id: 56,
+    spoke_pool: address!("4e8E101924eDE233C13e2D8622DC8aED2872d505"),
+    one_click_blockchain: "bsc",
+    ..MAINNET_BRIDGE_PROFILE
+};
+const POLYGON_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
+    chain_id: 137,
+    spoke_pool: address!("9295ee1d8C5b022Be115A2AD3c30C72E34e7F096"),
+    one_click_blockchain: "pol",
+    ..MAINNET_BRIDGE_PROFILE
+};
+const ARBITRUM_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
+    chain_id: 42161,
+    spoke_pool: address!("e35e9842fceaCA96570B734083f4a58e8F7C5f2A"),
+    one_click_blockchain: "arb",
+    ..MAINNET_BRIDGE_PROFILE
+};
+
+impl BridgeProfile {
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+    #[must_use]
+    pub const fn across_api_base(&self) -> &'static str {
+        self.across_api_base
+    }
+    #[must_use]
+    pub const fn spoke_pool(&self) -> Address {
+        self.spoke_pool
+    }
+    #[must_use]
+    pub const fn one_click_api_base(&self) -> &'static str {
+        self.one_click_api_base
+    }
+    /// 1Click's `blockchain` identifier for this chain in its token list.
+    #[must_use]
+    pub const fn one_click_blockchain(&self) -> &'static str {
+        self.one_click_blockchain
+    }
+    /// The `ed25519:`-prefixed base58 key that signs 1Click quotes.
+    #[must_use]
+    pub const fn one_click_quote_key(&self) -> &'static str {
+        self.one_click_quote_key
+    }
+
+    /// Check a Bridge delivery receiver on this profile's chain, the destination chain,
+    /// against that chain's Railgun proxy `railgun` and this profile's `SpokePool`. Any other
+    /// address is accepted.
+    pub fn check_receiver(
+        &self,
+        railgun: Address,
+        receiver: Address,
+    ) -> Result<(), BridgeReceiverRejection> {
+        let rejection = if receiver == Address::ZERO {
+            BridgeReceiverRejection::ZeroAddress
+        } else if receiver == railgun {
+            BridgeReceiverRejection::Railgun
+        } else if receiver == self.spoke_pool {
+            BridgeReceiverRejection::SpokePool
+        } else {
+            return Ok(());
+        };
+        Err(rejection)
+    }
+}
+
+/// Why a Bridge swap can't deliver to a receiver on the destination chain: the funds would be
+/// lost or stranded in a protocol contract there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BridgeReceiverRejection {
+    #[error("the zero address can't receive the swap; the proceeds would be lost")]
+    ZeroAddress,
+    #[error(
+        "the destination Railgun contract can't be the receiver; the proceeds would be stranded"
+    )]
+    Railgun,
+    #[error(
+        "the destination Across SpokePool can't be the receiver; the proceeds would be stranded"
+    )]
+    SpokePool,
+}
+
 impl SwapProfile {
     #[must_use]
     pub const fn chain_id(&self) -> u64 {
@@ -250,6 +358,24 @@ impl EffectiveChainConfig {
     }
 }
 
+impl EffectiveChainConfig {
+    /// Bridge parameters for a built-in chain. Unlike [`Self::swap_profile`], this doesn't
+    /// require an executor profile: a bridge's destination chain needs only RPC access.
+    #[must_use]
+    pub const fn bridge_profile(&self) -> Option<BridgeProfile> {
+        if !self.built_in {
+            return None;
+        }
+        match self.chain_id {
+            1 => Some(MAINNET_BRIDGE_PROFILE),
+            56 => Some(BNB_BRIDGE_PROFILE),
+            137 => Some(POLYGON_BRIDGE_PROFILE),
+            42161 => Some(ARBITRUM_BRIDGE_PROFILE),
+            _ => None,
+        }
+    }
+}
+
 /// v1 destination-token source: configured tokens on the profile's chain filtered by eligibility.
 /// The list is ERC-20 only for both delivery kinds; a native payout is an output choice on the
 /// wrapped native token, not a list entry.
@@ -344,6 +470,32 @@ mod tests {
     }
 
     #[test]
+    fn bridge_profiles_cover_every_swap_chain_only() {
+        let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let mut unsupported_built_in = 0;
+        for chain in chains.values() {
+            let bridge = chain.bridge_profile();
+            if chain.swap_profile().is_some() {
+                let bridge = bridge.expect("every swap chain can bridge");
+                assert_eq!(bridge.chain_id(), chain.chain_id);
+                assert_ne!(bridge.spoke_pool(), Address::ZERO);
+            } else if chain.built_in && ![1, 56, 137, 42161].contains(&chain.chain_id) {
+                assert!(bridge.is_none(), "chain {}", chain.chain_id);
+                unsupported_built_in += 1;
+            }
+        }
+        assert!(unsupported_built_in > 0);
+
+        // A destination chain needs only RPC, so no executor or enabled check applies here.
+        let chain = chains.get_mut(137).unwrap();
+        chain.enabled = false;
+        assert!(chain.swap_profile().is_none());
+        assert!(chain.bridge_profile().is_some());
+        chain.built_in = false;
+        assert!(chain.bridge_profile().is_none());
+    }
+
+    #[test]
     fn swap_tokens_follow_the_configured_registry() {
         let profile = MAINNET_SWAP_PROFILE;
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
@@ -432,6 +584,25 @@ mod tests {
         // Another of the wallet's stealth accounts may receive.
         assert_eq!(
             profile.check_receiver(railgun, executor, Address::repeat_byte(3)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bridge_receivers_exclude_the_destination_chains_protocol_contracts() {
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let destination = chains.get(137).unwrap();
+        let bridge = destination.bridge_profile().unwrap();
+        let railgun = destination.require_railgun().unwrap().deployment.contract;
+        for (receiver, rejection) in [
+            (Address::ZERO, BridgeReceiverRejection::ZeroAddress),
+            (railgun, BridgeReceiverRejection::Railgun),
+            (bridge.spoke_pool(), BridgeReceiverRejection::SpokePool),
+        ] {
+            assert_eq!(bridge.check_receiver(railgun, receiver), Err(rejection));
+        }
+        assert_eq!(
+            bridge.check_receiver(railgun, Address::repeat_byte(3)),
             Ok(())
         );
     }

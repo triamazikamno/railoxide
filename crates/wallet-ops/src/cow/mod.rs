@@ -31,8 +31,9 @@ mod pricing;
 mod tests;
 
 pub use pricing::{
-    NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams, PreHookCalls, hook_gas_limit,
-    order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit,
+    NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams, PreHookCalls,
+    across_post_hook_gas, hook_gas_limit, order_buy_amount, post_hook_gas, pre_hook_gas,
+    price_order_limit,
 };
 
 /// Hook-free app data sent with every quote request. `CoW` documents `"{}"` as the app data
@@ -244,6 +245,12 @@ impl CowOrderbookClient {
     #[must_use]
     pub const fn isolation(&self) -> OperationNetworkIsolation {
         self.http.isolation()
+    }
+
+    /// The swap's HTTP route, so its bridge clients share this client's isolation group.
+    #[must_use]
+    pub const fn http(&self) -> &OperationHttpClient {
+        &self.http
     }
 
     /// `POST /api/v1/quote` for a sell order, with hook-free app data.

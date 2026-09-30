@@ -1265,7 +1265,9 @@ pub(super) fn swap_needs_recovery(record: &ExecutorRecord) -> bool {
 }
 
 /// The swap's own record says its stealth account holds the swap's funds, including while
-/// the order can still fill. Recovery then also invalidates the order.
+/// the order can still fill. Recovery then also invalidates the order, and reads the balance
+/// before anything is signed. A bridge's refund isn't among them: only a balance check shows
+/// that it arrived.
 pub(super) fn swap_holds_funds(record: &ExecutorRecord) -> bool {
     matches!(
         record_swap_stage(record),
@@ -1275,10 +1277,10 @@ pub(super) fn swap_holds_funds(record: &ExecutorRecord) -> bool {
     )
 }
 
-/// "Recovery needed" is the only swap status with a semantic color: it is the one that asks
-/// the user to act.
+/// Only the swap statuses that ask the user to act have a semantic color: recovery, a refund,
+/// and a bridge deposit that needs attention.
 fn swap_status_tag(stage: SwapStage) -> Tag {
-    let tag = if stage.needs_recovery() {
+    let tag = if stage.needs_attention() {
         Tag::warning()
     } else {
         Tag::secondary()

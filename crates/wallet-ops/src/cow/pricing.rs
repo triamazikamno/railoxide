@@ -1,10 +1,10 @@
 //! Hook gas estimate and order limit for a private swap.
 //!
 //! `CoW` quote verification doesn't count hook gas (design decision 5), so the wallet estimates
-//! it here, prices the estimate in the buy token at the higher of `CoW`'s quoted gas price and
-//! the buffered RPC price, and takes it off the quoted output together with slippage before
-//! binding the private minimum. Solvers pay for the gas a hook uses, so the declared gas limit,
-//! which only caps execution, is not priced. The estimate depends only on the chain and
+//! it here and prices it in the buy token at the caller's RPC gas price. The review adds a
+//! gas-price cushion for the minimum, then deducts hook costs and slippage from the quote.
+//! Actual solver fees can differ from this allowance. The declared gas limit only caps
+//! execution and is not priced. The gas estimate depends only on the chain and
 //! transaction shapes. It reads no chain state and sends nothing to an RPC, so it works before
 //! delegation and never exposes a signed hook.
 //!
@@ -16,7 +16,8 @@
 //! unattractive to solvers.
 //!
 //! The Railgun parts come from the shared per-chain model, [`RailgunGasModel`], in its
-//! [`GasEstimateMode::UpperBound`] mode: the `RelayAdapt7702` execute
+//! [`GasEstimateMode::UpperBound`] mode for signing limits and
+//! [`GasEstimateMode::Expected`] mode for displayed outcomes: the `RelayAdapt7702` execute
 //! ([`RailgunGasModel::executor`]), the pre-hook's `transact`, and the post-hook's one-leaf
 //! shield. Its docs hold the calibration and the per-chain samples. Only the calls a hook adds
 //! around them are measured here, on anvil 1.7.1 mainnet forks at blocks 26,060,041, 26,060,057
@@ -49,6 +50,12 @@ const HOOK_PRE_CALLS_GAS: u64 = 40_000;
 const INVALIDATE_ORDER_GAS: u64 = 35_000;
 /// The post-hook's self-transfer guard and trampoline call overhead.
 const HOOK_GUARD_GAS: u64 = 25_000;
+/// The Across post-hook's exact approval of the `SpokePool`. Measured at most 25,603 inside the
+/// post-hook on forks of all four chains.
+const ACROSS_APPROVE_GAS: u64 = 30_000;
+/// The Across post-hook's `depositV3`. Measured at most 42,339 on forks of all four chains; a
+/// `SpokePool` that holds none of the token adds about 17,100.
+const ACROSS_DEPOSIT_GAS: u64 = 60_000;
 
 const WEI_PER_NATIVE: U256 = uint!(1_000_000_000_000_000_000_U256);
 
@@ -65,6 +72,7 @@ pub fn pre_hook_gas(
     model: &RailgunGasModel,
     transactions: &[TransactionShape],
     calls: PreHookCalls,
+    mode: GasEstimateMode,
 ) -> u64 {
     let invalidate = if calls.invalidate_order {
         INVALIDATE_ORDER_GAS
@@ -75,16 +83,36 @@ pub fn pre_hook_gas(
         .executor()
         .saturating_add(HOOK_PRE_CALLS_GAS)
         .saturating_add(invalidate)
-        .saturating_add(model.transact(GasEstimateMode::UpperBound, transactions.into()))
+        .saturating_add(model.transact(mode, transactions.into()))
 }
 
 /// Estimated gas of the post-hook `multicall`: the guard and a full-balance shield of one leaf.
 #[must_use]
-pub const fn post_hook_gas(model: &RailgunGasModel) -> u64 {
+pub const fn post_hook_gas(model: &RailgunGasModel, mode: GasEstimateMode) -> u64 {
     model
         .executor()
         .saturating_add(HOOK_GUARD_GAS)
-        .saturating_add(model.shield(GasEstimateMode::UpperBound, 1))
+        .saturating_add(model.shield(mode, 1))
+}
+
+/// Estimated gas of the Across post-hook `multicall`: the guard, the approval of the
+/// `SpokePool` and the deposit, and with `reshield_surplus` a full-balance shield of one leaf.
+#[must_use]
+pub const fn across_post_hook_gas(
+    model: &RailgunGasModel,
+    reshield_surplus: bool,
+    mode: GasEstimateMode,
+) -> u64 {
+    let calls = model
+        .executor()
+        .saturating_add(HOOK_GUARD_GAS)
+        .saturating_add(ACROSS_APPROVE_GAS)
+        .saturating_add(ACROSS_DEPOSIT_GAS);
+    if reshield_surplus {
+        calls.saturating_add(model.shield(mode, 1))
+    } else {
+        calls
+    }
 }
 
 /// Gas limit to declare for a hook in the app data: the estimate plus 10%. The margin covers
@@ -114,9 +142,10 @@ pub struct OrderLimitParams<'a> {
     /// protocol fees.
     pub quote: &'a CowQuoteParameters,
     /// Sum of the gas estimates of the order's hooks, without the declared limits' margin: the
-    /// pre-hook, and the post-hook when the order reshields.
+    /// pre-hook, and any post-hook.
     pub hook_gas: u64,
-    /// Buffered RPC gas price in wei. The quote's gas price is a floor, rounded up to whole wei.
+    /// RPC gas price in wei, including any cushion selected by the caller. The quote's gas
+    /// price does not change the hook allowance.
     pub gas_price_wei: u128,
     /// Additional native cost for posting the hooks' calldata on rollups.
     pub hook_data_cost_wei: U256,
@@ -153,8 +182,6 @@ pub enum OrderLimitError {
     InvalidSlippage,
     #[error("the quote's native price can't be used")]
     InvalidQuotePrice,
-    #[error("the quote's gas price can't be used")]
-    InvalidQuoteGasPrice,
     #[error(transparent)]
     ShieldFee(#[from] ShieldFeeError),
     #[error("order amounts overflow")]
@@ -181,20 +208,8 @@ pub fn price_order_limit(params: &OrderLimitParams<'_>) -> Result<OrderLimit, Or
         NativeBuyRate::Anchor(rate) => rate,
         NativeBuyRate::Quote => quote_native_to_buy_rate(params.quote)?,
     };
-    let cow_gas_price = quote_gas_price_wei(params.quote)?;
-    let rpc_gas_price = U256::from(params.gas_price_wei);
-    let gas_price = cow_gas_price.max(rpc_gas_price);
-    tracing::debug!(
-        target: "swap_quote",
-        step = "gas_price_comparison",
-        cow_gas_price_wei = %cow_gas_price,
-        rpc_buffered_gas_price_wei = %rpc_gas_price,
-        selected_gas_price_wei = %gas_price,
-        cow_covers_rpc = cow_gas_price >= rpc_gas_price,
-        "compared gas prices"
-    );
     let hook_wei = U256::from(params.hook_gas)
-        .checked_mul(gas_price)
+        .checked_mul(U256::from(params.gas_price_wei))
         .and_then(|cost| cost.checked_add(params.hook_data_cost_wei))
         .ok_or(OrderLimitError::Overflow)?;
     let hook_cost = hook_wei
@@ -221,26 +236,6 @@ pub fn price_order_limit(params: &OrderLimitParams<'_>) -> Result<OrderLimit, Or
         min_received,
         buy_amount: order_buy_amount(min_received, params.shield_fee_bps)?,
     })
-}
-
-/// `CoW` returns decimal wei and may use exponent notation. Alloy's `parse_units`
-/// truncates fractions and doesn't read exponents, so reuse the quote-price decimal
-/// adapter and round upward to avoid understating the solver's gas price.
-fn quote_gas_price_wei(quote: &CowQuoteParameters) -> Result<U256, OrderLimitError> {
-    let (mantissa, exponent) =
-        parse_decimal(&quote.gas_price).ok_or(OrderLimitError::InvalidQuoteGasPrice)?;
-    if mantissa.is_zero() {
-        return Ok(U256::ZERO);
-    }
-    let scale = U256::from(10_u8).checked_pow(U256::from(exponent.unsigned_abs()));
-    if exponent >= 0 {
-        scale
-            .and_then(|scale| mantissa.checked_mul(scale))
-            .ok_or(OrderLimitError::InvalidQuoteGasPrice)
-    } else {
-        // If the divisor exceeds U256, this positive price is below one wei.
-        Ok(scale.map_or(U256::ONE, |scale| mantissa.div_ceil(scale)))
-    }
 }
 
 /// The order's `buyAmount` for a minimum received privately: the smallest amount whose net
@@ -372,20 +367,30 @@ mod tests {
                 invalidate_order: *invalidate_order,
             };
             assert!(
-                pre_hook_gas(&ETHEREUM_GAS_MODEL, &shapes, calls) >= *measured,
+                pre_hook_gas(
+                    &ETHEREUM_GAS_MODEL,
+                    &shapes,
+                    calls,
+                    GasEstimateMode::UpperBound
+                ) >= *measured,
                 "{transactions:?} {invalidate_order}"
             );
         }
         // Post-hooks at the tree's position at the time, and at leaf index 32,768.
         for measured in [803_508, 820_094, 855_936] {
-            assert!(post_hook_gas(&ETHEREUM_GAS_MODEL) >= measured);
+            assert!(post_hook_gas(&ETHEREUM_GAS_MODEL, GasEstimateMode::UpperBound) >= measured);
         }
         // The first leaf of a fresh tree is not priced, but the declared limit must let it run.
         for measured in [902_453, 885_487, 878_423] {
-            assert!(hook_gas_limit(post_hook_gas(&ETHEREUM_GAS_MODEL)) >= measured);
+            assert!(
+                hook_gas_limit(post_hook_gas(
+                    &ETHEREUM_GAS_MODEL,
+                    GasEstimateMode::UpperBound
+                )) >= measured
+            );
         }
         // The heaviest Polygon `RelayAdapt7702` shield-only call.
-        assert!(post_hook_gas(&POLYGON_GAS_MODEL) >= 936_417);
+        assert!(post_hook_gas(&POLYGON_GAS_MODEL, GasEstimateMode::UpperBound) >= 936_417);
     }
 
     #[test]
@@ -417,26 +422,24 @@ mod tests {
     }
 
     #[test]
-    fn order_limit_covers_cow_gas_when_rpc_is_cheaper() {
-        // The expired 50 USDC -> DAI order's quote, scaled after its 0.431971 USDC
-        // base fee. Its hooks declare 2,479,400 gas, including their 10% margin.
-        let mut quote = quote(49_568_029, 1, "371805436.07432949542999267578125");
-        quote.buy_amount = uint!(49_567_285_817_433_747_187_U256);
-        quote.gas_price = "843216447".into();
+    fn order_limit_uses_the_supplied_gas_price_without_a_cow_floor() {
+        // A 10 USDC swap quoted about 9.12 USDT, but CoW's 1.34 gwei
+        // inflated the hook allowance. Price 2M gas at the supplied 0.25 gwei.
+        let quote = quote(10_000_000, 9_120_000, "1");
         let params = OrderLimitParams {
             quote: &quote,
-            hook_gas: 2_479_400,
-            gas_price_wei: 90_505_453,
+            hook_gas: 2_000_000,
+            gas_price_wei: 250_000_000,
             hook_data_cost_wei: U256::ZERO,
-            native_rate: NativeBuyRate::Quote,
+            native_rate: NativeBuyRate::Anchor(U256::from(3_000_000_000_u64)),
             slippage_bps: 50,
             shield_fee_bps: U256::from(25),
         };
         let limit = price_order_limit(&params).unwrap();
-        assert_eq!(limit.hook_cost, uint!(5_622_939_607_751_008_887_U256));
-        assert_eq!(limit.min_received, uint!(43_615_312_917_437_738_797_U256));
+        assert_eq!(limit.hook_cost, U256::from(1_500_000));
+        assert_eq!(limit.min_received, U256::from(7_562_946));
 
-        // A higher buffered RPC price must still take precedence.
+        // Raising the supplied price still lowers the minimum.
         let higher = price_order_limit(&OrderLimitParams {
             gas_price_wei: 1_000_000_000,
             ..params
@@ -444,6 +447,20 @@ mod tests {
         .unwrap();
         assert!(higher.hook_cost > limit.hook_cost);
         assert!(higher.min_received < limit.min_received);
+
+        // The quote's gas price is informational, even if it cannot be parsed.
+        for cow_price in ["1339699137", "1e100", "NaN"] {
+            let mut quote = quote.clone();
+            quote.gas_price = cow_price.into();
+            assert_eq!(
+                price_order_limit(&OrderLimitParams {
+                    quote: &quote,
+                    ..params
+                })
+                .unwrap(),
+                limit
+            );
+        }
     }
 
     #[test]
@@ -470,45 +487,6 @@ mod tests {
             quote_native_to_buy_rate(&quote),
             Ok(U256::from(333_333_333_333_333_334_u64))
         );
-
-        // CoW gas prices are decimal wei, including exponent notation. A fraction
-        // must round upward before pricing hooks, even when the RPC price is lower.
-        let mut quote = self::quote(1, 100, "1");
-        for gas_price in ["1.01", "1.01e0", "0.101E+1"] {
-            quote.gas_price = gas_price.into();
-            let limit = price_order_limit(&OrderLimitParams {
-                quote: &quote,
-                hook_gas: 1,
-                gas_price_wei: 1,
-                hook_data_cost_wei: U256::ZERO,
-                native_rate: NativeBuyRate::Anchor(WEI_PER_NATIVE),
-                slippage_bps: 0,
-                shield_fee_bps: U256::ZERO,
-            })
-            .unwrap();
-            assert_eq!(limit.hook_cost, U256::from(2), "{gas_price}");
-        }
-    }
-
-    #[test]
-    fn unusable_quote_gas_does_not_fall_back_to_a_cheaper_rpc_price() {
-        let mut quote = quote(1, 100, "1");
-        for gas_price in ["", "-1", "NaN", "1e100"] {
-            quote.gas_price = gas_price.into();
-            assert!(
-                price_order_limit(&OrderLimitParams {
-                    quote: &quote,
-                    hook_gas: 1,
-                    gas_price_wei: 1,
-                    hook_data_cost_wei: U256::ZERO,
-                    native_rate: NativeBuyRate::Anchor(WEI_PER_NATIVE),
-                    slippage_bps: 0,
-                    shield_fee_bps: U256::ZERO,
-                })
-                .is_err(),
-                "{gas_price}"
-            );
-        }
     }
 
     #[test]

@@ -24,17 +24,18 @@ use wallet_ops::{
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
     SwapOrderState, WakuDeliveryClient,
     vault::{
-        ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
+        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId, ExecutorRecord,
+        SwapBridgeOutcome, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
         SwapSubmissionStatus,
     },
 };
 
 use super::dialog::{SwapDialogView, settled_by_cow};
-use super::form::broadcaster_result_problem;
+use super::form::{broadcaster_result_problem, network_name};
 use super::model::{
-    SwapActions, SwapOrderGroup, SwapStage, SwapStep, format_bps_percent, record_swap_ranges,
-    swap_actions, swap_order_group, swap_order_stage, swap_outcome, swap_private_minimum,
-    swap_steps, swap_valid_to, swaps_card_line,
+    SwapActions, SwapOrderGroup, SwapStage, SwapStep, bridge_sent_amount, format_bps_percent,
+    provider_name, record_swap_ranges, swap_actions, swap_order_group, swap_order_stage,
+    swap_outcome, swap_private_minimum, swap_steps, swap_valid_to, swaps_card_line,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -268,6 +269,13 @@ impl PrivateSwapsView {
         let delivery = pending.map_or_else(|| swap_delivery(record), |pending| pending.delivery);
         let outcome =
             order.and_then(|order| self.render_outcome(record, order, stage, started, cx));
+        let facts = match delivery {
+            SwapDelivery::Bridge(bridge) => {
+                Some(self.render_bridge_facts(record, order, bridge, stage, started, cx))
+            }
+            _ if outcome.is_none() => self.render_facts(order, delivery, minimum, started, cx),
+            _ => None,
+        };
         let body = div()
             .flex()
             .flex_col()
@@ -276,11 +284,7 @@ impl PrivateSwapsView {
                 shows_steps(stage, outcome.is_some())
                     .then(|| render_submission_progress_stepper(steps)),
             )
-            .children(if outcome.is_none() {
-                self.render_facts(order, delivery, minimum, started, cx)
-            } else {
-                None
-            })
+            .children(facts)
             .children(outcome)
             .children(
                 latest
@@ -344,6 +348,15 @@ impl PrivateSwapsView {
         );
         let started = self.swap_started(record, Some(&range), cx);
         let outcome = self.render_outcome(record, order, stage, started, cx);
+        let facts = match order.delivery() {
+            SwapDelivery::Bridge(bridge) => {
+                Some(self.render_bridge_facts(record, Some(order), bridge, stage, started, cx))
+            }
+            delivery if outcome.is_none() => {
+                self.render_facts(Some(order), delivery, None, started, cx)
+            }
+            _ => None,
+        };
         let body = div()
             .flex()
             .flex_col()
@@ -352,11 +365,7 @@ impl PrivateSwapsView {
                 shows_steps(stage, outcome.is_some())
                     .then(|| render_submission_progress_stepper(steps)),
             )
-            .children(if outcome.is_none() {
-                self.render_facts(Some(order), order.delivery(), None, started, cx)
-            } else {
-                None
-            })
+            .children(facts)
             .children(outcome)
             .children(
                 earlier_attempts_note(record, range)
@@ -432,9 +441,266 @@ impl PrivateSwapsView {
             )
     }
 
+    /// A Bridge swap's facts: its receiver, destination and provider, then what its state
+    /// needs, from the provider's deposit and the destination outcome to the settlement on this
+    /// network. A deposit that needs attention shows its address in full.
+    fn render_bridge_facts(
+        &self,
+        record: &ExecutorRecord,
+        order: Option<&SwapOrderRecord>,
+        delivery: BridgeDelivery,
+        stage: SwapStage,
+        started: Option<(&'static str, u64)>,
+        cx: &App,
+    ) -> gpui::Div {
+        let network = network_name(delivery.destination_chain);
+        let origin = network_name(self.session.chain_id);
+        let provider = provider_name(delivery.provider);
+        let destination_amount = |amount| {
+            self.network_token_amount(
+                delivery.destination_chain,
+                self.bridge_received_token(delivery, cx),
+                amount,
+                cx,
+            )
+        };
+        let buy = order
+            .and_then(|order| Some(record.swap()?.order_terms(order).buy_token()))
+            .or_else(|| swap_tokens(record).map(|(_, buy)| buy));
+        let observed = order.map(SwapOrderRecord::observations).unwrap_or_default();
+        let terms = order.and_then(SwapOrderRecord::bridge);
+        let (across, near) = match terms {
+            Some(BridgeOrderTerms::Across(across)) => (Some(across), None),
+            Some(BridgeOrderTerms::NearIntents(near)) => (None, Some(near)),
+            None => (None, None),
+        };
+        let minimum = order.map_or_else(
+            || {
+                record
+                    .swap_approval()
+                    .and_then(|approval| approval.bounds.destination_minimum)
+            },
+            |order| order.bounds().destination_minimum,
+        );
+        let receiver = self.receiver_row(delivery.receiver, cx);
+        let destination = fact_row("Destination", app_text(network.clone()));
+        let provider_row = fact_row("Provider", app_text(provider));
+        let deposit = observed
+            .bridge_handoff
+            .and_then(|handoff| handoff.deposit_id)
+            .map(|id| {
+                let id = id.to_string();
+                let copy_id = SharedString::from(format!("swap-deposit-{id}-copy"));
+                hash_row("Deposit ID", id, copy_id, "Copy Across deposit ID")
+            })
+            .or_else(|| {
+                near.map(|near| {
+                    address_row(
+                        "Deposit address",
+                        near.deposit_address,
+                        "Copy deposit address",
+                    )
+                })
+            });
+        let settlement = observed
+            .traded
+            .and_then(|traded| traded.transaction_hash)
+            .map(|hash| {
+                let hash = hash.to_string();
+                let copy_id = SharedString::from(format!("swap-settlement-{hash}-copy"));
+                hash_row(
+                    "Settlement",
+                    hash,
+                    copy_id,
+                    "Copy settlement transaction hash",
+                )
+            });
+        let started =
+            started.map(|(label, at)| fact_row(label, app_text(local_date_time_label(at))));
+        // What this session's last explicit check found in the stealth account.
+        let checked = buy
+            .zip(
+                self.tracking
+                    .get(&record.operation())
+                    .and_then(|tracking| tracking.stealth_balance)
+                    .map(|(balance, _)| balance),
+            )
+            .map(|(buy, balance)| {
+                fact_row(
+                    "In stealth account",
+                    app_text(self.token_amount(buy, balance, cx)),
+                )
+            });
+        let mut rows = Vec::new();
+        let mut note = None;
+        match stage {
+            SwapStage::Order(SwapOrderState::Done) => {
+                rows.push(receiver);
+                match observed.bridge_outcome {
+                    Some(SwapBridgeOutcome::DeliveredVerified {
+                        block,
+                        output_amount,
+                        ..
+                    }) => {
+                        rows.push(fact_row(
+                            "Delivered",
+                            amount_with_note(
+                                destination_amount(output_amount),
+                                format!("on {network}"),
+                            ),
+                        ));
+                        // A post-hook that reshields the surplus credits it privately.
+                        rows.extend(buy.zip(observed.settlement_credit).map(|(buy, credit)| {
+                            fact_row(
+                                "Surplus",
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_1()
+                                    .child(
+                                        app_text(format!(
+                                            "+{}",
+                                            self.token_amount(buy, credit.private_amount, cx)
+                                        ))
+                                        .text_color(cx.theme().success),
+                                    )
+                                    .child(app_muted_text(format!("reshielded on {origin}"))),
+                            )
+                        }));
+                        rows.push(provider_row);
+                        // A fact, not a link: looking the block up is the user's choice.
+                        rows.push(fact_row(
+                            "Fill",
+                            app_text(format!(
+                                "{network} block {}",
+                                railgun_ui::format_token_amount(U256::from(block.number), 0)
+                            )),
+                        ));
+                        rows.push(fact_row("Settled by", settled_by_cow()));
+                    }
+                    Some(SwapBridgeOutcome::DeliveredReported {
+                        amount_out,
+                        transaction_hash,
+                    }) => {
+                        rows.extend(amount_out.map(|amount| {
+                            fact_row(
+                                "Reported amount",
+                                amount_with_note(
+                                    destination_amount(amount),
+                                    minimum.map_or_else(String::new, |minimum| {
+                                        format!("(minimum {})", destination_amount(minimum))
+                                    }),
+                                ),
+                            )
+                        }));
+                        // A copy button only, with no explorer link.
+                        rows.extend(transaction_hash.map(|hash| {
+                            let hash = hash.to_string();
+                            let copy_id =
+                                SharedString::from(format!("swap-destination-{hash}-copy"));
+                            hash_row(
+                                format!("{network} transaction"),
+                                hash,
+                                copy_id,
+                                "Copy transaction hash",
+                            )
+                        }));
+                        rows.push(provider_row);
+                        rows.extend(deposit);
+                        note = Some(format!(
+                            "{provider} reports this delivery. The wallet doesn't check it on {network}, because looking the transaction up would tell the RPC provider which swap is yours."
+                        ));
+                    }
+                    _ => rows.push(provider_row),
+                }
+                rows.extend(settlement);
+            }
+            SwapStage::Order(SwapOrderState::Refunding) => {
+                rows.extend([receiver, provider_row]);
+                rows.extend(deposit);
+                rows.extend(across.map(|across| {
+                    fact_row(
+                        "Deposit expired",
+                        app_text(local_date_time_label(u64::from(across.fill_deadline))),
+                    )
+                }));
+                rows.extend(checked);
+                note = Some(
+                    "Check status confirms the refund reached the stealth account. Then Recover… shields it to your private balance for the shield fee and a broadcaster fee."
+                        .to_owned(),
+                );
+            }
+            SwapStage::Order(SwapOrderState::NeedsAttention) => {
+                rows.extend(near.map(|near| deposit_address_box(near.deposit_address)));
+                rows.extend(
+                    buy.zip(order.and_then(bridge_sent_amount))
+                        .map(|(buy, sent)| {
+                            fact_row("Amount sent", app_text(self.token_amount(buy, sent, cx)))
+                        }),
+                );
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(settlement);
+                note = Some(format!(
+                    "Give {provider} support the deposit address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
+                    buy.map_or_else(|| "deposit".to_owned(), |buy| self.token_symbol(buy, cx))
+                ));
+            }
+            // The Across post-hook didn't run, so there's no deposit.
+            SwapStage::Order(SwapOrderState::NotDelivered) => {
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(settlement);
+                rows.extend(checked);
+            }
+            SwapStage::Order(SwapOrderState::Traded | SwapOrderState::Bridging) => {
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(deposit);
+                rows.extend(settlement);
+                rows.extend(started);
+            }
+            // Before the trade: the order, and what the receiver gets on the destination network.
+            _ => {
+                if let Some(order) = order {
+                    let order_id = order.uid().0.to_string();
+                    let copy_id = SharedString::from(format!("swap-order-{order_id}-copy"));
+                    rows.push(hash_row("Order ID", order_id, copy_id, "Copy order ID"));
+                    rows.push(fact_row("Settled by", settled_by_cow()));
+                }
+                rows.extend([receiver, destination, provider_row]);
+                // Across delivers its exact output; NEAR Intents at least its minimum.
+                rows.extend(
+                    minimum
+                        .filter(|_| swap_order_group(stage, false, false) == SwapOrderGroup::Open)
+                        .map(|minimum| {
+                            let amount = destination_amount(minimum);
+                            fact_row(
+                                format!("Receive on {network}"),
+                                app_text(match delivery.provider {
+                                    BridgeProvider::Across => amount,
+                                    BridgeProvider::NearIntents => format!("at least {amount}"),
+                                }),
+                            )
+                        }),
+                );
+                rows.extend(started);
+            }
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .debug_selector(|| "swap-bridge-facts".into())
+            .child(div().w_full().flex().flex_col().gap_2().children(rows))
+            .children(note.map(|note| app_muted_text(note).whitespace_normal()))
+    }
+
     /// What a traded order sold and delivered, from its approved bounds and canonical
     /// observations: the amounts, the price, the result against the minimum and the fees, then
-    /// the order's details, collapsed. Rows without recorded data are left out.
+    /// the order's details, collapsed. Rows without recorded data are left out. A Bridge
+    /// swap's outcome is on its destination network, which [`Self::render_bridge_facts`] shows.
     fn render_outcome(
         &self,
         record: &ExecutorRecord,
@@ -443,6 +709,9 @@ impl PrivateSwapsView {
         started: Option<(&'static str, u64)>,
         cx: &Context<'_, Self>,
     ) -> Option<gpui::Div> {
+        if matches!(order.delivery(), SwapDelivery::Bridge(_)) {
+            return None;
+        }
         let SwapStage::Order(
             state @ (SwapOrderState::Traded | SwapOrderState::Done | SwapOrderState::NotDelivered),
         ) = stage
@@ -742,11 +1011,31 @@ impl PrivateSwapsView {
                         this.resubmit_order(operation, window, cx);
                     }))
             });
+        // A Bridge swap's check asks its provider again about a deposit that needs attention or
+        // that Across refunds, and reads the stealth account for a refund or a deposit that
+        // wasn't sent.
+        let across_refund = stage == SwapStage::Order(SwapOrderState::Refunding)
+            && record.is_some_and(refunds_across_deposit);
+        let bridge_check = record.is_some_and(|record| {
+            matches!(swap_delivery(record), SwapDelivery::Bridge(_))
+                && matches!(
+                    stage,
+                    SwapStage::Order(
+                        SwapOrderState::NeedsAttention
+                            | SwapOrderState::Refunding
+                            | SwapOrderState::NotDelivered
+                    )
+                )
+        });
         let check = record
             .and_then(|record| record.swap())
             .and_then(|swap| swap.orders().last())
-            .filter(|order| stage.is_observed() && (u64::from(order.valid_to()) < now_unix()
-                || stage == SwapStage::Order(SwapOrderState::Traded)))
+            .filter(|order| {
+                bridge_check
+                    || (stage.is_observed()
+                        && (u64::from(order.valid_to()) < now_unix()
+                            || stage == SwapStage::Order(SwapOrderState::Traded)))
+            })
             .map(|_| {
                 app_button("swap-progress-check", "Check status")
                     .debug_selector(|| "swap-progress-check".into())
@@ -754,11 +1043,48 @@ impl PrivateSwapsView {
                     .small()
                     .disabled(busy)
                     .loading(job == Some(SwapJobKind::Check))
-                    .tooltip("Checks this stealth account's state with the RPC provider for retry or recovery")
+                    .tooltip(match stage {
+                        _ if !bridge_check => "Checks this stealth account's state with the RPC provider for retry or recovery",
+                        SwapStage::Order(SwapOrderState::NeedsAttention) => {
+                            "Asks the provider about the deposit, then checks this stealth account for a refund"
+                        }
+                        _ if across_refund => {
+                            "Asks Across about the deposit and confirms its refund, then checks this stealth account's balance"
+                        }
+                        _ => "Checks this stealth account's balance with the RPC provider",
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.check_order_status(operation, window, cx);
+                        if bridge_check {
+                            this.check_bridge_status(operation, window, cx);
+                        } else {
+                            this.check_order_status(operation, window, cx);
+                        }
                     }))
             });
+        // A refund is recovered once an explicit check finds it in the stealth account. Kept
+        // surplus can be there before an Across refund, so its refund must be verified first.
+        let recover_blocked = if stage == SwapStage::Order(SwapOrderState::Refunding) {
+            match self
+                .tracking
+                .get(&operation)
+                .and_then(|tracking| tracking.stealth_balance)
+            {
+                _ if across_refund
+                    && record
+                        .and_then(|record| record.swap()?.orders().last())
+                        .is_none_or(|order| order.observations().bridge_refund.is_none()) =>
+                {
+                    Some("Check status to confirm Across's refund to the stealth account.")
+                }
+                Some((balance, _)) if !balance.is_zero() => None,
+                Some(_) => {
+                    Some("The refund isn't in the stealth account yet. Check status again later.")
+                }
+                None => Some("Check status to find the refund in the stealth account."),
+            }
+        } else {
+            None
+        };
         let recover_is_next = stage.needs_recovery();
         let cancel = actions.cancel.map(|availability| {
             app_button("swap-progress-cancel-order", "Cancel order…")
@@ -822,8 +1148,8 @@ impl PrivateSwapsView {
                 .when(recover_is_next, ButtonVariants::primary)
                 .small()
                 .flex_none()
-                .disabled(busy)
-                .tooltip("Opens this swap's stealth account recovery")
+                .disabled(busy || recover_blocked.is_some())
+                .tooltip(recover_blocked.unwrap_or("Opens this swap's stealth account recovery"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.recover(operation, window, cx);
                 }))
@@ -976,6 +1302,132 @@ impl PrivateSwapsView {
             },
             move |this, (), _, _| {
                 this.tracking.entry(operation).or_default().error = None;
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// A Bridge swap's explicit check. A deposit that needs attention is asked about again on
+    /// the swap's own route, with the destination network's settings; a refund, then or
+    /// already recorded, and a deposit that wasn't sent are looked for in the stealth account.
+    fn check_bridge_status(
+        &mut self,
+        operation: ExecutorOperationId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(record) = self.record(operation) else {
+            return;
+        };
+        let Some(order) = record.swap().and_then(|swap| swap.orders().last()) else {
+            return;
+        };
+        let SwapDelivery::Bridge(delivery) = order.delivery() else {
+            return;
+        };
+        let stage = self.stage(record);
+        let across_refund =
+            stage == SwapStage::Order(SwapOrderState::Refunding) && refunds_across_deposit(record);
+        let uid = order.uid();
+        let buy = record
+            .swap()
+            .map(|swap| swap.order_terms(order).buy_token());
+        let destination = self.root.upgrade().and_then(|root| {
+            root.read(cx)
+                .effective_chain_configs
+                .get(delivery.destination_chain)
+                .filter(|chain| chain.enabled)
+                .cloned()
+        });
+        let network = network_name(delivery.destination_chain);
+        let tracking = self.tracking.get(&operation);
+        let client = tracking.and_then(|tracking| tracking.orderbook.clone());
+        let clients = tracking.and_then(|tracking| tracking.bridge_clients.clone());
+        let owner = Arc::clone(&self.owner);
+        self.start_job(
+            operation,
+            SwapJobKind::Check,
+            async move {
+                let asked = if stage == SwapStage::Order(SwapOrderState::NeedsAttention)
+                    || across_refund
+                {
+                    let destination = destination.ok_or_else(|| {
+                        eyre::eyre!("Turn on {network} in Settings to check this swap's delivery.")
+                    });
+                    let ask = async {
+                        let destination = destination?;
+                        let client = match client {
+                            Some(client) => client,
+                            None => owner.swap_orderbook_client().await?,
+                        };
+                        let clients = match clients {
+                            Some(clients) => clients,
+                            None => owner.swap_bridge_clients(&client)?,
+                        };
+                        let outcome = Box::pin(owner.check_swap_bridge(
+                            operation,
+                            uid,
+                            &clients,
+                            &destination,
+                        ))
+                        .await?;
+                        Ok::<_, eyre::Report>((client, clients, outcome))
+                    };
+                    Some(ask.await)
+                } else {
+                    None
+                };
+                // The refund is on this network, so a failed provider or destination check
+                // still looks for it in the stealth account.
+                let (route, refunding, problem) = match asked {
+                    Some(Ok((client, clients, outcome))) => (
+                        Some((client, clients)),
+                        outcome == Some(SwapBridgeOutcome::Refunding),
+                        None,
+                    ),
+                    Some(Err(error)) if across_refund => (None, true, Some(format!("{error:#}"))),
+                    Some(Err(error)) => return Err(error),
+                    None => (
+                        None,
+                        stage == SwapStage::Order(SwapOrderState::Refunding),
+                        None,
+                    ),
+                };
+                let balance = match buy {
+                    Some(buy)
+                        if refunding || stage == SwapStage::Order(SwapOrderState::NotDelivered) =>
+                    {
+                        let asset = ExecutorAsset::Erc20(buy);
+                        let inspection = owner.inspect_record(operation, &[asset]).await?;
+                        inspection
+                            .balances()
+                            .get(&asset)
+                            .copied()
+                            .flatten()
+                            .map(|balance| (balance, inspection.block()))
+                    }
+                    _ => None,
+                };
+                Ok((route, balance, problem))
+            },
+            move |this, (route, balance, problem), _, _| {
+                let tracking = this.tracking.entry(operation).or_default();
+                if let Some((client, clients)) = route {
+                    if tracking.orderbook.is_none() {
+                        tracking.orderbook = Some(client);
+                    }
+                    if tracking.bridge_clients.is_none() {
+                        tracking.bridge_clients = Some(clients);
+                    }
+                }
+                if balance.is_some() {
+                    tracking.stealth_balance = balance;
+                }
+                tracking.error = None;
+                if let Some(problem) = problem {
+                    this.fail(operation, problem);
+                }
             },
             window,
             cx,
@@ -1235,12 +1687,19 @@ impl PrivateSwapsView {
             return;
         };
         let token = swap_recovery_token(self.stage(record), swap_delivery(record), sell, buy);
+        // Recovery offers what a balance check found, so this swap's own check goes with it.
+        let checked = self
+            .tracking
+            .get(&operation)
+            .and_then(|tracking| tracking.stealth_balance)
+            .filter(|_| token == buy);
         let target = StealthAccountTarget::new(&self.session, operation);
         let return_focus = self.swap_dialog_focus();
         let _ = self.root.update(cx, |root, cx| {
             root.open_stealth_account_recovery(
                 &target,
                 ExecutorAsset::Erc20(token),
+                checked,
                 return_focus,
                 window,
                 cx,
@@ -1268,9 +1727,18 @@ impl PrivateSwapsView {
     }
 }
 
+/// Whether the record's latest order is an Across Bridge order, whose refund an explicit check
+/// verifies on this network.
+fn refunds_across_deposit(record: &ExecutorRecord) -> bool {
+    record
+        .swap()
+        .and_then(|swap| swap.orders().last())
+        .is_some_and(|order| matches!(order.bridge(), Some(BridgeOrderTerms::Across(_))))
+}
+
 /// A hash, shortened, with a control that copies it in full.
 fn hash_row(
-    label: &'static str,
+    label: impl Into<SharedString>,
     hash: String,
     copy_id: SharedString,
     tooltip: &'static str,
@@ -1294,8 +1762,77 @@ fn hash_row(
         )
 }
 
+/// An address, shortened, with a control that copies it in full, laid out like [`hash_row`].
+fn address_row(label: &'static str, address: Address, tooltip: &'static str) -> gpui::Div {
+    let short = short_receiver(address);
+    let address = address.to_checksum(None);
+    let copy_id = SharedString::from(format!("swap-address-{address}-copy"));
+    fact_row(
+        label,
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(app_strong_text(short).font_family(theme::APP_MONO_FONT_FAMILY))
+            .child(clipboard_with_toast(copy_id, address).tooltip(tooltip)),
+    )
+}
+
+/// A deposit address in full, so it can be read out or checked character by character. It
+/// wraps inside its box, and its copy control stays at the trailing edge.
+fn deposit_address_box(address: Address) -> gpui::Div {
+    let address = address.to_checksum(None);
+    let copy_id = SharedString::from(format!("swap-deposit-address-{address}-copy"));
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text("Deposit address"))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .bg(rgb(theme::SETTINGS_INPUT_SURFACE))
+                .debug_selector(|| "swap-detail-deposit-address".into())
+                .child(
+                    app_strong_text(address.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(theme::APP_MONO_FONT_FAMILY)
+                        .whitespace_normal(),
+                )
+                .child(
+                    div().flex_none().child(
+                        clipboard_with_toast(copy_id, address).tooltip("Copy deposit address"),
+                    ),
+                ),
+        )
+}
+
+/// An amount and a muted note after it, wrapping to the trailing edge when narrow.
+fn amount_with_note(amount: String, note: String) -> gpui::Div {
+    div()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .justify_end()
+        .gap_1()
+        .child(app_text(amount))
+        .when(!note.is_empty(), |value| value.child(app_muted_text(note)))
+}
+
 /// One fact, laid out like [`hash_row`].
-fn fact_row(label: &'static str, value: impl gpui::IntoElement) -> gpui::Div {
+fn fact_row(label: impl Into<SharedString>, value: impl gpui::IntoElement) -> gpui::Div {
     div()
         .w_full()
         .min_w_0()
@@ -1497,6 +2034,7 @@ const fn progress_note(stage: SwapStage) -> Option<&'static str> {
         | SwapStage::Order(
             SwapOrderState::Open
             | SwapOrderState::Traded
+            | SwapOrderState::Bridging
             | SwapOrderState::PreHookOnly { expired: false },
         ) => Some(
             "You can close this. The swap keeps running and its status stays on the Private tab.",
@@ -1521,6 +2059,10 @@ const fn progress_note(stage: SwapStage) -> Option<&'static str> {
         SwapStage::SetupNotSent | SwapStage::SetupFailed => Some(
             "Continue to send the setup again with the same stealth account. Nothing was unshielded.",
         ),
-        SwapStage::Order(SwapOrderState::Done) | SwapStage::Recovered => None,
+        // A Bridge swap's facts explain its refund, or what needs attention.
+        SwapStage::Order(
+            SwapOrderState::Done | SwapOrderState::Refunding | SwapOrderState::NeedsAttention,
+        )
+        | SwapStage::Recovered => None,
     }
 }

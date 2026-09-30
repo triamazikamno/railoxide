@@ -4,9 +4,10 @@
 //! without proving. The review quotes without hooks and prices the order limit. Both run before
 //! the setup is confirmed, for a preview or a reserved executor; signing needs the confirmed
 //! delegation. Signing checks cached anchors and signs the pre-hook at the executor's current
-//! nonce `k`, for Reshield delivery the post-hook at `k + 1`, and the order, persists all of
-//! them with the input reservation, and only then sends the order. That request is the only one
-//! that carries signed hooks. An External order pays its receiver directly and has no post-hook.
+//! nonce `k`, for Reshield and Across delivery the post-hook at `k + 1`, and the order, persists
+//! all of them with the input reservation, and only then sends the order. That request is the
+//! only one that carries signed hooks. An External order pays its receiver directly and a NEAR
+//! Intents order its verified deposit address; neither has a post-hook.
 //!
 //! The pre-hook unshields the planned amount, the private spend. Railgun takes its unshield
 //! fee from that value, so the order, its quote, and the pre-hook's approval use what the
@@ -20,12 +21,14 @@ use alloy::primitives::aliases::U120;
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::signers::SignerSync as _;
 use alloy::sol_types::{SolCall as _, SolValue as _};
+use broadcaster_core::contracts::across::SpokePool;
 use broadcaster_core::contracts::cow::{
     AppData, AppDataHook, BUY_NATIVE_TOKEN, EncodedAppData, GPv2Settlement, ORDER_KIND_SELL, Order,
     OrderUid, TOKEN_BALANCE_ERC20, eip712_order_signature, order_digest,
 };
 use broadcaster_core::contracts::executor::{
-    ExecutorAction, guarded_shield_calls, post_hook_signing_hash, signed_post_hook_calldata,
+    ExecutorAction, bridge_deposit_calls, guarded_shield_calls, post_hook_signing_hash,
+    signed_post_hook_calldata,
 };
 use broadcaster_core::contracts::railgun::{
     Call, CommitmentPreimage, RelayAdapt7702, RelayAdapt7702ActionData, ShieldCiphertext,
@@ -36,26 +39,30 @@ use eyre::{Result, eyre};
 use local_db::PendingOutputPoiContextRecord;
 use railgun_wallet::tx::{
     BuildError, CompositeExecution, CompositeUnshieldLeg, CompositeUnshieldLegRole,
-    CompositeUnshieldRecipient, ExecutorContext, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS,
-    MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    RailgunGasModel, SelectedInputIdentity, SwapAmountCheck, SwapAppDataTemplate,
-    SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
+    CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode, MAX_BATCH_TRANSACTIONS,
+    MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest,
+    MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity, SwapAmountCheck,
+    SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, TransactionCall, Utxo};
 use reqwest::Url;
 use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
+use super::bridge::{
+    BridgeLegPrice, BridgeSigning, SwapBridgeQuote, SwapBridgeRoute, across_deposit, bridge_route,
+};
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::simulation::{PreHookSimulation, simulate_pre_hook};
 use super::{DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, trace_step};
 use crate::cow::{
     CowApiError, CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters,
     CowSellQuoteRequest, NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams,
-    PreHookCalls, hook_gas_limit, order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit,
+    PreHookCalls, across_post_hook_gas, hook_gas_limit, order_buy_amount, post_hook_gas,
+    pre_hook_gas, price_order_limit,
 };
 use crate::desktop::{
-    artifact_source, buffered_gas_price_from_rpc_pool, effective_desktop_chain_config,
+    artifact_source, effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
     query_rpc_pool_with_http_client,
 };
 use crate::poi_contexts::{
@@ -64,11 +71,12 @@ use crate::poi_contexts::{
 };
 use crate::settings::{EffectiveTokenRegistry, ExecutorProfile, SwapProfile, SwapTokenEligibility};
 use crate::vault::{
-    ExecutorInputIdentity, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
-    ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStoreError,
-    IssuedExecutorPayload, SwapAnchorObservation, SwapApproval, SwapApprovalTokens,
-    SwapApprovedBounds, SwapAttempt, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
-    SwapProof, SwapRecipient, SwapSubmission, SwapSubmissionStatus, SwapTerms,
+    BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeSurplus, ExecutorInputIdentity,
+    ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose,
+    ExecutorPayloadStatus, ExecutorRecord, ExecutorStoreError, IssuedExecutorPayload,
+    SwapAnchorObservation, SwapApproval, SwapApprovalTokens, SwapApprovedBounds, SwapAttempt,
+    SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSubmission,
+    SwapSubmissionStatus, SwapTerms,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
@@ -115,6 +123,8 @@ pub struct SwapInputPlan {
     byte_budget: usize,
     size: SwapPreHookSize,
     gas_model: &'static RailgunGasModel,
+    /// Estimated post-hook gas, `None` for an order without a post-hook.
+    post_hook_gas: Option<u64>,
 }
 
 impl SwapInputPlan {
@@ -173,20 +183,19 @@ impl SwapInputPlan {
     /// Gas limit the order declares for the pre-hook.
     #[must_use]
     pub fn pre_hook_gas_limit(&self) -> u64 {
-        hook_gas_limit(self.pre_hook_gas())
+        hook_gas_limit(self.pre_hook_gas(GasEstimateMode::UpperBound))
     }
-    /// Gas limit the order declares for the post-hook. `None` for External delivery, whose
-    /// order has no post-hook.
+    /// Gas limit the order declares for the post-hook. `None` for External and NEAR Intents
+    /// delivery, whose orders have no post-hook.
     #[must_use]
     pub fn post_hook_gas_limit(&self) -> Option<u64> {
         self.post_hook_estimate().map(hook_gas_limit)
     }
-    /// Estimated gas of the order's hooks, which the order limit prices: the pre-hook, and the
-    /// post-hook for Reshield delivery. The declared limits add a margin that only caps
-    /// execution.
+    /// Estimated gas of the order's hooks, which the order limit prices: the pre-hook, and any
+    /// post-hook. The declared limits add a margin that only caps execution.
     #[must_use]
     pub fn hook_gas_estimate(&self) -> u64 {
-        self.pre_hook_gas()
+        self.pre_hook_gas(GasEstimateMode::UpperBound)
             .saturating_add(self.post_hook_estimate().unwrap_or(0))
     }
 
@@ -213,21 +222,51 @@ impl SwapInputPlan {
         Ok(request)
     }
 
-    fn pre_hook_gas(&self) -> u64 {
+    fn expected_hook_gas(&self) -> u64 {
+        self.pre_hook_gas(GasEstimateMode::Expected).saturating_add(
+            swap_post_hook_gas(self.gas_model, self.delivery, GasEstimateMode::Expected)
+                .unwrap_or(0),
+        )
+    }
+
+    fn pre_hook_gas(&self, mode: GasEstimateMode) -> u64 {
         pre_hook_gas(
             self.gas_model,
             &self.size.preview.transactions,
             PreHookCalls {
                 invalidate_order: self.invalidates.is_some(),
             },
+            mode,
         )
     }
 
     const fn post_hook_estimate(&self) -> Option<u64> {
-        match self.delivery {
-            SwapDelivery::Reshield => Some(post_hook_gas(self.gas_model)),
-            SwapDelivery::External { .. } => None,
-        }
+        self.post_hook_gas
+    }
+}
+
+/// Estimated gas of `delivery`'s post-hook, `None` for an order without one.
+const fn swap_post_hook_gas(
+    gas_model: &RailgunGasModel,
+    delivery: SwapDelivery,
+    mode: GasEstimateMode,
+) -> Option<u64> {
+    match delivery {
+        SwapDelivery::Reshield => Some(post_hook_gas(gas_model, mode)),
+        SwapDelivery::External { .. }
+        | SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            ..
+        }) => None,
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            surplus,
+            ..
+        }) => Some(across_post_hook_gas(
+            gas_model,
+            matches!(surplus, BridgeSurplus::Reshield),
+            mode,
+        )),
     }
 }
 
@@ -265,12 +304,16 @@ pub struct SwapReview {
     quote: CowQuoteParameters,
     quote_id: Option<i64>,
     limit: OrderLimit,
+    estimated_hook_cost: U256,
+    surplus_shield_fee_bps: U256,
     shield_fee_bps: U256,
     unshield_fee_bps: U256,
     sell_amount: U256,
     slippage_bps: u32,
     price: SwapPrice,
     isolation: OperationNetworkIsolation,
+    /// The bridge leg, for Bridge delivery.
+    bridge: Option<SwapBridgeQuote>,
 }
 
 impl SwapReview {
@@ -287,6 +330,58 @@ impl SwapReview {
     #[must_use]
     pub const fn hook_cost(&self) -> U256 {
         self.limit.hook_cost
+    }
+    /// Expected hook cost for display. Signing still uses the conservative `hook_cost`.
+    #[must_use]
+    pub const fn estimated_hook_cost(&self) -> U256 {
+        self.estimated_hook_cost
+    }
+
+    /// Expected `CoW` payout after its quoted fee and the expected hook cost, before delivery.
+    #[must_use]
+    pub const fn estimated_buy_amount(&self) -> U256 {
+        self.quote
+            .buy_amount
+            .saturating_sub(self.estimated_hook_cost)
+    }
+
+    /// Shield fee for a `CoW` payout. Across shields only what remains after its fixed deposit.
+    #[must_use]
+    pub fn shield_fee_on_output(&self, amount: U256) -> U256 {
+        if matches!(
+            self.plan.delivery,
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider: BridgeProvider::Across,
+                surplus: BridgeSurplus::Reshield,
+                ..
+            })
+        ) {
+            railgun_protocol_fee_amount(
+                amount.saturating_sub(self.limit.buy_amount),
+                self.surplus_shield_fee_bps,
+            )
+        } else {
+            railgun_protocol_fee_amount(amount, self.shield_fee_bps)
+        }
+    }
+
+    /// Estimated source-chain return after hook costs and any surplus shield fee.
+    /// Only Across deposits a fixed amount and leaves surplus on the source chain.
+    #[must_use]
+    pub fn estimated_source_surplus(&self) -> Option<U256> {
+        matches!(
+            self.plan.delivery,
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider: BridgeProvider::Across,
+                ..
+            })
+        )
+        .then(|| {
+            let bought = self.estimated_buy_amount();
+            bought
+                .saturating_sub(self.limit.buy_amount)
+                .saturating_sub(self.shield_fee_on_output(bought))
+        })
     }
     /// Suggested minimum received privately after the shield fee, or for External delivery,
     /// the minimum the receiver gets.
@@ -317,6 +412,25 @@ impl SwapReview {
     pub const fn price(&self) -> &SwapPrice {
         &self.price
     }
+    /// The bridge quote for the order's buy amount, for Bridge delivery.
+    #[must_use]
+    pub const fn bridge(&self) -> Option<&SwapBridgeQuote> {
+        self.bridge.as_ref()
+    }
+    /// Whether both the `CoW` price and any bridge leg were checked. Otherwise approval requires
+    /// the user's acknowledgement.
+    #[must_use]
+    pub fn price_verified(&self) -> bool {
+        self.price != SwapPrice::Unverified
+            && self
+                .bridge
+                .is_none_or(|bridge| bridge.leg != BridgeLegPrice::Unverified)
+    }
+    /// Attach a bridge quote to a review priced without one.
+    #[cfg(test)]
+    pub(crate) const fn set_bridge_for_tests(&mut self, bridge: SwapBridgeQuote) {
+        self.bridge = Some(bridge);
+    }
     /// In proxy and direct modes the review states that per-swap isolation is unavailable.
     #[must_use]
     pub const fn isolation(&self) -> OperationNetworkIsolation {
@@ -334,7 +448,9 @@ impl SwapReview {
         private_minimum: U256,
         price_acknowledged: bool,
     ) -> Result<SwapApproval> {
-        let buy_amount = self.require_approval(private_minimum, price_acknowledged)?;
+        let destination_minimum = self.bridge.map(|bridge| bridge.destination_minimum);
+        let buy_amount =
+            self.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
         Ok(SwapApproval {
             bounds: SwapApprovedBounds {
                 sell_amount: self.sell_amount,
@@ -351,8 +467,9 @@ impl SwapReview {
                     SwapPrice::Verified { observations, .. } => observations.clone(),
                     SwapPrice::Unverified => Vec::new(),
                 },
+                destination_minimum,
             },
-            price_verified: Some(self.price != SwapPrice::Unverified),
+            price_verified: Some(self.price_verified()),
             price_acknowledged,
             delivery: self.plan.delivery,
             tokens: Some(SwapApprovalTokens {
@@ -365,8 +482,8 @@ impl SwapReview {
     /// How this fresh review, planned for the approved amount and slippage once the setup is
     /// confirmed, differs from the approval. `None` means the order can be signed with the
     /// approved minimum: a better quote only adds surplus. Another delivery kind or receiver
-    /// address, a lower suggested minimum, another Railgun fee the order depends on, or another
-    /// kind of price check needs a new review.
+    /// address, a lower suggested minimum or destination minimum, another Railgun fee the order
+    /// depends on, or another kind of price check needs a new review.
     #[must_use]
     pub fn approval_change(&self, approval: &SwapApproval) -> Option<SwapReviewChange> {
         // Only the parsed address counts; a receiver's label isn't part of the delivery.
@@ -404,18 +521,57 @@ impl SwapReview {
         let was_verified = approval
             .price_verified
             .unwrap_or(!approved.anchors.is_empty());
-        if (self.price != SwapPrice::Unverified) != was_verified {
+        if self.price_verified() != was_verified {
             return Some(SwapReviewChange::PriceVerification);
         }
         let current = self.suggested_private_minimum();
-        (current < approved.private_minimum).then_some(SwapReviewChange::Minimum {
-            approved: approved.private_minimum,
-            current,
-        })
+        if current < approved.private_minimum {
+            return Some(SwapReviewChange::Minimum {
+                approved: approved.private_minimum,
+                current,
+            });
+        }
+        // A Bridge approval without a destination minimum binds none, so it signs nothing.
+        let destination = self
+            .bridge
+            .map_or(U256::ZERO, |bridge| bridge.destination_minimum);
+        if matches!(self.plan.delivery, SwapDelivery::Bridge(_))
+            && approved
+                .destination_minimum
+                .is_none_or(|minimum| destination < minimum)
+        {
+            return Some(SwapReviewChange::DestinationMinimum {
+                approved: approved.destination_minimum.unwrap_or_default(),
+                current: destination,
+            });
+        }
+        None
     }
 
-    fn require_approval(&self, private_minimum: U256, price_acknowledged: bool) -> Result<U256> {
-        if self.price == SwapPrice::Unverified && !price_acknowledged {
+    /// A Bridge delivery needs its bridge quote and a nonzero `destination_minimum`; other
+    /// deliveries take none.
+    fn require_approval(
+        &self,
+        private_minimum: U256,
+        destination_minimum: Option<U256>,
+        price_acknowledged: bool,
+    ) -> Result<U256> {
+        if let SwapDelivery::Bridge(bridge) = self.plan.delivery {
+            if !bridge.has_valid_surplus() {
+                return Err(eyre!("this bridge provider can't handle surplus that way"));
+            }
+            if self.bridge.is_none() {
+                return Err(eyre!("quote the bridge before approving this swap"));
+            }
+            if destination_minimum.is_none_or(|minimum| minimum.is_zero()) {
+                return Err(eyre!(
+                    "approve a minimum received on the destination network for this swap"
+                ));
+            }
+        } else if destination_minimum.is_some() {
+            return Err(eyre!("only a bridge swap has a destination minimum"));
+        }
+        if !self.price_verified() && !price_acknowledged {
             return Err(eyre!(
                 "acknowledge the unverified price before approving this swap"
             ));
@@ -433,6 +589,9 @@ pub struct SwapReviewRequest<'a> {
     /// background cache, and still checks the downside limit if a rate becomes available.
     pub anchor_cache: Option<&'a TokenAnchorRateCache>,
     pub token_registry: &'a EffectiveTokenRegistry,
+    /// Required for Bridge delivery, whose bridge leg the review quotes for the order's buy
+    /// amount.
+    pub bridge: Option<SwapBridgeRoute<'a>>,
 }
 
 /// Approval of a reviewed swap.
@@ -448,14 +607,23 @@ pub struct SwapOrderRequest<'a> {
     pub orderbook: &'a CowOrderbookClient,
     pub anchor_cache: &'a TokenAnchorRateCache,
     pub token_registry: &'a EffectiveTokenRegistry,
+    /// The route of a Bridge delivery: the provider to quote again while signing, and the
+    /// destination chain whose contracts its receiver is checked against. Required for Bridge
+    /// delivery.
+    pub bridge: Option<SwapBridgeRoute<'a>>,
+    /// The approved minimum received on a Bridge delivery's destination chain: the review's
+    /// bridge quote minimum for a fresh approval, or the saved approval's. Required for Bridge
+    /// delivery.
+    pub destination_minimum: Option<U256>,
     pub verify_proof: bool,
 }
 
 /// A term that changed between review and signing. Nothing was signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapReviewChange {
-    /// The delivery kind or the External receiver's address differs from the approval. This
-    /// always needs a full review.
+    /// The delivery kind, the External receiver's address, or a Bridge delivery's provider,
+    /// destination, receiver, token or surplus choice differs from the approval. This always
+    /// needs a full review.
     Delivery,
     /// A displayed network/hook limit increased, or an older approval lacks it.
     HookCost,
@@ -477,6 +645,11 @@ pub enum SwapReviewChange {
     PriceUnavailable,
     /// The fresh quote no longer supports the minimum approved before setup.
     Minimum {
+        approved: U256,
+        current: U256,
+    },
+    /// A fresh bridge quote delivers less than the approved minimum on the destination chain.
+    DestinationMinimum {
         approved: U256,
         current: U256,
     },
@@ -533,8 +706,8 @@ const fn swap_replan_budget(byte_budget: usize, rejected_len: usize) -> usize {
 /// Select `utxos` for a swap pre-hook and check it against the batch limit and `byte_budget`,
 /// without proving. The pre-hook unshields to the executor and runs the deadline guard, an
 /// optional invalidation of `invalidates`, and the exact approval. The app data holds a
-/// post-hook only for Reshield delivery. Hook calls are sized with their real encodings; every
-/// argument that is only known at signing is a static ABI word.
+/// post-hook only for Reshield and Across delivery. Hook calls are sized with their real
+/// encodings; every argument that is only known at signing is a static ABI word.
 pub(crate) fn plan_swap_inputs(
     builder: &TransactionBuilder,
     profile: &SwapProfile,
@@ -560,6 +733,8 @@ pub(crate) fn plan_swap_inputs(
         invalidates,
     )?;
     let gas_model = RailgunGasModel::for_chain(profile.chain_id());
+    let post_hook_gas =
+        swap_post_hook_gas(gas_model, request.delivery, GasEstimateMode::UpperBound);
     let template = SwapAppDataTemplate {
         app_code: profile.app_code().to_owned(),
         pre_hook_gas_limit: hook_gas_limit(pre_hook_gas(
@@ -568,18 +743,18 @@ pub(crate) fn plan_swap_inputs(
             PreHookCalls {
                 invalidate_order: invalidates.is_some(),
             },
+            GasEstimateMode::UpperBound,
         )),
-        post_hook: match request.delivery {
-            SwapDelivery::Reshield => Some(SwapPostHookTemplate {
-                calls: guarded_shield_calls(
+        post_hook: match post_hook_gas {
+            Some(gas) => Some(SwapPostHookTemplate {
+                calls: placeholder_post_hook_calls(
                     context.executor,
                     request.buy_token,
-                    U256::ONE,
-                    placeholder_shield(request.buy_token),
+                    request.delivery,
                 )?,
-                gas_limit: hook_gas_limit(post_hook_gas(gas_model)),
+                gas_limit: hook_gas_limit(gas),
             }),
-            SwapDelivery::External { .. } => None,
+            None => None,
         },
     };
     let check = builder.check_swap_pre_hook(
@@ -598,6 +773,7 @@ pub(crate) fn plan_swap_inputs(
         byte_budget,
         size,
         gas_model,
+        post_hook_gas,
     };
     Ok(match check {
         SwapAmountCheck::Fits(size) => SwapAmountPlan::Fits(plan(size)),
@@ -608,9 +784,9 @@ pub(crate) fn plan_swap_inputs(
 }
 
 /// Price the order limit for a hook-free quote of the order's sell amount, the plan's amount
-/// after the unshield fee: hook gas, slippage, and for Reshield delivery the shield fee. An
-/// External order carries no shield, so its review uses a shield fee of zero and its buy amount
-/// is the approved minimum.
+/// after the unshield fee: hook gas, slippage, and for Reshield delivery the shield fee. External
+/// and Bridge orders carry no shield of the buy amount, so their reviews use a shield fee of zero
+/// and their buy amount is the approved minimum.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn price_swap_review(
     plan: SwapInputPlan,
@@ -624,15 +800,16 @@ pub(crate) fn price_swap_review(
     isolation: OperationNetworkIsolation,
 ) -> Result<SwapReview> {
     let sell_amount = order_sell_amount(plan.amount(), unshield_fee_bps)?;
+    let surplus_shield_fee_bps = shield_fee_bps;
     let shield_fee_bps = match plan.delivery {
         SwapDelivery::Reshield => shield_fee_bps,
-        SwapDelivery::External { .. } => U256::ZERO,
+        SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => U256::ZERO,
     };
     let native_rate = match &price {
         SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
         SwapPrice::Unverified => NativeBuyRate::Quote,
     };
-    let limit = price_order_limit(&OrderLimitParams {
+    let params = OrderLimitParams {
         quote: &quote.quote,
         hook_gas: plan.hook_gas_estimate(),
         gas_price_wei,
@@ -640,6 +817,25 @@ pub(crate) fn price_swap_review(
         native_rate,
         slippage_bps,
         shield_fee_bps,
+    };
+    // The displayed estimate uses the current RPC price. The signed minimum, and thus an
+    // Across deposit, allow a 25% increase, rounded upward to whole wei. Neither changes the
+    // hooks' execution gas limits or applies the broadcaster's separate gas-price buffer.
+    let limit_gas_price_wei = gas_price_wei
+        .checked_add(gas_price_wei.div_ceil(4))
+        .ok_or(OrderLimitError::Overflow)?;
+    tracing::debug!(
+        target: "swap_quote",
+        step = "gas_price_comparison",
+        cow_gas_price_wei = %quote.quote.gas_price,
+        rpc_gas_price_wei = gas_price_wei,
+        estimated_gas_price_wei = gas_price_wei,
+        limit_gas_price_wei,
+        "priced hooks from RPC gas"
+    );
+    let limit = price_order_limit(&OrderLimitParams {
+        gas_price_wei: limit_gas_price_wei,
+        ..params
     })
     .map_err(|error| match error {
         // Report the wallet's buy token, not CoW's native buy address.
@@ -654,17 +850,25 @@ pub(crate) fn price_swap_review(
         },
         error => error,
     })?;
+    let estimated_hook_cost = price_order_limit(&OrderLimitParams {
+        hook_gas: plan.expected_hook_gas(),
+        ..params
+    })?
+    .hook_cost;
     Ok(SwapReview {
         plan,
         quote: quote.quote,
         quote_id: quote.id,
         limit,
+        estimated_hook_cost,
+        surplus_shield_fee_bps,
         shield_fee_bps,
         unshield_fee_bps,
         sell_amount,
         slippage_bps,
         price,
         isolation,
+        bridge: None,
     })
 }
 
@@ -703,6 +907,10 @@ pub(crate) struct SwapOrderSigning<'a> {
     pub(crate) orderbook: &'a CowOrderbookClient,
     pub(crate) anchor_cache: &'a TokenAnchorRateCache,
     pub(crate) token_registry: &'a EffectiveTokenRegistry,
+    /// Required for Bridge delivery: see [`SwapOrderRequest::bridge`].
+    pub(crate) bridge: Option<SwapBridgeRoute<'a>>,
+    /// Required for Bridge delivery: see [`SwapOrderRequest::destination_minimum`].
+    pub(crate) destination_minimum: Option<U256>,
 }
 
 enum SwapRecheck {
@@ -813,8 +1021,10 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
         } = request;
         let profile = self.swap_order_profile()?;
+        let bridge = bridge_route(&plan, bridge)?;
         if let Some(operation) = plan.operation() {
             self.swap_account_record(operation)?
                 .ok_or_else(|| eyre!("swap executor is unavailable"))?;
@@ -848,7 +1058,7 @@ impl ExecutorOwner {
         let gas_price = async {
             let started = Instant::now();
             tracing::debug!(target: "swap_quote", step = "gas_price", "started");
-            let gas_price = buffered_gas_price_from_rpc_pool(&pool, &chain.gas).await;
+            let gas_price = gas_price_from_rpc_pool_with_policy(&pool, 1, 1).await;
             tracing::debug!(
                 target: "swap_quote",
                 step = "gas_price",
@@ -905,7 +1115,7 @@ impl ExecutorOwner {
             }
             Ok(None) | Err(_) => SwapPrice::Unverified,
         };
-        price_swap_review(
+        let mut review = price_swap_review(
             plan,
             quote,
             price,
@@ -915,7 +1125,32 @@ impl ExecutorOwner {
             gas_price_wei,
             hook_data_cost_wei,
             orderbook.isolation(),
-        )
+        )?;
+        if let Some((delivery, route)) = bridge {
+            // Bridge orders carry no shield, so the buy amount is the suggested minimum.
+            let started = Instant::now();
+            tracing::debug!(target: "swap_quote", step = "bridge_quote", "started");
+            let quote = self
+                .quote_swap_bridge(
+                    route,
+                    delivery,
+                    &profile,
+                    review.limit.buy_amount,
+                    slippage_bps,
+                    anchor_cache,
+                    token_registry,
+                )
+                .await;
+            tracing::debug!(
+                target: "swap_quote",
+                step = "bridge_quote",
+                elapsed_ms = started.elapsed().as_millis(),
+                success = quote.is_ok(),
+                "finished"
+            );
+            review.bridge = Some(quote?);
+        }
+        Ok(review)
     }
 
     /// Prove the planned pre-hook, or reuse the recorded proof when a retry spends the same
@@ -948,10 +1183,13 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
             verify_proof,
         } = request;
         self.require_swap_session(&session)?;
-        review.require_approval(private_minimum, price_acknowledged)?;
+        review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
+        bridge_route(&review.plan, bridge)?;
         let confirmed = session
             .sync_tip_rx
             .borrow()
@@ -1005,6 +1243,8 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
         }))
         .await
     }
@@ -1106,11 +1346,15 @@ impl ExecutorOwner {
         ))
     }
 
-    /// Sign the pre-hook at the executor's current nonce `k`, for Reshield delivery the post-hook
-    /// at `k + 1`, and the order, after checking cached anchors. The first order after setup
-    /// must match the pair and delivery approved with the setup, and an External receiver must
-    /// pass [`SwapProfile::check_receiver`]. Persist them with the input reservation, then
-    /// submit. Nothing signed leaves the wallet before the write succeeds.
+    /// Sign the pre-hook at the executor's current nonce `k`, for Reshield and Across delivery
+    /// the post-hook at `k + 1`, and the order, after checking cached anchors. The first order
+    /// after setup must match the pair and delivery approved with the setup, an External
+    /// receiver must pass [`SwapProfile::check_receiver`], and a Bridge receiver the destination
+    /// chain's [`crate::settings::BridgeProfile::check_receiver`]. A Bridge order's provider is
+    /// quoted again before anything is signed: Across for the deposit's terms, NEAR Intents for
+    /// a verified deposit address that the order pays. Persist them with the input reservation
+    /// and the provider's terms, then submit. Nothing signed leaves the wallet before the write
+    /// succeeds.
     pub(crate) async fn issue_swap_order(
         &self,
         signing: SwapOrderSigning<'_>,
@@ -1127,11 +1371,15 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
         } = signing;
         let plan = &review.plan;
         let delegated = require_delegated_plan(plan)?;
         let (operation, executor) = (delegated.operation(), delegated.executor());
-        let buy_amount = review.require_approval(private_minimum, price_acknowledged)?;
+        let buy_amount =
+            review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
+        let bridge = bridge_route(plan, bridge)?;
         let profile = self.swap_order_profile()?;
         self.ensure_active()?;
         let record = self
@@ -1168,6 +1416,16 @@ impl ExecutorOwner {
                 receiver,
             )?;
         }
+        if let Some((delivery, route)) = bridge {
+            let destination = route.destination_chain;
+            destination
+                .bridge_profile()
+                .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
+                .check_receiver(
+                    destination.require_railgun()?.deployment.contract,
+                    delivery.receiver,
+                )?;
+        }
         // The pre-hook must invalidate every earlier order that could fill with its funds.
         if swap_invalidation(&record, &profile, SystemTime::now())?
             .is_some_and(|live| plan.invalidates != Some(live))
@@ -1196,11 +1454,44 @@ impl ExecutorOwner {
                 }
             };
 
+        let valid_to = valid_to_after(SystemTime::now(), profile.valid_to_window())?;
+        // The provider quotes the approved order before anything is signed. A 1Click quote
+        // names the receiver, so it follows every check above.
+        let bridge_terms = match bridge {
+            Some((delivery, route)) => {
+                let destination_minimum = destination_minimum
+                    .ok_or_else(|| eyre!("a bridge swap needs its approved destination minimum"))?;
+                let signing = trace_step(
+                    "order_bridge_quote",
+                    self.while_active(self.bridge_signing_terms(
+                        review,
+                        route,
+                        delivery,
+                        buy_amount,
+                        destination_minimum,
+                        valid_to,
+                        &profile,
+                        anchor_cache,
+                        token_registry,
+                    )),
+                )
+                .await?;
+                match signing {
+                    BridgeSigning::Terms(terms) => Some(terms),
+                    BridgeSigning::Changed(change) => {
+                        return Ok(SwapOrderOutcome::ReviewRequired(change));
+                    }
+                }
+            }
+            None => None,
+        };
+        // Resolved before anything is signed.
+        let receiver = order_receiver(executor, plan.delivery, bridge_terms.as_ref())?;
+
         let signing_started = Instant::now();
         tracing::debug!(target: "executor_observation", step = "order_sign", "started");
         let chain_id = self.chain.chain_id;
         let nonce = observed.nonce();
-        let valid_to = valid_to_after(SystemTime::now(), profile.valid_to_window())?;
         let proof_digest = keccak256(transactions.abi_encode());
         let unsigned = TransactionCall {
             to: executor,
@@ -1239,28 +1530,50 @@ impl ExecutorOwner {
             .authorize_call(&unsigned, signer.sign_hash_sync(&pre_hook_hash)?)?
             .data;
         let recipient = self.view.scan_keys().address_data();
-        // Every Reshield post-hook of this swap shields the full buy-token balance to the
-        // wallet's own address, keyed like executor recovery's shields. An External order pays
-        // its receiver and signs none.
-        let post_hook = match plan.delivery {
-            SwapDelivery::Reshield => {
+        // Every post-hook shield of this swap shields the full buy-token balance to the
+        // wallet's own address, keyed like executor recovery's shields.
+        let wallet_shield = || -> Result<ShieldRequest> {
+            let shield_key = Zeroizing::new(derive_shield_private_key(&Zeroizing::new(
+                signer.to_bytes().0,
+            ))?);
+            Ok(build_shield_request(
+                recipient.master_public_key,
+                &recipient.viewing_public_key,
+                TokenData::erc20(plan.buy_token),
+                U120::ZERO,
+                &shield_key,
+            )?)
+        };
+        // A Reshield post-hook shields the bought token and an Across post-hook deposits it,
+        // shielding any surplus when the user chose to. External and NEAR Intents orders pay
+        // their receiver and sign none.
+        let post_hook_calls = match (plan.delivery, &bridge_terms) {
+            (SwapDelivery::Reshield, _) => Some(guarded_shield_calls(
+                executor,
+                plan.buy_token,
+                buy_amount,
+                wallet_shield()?,
+            )?),
+            (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
+                Some(bridge_deposit_calls(
+                    executor,
+                    terms.spoke_pool,
+                    across_deposit(executor, delivery, terms),
+                    (delivery.surplus == BridgeSurplus::Reshield)
+                        .then(wallet_shield)
+                        .transpose()?,
+                )?)
+            }
+            (SwapDelivery::External { .. } | SwapDelivery::Bridge(_), _) => None,
+        };
+        let post_hook = match post_hook_calls {
+            Some(calls) => {
                 let post_hook_nonce = nonce
                     .checked_add(U256::ONE)
                     .ok_or_else(|| eyre!("executor nonce is exhausted"))?;
                 let gas_limit = plan
                     .post_hook_gas_limit()
                     .ok_or_else(|| eyre!("the swap's post-hook is unavailable"))?;
-                let shield_key = Zeroizing::new(derive_shield_private_key(&Zeroizing::new(
-                    signer.to_bytes().0,
-                ))?);
-                let shield = build_shield_request(
-                    recipient.master_public_key,
-                    &recipient.viewing_public_key,
-                    TokenData::erc20(plan.buy_token),
-                    U120::ZERO,
-                    &shield_key,
-                )?;
-                let calls = guarded_shield_calls(executor, plan.buy_token, buy_amount, shield)?;
                 let hash = post_hook_signing_hash(&calls, post_hook_nonce, chain_id, executor);
                 let calldata = signed_post_hook_calldata(
                     calls,
@@ -1271,7 +1584,7 @@ impl ExecutorOwner {
                 )?;
                 Some((post_hook_nonce, hash, calldata, gas_limit))
             }
-            SwapDelivery::External { .. } => None,
+            None => None,
         };
         let app_data = swap_app_data(
             profile.app_code(),
@@ -1292,7 +1605,7 @@ impl ExecutorOwner {
         let order = swap_order(
             plan.sell_token,
             plan.buy_token,
-            order_receiver(executor, plan.delivery),
+            receiver,
             review.sell_amount,
             buy_amount,
             valid_to,
@@ -1352,6 +1665,7 @@ impl ExecutorOwner {
                             .map(|(_, _, _, gas_limit)| *gas_limit),
                         hook_cost: Some(review.hook_cost()),
                         anchors,
+                        destination_minimum,
                     },
                     invalidates: plan.invalidates,
                     pre_hook: IssuedExecutorPayload::new(
@@ -1370,6 +1684,7 @@ impl ExecutorOwner {
                             ExecutorPayloadContext::new(calldata, observed, Vec::new()),
                         )
                     }),
+                    bridge: bridge_terms,
                 },
             )
         })
@@ -1479,7 +1794,7 @@ impl ExecutorOwner {
         let order = swap_order(
             swap.order_terms(saved).sell_token(),
             swap.order_terms(saved).buy_token(),
-            order_receiver(executor, saved.delivery()),
+            order_receiver(executor, saved.delivery(), saved.bridge())?,
             bounds.sell_amount,
             bounds.buy_amount,
             saved.valid_to(),
@@ -1956,6 +2271,8 @@ fn require_swap_attempt_admitted(record: &ExecutorRecord) -> Result<()> {
 
 const UNFINISHED_WORK: &str =
     "this account still has unfinished work; resolve it before starting a swap";
+const PREVIOUS_ORDER_LIVE: &str =
+    "the previous order of this swap can still execute; retry once it has ended";
 
 /// Why `record` can't place a swap, from local state. `unresolved_work` reports signed work
 /// that isn't settled, which blocks an account that doesn't belong to a swap.
@@ -1972,10 +2289,31 @@ fn swap_attempt_refusal(
     if !super::is_swap_record(record) && unresolved_work() {
         return Some(UNFINISHED_WORK);
     }
-    if record.swap().is_some_and(|swap| !swap.admits_attempt()) {
-        return Some("the previous order of this swap can still execute; retry once it has ended");
+    if let Some(swap) = record.swap().filter(|swap| !swap.admits_attempt()) {
+        return Some(
+            swap.orders()
+                .iter()
+                .find_map(bridge_refusal)
+                .unwrap_or(PREVIOUS_ORDER_LIVE),
+        );
     }
     None
+}
+
+/// Why a Bridge order keeps its account from placing a swap, when its bridge is the reason.
+fn bridge_refusal(order: &SwapOrderRecord) -> Option<&'static str> {
+    match super::observation::swap_order_state(order) {
+        super::observation::SwapOrderState::Bridging => {
+            Some("the previous swap's bridge hasn't delivered yet; retry once it has")
+        }
+        super::observation::SwapOrderState::Refunding => Some(
+            "the previous swap's bridge is refunding to this account; recover the funds instead",
+        ),
+        super::observation::SwapOrderState::NeedsAttention => {
+            Some("the previous swap's bridge needs attention; check its status first")
+        }
+        _ => None,
+    }
 }
 
 /// The earlier order of this executor that a retry's pre-hook invalidates in the same execution
@@ -2180,6 +2518,48 @@ fn pre_hook_request(
     }
 }
 
+/// The post-hook calls of `delivery`, with placeholders for the terms only known at signing.
+/// Every such argument is a static ABI word, so the calls encode to the signed calls' length.
+fn placeholder_post_hook_calls(
+    executor: Address,
+    buy_token: Address,
+    delivery: SwapDelivery,
+) -> Result<Vec<Call>> {
+    Ok(match delivery {
+        SwapDelivery::Bridge(
+            bridge @ BridgeDelivery {
+                provider: BridgeProvider::Across,
+                ..
+            },
+        ) => bridge_deposit_calls(
+            executor,
+            Address::ZERO,
+            SpokePool::depositV3Call {
+                depositor: executor,
+                recipient: bridge.receiver,
+                inputToken: buy_token,
+                outputToken: bridge.destination_token,
+                inputAmount: U256::ONE,
+                outputAmount: U256::ONE,
+                destinationChainId: U256::from(bridge.destination_chain),
+                exclusiveRelayer: Address::ZERO,
+                quoteTimestamp: u32::MAX,
+                fillDeadline: u32::MAX,
+                exclusivityParameter: u32::MAX,
+                message: Bytes::new(),
+            },
+            matches!(bridge.surplus, BridgeSurplus::Reshield)
+                .then_some(placeholder_shield(buy_token)),
+        )?,
+        _ => guarded_shield_calls(
+            executor,
+            buy_token,
+            U256::ONE,
+            placeholder_shield(buy_token),
+        )?,
+    })
+}
+
 /// Shield requests are static ABI types, so this encodes to the signed request's length.
 const fn placeholder_shield(token: Address) -> ShieldRequest {
     ShieldRequest {
@@ -2250,12 +2630,29 @@ fn swap_order(
     }
 }
 
-/// Who an order pays: the executor, whose post-hook reshields the bought token, or an External
-/// receiver.
-const fn order_receiver(executor: Address, delivery: SwapDelivery) -> Address {
+/// Who an order pays: the executor, whose post-hook reshields or bridges the bought token, an
+/// External receiver, or the NEAR Intents deposit address in the order's `bridge` terms.
+fn order_receiver(
+    executor: Address,
+    delivery: SwapDelivery,
+    bridge: Option<&BridgeOrderTerms>,
+) -> Result<Address> {
     match delivery {
-        SwapDelivery::Reshield => executor,
-        SwapDelivery::External { receiver } => receiver,
+        SwapDelivery::Reshield
+        | SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            ..
+        }) => Ok(executor),
+        SwapDelivery::External { receiver } => Ok(receiver),
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            ..
+        }) => match bridge {
+            Some(BridgeOrderTerms::NearIntents(terms)) => Ok(terms.deposit_address),
+            _ => Err(eyre!(
+                "NEAR Intents orders need their verified deposit address"
+            )),
+        },
     }
 }
 
@@ -2271,7 +2668,7 @@ pub(super) fn cow_buy_token(buy_token: Address) -> Address {
 
 /// The token whose anchors price `token`. The native asset uses the chain's wrapped-native
 /// anchors, which have the same price.
-fn anchor_token(chain_id: u64, token: Address) -> Address {
+pub(super) fn anchor_token(chain_id: u64, token: Address) -> Address {
     if token == Address::ZERO {
         crate::amounts::wrapped_native_token_for_chain(chain_id).unwrap_or(token)
     } else {

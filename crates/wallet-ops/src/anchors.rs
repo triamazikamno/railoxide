@@ -267,38 +267,83 @@ impl TokenAnchorRateCache {
         token_registry: &EffectiveTokenRegistry,
     ) -> Result<Option<PairAnchorRate>, AnchorBlocked> {
         let entries = token_anchor_entries_for_chains(&[chain_id], token_registry);
-        let sources_for = |token| {
-            entries
-                .iter()
-                .find(|entry| entry.token == token)
-                .map(|entry| entry.anchor_sources.as_slice())
-                .filter(|sources| !sources.is_empty())
-        };
-        let (Some(sell_sources), Some(buy_sources)) =
-            (sources_for(sell_token), sources_for(buy_token))
-        else {
+        let (Some(sell_sources), Some(buy_sources)) = (
+            configured_anchor_sources(&entries, chain_id, sell_token),
+            configured_anchor_sources(&entries, chain_id, buy_token),
+        ) else {
             return Ok(None);
         };
-        let rate_for = |token, sources: &[RuntimeTokenAnchorSource]| {
-            self.cached_rate(chain_id, token)
-                .or_else(|| {
-                    // Fixed sources need no background read, including user-configured ones.
-                    average_non_outlier_anchor_rates(&anchor_rates_from_sources_with_inputs(
-                        chain_id,
-                        sources,
-                        &BTreeMap::new(),
-                        &TwapFetchedInputs::default(),
-                    ))
-                })
-                .ok_or_else(|| AnchorBlocked {
-                    token,
-                    failures: vec![AnchorReadFailure::NoRate],
-                })
-        };
         Ok(Some(PairAnchorRate {
-            sell_rate: rate_for(sell_token, sell_sources)?,
-            buy_rate: rate_for(buy_token, buy_sources)?,
+            sell_rate: self.cached_rate_from(chain_id, sell_token, sell_sources)?,
+            buy_rate: self.cached_rate_from(chain_id, buy_token, buy_sources)?,
         }))
+    }
+
+    /// Anchor rates for a bridge leg from `origin_token` on `origin_chain` to
+    /// `destination_token` on `destination_chain`, from background rates only. Each token's rate
+    /// is scaled by the other chain's native USD rate, so [`check_quote_against_anchor`]
+    /// compares USD values without rounding. Missing configuration returns `None`; a missing
+    /// token or native USD rate returns its read failure.
+    pub(crate) fn cached_bridge_leg_rate(
+        &self,
+        origin_chain: u64,
+        origin_token: Address,
+        destination_chain: u64,
+        destination_token: Address,
+        token_registry: &EffectiveTokenRegistry,
+    ) -> Result<Option<PairAnchorRate>, AnchorBlocked> {
+        let entries =
+            token_anchor_entries_for_chains(&[origin_chain, destination_chain], token_registry);
+        let (Some(origin_sources), Some(destination_sources)) = (
+            configured_anchor_sources(&entries, origin_chain, origin_token),
+            configured_anchor_sources(&entries, destination_chain, destination_token),
+        ) else {
+            return Ok(None);
+        };
+        let no_rate = |token| AnchorBlocked {
+            token,
+            failures: vec![AnchorReadFailure::NoRate],
+        };
+        let origin_rate = self.cached_rate_from(origin_chain, origin_token, origin_sources)?;
+        let destination_rate =
+            self.cached_rate_from(destination_chain, destination_token, destination_sources)?;
+        let origin_native_usd = self
+            .cached_native_usd_rate(origin_chain)
+            .ok_or_else(|| no_rate(origin_token))?;
+        let destination_native_usd = self
+            .cached_native_usd_rate(destination_chain)
+            .ok_or_else(|| no_rate(destination_token))?;
+        Ok(Some(PairAnchorRate {
+            sell_rate: origin_rate
+                .checked_mul(destination_native_usd)
+                .ok_or_else(|| no_rate(origin_token))?,
+            buy_rate: destination_rate
+                .checked_mul(origin_native_usd)
+                .ok_or_else(|| no_rate(destination_token))?,
+        }))
+    }
+
+    /// The cached rate of a token with configured `sources`, or the rate of its fixed sources.
+    fn cached_rate_from(
+        &self,
+        chain_id: u64,
+        token: Address,
+        sources: &[RuntimeTokenAnchorSource],
+    ) -> Result<U256, AnchorBlocked> {
+        self.cached_rate(chain_id, token)
+            .or_else(|| {
+                // Fixed sources need no background read, including user-configured ones.
+                average_non_outlier_anchor_rates(&anchor_rates_from_sources_with_inputs(
+                    chain_id,
+                    sources,
+                    &BTreeMap::new(),
+                    &TwapFetchedInputs::default(),
+                ))
+            })
+            .ok_or_else(|| AnchorBlocked {
+                token,
+                failures: vec![AnchorReadFailure::NoRate],
+            })
     }
 
     pub fn store_rate(&self, chain_id: u64, token: Address, rate: U256) {
@@ -722,6 +767,19 @@ async fn fetch_oracle_answers_for_chain_with_timeout(
         }
     }
     Ok(answers)
+}
+
+/// The anchor sources `entries` configure for `token` on `chain_id`, `None` without any.
+fn configured_anchor_sources(
+    entries: &[RuntimeTokenAnchorInfo],
+    chain_id: u64,
+    token: Address,
+) -> Option<&[RuntimeTokenAnchorSource]> {
+    entries
+        .iter()
+        .find(|entry| entry.chain_id == chain_id && entry.token == token)
+        .map(|entry| entry.anchor_sources.as_slice())
+        .filter(|sources| !sources.is_empty())
 }
 
 fn token_anchor_entries_for_chains(
@@ -1679,6 +1737,40 @@ mod tests {
         assert_eq!(
             cache.cached_pair_rate(1, weth, usdc, &unconfigured),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn cached_bridge_leg_rate_compares_usd_values_across_chains() {
+        let cache = TokenAnchorRateCache::new();
+        let tokens = crate::settings::build_effective_token_registry(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap();
+        let arb_weth = address!("82af49447d8a07e3bd95bd0d56f35241523fbab1");
+        let bsc_usdc = address!("8ac76a51cc950d9822d68b83fe1ad97b32cd580d");
+        let leg_rate = || cache.cached_bridge_leg_rate(42161, arb_weth, 56, bsc_usdc, &tokens);
+        // 600 USDC per BNB at 600 USD per BNB, but no native USD rate on Arbitrum One yet.
+        cache.store_rate(56, bsc_usdc, uint!(600_000_000_000_000_000_000_U256));
+        cache.store_native_usd_rate(56, uint!(600_000_000_U256), 18);
+        assert_eq!(
+            leg_rate(),
+            Err(AnchorBlocked {
+                token: arb_weth,
+                failures: vec![AnchorReadFailure::NoRate]
+            })
+        );
+        // At 3,000 USD per ETH, one WETH is worth exactly 3,000 USDC on BNB Chain.
+        cache.store_native_usd_rate(42161, uint!(3_000_000_000_U256), 18);
+        let rate = leg_rate().unwrap().unwrap();
+        let usdc = uint!(3_000_000_000_000_000_000_000_U256);
+        assert_eq!(
+            check_quote_against_anchor(WRAPPED_NATIVE_FEE_RATE, usdc, rate, 0),
+            Ok(())
+        );
+        assert_eq!(
+            check_quote_against_anchor(WRAPPED_NATIVE_FEE_RATE, usdc - U256::ONE, rate, 0),
+            Err(QuoteDeviationError::ExceedsThreshold)
         );
     }
 

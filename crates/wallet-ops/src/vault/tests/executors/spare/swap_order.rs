@@ -1,6 +1,7 @@
 use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
+use crate::settings::BridgeReceiverRejection;
 use crate::{
     OperationHttpClient, OperationNetworkIsolation, SwapAmountPlan, SwapAmountRequest,
     SwapOrderOutcome, SwapPrice, SwapReviewChange, SwapReviewRequest, SwapSetupStatus,
@@ -118,7 +119,46 @@ async fn spawn_quote_stub(
     (url, requests, task)
 }
 
-/// One HTTP request's JSON body, or `None` when the client closed the connection first.
+/// Bridge provider stub that records each request's path and JSON body, `Null` for a GET, and
+/// answers it with `respond(body)`.
+pub(super) async fn spawn_bridge_stub(
+    respond: impl Fn(&Value) -> String + Send + 'static,
+) -> (
+    url::Url,
+    Arc<Mutex<Vec<(String, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut stream = BufReader::new(stream);
+            let mut request_line = String::new();
+            if stream.read_line(&mut request_line).await.unwrap() == 0 {
+                continue;
+            }
+            let Some(body) = read_json_body(&mut stream).await else {
+                continue;
+            };
+            let reply = respond(&body);
+            let path = request_line.split_whitespace().nth(1).unwrap().to_owned();
+            recorded.lock().unwrap().push((path, body));
+            stream
+                .get_mut()
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    (url, requests, task)
+}
+
+/// One HTTP request's JSON body, `Null` when it has none, or `None` when the client closed the
+/// connection first.
 async fn read_json_body(stream: &mut BufReader<tokio::net::TcpStream>) -> Option<Value> {
     let mut content_length = 0;
     loop {
@@ -135,6 +175,9 @@ async fn read_json_body(stream: &mut BufReader<tokio::net::TcpStream>) -> Option
     }
     let mut body = vec![0; content_length];
     stream.read_exact(&mut body).await.unwrap();
+    if body.is_empty() {
+        return Some(Value::Null);
+    }
     Some(serde_json::from_slice(&body).unwrap())
 }
 
@@ -241,7 +284,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
                 "quotes need no fee or anchor RPC"
             );
             gas_sampled.notify_one();
-            json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"})
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x3b9aca00"})
         }),
         Arc::default(),
         Arc::default(),
@@ -341,6 +384,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
             orderbook: &orderbook,
             anchor_cache: Some(&cache),
             token_registry: &tokens,
+            bridge: None,
         }),
     )
     .await
@@ -349,6 +393,12 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
     assert!(
         matches!(review.price(), SwapPrice::Verified { rate, observations }
         if rate.buy_rate == U256::from(3_000_000_000_u64) && observations.is_empty())
+    );
+    // 1 gwei from RPC with the swap's 25% cushion, at 3,000 USDC/ETH.
+    // Applying the broadcaster buffer as well would inflate this allowance.
+    assert_eq!(
+        review.hook_cost(),
+        (U256::from(plan.hook_gas_estimate()) * U256::from(15)).div_ceil(U256::from(4))
     );
     // Configured oracles with no cached rates still produce a quote. The user must
     // explicitly accept the missing independent check before it can be approved.
@@ -359,6 +409,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
             orderbook: &orderbook,
             anchor_cache: Some(&crate::TokenAnchorRateCache::new()),
             token_registry: &tokens,
+            bridge: None,
         })
         .await
         .unwrap();
@@ -375,6 +426,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
             orderbook: &orderbook,
             anchor_cache: None,
             token_registry: &tokens,
+            bridge: None,
         })
         .await
         .unwrap();
@@ -402,6 +454,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
             orderbook: &orderbook,
             anchor_cache: Some(&cache),
             token_registry: &tokens,
+            bridge: None,
         })
         .await
         .unwrap_err();
@@ -640,6 +693,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             .unwrap(),
             anchor_cache: Some(&anchors),
             token_registry: &tokens,
+            bridge: None,
         })
         .await
         .unwrap();
@@ -698,6 +752,8 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             orderbook: &orderbook,
             anchor_cache: &anchors,
             token_registry: &tokens,
+            bridge: None,
+            destination_minimum: None,
         })
     };
     let first = || issue(vec![pre_hook_transaction.clone()], vec![change.clone()]);
@@ -727,6 +783,8 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             orderbook: &orderbook,
             anchor_cache: &anchors,
             token_registry: &tokens,
+            bridge: None,
+            destination_minimum: None,
         });
         tokio::pin!(pending);
         tokio::select! {
@@ -1104,6 +1162,8 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             orderbook: &orderbook,
             anchor_cache: &anchors,
             token_registry: &tokens,
+            bridge: None,
+            destination_minimum: None,
         })
         .await
         .unwrap()
@@ -1242,13 +1302,13 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
         .unwrap()
     };
     let review = price(25, 25);
-    // At 1 gwei and this quote's rate of at least 3,000 USDC/ETH, the cost must cover the
+    // At 1 gwei plus 25% and this quote's rate of at least 3,000 USDC/ETH, price the
     // estimated hook gas. The declared limits' margin only caps execution and isn't priced.
     let estimated_gas = plan.hook_gas_estimate();
     let declared_gas = plan.pre_hook_gas_limit() + plan.post_hook_gas_limit().unwrap();
     assert!(estimated_gas < declared_gas);
-    assert!(review.hook_cost() >= U256::from(estimated_gas) * U256::from(3));
-    assert!(review.hook_cost() < U256::from(declared_gas) * U256::from(3));
+    assert!(review.hook_cost() * U256::from(4) >= U256::from(estimated_gas) * U256::from(15));
+    assert!(review.hook_cost() * U256::from(4) < U256::from(declared_gas) * U256::from(15));
     let private_minimum = review.suggested_private_minimum();
     // An unverified price is approved only with the user's acknowledgement.
     assert!(review.approval(private_minimum, false).is_err());
@@ -1352,6 +1412,8 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             orderbook: &orderbook,
             anchor_cache: &crate::TokenAnchorRateCache::new(),
             token_registry: &tokens,
+            bridge: None,
+            destination_minimum: None,
         })
         .await;
     assert!(signed.is_err());
@@ -1531,7 +1593,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .unwrap() else {
             panic!("one note fits one order");
         };
-        crate::price_swap_review(
+        let mut review = crate::price_swap_review(
             plan,
             quote.clone(),
             SwapPrice::Unverified,
@@ -1542,7 +1604,19 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             U256::ZERO,
             isolation,
         )
-        .unwrap()
+        .unwrap();
+        // A Bridge review carries its bridge quote, whose minimum the approval binds.
+        if let SwapDelivery::Bridge(bridge) = delivery {
+            review.set_bridge_for_tests(crate::SwapBridgeQuote {
+                provider: bridge.provider,
+                destination_minimum: U256::from(1_000),
+                expected_output: U256::from(1_010),
+                fee: Some(U256::ZERO),
+                leg: crate::BridgeLegPrice::SameAsset,
+                fill_time_sec: None,
+            });
+        }
+        review
     };
     let first = review(Address::ZERO, approved);
     let changed = review(Address::ZERO, moved);
@@ -1599,6 +1673,9 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     };
     macro_rules! issue {
         ($review:expr) => {
+            issue!($review, None)
+        };
+        ($review:expr, $bridge:expr) => {
             owner
                 .issue_swap_order(crate::SwapOrderSigning {
                     review: $review,
@@ -1612,6 +1689,8 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
                     orderbook: &orderbook,
                     anchor_cache: &anchors,
                     token_registry: &tokens,
+                    bridge: $bridge,
+                    destination_minimum: $review.bridge().map(|bridge| bridge.destination_minimum),
                 })
                 .await
         };
@@ -1646,6 +1725,120 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         unsigned.swap_approval().map(|approval| approval.delivery),
         Some(approved)
     );
+    assert!(submissions.lock().unwrap().is_empty());
+
+    // A Bridge approval binds each destination term: a review that differs in any of them
+    // needs a full review.
+    let bridged = BridgeDelivery {
+        provider: BridgeProvider::NearIntents,
+        destination_chain: 137,
+        receiver: Address::repeat_byte(0x93),
+        destination_token: Address::repeat_byte(0x94),
+        surplus: BridgeSurplus::BridgedByProvider,
+    };
+    let bridge = review(WETH, SwapDelivery::Bridge(bridged));
+    let bridge_approval = bridge
+        .approval(bridge.suggested_private_minimum(), true)
+        .unwrap();
+    assert_eq!(bridge.approval_change(&bridge_approval), None);
+    for other_terms in [
+        BridgeDelivery {
+            provider: BridgeProvider::Across,
+            ..bridged
+        },
+        BridgeDelivery {
+            destination_chain: 56,
+            ..bridged
+        },
+        BridgeDelivery {
+            destination_token: Address::ZERO,
+            ..bridged
+        },
+        BridgeDelivery {
+            surplus: BridgeSurplus::Reshield,
+            ..bridged
+        },
+    ] {
+        let mut other = bridge_approval.clone();
+        other.delivery = SwapDelivery::Bridge(other_terms);
+        assert_eq!(
+            bridge.approval_change(&other),
+            Some(SwapReviewChange::Delivery)
+        );
+    }
+    // NEAR Intents converts the whole deposit, so it can't reshield surplus.
+    let reshielding = review(
+        WETH,
+        SwapDelivery::Bridge(BridgeDelivery {
+            surplus: BridgeSurplus::Reshield,
+            ..bridged
+        }),
+    );
+    assert!(
+        reshielding
+            .approval(reshielding.suggested_private_minimum(), true)
+            .is_err()
+    );
+
+    // Each protocol contract on the destination chain is refused before anything is signed,
+    // even once approved, and so is an order without its bridge route.
+    let chains =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap();
+    let polygon = chains.get(137).unwrap();
+    let clients = owner.swap_bridge_clients(&orderbook).unwrap();
+    let near_destination = crate::bridge::BridgeDestination {
+        destination_token: bridged.destination_token,
+        intermediate: WETH,
+        symbol: "DST".to_owned(),
+        same_asset: false,
+        near: Some(crate::bridge::NearAssets {
+            origin_asset: "nep141:weth".to_owned(),
+            destination_asset: "nep141:dst".to_owned(),
+            origin_decimals: 18,
+            destination_decimals: 18,
+        }),
+    };
+    let route = crate::SwapBridgeRoute {
+        clients: &clients,
+        destination: &near_destination,
+        destination_chain: polygon,
+    };
+    let polygon_railgun = polygon.require_railgun().unwrap().deployment.contract;
+    let spoke_pool = polygon.bridge_profile().unwrap().spoke_pool();
+    for (receiver, rejection) in [
+        (Address::ZERO, BridgeReceiverRejection::ZeroAddress),
+        (polygon_railgun, BridgeReceiverRejection::Railgun),
+        (spoke_pool, BridgeReceiverRejection::SpokePool),
+    ] {
+        let refused = review(
+            WETH,
+            SwapDelivery::Bridge(BridgeDelivery {
+                receiver,
+                ..bridged
+            }),
+        );
+        owner
+            .record_swap_approval(
+                operation,
+                refused
+                    .approval(refused.suggested_private_minimum(), true)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            issue!(&refused, Some(route))
+                .unwrap_err()
+                .downcast_ref::<BridgeReceiverRejection>(),
+            Some(&rejection)
+        );
+    }
+    owner
+        .record_swap_approval(operation, bridge_approval)
+        .unwrap();
+    assert!(issue!(&bridge).is_err());
+    assert!(record().swap().is_none());
+    assert_eq!(record().issued().len(), 1);
     assert!(submissions.lock().unwrap().is_empty());
 
     // Once the user approves the new receiver, the same order is signed and persisted. Its
@@ -1730,6 +1923,651 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         ]
     );
 
+    orderbook_task.abort();
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+const POLYGON_WETH: Address =
+    alloy::primitives::address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619");
+
+/// A delegated swap account from USDC to WETH approved for `delivery`, with one spendable
+/// note, and the reviewed first order with a bridge quote whose destination minimum is 1,000.
+struct BridgeOrderFixture {
+    operation: ExecutorOperationId,
+    executor: Address,
+    input: Utxo,
+    transaction: Transaction,
+    review: crate::SwapReview,
+}
+
+impl BridgeOrderFixture {
+    /// The setup wins nonce 0, so the pre-hook signs at 1 and any post-hook at 2.
+    async fn new(
+        owner: &ExecutorOwner,
+        store: &ExecutorStore,
+        view: &DesktopViewSession,
+        profile: crate::settings::ExecutorProfile,
+        swap_profile: &crate::settings::SwapProfile,
+        delivery: BridgeDelivery,
+    ) -> Self {
+        let delegate = profile.delegate();
+        let operation = ExecutorOperationId::random().unwrap();
+        let executor = owner
+            .prepare_swap_setup(
+                operation,
+                broadcaster(delegate),
+                setup_approval(USDC, WETH, SwapDelivery::Bridge(delivery)),
+                &password(),
+            )
+            .await
+            .unwrap()
+            .context()
+            .executor;
+        let before =
+            ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+        store.reconcile(operation, before, &[]).unwrap();
+        let setup = B256::repeat_byte(3);
+        store
+            .record_issued(
+                operation,
+                IssuedExecutorPayload::new(
+                    U256::ZERO,
+                    delegate,
+                    setup,
+                    ExecutorPayloadPurpose::Operation,
+                    ExecutorPayloadContext::new(Bytes::from_static(b"setup"), before, Vec::new()),
+                ),
+            )
+            .unwrap();
+        let observed =
+            ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+        let setup_won = (
+            setup,
+            ExecutorPayloadInclusion::new(
+                BlockNumHash::new(11, B256::repeat_byte(11)),
+                B256::repeat_byte(4),
+                ExecutorExecutionResult::Executed,
+            ),
+        );
+        let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+        let code = [
+            EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+            delegate.as_slice(),
+        ]
+        .concat();
+        let SwapSetupStatus::Delegated(delegated) =
+            swap_setup_status(&record, observed.block(), &code, profile)
+        else {
+            panic!("the setup delegated the executor");
+        };
+
+        let amount = U256::from(1_000_000);
+        let input = Utxo::new(
+            broadcaster_core::notes::Note::new_change(
+                view.scan_keys().master_public_key,
+                USDC,
+                amount,
+                [7; 16],
+            ),
+            0,
+            0,
+            UtxoSource {
+                tx_hash: B256::ZERO,
+                block_number: 0,
+                block_timestamp: 0,
+            },
+            UtxoCommitmentKind::Shield,
+        );
+        let builder = railgun_wallet::TransactionBuilder {
+            chain_type: 0,
+            chain_id: 1,
+            railgun_contract: Address::repeat_byte(4),
+            relay_adapt_contract: Address::repeat_byte(5),
+        };
+        let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
+            &builder,
+            swap_profile,
+            delegated,
+            std::slice::from_ref(&input),
+            &SwapAmountRequest {
+                sell_token: USDC,
+                buy_token: WETH,
+                amount,
+                delivery: SwapDelivery::Bridge(delivery),
+                byte_budget: None,
+            },
+            swap_profile.app_data_byte_budget(),
+            None,
+        )
+        .unwrap() else {
+            panic!("one note fits one order");
+        };
+        let quote: CowQuote = serde_json::from_value(json!({
+            "quote": {
+                "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
+                "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
+                "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
+                "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        }))
+        .unwrap();
+        let mut review = crate::price_swap_review(
+            plan,
+            quote,
+            SwapPrice::Unverified,
+            U256::from(25),
+            U256::from(25),
+            50,
+            1,
+            U256::ZERO,
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        )
+        .unwrap();
+        review.set_bridge_for_tests(crate::SwapBridgeQuote {
+            provider: delivery.provider,
+            destination_minimum: U256::from(1_000),
+            expected_output: U256::from(1_010),
+            fee: Some(U256::ZERO),
+            leg: crate::BridgeLegPrice::SameAsset,
+            fill_time_sec: None,
+        });
+        let transaction = Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: B256::ZERO,
+            nullifiers: vec![B256::from(input.nullifier(view.scan_keys().nullifying_key))],
+            commitments: vec![B256::ZERO],
+            boundParams: BoundParams::new_transact(0, 0, 1, Vec::new(), executor, B256::ZERO),
+            unshieldPreimage: CommitmentPreimage::empty(),
+        };
+        Self {
+            operation,
+            executor,
+            input,
+            transaction,
+            review,
+        }
+    }
+
+    /// Sign the reviewed order over `route` for the approved minimums.
+    async fn issue(
+        &self,
+        owner: &ExecutorOwner,
+        orderbook: &CowOrderbookClient,
+        route: crate::SwapBridgeRoute<'_>,
+    ) -> eyre::Result<SwapOrderOutcome> {
+        owner
+            .issue_swap_order(crate::SwapOrderSigning {
+                review: &self.review,
+                private_minimum: self.review.suggested_private_minimum(),
+                price_acknowledged: true,
+                transactions: vec![self.transaction.clone()],
+                inputs: std::slice::from_ref(&self.input),
+                change_output_pois: Vec::new(),
+                output_pois: &OutputPois::default(),
+                authorization: &password(),
+                orderbook,
+                anchor_cache: &crate::TokenAnchorRateCache::new(),
+                token_registry: &crate::settings::EffectiveTokenRegistry {
+                    tokens: std::collections::BTreeMap::new(),
+                },
+                bridge: Some(route),
+                destination_minimum: Some(U256::from(1_000)),
+            })
+            .await
+    }
+
+    fn record(&self, store: &ExecutorStore) -> ExecutorRecord {
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == self.operation)
+            .unwrap()
+    }
+
+    /// Nothing was signed, persisted or sent.
+    fn assert_unsigned(&self, store: &ExecutorStore, submissions: &Submissions) {
+        let record = self.record(store);
+        assert!(record.swap().is_none());
+        assert_eq!(record.issued().len(), 1, "only the setup is issued");
+        assert!(submissions.lock().unwrap().is_empty());
+    }
+}
+
+// An Across order pays the executor. Its post-hook deposits exactly the buy amount for the
+// approved destination minimum on the terms of a quote fetched while signing, and shields any
+// surplus. A quote below that minimum, or with a fill deadline the SpokePool could refuse,
+// stops signing.
+#[tokio::test]
+async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let profile = chain.accepted_executor_profile().unwrap();
+    let swap_profile = chain.swap_profile().unwrap();
+    let spoke_pool = chain.bridge_profile().unwrap().spoke_pool();
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let receiver = Address::repeat_byte(0x93);
+    let delivery = BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: 137,
+        receiver,
+        destination_token: POLYGON_WETH,
+        surplus: BridgeSurplus::Reshield,
+    };
+    let fixture =
+        BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
+    let executor = fixture.executor;
+    let buy_amount = fixture.review.suggested_private_minimum();
+
+    // The quote's output and fill deadline, in seconds after the request.
+    let quoted = Arc::new(Mutex::new((U256::from(999), 3 * 60 * 60)));
+    let answer = quoted.clone();
+    let (across_url, across_requests, across_task) = spawn_bridge_stub(move |_| {
+        let (output, fill_after) = *answer.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json!({
+            "outputAmount": output.to_string(),
+            "totalRelayFee": {"total": "10"},
+            "lpFee": {"total": "0"},
+            "timestamp": (now - 5).to_string(),
+            "fillDeadline": (now + fill_after).to_string(),
+            "exclusiveRelayer": Address::repeat_byte(0x77),
+            "exclusivityDeadline": 3,
+            "spokePoolAddress": spoke_pool,
+            "destinationSpokePoolAddress": Address::repeat_byte(0x78),
+            "isAmountTooLow": false,
+            "limits": {"minDeposit": "1", "maxDeposit": "1000000000000000000000"},
+            "estimatedFillTimeSec": 2
+        })
+        .to_string()
+    })
+    .await;
+    let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
+    let (orderbook_url, submissions, orderbook_task) = spawn_orderbook_with_lost_response(
+        db.clone(),
+        view.clone(),
+        fixture.operation,
+        swap_profile.settlement(),
+        true,
+    )
+    .await;
+    let orderbook = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        orderbook_url,
+        1,
+    )
+    .unwrap();
+    let mut clients = owner.swap_bridge_clients(&orderbook).unwrap();
+    clients.across = crate::bridge::AcrossClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        across_url,
+    )
+    .unwrap();
+    let chains =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap();
+    let destination = crate::bridge::BridgeDestination {
+        destination_token: POLYGON_WETH,
+        intermediate: WETH,
+        symbol: "WETH".to_owned(),
+        same_asset: true,
+        near: None,
+    };
+    let route = crate::SwapBridgeRoute {
+        clients: &clients,
+        destination: &destination,
+        destination_chain: chains.get(137).unwrap(),
+    };
+
+    assert_eq!(
+        fixture.issue(&owner, &orderbook, route).await.unwrap(),
+        SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+            approved: U256::from(1_000),
+            current: U256::from(999),
+        })
+    );
+    fixture.assert_unsigned(&store, &submissions);
+    // A deadline that leaves relayers too little time after the order expires.
+    *quoted.lock().unwrap() = (U256::from(1_005), 60);
+    let error = fixture.issue(&owner, &orderbook, route).await.unwrap_err();
+    assert!(
+        error.to_string().contains("Across's quote can't be used"),
+        "{error:#}"
+    );
+    fixture.assert_unsigned(&store, &submissions);
+
+    // The order is persisted with the quote's terms and sent. Its response is lost, and the
+    // resubmission rebuilds the identical order.
+    *quoted.lock().unwrap() = (U256::from(1_005), 3 * 60 * 60);
+    assert!(
+        fixture
+            .issue(&owner, &orderbook, route)
+            .await
+            .unwrap_err()
+            .downcast_ref::<crate::cow::CowApiError>()
+            .is_some()
+    );
+    let (path, _) = across_requests.lock().unwrap().last().cloned().unwrap();
+    assert!(path.contains(&format!("amount={buy_amount}")), "{path}");
+    let saved = fixture.record(&store).swap().unwrap().orders()[0].clone();
+    let Some(BridgeOrderTerms::Across(terms)) = saved.bridge().cloned() else {
+        panic!("an Across order keeps its deposit terms");
+    };
+    assert_eq!(
+        terms,
+        AcrossOrderTerms {
+            spoke_pool,
+            input_token: WETH,
+            output_token: POLYGON_WETH,
+            input_amount: buy_amount,
+            // The approved minimum, not the quote's higher output.
+            output_amount: U256::from(1_000),
+            exclusive_relayer: Address::repeat_byte(0x77),
+            exclusivity_parameter: 3,
+            ..terms
+        }
+    );
+    assert_eq!(saved.bounds().destination_minimum, Some(U256::from(1_000)));
+    assert_eq!(saved.bounds().buy_amount, buy_amount);
+    assert_eq!(
+        owner
+            .resubmit_swap_order(fixture.operation, &orderbook)
+            .await
+            .unwrap(),
+        SwapOrderOutcome::Submitted { uid: saved.uid() }
+    );
+    let submitted = submissions.lock().unwrap().clone();
+    let [(persisted, body), (_, resent)] = submitted.as_slice() else {
+        panic!("one initial request and one resubmission");
+    };
+    assert!(*persisted, "the terms are durable before the order request");
+    assert_eq!(body, resent);
+    assert_eq!(submitted_order(body).receiver, executor);
+
+    // The post-hook guards, approves and deposits the buy amount, then shields the surplus.
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    let post_hook = RelayAdapt7702::multicallCall::abi_decode(&hooks.post[0].call_data).unwrap();
+    let calls = post_hook._calls;
+    assert_eq!(
+        calls.iter().map(|call| call.to).collect::<Vec<_>>(),
+        [executor, WETH, spoke_pool, executor]
+    );
+    let guard = transferCall::abi_decode(&calls[0].data).unwrap();
+    assert_eq!(guard._transfers[0].value, buy_amount);
+    let approval = approveCall::abi_decode(&calls[1].data).unwrap();
+    assert_eq!(
+        (approval.spender, approval.amount),
+        (spoke_pool, buy_amount)
+    );
+    let deposit =
+        broadcaster_core::contracts::across::SpokePool::depositV3Call::abi_decode(&calls[2].data)
+            .unwrap();
+    assert_eq!((deposit.depositor, deposit.recipient), (executor, receiver));
+    assert_eq!(
+        (
+            deposit.inputToken,
+            deposit.outputToken,
+            deposit.destinationChainId
+        ),
+        (WETH, POLYGON_WETH, U256::from(137))
+    );
+    assert_eq!(
+        (deposit.inputAmount, deposit.outputAmount),
+        (buy_amount, U256::from(1_000))
+    );
+    assert_eq!(
+        (
+            deposit.quoteTimestamp,
+            deposit.fillDeadline,
+            deposit.exclusiveRelayer,
+            deposit.exclusivityParameter
+        ),
+        (
+            terms.quote_timestamp,
+            terms.fill_deadline,
+            terms.exclusive_relayer,
+            terms.exclusivity_parameter
+        )
+    );
+    assert!(deposit.message.is_empty());
+    let shield =
+        broadcaster_core::contracts::railgun::shieldCall::abi_decode(&calls[3].data).unwrap();
+    assert_eq!(shield._shieldRequests[0].preimage.token.tokenAddress, WETH);
+
+    across_task.abort();
+    orderbook_task.abort();
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// A NEAR Intents order pays the deposit address of a 1Click quote requested while signing,
+// which names the receiver and refunds to the executor, and has no post-hook. A quote that
+// doesn't verify, or that can't deliver the approved minimum, stops signing.
+#[tokio::test]
+async fn near_intents_order_pays_a_verified_deposit_address() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let profile = chain.accepted_executor_profile().unwrap();
+    let swap_profile = chain.swap_profile().unwrap();
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let receiver = Address::repeat_byte(0x93);
+    let delivery = BridgeDelivery {
+        provider: BridgeProvider::NearIntents,
+        destination_chain: 137,
+        receiver,
+        destination_token: Address::repeat_byte(0x94),
+        surplus: BridgeSurplus::BridgedByProvider,
+    };
+    let fixture =
+        BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
+    let executor = fixture.executor;
+    let buy_amount = fixture.review.suggested_private_minimum();
+
+    // 1Click signs the request it was sent. The test key stands in for 1Click's.
+    let quote_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let pinned = format!(
+        "ed25519:{}",
+        bs58::encode(quote_key.verifying_key().to_bytes()).into_string()
+    );
+    let deposit_address = Address::repeat_byte(0xd0);
+    // The quote's minimum output and the key that signs it.
+    let quoted = Arc::new(Mutex::new((
+        U256::from(1_000),
+        ed25519_dalek::SigningKey::from_bytes(&[8; 32]),
+    )));
+    let answer = quoted.clone();
+    let (near_url, near_requests, near_task) = spawn_bridge_stub(move |request| {
+        let (minimum, key) = answer.lock().unwrap().clone();
+        let response = json!({
+            "quote": {
+                "amountIn": request["amount"],
+                "amountInFormatted": "1",
+                "amountInUsd": "1",
+                "minAmountIn": request["amount"],
+                "amountOut": (minimum + U256::from(10)).to_string(),
+                "amountOutFormatted": "1",
+                "amountOutUsd": "1",
+                "minAmountOut": minimum.to_string(),
+                "timeEstimate": 20,
+                "deadline": request["deadline"],
+                "timeWhenInactive": request["deadline"],
+                "depositAddress": deposit_address
+            },
+            "quoteRequest": request,
+            "timestamp": "2026-09-30T00:00:00.000Z"
+        });
+        crate::bridge::sign_quote_response_for_tests(response, &key)
+    })
+    .await;
+    let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
+    let (orderbook_url, submissions, orderbook_task) = spawn_orderbook_with_lost_response(
+        db.clone(),
+        view.clone(),
+        fixture.operation,
+        swap_profile.settlement(),
+        true,
+    )
+    .await;
+    let orderbook = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        orderbook_url,
+        1,
+    )
+    .unwrap();
+    let mut clients = owner.swap_bridge_clients(&orderbook).unwrap();
+    clients.near = crate::bridge::NearIntentsClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        near_url,
+        &pinned,
+    )
+    .unwrap();
+    let chains =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap();
+    let destination = crate::bridge::BridgeDestination {
+        destination_token: delivery.destination_token,
+        intermediate: WETH,
+        symbol: "DST".to_owned(),
+        same_asset: false,
+        near: Some(crate::bridge::NearAssets {
+            origin_asset: "nep141:eth-weth.omft.near".to_owned(),
+            destination_asset: "nep141:pol-dst.omft.near".to_owned(),
+            origin_decimals: 18,
+            destination_decimals: 18,
+        }),
+    };
+    let route = crate::SwapBridgeRoute {
+        clients: &clients,
+        destination: &destination,
+        destination_chain: chains.get(137).unwrap(),
+    };
+
+    // A quote signed by another key isn't 1Click's.
+    let error = fixture.issue(&owner, &orderbook, route).await.unwrap_err();
+    assert!(
+        error.to_string().contains("quote couldn't be verified"),
+        "{error:#}"
+    );
+    fixture.assert_unsigned(&store, &submissions);
+    *quoted.lock().unwrap() = (U256::from(999), quote_key.clone());
+    assert_eq!(
+        fixture.issue(&owner, &orderbook, route).await.unwrap(),
+        SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+            approved: U256::from(1_000),
+            current: U256::from(999),
+        })
+    );
+    fixture.assert_unsigned(&store, &submissions);
+
+    // The order is persisted with the verified quote and sent. Its response is lost, and the
+    // resubmission rebuilds the identical order from the saved deposit address.
+    *quoted.lock().unwrap() = (U256::from(1_000), quote_key);
+    assert!(
+        fixture
+            .issue(&owner, &orderbook, route)
+            .await
+            .unwrap_err()
+            .downcast_ref::<crate::cow::CowApiError>()
+            .is_some()
+    );
+    let (_, request) = near_requests.lock().unwrap().last().cloned().unwrap();
+    let sent = |field: &str| request[field].as_str().unwrap().parse::<Address>().unwrap();
+    assert_eq!((sent("recipient"), sent("refundTo")), (receiver, executor));
+    assert_eq!(request["dry"], false);
+    assert_eq!(request["amount"], buy_amount.to_string());
+    let record = fixture.record(&store);
+    let saved = record.swap().unwrap().orders()[0].clone();
+    let Some(BridgeOrderTerms::NearIntents(terms)) = saved.bridge().cloned() else {
+        panic!("a NEAR Intents order keeps its verified quote");
+    };
+    assert_eq!(
+        (
+            terms.deposit_address,
+            terms.min_amount_out,
+            terms.amount_out
+        ),
+        (deposit_address, U256::from(1_000), U256::from(1_010))
+    );
+    assert_eq!(terms.deadline, request["deadline"]);
+    let signed: Value = serde_json::from_str(&terms.signed_quote).unwrap();
+    assert_eq!(signed["quoteRequest"], request);
+    assert_eq!(saved.bounds().destination_minimum, Some(U256::from(1_000)));
+    assert!(saved.post_hook().is_none());
+    let [_, pre_hook] = record.issued() else {
+        panic!("a NEAR Intents order issues only its pre-hook");
+    };
+    assert_eq!(pre_hook.purpose(), ExecutorPayloadPurpose::SwapPreHook);
+    assert_eq!(
+        owner
+            .resubmit_swap_order(fixture.operation, &orderbook)
+            .await
+            .unwrap(),
+        SwapOrderOutcome::Submitted { uid: saved.uid() }
+    );
+    let submitted = submissions.lock().unwrap().clone();
+    let [(persisted, body), (_, resent)] = submitted.as_slice() else {
+        panic!("one initial request and one resubmission");
+    };
+    assert!(*persisted, "the quote is durable before the order request");
+    assert_eq!(body, resent);
+    let order = submitted_order(body);
+    assert_eq!(
+        (order.receiver, order.buyToken, order.buyAmount),
+        (deposit_address, WETH, buy_amount)
+    );
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    assert_eq!((hooks.pre.len(), hooks.post.len()), (1, 0));
+
+    near_task.abort();
     orderbook_task.abort();
     owner.shutdown().await;
     drop(owner);

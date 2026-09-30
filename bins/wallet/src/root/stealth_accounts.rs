@@ -210,12 +210,14 @@ impl WalletRoot {
     }
 
     /// Reveal `target` and open its recovery for `asset`, as the account menu's Recover… does.
-    /// With `return_focus`, the caller's dialog keeps focus if recovery doesn't open and gets it
-    /// back when recovery closes.
+    /// `checked` is the caller's own balance check of `asset` and its block, which recovery
+    /// offers like one made here. With `return_focus`, the caller's dialog keeps focus if
+    /// recovery doesn't open and gets it back when recovery closes.
     pub(super) fn open_stealth_account_recovery(
         &mut self,
         target: &StealthAccountTarget,
         asset: ExecutorAsset,
+        checked: Option<(U256, alloy::eips::BlockNumHash)>,
         return_focus: Option<gpui::FocusHandle>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -235,6 +237,9 @@ impl WalletRoot {
                 }
                 view.update(cx, |view, cx| {
                     if view.session_is_current(cx) {
+                        if let Some((amount, block)) = checked {
+                            view.note_checked_balance(operation, asset, amount, block, cx);
+                        }
                         view.open_recovery(operation, Some(asset), return_focus, window, cx);
                     }
                 });
@@ -554,6 +559,27 @@ impl StealthAccountsView {
             },
             cx,
         );
+    }
+
+    /// Keep a balance of `asset` that another view checked, unless this view read a later one.
+    fn note_checked_balance(
+        &mut self,
+        operation: ExecutorOperationId,
+        asset: ExecutorAsset,
+        amount: U256,
+        block: alloy::eips::BlockNumHash,
+        cx: &gpui::App,
+    ) {
+        let observations = self.observations.entry(operation).or_default();
+        if observations
+            .assets
+            .get(&asset)
+            .and_then(|balance| balance.value)
+            .is_none_or(|value| value.block.number <= block.number)
+        {
+            observations.merge(asset, Some(amount), block, std::time::SystemTime::now());
+            self.refresh_visible(cx);
+        }
     }
 
     fn request_discovery(

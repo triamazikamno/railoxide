@@ -13,6 +13,9 @@ use alloy::primitives::aliases::U120;
 use alloy::primitives::{LogData, Signature, TxKind, address, keccak256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
+use broadcaster_core::contracts::across::{
+    SpokePool, V3RelayExecutionEventInfo, address_to_bytes32,
+};
 use broadcaster_core::contracts::cow::{BUY_NATIVE_TOKEN, GPv2Settlement, OrderUid};
 use broadcaster_core::contracts::railgun::{
     Call, CommitmentCiphertext, Nullified, Shield, ShieldCiphertext, ShieldRequest, TokenData,
@@ -56,6 +59,7 @@ fn quantity(value: &Value) -> u64 {
 /// transactions keep the hash of the block they were added to, so a reorg
 /// removes them.
 struct MockChain {
+    chain_id: u64,
     railgun: Address,
     delegate: Address,
     head: u64,
@@ -78,6 +82,27 @@ struct MockChain {
 }
 
 impl MockChain {
+    const fn new(chain_id: u64, railgun: Address, delegate: Address) -> Self {
+        Self {
+            chain_id,
+            railgun,
+            delegate,
+            head: 0,
+            reorgs: Vec::new(),
+            nonces: Vec::new(),
+            buy_balance: Vec::new(),
+            fill_cleared: Vec::new(),
+            invalidated: Vec::new(),
+            logs: Vec::new(),
+            transactions: Vec::new(),
+            log_queries: 0,
+            rpc_methods: Vec::new(),
+            rpc_requests: Vec::new(),
+            receipt_error: None,
+            reorg_on_receipts: false,
+        }
+    }
+
     fn hash(&self, number: u64) -> B256 {
         let fork = self
             .reorgs
@@ -237,7 +262,7 @@ impl MockChain {
         self.rpc_requests.push(request.clone());
         let params = &request["params"];
         let result = match request["method"].as_str().unwrap() {
-            "eth_chainId" => json!("0x1"),
+            "eth_chainId" => json!(format!("0x{:x}", self.chain_id)),
             "eth_blockNumber" => json!(format!("0x{:x}", self.head)),
             "eth_getBlockByNumber" => {
                 let number = quantity(&params[0]);
@@ -278,6 +303,18 @@ impl MockChain {
                     self.reorg(number);
                 }
                 receipts
+            }
+            "eth_getTransactionReceipt" => {
+                let hash: B256 = serde_json::from_value(params[0].clone()).unwrap();
+                self.transactions
+                    .iter()
+                    .find(|(known, transaction, _)| {
+                        *known == hash
+                            && self.canonical(transaction.block_number, transaction.block_hash)
+                    })
+                    .map_or(Value::Null, |(_, _, receipt)| {
+                        serde_json::to_value(receipt).unwrap()
+                    })
             }
             "eth_getCode" => {
                 let code = [
@@ -517,21 +554,9 @@ impl Fixture {
         let railgun = config.require_railgun().unwrap().deployment.contract;
         let settlement = config.swap_profile().unwrap().settlement();
         let chain = Arc::new(Mutex::new(MockChain {
-            railgun,
-            delegate,
             head: 14,
-            reorgs: Vec::new(),
             nonces: vec![(11, 1)],
-            buy_balance: Vec::new(),
-            fill_cleared: Vec::new(),
-            invalidated: Vec::new(),
-            logs: Vec::new(),
-            transactions: Vec::new(),
-            log_queries: 0,
-            rpc_methods: Vec::new(),
-            rpc_requests: Vec::new(),
-            receipt_error: None,
-            reorg_on_receipts: false,
+            ..MockChain::new(1, railgun, delegate)
         }));
         let served = chain.clone();
         let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
@@ -624,18 +649,20 @@ impl Fixture {
     }
 
     fn record_pair_attempt(&self, attempt: u8, valid_to_block: u64, buy: Address) {
-        self.record_delivery_attempt(attempt, valid_to_block, buy, SwapDelivery::Reshield);
+        self.record_delivery_attempt(attempt, valid_to_block, buy, SwapDelivery::Reshield, None);
     }
 
-    /// An External attempt signs no post-hook.
+    /// External and NEAR Intents attempts sign no post-hook. An Across post-hook's calls
+    /// are its surplus shield alone; the deposit is matched against `bridge`.
     fn record_delivery_attempt(
         &self,
         attempt: u8,
         valid_to_block: u64,
         buy: Address,
         delivery: SwapDelivery,
+        bridge: Option<BridgeOrderTerms>,
     ) {
-        let reshield = matches!(delivery, SwapDelivery::Reshield);
+        let post_hook = delivery.has_post_hook();
         let mut shield = post_hook_shield(attempt);
         shield.preimage.token = TokenData::erc20(buy);
         let observed = self.record().nonce_observation().unwrap();
@@ -664,9 +691,16 @@ impl Fixture {
                         shield_fee_bps: U256::from(25),
                         slippage_bps: 50,
                         pre_hook_gas_limit: 1,
-                        post_hook_gas_limit: reshield.then_some(1),
+                        post_hook_gas_limit: post_hook.then_some(1),
                         hook_cost: Some(U256::ZERO),
                         anchors: Vec::new(),
+                        destination_minimum: match &bridge {
+                            Some(BridgeOrderTerms::Across(terms)) => Some(terms.output_amount),
+                            Some(BridgeOrderTerms::NearIntents(terms)) => {
+                                Some(terms.min_amount_out)
+                            }
+                            None => None,
+                        },
                     },
                     invalidates: None,
                     pre_hook: IssuedExecutorPayload::new(
@@ -684,7 +718,7 @@ impl Fixture {
                             inputs,
                         ),
                     ),
-                    post_hook: reshield.then(|| {
+                    post_hook: post_hook.then(|| {
                         IssuedExecutorPayload::new(
                             U256::from(nonce + 1),
                             self.delegate,
@@ -712,6 +746,7 @@ impl Fixture {
                             ),
                         )
                     }),
+                    bridge,
                 },
             )
             .unwrap();
@@ -1053,6 +1088,7 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
                     post_hook_gas_limit: Some(1),
                     hook_cost: Some(U256::ZERO),
                     anchors: Vec::new(),
+                    destination_minimum: None,
                 },
                 price_verified: Some(false),
                 price_acknowledged: true,
@@ -1241,7 +1277,7 @@ fn reads_a_balance(requests: &[Value]) -> bool {
 async fn reconciling_an_external_swap_delivers_on_its_trade_without_reading_balances() {
     let fixture = Fixture::start().await;
     let receiver = Address::repeat_byte(0x77);
-    fixture.record_delivery_attempt(0, 100, BUY, SwapDelivery::External { receiver });
+    fixture.record_delivery_attempt(0, 100, BUY, SwapDelivery::External { receiver }, None);
     // One settlement runs the pre-hook and pays the receiver. Only the pre-hook takes a nonce.
     let settlement_tx = B256::repeat_byte(0x40);
     {
@@ -1277,7 +1313,13 @@ async fn reconciling_an_external_swap_delivers_on_its_trade_without_reading_bala
 async fn an_external_pre_hook_without_a_trade_recovers_only_the_sell_token() {
     let fixture = Fixture::start().await;
     let receiver = Address::repeat_byte(0x77);
-    fixture.record_delivery_attempt(0, 35, Address::ZERO, SwapDelivery::External { receiver });
+    fixture.record_delivery_attempt(
+        0,
+        35,
+        Address::ZERO,
+        SwapDelivery::External { receiver },
+        None,
+    );
     {
         let mut chain = fixture.chain.lock().unwrap();
         let logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
@@ -2244,7 +2286,7 @@ async fn settlement_receipts_deliver_external_orders_from_the_trade_alone() {
         (BUY, trade_log_for(uid(2, 20), BUY), false),
     ] {
         let fixture = Fixture::start().await;
-        fixture.record_delivery_attempt(1, 20, buy, SwapDelivery::External { receiver });
+        fixture.record_delivery_attempt(1, 20, buy, SwapDelivery::External { receiver }, None);
         let mut logs = vec![(fixture.settlement, trade)];
         if buy == BUY {
             logs.push((
@@ -2292,6 +2334,791 @@ async fn settlement_receipts_deliver_external_orders_from_the_trade_alone() {
             }
             assert_block_only_requests(&chain.rpc_requests, block);
         }
+        fixture.finish().await;
+    }
+}
+
+/// Across delivery that reshields surplus, and the terms its post-hook's deposit signed. The
+/// order's buy amount is 99 below the trade's, so the post-hook reshields 99.
+fn across_order(spoke_pool: Address) -> (BridgeDelivery, AcrossOrderTerms) {
+    (
+        BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 42161,
+            receiver: Address::repeat_byte(0x77),
+            destination_token: Address::repeat_byte(0xa0),
+            surplus: BridgeSurplus::Reshield,
+        },
+        AcrossOrderTerms {
+            spoke_pool,
+            input_token: BUY,
+            output_token: Address::repeat_byte(0xa0),
+            input_amount: U256::from(BUY_AMOUNT - 99),
+            output_amount: U256::from(9_800),
+            quote_timestamp: 1_000_100,
+            fill_deadline: 1_010_000,
+            exclusive_relayer: Address::ZERO,
+            exclusivity_parameter: 0,
+        },
+    )
+}
+
+/// The `FundsDeposited` event of the deposit an Across post-hook signed with `terms`.
+fn signed_deposit(delivery: BridgeDelivery, terms: &AcrossOrderTerms) -> SpokePool::FundsDeposited {
+    SpokePool::FundsDeposited {
+        inputToken: address_to_bytes32(terms.input_token),
+        outputToken: address_to_bytes32(terms.output_token),
+        inputAmount: terms.input_amount,
+        outputAmount: terms.output_amount,
+        destinationChainId: U256::from(delivery.destination_chain),
+        depositId: U256::from(42),
+        quoteTimestamp: terms.quote_timestamp,
+        fillDeadline: terms.fill_deadline,
+        exclusivityDeadline: 0,
+        depositor: address_to_bytes32(EXECUTOR),
+        recipient: address_to_bytes32(delivery.receiver),
+        exclusiveRelayer: address_to_bytes32(terms.exclusive_relayer),
+        message: Bytes::new(),
+    }
+}
+
+/// One settlement runs the pre-hook and pays the executor. Given its deposit, the Across
+/// post-hook then runs, deposits, and reshields the surplus after the shield fee.
+fn across_settlement_logs(
+    fixture: &Fixture,
+    terms: &AcrossOrderTerms,
+    deposit: Option<SpokePool::FundsDeposited>,
+) -> Vec<(Address, LogData)> {
+    let transfer = |from: Address, to: Address, value: u64| {
+        (
+            BUY,
+            Transfer {
+                from,
+                to,
+                value: U256::from(value),
+            }
+            .encode_log_data(),
+        )
+    };
+    let mut logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
+        .into_iter()
+        .map(|data| (fixture.railgun, data))
+        .collect::<Vec<_>>();
+    logs.push((fixture.settlement, trade_log(uid(1, 20))));
+    logs.push(transfer(fixture.settlement, EXECUTOR, BUY_AMOUNT));
+    if let Some(deposit) = deposit {
+        logs.extend([
+            transfer(EXECUTOR, terms.spoke_pool, terms.input_amount.to()),
+            (terms.spoke_pool, deposit.encode_log_data()),
+            transfer(EXECUTOR, fixture.railgun, 74),
+            // Railgun's treasury receives the fee separately.
+            transfer(EXECUTOR, Address::repeat_byte(0xfe), 25),
+            (fixture.railgun, post_hook_shield_log(1, 74)),
+        ]);
+    }
+    logs
+}
+
+/// Record the settlement in block 15 from its receipts alone, and return the trade's
+/// observation.
+async fn confirm_settlement(fixture: &Fixture, logs: Vec<(Address, LogData)>) -> SwapObservation {
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        chain.head = 16;
+        chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
+        chain.rpc_requests.clear();
+    }
+    fixture
+        .owner
+        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .await
+        .unwrap();
+    let chain = fixture.chain.lock().unwrap();
+    let block = chain.block(15);
+    assert_block_only_requests(&chain.rpc_requests, block);
+    SwapObservation {
+        block,
+        transaction_hash: Some(chain.transactions.last().unwrap().0),
+    }
+}
+
+#[tokio::test]
+async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
+    // 0: the signed deposit, then the reshielded surplus. 1 and 2: a deposit to another
+    // recipient, or of another output amount. 3: the post-hook didn't run. 4: the signed
+    // deposit, paid by someone other than the executor.
+    for scenario in 0..5 {
+        let fixture = Fixture::start().await;
+        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        fixture.record_delivery_attempt(
+            1,
+            20,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(terms)),
+        );
+        let mut deposit = signed_deposit(delivery, &terms);
+        match scenario {
+            1 => deposit.recipient = address_to_bytes32(Address::repeat_byte(0x78)),
+            2 => deposit.outputAmount -= U256::ONE,
+            _ => {}
+        }
+        let mut logs = across_settlement_logs(&fixture, &terms, (scenario != 3).then_some(deposit));
+        if scenario == 4 {
+            let executor_payment = Transfer {
+                from: EXECUTOR,
+                to: terms.spoke_pool,
+                value: terms.input_amount,
+            }
+            .encode_log_data();
+            logs.retain(|(_, data)| *data != executor_payment);
+        }
+        let traded = confirm_settlement(&fixture, logs).await;
+        let record = fixture.record();
+        let observed = record.swap().unwrap().orders()[0].observations();
+        assert_eq!(observed.traded, Some(traded), "scenario {scenario}");
+        if scenario != 0 {
+            // The bought token stays in the executor.
+            assert_eq!(
+                state(&record, 0),
+                SwapOrderState::Traded,
+                "scenario {scenario}"
+            );
+            assert_eq!(
+                (
+                    observed.bridge_handoff,
+                    observed.delivered,
+                    observed.settlement_credit
+                ),
+                (None, None, None),
+                "scenario {scenario}"
+            );
+            if scenario == 3 {
+                // Explicit reconciliation finds the bought token still in the executor, which
+                // recovery then offers.
+                {
+                    let mut chain = fixture.chain.lock().unwrap();
+                    chain.nonces.push((15, 2));
+                    chain.buy_balance.push((15, BUY_AMOUNT));
+                }
+                let record = fixture.observe(17, 14).await;
+                assert_eq!(state(&record, 0), SwapOrderState::NotDelivered);
+            }
+            fixture.finish().await;
+            continue;
+        }
+        // Handed off, and not yet delivered on the destination chain.
+        assert_eq!(state(&record, 0), SwapOrderState::Bridging);
+        assert_eq!(
+            (observed.bridge_handoff, observed.delivered),
+            (
+                Some(SwapBridgeHandoff {
+                    observation: traded,
+                    deposit_id: Some(U256::from(42)),
+                }),
+                Some(traded)
+            )
+        );
+        assert_eq!(
+            observed
+                .settlement_credit
+                .map(|credit| (credit.private_amount, credit.fee)),
+            Some((U256::from(74), Some(U256::from(25))))
+        );
+        // Explicit reconciliation finds the post-hook's nonce passed in the settlement, so the
+        // retained deposit shows which payload took that nonce.
+        fixture.chain.lock().unwrap().nonces.push((15, 3));
+        let record = fixture.observe(17, 14).await;
+        assert_eq!(
+            record.swap().unwrap().orders()[0]
+                .observations()
+                .post_hook_deposit,
+            Some(traded)
+        );
+        fixture.finish().await;
+    }
+}
+
+/// Record a NEAR Intents order to BNB Chain and confirm its settlement in block 15, whose trade
+/// pays `deposit_address`. Returns the trade's observation.
+async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
+    fixture.record_delivery_attempt(
+        1,
+        20,
+        BUY,
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            destination_chain: 56,
+            receiver: Address::repeat_byte(0x77),
+            destination_token: Address::ZERO,
+            surplus: BridgeSurplus::BridgedByProvider,
+        }),
+        Some(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+            deposit_address,
+            min_amount_out: U256::from(15),
+            amount_out: U256::from(16),
+            deadline: "2026-09-30T01:00:00.000Z".into(),
+            signed_quote: "{}".into(),
+        })),
+    );
+    // The order's UID commits to the deposit address the settlement pays.
+    let logs = vec![
+        (fixture.settlement, trade_log(uid(1, 20))),
+        (
+            BUY,
+            Transfer {
+                from: fixture.settlement,
+                to: deposit_address,
+                value: U256::from(BUY_AMOUNT),
+            }
+            .encode_log_data(),
+        ),
+    ];
+    confirm_settlement(fixture, logs).await
+}
+
+#[tokio::test]
+async fn settlement_receipts_hand_off_to_near_intents_with_the_trade() {
+    let fixture = Fixture::start().await;
+    let traded = near_handoff(&fixture, Address::repeat_byte(0x79)).await;
+    let record = fixture.record();
+    let observed = record.swap().unwrap().orders()[0].observations();
+    assert_eq!(state(&record, 0), SwapOrderState::Bridging);
+    assert_eq!(
+        (
+            observed.bridge_handoff,
+            observed.delivered,
+            observed.settlement_credit
+        ),
+        (
+            Some(SwapBridgeHandoff {
+                observation: traded,
+                deposit_id: None,
+            }),
+            Some(traded),
+            None
+        )
+    );
+    fixture.finish().await;
+}
+
+/// Bridge clients for the provider stub at `url`, on a direct test route.
+fn bridge_clients(fixture: &Fixture, url: &url::Url) -> crate::SwapBridgeClients {
+    let http = || {
+        crate::OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        )
+    };
+    crate::SwapBridgeClients {
+        across: crate::bridge::AcrossClient::new(http(), url.clone()).unwrap(),
+        near: crate::bridge::NearIntentsClient::new(
+            http(),
+            url.clone(),
+            fixture
+                .config
+                .bridge_profile()
+                .unwrap()
+                .one_click_quote_key(),
+        )
+        .unwrap(),
+    }
+}
+
+/// Arbitrum One, the Across orders' destination, on its own mock chain at head 30 with
+/// finality depth 1.
+async fn across_destination() -> (
+    Arc<Mutex<MockChain>>,
+    crate::settings::EffectiveChainConfig,
+    tokio::task::JoinHandle<()>,
+) {
+    let chain = Arc::new(Mutex::new(MockChain {
+        head: 30,
+        ..MockChain::new(42161, Address::ZERO, Address::ZERO)
+    }));
+    let served = chain.clone();
+    let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+        Arc::new(move |request: Value| served.lock().unwrap().respond(&request)),
+        Arc::default(),
+        Arc::default(),
+    )
+    .await;
+    let mut config =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(42161)
+            .cloned()
+            .unwrap();
+    config.enabled = true;
+    config.finality_depth = 1;
+    config.rpc_route = crate::RpcChainRoute::new(42161, vec![endpoint]);
+    (chain, config, server)
+}
+
+/// A relayer's fill of Across deposit `deposit_id` from chain 1 with the order's terms.
+fn filled_relay(
+    delivery: BridgeDelivery,
+    terms: &AcrossOrderTerms,
+    deposit_id: u64,
+) -> SpokePool::FilledRelay {
+    let recipient = address_to_bytes32(delivery.receiver);
+    SpokePool::FilledRelay {
+        inputToken: address_to_bytes32(terms.input_token),
+        outputToken: address_to_bytes32(terms.output_token),
+        inputAmount: terms.input_amount,
+        outputAmount: terms.output_amount,
+        repaymentChainId: U256::ONE,
+        originChainId: U256::ONE,
+        depositId: U256::from(deposit_id),
+        fillDeadline: terms.fill_deadline,
+        exclusivityDeadline: 0,
+        exclusiveRelayer: B256::ZERO,
+        relayer: address_to_bytes32(Address::repeat_byte(0x55)),
+        depositor: address_to_bytes32(EXECUTOR),
+        recipient,
+        messageHash: B256::ZERO,
+        relayExecutionInfo: V3RelayExecutionEventInfo {
+            updatedRecipient: recipient,
+            updatedMessageHash: B256::ZERO,
+            updatedOutputAmount: terms.output_amount,
+            fillType: 0,
+        },
+    }
+}
+
+async fn observe_bridge(
+    fixture: &Fixture,
+    clients: &crate::SwapBridgeClients,
+    destination: &crate::settings::EffectiveChainConfig,
+) -> Option<SwapBridgeOutcome> {
+    fixture
+        .owner
+        .observe_swap_bridge(fixture.operation, uid(1, 20), clients, destination)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn across_delivery_is_verified_from_finalized_destination_receipts() {
+    // 0: the deposit's fill. 1: a fill of another deposit. 2: the fill's block is reorged
+    // during the read. 3: Across reports the deposit expired. 4: a slow fill, which pays more
+    // than the signed output. 5: a fill that executes less than the signed output.
+    for scenario in 0..6 {
+        let fixture = Fixture::start().await;
+        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        fixture.record_delivery_attempt(
+            1,
+            20,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(terms)),
+        );
+        let logs = across_settlement_logs(&fixture, &terms, Some(signed_deposit(delivery, &terms)));
+        confirm_settlement(&fixture, logs).await;
+        let (destination, config, server) = across_destination().await;
+        let spoke_pool = config.bridge_profile().unwrap().spoke_pool();
+        let mut fill = filled_relay(delivery, &terms, if scenario == 1 { 43 } else { 42 });
+        let executed = match scenario {
+            4 => {
+                fill.relayExecutionInfo.fillType = 2;
+                terms.output_amount + U256::from(50)
+            }
+            5 => terms.output_amount - U256::ONE,
+            _ => terms.output_amount,
+        };
+        fill.relayExecutionInfo.updatedOutputAmount = executed;
+        {
+            let mut chain = destination.lock().unwrap();
+            chain.add_addressed_transaction(
+                30,
+                spoke_pool,
+                Bytes::new(),
+                vec![(spoke_pool, fill.encode_log_data())],
+            );
+            chain.reorg_on_receipts = scenario == 2;
+        }
+        // Across's fill transaction, amount and recipient only locate the block.
+        let status = if scenario == 3 { "expired" } else { "filled" };
+        let deposit = format!(
+            r#"{{"deposit":{{"status":"{status}","fillBlockNumber":30,"fillTx":"{}","outputAmount":"1","recipient":"{}","destinationChainId":"42161"}}}}"#,
+            B256::repeat_byte(0xf1),
+            Address::repeat_byte(0x78),
+        );
+        let (url, lookups, stub) =
+            super::swap_order::spawn_bridge_stub(move |_| deposit.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        let first = observe_bridge(&fixture, &clients, &config).await;
+        let outcome = if scenario == 3 {
+            assert_eq!(first, Some(SwapBridgeOutcome::Refunding));
+            assert!(destination.lock().unwrap().rpc_requests.is_empty());
+            first
+        } else {
+            // The fill's block isn't final at head 30.
+            assert_eq!(first, None, "scenario {scenario}");
+            destination.lock().unwrap().head = 31;
+            let outcome = observe_bridge(&fixture, &clients, &config).await;
+            let chain = destination.lock().unwrap();
+            let (transaction_hash, transaction, _) = &chain.transactions[0];
+            let block = BlockNumHash::new(30, transaction.block_hash.unwrap());
+            // The executed amount is delivered.
+            assert_eq!(
+                outcome,
+                matches!(scenario, 0 | 4).then_some(SwapBridgeOutcome::DeliveredVerified {
+                    block,
+                    transaction_hash: *transaction_hash,
+                    output_amount: executed,
+                }),
+                "scenario {scenario}"
+            );
+            assert_block_only_requests(&chain.rpc_requests, block);
+            outcome
+        };
+        let record = fixture.record();
+        assert_eq!(
+            record.swap().unwrap().orders()[0]
+                .observations()
+                .bridge_outcome,
+            outcome
+        );
+        assert_eq!(
+            state(&record, 0),
+            [
+                SwapOrderState::Done,
+                SwapOrderState::Bridging,
+                SwapOrderState::Bridging,
+                SwapOrderState::Refunding,
+                SwapOrderState::Done,
+                SwapOrderState::Bridging,
+            ][scenario],
+            "scenario {scenario}"
+        );
+        assert!(
+            lookups
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(path, _)| path == "/api/deposit?originChainId=1&depositId=42")
+        );
+        stub.abort();
+        server.abort();
+        fixture.finish().await;
+    }
+}
+
+/// Across can fill a deposit after reporting it expired. Routine polling stops at the refund,
+/// but an explicit status check asks Across again and records the verified fill.
+#[tokio::test]
+async fn an_explicit_check_corrects_an_across_refund_with_a_verified_fill() {
+    let fixture = Fixture::start().await;
+    let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+    fixture.record_delivery_attempt(
+        1,
+        20,
+        BUY,
+        SwapDelivery::Bridge(delivery),
+        Some(BridgeOrderTerms::Across(terms)),
+    );
+    let logs = across_settlement_logs(&fixture, &terms, Some(signed_deposit(delivery, &terms)));
+    confirm_settlement(&fixture, logs).await;
+    let (destination, config, server) = across_destination().await;
+    let spoke_pool = config.bridge_profile().unwrap().spoke_pool();
+    {
+        let mut chain = destination.lock().unwrap();
+        chain.add_addressed_transaction(
+            30,
+            spoke_pool,
+            Bytes::new(),
+            vec![(
+                spoke_pool,
+                filled_relay(delivery, &terms, 42).encode_log_data(),
+            )],
+        );
+        chain.head = 31;
+    }
+    let deposit = |status: &str| {
+        format!(
+            r#"{{"deposit":{{"status":"{status}","fillBlockNumber":30,"outputAmount":"1","recipient":"{}","destinationChainId":"42161"}}}}"#,
+            delivery.receiver,
+        )
+    };
+    let reply = Arc::new(Mutex::new(deposit("expired")));
+    let served = reply.clone();
+    let (url, lookups, stub) =
+        super::swap_order::spawn_bridge_stub(move |_| served.lock().unwrap().clone()).await;
+    let clients = bridge_clients(&fixture, &url);
+    assert_eq!(
+        observe_bridge(&fixture, &clients, &config).await,
+        Some(SwapBridgeOutcome::Refunding)
+    );
+    *reply.lock().unwrap() = deposit("filled");
+    assert_eq!(
+        observe_bridge(&fixture, &clients, &config).await,
+        Some(SwapBridgeOutcome::Refunding)
+    );
+    assert_eq!(lookups.lock().unwrap().len(), 1);
+    assert_eq!(fixture.record().swap_bridges_to_track().count(), 0);
+    let outcome = fixture
+        .owner
+        .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+        .await
+        .unwrap();
+    let expected = {
+        let chain = destination.lock().unwrap();
+        let (transaction_hash, transaction, _) = &chain.transactions[0];
+        SwapBridgeOutcome::DeliveredVerified {
+            block: BlockNumHash::new(30, transaction.block_hash.unwrap()),
+            transaction_hash: *transaction_hash,
+            output_amount: terms.output_amount,
+        }
+    };
+    assert_eq!(outcome, Some(expected));
+    let record = fixture.record();
+    assert_eq!(
+        record.swap().unwrap().orders()[0]
+            .observations()
+            .bridge_outcome,
+        Some(expected)
+    );
+    assert_eq!(state(&record, 0), SwapOrderState::Done);
+    stub.abort();
+    server.abort();
+    fixture.finish().await;
+}
+
+/// Across refunds an expired deposit to the stealth account, which may also hold kept surplus
+/// larger than the deposit, so its balance can't show the refund. Routine polling doesn't look
+/// the refund up. An explicit status check verifies it in the finalized receipts of the block
+/// holding the refund transaction Across names: a transfer of the deposit's input token from
+/// the `SpokePool` to the stealth account covering the deposit. The verified refund survives a
+/// restart and reconciliation, and a reorg of its block removes it.
+#[tokio::test]
+async fn an_explicit_check_verifies_an_across_refund_on_this_chain() {
+    let refund_of = |record: &ExecutorRecord| {
+        record.swap().unwrap().orders()[0]
+            .observations()
+            .bridge_refund
+    };
+    let arbitrum =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(42161)
+            .cloned()
+            .unwrap();
+    // 0: the refund. 1: from another sender. 2: of another token. 3: to another account. 4: less
+    // than the deposit.
+    for scenario in 0..5 {
+        let fixture = Fixture::start().await;
+        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        let delivery = BridgeDelivery {
+            surplus: BridgeSurplus::KeepInAccount,
+            ..delivery
+        };
+        let terms = AcrossOrderTerms {
+            input_amount: U256::from(4_000),
+            ..terms
+        };
+        fixture.record_delivery_attempt(
+            1,
+            20,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(terms)),
+        );
+        let mut logs =
+            across_settlement_logs(&fixture, &terms, Some(signed_deposit(delivery, &terms)));
+        // The post-hook keeps the surplus of 5,999 rather than shielding it.
+        logs.truncate(logs.len() - 3);
+        confirm_settlement(&fixture, logs).await;
+        let mut refund = Transfer {
+            from: terms.spoke_pool,
+            to: EXECUTOR,
+            value: terms.input_amount,
+        };
+        let mut token = BUY;
+        match scenario {
+            1 => refund.from = Address::repeat_byte(0x99),
+            2 => token = OTHER_BUY,
+            3 => refund.to = Address::repeat_byte(0x99),
+            4 => refund.value -= U256::ONE,
+            _ => {}
+        }
+        let refund_tx = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.add_addressed_transaction(
+                18,
+                terms.spoke_pool,
+                Bytes::new(),
+                vec![(token, refund.encode_log_data())],
+            );
+            chain.head = 20;
+            chain.rpc_methods.clear();
+            chain.transactions.last().unwrap().0
+        };
+        let deposit = format!(
+            r#"{{"deposit":{{"status":"expired","depositRefundTxHash":"{refund_tx}","outputAmount":"1","recipient":"{}","destinationChainId":"42161"}}}}"#,
+            delivery.receiver,
+        );
+        let (url, _, stub) = super::swap_order::spawn_bridge_stub(move |_| deposit.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        assert_eq!(
+            observe_bridge(&fixture, &clients, &arbitrum).await,
+            Some(SwapBridgeOutcome::Refunding)
+        );
+        let looked_up = |fixture: &Fixture| {
+            fixture
+                .chain
+                .lock()
+                .unwrap()
+                .rpc_methods
+                .iter()
+                .any(|method| method == "eth_getTransactionReceipt")
+        };
+        assert!(!looked_up(&fixture));
+        assert_eq!(refund_of(&fixture.record()), None);
+        assert_eq!(
+            fixture
+                .owner
+                .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &arbitrum)
+                .await
+                .unwrap(),
+            Some(SwapBridgeOutcome::Refunding)
+        );
+        assert!(looked_up(&fixture));
+        let verified = SwapObservation {
+            block: fixture.chain.lock().unwrap().block(18),
+            transaction_hash: Some(refund_tx),
+        };
+        let record = fixture.record();
+        assert_eq!(
+            refund_of(&record),
+            (scenario == 0).then_some(verified),
+            "scenario {scenario}"
+        );
+        assert_eq!(state(&record, 0), SwapOrderState::Refunding);
+        if scenario == 0 {
+            // A verified refund rules out a fill, and isn't replaced.
+            assert!(matches!(
+                fixture.store.record_swap_bridge_outcome(
+                    fixture.operation,
+                    uid(1, 20),
+                    SwapBridgeOutcome::DeliveredVerified {
+                        block: BlockNumHash::new(30, B256::repeat_byte(30)),
+                        transaction_hash: B256::repeat_byte(31),
+                        output_amount: terms.output_amount,
+                    },
+                ),
+                Err(ExecutorStoreError::InvalidRecord)
+            ));
+            assert!(matches!(
+                fixture.store.record_swap_bridge_refund(
+                    fixture.operation,
+                    uid(1, 20),
+                    SwapObservation {
+                        block: fixture.chain.lock().unwrap().block(19),
+                        ..verified
+                    },
+                ),
+                Err(ExecutorStoreError::InvalidRecord)
+            ));
+            let restarted =
+                ExecutorStore::new(fixture.db.clone(), fixture.view.clone(), 1).unwrap();
+            let restored = restarted
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == fixture.operation)
+                .unwrap();
+            assert_eq!(refund_of(&restored), Some(verified));
+            drop(restarted);
+            // The post-hook's nonce passed in the settlement.
+            fixture.chain.lock().unwrap().nonces.push((15, 3));
+            assert_eq!(refund_of(&fixture.observe(20, 14).await), Some(verified));
+            fixture.chain.lock().unwrap().reorg(18);
+            assert_eq!(refund_of(&fixture.observe(21, 14).await), None);
+        }
+        stub.abort();
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
+    let destination_tx = B256::repeat_byte(2);
+    let bnb =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(56)
+            .cloned()
+            .unwrap();
+    for (status, expected, expected_state) in [
+        (
+            "SUCCESS",
+            Some(SwapBridgeOutcome::DeliveredReported {
+                amount_out: Some(U256::from(16)),
+                transaction_hash: Some(destination_tx),
+            }),
+            SwapOrderState::Done,
+        ),
+        (
+            "REFUNDED",
+            Some(SwapBridgeOutcome::Refunding),
+            SwapOrderState::Refunding,
+        ),
+        (
+            "FAILED",
+            Some(SwapBridgeOutcome::NeedsAttention),
+            SwapOrderState::NeedsAttention,
+        ),
+        (
+            "INCOMPLETE_DEPOSIT",
+            Some(SwapBridgeOutcome::NeedsAttention),
+            SwapOrderState::NeedsAttention,
+        ),
+        ("PROCESSING", None, SwapOrderState::Bridging),
+    ] {
+        let fixture = Fixture::start().await;
+        near_handoff(&fixture, Address::repeat_byte(0x79)).await;
+        let report = format!(
+            r#"{{"status":"{status}","swapDetails":{{"amountOut":"16","destinationChainTxHashes":[{{"hash":"{destination_tx}","explorerUrl":"https://bscscan.com/tx/{destination_tx}"}}]}}}}"#
+        );
+        let (url, requests, stub) =
+            super::swap_order::spawn_bridge_stub(move |_| report.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        assert_eq!(
+            observe_bridge(&fixture, &clients, &bnb).await,
+            expected,
+            "{status}"
+        );
+        let record = fixture.record();
+        assert_eq!(
+            record.swap().unwrap().orders()[0]
+                .observations()
+                .bridge_outcome,
+            expected,
+            "{status}"
+        );
+        assert_eq!(state(&record, 0), expected_state, "{status}");
+        // Only an order without an outcome is polled again.
+        assert_eq!(
+            record.swap_bridges_to_track().count(),
+            usize::from(expected.is_none()),
+            "{status}"
+        );
+        if expected == Some(SwapBridgeOutcome::NeedsAttention) {
+            // Routine polling leaves it alone; an explicit status check asks again.
+            assert_eq!(observe_bridge(&fixture, &clients, &bnb).await, expected);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                fixture
+                    .owner
+                    .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &bnb)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(requests.lock().unwrap().len(), 2);
+        }
+        stub.abort();
         fixture.finish().await;
     }
 }

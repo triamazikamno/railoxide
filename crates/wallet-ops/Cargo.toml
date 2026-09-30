@@ -30,6 +30,7 @@ base64 = { workspace = true }
 bip39 = { version = "2", features = ["zeroize"] }
 bs58 = { workspace = true }
 chacha20poly1305 = { workspace = true }
+chrono = { workspace = true }
 cid = "0.11"
 coins-bip32 = "0.13"
 coins-ledger = { workspace = true, optional = true }

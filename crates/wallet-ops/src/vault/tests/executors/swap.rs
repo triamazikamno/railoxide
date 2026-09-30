@@ -98,6 +98,7 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
             block_timestamp: 1_700_000_000,
             updated_at: Some(1_699_990_000),
         }],
+        destination_minimum: None,
     };
     let attempt = |digest: u8, valid_to: u32, hooks: u8, post_nonce: u64| SwapAttempt {
         submission: None,
@@ -123,6 +124,7 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
             observed,
             Vec::new(),
         )),
+        bridge: None,
     };
 
     // A post-hook is admitted only alongside its pre-hook, at exactly k + 1.
@@ -251,15 +253,14 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
     assert_eq!(restored.reserved_inputs(), inputs);
     // An old order lacking per-order terms keeps the original pair after later reuse. An old
     // order without the unshield split sold its whole unshield amount. Observations from
-    // before trade amounts were kept still decode.
+    // before trade amounts or Across refunds were kept still decode, with no refund.
     let mut legacy = serde_json::to_value(&restored).unwrap();
     let legacy_order = legacy["swap"]["orders"][0].as_object_mut().unwrap();
     legacy_order.remove("terms");
-    legacy_order["observations"]
-        .as_object_mut()
-        .unwrap()
-        .remove("trade_amounts")
-        .unwrap();
+    let legacy_observations = legacy_order["observations"].as_object_mut().unwrap();
+    for field in ["trade_amounts", "bridge_refund"] {
+        legacy_observations.remove(field).unwrap();
+    }
     let legacy_bounds = legacy_order["bounds"].as_object_mut().unwrap();
     legacy_bounds.remove("unshield_amount");
     legacy_bounds.remove("unshield_fee_bps");
@@ -558,6 +559,228 @@ fn swap_records_written_before_external_delivery_decode_as_reshield() {
 }
 
 #[test]
+fn swap_records_written_by_the_external_build_decode_unchanged() {
+    // Match the named MessagePack swap record of the External build: no bridge terms,
+    // destination minimum or bridge observations.
+    #[derive(serde::Serialize)]
+    enum EarlierDelivery {
+        External { receiver: Address },
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierBounds {
+        sell_amount: U256,
+        unshield_amount: Option<U256>,
+        unshield_fee_bps: U256,
+        buy_amount: U256,
+        private_minimum: U256,
+        shield_fee_bps: U256,
+        slippage_bps: u32,
+        pre_hook_gas_limit: u64,
+        post_hook_gas_limit: Option<u64>,
+        hook_cost: Option<U256>,
+        anchors: Vec<SwapAnchorObservation>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierObservations {
+        pre_hook_executed: Option<SwapObservation>,
+        traded: Option<SwapObservation>,
+        trade_amounts: Option<SwapTradeAmounts>,
+        delivered: Option<SwapObservation>,
+        shielded: Option<SwapShieldObservation>,
+        settlement_credit: Option<SwapShieldObservation>,
+        pre_hook_dead: Option<SwapPreHookDeath>,
+        undelivered: Option<SwapObservation>,
+        expired: Option<SwapObservation>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierHook {
+        nonce: U256,
+        payload: B256,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierOrder {
+        terms: Option<SwapTerms>,
+        attempt: u32,
+        uid: FixedBytes<56>,
+        delivery: EarlierDelivery,
+        bounds: EarlierBounds,
+        pre_hook: EarlierHook,
+        post_hook: Option<EarlierHook>,
+        invalidates: Option<FixedBytes<56>>,
+        observations: EarlierObservations,
+        submission: Option<SwapSubmission>,
+        submission_status: SwapSubmissionStatus,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierSwap {
+        terms: SwapTerms,
+        proof: SwapProof,
+        orders: Vec<EarlierOrder>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierApproval {
+        bounds: EarlierBounds,
+        price_verified: Option<bool>,
+        price_acknowledged: bool,
+        delivery: EarlierDelivery,
+        tokens: Option<SwapApprovalTokens>,
+    }
+    #[derive(serde::Serialize)]
+    struct SavedRecord {
+        version: u32,
+        derivation: ExecutorDerivationScheme,
+        origin: ExecutorRecordOrigin,
+        operation: ExecutorOperationId,
+        index: u32,
+        address: Address,
+        delegate: Address,
+        retired: bool,
+        assets: Vec<ExecutorAsset>,
+        issued: Vec<IssuedExecutorPayload>,
+        swap: EarlierSwap,
+        swap_approval: EarlierApproval,
+    }
+    let receiver = Address::repeat_byte(9);
+    let bounds = || EarlierBounds {
+        sell_amount: U256::from(9_975),
+        unshield_amount: Some(U256::from(10_000)),
+        unshield_fee_bps: U256::from(25),
+        buy_amount: U256::from(9_975),
+        private_minimum: U256::from(9_975),
+        shield_fee_bps: U256::ZERO,
+        slippage_bps: 50,
+        pre_hook_gas_limit: 900_000,
+        post_hook_gas_limit: None,
+        hook_cost: Some(U256::ZERO),
+        anchors: Vec::new(),
+    };
+    let (sell, buy) = (Address::repeat_byte(5), Address::ZERO);
+    let terms = SwapTerms::new(
+        sell,
+        buy,
+        SwapRecipient::new(U256::from(7), [8; 32]),
+        B256::repeat_byte(3),
+    );
+    let traded = SwapObservation {
+        block: BlockNumHash::new(13, B256::repeat_byte(13)),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    let amounts = SwapTradeAmounts {
+        sell_amount: U256::from(9_975),
+        buy_amount: U256::from(10_100),
+        fee_amount: U256::ZERO,
+    };
+    let saved = SavedRecord {
+        version: 1,
+        derivation: ExecutorDerivationScheme::Railgun7702V1,
+        origin: ExecutorRecordOrigin::Reserved,
+        operation: ExecutorOperationId::random().unwrap(),
+        index: 7,
+        address: Address::repeat_byte(2),
+        delegate: Address::repeat_byte(1),
+        retired: false,
+        assets: vec![ExecutorAsset::Erc20(sell)],
+        issued: Vec::new(),
+        swap: EarlierSwap {
+            terms,
+            proof: SwapProof::new(B256::repeat_byte(20), Vec::new()),
+            orders: vec![EarlierOrder {
+                terms: Some(terms),
+                attempt: 0,
+                uid: FixedBytes::repeat_byte(30),
+                delivery: EarlierDelivery::External { receiver },
+                bounds: bounds(),
+                pre_hook: EarlierHook {
+                    nonce: U256::ONE,
+                    payload: B256::repeat_byte(31),
+                },
+                post_hook: None,
+                invalidates: None,
+                observations: EarlierObservations {
+                    pre_hook_executed: Some(traded),
+                    traded: Some(traded),
+                    trade_amounts: Some(amounts),
+                    delivered: Some(traded),
+                    shielded: None,
+                    settlement_credit: None,
+                    pre_hook_dead: None,
+                    undelivered: None,
+                    expired: None,
+                },
+                submission: None,
+                submission_status: SwapSubmissionStatus::Accepted,
+            }],
+        },
+        swap_approval: EarlierApproval {
+            bounds: bounds(),
+            price_verified: Some(false),
+            price_acknowledged: true,
+            delivery: EarlierDelivery::External { receiver },
+            tokens: Some(SwapApprovalTokens { sell, buy }),
+        },
+    };
+    let record: ExecutorRecord =
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&saved).unwrap()).unwrap();
+
+    let delivery = SwapDelivery::External { receiver };
+    let swap = record.swap().unwrap();
+    let order = &swap.orders()[0];
+    assert_eq!(
+        (order.delivery(), order.post_hook(), order.bridge()),
+        (delivery, None, None)
+    );
+    assert_eq!(order.bounds().destination_minimum, None);
+    assert_eq!(
+        order.observations(),
+        SwapOrderObservations {
+            pre_hook_executed: Some(traded),
+            traded: Some(traded),
+            trade_amounts: Some(amounts),
+            delivered: Some(traded),
+            ..SwapOrderObservations::default()
+        }
+    );
+    assert!(swap.admits_attempt());
+    let approval = record.swap_approval().unwrap();
+    assert_eq!(
+        (
+            approval.delivery,
+            approval.tokens,
+            approval.bounds.destination_minimum
+        ),
+        (delivery, Some(SwapApprovalTokens { sell, buy }), None)
+    );
+
+    // Bridge approvals round-trip for each provider, with their destination terms.
+    for (provider, surplus) in [
+        (BridgeProvider::Across, BridgeSurplus::Reshield),
+        (
+            BridgeProvider::NearIntents,
+            BridgeSurplus::BridgedByProvider,
+        ),
+    ] {
+        let mut bridged = approval.clone();
+        bridged.delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider,
+            destination_chain: 137,
+            receiver,
+            destination_token: Address::repeat_byte(10),
+            surplus,
+        });
+        bridged.bounds.destination_minimum = Some(U256::from(9_900));
+        bridged.tokens = Some(SwapApprovalTokens {
+            sell,
+            buy: Address::repeat_byte(6),
+        });
+        assert_eq!(
+            rmp_serde::from_slice::<SwapApproval>(&rmp_serde::to_vec_named(&bridged).unwrap())
+                .unwrap(),
+            bridged
+        );
+    }
+}
+
+#[test]
 fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_next() {
     let (root, db, vault) = desktop_store_with_vault();
     let view = Arc::new(import_wallet_with_metadata(
@@ -641,6 +864,7 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
             post_hook_gas_limit: None,
             hook_cost: Some(U256::ZERO),
             anchors: Vec::new(),
+            destination_minimum: None,
         },
         invalidates: None,
         pre_hook: hook(
@@ -652,6 +876,7 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
             inputs.clone(),
         ),
         post_hook,
+        bridge: None,
     };
 
     // The post-hook's presence must match the delivery kind.
@@ -717,11 +942,11 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
         fee: None,
     };
     assert!(matches!(
-        store.record_swap_settlement(operation, order.uid(), traded, amounts, Some(credit)),
+        store.record_swap_settlement(operation, order.uid(), traded, amounts, Some(credit), None),
         Err(ExecutorStoreError::InvalidRecord)
     ));
     let settled = store
-        .record_swap_settlement(operation, order.uid(), traded, amounts, None)
+        .record_swap_settlement(operation, order.uid(), traded, amounts, None, None)
         .unwrap();
     let observations = settled.swap().unwrap().orders()[0].observations();
     assert_eq!(
@@ -752,6 +977,479 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
         recorded.swap().unwrap().orders()[1].pre_hook().nonce(),
         U256::from(2)
     );
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let delegate = Address::repeat_byte(1);
+    let executor = Address::repeat_byte(2);
+    let sell = Address::repeat_byte(5);
+    store
+        .reserve(operation, delegate, None, &[ExecutorAsset::Erc20(sell)])
+        .unwrap();
+    store.bind_address(operation, executor).unwrap();
+    let before_setup =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    store.reconcile(operation, before_setup, &[]).unwrap();
+    let setup = B256::repeat_byte(3);
+    store
+        .record_issued(
+            operation,
+            hook(
+                ExecutorPayloadPurpose::Operation,
+                0,
+                3,
+                delegate,
+                before_setup,
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+    let setup_won = (
+        setup,
+        ExecutorPayloadInclusion::new(
+            BlockNumHash::new(11, B256::repeat_byte(11)),
+            B256::repeat_byte(4),
+            ExecutorExecutionResult::Executed,
+        ),
+    );
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    store.reconcile(operation, observed, &[setup_won]).unwrap();
+
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
+        2,
+        3,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    let inputs = vec![ExecutorInputIdentity::from_utxo(&input)];
+    let receiver = Address::repeat_byte(9);
+    let across = BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: 137,
+        receiver,
+        destination_token: Address::repeat_byte(10),
+        surplus: BridgeSurplus::KeepInAccount,
+    };
+    let near = BridgeDelivery {
+        provider: BridgeProvider::NearIntents,
+        destination_chain: 56,
+        receiver,
+        destination_token: Address::ZERO,
+        surplus: BridgeSurplus::BridgedByProvider,
+    };
+    let across_terms = BridgeOrderTerms::Across(AcrossOrderTerms {
+        spoke_pool: Address::repeat_byte(11),
+        input_token: Address::repeat_byte(6),
+        output_token: Address::repeat_byte(10),
+        input_amount: U256::from(9_975),
+        output_amount: U256::from(9_900),
+        quote_timestamp: 1_700_000_000,
+        fill_deadline: 1_700_021_600,
+        exclusive_relayer: Address::ZERO,
+        exclusivity_parameter: 0,
+    });
+    let near_terms = BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+        deposit_address: Address::repeat_byte(12),
+        min_amount_out: U256::from(15),
+        amount_out: U256::from(16),
+        deadline: "2026-09-30T01:00:00.000Z".into(),
+        signed_quote: r#"{"signature":"ed25519:..."}"#.into(),
+    });
+    // The pre-hook takes nonce `k`, the Across post-hook `k + 1`. The bought intermediate is
+    // `buy`; the destination token lives only in the delivery.
+    let attempt =
+        |delivery: SwapDelivery,
+         bridge: Option<BridgeOrderTerms>,
+         post_hook: bool,
+         (buy, uid, nonce, observed): (u8, u8, u64, ExecutorNonceObservation)| {
+            SwapAttempt {
+                terms: SwapTerms::new(
+                    sell,
+                    Address::repeat_byte(buy),
+                    SwapRecipient::new(U256::from(7), [8; 32]),
+                    setup,
+                ),
+                proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+                uid: OrderUid::new(B256::repeat_byte(uid), executor, 1_000),
+                submission: None,
+                delivery,
+                bounds: SwapApprovedBounds {
+                    sell_amount: U256::from(9_975),
+                    unshield_amount: Some(U256::from(10_000)),
+                    unshield_fee_bps: U256::from(25),
+                    buy_amount: U256::from(9_975),
+                    private_minimum: U256::from(9_975),
+                    shield_fee_bps: U256::ZERO,
+                    slippage_bps: 50,
+                    pre_hook_gas_limit: 900_000,
+                    post_hook_gas_limit: post_hook.then_some(400_000),
+                    hook_cost: Some(U256::ZERO),
+                    anchors: Vec::new(),
+                    destination_minimum: Some(U256::from(9_900)),
+                },
+                invalidates: None,
+                pre_hook: hook(
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    nonce,
+                    uid + 1,
+                    delegate,
+                    observed,
+                    inputs.clone(),
+                ),
+                post_hook: post_hook.then(|| {
+                    hook(
+                        ExecutorPayloadPurpose::SwapPostHook,
+                        nonce + 1,
+                        uid + 2,
+                        delegate,
+                        observed,
+                        Vec::new(),
+                    )
+                }),
+                bridge,
+            }
+        };
+    let first = (6, 30, 1, observed);
+
+    // Across posts a post-hook and NEAR Intents doesn't. Each order carries its own provider's
+    // terms, with a surplus choice that provider supports.
+    for mismatched in [
+        attempt(
+            SwapDelivery::Bridge(across),
+            Some(across_terms.clone()),
+            false,
+            first,
+        ),
+        attempt(
+            SwapDelivery::Bridge(near),
+            Some(near_terms.clone()),
+            true,
+            first,
+        ),
+        attempt(SwapDelivery::Bridge(across), None, true, first),
+        attempt(
+            SwapDelivery::Bridge(across),
+            Some(near_terms.clone()),
+            true,
+            first,
+        ),
+        attempt(
+            SwapDelivery::Bridge(BridgeDelivery {
+                surplus: BridgeSurplus::BridgedByProvider,
+                ..across
+            }),
+            Some(across_terms.clone()),
+            true,
+            first,
+        ),
+        attempt(
+            SwapDelivery::Bridge(BridgeDelivery {
+                surplus: BridgeSurplus::Reshield,
+                ..near
+            }),
+            Some(near_terms.clone()),
+            false,
+            first,
+        ),
+        attempt(
+            SwapDelivery::Reshield,
+            Some(across_terms.clone()),
+            true,
+            first,
+        ),
+    ] {
+        assert!(matches!(
+            store.record_swap_attempt(operation, mismatched),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+    }
+    let recorded = store
+        .record_swap_attempt(
+            operation,
+            attempt(
+                SwapDelivery::Bridge(across),
+                Some(across_terms.clone()),
+                true,
+                first,
+            ),
+        )
+        .unwrap();
+    let [_, pre_hook, post_hook] = recorded.issued() else {
+        panic!("an Across attempt issues its pre-hook and post-hook");
+    };
+    assert_eq!(
+        (pre_hook.nonce(), post_hook.nonce()),
+        (U256::ONE, U256::from(2))
+    );
+    let order = &recorded.swap().unwrap().orders()[0];
+    assert_eq!(order.bridge(), Some(&across_terms));
+    // A skipped post-hook or a refund leaves the intermediate in the stealth account.
+    assert_eq!(
+        recorded.assets(),
+        &[
+            ExecutorAsset::Erc20(sell),
+            ExecutorAsset::Erc20(Address::repeat_byte(6))
+        ]
+    );
+
+    // Across hands off in the trade's receipt, with a deposit id. Kept surplus has no credit.
+    let traded = SwapObservation {
+        block: BlockNumHash::new(13, B256::repeat_byte(13)),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    let amounts = SwapTradeAmounts {
+        sell_amount: U256::from(9_975),
+        buy_amount: U256::from(10_000),
+        fee_amount: U256::ZERO,
+    };
+    let deposit = SwapBridgeHandoff {
+        observation: traded,
+        deposit_id: Some(U256::from(77)),
+    };
+    let credit = SwapShieldObservation {
+        observation: traded,
+        private_amount: U256::from(20),
+        fee: None,
+    };
+    let elsewhere = SwapObservation {
+        transaction_hash: Some(B256::repeat_byte(51)),
+        ..traded
+    };
+    for (credit, handoff) in [
+        (
+            None,
+            Some(SwapBridgeHandoff {
+                deposit_id: None,
+                ..deposit
+            }),
+        ),
+        (
+            None,
+            Some(SwapBridgeHandoff {
+                observation: elsewhere,
+                ..deposit
+            }),
+        ),
+        (Some(credit), Some(deposit)),
+    ] {
+        assert!(matches!(
+            store.record_swap_settlement(operation, order.uid(), traded, amounts, credit, handoff),
+            Err(ExecutorStoreError::InvalidRecord)
+        ));
+    }
+    let settled = store
+        .record_swap_settlement(operation, order.uid(), traded, amounts, None, Some(deposit))
+        .unwrap();
+    let observations = settled.swap().unwrap().orders()[0].observations();
+    assert_eq!(
+        (observations.delivered, observations.bridge_handoff),
+        (Some(traded), Some(deposit))
+    );
+    // Handed off, but not yet delivered on the destination chain.
+    assert!(!settled.swap().unwrap().admits_attempt());
+    let tracked = |record: &ExecutorRecord| {
+        record
+            .swap_bridges_to_track()
+            .map(SwapOrderRecord::uid)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tracked(&settled), vec![order.uid()]);
+    let verified = |output_amount: u64| SwapBridgeOutcome::DeliveredVerified {
+        block: BlockNumHash::new(500, B256::repeat_byte(60)),
+        transaction_hash: B256::repeat_byte(61),
+        output_amount: U256::from(output_amount),
+    };
+    // Across may fill a deposit it reported expired. Only a verified fill of at least the
+    // approved minimum replaces the refund.
+    let refunding = store
+        .record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::Refunding)
+        .unwrap();
+    assert!(tracked(&refunding).is_empty());
+    for replacement in [
+        SwapBridgeOutcome::NeedsAttention,
+        SwapBridgeOutcome::DeliveredReported {
+            amount_out: Some(U256::from(9_900)),
+            transaction_hash: None,
+        },
+        verified(9_899),
+    ] {
+        assert!(matches!(
+            store.record_swap_bridge_outcome(operation, order.uid(), replacement),
+            Err(ExecutorStoreError::InvalidRecord)
+        ));
+    }
+    let delivered = store
+        .record_swap_bridge_outcome(operation, order.uid(), verified(9_900))
+        .unwrap();
+    assert!(delivered.swap().unwrap().admits_attempt());
+    assert!(tracked(&delivered).is_empty());
+    // A final outcome stays, and the delivery doesn't turn back into a refund; recording it
+    // again changes nothing.
+    assert!(matches!(
+        store.record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::Refunding),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    let delivered = store
+        .record_swap_bridge_outcome(operation, order.uid(), verified(9_900))
+        .unwrap();
+
+    // The Across deposit, found where the nonce passed `k + 1`, shows the post-hook took it.
+    let after_trade =
+        ExecutorNonceObservation::new(BlockNumHash::new(14, B256::repeat_byte(14)), U256::from(3));
+    assert!(delivered.settled_swaps_at(after_trade.block().number));
+    let refreshed = store
+        .refresh_settled_swap_nonce(&delivered, after_trade)
+        .unwrap();
+    assert_eq!(refreshed.swap_hook_winner(U256::from(2)), None);
+    let deposited = store
+        .record_swap_observations(
+            operation,
+            order.uid(),
+            SwapOrderObservations {
+                post_hook_deposit: Some(traded),
+                ..refreshed.swap().unwrap().orders()[0].observations()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        deposited.swap_hook_winner(U256::from(2)),
+        Some(B256::repeat_byte(32))
+    );
+
+    // NEAR Intents pays its deposit address and issues only the pre-hook.
+    let recorded = store
+        .record_swap_attempt(
+            operation,
+            attempt(
+                SwapDelivery::Bridge(near),
+                Some(near_terms.clone()),
+                false,
+                (7, 40, 3, after_trade),
+            ),
+        )
+        .unwrap();
+    assert_eq!(recorded.issued().len(), 4);
+    assert_eq!(
+        recorded.assets(),
+        &[
+            ExecutorAsset::Erc20(sell),
+            ExecutorAsset::Erc20(Address::repeat_byte(6)),
+            ExecutorAsset::Erc20(Address::repeat_byte(7))
+        ]
+    );
+    let order = recorded.swap().unwrap().orders()[1].clone();
+    // No outcome before its hand-off.
+    assert!(matches!(
+        store.record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::NeedsAttention),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    let traded = SwapObservation {
+        block: BlockNumHash::new(15, B256::repeat_byte(15)),
+        transaction_hash: Some(B256::repeat_byte(52)),
+    };
+    let handoff = SwapBridgeHandoff {
+        observation: traded,
+        deposit_id: None,
+    };
+    // Its deposit address, not a deposit id, identifies the transfer, and it shields nothing.
+    for (credit, handoff) in [
+        (
+            None,
+            Some(SwapBridgeHandoff {
+                deposit_id: Some(U256::from(77)),
+                ..handoff
+            }),
+        ),
+        (
+            Some(SwapShieldObservation {
+                observation: traded,
+                ..credit
+            }),
+            Some(handoff),
+        ),
+    ] {
+        assert!(matches!(
+            store.record_swap_settlement(operation, order.uid(), traded, amounts, credit, handoff),
+            Err(ExecutorStoreError::InvalidRecord)
+        ));
+    }
+    store
+        .record_swap_settlement(operation, order.uid(), traded, amounts, None, Some(handoff))
+        .unwrap();
+    // After a restart, the handed-off order without an outcome is polled again.
+    drop(store);
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let reopened = store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap();
+    assert_eq!(tracked(&reopened), vec![order.uid()]);
+    let attention = store
+        .record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::NeedsAttention)
+        .unwrap();
+    assert!(!attention.swap().unwrap().admits_attempt());
+    // Needs attention waits for an explicit status check.
+    assert!(tracked(&attention).is_empty());
+
+    // Both providers' terms and outcomes survive the store's encoding and a restart.
+    drop(store);
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let restored = store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap();
+    assert_eq!(restored, attention);
+    assert_eq!(
+        restored.swap().unwrap().orders()[1].bridge(),
+        Some(&near_terms)
+    );
+
+    // A status check may replace NeedsAttention. A refund is final, and like an undelivered
+    // reshield it keeps the account from another attempt.
+    let refunding = store
+        .record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::Refunding)
+        .unwrap();
+    assert!(!refunding.swap().unwrap().admits_attempt());
+    assert!(matches!(
+        store.record_swap_bridge_outcome(
+            operation,
+            order.uid(),
+            SwapBridgeOutcome::DeliveredReported {
+                amount_out: Some(U256::from(16)),
+                transaction_hash: None,
+            },
+        ),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    // Only an Across refund can turn out delivered.
+    assert!(matches!(
+        store.record_swap_bridge_outcome(operation, order.uid(), verified(9_900)),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
     drop(store);
     drop(view);
     drop(vault);

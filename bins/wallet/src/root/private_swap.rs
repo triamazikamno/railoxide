@@ -6,7 +6,7 @@
 //! from its encrypted executor record, so the card and its progress survive a restart. The
 //! wallet-ops executor owner performs every chain, orderbook, signing, and submission step.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,10 +22,11 @@ use wallet_ops::{
     TransactionGenerationStage, WakuDeliveryClient, WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
     is_swap_record,
-    settings::{ExecutorProfile, SwapProfile, SwapTokenEligibility},
+    settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
     swap_setup_recorded_executed,
     vault::{
-        ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload, SwapDelivery, SwapOrderRecord,
+        ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload, SwapBridgeOutcome,
+        SwapDelivery, SwapOrderRecord,
     },
 };
 
@@ -38,7 +39,10 @@ mod model;
 mod progress;
 
 use form::SwapForm;
-use model::{SwapFillHint, SwapLabels, swap_history_start, swap_observation_range};
+use model::{
+    SwapBridgeLabels, SwapFillHint, SwapLabels, bridge_sent_amount, swap_history_start,
+    swap_observation_range,
+};
 pub(super) use model::{
     SwapStage, swap_account_status, swap_delivery, swap_pair_label, swap_recovery_token,
     swap_sell_amount, swap_stage, swap_tokens,
@@ -46,6 +50,8 @@ pub(super) use model::{
 
 /// Delay between caught-up observation passes, and before retrying failed reads.
 const SWAP_OBSERVATION_INTERVAL: Duration = Duration::from_secs(12);
+/// Longest wait between routine polls of a bridge provider about one order.
+const MAX_BRIDGE_POLL_INTERVAL: Duration = Duration::from_mins(5);
 /// A setup still unconfirmed this many blocks (about 30 minutes) after it was sent is checked
 /// only every [`DEFERRED_SETUP_OBSERVATION_INTERVAL`], sparing the account repeated RPC reads.
 const STALE_SETUP_BLOCKS: u64 = 150;
@@ -69,7 +75,7 @@ pub(super) struct SwapAuthorization {
 #[derive(Clone)]
 enum SwapAction {
     Setup(Box<form::SetupApproval>),
-    Order(form::OrderApproval),
+    Order(Box<form::OrderApproval>),
     Cancel(Box<progress::CancelApproval>),
 }
 
@@ -158,6 +164,14 @@ struct SwapTracking {
     order_hint: Option<SwapOrderHint>,
     /// The app-data budget after the orderbook rejected an order's size.
     byte_budget: Option<usize>,
+    /// Routine bridge provider polls of handed-off orders without an outcome, which back off.
+    bridge_polls: HashMap<OrderUid, BridgePoll>,
+    /// Bridge provider clients on the `orderbook` route, kept with it for status checks.
+    bridge_clients: Option<wallet_ops::SwapBridgeClients>,
+    /// The bought token in the stealth account, and the block it was read at, from this
+    /// session's last explicit check of a Bridge swap's refund or undelivered deposit. Recovery
+    /// of a refund waits for it, and opens with it.
+    stealth_balance: Option<(U256, alloy::eips::BlockNumHash)>,
     /// Stage of the setup handed to a broadcaster in this session.
     setup_stage: Option<watch::Receiver<TransactionGenerationStage>>,
     setup_watch: Option<Task<()>>,
@@ -167,6 +181,30 @@ struct SwapTracking {
     /// wallet checks the approved terms again and asks to place the order without waiting
     /// for the user to return. Cleared after the first attempt, so failures don't repeat.
     auto_place: bool,
+}
+
+/// A swap's name, after the token its receiver gets on a Bridge swap's destination network.
+fn bridge_pair_label(labels: &SwapLabels, bridge: Option<&SwapBridgeLabels>) -> String {
+    swap_pair_label(
+        &labels.sell,
+        bridge.map_or(&labels.buy_symbol, |bridge| &bridge.token),
+    )
+}
+
+/// Consecutive bridge provider polls of one order that returned no outcome, and when the next
+/// is due.
+#[derive(Clone, Copy)]
+struct BridgePoll {
+    attempts: u32,
+    next_at: Instant,
+}
+
+/// The wait after `attempts` consecutive bridge polls without an outcome: the observation
+/// interval, doubled after each, up to [`MAX_BRIDGE_POLL_INTERVAL`].
+fn bridge_poll_interval(attempts: u32) -> Duration {
+    SWAP_OBSERVATION_INTERVAL
+        .saturating_mul(2_u32.saturating_pow(attempts))
+        .min(MAX_BRIDGE_POLL_INTERVAL)
 }
 
 /// What the orderbook last reported about one order.
@@ -192,6 +230,9 @@ pub(super) struct PrivateSwapsView {
     /// it changes, so wakes during a pass coalesce into one follow-up pass.
     observation_wake: watch::Sender<u64>,
     tracking: BTreeMap<ExecutorOperationId, SwapTracking>,
+    /// My orders' open swaps, counted again whenever the view changes rather than on every
+    /// frame.
+    open_orders: usize,
     /// The open swap dialog's view, and its focus, which tells it apart from unrelated modal
     /// work.
     dialog: Option<dialog::SwapDialog>,
@@ -282,6 +323,31 @@ impl WalletRoot {
             .map(|panel| panel.view.clone())
     }
 
+    /// Read the swap form's balances again once a private snapshot of `chain_id` replaced the
+    /// root's. The swap view hears of the same observation on its own and may read the root
+    /// before this update, so it reads again after it.
+    pub(super) fn refresh_private_swap_assets(&self, chain_id: u64, cx: &mut Context<'_, Self>) {
+        if self
+            .private_swaps
+            .as_ref()
+            .is_none_or(|panel| panel.session.chain_id != chain_id)
+        {
+            return;
+        }
+        let Some(view) = self.private_swaps_view() else {
+            return;
+        };
+        let view = view.downgrade();
+        cx.defer(move |cx| {
+            let _ = view.update(cx, |view, cx| {
+                if view.form.is_some() {
+                    view.refresh_form_assets(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
     /// The selected chain's swap profile, when this wallet can run executor operations there.
     pub(super) fn private_swap_profile(&self) -> Option<SwapProfile> {
         self.private_swaps_view()?;
@@ -340,7 +406,7 @@ impl PrivateSwapsView {
         owner: Arc<ExecutorOwner>,
         runtime: tokio::runtime::Handle,
         window: &Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut changes = owner.subscribe();
         let mut private_changes = session.observation_rx.clone();
@@ -360,6 +426,7 @@ impl PrivateSwapsView {
                         if this.session_is_current(cx) {
                             if reload {
                                 this.reload_records();
+                                this.refresh_form_assets(cx);
                             }
                             cx.notify();
                         }
@@ -370,6 +437,14 @@ impl PrivateSwapsView {
                 }
             }
         });
+        // Every change to the records, tracking or jobs notifies, so the open count follows
+        // notifications. It reads the root, which is busy creating this view, so the first
+        // count waits for the first notification; opening the dialog sends one.
+        cx.observe_self(|this, cx| {
+            let open = this.open_order_count(cx);
+            this.open_orders = open;
+        })
+        .detach();
         let observation_wake = watch::channel(0).0;
         let mut wake = observation_wake.subscribe();
         let polling = cx.spawn_in(window, async move |this, cx| {
@@ -456,6 +531,7 @@ impl PrivateSwapsView {
             setup_inclusions: None,
             observation_wake,
             tracking: BTreeMap::new(),
+            open_orders: 0,
             dialog: None,
             orders_filter: None,
             orders_list: None,
@@ -635,9 +711,18 @@ impl PrivateSwapsView {
         token: Address,
         cx: &gpui::App,
     ) -> Option<super::tokens::TokenDisplayMetadata> {
+        self.chain_token_metadata(self.session.chain_id, token, cx)
+    }
+
+    /// [`Self::token_metadata`] on `chain_id`, such as a Bridge swap's destination network.
+    fn chain_token_metadata(
+        &self,
+        chain_id: u64,
+        token: Address,
+        cx: &gpui::App,
+    ) -> Option<super::tokens::TokenDisplayMetadata> {
         let root = self.root.upgrade()?;
         let root = root.read(cx);
-        let chain_id = self.session.chain_id;
         if token == Address::ZERO {
             let native = &root.effective_chain_configs.get(chain_id)?.native_currency;
             return Some(super::tokens::TokenDisplayMetadata {
@@ -680,16 +765,20 @@ impl PrivateSwapsView {
 
     fn labels(&self, record: &ExecutorRecord, cx: &gpui::App) -> SwapLabels {
         if let Some(pending) = self.pending_order(record) {
+            let labels = self.order_labels(
+                (pending.sell, pending.buy),
+                Some(pending.amount),
+                None,
+                None,
+                cx,
+            );
+            let bridge = self.bridge_labels(pending.delivery, pending.buy, None, None, cx);
             return SwapLabels {
+                pair: bridge_pair_label(&labels, bridge.as_ref()),
                 receiver: self.receiver_name(pending.delivery, cx),
                 minimum: Some(self.token_amount(pending.buy, pending.private_minimum, cx)),
-                ..self.order_labels(
-                    (pending.sell, pending.buy),
-                    Some(pending.amount),
-                    None,
-                    None,
-                    cx,
-                )
+                bridge,
+                ..labels
             };
         }
         let Some((sell, buy)) = swap_tokens(record) else {
@@ -703,6 +792,7 @@ impl PrivateSwapsView {
                 received: None,
                 receiver: None,
                 minimum: None,
+                bridge: None,
             };
         };
         let amount = swap_sell_amount(record).or_else(|| {
@@ -716,10 +806,17 @@ impl PrivateSwapsView {
             return labels;
         }
         // Before its first order, the swap delivers as approved with its setup.
+        let delivery = swap_delivery(record);
+        let destination_minimum = record
+            .swap_approval()
+            .and_then(|approval| approval.bounds.destination_minimum);
+        let bridge = self.bridge_labels(delivery, buy, None, destination_minimum, cx);
         SwapLabels {
-            receiver: self.receiver_name(swap_delivery(record), cx),
+            pair: bridge_pair_label(&labels, bridge.as_ref()),
+            receiver: self.receiver_name(delivery, cx),
             minimum: model::swap_private_minimum(record)
                 .map(|minimum| self.token_amount(buy, minimum, cx)),
+            bridge,
             ..labels
         }
     }
@@ -765,22 +862,42 @@ impl PrivateSwapsView {
         let sell_symbol = self.token_symbol(sell, cx);
         let buy_symbol = self.token_symbol(buy, cx);
         let sell_label = amount.map_or(sell_symbol, |amount| self.token_amount(sell, amount, cx));
-        let received = order
-            .and_then(|order| {
-                let observed = order.observations();
-                match order.delivery() {
-                    SwapDelivery::Reshield => observed.shielded.map(|shield| shield.private_amount),
-                    // The trade paid the receiver directly.
-                    SwapDelivery::External { .. } => observed
-                        .delivered
-                        .and(observed.trade_amounts)
-                        .map(|trade| trade.buy_amount),
+        let received = order.and_then(|order| {
+            let observed = order.observations();
+            let amount = match order.delivery() {
+                SwapDelivery::Reshield => observed.shielded.map(|shield| shield.private_amount),
+                // The trade paid the receiver directly.
+                SwapDelivery::External { .. } => observed
+                    .delivered
+                    .and(observed.trade_amounts)
+                    .map(|trade| trade.buy_amount),
+                // The destination network's token and amount, verified or reported.
+                SwapDelivery::Bridge(bridge) => {
+                    let amount = match observed.bridge_outcome? {
+                        SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => {
+                            Some(output_amount)
+                        }
+                        SwapBridgeOutcome::DeliveredReported { amount_out, .. } => amount_out,
+                        SwapBridgeOutcome::Refunding | SwapBridgeOutcome::NeedsAttention => None,
+                    }?;
+                    return Some(self.network_token_amount(
+                        bridge.destination_chain,
+                        self.bridge_received_token(bridge, cx),
+                        amount,
+                        cx,
+                    ));
                 }
-            })
-            .map(|amount| self.token_amount(buy, amount, cx));
+            };
+            amount.map(|amount| self.token_amount(buy, amount, cx))
+        });
         let valid_to = order.map(|order| u64::from(order.valid_to()));
+        let bridge = order
+            .and_then(|order| self.bridge_labels(order.delivery(), buy, Some(order), None, cx));
         SwapLabels {
-            pair: swap_pair_label(&sell_label, &buy_symbol),
+            pair: swap_pair_label(
+                &sell_label,
+                bridge.as_ref().map_or(&buy_symbol, |bridge| &bridge.token),
+            ),
             sell: sell_label,
             buy_symbol,
             expires: valid_to.map(local_time_label),
@@ -789,7 +906,52 @@ impl PrivateSwapsView {
             received,
             receiver: order.and_then(|order| self.receiver_name(order.delivery(), cx)),
             minimum: order.map(|order| self.token_amount(buy, order.bounds().private_minimum, cx)),
+            bridge,
         }
+    }
+
+    /// How swaps name a Bridge delivery of `buy`: its network, provider and receiver, and from
+    /// `order`, what it handed to the bridge and its approved destination minimum. Before an
+    /// order exists, `destination_minimum` is the one approved with the setup. `None` for
+    /// delivery on this network.
+    fn bridge_labels(
+        &self,
+        delivery: SwapDelivery,
+        buy: Address,
+        order: Option<&SwapOrderRecord>,
+        destination_minimum: Option<U256>,
+        cx: &gpui::App,
+    ) -> Option<SwapBridgeLabels> {
+        let SwapDelivery::Bridge(bridge) = delivery else {
+            return None;
+        };
+        Some(SwapBridgeLabels {
+            provider: bridge.provider,
+            network: form::network_name(bridge.destination_chain),
+            token: self.network_token_symbol(
+                bridge.destination_chain,
+                self.bridge_received_token(bridge, cx),
+                cx,
+            ),
+            origin: form::network_name(self.session.chain_id),
+            receiver: self
+                .receiver_label(bridge.receiver, cx)
+                .map_or_else(|| short_receiver(bridge.receiver), |(label, _)| label),
+            sent: order
+                .and_then(bridge_sent_amount)
+                .map(|amount| self.token_amount(buy, amount, cx)),
+            minimum: order
+                .and_then(|order| order.bounds().destination_minimum)
+                .or(destination_minimum)
+                .map(|minimum| {
+                    self.network_token_amount(
+                        bridge.destination_chain,
+                        self.bridge_received_token(bridge, cx),
+                        minimum,
+                        cx,
+                    )
+                }),
+        })
     }
 
     /// How swaps name a Public address receiver: the wallet's label for it, or its short
@@ -938,6 +1100,10 @@ impl PrivateSwapsView {
     /// Orders to ask the orderbook about in this pass, at most one report each. An open order
     /// is asked about until its settlement is verified, including fills while offline.
     /// These reports only locate evidence; they cannot change a persisted outcome.
+    ///
+    /// Handed-off Bridge orders ask their provider through the same route until an outcome is
+    /// recorded, including after a restart, backing off while it reports none. A destination
+    /// chain that isn't enabled here isn't tracked.
     fn next_order_hints(
         &self,
         cx: &gpui::App,
@@ -945,7 +1111,12 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) {
             return None;
         }
+        let root = self.root.upgrade();
+        let chains = root
+            .as_ref()
+            .map(|root| &root.read(cx).effective_chain_configs);
         let busy = self.job.as_ref().map(|job| job.operation);
+        let now = Instant::now();
         let requests = self
             .records
             .iter()
@@ -965,10 +1136,29 @@ impl PrivateSwapsView {
                                 | SwapOrderState::Traded,
                         )
                 );
-                wanted.then(|| HintRequest {
+                let bridges = record
+                    .swap_bridges_to_track()
+                    .filter(|order| {
+                        tracking
+                            .and_then(|tracking| tracking.bridge_polls.get(&order.uid()))
+                            .is_none_or(|poll| poll.next_at <= now)
+                    })
+                    .filter_map(|order| {
+                        let SwapDelivery::Bridge(delivery) = order.delivery() else {
+                            return None;
+                        };
+                        let chain = chains?
+                            .get(delivery.destination_chain)
+                            .filter(|chain| chain.enabled)?;
+                        Some((order.uid(), chain.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                (wanted || !bridges.is_empty()).then(|| HintRequest {
                     operation: record.operation(),
                     uid: order.uid(),
+                    hint: wanted,
                     client: tracking.and_then(|tracking| tracking.orderbook.clone()),
+                    bridges,
                 })
             })
             .collect::<Vec<_>>();
@@ -979,10 +1169,29 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) {
             return;
         }
+        let now = Instant::now();
         for result in results {
             let tracking = self.tracking.entry(result.operation).or_default();
             if tracking.orderbook.is_none() {
                 tracking.orderbook = result.client;
+            }
+            // An outcome ends the order's polling; otherwise the next poll waits longer.
+            for (uid, outcome) in result.bridges {
+                if outcome {
+                    tracking.bridge_polls.remove(&uid);
+                } else {
+                    let attempts = tracking
+                        .bridge_polls
+                        .get(&uid)
+                        .map_or(0, |poll| poll.attempts);
+                    tracking.bridge_polls.insert(
+                        uid,
+                        BridgePoll {
+                            attempts: attempts.saturating_add(1),
+                            next_at: now + bridge_poll_interval(attempts),
+                        },
+                    );
+                }
             }
             let Some((report, trade_block)) = result.report else {
                 continue;
@@ -999,6 +1208,20 @@ impl PrivateSwapsView {
                 } else {
                     None
                 },
+            });
+        }
+        // Forget orders that are no longer tracked, such as those with a recorded outcome.
+        let records = &self.records;
+        for (operation, tracking) in &mut self.tracking {
+            let record = records
+                .iter()
+                .find(|record| record.operation() == *operation);
+            tracking.bridge_polls.retain(|uid, _| {
+                record.is_some_and(|record| {
+                    record
+                        .swap_bridges_to_track()
+                        .any(|order| order.uid() == *uid)
+                })
             });
         }
         cx.notify();
@@ -1285,7 +1508,7 @@ impl PrivateSwapsView {
                 self.submit_setup(*approval, authorization, window, cx);
             }
             SwapAction::Order(approval) => {
-                self.submit_order(approval, authorization, window, cx);
+                self.submit_order(*approval, authorization, window, cx);
             }
             SwapAction::Cancel(approval) => {
                 self.submit_cancellation(*approval, authorization, window, cx);
@@ -1397,20 +1620,28 @@ struct ObservationResult {
 struct HintRequest {
     operation: ExecutorOperationId,
     uid: OrderUid,
+    /// Whether to ask the orderbook about `uid`.
+    hint: bool,
     /// The swap's own orderbook route, when this session has one.
     client: Option<CowOrderbookClient>,
+    /// Handed-off Bridge orders to poll, with their destination chain.
+    bridges: Vec<(OrderUid, EffectiveChainConfig)>,
 }
 
 struct HintResult {
     operation: ExecutorOperationId,
     uid: OrderUid,
     client: Option<CowOrderbookClient>,
+    /// Each polled Bridge order, and whether it has an outcome now.
+    bridges: Vec<(OrderUid, bool)>,
     /// The report and trade block, or `None` when the orderbook couldn't be asked.
     report: Option<(CowOrderStatusReport, Option<u64>)>,
 }
 
 /// Ask the orderbook about each order through its swap's own route, sending only the order
 /// UID. A failed request leaves the last report; the client logs failures without URLs.
+/// Bridge providers are polled on the same route, and the owner persists any outcome. The
+/// caller backs off after a poll without an outcome, including a failed one.
 async fn fetch_order_hints(
     owner: Arc<ExecutorOwner>,
     requests: Vec<HintRequest>,
@@ -1421,7 +1652,8 @@ async fn fetch_order_hints(
             Some(client) => Some(client),
             None => owner.swap_orderbook_client().await.ok(),
         };
-        let report = if let Some(client) = &client
+        let report = if request.hint
+            && let Some(client) = &client
             && let Ok(status) = client.order_status_hint(&request.uid).await
         {
             let trade_block = if status.status == CowOrderStatusHint::Fulfilled {
@@ -1433,10 +1665,37 @@ async fn fetch_order_hints(
         } else {
             None
         };
+        // Without clients, every poll counts as one without an outcome.
+        let clients = if request.bridges.is_empty() {
+            None
+        } else {
+            client
+                .as_ref()
+                .and_then(|client| owner.swap_bridge_clients(client).ok())
+        };
+        let mut bridges = Vec::with_capacity(request.bridges.len());
+        for (uid, destination) in &request.bridges {
+            let outcome = if let Some(clients) = &clients {
+                matches!(
+                    Box::pin(owner.observe_swap_bridge(
+                        request.operation,
+                        *uid,
+                        clients,
+                        destination,
+                    ))
+                    .await,
+                    Ok(Some(_))
+                )
+            } else {
+                false
+            };
+            bridges.push((*uid, outcome));
+        }
         results.push(HintResult {
             operation: request.operation,
             uid: request.uid,
             client,
+            bridges,
             report,
         });
     }
@@ -1550,5 +1809,13 @@ mod tests {
             ));
         }
         assert_eq!(swap_entry_availability(None, Some(weth), true, true), None);
+    }
+
+    #[test]
+    fn bridge_polls_back_off_to_a_capped_interval() {
+        assert_eq!(bridge_poll_interval(0), SWAP_OBSERVATION_INTERVAL);
+        assert_eq!(bridge_poll_interval(1), SWAP_OBSERVATION_INTERVAL * 2);
+        assert_eq!(bridge_poll_interval(5), MAX_BRIDGE_POLL_INTERVAL);
+        assert_eq!(bridge_poll_interval(u32::MAX), MAX_BRIDGE_POLL_INTERVAL);
     }
 }

@@ -54,6 +54,7 @@ pub(super) fn setup_approval(sell: Address, buy: Address, delivery: SwapDelivery
             post_hook_gas_limit: Some(1),
             hook_cost: Some(U256::ZERO),
             anchors: Vec::new(),
+            destination_minimum: None,
         },
         price_verified: Some(false),
         price_acknowledged: true,

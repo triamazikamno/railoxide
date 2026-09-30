@@ -8,10 +8,10 @@ use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
     SwapOrderState, SwapSetupStatus, swap_order_state,
     vault::{
-        ExecutorExecutionResult, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
-        ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind, SwapApprovedBounds,
-        SwapDelivery, SwapOrderObservations, SwapOrderRecord, SwapPreHookDeathCause,
-        SwapSubmissionStatus, SwapTradeAmounts,
+        BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult, ExecutorPayloadInclusion,
+        ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind,
+        SwapApprovedBounds, SwapDelivery, SwapOrderObservations, SwapOrderRecord,
+        SwapPreHookDeathCause, SwapSubmissionStatus, SwapTradeAmounts,
     },
 };
 
@@ -62,6 +62,7 @@ impl SwapStage {
                     SwapOrderState::Done
                         | SwapOrderState::AttemptEnded(_)
                         | SwapOrderState::NotDelivered
+                        | SwapOrderState::Refunding
                         | SwapOrderState::PreHookOnly { expired: true }
                 )
         )
@@ -82,9 +83,17 @@ impl SwapStage {
         matches!(
             self,
             Self::Order(
-                SwapOrderState::NotDelivered | SwapOrderState::PreHookOnly { expired: true }
+                SwapOrderState::NotDelivered
+                    | SwapOrderState::Refunding
+                    | SwapOrderState::PreHookOnly { expired: true }
             )
         )
+    }
+
+    /// The swap asks the user to act: recover its funds, or have a bridge provider resolve its
+    /// deposit.
+    pub(in crate::root) const fn needs_attention(self) -> bool {
+        self.needs_recovery() || matches!(self, Self::Order(SwapOrderState::NeedsAttention))
     }
 
     /// Canonical observation can still change this stage.
@@ -255,14 +264,23 @@ pub(in crate::root) fn swap_order_stage(
     }
     let observed = order.observations();
     // Funds reach the stealth account when the pre-hook runs. A recovery confirmed after
-    // that returned them; an earlier cancellation, which is also recovery, didn't.
-    let stranded_since = observed
-        .pre_hook_executed
-        .or(observed.traded)
-        .map(|observation| observation.block.number);
+    // that returned them; an earlier cancellation, which is also recovery, didn't. An Across
+    // refund reaches it later, and surplus kept there can be recovered before, so only a
+    // recovery after the verified refund returned it. Without that refund, none did.
+    let stranded_since = match (state, order.bridge()) {
+        (SwapOrderState::Refunding, Some(BridgeOrderTerms::Across(_))) => observed
+            .bridge_refund
+            .map(|refund| refund.block.number.saturating_add(1)),
+        _ => observed
+            .pre_hook_executed
+            .or(observed.traded)
+            .map(|observation| observation.block.number),
+    };
     let stranded = matches!(
         state,
-        SwapOrderState::PreHookOnly { .. } | SwapOrderState::NotDelivered
+        SwapOrderState::PreHookOnly { .. }
+            | SwapOrderState::NotDelivered
+            | SwapOrderState::Refunding
     );
     match stranded_since {
         Some(block) if stranded && recovered_since(record, block) => SwapStage::Recovered,
@@ -449,13 +467,55 @@ pub(in crate::root) struct SwapLabels {
     /// The orderbook reports the open order filled; canonical observation doesn't show it yet.
     pub(in crate::root) fill_hint: Option<SwapFillHint>,
     /// "49.28 DAI", the amount the post-hook credited privately once the swap is done, or for
-    /// a Public address swap, the amount its receiver got.
+    /// a Public address swap, the amount its receiver got. A Bridge swap's is the amount
+    /// delivered on its destination network, verified or reported.
     pub(in crate::root) received: Option<String>,
     /// A Public address swap's receiver: its Public account or address-book label, or its
-    /// short address. `None` for a swap back to the private balance.
+    /// short address. `None` for a swap back to the private balance or to another network.
     pub(in crate::root) receiver: Option<String>,
     /// "0.3787 ETH", the least the receiver gets while the order can fill.
     pub(in crate::root) minimum: Option<String>,
+    /// A Bridge swap's destination. `None` for delivery on the swap's own network.
+    pub(in crate::root) bridge: Option<SwapBridgeLabels>,
+}
+
+/// Display strings for a Bridge swap's destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) struct SwapBridgeLabels {
+    pub(in crate::root) provider: BridgeProvider,
+    /// The destination network, such as "Polygon".
+    pub(in crate::root) network: String,
+    /// The token the receiver gets there, such as "POL". The swap is named after it.
+    pub(in crate::root) token: String,
+    /// The swap's own network, where a refund reaches the stealth account.
+    pub(in crate::root) origin: String,
+    /// The receiver's Public account or address-book label, or its short address.
+    pub(in crate::root) receiver: String,
+    /// "248.82 USDC" of the bought token, once traded: what the settlement handed to the
+    /// bridge, or what an Across post-hook that didn't run left in the stealth account.
+    pub(in crate::root) sent: Option<String>,
+    /// "248.71 USDC", the approved minimum on the destination network.
+    pub(in crate::root) minimum: Option<String>,
+}
+
+pub(in crate::root) const fn provider_name(provider: BridgeProvider) -> &'static str {
+    match provider {
+        BridgeProvider::Across => "Across",
+        BridgeProvider::NearIntents => "NEAR Intents",
+    }
+}
+
+/// What a traded Bridge order handed to its bridge, in bought-token base units: an Across
+/// deposit's input amount, or the whole trade paid to a NEAR Intents deposit address. Without
+/// an Across deposit, the trade's amount stays in the stealth account.
+pub(in crate::root) fn bridge_sent_amount(order: &SwapOrderRecord) -> Option<U256> {
+    let observed = order.observations();
+    match order.bridge() {
+        Some(BridgeOrderTerms::Across(terms)) if observed.bridge_handoff.is_some() => {
+            Some(terms.input_amount)
+        }
+        _ => observed.trade_amounts.map(|trade| trade.buy_amount),
+    }
 }
 
 /// The orderbook reports an open order filled before canonical observation records the trade.
@@ -501,8 +561,9 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
     let line = |title: String, detail: String| SwapCardLine {
         title,
         detail,
-        attention: stage.needs_recovery(),
+        attention: stage.needs_attention(),
     };
+    let bridge = labels.bridge.as_ref();
     match stage {
         SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
             if labels.fill_hint.is_some() =>
@@ -557,15 +618,48 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::Order(SwapOrderState::Traded) => line(
             format!("Swapping {pair}"),
-            "Traded · private return unverified".into(),
+            bridge.map_or_else(
+                || "Traded · private return unverified".into(),
+                |bridge| {
+                    format!(
+                        "Traded · hand-off to {} unverified",
+                        provider_name(bridge.provider)
+                    )
+                },
+            ),
+        ),
+        SwapStage::Order(SwapOrderState::Bridging) => line(
+            format!("Swapping {pair}"),
+            bridge.map_or_else(
+                || "Sent to the bridge".into(),
+                |bridge| {
+                    format!(
+                        "Sent to {} · delivering to {} on {}",
+                        provider_name(bridge.provider),
+                        bridge.receiver,
+                        bridge.network
+                    )
+                },
+            ),
         ),
         SwapStage::Order(SwapOrderState::Done) => line(
             format!("Swapped {pair}"),
-            match (&labels.receiver, &labels.received) {
-                (Some(receiver), Some(received)) => format!("Delivered {received} to {receiver}"),
-                (Some(receiver), None) => format!("Delivered to {receiver}"),
-                (None, Some(received)) => format!("Received {received} privately"),
-                (None, None) => "Back in your private balance".into(),
+            match (bridge, &labels.receiver, &labels.received) {
+                (Some(bridge), _, received) => format!(
+                    "Delivered {}to {} on {} via {}",
+                    received
+                        .as_ref()
+                        .map_or_else(String::new, |amount| format!("{amount} ")),
+                    bridge.receiver,
+                    bridge.network,
+                    provider_name(bridge.provider)
+                ),
+                (None, Some(receiver), Some(received)) => {
+                    format!("Delivered {received} to {receiver}")
+                }
+                (None, Some(receiver), None) => format!("Delivered to {receiver}"),
+                (None, None, Some(received)) => format!("Received {received} privately"),
+                (None, None, None) => "Back in your private balance".into(),
             },
         ),
         SwapStage::Order(SwapOrderState::AttemptEnded(cause)) => line(
@@ -588,9 +682,52 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::Order(SwapOrderState::NotDelivered) => line(
             "Swap needs attention".into(),
-            format!(
-                "{} is in the swap's stealth account and wasn't moved to your private balance",
-                labels.buy_symbol
+            match bridge {
+                // The Across post-hook didn't run, so the bought token stayed behind.
+                Some(bridge) => format!(
+                    "{} is in the swap's stealth account on {} and wasn't sent to the bridge",
+                    bridge.sent.as_ref().unwrap_or(&labels.buy_symbol),
+                    bridge.origin
+                ),
+                None => format!(
+                    "{} is in the swap's stealth account and wasn't moved to your private balance",
+                    labels.buy_symbol
+                ),
+            },
+        ),
+        SwapStage::Order(SwapOrderState::Refunding) => line(
+            format!("Swap of {pair} is refunding"),
+            bridge.map_or_else(
+                || {
+                    format!(
+                        "{} returns to the swap's stealth account.",
+                        labels.buy_symbol
+                    )
+                },
+                |bridge| {
+                    format!(
+                        "{} didn't deliver to {} on {}. {} returns to the stealth account on {}.",
+                        provider_name(bridge.provider),
+                        bridge.receiver,
+                        bridge.network,
+                        bridge.sent.as_ref().unwrap_or(&labels.buy_symbol),
+                        bridge.origin
+                    )
+                },
+            ),
+        ),
+        SwapStage::Order(SwapOrderState::NeedsAttention) => line(
+            "Swap needs attention".into(),
+            bridge.map_or_else(
+                || "The bridge provider has to resolve the deposit".into(),
+                |bridge| {
+                    format!(
+                        "{} reported the deposit for {} on {} as failed or incomplete",
+                        provider_name(bridge.provider),
+                        bridge.receiver,
+                        bridge.network
+                    )
+                },
             ),
         ),
         SwapStage::Recovered => line(
@@ -608,7 +745,7 @@ pub(in crate::root) fn swaps_card_line(swaps: &[(SwapStage, SwapLabels)]) -> Opt
         swaps => {
             let attention = swaps
                 .iter()
-                .filter(|(stage, _)| stage.needs_recovery())
+                .filter(|(stage, _)| stage.needs_attention())
                 .count();
             Some(SwapCardLine {
                 title: if attention == 0 {
@@ -636,12 +773,17 @@ pub(in crate::root) struct SwapStep {
 
 const TRADED: &str = "Traded";
 const BACK_IN_PRIVATE_BALANCE: &str = "Back in private balance";
+const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 
 /// The progress steps of decision 8: set up, order open, traded, back in private balance. An
 /// attempt that ended, or stranded funds before a trade, ends the list at the order step. A
 /// fill the orderbook reports shows the trade confirming until observation records it. A Public
-/// address swap has no private-balance step, as [`external_steps`] describes.
+/// address swap has no private-balance step, as [`external_steps`] describes, and a Bridge swap
+/// hands off to its bridge instead, as [`bridge_steps`] describes.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
+    if let Some(bridge) = &labels.bridge {
+        return bridge_steps(stage, labels, bridge);
+    }
     let steps = reshield_steps(stage, labels);
     match &labels.receiver {
         Some(receiver) => external_steps(steps, receiver, labels),
@@ -829,6 +971,11 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
                 Warning,
             ),
         ],
+        // Only Bridge orders reach these states; [`bridge_steps`] adds their hand-off and
+        // outcome.
+        SwapStage::Order(
+            SwapOrderState::Bridging | SwapOrderState::Refunding | SwapOrderState::NeedsAttention,
+        ) => vec![setup(Done, ""), open(Done, String::new())],
         SwapStage::Order(SwapOrderState::AttemptEnded(cause)) => vec![
             setup(Done, ""),
             step(
@@ -895,6 +1042,151 @@ fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> 
             step
         })
         .collect()
+}
+
+/// A Bridge swap's steps: set up, order open, sent to the bridge once the hand-off is proven,
+/// then delivered on the destination network, labelled verified for Across or reported by NEAR
+/// Intents. Refunding and Needs attention replace the delivered step. An Across post-hook that
+/// didn't run replaces both with the bought token held on the swap's network.
+fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels) -> Vec<SwapStep> {
+    use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
+    let step = |label: String, detail: String, status| SwapStep {
+        label,
+        detail,
+        status,
+    };
+    let provider = provider_name(bridge.provider);
+    let sent = bridge.sent.as_ref().unwrap_or(&labels.buy_symbol);
+    let handed_off = || {
+        step(
+            BRIDGE_DEPOSIT.into(),
+            bridge
+                .sent
+                .as_ref()
+                .map_or_else(String::new, |sent| match bridge.provider {
+                    BridgeProvider::Across => format!("{sent} to Across"),
+                    BridgeProvider::NearIntents => format!("{sent} to 1Click"),
+                }),
+            Done,
+        )
+    };
+    let delivered = format!("Delivered on {}", bridge.network);
+    // Across delivers its deposit's exact output; NEAR Intents converts all of it.
+    let expected = match (&bridge.minimum, bridge.provider) {
+        (Some(minimum), BridgeProvider::Across) => format!("{minimum} to {}", bridge.receiver),
+        (Some(minimum), BridgeProvider::NearIntents) => {
+            format!("At least {minimum} to {}", bridge.receiver)
+        }
+        (None, _) => format!("To {}", bridge.receiver),
+    };
+    let mut steps = reshield_steps(stage, labels);
+    let outcome = match stage {
+        SwapStage::Order(SwapOrderState::Traded) => vec![
+            step(
+                BRIDGE_DEPOSIT.into(),
+                "Checking the settlement…".into(),
+                Pending,
+            ),
+            step(delivered, expected, NotStarted),
+        ],
+        SwapStage::Order(SwapOrderState::Bridging) => vec![
+            handed_off(),
+            step(
+                delivered,
+                format!(
+                    "{expected} · {}",
+                    match bridge.provider {
+                        BridgeProvider::Across => "Across usually fills within a few minutes",
+                        BridgeProvider::NearIntents => {
+                            "NEAR Intents usually delivers within a few minutes"
+                        }
+                    }
+                ),
+                Pending,
+            ),
+        ],
+        SwapStage::Order(SwapOrderState::Done) => vec![
+            handed_off(),
+            step(
+                match bridge.provider {
+                    BridgeProvider::Across => format!("{delivered} · verified"),
+                    BridgeProvider::NearIntents => format!("{delivered} · reported by {provider}"),
+                },
+                labels.received.as_ref().map_or_else(
+                    || format!("To {}", bridge.receiver),
+                    |received| format!("{received} to {}", bridge.receiver),
+                ),
+                Done,
+            ),
+        ],
+        SwapStage::Order(SwapOrderState::Refunding) => vec![
+            handed_off(),
+            step(
+                format!("Refunding on {}", bridge.origin),
+                match bridge.provider {
+                    BridgeProvider::Across => format!(
+                        "No relayer filled the deposit before it expired. Across returns {sent} to the stealth account on {}, usually within a few hours.",
+                        bridge.origin
+                    ),
+                    BridgeProvider::NearIntents => format!(
+                        "NEAR Intents refunded the deposit to the stealth account on {}.",
+                        bridge.origin
+                    ),
+                },
+                Warning,
+            ),
+        ],
+        SwapStage::Order(SwapOrderState::NeedsAttention) => vec![
+            handed_off(),
+            step(
+                "Needs attention".into(),
+                format!(
+                    "{provider} reported the deposit as failed or incomplete. The wallet can't recover it. {provider} has to resolve it."
+                ),
+                Warning,
+            ),
+        ],
+        SwapStage::Order(SwapOrderState::NotDelivered) => vec![step(
+            "Not sent to the bridge".into(),
+            format!("{sent} is in the stealth account on {}.", bridge.origin),
+            Warning,
+        )],
+        // Before the trade, the hand-off waits for it, including a fill the orderbook reports.
+        _ => {
+            let traded = steps
+                .iter()
+                .find(|step| step.label == TRADED)
+                .map(|step| (step.status, step.detail.clone()));
+            return steps
+                .into_iter()
+                .filter(|step| step.label != TRADED)
+                .flat_map(|step| {
+                    if step.label != BACK_IN_PRIVATE_BALANCE {
+                        return vec![step];
+                    }
+                    let (status, detail) = traded
+                        .clone()
+                        .unwrap_or_else(|| (NotStarted, String::new()));
+                    vec![
+                        SwapStep {
+                            label: BRIDGE_DEPOSIT.into(),
+                            detail,
+                            status,
+                        },
+                        SwapStep {
+                            label: delivered.clone(),
+                            detail: expected.clone(),
+                            status: NotStarted,
+                        },
+                    ]
+                })
+                .collect();
+        }
+    };
+    // Set up and Order open are done once the order traded.
+    steps.truncate(2);
+    steps.extend(outcome);
+    steps
 }
 
 /// A traded order's outcome, from its approved bounds and canonical observations. Amounts are
@@ -1000,7 +1292,9 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
             ..none
         },
         SwapStage::Order(
-            SwapOrderState::PreHookOnly { expired: true } | SwapOrderState::NotDelivered,
+            SwapOrderState::PreHookOnly { expired: true }
+            | SwapOrderState::NotDelivered
+            | SwapOrderState::Refunding,
         ) => SwapActions {
             recover: true,
             dismiss: true,
@@ -1025,12 +1319,17 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
         },
         SwapStage::SetupSubmitting
         | SwapStage::Recovered
-        | SwapStage::Order(SwapOrderState::Traded | SwapOrderState::Done) => none,
+        | SwapStage::Order(
+            SwapOrderState::Traded
+            | SwapOrderState::Bridging
+            | SwapOrderState::Done
+            | SwapOrderState::NeedsAttention,
+        ) => none,
     }
 }
 
-/// The status a swap's account shows in Stealth accounts. "Recovery needed" feeds the
-/// Needs attention filter.
+/// The status a swap's account shows in Stealth accounts. "Recovery needed" and "Refunding"
+/// feed the Needs attention filter.
 pub(in crate::root) const fn swap_account_status(stage: SwapStage) -> &'static str {
     match stage {
         SwapStage::SetupNotSent => "Setup not sent",
@@ -1045,10 +1344,13 @@ pub(in crate::root) const fn swap_account_status(stage: SwapStage) -> &'static s
             "Unshielded, order open"
         }
         SwapStage::Order(SwapOrderState::Traded) => "Traded",
+        SwapStage::Order(SwapOrderState::Bridging) => "Sent to the bridge",
         SwapStage::Order(SwapOrderState::Done) => "Delivered",
         SwapStage::Order(
             SwapOrderState::PreHookOnly { expired: true } | SwapOrderState::NotDelivered,
         ) => "Recovery needed",
+        SwapStage::Order(SwapOrderState::Refunding) => "Refunding",
+        SwapStage::Order(SwapOrderState::NeedsAttention) => "Needs attention",
         SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)) => {
             "Order expired"
         }
@@ -1067,13 +1369,15 @@ pub(in crate::root) enum SwapOrderGroup {
     Open,
     /// Funds sit in the stealth account and no order can deliver them any more.
     NeedsRecovery,
+    /// A bridge provider has to resolve the deposit. The wallet can't recover it.
+    NeedsAttention,
     /// Nothing more happens to the swap by itself.
     Ended,
 }
 
 /// The My orders group of a swap at `stage`. A stopped setup has ended, and so has a swap that
 /// was removed from the Private tab while nothing of it was in flight. Removal never ends a
-/// swap that can still move on, nor one that needs recovery.
+/// swap that can still move on, nor one that needs recovery or attention.
 pub(in crate::root) const fn swap_order_group(
     stage: SwapStage,
     stopped: bool,
@@ -1081,6 +1385,9 @@ pub(in crate::root) const fn swap_order_group(
 ) -> SwapOrderGroup {
     if stage.needs_recovery() {
         return SwapOrderGroup::NeedsRecovery;
+    }
+    if stage.needs_attention() {
+        return SwapOrderGroup::NeedsAttention;
     }
     if stage.has_ended() || stopped || hidden && stage.is_dismissible() {
         SwapOrderGroup::Ended
@@ -1123,12 +1430,20 @@ pub(in crate::root) fn swap_order_status(
         SwapStage::SubmissionPending => "Submission unconfirmed".into(),
         SwapStage::SubmissionRejected => "Rejected".into(),
         SwapStage::Order(SwapOrderState::Traded) => "Traded".into(),
-        // Filled means back in the private balance; a Public address swap was delivered.
-        SwapStage::Order(SwapOrderState::Done) if labels.receiver.is_some() => "Delivered".into(),
+        SwapStage::Order(SwapOrderState::Bridging) => "Sent to the bridge".into(),
+        // Filled means back in the private balance; a Public address or Bridge swap was
+        // delivered.
+        SwapStage::Order(SwapOrderState::Done)
+            if labels.receiver.is_some() || labels.bridge.is_some() =>
+        {
+            "Delivered".into()
+        }
         SwapStage::Order(SwapOrderState::Done) => "Filled".into(),
         SwapStage::Order(
             SwapOrderState::PreHookOnly { expired: true } | SwapOrderState::NotDelivered,
         ) => "Needs recovery".into(),
+        SwapStage::Order(SwapOrderState::Refunding) => "Refunding".into(),
+        SwapStage::Order(SwapOrderState::NeedsAttention) => "Needs attention".into(),
         SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)) => {
             "Expired".into()
         }
@@ -1140,20 +1455,22 @@ pub(in crate::root) fn swap_order_status(
     }
 }
 
-/// The asset a swap's recovery starts with: the sell token before a trade, the buy token after.
-/// A Public address swap's stealth account never holds the buy token, so it's always the sell
-/// token.
+/// The asset a swap's recovery starts with: the sell token before a trade, the buy token after
+/// one that paid the stealth account, and a bridge's refund of the bought token. Public address
+/// and NEAR Intents orders pay elsewhere, so their trade leaves only the sell token to recover.
 pub(in crate::root) const fn swap_recovery_token(
     stage: SwapStage,
     delivery: SwapDelivery,
     sell: Address,
     buy: Address,
 ) -> Address {
-    match (stage, delivery) {
-        (
-            SwapStage::Order(SwapOrderState::Traded | SwapOrderState::NotDelivered),
-            SwapDelivery::Reshield,
-        ) => buy,
+    match stage {
+        SwapStage::Order(SwapOrderState::Traded | SwapOrderState::NotDelivered)
+            if delivery.pays_executor() =>
+        {
+            buy
+        }
+        SwapStage::Order(SwapOrderState::Refunding) => buy,
         _ => sell,
     }
 }
@@ -1238,6 +1555,7 @@ mod tests {
             received: None,
             receiver: None,
             minimum: None,
+            bridge: None,
         }
     }
 
@@ -1265,8 +1583,11 @@ mod tests {
             SwapStage::Order(SwapOrderState::PreHookOnly { expired: false }),
             SwapStage::Order(SwapOrderState::PreHookOnly { expired: true }),
             SwapStage::Order(SwapOrderState::Traded),
+            SwapStage::Order(SwapOrderState::Bridging),
             SwapStage::Order(SwapOrderState::Done),
             SwapStage::Order(SwapOrderState::NotDelivered),
+            SwapStage::Order(SwapOrderState::Refunding),
+            SwapStage::Order(SwapOrderState::NeedsAttention),
         ];
         stages.extend(
             ENDED
@@ -1291,14 +1612,17 @@ mod tests {
                 ),
                 "{stage:?}"
             );
-            // Recovery for stranded funds or a retired account that may hold funds.
+            // Recovery for stranded or refunded funds, or a retired account that may hold funds.
+            // A bridge deposit that needs attention isn't in the account to recover.
             assert_eq!(
                 actions.recover,
                 matches!(
                     stage,
                     SwapStage::SetupRetired
                         | SwapStage::Order(
-                            SwapOrderState::PreHookOnly { .. } | SwapOrderState::NotDelivered
+                            SwapOrderState::PreHookOnly { .. }
+                                | SwapOrderState::NotDelivered
+                                | SwapOrderState::Refunding
                         )
                 ),
                 "{stage:?}"
@@ -1330,6 +1654,8 @@ mod tests {
                     | SwapStage::Order(
                         SwapOrderState::Open
                             | SwapOrderState::Traded
+                            | SwapOrderState::Bridging
+                            | SwapOrderState::NeedsAttention
                             | SwapOrderState::PreHookOnly { expired: false }
                     )
             );
@@ -1343,13 +1669,19 @@ mod tests {
             let needs_recovery = matches!(
                 stage,
                 SwapStage::Order(
-                    SwapOrderState::NotDelivered | SwapOrderState::PreHookOnly { expired: true }
+                    SwapOrderState::NotDelivered
+                        | SwapOrderState::Refunding
+                        | SwapOrderState::PreHookOnly { expired: true }
                 )
             );
             assert_eq!(stage.needs_recovery(), needs_recovery, "{stage:?}");
+            // A bridge deposit that needs attention asks the user to act, though not to recover.
+            let needs_attention =
+                needs_recovery || stage == SwapStage::Order(SwapOrderState::NeedsAttention);
+            assert_eq!(stage.needs_attention(), needs_attention, "{stage:?}");
             assert_eq!(
                 swap_card_line(stage, &labels()).attention,
-                needs_recovery,
+                needs_attention,
                 "{stage:?}"
             );
             if matches!(
@@ -1403,7 +1735,7 @@ mod tests {
 
     #[test]
     fn my_orders_groups_follow_what_the_swap_can_still_do() {
-        use SwapOrderGroup::{Ended, NeedsRecovery, Open};
+        use SwapOrderGroup::{Ended, NeedsAttention, NeedsRecovery, Open};
         for (stage, group) in [
             (SwapStage::SetupPending, Open),
             (SwapStage::Approved, Open),
@@ -1413,8 +1745,14 @@ mod tests {
                 SwapStage::Order(SwapOrderState::PreHookOnly { expired: false }),
                 Open,
             ),
-            // Traded but not yet back in the private balance.
+            // Traded but not yet back in the private balance, or not yet delivered by the bridge.
             (SwapStage::Order(SwapOrderState::Traded), Open),
+            (SwapStage::Order(SwapOrderState::Bridging), Open),
+            // The provider has to resolve it, so it isn't grouped with recoverable swaps.
+            (
+                SwapStage::Order(SwapOrderState::NeedsAttention),
+                NeedsAttention,
+            ),
             (
                 SwapStage::Order(SwapOrderState::PreHookOnly { expired: true }),
                 NeedsRecovery,
@@ -1423,6 +1761,7 @@ mod tests {
                 SwapStage::Order(SwapOrderState::NotDelivered),
                 NeedsRecovery,
             ),
+            (SwapStage::Order(SwapOrderState::Refunding), NeedsRecovery),
             (SwapStage::Order(SwapOrderState::Done), Ended),
             (
                 SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)),
@@ -1515,6 +1854,48 @@ mod tests {
     }
 
     #[test]
+    fn recovery_starts_with_the_token_the_stealth_account_holds() {
+        use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus};
+        let (sell, buy) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let bridge = |provider, surplus| {
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider,
+                destination_chain: 42161,
+                receiver: Address::repeat_byte(3),
+                destination_token: Address::repeat_byte(4),
+                surplus,
+            })
+        };
+        let across = bridge(BridgeProvider::Across, BridgeSurplus::KeepInAccount);
+        let near = bridge(
+            BridgeProvider::NearIntents,
+            BridgeSurplus::BridgedByProvider,
+        );
+        let order = SwapStage::Order;
+        for (stage, delivery, token) in [
+            (
+                order(SwapOrderState::PreHookOnly { expired: true }),
+                across,
+                sell,
+            ),
+            // An Across post-hook that didn't run leaves the bought token in the account.
+            (order(SwapOrderState::Traded), across, buy),
+            (order(SwapOrderState::NotDelivered), across, buy),
+            // NEAR Intents' trade pays its deposit address.
+            (order(SwapOrderState::Traded), near, sell),
+            // Either bridge refunds the bought token to the account.
+            (order(SwapOrderState::Refunding), across, buy),
+            (order(SwapOrderState::Refunding), near, buy),
+        ] {
+            assert_eq!(
+                swap_recovery_token(stage, delivery, sell, buy),
+                token,
+                "{stage:?} {delivery:?}"
+            );
+        }
+    }
+
+    #[test]
     fn local_expiry_disables_cancel_and_waits_for_a_final_expiry_before_retry() {
         let actions = swap_actions(SwapStage::Order(SwapOrderState::Open), true);
         assert!(matches!(actions.cancel, Some(Err(_))));
@@ -1537,6 +1918,137 @@ mod tests {
         assert_ne!(
             undelivered.last().map(|step| step.status),
             Some(PublicActionStepStatus::Done)
+        );
+    }
+
+    #[test]
+    fn bridge_steps_follow_the_hand_off_then_the_destination_outcome() {
+        use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
+        let bridged = |provider| SwapLabels {
+            received: Some("248.71 USDC".into()),
+            bridge: Some(SwapBridgeLabels {
+                provider,
+                network: "Polygon".into(),
+                token: "USDC".into(),
+                origin: "Arbitrum One".into(),
+                receiver: "Treasury".into(),
+                sent: Some("248.82 USDC".into()),
+                minimum: Some("248.70 USDC".into()),
+            }),
+            ..labels()
+        };
+        let (across, near) = (
+            bridged(BridgeProvider::Across),
+            bridged(BridgeProvider::NearIntents),
+        );
+        let order = SwapStage::Order;
+        for (stage, labels, steps) in [
+            // Before the trade, the hand-off and the delivery wait for it.
+            (
+                order(SwapOrderState::Open),
+                &across,
+                vec![
+                    ("Order open", Pending),
+                    ("Bridge deposit", NotStarted),
+                    ("Delivered on Polygon", NotStarted),
+                ],
+            ),
+            (
+                order(SwapOrderState::Bridging),
+                &across,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Done),
+                    ("Delivered on Polygon", Pending),
+                ],
+            ),
+            (
+                order(SwapOrderState::Done),
+                &across,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Done),
+                    ("Delivered on Polygon · verified", Done),
+                ],
+            ),
+            (
+                order(SwapOrderState::Done),
+                &near,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Done),
+                    ("Delivered on Polygon · reported by NEAR Intents", Done),
+                ],
+            ),
+            // Refunding and Needs attention replace the delivered step.
+            (
+                order(SwapOrderState::Refunding),
+                &across,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Done),
+                    ("Refunding on Arbitrum One", Warning),
+                ],
+            ),
+            (
+                order(SwapOrderState::NeedsAttention),
+                &near,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Done),
+                    ("Needs attention", Warning),
+                ],
+            ),
+            // An Across post-hook that didn't run left the bought token on the swap's network.
+            (
+                order(SwapOrderState::NotDelivered),
+                &across,
+                vec![("Order open", Done), ("Not sent to the bridge", Warning)],
+            ),
+        ] {
+            let shown = swap_steps(stage, labels);
+            assert_eq!(
+                shown[1..]
+                    .iter()
+                    .map(|step| (step.label.as_str(), step.status))
+                    .collect::<Vec<_>>(),
+                steps,
+                "{stage:?}"
+            );
+            // Nothing of a Bridge swap returns to the private balance by itself.
+            let card = swap_card_line(stage, labels);
+            assert!(
+                shown
+                    .iter()
+                    .flat_map(|step| [&step.label, &step.detail])
+                    .chain([&card.title, &card.detail])
+                    .all(|text| !text.contains("private balance")),
+                "{stage:?}"
+            );
+        }
+        let pending = swap_steps(order(SwapOrderState::Bridging), &near);
+        assert_eq!(pending[2].detail, "248.82 USDC to 1Click");
+        assert!(
+            pending[3]
+                .detail
+                .starts_with("At least 248.70 USDC to Treasury")
+        );
+        assert_eq!(
+            swap_card_line(order(SwapOrderState::Done), &across).detail,
+            "Delivered 248.71 USDC to Treasury on Polygon via Across"
+        );
+        // A refund returns to the stealth account on the swap's own network.
+        assert!(
+            swap_card_line(order(SwapOrderState::Refunding), &across)
+                .detail
+                .contains("248.82 USDC returns to the stealth account on Arbitrum One")
+        );
+        // Needs attention is its own condition, which the card names, not a recovery.
+        let attention = swap_card_line(order(SwapOrderState::NeedsAttention), &near);
+        assert!(attention.attention && attention.detail.contains("Treasury on Polygon"));
+        assert_eq!(
+            swap_order_status(order(SwapOrderState::Done), false, &near),
+            "Delivered"
         );
     }
 
@@ -1596,6 +2108,7 @@ mod tests {
             post_hook_gas_limit: Some(300_000),
             hook_cost: None,
             anchors: Vec::new(),
+            destination_minimum: None,
         };
         let settlement = B256::repeat_byte(0x51);
         let observed = SwapOrderObservations {

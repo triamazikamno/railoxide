@@ -219,6 +219,17 @@ impl ForkChain {
         self.provider.get_block_number().await.unwrap()
     }
 
+    /// The latest block's timestamp, the fork's clock.
+    pub(crate) async fn timestamp(&self) -> u64 {
+        self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .unwrap()
+            .expect("latest block")
+            .header
+            .timestamp
+    }
+
     pub(crate) async fn call<C: SolCall>(&self, to: Address, call: C) -> C::Return {
         let output = self
             .provider
@@ -283,6 +294,27 @@ impl ForkChain {
             .await
     }
 
+    /// Like [`Self::settle`], but at a clearing price that pays `surplus` more than the
+    /// order's `buyAmount`, as for a solver that found a better price.
+    pub(crate) async fn settle_with_surplus(
+        &self,
+        order: &Order,
+        signature: Bytes,
+        pre_hooks: &[AppDataHook],
+        post_hooks: &[AppDataHook],
+        surplus: U256,
+    ) -> TransactionReceipt {
+        self.settle_paying(
+            order,
+            signature,
+            pre_hooks,
+            &[],
+            post_hooks,
+            order.buyAmount + surplus,
+        )
+        .await
+    }
+
     /// Like [`Self::settle`], but also runs `intra_hooks` after the settlement records
     /// the trade and pulls in the sell token, and before it pays out the buy token.
     /// A solver controls that ordering.
@@ -294,13 +326,33 @@ impl ForkChain {
         intra_hooks: &[AppDataHook],
         post_hooks: &[AppDataHook],
     ) -> TransactionReceipt {
+        self.settle_paying(
+            order,
+            signature,
+            pre_hooks,
+            intra_hooks,
+            post_hooks,
+            order.buyAmount,
+        )
+        .await
+    }
+
+    /// Settle `order` paying `payout` of the buy token, at least its `buyAmount`.
+    async fn settle_paying(
+        &self,
+        order: &Order,
+        signature: Bytes,
+        pre_hooks: &[AppDataHook],
+        intra_hooks: &[AppDataHook],
+        post_hooks: &[AppDataHook],
+        payout: U256,
+    ) -> TransactionReceipt {
         if order.buyToken == BUY_NATIVE_TOKEN {
             let balance = self.native_balance(SETTLEMENT).await;
-            self.raw("anvil_setBalance", (SETTLEMENT, balance + order.buyAmount))
+            self.raw("anvil_setBalance", (SETTLEMENT, balance + payout))
                 .await;
         } else {
-            self.add_erc20(order.buyToken, SETTLEMENT, order.buyAmount)
-                .await;
+            self.add_erc20(order.buyToken, SETTLEMENT, payout).await;
         }
         let trampoline = |hooks: &[AppDataHook]| {
             if hooks.is_empty() {
@@ -325,7 +377,8 @@ impl ForkChain {
         };
         let settle = ForkSettlement::settleCall {
             tokens: vec![order.sellToken, order.buyToken],
-            clearingPrices: vec![order.buyAmount, order.sellAmount],
+            // The sell amount at these prices buys exactly `payout`.
+            clearingPrices: vec![payout, order.sellAmount],
             trades: vec![ForkSettlement::TradeData {
                 sellTokenIndex: U256::ZERO,
                 buyTokenIndex: U256::ONE,

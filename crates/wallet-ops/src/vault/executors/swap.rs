@@ -132,12 +132,15 @@ impl SwapOperationRecord {
         &self.orders
     }
     /// A new attempt may start once each earlier attempt has either ended before its pre-hook
-    /// ran or traded and completed delivery. Unrecovered executed pre-hooks block it.
+    /// ran or traded and completed delivery, for a Bridge order delivery on the destination
+    /// chain. Unrecovered executed pre-hooks block it, as do refunding and unresolved bridges.
     #[must_use]
     pub fn admits_attempt(&self) -> bool {
         self.orders.iter().all(|order| {
             order.has_ended()
-                || order.observations.traded.is_some() && order.observations.delivered.is_some()
+                || order.observations.traded.is_some()
+                    && order.observations.delivered.is_some()
+                    && order.destination_delivered()
         })
     }
 }
@@ -151,6 +154,135 @@ pub enum SwapDelivery {
     Reshield,
     /// The order pays the bought token to `receiver` and carries no post-hook.
     External { receiver: Address },
+    /// The order buys an intermediate token on this chain and hands it to a bridge provider,
+    /// which delivers the destination token to the receiver on another chain.
+    Bridge(BridgeDelivery),
+}
+
+impl SwapDelivery {
+    /// Whether the order carries a post-hook at the pre-hook's nonce plus one: Reshield's
+    /// shield, or Across's deposit.
+    #[must_use]
+    pub const fn has_post_hook(&self) -> bool {
+        matches!(
+            self,
+            Self::Reshield
+                | Self::Bridge(BridgeDelivery {
+                    provider: BridgeProvider::Across,
+                    ..
+                })
+        )
+    }
+    /// Whether the order's receiver is the executor, so the bought token lands there first.
+    /// The same orders carry a post-hook that moves it on.
+    #[must_use]
+    pub const fn pays_executor(&self) -> bool {
+        self.has_post_hook()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeProvider {
+    Across,
+    NearIntents,
+}
+
+/// What happens to `CoW` surplus above the order's buy amount. Across either reshields it or
+/// leaves it in the stealth account; NEAR Intents converts the whole deposit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeSurplus {
+    Reshield,
+    KeepInAccount,
+    BridgedByProvider,
+}
+
+/// The destination terms of a Bridge order, all bound by its approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeDelivery {
+    pub provider: BridgeProvider,
+    pub destination_chain: u64,
+    pub receiver: Address,
+    /// The token delivered on the destination chain. `Address::ZERO` is its native asset,
+    /// which only NEAR Intents delivers. Across delivers its route's destination token; WETH
+    /// on Ethereum or Arbitrum One reaches receivers without code as ETH.
+    pub destination_token: Address,
+    pub surplus: BridgeSurplus,
+}
+
+impl BridgeDelivery {
+    /// Across reshields or keeps surplus; NEAR Intents always bridges it.
+    #[must_use]
+    pub const fn has_valid_surplus(&self) -> bool {
+        matches!(
+            (self.provider, self.surplus),
+            (
+                BridgeProvider::Across,
+                BridgeSurplus::Reshield | BridgeSurplus::KeepInAccount
+            ) | (
+                BridgeProvider::NearIntents,
+                BridgeSurplus::BridgedByProvider
+            )
+        )
+    }
+}
+
+/// A Bridge order's provider terms, persisted with the order before it is submitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeOrderTerms {
+    Across(AcrossOrderTerms),
+    NearIntents(NearIntentsOrderTerms),
+}
+
+impl BridgeOrderTerms {
+    #[must_use]
+    pub const fn provider(&self) -> BridgeProvider {
+        match self {
+            Self::Across(_) => BridgeProvider::Across,
+            Self::NearIntents(_) => BridgeProvider::NearIntents,
+        }
+    }
+}
+
+/// The signed `depositV3` arguments besides the depositor (the executor), the recipient (the
+/// delivery's receiver), the destination chain and the empty message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcrossOrderTerms {
+    pub spoke_pool: Address,
+    pub input_token: Address,
+    pub output_token: Address,
+    /// The order's buy amount.
+    pub input_amount: U256,
+    /// The approved destination minimum.
+    pub output_amount: U256,
+    pub quote_timestamp: u32,
+    pub fill_deadline: u32,
+    pub exclusive_relayer: Address,
+    pub exclusivity_parameter: u32,
+}
+
+/// A verified 1Click quote the order pays into.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearIntentsOrderTerms {
+    /// The order's receiver.
+    pub deposit_address: Address,
+    pub min_amount_out: U256,
+    pub amount_out: U256,
+    /// The signed quote's `deadline`.
+    pub deadline: String,
+    /// The exact 1Click response body: request, quote, signature and timestamp.
+    pub signed_quote: String,
+}
+
+// The deposit address and the signed quote name the swap's receiver and deposit, so neither is
+// formatted.
+impl std::fmt::Debug for NearIntentsOrderTerms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NearIntentsOrderTerms")
+            .field("min_amount_out", &self.min_amount_out)
+            .field("amount_out", &self.amount_out)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One anchor reading approved with an order: a Chainlink aggregator with its
@@ -193,6 +325,10 @@ pub struct SwapApprovedBounds {
     #[serde(default)]
     pub hook_cost: Option<U256>,
     pub anchors: Vec<SwapAnchorObservation>,
+    /// The approved minimum received on a Bridge order's destination chain: Across's output
+    /// amount or 1Click's `minAmountOut`. `None` for same-chain delivery.
+    #[serde(default)]
+    pub destination_minimum: Option<U256>,
 }
 
 impl SwapApprovedBounds {
@@ -311,7 +447,7 @@ pub struct SwapOrderObservations {
     pub trade_amounts: Option<SwapTradeAmounts>,
     /// Finalized block establishing delivery. For Reshield delivery it establishes the
     /// approved private minimum, and the transaction is the post-hook shield. For External
-    /// delivery it is the trade itself.
+    /// delivery it is the trade itself, and for Bridge delivery the hand-off to the bridge.
     pub delivered: Option<SwapObservation>,
     /// Retained separately so a later page can establish delivery after a balance change.
     #[serde(default)]
@@ -327,9 +463,26 @@ pub struct SwapOrderObservations {
     /// Finalized block past `validTo` at which the order had not filled.
     #[serde(default)]
     pub expired: Option<SwapObservation>,
+    /// A Bridge order's hand-off on this chain: the trade that paid the NEAR Intents deposit
+    /// address, or the Across deposit in the settlement that paid the executor.
+    #[serde(default)]
+    pub bridge_handoff: Option<SwapBridgeHandoff>,
+    /// An Across post-hook's deposit, found by explicit reconciliation in a block where the
+    /// nonce passed the post-hook's. Like `shielded`, it shows which payload took that nonce.
+    #[serde(default)]
+    pub post_hook_deposit: Option<SwapObservation>,
+    /// The bridge's result on the destination chain. It is not evidence on this chain.
+    #[serde(default)]
+    pub bridge_outcome: Option<SwapBridgeOutcome>,
+    /// Across's refund of a refunding order's deposit to the executor, verified in a finalized
+    /// block's receipts by an explicit status check. `None` in older records and until a
+    /// refund is verified; it never means the refund was recovered.
+    #[serde(default)]
+    pub bridge_refund: Option<SwapObservation>,
 }
 
 impl SwapOrderObservations {
+    /// Blocks on this chain. A bridge outcome's block is on the destination chain.
     fn blocks(&self) -> impl Iterator<Item = BlockNumHash> {
         [
             self.pre_hook_executed,
@@ -340,10 +493,64 @@ impl SwapOrderObservations {
             self.pre_hook_dead.map(|death| death.observation),
             self.undelivered,
             self.expired,
+            self.bridge_handoff.map(|handoff| handoff.observation),
+            self.post_hook_deposit,
+            self.bridge_refund,
         ]
         .into_iter()
         .flatten()
         .map(|observation| observation.block)
+    }
+
+    /// Canonical evidence that the order's post-hook ran: its shield, or its Across deposit.
+    #[must_use]
+    pub const fn post_hook_evidence(&self) -> bool {
+        self.shielded.is_some() || self.post_hook_deposit.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapBridgeHandoff {
+    pub observation: SwapObservation,
+    /// The Across `depositId`. `None` for NEAR Intents, whose persisted deposit address
+    /// identifies the transfer.
+    pub deposit_id: Option<U256>,
+}
+
+/// `DeliveredVerified`, `DeliveredReported` and `Refunding` are final. `NeedsAttention` stops
+/// automatic polling, but an explicit status check may replace it. An explicit check may also
+/// replace an Across `Refunding` with `DeliveredVerified` once it verifies the matching fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwapBridgeOutcome {
+    /// Across's fill, checked in the destination chain's finalized receipts. `output_amount` is
+    /// the fill's executed amount, at least the signed one.
+    DeliveredVerified {
+        block: BlockNumHash,
+        transaction_hash: B256,
+        output_amount: U256,
+    },
+    /// Success as reported by 1Click, not checked on the destination chain.
+    DeliveredReported {
+        amount_out: Option<U256>,
+        transaction_hash: Option<B256>,
+    },
+    /// The bridge expired or refunded the deposit, which returns to the executor on this chain.
+    Refunding,
+    /// 1Click reported a failed or incomplete deposit.
+    NeedsAttention,
+}
+
+impl SwapBridgeOutcome {
+    #[must_use]
+    pub const fn is_final(&self) -> bool {
+        !matches!(self, Self::NeedsAttention)
+    }
+    #[must_use]
+    pub const fn is_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::DeliveredVerified { .. } | Self::DeliveredReported { .. }
+        )
     }
 }
 
@@ -406,6 +613,9 @@ pub struct SwapOrderRecord {
     submission: Option<SwapSubmission>,
     #[serde(default)]
     submission_status: SwapSubmissionStatus,
+    /// Required for Bridge delivery, with the delivery's provider, and absent otherwise.
+    #[serde(default)]
+    bridge: Option<BridgeOrderTerms>,
 }
 
 impl SwapOrderRecord {
@@ -417,6 +627,23 @@ impl SwapOrderRecord {
                 .observations
                 .delivered
                 .is_some_and(|event| event.block.number <= cutoff)
+            && self.destination_delivered()
+    }
+
+    /// A Bridge order's outcome on the destination chain is a delivery. Other orders have no
+    /// destination outcome to wait for.
+    fn destination_delivered(&self) -> bool {
+        !matches!(self.delivery, SwapDelivery::Bridge(_))
+            || self
+                .observations
+                .bridge_outcome
+                .is_some_and(|outcome| outcome.is_delivered())
+    }
+
+    /// A Bridge order's provider terms.
+    #[must_use]
+    pub const fn bridge(&self) -> Option<&BridgeOrderTerms> {
+        self.bridge.as_ref()
     }
 
     #[must_use]
@@ -485,8 +712,10 @@ pub struct SwapAttempt {
     pub bounds: SwapApprovedBounds,
     pub invalidates: Option<OrderUid>,
     pub pre_hook: IssuedExecutorPayload,
-    /// Required for Reshield delivery and absent for External delivery.
+    /// Required exactly when [`SwapDelivery::has_post_hook`].
     pub post_hook: Option<IssuedExecutorPayload>,
+    /// Required for Bridge delivery, with the delivery's provider, and absent otherwise.
+    pub bridge: Option<BridgeOrderTerms>,
 }
 
 impl ExecutorRecord {
@@ -521,6 +750,19 @@ impl ExecutorRecord {
     #[must_use]
     pub const fn swap(&self) -> Option<&SwapOperationRecord> {
         self.swap.as_ref()
+    }
+
+    /// Bridge orders handed off on this chain without a destination outcome, which their
+    /// provider is polled for. `NeedsAttention` waits for an explicit status check.
+    pub fn swap_bridges_to_track(&self) -> impl Iterator<Item = &SwapOrderRecord> {
+        self.swap
+            .iter()
+            .flat_map(|swap| &swap.orders)
+            .filter(|order| {
+                matches!(order.delivery, SwapDelivery::Bridge(_))
+                    && order.observations.bridge_handoff.is_some()
+                    && order.observations.bridge_outcome.is_none()
+            })
     }
 
     /// The terms approved before setup, while no order records its own.
@@ -660,13 +902,13 @@ impl ExecutorRecord {
     }
 
     /// A post-hook that runs inside a settlement never becomes a direct-call winner. Its nonce
-    /// is resolved by its observed shield and consumed nonce, including when an older post-hook
-    /// took another order's pre-hook nonce.
+    /// is resolved by its observed shield or Across deposit and consumed nonce, including when
+    /// an older post-hook took another order's pre-hook nonce.
     fn swap_post_hook_took_nonce(&self, nonce: U256) -> bool {
         self.swap.as_ref().is_some_and(|swap| {
             swap.orders.iter().any(|order| {
                 (order.post_hook.is_some_and(|hook| hook.nonce == nonce)
-                    && order.observations.shielded.is_some()
+                    && order.observations.post_hook_evidence()
                     && self
                         .nonce_observation
                         .is_some_and(|observed| observed.nonce > nonce))
@@ -695,7 +937,7 @@ impl ExecutorRecord {
         if let Some(post_hook) = swap.orders.iter().find_map(|order| {
             order.post_hook.filter(|hook| {
                 hook.nonce == nonce
-                    && order.observations.shielded.is_some()
+                    && order.observations.post_hook_evidence()
                     && self
                         .nonce_observation
                         .is_some_and(|observed| observed.nonce > nonce)
@@ -721,6 +963,18 @@ impl ExecutorRecord {
             (Some(hook), None) => Some(hook.payload),
             _ => None,
         }
+    }
+}
+
+/// A Bridge order carries its own provider's terms and a surplus that provider supports. Other
+/// orders carry none.
+fn bridge_terms_fit(delivery: SwapDelivery, bridge: Option<&BridgeOrderTerms>) -> bool {
+    match (delivery, bridge) {
+        (SwapDelivery::Bridge(delivery), Some(terms)) => {
+            terms.provider() == delivery.provider && delivery.has_valid_surplus()
+        }
+        (SwapDelivery::Bridge(_), None) => false,
+        (SwapDelivery::Reshield | SwapDelivery::External { .. }, bridge) => bridge.is_none(),
     }
 }
 
@@ -753,8 +1007,9 @@ impl ExecutorStore {
 
     /// Persist a swap attempt's order and hook payloads in one write, before the
     /// order request exposes them. The pre-hook holds the current nonce `k`. A
-    /// Reshield order's post-hook holds `k + 1`; an External order has none. No
-    /// other payload may use a future nonce. A retry is admitted only after every
+    /// Reshield or Across Bridge order's post-hook holds `k + 1`; External and NEAR
+    /// Intents Bridge orders have none. No other payload may use a future nonce. A
+    /// Bridge order carries its provider's terms. A retry is admitted only after every
     /// earlier attempt ended or completed delivery.
     pub fn record_swap_attempt(
         &self,
@@ -771,6 +1026,7 @@ impl ExecutorStore {
             invalidates,
             pre_hook,
             post_hook,
+            bridge,
         } = attempt;
         self.update(operation, |record| {
             let orders = record
@@ -791,7 +1047,8 @@ impl ExecutorStore {
                     .issued
                     .iter()
                     .any(|issued| issued.hash == pre_hook.hash)
-                || post_hook.is_some() != matches!(delivery, SwapDelivery::Reshield)
+                || post_hook.is_some() != delivery.has_post_hook()
+                || !bridge_terms_fit(delivery, bridge.as_ref())
                 || post_hook.as_ref().is_some_and(|post_hook| {
                     post_hook.delegate != record.delegate
                         || post_hook.purpose != ExecutorPayloadPurpose::SwapPostHook
@@ -877,6 +1134,7 @@ impl ExecutorStore {
                 observations: SwapOrderObservations::default(),
                 submission,
                 submission_status: SwapSubmissionStatus::Pending,
+                bridge,
             };
             if let Some(swap) = &mut record.swap {
                 swap.proof = proof;
@@ -890,10 +1148,12 @@ impl ExecutorStore {
             }
             record.issued.push(pre_hook);
             record.issued.extend(post_hook);
-            // Only a Reshield order pays the bought token to the executor; an External order
-            // pays its receiver. Earlier attempts' assets stay. The wallet's native marker is
-            // not an ERC-20 asset.
-            let bought = matches!(delivery, SwapDelivery::Reshield).then_some(terms.buy_token);
+            // A Reshield order pays the bought token to the executor. A Bridge order's bought
+            // token can end up there too: a skipped Across post-hook leaves it, and a bridge
+            // refunds to the executor. An External order pays its receiver. Earlier attempts'
+            // assets stay. The wallet's native marker is not an ERC-20 asset.
+            let bought = matches!(delivery, SwapDelivery::Reshield | SwapDelivery::Bridge(_))
+                .then_some(terms.buy_token);
             for token in std::iter::once(terms.sell_token).chain(bought) {
                 if token == Address::ZERO {
                     continue;
@@ -1008,7 +1268,10 @@ impl ExecutorStore {
     /// Persist receipt evidence checked at head minus finality depth by the owner.
     /// This deliberately leaves account nonce reconciliation and input reservations alone.
     /// A Reshield order is delivered only with a private credit. An External order is
-    /// delivered by its trade and never carries a credit.
+    /// delivered by its trade and never carries a credit. A Bridge order is delivered on this
+    /// chain by its hand-off, in the trade's own transaction: for NEAR Intents the trade, for
+    /// Across the deposit that names its id, optionally with the surplus credit of a post-hook
+    /// that reshields it. Same-chain orders take no hand-off.
     pub(crate) fn record_swap_settlement(
         &self,
         operation: ExecutorOperationId,
@@ -1016,6 +1279,7 @@ impl ExecutorStore {
         traded: SwapObservation,
         amounts: SwapTradeAmounts,
         credit: Option<SwapShieldObservation>,
+        handoff: Option<SwapBridgeHandoff>,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         self.update(operation, |record| {
             let order = record
@@ -1023,17 +1287,43 @@ impl ExecutorStore {
                 .as_mut()
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
-            let external = matches!(order.delivery, SwapDelivery::External { .. });
+            let (credit_fits, handoff_fits, delivered) = match order.delivery {
+                SwapDelivery::Reshield => (
+                    credit
+                        .is_none_or(|credit| credit.private_amount >= order.bounds.private_minimum),
+                    handoff.is_none(),
+                    credit.is_some(),
+                ),
+                SwapDelivery::External { .. } => (credit.is_none(), handoff.is_none(), true),
+                SwapDelivery::Bridge(bridge) => {
+                    let handoff_fits = handoff.is_none_or(|handoff| {
+                        handoff.observation == traded
+                            && handoff.deposit_id.is_some()
+                                == (bridge.provider == BridgeProvider::Across)
+                    });
+                    // Only an Across post-hook that reshields surplus shields anything, and
+                    // only after its deposit. The surplus has no minimum.
+                    let credit_fits = credit.is_none()
+                        || bridge.surplus == BridgeSurplus::Reshield
+                            && bridge.provider == BridgeProvider::Across
+                            && handoff.is_some();
+                    (credit_fits, handoff_fits, handoff.is_some())
+                }
+            };
             if traded.transaction_hash.is_none()
-                || external && credit.is_some()
-                || credit.is_some_and(|credit| {
-                    credit.observation != traded
-                        || credit.private_amount < order.bounds.private_minimum
-                })
+                || !credit_fits
+                || !handoff_fits
+                || credit.is_some_and(|credit| credit.observation != traded)
                 || order
                     .observations
                     .traded
                     .is_some_and(|known| known != traded)
+                || handoff.is_some_and(|handoff| {
+                    order
+                        .observations
+                        .bridge_handoff
+                        .is_some_and(|known| known != handoff)
+                })
             {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
@@ -1042,10 +1332,91 @@ impl ExecutorStore {
             if let Some(credit) = credit {
                 order.observations.settlement_credit = Some(credit);
             }
-            if external || credit.is_some() {
+            if let Some(handoff) = handoff {
+                order.observations.bridge_handoff = Some(handoff);
+            }
+            if delivered {
                 order.observations.delivered = Some(traded);
                 order.observations.undelivered = None;
             }
+            Ok(())
+        })
+    }
+
+    /// Persist a Bridge order's destination outcome after its hand-off. A final outcome is
+    /// never replaced, though recording it again is accepted; `NeedsAttention` may be
+    /// replaced by any outcome. The one exception is an Across `Refunding` without a verified
+    /// refund, which a verified delivery replaces. A verified delivery must meet the approved
+    /// destination minimum.
+    pub fn record_swap_bridge_outcome(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        outcome: SwapBridgeOutcome,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let order = record
+                .swap
+                .as_mut()
+                .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if !matches!(order.delivery, SwapDelivery::Bridge(_)) {
+                return Err(ExecutorStoreError::OperationMismatch);
+            }
+            let below_minimum = match outcome {
+                SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => order
+                    .bounds
+                    .destination_minimum
+                    .is_none_or(|minimum| output_amount < minimum),
+                _ => false,
+            };
+            // Across may have filled a deposit it reported expired. A refund verified on this
+            // chain rules that fill out.
+            let corrects_refund = order.observations.bridge_outcome
+                == Some(SwapBridgeOutcome::Refunding)
+                && matches!(outcome, SwapBridgeOutcome::DeliveredVerified { .. })
+                && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
+                && order.observations.bridge_refund.is_none();
+            if order.observations.bridge_handoff.is_none()
+                || below_minimum
+                || order
+                    .observations
+                    .bridge_outcome
+                    .is_some_and(|known| known.is_final() && known != outcome && !corrects_refund)
+            {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
+            order.observations.bridge_outcome = Some(outcome);
+            Ok(())
+        })
+    }
+
+    /// Persist Across's refund of a refunding order's deposit, in a finalized block after the
+    /// hand-off. A recorded refund is never replaced, though recording it again is accepted.
+    pub(crate) fn record_swap_bridge_refund(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        refund: SwapObservation,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let order = record
+                .swap
+                .as_mut()
+                .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            let observed = order.observations;
+            if !matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
+                || observed.bridge_outcome != Some(SwapBridgeOutcome::Refunding)
+                || refund.transaction_hash.is_none()
+                || observed
+                    .bridge_handoff
+                    .is_none_or(|handoff| refund.block.number <= handoff.observation.block.number)
+                || observed.bridge_refund.is_some_and(|known| known != refund)
+            {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
+            order.observations.bridge_refund = Some(refund);
             Ok(())
         })
     }

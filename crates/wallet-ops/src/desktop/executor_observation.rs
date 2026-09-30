@@ -605,7 +605,7 @@ fn range_scan_can_find_executions(
                     || (order
                         .post_hook()
                         .is_some_and(|hook| hook.nonce() == consumed)
-                        && observed.shielded.is_some())
+                        && observed.post_hook_evidence())
             })
         })
     };

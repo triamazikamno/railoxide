@@ -10,23 +10,26 @@
 //! because Railgun accepts a synthetic proof only when `tx.origin` is that
 //! `VERIFICATION_BYPASS` address, and a settlement can run the swap's pre-hook.
 
-use super::swap_order::{OutputPois, spawn_orderbook, submitted_order};
+use super::swap_order::{OutputPois, spawn_bridge_stub, spawn_orderbook, submitted_order};
 use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
 use crate::tests::cow_fork::{
-    ForkChain, MULTICALL3, RailgunTree, VERIFICATION_BYPASS, synthetic_transaction, unshield_to,
+    ForkChain, MULTICALL3, RAILGUN, RailgunTree, VERIFICATION_BYPASS, synthetic_transaction,
+    unshield_to,
 };
 use crate::{
     DelegatedSwapExecutor, ExecutorRecoveryExecution, ExecutorRecoveryFunding,
     IssuedExecutorTransaction, OperationHttpClient, OperationNetworkIsolation,
-    PreparedExecutorRecovery, SwapAmountPlan, SwapAmountRequest, SwapOrderOutcome, SwapOrderState,
-    SwapPrice, SwapSetupStatus, WalletNetworkMode, swap_order_state,
+    PreparedExecutorRecovery, SwapAmountPlan, SwapAmountRequest, SwapInputPlan, SwapOrderOutcome,
+    SwapOrderState, SwapPrice, SwapSetupStatus, WalletNetworkMode, swap_order_state,
 };
+use alloy::rpc::types::TransactionReceipt;
+use broadcaster_core::contracts::across::{SpokePool, address_to_bytes32};
 use broadcaster_core::contracts::cow::{
     AppData, AppDataHooks, BUY_NATIVE_TOKEN, GPv2Settlement, Order, OrderUid,
 };
-use broadcaster_core::contracts::railgun::Call;
+use broadcaster_core::contracts::railgun::{Call, Shield};
 
 alloy::sol! {
     interface ForkSwapSettlement {
@@ -36,9 +39,44 @@ alloy::sol! {
     interface ForkAllowance {
         function allowance(address owner, address spender) external view returns (uint256);
     }
+
+    interface ForkTransfer {
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
 }
 
 const SELL_AMOUNT: u64 = 10_000_000_000_000_000;
+
+const ARBITRUM_ONE: u64 = 42_161;
+const ARBITRUM_USDC: Address =
+    alloy::primitives::address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+/// The receiver on Arbitrum One of every Across order here.
+const BRIDGE_RECEIVER: Address = Address::repeat_byte(0x77);
+/// The approved minimum on Arbitrum One of every Across order here, in USDC base units.
+const DESTINATION_MINIMUM: u64 = 15_000_000;
+/// What a settlement with surplus pays above the order's `buyAmount`, in USDC base units.
+const SURPLUS: u64 = 1_000_000;
+
+/// Across delivery of bought USDC as Arbitrum One USDC, with `surplus` handled as chosen.
+const fn across_delivery(surplus: BridgeSurplus) -> SwapDelivery {
+    SwapDelivery::Bridge(BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: ARBITRUM_ONE,
+        receiver: BRIDGE_RECEIVER,
+        destination_token: ARBITRUM_USDC,
+        surplus,
+    })
+}
+
+/// The transaction builder the wallet plans swaps with. Planning never reads its contracts.
+const fn builder() -> railgun_wallet::TransactionBuilder {
+    railgun_wallet::TransactionBuilder {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: Address::repeat_byte(4),
+        relay_adapt_contract: Address::repeat_byte(5),
+    }
+}
 
 /// A published order of a delegated swap executor.
 struct Swap {
@@ -50,6 +88,8 @@ struct Swap {
     uid: OrderUid,
     signature: Bytes,
     hooks: AppDataHooks,
+    /// Length of the signed app data document.
+    app_data_len: usize,
 }
 
 struct Wallet {
@@ -138,7 +178,8 @@ impl Wallet {
                 U256::from(SELL_AMOUNT),
             )),
         )];
-        self.submit(delegated, note, Some(transactions), None).await
+        self.submit(fork, delegated, note, Some(transactions), None)
+            .await
     }
 
     /// Delegate a fresh executor with a real delegation-only setup.
@@ -230,42 +271,69 @@ impl Wallet {
         delegated
     }
 
-    /// Plan `note` with `invalidates`, then sign, persist, and submit the order to a local
-    /// orderbook stub. Without `transactions`, a retry reuses the recorded proof.
-    async fn submit(
+    /// Plan selling `amount` from `notes` in `delegated`'s next order, which invalidates
+    /// `invalidates`.
+    fn plan(
         &self,
         delegated: DelegatedSwapExecutor,
-        note: Utxo,
-        transactions: Option<Vec<Transaction>>,
+        notes: &[Utxo],
+        amount: U256,
         invalidates: Option<OrderUid>,
-    ) -> Swap {
-        let authorization = password();
-        let (operation, executor) = (delegated.operation(), delegated.executor());
+    ) -> SwapAmountPlan {
         let swap_profile = self.chain.swap_profile().unwrap();
-        let builder = railgun_wallet::TransactionBuilder {
-            chain_type: 0,
-            chain_id: 1,
-            railgun_contract: Address::repeat_byte(4),
-            relay_adapt_contract: Address::repeat_byte(5),
-        };
-        let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
-            &builder,
+        crate::plan_swap_inputs(
+            &builder(),
             &swap_profile,
             delegated,
-            std::slice::from_ref(&note),
+            notes,
             &SwapAmountRequest {
                 sell_token: WETH,
                 buy_token: self.pair.0,
-                amount: U256::from(SELL_AMOUNT),
+                amount,
                 delivery: self.pair.1,
                 byte_budget: None,
             },
             swap_profile.app_data_byte_budget(),
             invalidates,
         )
-        .unwrap() else {
+        .unwrap()
+    }
+
+    /// Plan `note` with `invalidates`, then sign, persist, and submit the order to a local
+    /// orderbook stub. Without `transactions`, a retry reuses the recorded proof.
+    async fn submit(
+        &self,
+        fork: &ForkChain,
+        delegated: DelegatedSwapExecutor,
+        note: Utxo,
+        transactions: Option<Vec<Transaction>>,
+        invalidates: Option<OrderUid>,
+    ) -> Swap {
+        let SwapAmountPlan::Fits(plan) = self.plan(
+            delegated,
+            std::slice::from_ref(&note),
+            U256::from(SELL_AMOUNT),
+            invalidates,
+        ) else {
             panic!("one note fits one order");
         };
+        self.sign(fork, plan, std::slice::from_ref(&note), transactions)
+            .await
+    }
+
+    /// Sign, persist, and submit `plan`'s order, which spends `notes`, to a local orderbook
+    /// stub. A Bridge order is quoted by a local Across stub. Without `transactions`, a retry
+    /// reuses the recorded proof.
+    async fn sign(
+        &self,
+        fork: &ForkChain,
+        plan: SwapInputPlan,
+        notes: &[Utxo],
+        transactions: Option<Vec<Transaction>>,
+    ) -> Swap {
+        let authorization = password();
+        let (operation, executor) = (plan.operation().unwrap(), plan.executor());
+        let swap_profile = self.chain.swap_profile().unwrap();
         let quote_fee = SELL_AMOUNT / 1_000;
         let buy_token = if self.pair.0 == Address::ZERO {
             BUY_NATIVE_TOKEN
@@ -284,7 +352,7 @@ impl Wallet {
         }))
         .unwrap();
         let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
-        let review = crate::price_swap_review(
+        let mut review = crate::price_swap_review(
             plan,
             quote,
             SwapPrice::Unverified,
@@ -296,6 +364,17 @@ impl Wallet {
             isolation,
         )
         .unwrap();
+        let bridged = matches!(self.pair.1, SwapDelivery::Bridge(_));
+        if bridged {
+            review.set_bridge_for_tests(crate::SwapBridgeQuote {
+                provider: BridgeProvider::Across,
+                destination_minimum: U256::from(DESTINATION_MINIMUM),
+                expected_output: U256::from(DESTINATION_MINIMUM),
+                fee: Some(U256::ZERO),
+                leg: crate::BridgeLegPrice::SameAsset,
+                fill_time_sec: None,
+            });
+        }
         let (orderbook_url, submissions, orderbook_task) = spawn_orderbook(
             self.db.clone(),
             self.view.clone(),
@@ -309,6 +388,25 @@ impl Wallet {
             1,
         )
         .unwrap();
+        let across = if bridged {
+            Some(self.across_stub(fork, &orderbook).await)
+        } else {
+            None
+        };
+        let destination = crate::bridge::BridgeDestination {
+            destination_token: ARBITRUM_USDC,
+            intermediate: USDC,
+            symbol: "USDC".to_owned(),
+            same_asset: true,
+            near: None,
+        };
+        let route = across
+            .as_ref()
+            .map(|(clients, arbitrum, _)| crate::SwapBridgeRoute {
+                clients,
+                destination: &destination,
+                destination_chain: arbitrum,
+            });
         let transactions = transactions.unwrap_or_else(|| {
             let record = self
                 .owner
@@ -317,7 +415,7 @@ impl Wallet {
                 .into_iter()
                 .find(|record| record.operation() == operation)
                 .unwrap();
-            crate::reusable_swap_proof(&record, review.plan(), std::slice::from_ref(&note))
+            crate::reusable_swap_proof(&record, review.plan(), notes)
                 .expect("a retry for the same notes and amount reuses the proof")
                 .0
         });
@@ -332,35 +430,186 @@ impl Wallet {
                 private_minimum: review.suggested_private_minimum(),
                 price_acknowledged: true,
                 transactions,
-                inputs: std::slice::from_ref(&note),
+                inputs: notes,
                 change_output_pois: Vec::new(),
                 output_pois: &output_pois,
                 authorization: &authorization,
                 orderbook: &orderbook,
                 anchor_cache: &crate::TokenAnchorRateCache::new(),
                 token_registry: &tokens,
+                bridge: route,
+                destination_minimum: bridged.then_some(U256::from(DESTINATION_MINIMUM)),
             })
             .await
             .unwrap();
         orderbook_task.abort();
+        if let Some((_, _, across_task)) = across {
+            across_task.abort();
+        }
         let SwapOrderOutcome::Submitted { uid } = outcome else {
             panic!("the order is submitted");
         };
         let (persisted, body) = submissions.lock().unwrap()[0].clone();
         assert!(persisted);
+        let app_data = body["appData"].as_str().unwrap();
         Swap {
             operation,
             executor,
-            input: ExecutorInputIdentity::from_utxo(&note),
-            note,
+            input: ExecutorInputIdentity::from_utxo(&notes[0]),
+            note: notes[0].clone(),
             order: submitted_order(&body),
             uid,
             signature: body["signature"].as_str().unwrap().parse().unwrap(),
-            hooks: serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+            hooks: serde_json::from_str::<AppData>(app_data)
                 .unwrap()
                 .metadata
                 .hooks,
+            app_data_len: app_data.len(),
         }
+    }
+
+    /// Across clients on `orderbook`'s route whose fee quotes come from a local stub, and the
+    /// destination chain, Arbitrum One. The quote is dated at the fork's latest block, which
+    /// the `SpokePool` checks at the deposit, and its fill deadline is three hours later: past
+    /// the order's expiry plus the wallet's margin, and within the `SpokePool`'s buffer.
+    async fn across_stub(
+        &self,
+        fork: &ForkChain,
+        orderbook: &CowOrderbookClient,
+    ) -> (
+        crate::SwapBridgeClients,
+        crate::settings::EffectiveChainConfig,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let quoted = fork.timestamp().await;
+        let spoke_pool = self.chain.bridge_profile().unwrap().spoke_pool();
+        let arbitrum = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(ARBITRUM_ONE)
+        .cloned()
+        .unwrap();
+        let destination_spoke_pool = arbitrum.bridge_profile().unwrap().spoke_pool();
+        let (url, _, task) = spawn_bridge_stub(move |_| {
+            json!({
+                "outputAmount": DESTINATION_MINIMUM.to_string(),
+                "totalRelayFee": {"total": "10000"},
+                "lpFee": {"total": "0"},
+                "timestamp": quoted.to_string(),
+                "fillDeadline": (quoted + 3 * 60 * 60).to_string(),
+                "exclusiveRelayer": Address::ZERO,
+                "exclusivityDeadline": 0,
+                "spokePoolAddress": spoke_pool,
+                "destinationSpokePoolAddress": destination_spoke_pool,
+                "isAmountTooLow": false,
+                "limits": {"minDeposit": "1", "maxDeposit": "1000000000000"},
+                "estimatedFillTimeSec": 2
+            })
+            .to_string()
+        })
+        .await;
+        let mut clients = self.owner.swap_bridge_clients(orderbook).unwrap();
+        clients.across = crate::bridge::AcrossClient::new(
+            OperationHttpClient::for_tests(
+                reqwest::Client::new(),
+                OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+            ),
+            url,
+        )
+        .unwrap();
+        (clients, arbitrum, task)
+    }
+
+    /// Synthetic transactions with the shapes of `plan`'s pre-hook, and the notes they spend,
+    /// for an order that is signed but never settled. Each of `notes` must be in its own
+    /// tree, so each transaction spends one note; one spent whole has no change output.
+    fn synthetic_pre_hook(
+        &self,
+        plan: &SwapInputPlan,
+        notes: &[Utxo],
+    ) -> (Vec<Utxo>, Vec<Transaction>) {
+        let profile = self.chain.swap_profile().unwrap();
+        let preview = builder()
+            .preview_mixed_private_action_plan(notes, &plan.proof_request(&profile).unwrap())
+            .unwrap();
+        let selected = notes
+            .iter()
+            .filter(|note| {
+                preview
+                    .selected_inputs
+                    .iter()
+                    .any(|input| (input.tree, input.position) == (note.tree, note.position))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), preview.transactions.len());
+        let transactions = selected
+            .iter()
+            .zip(&preview.transactions)
+            .map(|(note, shape)| {
+                assert_eq!((shape.input_count, shape.has_unshield), (1, true));
+                let tree = RailgunTree {
+                    number: u16::try_from(note.tree).unwrap(),
+                    root: B256::ZERO,
+                };
+                let mut transaction = synthetic_transaction(
+                    tree,
+                    self.nullifier(note),
+                    plan.executor(),
+                    Some(unshield_to(plan.executor(), WETH, note.note.value)),
+                );
+                if shape.output_count == 1 {
+                    transaction.commitments.remove(0);
+                    transaction.boundParams.commitmentCiphertext.clear();
+                }
+                transaction
+            })
+            .collect();
+        (selected, transactions)
+    }
+
+    fn record(&self, operation: ExecutorOperationId) -> ExecutorRecord {
+        self.owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    }
+
+    /// Place an Across order with `surplus` handled as chosen from a fresh executor, and
+    /// settle it through `GPv2Settlement` with both hooks, paying `SURPLUS` above its limit.
+    /// Returns the order, the settlement and the persisted deposit terms, once the
+    /// settlement is final and observed.
+    async fn settle_across(
+        &mut self,
+        fork: &ForkChain,
+        surplus: BridgeSurplus,
+    ) -> (Swap, TransactionReceipt, AcrossOrderTerms) {
+        self.pair = (USDC, across_delivery(surplus));
+        let swap = self.swap(fork).await;
+        let record = self.record(swap.operation);
+        let Some(BridgeOrderTerms::Across(terms)) = first_order(&record).bridge().cloned() else {
+            panic!("an Across order keeps its deposit terms");
+        };
+        let receipt = fork
+            .settle_with_surplus(
+                &swap.order,
+                swap.signature.clone(),
+                &swap.hooks.pre,
+                &swap.hooks.post,
+                U256::from(SURPLUS),
+            )
+            .await;
+        assert!(receipt.status(), "the solver settles with both hooks");
+        let settled = receipt.block_number.unwrap();
+        fork.mine(self.chain.finality_depth).await;
+        self.owner
+            .observe_swap_settlement(swap.operation, swap.uid, settled)
+            .await
+            .unwrap();
+        (swap, receipt, terms)
     }
 
     /// Prepare a broadcaster-funded recovery of `amount` of `token`, or an early cancellation
@@ -853,7 +1102,7 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     // The retry signs at k + 1 with the same proof, where the first post-hook is also valid.
     let delegated = wallet.redelegate(operation, cancelled).await;
     let retry = wallet
-        .submit(delegated, first.note.clone(), None, None)
+        .submit(&fork, delegated, first.note.clone(), None, None)
         .await;
 
     // Someone funds the executor and runs that older post-hook through another contract, so
@@ -895,7 +1144,7 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     // call, and its pre-hook invalidates the stalled order.
     let delegated = wallet.redelegate(operation, stalled_at).await;
     let latest = wallet
-        .submit(delegated, first.note, None, invalidates)
+        .submit(&fork, delegated, first.note, None, invalidates)
         .await;
     let calls = RelayAdapt7702::executeCall::abi_decode(&latest.hooks.pre[0].call_data)
         .unwrap()
@@ -1277,5 +1526,268 @@ async fn swap_fork_pre_hook_beats_the_cancellation_and_recovery_invalidates_the_
         )
         .await;
     assert!(!receipt.status(), "the order can't fill after recovery");
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_across_settlement_deposits_the_approved_terms() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let spoke_pool = wallet.chain.bridge_profile().unwrap().spoke_pool();
+    // Each settlement pays a surplus above the order's limit. The post-hook deposits exactly
+    // the limit, then shields the surplus to the wallet or leaves it in the account.
+    for surplus in [BridgeSurplus::Reshield, BridgeSurplus::KeepInAccount] {
+        let reshielded = surplus == BridgeSurplus::Reshield;
+        let (swap, receipt, terms) = wallet.settle_across(&fork, surplus).await;
+        assert_eq!(swap.order.receiver, swap.executor);
+        assert_eq!(
+            (terms.spoke_pool, terms.input_token, terms.output_token),
+            (spoke_pool, USDC, ARBITRUM_USDC)
+        );
+        assert_eq!(
+            (terms.input_amount, terms.output_amount),
+            (swap.order.buyAmount, U256::from(DESTINATION_MINIMUM))
+        );
+
+        let deposits = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter(|log| log.address() == spoke_pool)
+            .filter_map(|log| log.log_decode::<SpokePool::FundsDeposited>().ok())
+            .map(|log| log.inner.data)
+            .collect::<Vec<_>>();
+        let [deposit] = deposits.as_slice() else {
+            panic!("the post-hook deposits once");
+        };
+        assert_eq!(
+            (deposit.depositor, deposit.recipient),
+            (
+                address_to_bytes32(swap.executor),
+                address_to_bytes32(BRIDGE_RECEIVER)
+            )
+        );
+        assert_eq!(
+            (
+                deposit.inputToken,
+                deposit.outputToken,
+                deposit.destinationChainId
+            ),
+            (
+                address_to_bytes32(terms.input_token),
+                address_to_bytes32(terms.output_token),
+                U256::from(ARBITRUM_ONE)
+            )
+        );
+        assert_eq!(
+            (deposit.inputAmount, deposit.outputAmount),
+            (terms.input_amount, terms.output_amount)
+        );
+        assert_eq!(
+            (deposit.quoteTimestamp, deposit.fillDeadline),
+            (terms.quote_timestamp, terms.fill_deadline)
+        );
+        assert_eq!(
+            fork.erc20_balance(USDC, swap.executor).await,
+            if reshielded {
+                U256::ZERO
+            } else {
+                U256::from(SURPLUS)
+            }
+        );
+
+        let record = wallet.record(swap.operation);
+        let observed = first_order(&record).observations();
+        assert_eq!(
+            observed.trade_amounts.map(|amounts| amounts.buy_amount),
+            Some(swap.order.buyAmount + U256::from(SURPLUS))
+        );
+        assert_eq!(
+            observed
+                .bridge_handoff
+                .map(|handoff| (handoff.observation.transaction_hash, handoff.deposit_id)),
+            Some((Some(receipt.transaction_hash), Some(deposit.depositId)))
+        );
+        // Only reshielded surplus is a private credit, net of Railgun's shield fee.
+        assert_eq!(
+            observed
+                .settlement_credit
+                .map(|credit| credit.private_amount + credit.fee.unwrap()),
+            reshielded.then_some(U256::from(SURPLUS))
+        );
+        assert_eq!(
+            swap_order_state(first_order(&record)),
+            SwapOrderState::Bridging
+        );
+    }
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_across_order_app_data_stays_within_the_planned_length() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    // Reshielded surplus gives an Across order its largest post-hook.
+    wallet.pair = (USDC, across_delivery(BridgeSurplus::Reshield));
+    let budget = wallet.chain.swap_profile().unwrap().app_data_byte_budget();
+    // Notes in separate trees, each spent by its own pre-hook transaction. These orders are
+    // signed but never settled, so the trees' roots don't matter.
+    let notes = |count: u16| {
+        (0..count)
+            .map(|number| {
+                wallet.note(
+                    RailgunTree {
+                        number,
+                        root: B256::ZERO,
+                    },
+                    U256::from(2 * SELL_AMOUNT),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (count, amount) in [(1, SELL_AMOUNT), (2, 3 * SELL_AMOUNT)] {
+        let delegated = wallet.delegate(&fork).await;
+        let notes = notes(count);
+        let SwapAmountPlan::Fits(plan) = wallet.plan(delegated, &notes, U256::from(amount), None)
+        else {
+            panic!("{count} transactions fit one order");
+        };
+        assert_eq!(plan.transaction_count(), usize::from(count));
+        let planned = plan.app_data_len();
+        let (inputs, transactions) = wallet.synthetic_pre_hook(&plan, &notes);
+        let signed = wallet
+            .sign(&fork, plan, &inputs, Some(transactions))
+            .await
+            .app_data_len;
+        assert!(
+            signed <= planned && planned <= budget,
+            "{count} transactions: signed {signed}, planned {planned}, budget {budget}"
+        );
+        eprintln!("Across app data, {count} transactions: signed {signed}, planned {planned}");
+    }
+
+    // An amount that needs nine transactions, one more than a batch allows. The largest amount
+    // offered instead fits the budget, and so does its signed order.
+    let delegated = wallet.delegate(&fork).await;
+    let notes = notes(9);
+    let SwapAmountPlan::TooLarge { largest } =
+        wallet.plan(delegated, &notes, U256::from(18 * SELL_AMOUNT), None)
+    else {
+        panic!("nine transactions don't fit one order");
+    };
+    let (count, planned) = (largest.transaction_count(), largest.app_data_len());
+    let (inputs, transactions) = wallet.synthetic_pre_hook(&largest, &notes);
+    let signed = wallet
+        .sign(&fork, largest, &inputs, Some(transactions))
+        .await
+        .app_data_len;
+    assert!(
+        signed <= planned && planned <= budget,
+        "largest offer, {count} transactions: signed {signed}, planned {planned}, budget {budget}"
+    );
+    eprintln!(
+        "Across app data, largest offer of {count} transactions: signed {signed}, planned {planned}"
+    );
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_refunded_across_deposit_is_recovered_to_the_wallet() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let (swap, receipt, terms) = wallet.settle_across(&fork, BridgeSurplus::Reshield).await;
+    let settled = receipt.block_number.unwrap();
+    assert_eq!(fork.erc20_balance(USDC, swap.executor).await, U256::ZERO);
+
+    // The deposit expires unfilled, and the SpokePool refunds its input to the depositor.
+    fork.impersonate(terms.spoke_pool).await;
+    let refund = fork
+        .send(
+            alloy::rpc::types::TransactionRequest::default()
+                .from(terms.spoke_pool)
+                .to(USDC)
+                .input(
+                    ForkTransfer::transferCall {
+                        to: swap.executor,
+                        amount: terms.input_amount,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .gas_limit(200_000),
+        )
+        .await;
+    assert!(refund.status(), "the SpokePool refunds the deposit");
+    let refunded = refund.block_number.unwrap();
+    let store = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1).unwrap();
+    let record = store
+        .record_swap_bridge_outcome(swap.operation, swap.uid, SwapBridgeOutcome::Refunding)
+        .unwrap();
+    assert_eq!(
+        swap_order_state(first_order(&record)),
+        SwapOrderState::Refunding
+    );
+
+    // The explicit check reconciles the account at a final block that holds the refund.
+    fork.mine(wallet.chain.finality_depth).await;
+    let record = wallet.observe(swap.operation, settled..refunded + 1).await;
+    assert_eq!(
+        swap_order_state(first_order(&record)),
+        SwapOrderState::Refunding
+    );
+    let held = fork.erc20_balance(USDC, swap.executor).await;
+    assert_eq!(held, terms.input_amount);
+
+    // Both hooks used their nonces and the traded order can't fill again, so the batch only
+    // shields the refund, at k + 2.
+    let prepared = wallet
+        .prepare_recovery(swap.operation, Some(USDC), held)
+        .await;
+    assert_eq!(
+        prepared.execution(),
+        ExecutorRecoveryExecution::PaidExecute {
+            nonce: pre_hook_nonce(&record) + U256::from(2)
+        }
+    );
+    assert_eq!(prepared.calls().len(), 1);
+    assert!(shields(&prepared.calls()[0], swap.executor));
+    let npk = prepared.shield().unwrap().preimage.npk;
+    let issued = wallet.issue_recovery(&fork, prepared).await;
+    let receipt = deliver(&fork, &issued).await;
+    assert!(receipt.status(), "the recovery shields the refund");
+    assert_eq!(fork.erc20_balance(USDC, swap.executor).await, U256::ZERO);
+    // The wallet's new note holds the refund less Railgun's shield fee.
+    let credits = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.address() == RAILGUN)
+        .filter_map(|log| log.log_decode::<Shield>().ok())
+        .flat_map(|log| {
+            let event = log.inner.data;
+            event.commitments.into_iter().zip(event.fees)
+        })
+        .filter(|(preimage, _)| preimage.npk == npk)
+        .map(|(preimage, fee)| (U256::from(preimage.value), fee))
+        .collect::<Vec<_>>();
+    let [(credited, fee)] = credits.as_slice() else {
+        panic!("the recovery shields once to the wallet");
+    };
+    assert!(!fee.is_zero());
+    assert_eq!(*credited + *fee, held);
+    let recovered = receipt.block_number.unwrap();
+    fork.mine(wallet.chain.finality_depth).await;
+    let record = wallet
+        .observe(swap.operation, recovered..recovered + 1)
+        .await;
+    assert_eq!(
+        record.payload_status(issued.payload_hash()),
+        Some(ExecutorPayloadStatus::Executed)
+    );
+    drop(store);
     wallet.finish().await;
 }
