@@ -7,14 +7,15 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use gpui::{
     App, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, Render, SharedString, Styled as _, Window, div, img,
-    prelude::FluentBuilder as _, px, rems, rgb,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    div, img, prelude::FluentBuilder as _, px, rems, rgb,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::{ButtonVariant, ButtonVariants},
     collapsible::Collapsible,
     dialog::DialogButtonProps,
+    tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
@@ -848,18 +849,24 @@ impl PrivateSwapsView {
             fact_row(
                 "CoW fee",
                 div()
+                    .id("swap-outcome-gas-value")
                     .min_w_0()
                     .flex()
                     .flex_wrap()
                     .justify_end()
                     .gap_1()
+                    .tooltip(|window, cx| {
+                        Tooltip::new(
+                            "What CoW charged this order, network and protocol fees together, beside what the settlement's gas cost",
+                        )
+                        .build(window, cx)
+                    })
                     .child(app_text(format!(
-                        "{} charged to you,",
+                        "{} charged",
                         self.money(gas.fee_token, gas.fee, cx)
                     )))
-                    .child(app_muted_text("network and protocol fees"))
                     .child(app_muted_text(format!(
-                        "· settlement gas cost {}",
+                        "· settlement gas {}",
                         self.money(Address::ZERO, gas.settlement_cost, cx)
                     ))),
             )

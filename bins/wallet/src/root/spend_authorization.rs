@@ -1919,40 +1919,51 @@ fn render_spend_authorization_card(
         .bg(rgb(theme::SURFACE))
         .child(app_muted_text(card.label.to_string()).text_xs())
         .child(
+            // In a narrow dialog the USD value wraps under the amount, and the change under
+            // the amount before that. The amount itself never breaks.
             div()
                 .w_full()
                 .min_w_0()
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .gap_2()
-                .children(
-                    card.icon
-                        .clone()
-                        .map(|icon| img(icon).size(px(20.0)).rounded_full().flex_none()),
-                )
+                .gap_x_2()
                 .child(
                     div()
-                        .flex_1()
+                        .flex_auto()
                         .min_w_0()
                         .flex()
-                        .flex_wrap()
-                        .items_baseline()
-                        .gap_x_2()
-                        .child(
-                            app_amount_text(card.amount.to_string())
-                                .min_w_0()
-                                .text_color(rgb(theme::TEXT))
-                                .whitespace_normal(),
-                        )
+                        .items_center()
+                        .gap_2()
                         .children(
-                            card.delta
-                                .as_ref()
-                                .map(|delta| spend_authorization_delta_text(delta, cx)),
+                            card.icon
+                                .clone()
+                                .map(|icon| img(icon).size(px(20.0)).rounded_full().flex_none()),
+                        )
+                        .child(
+                            div()
+                                .flex_auto()
+                                .min_w_0()
+                                .flex()
+                                .flex_wrap()
+                                .items_baseline()
+                                .gap_x_2()
+                                .child(
+                                    app_amount_text(card.amount.to_string())
+                                        .text_color(rgb(theme::TEXT))
+                                        .whitespace_nowrap(),
+                                )
+                                .children(
+                                    card.delta
+                                        .as_ref()
+                                        .map(|delta| spend_authorization_delta_text(delta, cx)),
+                                ),
                         ),
                 )
                 .children(card.usd.as_ref().map(|usd| {
                     app_muted_text(usd.to_string())
                         .flex_none()
+                        .ml_auto()
                         .whitespace_nowrap()
                 })),
         )
@@ -2032,7 +2043,8 @@ fn render_spend_authorization_card(
 }
 
 /// A row on one line: its label, its value at the right, the value's change, and a slot for
-/// its info button. The slot stays empty without a hint, so the values line up.
+/// its info button. The slot stays empty without a hint, so the values line up. A value too wide
+/// to sit beside its label wraps under it, with its change and info button.
 fn render_spend_authorization_compact_row(
     row_index: usize,
     row: &SpendAuthorizationSummaryRow,
@@ -2041,7 +2053,7 @@ fn render_spend_authorization_compact_row(
     let value = if row.shortened_copyable {
         let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
         div()
-            .flex_1()
+            .flex_auto()
             .min_w_0()
             .flex()
             .items_center()
@@ -2065,7 +2077,7 @@ fn render_spend_authorization_compact_row(
             )
     } else {
         app_text(row.value.to_string())
-            .flex_1()
+            .flex_auto()
             .min_w_0()
             .text_right()
             .text_color(rgb(theme::TEXT))
@@ -2076,8 +2088,9 @@ fn render_spend_authorization_compact_row(
         .min_w_0()
         .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
         .flex()
+        .flex_wrap()
         .items_center()
-        .gap_2()
+        .gap_x_2()
         .child(
             app_muted_text(row.label.to_string())
                 .flex_none()
@@ -2268,6 +2281,8 @@ fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
     };
     div()
         .min_w_0()
+        // Clear of the dialog's close button, so the chip wraps under the title instead.
+        .pr_6()
         .flex()
         .flex_wrap()
         .items_center()
@@ -2287,6 +2302,8 @@ fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
 /// The summary's stepper, when it has steps: numbered badges and their labels joined by a
 /// connector, with an info button at the end. A completed step shows a check in the success
 /// colour, the current one a filled badge, and a later one an outlined badge and a muted label.
+/// A step that doesn't fit beside the one before it wraps to the next line, and a label wider
+/// than the strip truncates.
 fn render_spend_authorization_steps(summary: &SpendAuthorizationSummary) -> Option<gpui::Div> {
     let steps = summary.steps.as_ref()?;
     let mut strip = div()
@@ -2359,14 +2376,16 @@ fn render_spend_authorization_steps(summary: &SpendAuthorizationSummary) -> Opti
         };
         strip = strip.child(
             div()
-                .flex_none()
+                .min_w_0()
+                .max_w_full()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(badge)
                 .child(
                     app_text(label.to_string())
-                        .whitespace_nowrap()
+                        .min_w_0()
+                        .truncate()
                         .text_color(rgb(label_color)),
                 ),
         );
@@ -2395,8 +2414,9 @@ fn render_spend_authorization_details(
                 .min_w_0()
                 .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .gap_2()
+                .gap_x_2()
                 .cursor_pointer()
                 .on_click(on_toggle)
                 .child(
@@ -2404,28 +2424,37 @@ fn render_spend_authorization_details(
                         .flex_none()
                         .whitespace_nowrap(),
                 )
-                .child(
-                    app_text(details.collapsed_summary.to_string())
-                        .flex_1()
-                        .min_w_0()
-                        .text_right()
-                        .text_color(rgb(theme::TEXT))
-                        .whitespace_normal(),
-                )
+                // The summary and its chevron wrap under the title together.
                 .child(
                     div()
-                        .flex_none()
-                        .size_5()
+                        .flex_auto()
+                        .min_w_0()
                         .flex()
                         .items_center()
-                        .justify_center()
+                        .justify_end()
+                        .gap_x_2()
                         .child(
-                            Icon::new(if open {
-                                IconName::ChevronUp
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .xsmall(),
+                            app_text(details.collapsed_summary.to_string())
+                                .min_w_0()
+                                .text_right()
+                                .text_color(rgb(theme::TEXT))
+                                .whitespace_normal(),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .size_5()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(if open {
+                                        IconName::ChevronUp
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .xsmall(),
+                                ),
                         ),
                 ),
         )
@@ -2454,9 +2483,10 @@ fn render_spend_authorization_details(
                                 .w_full()
                                 .min_w_0()
                                 .flex()
+                                .flex_wrap()
                                 .items_start()
                                 .justify_between()
-                                .gap_3()
+                                .gap_x_3()
                                 .child(
                                     app_muted_text(label.to_string())
                                         .flex_none()
@@ -2464,7 +2494,7 @@ fn render_spend_authorization_details(
                                 )
                                 .child(
                                     app_text(value.to_string())
-                                        .flex_1()
+                                        .flex_auto()
                                         .min_w_0()
                                         .text_right()
                                         .text_color(rgb(theme::TEXT))
@@ -2849,16 +2879,15 @@ impl WalletRoot {
             content
         });
         let focus_content = content.clone();
-        let dialog_width =
-            (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
-        let dialog_max_height = dialog_max_height(window);
-        let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let dialog_width =
+                (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+            let content_width = secondary_dialog_content_width(dialog_width);
             let close_content = content.clone();
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
-                .max_h(dialog_max_height)
+                .max_h(dialog_max_height(window))
                 .title(spend_authorization_title(
                     &dialog_title,
                     title_chip.as_deref(),
@@ -2880,10 +2909,6 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        let dialog_width =
-            (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
-        let dialog_max_height = dialog_max_height(window);
-        let content_width = secondary_dialog_content_width(dialog_width);
         let payload_disclosure = summary
             .payload
             .clone()
@@ -2893,7 +2918,10 @@ impl WalletRoot {
             .clone()
             .map(|details| cx.new(|_cx| SpendAuthorizationDetailsDisclosure::new(details)));
         let handed_off = Rc::new(Cell::new(false));
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let dialog_width =
+                (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+            let content_width = secondary_dialog_content_width(dialog_width);
             let close_root = root.clone();
             let submit_root = root.clone();
             let close_intent = intent.clone();
@@ -2904,7 +2932,7 @@ impl WalletRoot {
             let trezor_app_passphrase_input = root.read(cx).trezor_app_passphrase_input.clone();
             dialog
                 .w(dialog_width)
-                .max_h(dialog_max_height)
+                .max_h(dialog_max_height(window))
                 .title(app_strong_text("Authorize hardware public action"))
                 .footer(dialog_footer("Approve on device", true))
                 .on_close({
@@ -3058,10 +3086,6 @@ impl WalletRoot {
         };
         let root = cx.entity();
         let device_label = hardware_device_label(descriptor.device_kind);
-        let dialog_width =
-            (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
-        let dialog_max_height = dialog_max_height(window);
-        let content_width = secondary_dialog_content_width(dialog_width);
         let gas_review = self.hardware_gas_payment_review(&completion, cx);
         let dialog_title = summary.title.to_string();
         let title_chip = summary.title_chip.clone();
@@ -3074,12 +3098,15 @@ impl WalletRoot {
                 device_label,
             )
         });
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let dialog_width =
+                (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+            let content_width = secondary_dialog_content_width(dialog_width);
             let close_content = content.clone();
             let close_root = root.clone();
             dialog
                 .w(dialog_width)
-                .max_h(dialog_max_height)
+                .max_h(dialog_max_height(window))
                 .title(spend_authorization_title(
                     &dialog_title,
                     title_chip.as_deref(),

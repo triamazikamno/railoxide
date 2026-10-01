@@ -6083,11 +6083,12 @@ impl PrivateSwapsView {
         let network = network_name(form.network.unwrap_or(self.session.chain_id));
         match form.bridge_state() {
             BridgeState::Loading => {
-                return line
-                    .child(Spinner::new().small())
-                    .child(app_muted_text(format!(
-                        "Getting the tokens {network} can receive…"
-                    )));
+                return line.child(Spinner::new().small()).child(
+                    app_muted_text(format!("Getting the tokens {network} can receive…"))
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal(),
+                );
             }
             BridgeState::Failed(error) => {
                 return line.child(retry_alert(
@@ -6153,11 +6154,17 @@ impl PrivateSwapsView {
                 } else {
                     "Enter an amount that fits to get a quote"
                 })
+                // Shrinks beside the balance and wraps, instead of running under it.
+                .flex_1()
+                .min_w_0()
                 .whitespace_normal(),
             ),
-            QuoteState::Loading => line
-                .child(Spinner::new().small())
-                .child(app_muted_text("Getting a quote and checking the price…")),
+            QuoteState::Loading => line.child(Spinner::new().small()).child(
+                app_muted_text("Getting a quote and checking the price…")
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal(),
+            ),
             QuoteState::Failed(error) => line.child(retry_alert(
                 "swap-price-error",
                 self.quote_error_message(error, cx),
