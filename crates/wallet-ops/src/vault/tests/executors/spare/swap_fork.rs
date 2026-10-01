@@ -359,6 +359,8 @@ impl Wallet {
             U256::from(25),
             U256::from(25),
             50,
+            crate::cow::GAS_SHARE_BALANCED_BPS,
+            std::time::Duration::from_mins(10),
             1,
             U256::ZERO,
             isolation,
@@ -759,6 +761,10 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
     let fork = ForkChain::start().await;
     let wallet = Wallet::open(&fork);
     let swap = wallet.swap(&fork).await;
+    // Balanced share of the stub quote: the best case is 20,000,000 plus the 20,020 network
+    // fee, less 0.5% tolerance (19,919,919), less 25% of a one-unit gas estimate at 1 wei.
+    // The buy amount is the smallest one that nets that minimum after the shield fee.
+    assert_eq!(swap.order.buyAmount, U256::from(19_919_918));
 
     let receipt = fork
         .settle(

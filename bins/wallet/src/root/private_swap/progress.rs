@@ -31,9 +31,9 @@ use wallet_ops::{
 };
 
 use super::dialog::{SwapDialogView, settled_by_cow};
-use super::form::{broadcaster_result_problem, network_name};
+use super::form::{broadcaster_result_problem, format_gwei, gas_share_name, network_name};
 use super::model::{
-    SwapActions, SwapOrderGroup, SwapStage, SwapStep, bridge_sent_amount, format_bps_percent,
+    SwapActions, SwapOrderGroup, SwapStage, SwapStep, bridge_sent_amount, needs_executed_fee,
     provider_name, record_swap_ranges, swap_actions, swap_order_group, swap_order_stage,
     swap_outcome, swap_private_minimum, swap_steps, swap_valid_to, swaps_card_line,
 };
@@ -243,6 +243,8 @@ impl PrivateSwapsView {
             Some(
                 "This setup was stopped, so no order will be placed. Its stealth account stays in Stealth accounts.",
             )
+        } else if record.is_hidden() && actions.dismiss {
+            Some("Removed from the Private tab. Tracking continues in My orders.")
         } else {
             progress_note(stage)
         };
@@ -254,6 +256,20 @@ impl PrivateSwapsView {
             .swap()
             .and_then(|swap| swap.orders().last())
             .filter(|_| pending.is_none());
+        let checked = tracking
+            .and_then(|tracking| tracking.status_checked)
+            .filter(|(uid, _)| {
+                job.is_none()
+                    && error.is_none()
+                    && stage.is_observed()
+                    && order.is_some_and(|order| order.uid() == *uid)
+            })
+            .map(|(_, at)| {
+                format!(
+                    "Checked at {}. The outcome is not confirmed yet. Check again after more blocks arrive.",
+                    local_time_label(at),
+                )
+            });
         let group = swap_order_group(stage, stopped, record.is_hidden());
         let minimum = pending
             .map(|pending| (pending.buy, pending.private_minimum))
@@ -269,6 +285,7 @@ impl PrivateSwapsView {
         let delivery = pending.map_or_else(|| swap_delivery(record), |pending| pending.delivery);
         let outcome =
             order.and_then(|order| self.render_outcome(record, order, stage, started, cx));
+        let not_filled = order.and_then(|order| self.render_not_filled(record, order, stage, cx));
         let facts = match delivery {
             SwapDelivery::Bridge(bridge) => {
                 Some(self.render_bridge_facts(record, order, bridge, stage, started, cx))
@@ -284,6 +301,7 @@ impl PrivateSwapsView {
                 shows_steps(stage, outcome.is_some())
                     .then(|| render_submission_progress_stepper(steps)),
             )
+            .children(not_filled)
             .children(facts)
             .children(outcome)
             .children(
@@ -292,6 +310,7 @@ impl PrivateSwapsView {
                     .map(|note| app_muted_text(note).whitespace_normal()),
             )
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
+            .children(checked.map(|message| app_muted_text(message).whitespace_normal()))
             .children(error.map(|error| {
                 app_muted_text(error)
                     .text_color(rgb(theme::DANGER))
@@ -348,6 +367,7 @@ impl PrivateSwapsView {
         );
         let started = self.swap_started(record, Some(&range), cx);
         let outcome = self.render_outcome(record, order, stage, started, cx);
+        let not_filled = self.render_not_filled(record, order, stage, cx);
         let facts = match order.delivery() {
             SwapDelivery::Bridge(bridge) => {
                 Some(self.render_bridge_facts(record, Some(order), bridge, stage, started, cx))
@@ -365,6 +385,7 @@ impl PrivateSwapsView {
                 shows_steps(stage, outcome.is_some())
                     .then(|| render_submission_progress_stepper(steps)),
             )
+            .children(not_filled)
             .children(facts)
             .children(outcome)
             .children(
@@ -719,7 +740,7 @@ impl PrivateSwapsView {
             return None;
         };
         let swap = record.swap()?;
-        let outcome = swap_outcome(order.bounds(), &order.observations())?;
+        let outcome = swap_outcome(order.bounds(), &order.observations(), order.delivery())?;
         let terms = swap.order_terms(order);
         let (sell, buy) = (terms.sell_token(), terms.buy_token());
         let amount =
@@ -794,33 +815,57 @@ impl PrivateSwapsView {
             None => (limit.map(|limit| ("Limit price", limit)), None),
         };
         rows.extend(price.map(|(label, price)| outcome_row(label, price, None).into_any_element()));
+        // What was delivered against the approved minimum, then the fee the orderbook charged
+        // beside the settlement transaction's gas cost, each once recorded.
+        rows.extend(outcome.received.map(|received| {
+            fact_row(
+                "Received",
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_1()
+                    .child(app_text(amount(buy, received)))
+                    .children(outcome.above_minimum.map(|above| {
+                        app_text(format!(
+                            "{} above your minimum",
+                            self.bare_amount(buy, above, cx)
+                        ))
+                        .text_color(cx.theme().success)
+                    })),
+            )
+            .debug_selector(|| "swap-outcome-received".into())
+            .into_any_element()
+        }));
         rows.push(
-            match outcome.surplus {
-                Some((surplus, share)) => fact_row(
-                    "vs. minimum",
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .justify_end()
-                        .gap_1()
-                        .child(
-                            app_text(format!(
-                                "+{} ({})",
-                                self.token_amount(buy, surplus, cx),
-                                format_bps_percent(share)
-                            ))
-                            .text_color(cx.theme().success),
-                        )
-                        .child(app_muted_text(format!(
-                            "above {}",
-                            self.bare_amount(buy, outcome.minimum, cx)
-                        ))),
-                ),
-                None => outcome_row("Minimum", amount(buy, outcome.minimum), None),
-            }
-            .into_any_element(),
+            self.minimum_row(buy, outcome.private_minimum, order, cx)
+                .into_any_element(),
         );
+        rows.extend(outcome.gas.map(|gas| {
+            // The executed fee is everything the order was charged, not its gas alone, so the
+            // two figures aren't compared.
+            fact_row(
+                "CoW fee",
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_1()
+                    .child(app_text(format!(
+                        "{} charged to you,",
+                        self.money(gas.fee_token, gas.fee, cx)
+                    )))
+                    .child(app_muted_text("network and protocol fees"))
+                    .child(app_muted_text(format!(
+                        "· settlement gas cost {}",
+                        self.money(Address::ZERO, gas.settlement_cost, cx)
+                    ))),
+            )
+            .debug_selector(|| "swap-outcome-gas".into())
+            .into_any_element()
+        }));
         let unshield_fee = Some(outcome.unshield_fee).filter(|fee| !fee.is_zero());
         let shield_fee = outcome
             .received_privately
@@ -955,6 +1000,90 @@ impl PrivateSwapsView {
         )
     }
 
+    /// The approved minimum of `buy` and, when recorded, the gas share it was set with.
+    fn minimum_row(
+        &self,
+        buy: Address,
+        minimum: U256,
+        order: &SwapOrderRecord,
+        cx: &App,
+    ) -> gpui::Div {
+        fact_row(
+            "Minimum",
+            amount_with_note(
+                self.with_usd(self.token_amount(buy, minimum, cx), buy, minimum, cx),
+                order
+                    .bounds()
+                    .gas_share_bps
+                    .map(gas_share_name)
+                    .unwrap_or_default(),
+            ),
+        )
+        .debug_selector(|| "swap-outcome-minimum".into())
+    }
+
+    /// An order that expired unfilled, as a normal outcome: its minimum, the gas it allowed
+    /// against the estimate, when it expired and the gas price when it was signed, then where
+    /// the inputs are. Rows a record from before gas shares lacks are left out. A Bridge
+    /// swap's facts explain its own expiry.
+    fn render_not_filled(
+        &self,
+        record: &ExecutorRecord,
+        order: &SwapOrderRecord,
+        stage: SwapStage,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        if stage != SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired))
+            || matches!(order.delivery(), SwapDelivery::Bridge(_))
+        {
+            return None;
+        }
+        let terms = record.swap()?.order_terms(order);
+        let (sell, buy) = (terms.sell_token(), terms.buy_token());
+        let bounds = order.bounds();
+        let mut rows = vec![self.minimum_row(buy, bounds.private_minimum, order, cx)];
+        if let (Some(allowance), Some(estimate)) = (bounds.gas_allowance, bounds.gas_estimate) {
+            rows.push(
+                fact_row(
+                    "Gas you allowed",
+                    app_text(format!(
+                        "up to {} of ≈ {}",
+                        self.money(buy, allowance, cx),
+                        self.money(buy, estimate, cx)
+                    )),
+                )
+                .debug_selector(|| "swap-not-filled-gas".into()),
+            );
+        }
+        rows.push(fact_row(
+            "Expired",
+            app_text(local_date_time_label(u64::from(order.valid_to()))),
+        ));
+        rows.extend(bounds.gas_price_wei.map(|price| {
+            fact_row(
+                "Gas price at signing",
+                app_text(format!("{} gwei", format_gwei(price))),
+            )
+            .debug_selector(|| "swap-not-filled-gas-price".into())
+        }));
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().w_full().flex().flex_col().gap_2().children(rows))
+                .child(
+                    app_muted_text(format!(
+                        "Nothing was unshielded. Your {} is still in your private balance. The setup fee isn't refunded.",
+                        self.token_amount(sell, bounds.spend_amount(), cx)
+                    ))
+                    .whitespace_normal(),
+                )
+                .debug_selector(|| "swap-not-filled".into()),
+        )
+    }
+
     fn render_progress_actions(
         &self,
         operation: ExecutorOperationId,
@@ -1037,12 +1166,19 @@ impl PrivateSwapsView {
                             || stage == SwapStage::Order(SwapOrderState::Traded)))
             })
             .map(|_| {
-                app_button("swap-progress-check", "Check status")
+                let checking = job == Some(SwapJobKind::Check);
+                let label = if checking {
+                    "Checking status"
+                } else {
+                    "Check status"
+                };
+                app_button("swap-progress-check", label)
                     .debug_selector(|| "swap-progress-check".into())
                     .outline()
                     .small()
                     .disabled(busy)
-                    .loading(job == Some(SwapJobKind::Check))
+                    .when(checking, |button| button.icon(IconName::LoaderCircle))
+                    .loading(checking)
                     .tooltip(match stage {
                         _ if !bridge_check => "Checks this stealth account's state with the RPC provider for retry or recovery",
                         SwapStage::Order(SwapOrderState::NeedsAttention) => {
@@ -1131,16 +1267,22 @@ impl PrivateSwapsView {
                 }
             }))
         });
+        let expired =
+            stage == SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired));
         let retry = actions.retry.map(|availability| {
-            app_button("swap-progress-retry", "Retry…")
-                .when(availability.is_ok(), ButtonVariants::primary)
-                .small()
-                .flex_none()
-                .disabled(busy || availability.is_err())
-                .when_some(availability.err(), gpui_component::button::Button::tooltip)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_existing_form(operation, window, cx);
-                }))
+            app_button(
+                "swap-progress-retry",
+                if expired { "Swap again…" } else { "Retry…" },
+            )
+            .debug_selector(|| "swap-progress-retry".into())
+            .when(availability.is_ok(), ButtonVariants::primary)
+            .small()
+            .flex_none()
+            .disabled(busy || availability.is_err())
+            .when_some(availability.err(), gpui_component::button::Button::tooltip)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_existing_form(operation, window, cx);
+            }))
         });
         let recover = actions.recover.then(|| {
             app_button("swap-progress-recover", "Recover…")
@@ -1162,7 +1304,7 @@ impl PrivateSwapsView {
                 .flex_none()
                 .disabled(busy)
                 .tooltip(
-                    "The swap stays in My orders, and its stealth account stays in Stealth accounts.",
+                    "Hides this card. Tracking and reserved funds are unchanged. The swap stays in My orders, and its account stays in Stealth accounts.",
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.remove_from_private_tab(operation, cx);
@@ -1275,33 +1417,79 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(confirmed) = self.confirmed_block(cx) else {
+            self.fail(
+                operation,
+                "Status is unavailable until the network has synced. Try again once sync resumes."
+                    .into(),
+            );
+            cx.notify();
             return;
         };
         let Some(mut cursor) = self
             .record(operation)
             .and_then(super::model::swap_history_start)
         else {
+            self.fail(
+                operation,
+                "This order's saved history is unavailable, so its status could not be checked."
+                    .into(),
+            );
+            cx.notify();
             return;
         };
         let owner = Arc::clone(&self.owner);
+        let client = self
+            .tracking
+            .get(&operation)
+            .and_then(|tracking| tracking.orderbook.clone());
         self.start_job(
             operation,
             SwapJobKind::Check,
             async move {
-                loop {
+                let fee_uid = loop {
                     let range = super::model::swap_observation_range(cursor, confirmed);
                     cursor = range.end;
                     let report = owner.observe_swap(operation, range).await?;
                     if cursor > confirmed
                         || !super::model::swap_stage(report.record(), None, false).is_observed()
                     {
-                        break;
+                        break report
+                            .record()
+                            .swap()
+                            .and_then(|swap| swap.orders().last())
+                            .filter(|order| needs_executed_fee(order))
+                            .map(SwapOrderRecord::uid);
+                    }
+                };
+                // A recorded trade still without its fee asks the orderbook once more on the
+                // swap's own route. A failed read leaves the CoW fee row out.
+                let Some(uid) = fee_uid else {
+                    return Ok(None);
+                };
+                let client = match client {
+                    Some(client) => Some(client),
+                    None => owner.swap_orderbook_client().await.ok(),
+                };
+                if let Some(client) = &client {
+                    let _ = Box::pin(owner.observe_swap_executed_fee(operation, uid, client)).await;
+                }
+                Ok(Some((uid, client)))
+            },
+            move |this, fee, _, _| {
+                let uid = this
+                    .record(operation)
+                    .and_then(|record| record.swap())
+                    .and_then(|swap| swap.orders().last())
+                    .map(SwapOrderRecord::uid);
+                let tracking = this.tracking.entry(operation).or_default();
+                tracking.error = None;
+                tracking.status_checked = uid.map(|uid| (uid, now_unix()));
+                if let Some((uid, client)) = fee {
+                    tracking.fee_asked.insert(uid);
+                    if tracking.orderbook.is_none() {
+                        tracking.orderbook = client;
                     }
                 }
-                Ok(())
-            },
-            move |this, (), _, _| {
-                this.tracking.entry(operation).or_default().error = None;
             },
             window,
             cx,

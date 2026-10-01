@@ -6,7 +6,7 @@
 //! from its encrypted executor record, so the card and its progress survive a restart. The
 //! wallet-ops executor owner performs every chain, orderbook, signing, and submission step.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,6 +120,8 @@ struct PendingSwapOrder {
     amount: U256,
     private_minimum: U256,
     slippage_bps: u32,
+    gas_share_bps: u16,
+    valid_for: Duration,
     reuse_account: bool,
     started_at: u64,
 }
@@ -154,9 +156,14 @@ struct SwapTracking {
     located_at: Option<(B256, Instant)>,
     /// The last observation or submission problem, shown in the swap's progress.
     error: Option<String>,
+    /// The latest successful explicit status check, scoped to its order and completion time.
+    status_checked: Option<(OrderUid, u64)>,
     /// The sell amount entered before the first order records it.
     amount: Option<U256>,
     slippage_bps: Option<u32>,
+    /// The gas share and order validity entered before the first order records them.
+    gas_share_bps: Option<u16>,
+    valid_for: Option<Duration>,
     /// The swap's own orderbook route, kept for its quotes, its order submission, and its
     /// order reports.
     orderbook: Option<CowOrderbookClient>,
@@ -168,6 +175,9 @@ struct SwapTracking {
     bridge_polls: HashMap<OrderUid, BridgePoll>,
     /// Bridge provider clients on the `orderbook` route, kept with it for status checks.
     bridge_clients: Option<wallet_ops::SwapBridgeClients>,
+    /// Traded orders whose executed fee this session already asked the orderbook for, whatever
+    /// the answer, so a failed read isn't repeated until the next session.
+    fee_asked: HashSet<OrderUid>,
     /// The bought token in the stealth account, and the block it was read at, from this
     /// session's last explicit check of a Bridge swap's refund or undelivered deposit. Recovery
     /// of a refund waits for it, and opens with it.
@@ -792,6 +802,7 @@ impl PrivateSwapsView {
                 received: None,
                 receiver: None,
                 minimum: None,
+                uncovered_gas: None,
                 bridge: None,
             };
         };
@@ -906,8 +917,24 @@ impl PrivateSwapsView {
             received,
             receiver: order.and_then(|order| self.receiver_name(order.delivery(), cx)),
             minimum: order.map(|order| self.token_amount(buy, order.bounds().private_minimum, cx)),
+            uncovered_gas: order
+                .and_then(|order| {
+                    let bounds = order.bounds();
+                    bounds.gas_estimate?.checked_sub(bounds.gas_allowance?)
+                })
+                .filter(|rest| !rest.is_zero())
+                .map(|rest| self.money(buy, rest, cx)),
             bridge,
         }
+    }
+
+    /// `amount` of `token` in the wallet's currency, "$4.42", or as a token amount without a
+    /// cached rate.
+    fn money(&self, token: Address, amount: U256, cx: &gpui::App) -> String {
+        self.usd_micro_value(token, amount, cx).map_or_else(
+            || self.token_amount(token, amount, cx),
+            railgun_ui::format_usd_micro_value,
+        )
     }
 
     /// How swaps name a Bridge delivery of `buy`: its network, provider and receiver, and from
@@ -1012,7 +1039,11 @@ impl PrivateSwapsView {
                 let stage = self.progress_stage(record);
                 (!record.is_swap_setup_stopped()
                     && (self.pending_order(record).is_some()
-                        || stage.is_shown_on_private_tab(record.is_hidden())))
+                        || stage.is_shown_on_private_tab(
+                            record.is_hidden(),
+                            model::swap_valid_to(record)
+                                .is_some_and(|valid_to| valid_to < now_unix()),
+                        )))
                 .then_some((record, stage))
             })
     }
@@ -1099,7 +1130,9 @@ impl PrivateSwapsView {
 
     /// Orders to ask the orderbook about in this pass, at most one report each. An open order
     /// is asked about until its settlement is verified, including fills while offline.
-    /// These reports only locate evidence; they cannot change a persisted outcome.
+    /// These reports only locate evidence; they cannot change a persisted outcome. A traded
+    /// order's executed fee is asked for once per session until it's recorded, also after
+    /// verification ends the reports.
     ///
     /// Handed-off Bridge orders ask their provider through the same route until an outcome is
     /// recorded, including after a restart, backing off while it reports none. A destination
@@ -1153,10 +1186,14 @@ impl PrivateSwapsView {
                         Some((order.uid(), chain.clone()))
                     })
                     .collect::<Vec<_>>();
-                (wanted || !bridges.is_empty()).then(|| HintRequest {
+                // A verified trade ends routine hints, but its fee is asked for once.
+                let fee = model::needs_executed_fee(order)
+                    && tracking.is_none_or(|tracking| !tracking.fee_asked.contains(&order.uid()));
+                (wanted || fee || !bridges.is_empty()).then(|| HintRequest {
                     operation: record.operation(),
                     uid: order.uid(),
                     hint: wanted,
+                    fee,
                     client: tracking.and_then(|tracking| tracking.orderbook.clone()),
                     bridges,
                 })
@@ -1174,6 +1211,9 @@ impl PrivateSwapsView {
             let tracking = self.tracking.entry(result.operation).or_default();
             if tracking.orderbook.is_none() {
                 tracking.orderbook = result.client;
+            }
+            if result.fee {
+                tracking.fee_asked.insert(result.uid);
             }
             // An outcome ends the order's polling; otherwise the next poll waits longer.
             for (uid, outcome) in result.bridges {
@@ -1368,7 +1408,9 @@ impl PrivateSwapsView {
             return;
         }
         self.error = None;
-        self.tracking.entry(operation).or_default().error = None;
+        let tracking = self.tracking.entry(operation).or_default();
+        tracking.error = None;
+        tracking.status_checked = None;
         self.job_revision = self.job_revision.wrapping_add(1);
         let revision = self.job_revision;
         let join = self.runtime.spawn(work);
@@ -1622,6 +1664,8 @@ struct HintRequest {
     uid: OrderUid,
     /// Whether to ask the orderbook about `uid`.
     hint: bool,
+    /// Whether to read the traded order's executed fee, once per session.
+    fee: bool,
     /// The swap's own orderbook route, when this session has one.
     client: Option<CowOrderbookClient>,
     /// Handed-off Bridge orders to poll, with their destination chain.
@@ -1632,6 +1676,8 @@ struct HintResult {
     operation: ExecutorOperationId,
     uid: OrderUid,
     client: Option<CowOrderbookClient>,
+    /// The executed fee was asked for, whether or not the read succeeded.
+    fee: bool,
     /// Each polled Bridge order, and whether it has an outcome now.
     bridges: Vec<(OrderUid, bool)>,
     /// The report and trade block, or `None` when the orderbook couldn't be asked.
@@ -1639,7 +1685,9 @@ struct HintResult {
 }
 
 /// Ask the orderbook about each order through its swap's own route, sending only the order
-/// UID. A failed request leaves the last report; the client logs failures without URLs.
+/// UID. A failed request leaves the last report; the client logs failures without URLs. A
+/// traded order's executed fee is read once, and the owner persists it; a failed read is
+/// dropped.
 /// Bridge providers are polled on the same route, and the owner persists any outcome. The
 /// caller backs off after a poll without an outcome, including a failed one.
 async fn fetch_order_hints(
@@ -1665,6 +1713,13 @@ async fn fetch_order_hints(
         } else {
             None
         };
+        if request.fee
+            && let Some(client) = &client
+        {
+            let _ =
+                Box::pin(owner.observe_swap_executed_fee(request.operation, request.uid, client))
+                    .await;
+        }
         // Without clients, every poll counts as one without an outcome.
         let clients = if request.bridges.is_empty() {
             None
@@ -1695,6 +1750,7 @@ async fn fetch_order_hints(
             operation: request.operation,
             uid: request.uid,
             client,
+            fee: request.fee,
             bridges,
             report,
         });

@@ -701,6 +701,11 @@ impl Fixture {
                             }
                             None => None,
                         },
+                        gas_share_bps: None,
+                        gas_estimate: None,
+                        gas_allowance: None,
+                        gas_price_wei: None,
+                        valid_for_secs: None,
                     },
                     invalidates: None,
                     pre_hook: IssuedExecutorPayload::new(
@@ -889,6 +894,8 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
         U256::from(25),
         U256::from(25),
         50,
+        crate::cow::GAS_SHARE_BALANCED_BPS,
+        std::time::Duration::from_mins(10),
         1,
         U256::ZERO,
         crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
@@ -1089,6 +1096,11 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
                     hook_cost: Some(U256::ZERO),
                     anchors: Vec::new(),
                     destination_minimum: None,
+                    gas_share_bps: None,
+                    gas_estimate: None,
+                    gas_allowance: None,
+                    gas_price_wei: None,
+                    valid_for_secs: None,
                 },
                 price_verified: Some(false),
                 price_acknowledged: true,
@@ -1158,6 +1170,10 @@ async fn swap_delivery_tolerates_dust_retains_shield_evidence_and_reopens_on_reo
             sell_amount: U256::from(SELL_AMOUNT),
             buy_amount: U256::from(BUY_AMOUNT),
             fee_amount: U256::ZERO,
+            settlement_gas_used: None,
+            settlement_effective_gas_price: None,
+            executed_fee: None,
+            executed_fee_token: None,
         })
     );
     // The retained shield keeps the credited amount with the fee its event charged.
@@ -2073,7 +2089,13 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     {
         let mut chain = fixture.chain.lock().unwrap();
         chain.head = 15;
+        // Another transaction in the block, whose gas isn't the settlement's.
+        chain.add_addressed_transaction(15, Address::repeat_byte(0x55), Bytes::new(), Vec::new());
+        let other = &mut chain.transactions.last_mut().unwrap().2;
+        (other.gas_used, other.effective_gas_price) = (21_000, 9);
         chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
+        let receipt = &mut chain.transactions.last_mut().unwrap().2;
+        (receipt.gas_used, receipt.effective_gas_price) = (187_654, 2_345_678_901);
         chain.rpc_requests.clear();
     }
     // CoW can locate an unconfirmed block but cannot advance canonical progress.
@@ -2108,6 +2130,15 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     assert!(
         order.observations().shielded.is_none(),
         "receipt credit does not invent hook nonce evidence"
+    );
+    // The settlement's gas comes from the receipt that emits the trade, without another read.
+    let amounts = order.observations().trade_amounts.unwrap();
+    assert_eq!(
+        (
+            amounts.settlement_gas_used,
+            amounts.settlement_effective_gas_price
+        ),
+        (Some(187_654), Some(2_345_678_901))
     );
     assert_eq!(record.nonce_observation(), nonce_before);
     assert!(
@@ -2209,6 +2240,79 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
             .nonce(),
         U256::from(3)
     );
+    restarted.shutdown().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn the_executed_fee_is_read_once_after_the_trade_and_kept_by_later_settlement_checks() {
+    let fixture = Fixture::start().await;
+    fixture.record_attempt(1, 20);
+    let order = uid(1, 20);
+    let (url, requests, stub) = super::swap_order::spawn_bridge_stub(|_| {
+        json!({"status": "fulfilled", "executedFee": "464572", "executedFeeToken": BUY}).to_string()
+    })
+    .await;
+    let orderbook = crate::cow::CowOrderbookClient::new(
+        crate::OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        ),
+        url,
+        1,
+    )
+    .unwrap();
+    let fee = |record: &ExecutorRecord| {
+        record.swap().unwrap().orders()[0]
+            .observations()
+            .trade_amounts
+            .map(|amounts| (amounts.executed_fee, amounts.executed_fee_token))
+    };
+
+    // Nothing is asked before the trade is verified.
+    fixture
+        .owner
+        .observe_swap_executed_fee(fixture.operation, order, &orderbook)
+        .await
+        .unwrap();
+    assert!(requests.lock().unwrap().is_empty());
+
+    // A credit below the approved minimum leaves the order traded, so its settlement is
+    // checked again later.
+    let mut logs = settlement_logs(&fixture, 1, 20);
+    logs[4].1 = post_hook_shield_log(1, 10);
+    confirm_settlement(&fixture, logs).await;
+    assert_eq!(state(&fixture.record(), 0), SwapOrderState::Traded);
+    fixture
+        .owner
+        .observe_swap_executed_fee(fixture.operation, order, &orderbook)
+        .await
+        .unwrap();
+    let charged = Some((Some(U256::from(464_572)), Some(BUY)));
+    assert_eq!(fee(&fixture.record()), charged);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![(format!("/api/api/v1/orders/{}", order.0), Value::Null)],
+        "the fee read carries only the order UID"
+    );
+
+    // The next settlement check records the same trade again and keeps the fee, and neither
+    // this owner nor one after a restart asks again.
+    fixture
+        .owner
+        .observe_swap_settlement(fixture.operation, order, 15)
+        .await
+        .unwrap();
+    assert_eq!(fee(&fixture.record()), charged);
+    let restarted = restarted_owner(&fixture);
+    for owner in [&fixture.owner, &restarted] {
+        owner
+            .observe_swap_executed_fee(fixture.operation, order, &orderbook)
+            .await
+            .unwrap();
+    }
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    stub.abort();
     restarted.shutdown().await;
     fixture.finish().await;
 }

@@ -28,13 +28,13 @@ fn swap_cost_confirmation_wraps_and_is_cleared_when_terms_change(cx: &mut TestAp
             });
             window.close_all_dialogs(cx);
             let swaps = swaps.clone();
-            // Mount the production warning with a high-cost percentage. Quote creation is
-            // exercised by wallet-ops tests; this checks the control and its consent lifetime.
+            // Mount the production warning with an authorized-cost message. Quote creation is
+            // exercised elsewhere; this checks the control and its consent lifetime.
             window.open_dialog(cx, move |dialog, _, cx| {
                 let warning = swaps.update(cx, |swaps, cx| {
                     PrivateSwapsView::render_cost_acknowledgement(
                         swaps.form.as_ref().unwrap(),
-                        Some(1_234),
+                        Some("You allow paying up to $5.90 of gas, 59% of this swap.".to_owned()),
                         true,
                         cx,
                     )
@@ -72,6 +72,10 @@ fn swap_cost_confirmation_wraps_and_is_cleared_when_terms_change(cx: &mut TestAp
                     !swaps.form.as_ref().unwrap().high_costs_acknowledged,
                     "consent to the previous quote cannot carry across changed terms"
                 );
+                // Another gas share changes the costs the user authorizes.
+                swaps.form.as_mut().unwrap().high_costs_acknowledged = true;
+                swaps.set_gas_share(wallet_ops::cow::GAS_SHARE_LOOSE_BPS, false, window, cx);
+                assert!(!swaps.form.as_ref().unwrap().high_costs_acknowledged);
             });
         });
     });
@@ -218,8 +222,8 @@ fn swap_quote_error_wraps_within_its_column(cx: &mut TestAppContext) {
             ),
             eyre::Report::from(wallet_ops::cow::OrderLimitError::HookCostExceedsOutput {
                 buy_token: Address::repeat_byte(2),
-                hook_cost: U256::from(60_000_000),
-                quoted_output: U256::from(49_500_000),
+                gas_estimate: U256::from(60_000_000),
+                best_case: U256::from(49_500_000),
             })
             .wrap_err("Could not price the order"),
         ] {
@@ -255,10 +259,10 @@ fn swap_quote_error_wraps_within_its_column(cx: &mut TestAppContext) {
                     "the error must stay out of the balance column: {error:?}, {status:?}"
                 );
                 assert!(
-                    retry.top() >= error.bottom(),
-                    "Retry follows the full error"
+                    retry.top() >= error.top() && retry.bottom() <= error.bottom(),
+                    "Retry is inside the error: {retry:?}, {error:?}"
                 );
-                assert!(retry.bottom() <= status.bottom());
+                assert!(error.bottom() <= status.bottom());
             }
         }
     });
@@ -1292,6 +1296,11 @@ fn test_approval() -> SwapApproval {
             hook_cost: Some(U256::ONE),
             anchors: Vec::new(),
             destination_minimum: None,
+            gas_share_bps: None,
+            gas_estimate: None,
+            gas_allowance: None,
+            gas_price_wei: None,
+            valid_for_secs: None,
         },
         price_verified: Some(false),
         price_acknowledged: true,
@@ -1343,6 +1352,11 @@ fn with_swap_view_and_rpc(
     cx.update(|cx| {
         gpui_component::init(cx);
         ui::theme::apply_zenburn_component_theme(cx);
+        // Dialogs slide in over a wall-clock animation, and a test build redraws a dirty
+        // window between a click's mouse down and up. Mid-animation, that redraw moves the
+        // dialog, so the release can miss the element the click measured. With reduced
+        // motion, a dialog settles on its first frame, as gpui-component's own tests do.
+        cx.set_reduce_motion(true);
     });
     let mut fixture = None;
     let (host, cx) = cx.add_window_view(|window, cx| {
@@ -1793,6 +1807,19 @@ fn placed_swap(
     broadcaster_core::contracts::cow::OrderUid,
     wallet_ops::vault::ExecutorNonceObservation,
 ) {
+    placed_swap_with(executors, operation, delivery, |_| {})
+}
+
+/// [`placed_swap`] with `edit` applied to the order's approved bounds.
+fn placed_swap_with(
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    delivery: wallet_ops::vault::SwapDelivery,
+    edit: impl FnOnce(&mut wallet_ops::vault::SwapApprovedBounds),
+) -> (
+    broadcaster_core::contracts::cow::OrderUid,
+    wallet_ops::vault::ExecutorNonceObservation,
+) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
     use broadcaster_core::contracts::cow::OrderUid;
@@ -1876,6 +1903,7 @@ fn placed_swap(
             }
         }
     };
+    edit(&mut bounds);
     executors
         .record_swap_attempt(
             operation,
@@ -1937,6 +1965,10 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                         sell_amount: U256::from(100),
                         buy_amount: U256::from(99),
                         fee_amount: U256::ZERO,
+                        settlement_gas_used: None,
+                        settlement_effective_gas_price: None,
+                        executed_fee: None,
+                        executed_fee_token: None,
                     }),
                     ..Default::default()
                 },
@@ -1951,6 +1983,8 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             amount: U256::from(50),
             private_minimum: U256::from(45),
             slippage_bps: 100,
+            gas_share_bps: wallet_ops::cow::GAS_SHARE_TIGHT_BPS,
+            valid_for: Duration::from_mins(30),
             reuse_account: true,
             started_at: now_unix(),
         };
@@ -2023,6 +2057,11 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                 assert_eq!((form.sell, form.buy), (pending.sell, Some(pending.buy)));
                 assert_eq!(swaps.form_amount(form, cx).unwrap(), pending.amount);
                 assert_eq!(form.slippage_bps, pending.slippage_bps);
+                // The retry restores the share and the validity the order was approved with.
+                assert_eq!(
+                    (form.gas_share_bps, form.valid_for),
+                    (pending.gas_share_bps, pending.valid_for)
+                );
                 assert!(form.reuse_account);
                 swaps.start_job(
                     operation,
@@ -2185,6 +2224,91 @@ fn declined_swap_recovery_leaves_focus_in_the_swap_detail(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut TestAppContext) {
+    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+        let (uid, _) = placed_swap(executors, operation, SwapDelivery::Reshield);
+        executors
+            .record_swap_submission(
+                operation,
+                uid,
+                wallet_ops::vault::SwapSubmissionStatus::Accepted,
+            )
+            .unwrap();
+        let reserved = executors.records().unwrap()[0].reserved_inputs();
+        assert!(!reserved.is_empty());
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let check = cx.debug_bounds("swap-progress-check").unwrap();
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            assert!(
+                swaps
+                    .read(cx)
+                    .tracking
+                    .get(&operation)
+                    .is_some_and(|tracking| tracking.error.is_some()),
+                "a check without a synced head must explain why it cannot run"
+            );
+        });
+        cx.update(|window, cx| {
+            root.update(cx, |root, _| {
+                let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
+                else {
+                    panic!("ready fixture")
+                };
+                sync_tip.head_block = Some(100);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let check = cx.debug_bounds("swap-progress-check").unwrap();
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            let swaps = swaps.read(cx);
+            assert_eq!(swaps.job.as_ref().unwrap().kind, SwapJobKind::Check);
+            assert!(swaps.tracking[&operation].error.is_none());
+        });
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+        });
+        cx.update(|window, cx| {
+            assert!(swaps.read(cx).tracking[&operation].error.is_some());
+            window.draw(cx).clear(cx);
+        });
+        let remove = cx.debug_bounds("swap-progress-remove").unwrap();
+        cx.simulate_click(remove.center(), gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            let swaps = swaps.read(cx);
+            assert!(!swaps.has_shown_swaps());
+            assert!(swaps.next_order_hints(cx).is_some(), "tracking continues");
+            let record = swaps.record(operation).unwrap();
+            assert_eq!(swaps.stage(record), SwapStage::Order(SwapOrderState::Open));
+            assert!(matches!(
+                model::swap_actions(swaps.stage(record), true).retry,
+                Some(Err(_))
+            ));
+            assert_eq!(
+                model::swap_order_group(swaps.stage(record), false, record.is_hidden()),
+                model::SwapOrderGroup::Open,
+                "hiding the card must not claim the swap has ended"
+            );
+        });
+        let saved = executors.records().unwrap().pop().unwrap();
+        assert!(saved.is_hidden());
+        assert_eq!(saved.reserved_inputs(), reserved);
+        assert_eq!(saved.swap().unwrap().orders()[0].uid(), uid);
+        assert_eq!(
+            saved.swap().unwrap().orders()[0].observations(),
+            wallet_ops::vault::SwapOrderObservations::default()
+        );
+    });
+}
+
+#[gpui::test]
 fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history(
     cx: &mut TestAppContext,
 ) {
@@ -2222,6 +2346,7 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
                     operation,
                     uid,
                     client: None,
+                    fee: false,
                     report: Some((
                         CowOrderStatusReport {
                             status: CowOrderStatusHint::Fulfilled,
@@ -2376,9 +2501,10 @@ fn swap_receiver_uses_unshield_suggestions_and_saves_to_the_public_address_book(
                 let form = swaps.form.as_ref().unwrap();
                 assert!(form.delivery.is_err());
                 assert!(
-                    matches!(form.quote, QuoteState::Idle),
-                    "nothing is quoted without a receiver"
+                    matches!(form.quote, QuoteState::Loading),
+                    "the swap is quoted before its receiver is entered"
                 );
+                let revision = form.quote_revision;
                 // Private Unshield's suggestions: active public accounts and the address book.
                 let options = swaps.receiver_options(cx);
                 let offered = |address: Address| {
@@ -2410,12 +2536,12 @@ fn swap_receiver_uses_unshield_suggestions_and_saves_to_the_public_address_book(
                     Ok(SwapDelivery::External { receiver: saved })
                 );
                 assert!(
-                    matches!(form.quote, QuoteState::Loading),
-                    "a picked receiver is quoted like a typed one"
+                    matches!(form.quote, QuoteState::Loading) && form.quote_revision == revision,
+                    "a picked receiver, like a typed one, keeps the quote in flight"
                 );
                 assert!(
                     !form.price_acknowledged && !form.high_costs_acknowledged,
-                    "acceptance of another receiver's quote doesn't carry over"
+                    "acceptance for another receiver doesn't carry over"
                 );
 
                 set_receiver_text(swaps, &unsaved.to_checksum(None), window, cx);
@@ -2524,9 +2650,12 @@ fn swap_receiver_rejects_addresses_that_would_lose_the_proceeds(cx: &mut TestApp
                         Err(DeliveryProblem::Receiver((*problem).into())),
                         "{entered}"
                     );
-                    assert!(
-                        matches!(form.quote, QuoteState::Idle) && form.quote_task.is_none(),
-                        "{entered} must not be quoted"
+                    assert_eq!(
+                        form.quote_delivery(),
+                        Some(SwapDelivery::External {
+                            receiver: Address::ZERO
+                        }),
+                        "{entered} never reaches a quote"
                     );
                 }
             });
@@ -2675,6 +2804,117 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
     });
 }
 
+/// The form's Public address quote is ready before a receiver is entered, and can't be reviewed.
+/// Entering one keeps that quote, asks neither `CoW` nor a bridge provider, and admits the
+/// review of a delivery to it.
+fn receiver_joins_the_ready_quote(
+    swaps: &Entity<PrivateSwapsView>,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let receiver = Address::repeat_byte(4);
+    let quoted = ready_review(swaps, runtime, cx);
+    let requests = || (stubs.quotes().len(), stubs.bridge_requests().len());
+    let asked = requests();
+    swaps.read_with(cx, |swaps, _| {
+        let form = swaps.form.as_ref().unwrap();
+        let Err(DeliveryProblem::Receiver(problem)) = &form.delivery else {
+            panic!("no receiver is entered");
+        };
+        assert_eq!(form.review_problem(&quoted), Some(problem.clone()));
+    });
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            set_receiver_text(swaps, &receiver.to_checksum(None), window, cx);
+        });
+    });
+    // Past the debounce, after which a quote or a bridge refresh would make its request.
+    cx.executor().advance_clock(QUOTE_DEBOUNCE);
+    cx.run_until_parked();
+    runtime.block_on(tokio::time::sleep(Duration::from_millis(50)));
+    cx.run_until_parked();
+    assert_eq!(requests(), asked, "the receiver asks nothing");
+    cx.update(|_, cx| {
+        swaps.update(cx, |swaps, _| {
+            let form = swaps.form.as_mut().unwrap();
+            let QuoteState::Ready(review) = &form.quote else {
+                panic!("the quote stays ready");
+            };
+            let review = Arc::clone(review);
+            assert_eq!(form.quote_receiver(), receiver);
+            assert_eq!(form.delivery, Ok(review.plan().delivery()));
+            assert_eq!(
+                review.with_receiver(Address::ZERO).plan(),
+                quoted.plan(),
+                "only the receiver differs"
+            );
+            assert_eq!(
+                (review.suggested_private_minimum(), review.bridge()),
+                (quoted.suggested_private_minimum(), quoted.bridge())
+            );
+            form.price_acknowledged = true;
+            form.high_costs_acknowledged = true;
+            assert!(form.review_problem(&review).is_none());
+        });
+    });
+}
+
+#[gpui::test]
+fn public_address_quote_is_ready_before_its_receiver_and_takes_it_locally(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        let orderbook = stub_orderbook(&stubs, runtime);
+        cx.update(|window, cx| {
+            let weth = root.update(cx, |root, _| {
+                root.effective_token_registry =
+                    wallet_ops::settings::build_effective_token_registry(
+                        &wallet_ops::settings::WalletSettings::default(),
+                    )
+                    .unwrap();
+                root.effective_chain_configs
+                    .get(1)
+                    .unwrap()
+                    .wrapped_native_token
+                    .unwrap()
+            });
+            swaps.update(cx, |swaps, cx| {
+                swaps
+                    .owner
+                    .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
+                swaps.open_form(
+                    None,
+                    STUB_USDC,
+                    Some(weth),
+                    Some(U256::from(1_000_000)),
+                    None,
+                    SwapDelivery::Reshield,
+                    window,
+                    cx,
+                );
+                swaps.form.as_mut().unwrap().orderbook = Some(orderbook);
+                swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+            });
+        });
+        receiver_joins_the_ready_quote(swaps, &stubs, runtime, cx);
+    });
+}
+
+#[gpui::test]
+fn bridge_quote_is_ready_before_its_receiver_and_takes_it_locally(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                set_receiver_text(swaps, "", window, cx);
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+            });
+        });
+        receiver_joins_the_ready_quote(swaps, &stubs, runtime, cx);
+    });
+}
+
 #[gpui::test]
 fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut TestAppContext) {
     use alloy::primitives::address;
@@ -2696,21 +2936,8 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
             });
         });
         swaps.read_with(cx, |swaps, cx| {
-            for (receiver, label, note, own_account) in [
-                (own, Some("Account 01 · your Public account"), None, true),
-                (saved, Some("Cold wallet"), None, false),
-                (unknown, None, Some("Not a saved address"), false),
-            ] {
-                let (row, warning) =
-                    swaps.external_receiver_review(receiver, &swaps.token_symbol(dai, cx), cx);
-                assert_eq!(
-                    row.values_for_test(),
-                    ("Receiver".to_owned(), receiver.to_checksum(None))
-                );
-                assert_eq!(
-                    row.full_address_for_test(),
-                    Some((label.map(str::to_owned), note.map(str::to_owned)))
-                );
+            for (receiver, own_account) in [(own, true), (saved, false), (unknown, false)] {
+                let warning = swaps.own_account_warning(receiver, &swaps.token_symbol(dai, cx), cx);
                 // Only the wallet's own account becomes linked to it, and the review says so.
                 assert_eq!(warning.is_some(), own_account);
                 if let Some(warning) = warning {
@@ -2740,7 +2967,10 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
                 swaps.schedule_quote(window, cx);
             });
         });
-        for (receiver, own_account) in [(own, true), (saved, false)] {
+        for (receiver, label, own_account) in [
+            (own, "Account 01 · your Public account", true),
+            (saved, "Cold wallet", false),
+        ] {
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
                     set_receiver_text(swaps, &receiver.to_checksum(None), window, cx);
@@ -2751,33 +2981,38 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
                 review.plan().delivery(),
                 SwapDelivery::External { receiver }
             );
-            let summary =
-                swaps.read_with(cx, |swaps, cx| swaps.swap_summary(&review, None, None, cx));
-            assert!(
-                summary
-                    .rows_for_test()
-                    .contains(&("Receiver".to_owned(), receiver.to_checksum(None)))
+            let (summary, unshield) = swaps.read_with(cx, |swaps, cx| {
+                (
+                    swaps.swap_summary(&review, None, None, None, cx),
+                    swaps.token_amount(
+                        STUB_USDC,
+                        review.plan().amount() - review.sell_amount(),
+                        cx,
+                    ),
+                )
+            });
+            assert_eq!(
+                summary.receiver_for_test(),
+                Some((receiver.to_checksum(None), Some(label.to_owned()))),
+                "the Receive card copies and shows the approved address in full"
             );
             // No shield: only the unshield fee applies.
             let details = summary.details_for_test();
-            assert!(details.contains(&("Railgun fee".to_owned(), "0.25% unshield".to_owned())));
+            assert!(details.contains(&("Railgun unshield".to_owned(), unshield)));
             assert!(
                 details
                     .iter()
-                    .all(|(label, value)| label != "Railgun fees" && !value.contains(" shield")),
+                    .all(|(label, value)| label != "Railgun shield" && !value.contains("shield")),
                 "{details:?}"
             );
-            assert!(
-                summary
-                    .context_for_test()
-                    .is_some_and(|context| context.contains(EXTERNAL_DELIVERY_DISCLOSURE))
-            );
+            // The disclosure warns only for the wallet's own account, which its card names.
+            let (_, public, warns) = summary.disclosure_for_test().unwrap();
+            assert!(public.contains(EXTERNAL_DELIVERY_DISCLOSURE), "{public}");
+            assert_eq!(warns, own_account);
             assert_eq!(
-                summary
-                    .warnings_for_test()
-                    .iter()
-                    .any(|warning| warning.contains("becomes publicly linked to this swap")),
-                own_account
+                public.contains("Account 01 becomes publicly linked to this swap"),
+                own_account,
+                "{public}"
             );
         }
         // Quotes never carry the receiver.
@@ -2876,6 +3111,10 @@ fn external_swaps_show_their_delivery_and_recover_only_the_sell_token(cx: &mut T
                         sell_amount: U256::from(100),
                         buy_amount: U256::from(99),
                         fee_amount: U256::ZERO,
+                        settlement_gas_used: None,
+                        settlement_effective_gas_price: None,
+                        executed_fee: None,
+                        executed_fee_token: None,
                     }),
                     ..Default::default()
                 },
@@ -2962,11 +3201,13 @@ fn restarted_external_swap_requotes_its_approved_delivery(cx: &mut TestAppContex
                 let plan = approval.review.plan();
                 assert_eq!(plan.delivery(), SwapDelivery::External { receiver });
                 assert_eq!(plan.buy_token(), Address::ZERO);
-                assert!(
+                assert_eq!(
                     swaps
                         .place_summary(approval, cx)
-                        .rows_for_test()
-                        .contains(&("Receiver".to_owned(), receiver.to_checksum(None)))
+                        .unwrap()
+                        .receiver_for_test()
+                        .map(|(address, _)| address),
+                    Some(receiver.to_checksum(None))
                 );
             });
             let quotes = stubs.quotes();
@@ -3003,7 +3244,7 @@ fn reopened_external_swap_keeps_its_delivery_and_names_a_receiver_change(cx: &mu
         cx,
         Some(stubs.rpc()),
         |root, _, executors, operation, runtime, cx| {
-            // An approval without a hook cost needs review again.
+            // An approval saved before gas shares needs review again.
             let setup = approved_swap(
                 root,
                 executors,
@@ -3023,7 +3264,7 @@ fn reopened_external_swap_keeps_its_delivery_and_names_a_receiver_change(cx: &mu
             swaps.read_with(cx, |swaps, cx| {
                 assert_eq!(
                     swaps.reapproval,
-                    Some((operation, SwapReviewChange::HookCost))
+                    Some((operation, SwapReviewChange::GasShare))
                 );
                 let form = swaps.form.as_ref().unwrap();
                 assert_eq!(form.operation, Some(operation));
@@ -3108,8 +3349,8 @@ fn reopened_external_swap_keeps_its_delivery_and_names_a_receiver_change(cx: &mu
 }
 
 /// Another network's Buy list holds what either provider delivers. Across is the default
-/// where it delivers; a token only NEAR Intents delivers switches to it, says so, and quotes
-/// again; and the sell token's own asset offers no provider.
+/// where it delivers; a token only NEAR Intents delivers switches to it and quotes again; and
+/// the sell token's own asset offers no provider. A chosen provider has its hint button.
 #[gpui::test]
 fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
@@ -3117,8 +3358,7 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
         let shown = |cx: &mut gpui::VisualTestContext| {
             cx.update(|window, cx| window.draw(cx).clear(cx));
             (
-                cx.debug_bounds("swap-provider-disclaimer").is_some(),
-                cx.debug_bounds("swap-provider-switched").is_some(),
+                cx.debug_bounds("swap-provider-hint-trigger").is_some(),
                 cx.debug_bounds("swap-bridge-same-token").is_some(),
             )
         };
@@ -3161,9 +3401,9 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
                 );
             });
         });
-        assert_eq!(shown(cx), (true, false, false));
+        assert_eq!(shown(cx), (true, false));
 
-        // Only NEAR Intents delivers POL: it switches, says so and quotes again.
+        // Only NEAR Intents delivers POL: it switches and quotes again.
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 let form = swaps.form.as_mut().unwrap();
@@ -3193,7 +3433,7 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
                 ));
             });
         });
-        assert_eq!(shown(cx), (true, true, false));
+        assert_eq!(shown(cx), (true, false));
         drive_until(cx, runtime, |cx| {
             swaps.read_with(cx, |swaps, _| {
                 !matches!(swaps.form.as_ref().unwrap().quote, QuoteState::Loading)
@@ -3228,7 +3468,95 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
                 );
             });
         });
-        assert_eq!(shown(cx), (false, false, true));
+        assert_eq!(shown(cx), (false, true));
+    });
+}
+
+/// While one provider can't list its tokens, the other's can be chosen and quoted, beside a
+/// warning button whose popover has Retry. With neither listing, the error takes the Buy line,
+/// and its Retry brings back both lists without the warning.
+#[gpui::test]
+fn bridge_routes_stay_usable_while_one_provider_is_unreachable(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            (
+                cx.debug_bounds("swap-bridge-partial").is_some(),
+                cx.debug_bounds("swap-price-error").is_some(),
+            )
+        };
+        // Retry asks on a fresh route, which the fixture points at the stubs again. The warning
+        // button's Retry is in its popover.
+        let retry = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if let Some(notice) = cx.debug_bounds("swap-bridge-notice-trigger") {
+                cx.simulate_click(notice.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            let retry = cx.debug_bounds("swap-bridge-routes-retry").unwrap();
+            cx.simulate_click(retry.center(), gpui::Modifiers::none());
+            let orderbook = stub_orderbook(&stubs, runtime);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    assert!(form.orderbook.is_none(), "Retry must request a fresh route");
+                    assert!(!form.bridge.notice_open, "Retry closes the popover");
+                    form.bridge.routes_task = None;
+                    form.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                    form.orderbook = Some(orderbook);
+                    swaps.load_bridge_routes(window, cx);
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| {
+                    let form = swaps.form.as_ref().unwrap();
+                    form.bridge.routes.contains_key(&(STUB_USDC, 137))
+                })
+            });
+        };
+
+        stubs.set_failing(&["/near/v0/tokens"]);
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+                assert!(matches!(
+                    swaps.form.as_ref().unwrap().bridge_state(),
+                    BridgeState::Ready {
+                        provider: BridgeProvider::Across,
+                        near: false,
+                        ..
+                    }
+                ));
+            });
+        });
+        ready_review(swaps, runtime, cx);
+        assert_eq!(shown(cx), (true, false));
+
+        stubs.set_failing(&["/near/v0/tokens", "/across/available-routes"]);
+        retry(cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(matches!(form.bridge_state(), BridgeState::Failed(_)));
+            assert!(swaps.buy_select_items(form, cx).is_empty());
+        });
+        assert_eq!(shown(cx), (false, true));
+
+        stubs.set_failing(&[]);
+        retry(cx);
+        swaps.read_with(cx, |swaps, _| {
+            assert!(matches!(
+                swaps.form.as_ref().unwrap().bridge_state(),
+                BridgeState::Ready {
+                    provider: BridgeProvider::Across,
+                    near: true,
+                    ..
+                }
+            ));
+        });
+        assert_eq!(shown(cx), (false, false));
     });
 }
 
@@ -3336,6 +3664,12 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     swaps.bridge_total_usd_value(&review, cx),
                     Some(payout + review.estimated_source_surplus().unwrap())
                 );
+                // The Minimum field shows a destination amount, which has no fallback.
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    swaps.strip_usd_label(form, &review, review.suggested_private_minimum(), cx),
+                    None
+                );
             });
             root.read_with(cx, |root, _| {
                 let cache = &root.public_broadcaster_anchor_cache;
@@ -3352,70 +3686,136 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
             assert!(total.bottom() <= source.bottom());
             assert!(cx.debug_bounds("swap-destination-usd").is_some());
             swaps.read_with(cx, |swaps, cx| {
-                let on_polygon = |amount| {
-                    format!(
-                        "{} on Polygon",
-                        swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx)
-                    )
+                let received = |summary: &SpendAuthorizationSummary| {
+                    summary
+                        .receive_card_for_test()
+                        .map(|(label, amount, _)| (label, amount))
+                };
+                let exactly = |amount| {
+                    Some((
+                        "Receive on Polygon, exactly".to_owned(),
+                        swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx),
+                    ))
                 };
                 let surplus = review.estimated_source_surplus().unwrap();
                 let destination_usd = bridge.expected_output * U256::from(2);
                 let total_usd = destination_usd + surplus;
                 assert_eq!(swaps.bridge_usd_value(&review, cx), Some(destination_usd));
                 assert_eq!(swaps.bridge_total_usd_value(&review, cx), Some(total_usd));
-                let summary = swaps.swap_summary(&review, None, None, cx);
-                let rows = summary.rows_for_test();
+                // The Minimum field's dollars are its destination amount's, after the bridge
+                // fee, also for a share whose bridge leg isn't quoted yet.
+                let form = swaps.form.as_ref().unwrap();
+                let pending = review.with_gas_share(5_000).unwrap();
+                assert!(pending.bridge().is_none());
+                for (minimum, destination) in [
+                    (review.suggested_private_minimum(), bridge.destination_minimum),
+                    (
+                        pending.suggested_private_minimum(),
+                        StripScale::of(&review).show(pending.suggested_private_minimum()),
+                    ),
+                ] {
+                    assert_eq!(
+                        swaps.strip_usd_label(form, &review, minimum, cx),
+                        Some(format!(
+                            "≈ {}",
+                            railgun_ui::format_usd_micro_value(destination * U256::from(2))
+                        ))
+                    );
+                }
+                let summary = swaps.swap_summary(&review, None, None, None, cx);
                 assert_eq!(
-                    rows[..8],
+                    received(&summary),
+                    exactly(bridge.destination_minimum),
+                    "Across delivers exactly its output"
+                );
+                assert_eq!(
+                    summary.receiver_for_test().map(|(address, _)| address),
+                    Some(receiver.clone())
+                );
+                assert_eq!(
+                    summary.rows_for_test()[..3],
                     [
+                        gas_row(swaps, &review, cx),
                         (
-                            "You receive".to_owned(),
-                            on_polygon(bridge.destination_minimum)
-                        ),
-                        (
-                            "Estimated return on Ethereum".to_owned(),
+                            "Returned".to_owned(),
                             swaps.with_usd(format!("≈ {}", swaps.token_amount(STUB_USDT, surplus, cx)),
                                 STUB_USDT, surplus, cx)
                         ),
                         (
-                            "Estimated total received".to_owned(),
-                            format!("≈ {}", railgun_ui::format_usd_micro_value(total_usd))
+                            "Bridge".to_owned(),
+                            format!(
+                                "Across · fee {}",
+                                swaps.token_amount(STUB_USDT, bridge.fee.unwrap(), cx)
+                            )
                         ),
-                        ("Destination".to_owned(), "Polygon".to_owned()),
-                        ("Receiver".to_owned(), receiver.clone()),
-                        ("Provider".to_owned(), "Across".to_owned()),
-                        (
-                            "Bridge fee".to_owned(),
-                            swaps.token_amount(STUB_USDT, bridge.fee.unwrap(), cx)
-                        ),
-                        ("Surplus".to_owned(), "Reshield on Ethereum".to_owned()),
-                    ],
-                    "Across delivers exactly its output, without ≈"
+                    ]
                 );
                 let deposit = swaps.token_amount(STUB_USDT, review.suggested_private_minimum(), cx);
                 let details = summary.details_for_test();
+                let unshield = review.plan().amount() - review.sell_amount();
                 for row in [
-                    ("Railgun fees", "0.25% unshield, shield on surplus".to_owned()),
+                    ("Railgun unshield", swaps.token_amount(STUB_USDC, unshield, cx)),
+                    ("Price tolerance", format_bps_percent(u64::from(DEFAULT_SLIPPAGE_BPS))),
                     ("Deposit to Across", format!("{deposit} on Ethereum")),
+                    // The bridge quote needs the profile's window.
+                    ("Order valid for", "10 minutes".to_owned()),
                 ] {
                     assert!(
                         details.contains(&(row.0.to_owned(), row.1)),
                         "{details:?}"
                     );
                 }
-                let warnings = summary.warnings_for_test();
+                // The surplus choice and the total are behind the Returned row's info button,
+                // and the refund path behind the Bridge row's.
+                let returned = summary.row_hint_for_test("Returned").unwrap();
                 assert!(
-                    warnings.iter().any(|warning| warning.starts_with(&format!(
+                    returned.contains(&format!(
+                        "above the {deposit} deposit is reshielded to your private balance"
+                    )) && returned.ends_with(&format!(
+                        "Estimated total received ≈ {}",
+                        railgun_ui::format_usd_micro_value(total_usd)
+                    )),
+                    "{returned}"
+                );
+                let terms = summary.row_hint_for_test("Bridge").unwrap();
+                assert!(
+                    terms.contains(&format!(
                         "If the deposit isn't filled before it expires, Across refunds the {deposit} to the stealth account on Ethereum"
-                    ))),
-                    "{warnings:?}"
+                    )),
+                    "{terms}"
                 );
-                let context = summary.context_for_test().unwrap();
+                let (_, public, _) = summary.disclosure_for_test().unwrap();
                 assert!(
-                    context.contains("The deposit names the receiver, Polygon and the amounts, so the receiver's funds on Polygon can be traced to this swap."),
-                    "{context}"
+                    public.contains("The deposit names the receiver, Polygon and the amounts, so the receiver's funds on Polygon can be traced to this swap."),
+                    "{public}"
                 );
-                assert!(!context.contains(EXTERNAL_DELIVERY_DISCLOSURE));
+                assert!(!public.contains(EXTERNAL_DELIVERY_DISCLOSURE));
+                // A Bridge order signs its deposit, which the Deposit row already shows.
+                assert!(details.iter().all(|(label, _)| label != "Signed minimum"));
+                assert_eq!(summary.card_deltas_for_test(), [None, None]);
+                assert_eq!(summary.row_delta_for_test("Gas"), None);
+
+                // Reopened against a saved approval that bound a higher destination minimum
+                // and allowed less gas, both amounts show an adverse change.
+                let mut saved = test_approval().bounds;
+                saved.unshield_amount = Some(review.plan().amount());
+                saved.destination_minimum = Some(bridge.destination_minimum * U256::from(2));
+                saved.gas_allowance = Some(review.gas_allowance() / U256::from(2));
+                let reopened = swaps.swap_summary(
+                    &review,
+                    None,
+                    Some(SwapReviewChange::DestinationMinimum {
+                        approved: bridge.destination_minimum * U256::from(2),
+                        current: bridge.destination_minimum,
+                    }),
+                    Some(&saved),
+                    cx,
+                );
+                let adverse = |delta: Option<(String, bool)>| delta.map(|(_, adverse)| adverse);
+                let [sell, receive] = reopened.card_deltas_for_test();
+                assert_eq!(sell, None, "the same sell amount");
+                assert_eq!(adverse(receive), Some(true));
+                assert_eq!(adverse(reopened.row_delta_for_test("Gas")), Some(true));
 
                 // The approval saved with the setup binds a lower minimum than this requote.
                 let approved = bridge.destination_minimum / U256::from(2);
@@ -3429,16 +3829,21 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     destination_minimum: Some(approved),
                     full_review: false,
                 };
+                let place = swaps.place_summary(&approval, cx).unwrap();
+                assert_eq!(received(&place), exactly(approved), "the bound minimum");
                 assert_eq!(
-                    swaps.place_summary(&approval, cx).rows_for_test(),
-                    [
-                        ("You receive".to_owned(), on_polygon(approved)),
-                        ("Destination".to_owned(), "Polygon".to_owned()),
-                        ("Receiver".to_owned(), receiver),
-                        ("Provider".to_owned(), "Across".to_owned()),
-                        ("Surplus".to_owned(), "Reshield on Ethereum".to_owned()),
-                    ],
-                    "the bound terms, without a bridge fee"
+                    place.receiver_for_test().map(|(address, _)| address),
+                    Some(receiver)
+                );
+                assert_eq!(
+                    place.rows_for_test(),
+                    [("Bridge".to_owned(), "Across".to_owned())],
+                    "without a bridge fee"
+                );
+                assert!(
+                    place
+                        .row_hint_for_test("Bridge")
+                        .is_some_and(|terms| terms.contains("surplus is reshielded on Ethereum"))
                 );
             });
         },
@@ -3446,39 +3851,54 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
 }
 
 /// A NEAR Intents review of native POL shows 1Click's estimate in POL's own decimals, no
-/// Surplus row, a fee it can't value without anchors, its disclaimer, and what 1Click learns.
+/// Returned row, a fee it can't value without anchors, its disclaimer, and what 1Click learns.
 #[gpui::test]
 fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
-        open_bridge_form(root, swaps, &stubs, runtime, cx);
-        cx.update(|window, cx| {
-            swaps.update(cx, |swaps, cx| {
-                swaps.set_form_buy(Address::ZERO, window, cx);
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, operation, runtime, cx| {
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_form_buy(Address::ZERO, window, cx);
+                });
             });
-        });
-        let review = ready_review(swaps, runtime, cx);
-        swaps.read_with(cx, |swaps, cx| {
-            let summary = swaps.swap_summary(&review, None, None, cx);
+            let review = ready_review(swaps, runtime, cx);
+            swaps.read_with(cx, |swaps, cx| {
+            let summary = swaps.swap_summary(&review, None, None, None, cx);
             let pol = swaps.network_token_symbol(137, Address::ZERO, cx);
+            let (label, amount, lines) = summary.receive_card_for_test().unwrap();
+            assert_eq!(
+                (label, amount),
+                (
+                    "Receive on Polygon, at least".to_owned(),
+                    format!("12.5 {pol}")
+                )
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("about ") && line.ends_with(" expected")),
+                "{lines:?}"
+            );
+            assert_eq!(
+                summary.receiver_for_test().map(|(address, _)| address),
+                Some(Address::repeat_byte(4).to_checksum(None))
+            );
             let rows = summary.rows_for_test();
             assert_eq!(
-                rows[..5],
+                rows[..2],
                 [
-                    ("You receive".to_owned(), format!("≈ 12.6 {pol} on Polygon")),
-                    ("Destination".to_owned(), "Polygon".to_owned()),
+                    gas_row(swaps, &review, cx),
                     (
-                        "Receiver".to_owned(),
-                        Address::repeat_byte(4).to_checksum(None)
-                    ),
-                    ("Provider".to_owned(), "NEAR Intents".to_owned()),
-                    (
-                        "Bridge fee".to_owned(),
-                        "Included in the minimum".to_owned()
+                        "Bridge".to_owned(),
+                        "NEAR Intents · fee included".to_owned()
                     ),
                 ]
             );
-            assert!(rows.iter().all(|(label, _)| label != "Surplus"), "{rows:?}");
+            assert!(rows.iter().all(|(label, _)| label != "Returned"), "{rows:?}");
             let deposit = swaps.token_amount(STUB_USDT, review.suggested_private_minimum(), cx);
             assert!(
                 summary
@@ -3491,17 +3911,51 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
                     && warnings.iter().all(|warning| !warning.contains("Across")),
                 "{warnings:?}"
             );
-            let context = summary.context_for_test().unwrap();
+            let (_, public, _) = summary.disclosure_for_test().unwrap();
             assert!(
-                context.contains("1Click learns the receiver when the order is signed, so the receiver's funds on Polygon can be traced to this swap."),
-                "{context}"
+                public.contains("1Click learns the receiver when the order is signed, so the receiver's funds on Polygon can be traced to this swap."),
+                "{public}"
             );
+
+            // The confirm-only step shows the estimate only for the deposit it was quoted
+            // for, and only when it reaches the approved destination minimum.
+            let bridge = *review.bridge().unwrap();
+            let shows_estimate = |private_minimum, destination_minimum| {
+                let approval = OrderApproval {
+                    operation,
+                    review: Arc::clone(&review),
+                    private_minimum,
+                    price_acknowledged: true,
+                    orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
+                    bridge: None,
+                    destination_minimum: Some(destination_minimum),
+                    full_review: false,
+                };
+                let (_, _, lines) = swaps
+                    .place_summary(&approval, cx)
+                    .unwrap()
+                    .receive_card_for_test()
+                    .unwrap();
+                lines.iter().any(|line| line.ends_with(" expected"))
+            };
+            let deposit = review.suggested_private_minimum();
+            let (below, above) = (
+                bridge.expected_output - U256::ONE,
+                bridge.expected_output + U256::ONE,
+            );
+            assert!(shows_estimate(deposit, below));
+            assert!(!shows_estimate(deposit, above));
+            // A raised deposit has no estimate, whichever side of the minimum the old one is.
+            for approved in [below, above] {
+                assert!(!shows_estimate(deposit + U256::ONE, approved), "{approved}");
+            }
         });
-    });
+        },
+    );
 }
 
-/// The bridge fee counts toward the swap's costs: one that takes them past 10% raises the
-/// high-cost warning, and the review waits for Swap anyway.
+/// The bridge fee counts toward the costs the user authorizes: one that takes them past 20%
+/// raises the warning, and the review waits for Swap anyway.
 #[gpui::test]
 fn high_bridge_fee_requires_swap_anyway(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
@@ -3516,14 +3970,16 @@ fn high_bridge_fee_requires_swap_anyway(cx: &mut TestAppContext) {
         let review = ready_review(swaps, runtime, cx);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("swap-high-costs").is_some());
-        let bps = high_cost_bps(&review).expect("the bridge fee takes the costs past 10%");
+        let bps = authorized_high_cost(&review).expect("the bridge fee takes the costs past 20%");
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
+                let message = swaps.authorized_cost_message(&review, bps, cx);
+                assert!(message.contains("bridge fee"), "{message}");
                 assert!(
                     swaps
-                        .swap_summary(&review, None, None, cx)
+                        .swap_summary(&review, None, None, None, cx)
                         .warnings_for_test()
-                        .contains(&high_cost_message(bps))
+                        .contains(&message)
                 );
                 let form = swaps.form.as_mut().unwrap();
                 form.price_acknowledged = true;
@@ -3535,6 +3991,884 @@ fn high_bridge_fee_requires_swap_anyway(cx: &mut TestAppContext) {
                 form.high_costs_acknowledged = true;
                 assert!(form.review_problem(&review).is_none());
             });
+        });
+    });
+}
+
+/// A new swap's gas share is Balanced, and a preset prices the same quote again without a `CoW`
+/// request. Order validity quotes again, and the share stays. While a quote loads, the strip's
+/// row keeps the Buy panel's height, and a preset chosen there prices the quote that lands.
+#[gpui::test]
+fn balanced_is_the_default_and_presets_reprice_without_a_new_quote(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let review = ready_review(swaps, runtime, cx);
+        assert_eq!(review.gas_share_bps(), GAS_SHARE_BALANCED_BPS);
+        assert_eq!(stubs.quotes().len(), 1);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let tight = cx.debug_bounds("swap-gas-tight").unwrap();
+        cx.simulate_click(tight.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            let QuoteState::Ready(repriced) = &form.quote else {
+                panic!("the quote priced at Tight");
+            };
+            assert_eq!(
+                (form.gas_share_bps, form.gas_custom),
+                (GAS_SHARE_TIGHT_BPS, false)
+            );
+            assert_eq!(repriced.gas_share_bps(), GAS_SHARE_TIGHT_BPS);
+            let tight = review.with_gas_share(GAS_SHARE_TIGHT_BPS).unwrap();
+            assert_eq!(
+                repriced.suggested_private_minimum(),
+                tight.suggested_private_minimum()
+            );
+            assert!(repriced.suggested_private_minimum() > review.suggested_private_minimum());
+            assert!(form.quote_task.is_none());
+            assert_eq!(
+                slider_percent(form.gas_slider.read(cx).value().end()),
+                90,
+                "the knob moves to Tight"
+            );
+        });
+        assert_eq!(stubs.quotes().len(), 1, "a preset makes no CoW request");
+
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_valid_for(Duration::from_mins(30), window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        assert_eq!(review.valid_for(), Duration::from_mins(30));
+        assert_eq!(review.gas_share_bps(), GAS_SHARE_TIGHT_BPS);
+        assert_eq!(stubs.quotes().len(), 2);
+
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| swaps.schedule_quote(window, cx));
+            window.draw(cx).clear(cx);
+        });
+        swaps.read_with(cx, |swaps, _| {
+            assert!(matches!(
+                swaps.form.as_ref().unwrap().quote,
+                QuoteState::Loading
+            ));
+        });
+        assert!(cx.debug_bounds("swap-gas-strip").is_some());
+        let edit = cx.debug_bounds("swap-gas-edit-minimum").unwrap();
+        let loose = cx.debug_bounds("swap-gas-loose").unwrap();
+        cx.simulate_click(edit.center(), gpui::Modifiers::none());
+        cx.simulate_click(loose.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(matches!(form.quote, QuoteState::Loading));
+            assert!(
+                !form.gas_minimum_editing,
+                "the edit button waits for a quote"
+            );
+            assert_eq!(
+                (form.gas_share_bps, form.gas_custom),
+                (GAS_SHARE_LOOSE_BPS, false)
+            );
+        });
+        // The card apart from its status line, which the stub's unverified price wraps.
+        let card = |cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds("swap-buy-panel").unwrap().size.height
+                - cx.debug_bounds("swap-price-status").unwrap().size.height
+        };
+        let loading = card(cx);
+        let review = ready_review(swaps, runtime, cx);
+        assert_eq!(review.gas_share_bps(), GAS_SHARE_LOOSE_BPS);
+        assert_eq!(stubs.quotes().len(), 3, "the share makes no CoW request");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(card(cx), loading);
+    });
+}
+
+/// A Bridge swap's bridge leg is quoted for the order amount, so another gas share quotes that
+/// leg again, without a `CoW` request, and a release at the dragged share asks nothing more.
+/// Its validity stays at the profile's window.
+#[gpui::test]
+fn bridge_gas_share_requotes_only_the_bridge_leg_and_keeps_the_profile_validity(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        let quotes = stubs.quotes().len();
+        let fees = across_fee_amounts(&stubs).len();
+        move_gas_slider(swaps, 50., false, cx);
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!((form.gas_share_bps, form.gas_custom), (5_000, true));
+            assert!(
+                matches!(&form.quote, QuoteState::Ready(quoted) if Arc::ptr_eq(quoted, &review)),
+                "the quote stays while its bridge leg is quoted again"
+            );
+        });
+        move_gas_slider(swaps, 50., true, cx);
+        let requoted = refreshed_review(swaps, runtime, cx);
+        assert_eq!(requoted.gas_share_bps(), 5_000);
+        assert_eq!(
+            across_fee_amounts(&stubs)[fees..],
+            [requoted.suggested_private_minimum()],
+            "the drag and its release ask Across once"
+        );
+        assert_eq!(stubs.quotes().len(), quotes, "no CoW request");
+        assert_eq!(requoted.quote(), review.quote());
+
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let before = swaps.form.as_ref().unwrap().valid_for;
+                swaps.set_valid_for(Duration::from_mins(60), window, cx);
+                let form = swaps.form.as_mut().unwrap();
+                assert_eq!(form.valid_for, before);
+                assert!(matches!(form.quote, QuoteState::Ready(_)));
+                form.details_open = true;
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(requoted.valid_for(), review.valid_for());
+        assert!(cx.debug_bounds("swap-validity-locked").is_some());
+    });
+}
+
+/// Editing a Bridge swap's minimum keeps the quote and the strip in view: typing, the bar's
+/// keys and a preset clicked from the focused Minimum field each price the strip locally,
+/// where the swap can't be reviewed, and then ask the provider once, for the last share's
+/// order amount. No edit asks `CoW`.
+#[gpui::test]
+fn bridge_share_edits_keep_the_strip_and_quote_the_bridge_leg_once(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        let quotes = stubs.quotes().len();
+        // Blur is only reported in an active window.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            swaps.update(cx, |swaps, cx| swaps.edit_gas_minimum(window, cx));
+            window.draw(cx).clear(cx);
+        });
+
+        // The form's share after an edit: the quote stays, estimated and unreviewable, and
+        // nothing is requested before the debounce.
+        let previewed = |cx: &mut gpui::VisualTestContext, fees: usize, edit: &str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(stubs.quotes().len(), quotes, "{edit}");
+            assert_eq!(across_fee_amounts(&stubs).len(), fees, "{edit}");
+            assert!(cx.debug_bounds("swap-gas-strip").is_some(), "{edit}");
+            assert!(cx.debug_bounds("swap-gas-pending").is_some(), "{edit}");
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                let QuoteState::Ready(quoted) = &form.quote else {
+                    panic!("{edit} keeps the quote");
+                };
+                assert_ne!(quoted.gas_share_bps(), form.gas_share_bps, "{edit}");
+                assert_eq!(
+                    form.review_problem(quoted)
+                        .map(|problem| problem.to_string()),
+                    Some("Updating the bridge quote…".to_owned()),
+                    "{edit}"
+                );
+                form.gas_share_bps
+            })
+        };
+        // The quote after the debounce: one Across request, for the last share's order amount,
+        // gave the review its destination minimum, and the swap can be reviewed.
+        let settled = |cx: &mut gpui::VisualTestContext, fees: usize, share: u16| {
+            let requoted = refreshed_review(swaps, runtime, cx);
+            let amount = requoted.suggested_private_minimum();
+            assert_eq!(requoted.gas_share_bps(), share);
+            assert_eq!(across_fee_amounts(&stubs)[fees..], [amount]);
+            assert_eq!(
+                requoted.bridge().unwrap().destination_minimum,
+                amount - amount * U256::from(10) / U256::from(10_000)
+            );
+            assert_eq!(stubs.quotes().len(), quotes);
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, _| {
+                    let form = swaps.form.as_mut().unwrap();
+                    assert!(
+                        !form.price_acknowledged && !form.high_costs_acknowledged,
+                        "consent doesn't carry over to the new terms"
+                    );
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    assert!(form.review_problem(&requoted).is_none());
+                });
+            });
+        };
+
+        let mut fees = across_fee_amounts(&stubs).len();
+        let mut shares = vec![review.gas_share_bps()];
+        let mut typed = String::new();
+        for share in [5_000, 3_000] {
+            typed = swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                format_unshield_amount_input(
+                    StripScale::of(&review).show(
+                        review
+                            .with_gas_share(share)
+                            .unwrap()
+                            .suggested_private_minimum(),
+                    ),
+                    swaps.strip_decimals(form, &review, cx),
+                )
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+            });
+            cx.simulate_input(&typed);
+            cx.run_until_parked();
+            let share = previewed(cx, fees, "typing");
+            assert!(cx.debug_bounds("swap-gas-minimum-field").is_some());
+            assert!(!shares.contains(&share), "each minimum is another share");
+            shares.push(share);
+        }
+        settled(cx, fees, *shares.last().unwrap());
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(
+                form.gas_minimum_input.read(cx).value().to_string(),
+                typed,
+                "the reply leaves the focused field as typed"
+            );
+        });
+
+        fees += 1;
+        focus_gas_bar(swaps, cx);
+        for _ in 0..2 {
+            cx.simulate_keystrokes("left");
+            cx.run_until_parked();
+            let share = previewed(cx, fees, "a bar key");
+            assert!(cx.debug_bounds("swap-gas-bar").is_some());
+            assert!(!shares.contains(&share), "each key moves the share");
+            shares.push(share);
+        }
+        settled(cx, fees, *shares.last().unwrap());
+
+        // A preset clicked while the Minimum field has the focus: the field's blur leaves the
+        // strip in place, so the click lands.
+        fees += 1;
+        cx.update(|window, cx| {
+            let input = swaps
+                .read(cx)
+                .form
+                .as_ref()
+                .unwrap()
+                .gas_minimum_input
+                .clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let tight = cx.debug_bounds("swap-gas-tight").unwrap();
+        cx.simulate_click(tight.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(previewed(cx, fees, "a preset"), GAS_SHARE_TIGHT_BPS);
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(!form.gas_custom && !form.gas_minimum_editing);
+        });
+        settled(cx, fees, GAS_SHARE_TIGHT_BPS);
+    });
+}
+
+/// A bridge refresh that another share superseded never replaces the shown terms. A failed one
+/// keeps the quote and the chosen share, shows why, and blocks the review until another share
+/// is quoted.
+#[gpui::test]
+fn a_superseded_or_failed_bridge_refresh_keeps_the_quote(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_form_buy(STUB_POLYGON_USDT, window, cx);
+            });
+        });
+        ready_review(swaps, runtime, cx);
+        let quotes = stubs.quotes().len();
+        let fees = across_fee_amounts(&stubs).len();
+
+        // Across holds its answer for the first share until after the second share's.
+        stubs.set_across_delay(Duration::from_millis(300));
+        move_gas_slider(swaps, 50., false, cx);
+        drive_until(cx, runtime, |_| across_fee_amounts(&stubs).len() > fees);
+        stubs.set_across_delay(Duration::ZERO);
+        move_gas_slider(swaps, 30., false, cx);
+        let current = refreshed_review(swaps, runtime, cx);
+        let amount = current.suggested_private_minimum();
+        let asked = across_fee_amounts(&stubs);
+        assert_eq!(asked.len(), fees + 2);
+        assert_ne!(asked[fees], amount);
+        assert_eq!(asked[fees + 1], amount);
+        runtime.block_on(tokio::time::sleep(Duration::from_millis(400)));
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(form.gas_share_bps, current.gas_share_bps());
+            assert!(
+                matches!(&form.quote, QuoteState::Ready(quoted) if Arc::ptr_eq(quoted, &current)),
+                "the first share's late answer changes nothing"
+            );
+        });
+
+        // Across leaves nothing to receive, which fails the bridge quote.
+        stubs.set_across_fee_bps(10_000);
+        move_gas_slider(swaps, 70., false, cx);
+        refreshed_review(swaps, runtime, cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-strip").is_some());
+        assert!(cx.debug_bounds("swap-bridge-quote-error").is_some());
+        assert!(cx.debug_bounds("swap-gas-pending").is_none());
+        let failed = swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(
+                matches!(&form.quote, QuoteState::Ready(quoted) if Arc::ptr_eq(quoted, &current)),
+                "a failed refresh keeps the quote"
+            );
+            assert_ne!(form.gas_share_bps, current.gas_share_bps());
+            let error = form.bridge_quote_error.clone().expect("the refresh failed");
+            assert_eq!(form.review_problem(&current), Some(error));
+            form.gas_share_bps
+        });
+
+        stubs.set_across_fee_bps(10);
+        move_gas_slider(swaps, 50., false, cx);
+        let recovered = refreshed_review(swaps, runtime, cx);
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(![failed, current.gas_share_bps()].contains(&recovered.gas_share_bps()));
+            assert_eq!(recovered.gas_share_bps(), form.gas_share_bps);
+            assert!(form.bridge_quote_error.is_none());
+            assert!(!form.gas_share_pending(&recovered));
+        });
+        assert_eq!(stubs.quotes().len(), quotes, "no refresh asks CoW");
+    });
+}
+
+/// The bar and the Minimum field stay closed until the edit button opens them, and it closes
+/// them again while a preset is selected. Dragging the bar selects Custom and prices its share,
+/// which keeps them open; the edit button then focuses the field. A typed minimum moves the
+/// knob to its share, a requote at another gas price keeps that share, not the typed amount,
+/// and a preset closes them.
+#[gpui::test]
+fn the_gas_bar_and_custom_minimum_set_a_share_that_a_requote_keeps(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let review = ready_review(swaps, runtime, cx);
+        let bar_open = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bar = cx.debug_bounds("swap-gas-bar").is_some();
+            assert_eq!(cx.debug_bounds("swap-gas-minimum-field").is_some(), bar);
+            bar
+        };
+        assert!(!bar_open(cx), "a preset's bar starts closed");
+        for open in [true, false] {
+            let edit = cx.debug_bounds("swap-gas-edit-minimum").unwrap();
+            cx.simulate_click(edit.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(bar_open(cx), open, "the edit button toggles the bar");
+        }
+        move_gas_slider(swaps, 50., false, cx);
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!((form.gas_share_bps, form.gas_custom), (5_000, true));
+            let QuoteState::Ready(repriced) = &form.quote else {
+                panic!("the quote at the knob's share");
+            };
+            assert_eq!(
+                repriced.suggested_private_minimum(),
+                review
+                    .with_gas_share(5_000)
+                    .unwrap()
+                    .suggested_private_minimum()
+            );
+        });
+
+        assert!(bar_open(cx), "a custom share shows its bar");
+
+        let typed = review
+            .with_gas_share(3_000)
+            .unwrap()
+            .suggested_private_minimum();
+        let edit = cx.debug_bounds("swap-gas-edit-minimum").unwrap();
+        cx.simulate_click(edit.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(bar_open(cx), "a custom share keeps its bar open");
+        cx.update(|window, cx| {
+            let input = swaps
+                .read(cx)
+                .form
+                .as_ref()
+                .unwrap()
+                .gas_minimum_input
+                .clone();
+            assert!(input.read(cx).focus_handle(cx).is_focused(window));
+            window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        });
+        cx.simulate_input(&format_unshield_amount_input(typed, Some(6)));
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(form.gas_share_bps, 3_000);
+            assert_eq!(slider_percent(form.gas_slider.read(cx).value().end()), 70);
+        });
+
+        stubs.set_gas_price_wei(2);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.focus_form_amount(window, cx);
+                swaps.schedule_quote(window, cx);
+            });
+        });
+        let requoted = ready_review(swaps, runtime, cx);
+        assert_eq!(requoted.gas_share_bps(), 3_000);
+        assert!(requoted.suggested_private_minimum() < typed, "the gas rose");
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(form.gas_custom);
+            assert_eq!(
+                form.gas_minimum_input.read(cx).value().to_string(),
+                railgun_ui::format_token_amount(requoted.suggested_private_minimum(), 6)
+            );
+        });
+
+        assert!(bar_open(cx));
+        let tight = cx.debug_bounds("swap-gas-tight").unwrap();
+        cx.simulate_click(tight.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!bar_open(cx), "a preset closes the bar");
+    });
+}
+
+/// With the bar focused, the arrows move the share by 5% of the gas, and Home and End go to
+/// the bar's ends.
+#[gpui::test]
+fn gas_bar_keys_step_the_share_by_five_percent(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        ready_review(swaps, runtime, cx);
+        focus_gas_bar(swaps, cx);
+        for (keys, share) in [
+            ("left", 3_000),
+            ("right right", 2_000),
+            ("end", 0),
+            ("home", GAS_SHARE_LOOSE_BPS),
+        ] {
+            cx.simulate_keystrokes(keys);
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    (form.gas_share_bps, form.gas_custom),
+                    (share, true),
+                    "{keys}"
+                );
+            });
+        }
+    });
+}
+
+/// When the gas estimate exceeds the swap, the bar starts at zero, Loose is unavailable, and
+/// the bar's start is the most gas that leaves a positive minimum.
+#[gpui::test]
+fn the_gas_bar_starts_at_zero_when_gas_exceeds_the_swap(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        let review = requote_at_gas(swaps, &stubs, runtime, gas_price_for(&first, 15_000), cx);
+        let bar = GasBar::of(&review);
+        assert!(bar.gas_exceeds());
+        assert_eq!(review.gas_share_bps(), GAS_SHARE_BALANCED_BPS);
+        assert!(review.with_gas_share(GAS_SHARE_LOOSE_BPS).is_err());
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            let (start, label, _) = swaps.gas_bar_ends(form, &review, &review, cx);
+            assert_eq!(
+                (start, label),
+                (
+                    swaps.bare_amount(STUB_USDT, U256::ZERO, cx),
+                    "gas exceeds the swap"
+                )
+            );
+        });
+        focus_gas_bar(swaps, cx);
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(form.gas_share_bps, bar.max_share_bps());
+            assert!(bar.max_share_bps() < GAS_SHARE_LOOSE_BPS);
+            assert!(matches!(&form.quote, QuoteState::Ready(start)
+                    if start.gas_share_bps() == bar.max_share_bps()
+                        && !start.suggested_private_minimum().is_zero()));
+        });
+    });
+}
+
+/// The spec's 10 USDC swap: Balanced's 8.45 USDT minimum stays below the warning, and
+/// Loose's 4.04 needs Swap anyway.
+#[test]
+fn authorized_costs_count_everything_the_minimum_gives_up() {
+    let cost = |minimum: u64| {
+        authorized_cost_bps(
+            U256::from(9_958_600),
+            U256::from(10_000_000),
+            U256::from(9_975_000),
+            U256::from(minimum),
+        )
+    };
+    assert!(cost(8_450_000) < AUTHORIZED_COST_WARNING_BPS, "Balanced");
+    assert!(cost(4_040_000) >= AUTHORIZED_COST_WARNING_BPS, "Loose");
+}
+
+/// A USD value is left out only when it reads as the amount beside it. Whole-number zeros are
+/// digits, not padding.
+#[test]
+fn a_usd_value_repeats_only_the_amount_it_reads_as() {
+    for (usd, amount, repeats) in [
+        ("≈ $9.63", "9.63", true),
+        ("≈ $10.00", "10", true),
+        ("≈ $1,234.50", "1234.5", true),
+        ("≈ $9.61", "9.63", false),
+        ("≈ $9.63", "0.0039", false),
+        ("≈ $100.00", "1", false),
+    ] {
+        assert_eq!(
+            usd_repeats_amount(usd, amount),
+            repeats,
+            "{usd} beside {amount}"
+        );
+    }
+}
+
+/// The details header's costs are measured from the best case, which counts `CoW`'s network
+/// fee as output: the unshield fee at the best-case rate, the gas allowance and the shield fee.
+/// A payout above the quote's `buyAmount` hides none of them.
+#[gpui::test]
+fn total_cost_counts_every_deduction_from_the_best_case(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    // Of the 997,500 sold after the unshield fee, which leaves a quoted sell amount of 900,000.
+    stubs.set_fee_amount(97_500);
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        let review = requote_at_gas(swaps, &stubs, runtime, gas_price_for(&first, 1_000), cx);
+        // buyAmount + floor(97,500 * buyAmount / 900,000).
+        let best = U256::from(443_333_333_333_333_u64);
+        assert_eq!(review.best_case(), best);
+        assert_eq!(review.plan().amount(), U256::from(1_000_000));
+        let unshield_fee = U256::from(2_500) * best / U256::from(997_500);
+        for review in [review.with_gas_share(0).unwrap(), (*review).clone()] {
+            let allowance = review.gas_allowance();
+            assert_eq!(allowance.is_zero(), review.gas_share_bps() == 0);
+            let payout = best - allowance;
+            assert!(payout > U256::from(STUB_BUY_AMOUNT));
+            let shield_fee = review.shield_fee_on_output(payout);
+            assert!(!shield_fee.is_zero());
+            assert_eq!(total_cost(&review), unshield_fee + allowance + shield_fee);
+        }
+    });
+}
+
+/// With gas at 40% of the swap, Balanced authorizes little and Loose needs Swap anyway, which
+/// another share clears.
+#[gpui::test]
+fn loose_needs_swap_anyway_where_balanced_does_not(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        let review = requote_at_gas(swaps, &stubs, runtime, gas_price_for(&first, 4_000), cx);
+        assert!(authorized_high_cost(&review).is_none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-high-costs").is_none());
+        let loose = cx.debug_bounds("swap-gas-loose").unwrap();
+        cx.simulate_click(loose.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-high-costs").is_some());
+        let loose = swaps.update(cx, |swaps, _| {
+            let form = swaps.form.as_mut().unwrap();
+            form.price_acknowledged = true;
+            let QuoteState::Ready(loose) = &form.quote else {
+                panic!("the quote priced at Loose");
+            };
+            let loose = Arc::clone(loose);
+            assert!(authorized_high_cost(&loose).is_some());
+            assert_eq!(
+                form.review_problem(&loose)
+                    .map(|problem| problem.to_string()),
+                Some("Confirm Swap anyway to accept the high swap costs.".to_owned())
+            );
+            loose
+        });
+        let checkbox = cx.debug_bounds("swap-costs-acknowledged").unwrap();
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                assert!(
+                    swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .review_problem(&loose)
+                        .is_none()
+                );
+                swaps.set_gas_preset(GasPreset::Balanced, window, cx);
+                assert!(!swaps.form.as_ref().unwrap().high_costs_acknowledged);
+            });
+        });
+    });
+}
+
+/// With gas at six times the swap, Balanced leaves no minimum and the quote is priced at Tight.
+/// The form keeps Balanced, selects no preset and refuses the review, and a quote at lower gas
+/// is Balanced again. Choosing Higher makes the Tight quote the user's, with its Swap anyway.
+#[gpui::test]
+fn a_quote_that_falls_back_to_tight_waits_for_a_chosen_minimum(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        let high = gas_price_for(&first, 60_000);
+        let fell_back = |cx: &mut gpui::VisualTestContext| {
+            let review = requote_at_gas(swaps, &stubs, runtime, high, cx);
+            assert_eq!(review.gas_share_bps(), GAS_SHARE_TIGHT_BPS);
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("swap-gas-too-high").is_some());
+            assert!(cx.debug_bounds("swap-high-costs").is_none());
+            swaps.update(cx, |swaps, _| {
+                let form = swaps.form.as_mut().unwrap();
+                form.price_acknowledged = true;
+                assert_eq!(
+                    (form.gas_share_bps, form.gas_custom),
+                    (GAS_SHARE_BALANCED_BPS, false)
+                );
+                assert_eq!(form.selected_gas_preset(Some(&review)), None);
+                assert!(form.review_problem(&review).is_some());
+            });
+        };
+        fell_back(cx);
+
+        let low = gas_price_for(&first, 1_000);
+        let review = requote_at_gas(swaps, &stubs, runtime, low, cx);
+        assert_eq!(review.gas_share_bps(), GAS_SHARE_BALANCED_BPS);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-too-high").is_none());
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(
+                form.selected_gas_preset(Some(&review)),
+                Some(GasPreset::Balanced)
+            );
+        });
+
+        fell_back(cx);
+        let tight = cx.debug_bounds("swap-gas-tight").unwrap();
+        cx.simulate_click(tight.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-too-high").is_none());
+        let checkbox = cx.debug_bounds("swap-costs-acknowledged").unwrap();
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            let QuoteState::Ready(review) = &form.quote else {
+                panic!("the quote stays ready");
+            };
+            assert_eq!(
+                form.selected_gas_preset(Some(review)),
+                Some(GasPreset::Tight)
+            );
+            assert!(form.review_problem(review).is_none());
+        });
+    });
+}
+
+/// When even Tight leaves no positive minimum, quoting stops with the sell-amount error, and
+/// the chosen share stays for the next quote.
+#[gpui::test]
+fn every_preset_leaving_nothing_shows_the_sell_amount_error(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        stubs.set_gas_price_wei(gas_price_for(&first, 150_000));
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| swaps.schedule_quote(window, cx));
+        });
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| {
+                !matches!(swaps.form.as_ref().unwrap().quote, QuoteState::Loading)
+            })
+        });
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            let QuoteState::Failed(error) = &form.quote else {
+                panic!("the quote fails");
+            };
+            assert!(matches!(
+                error.downcast_ref::<OrderLimitError>(),
+                Some(OrderLimitError::HookCostExceedsOutput { gas_estimate, best_case, .. })
+                    if *gas_estimate > *best_case * U256::from(10)
+            ));
+            assert_eq!(form.gas_share_bps, GAS_SHARE_BALANCED_BPS);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-price-error").is_some());
+    });
+}
+
+/// The gas strip's info button opens its explanation from the keyboard; Escape closes it and
+/// returns focus to the button. The explanation has the bar's legend only while the bar shows.
+#[gpui::test]
+fn gas_help_opens_from_its_button_and_escape_returns_focus(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        ready_review(swaps, runtime, cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(!swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().gas_bar_open()));
+        let info = cx.debug_bounds("swap-gas-help-trigger").unwrap();
+        cx.simulate_click(info.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-help-content").is_some());
+        assert!(cx.debug_bounds("swap-gas-help-legend").is_none());
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-help-content").is_none());
+        focus_gas_bar(swaps, cx);
+        // The info button, the three presets and the edit button precede the bar in the tab
+        // order.
+        cx.update(|window, cx| {
+            for _ in 0..5 {
+                window.focus_prev(cx);
+            }
+            window.draw(cx).clear(cx);
+        });
+        let trigger = cx.update(|window, cx| window.focused(cx)).unwrap();
+        swaps.read_with(cx, |swaps, _| {
+            assert_ne!(trigger, swaps.form.as_ref().unwrap().gas_bar_focus);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-help-content").is_some());
+        assert!(cx.debug_bounds("swap-gas-help-legend").is_some());
+        assert!(swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().gas_help_open));
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-gas-help-content").is_none());
+        assert!(!swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().gas_help_open));
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), Some(trigger));
+        assert!(
+            swaps.read_with(cx, |swaps, _| swaps.form.is_some()),
+            "the form stays open"
+        );
+    });
+}
+
+/// A Private delivery review leads with the guaranteed minimum, states the gas in money, and
+/// shows the signed buy amount and the gas price in its order terms. What the order publishes,
+/// when it expires unfilled and what a triggered unshield costs to recover stay in the review.
+#[gpui::test]
+fn private_review_leads_with_the_minimum_and_states_the_gas(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_private_form(root, swaps, &stubs, runtime, cx);
+        let first = ready_review(swaps, runtime, cx);
+        let review = requote_at_gas(swaps, &stubs, runtime, gas_price_for(&first, 1_000), cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let summary = swaps.swap_summary(&review, None, None, None, cx);
+            let minimum = review.suggested_private_minimum();
+            let (label, amount, lines) = summary.receive_card_for_test().unwrap();
+            assert_eq!(
+                (label, amount),
+                (
+                    "Receive at least".to_owned(),
+                    swaps.token_amount(STUB_USDT, minimum, cx)
+                )
+            );
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("to your private balance")
+            );
+            assert_eq!(summary.receiver_for_test(), None);
+            assert_eq!(summary.rows_for_test()[0], gas_row(swaps, &review, cx));
+            let gas = summary.row_hint_for_test("Gas").unwrap();
+            assert!(
+                gas.contains(
+                    "If no solver covers the rest within 10 minutes, the order expires and nothing is swapped."
+                ),
+                "{gas}"
+            );
+            assert!(summary.details_note_for_test().is_some_and(|note| {
+                note.contains("recovering the tokens costs the unshield and shield fees")
+            }));
+            let (_, public, warns) = summary.disclosure_for_test().unwrap();
+            assert!(
+                !warns && public.starts_with("Placing the order publishes its tokens, amounts"),
+                "{public}"
+            );
+            let signed = review.buy_amount_for(minimum).unwrap();
+            assert!(
+                signed > minimum,
+                "the order signs the amount before the shield fee"
+            );
+            let details = summary.details_for_test();
+            for row in [
+                (
+                    "Signed minimum",
+                    format!(
+                        "{}, before the shield fee",
+                        swaps.token_amount(STUB_USDT, signed, cx)
+                    ),
+                ),
+                (
+                    "Railgun unshield",
+                    swaps.token_amount(
+                        STUB_USDC,
+                        review.plan().amount() - review.sell_amount(),
+                        cx,
+                    ),
+                ),
+                (
+                    "Gas estimate",
+                    format!(
+                        "≈ {} at {} gwei",
+                        swaps.gas_money(STUB_USDT, review.gas_estimate(), cx),
+                        format_gwei(review.gas_price_wei())
+                    ),
+                ),
+                ("Price tolerance", "0.5%".to_owned()),
+                ("Order valid for", "10 minutes".to_owned()),
+            ] {
+                assert!(details.contains(&(row.0.to_owned(), row.1)), "{details:?}");
+            }
+            // The stub quote states no protocol fee.
+            assert!(details.iter().all(|(label, _)| label != "CoW fee"));
         });
     });
 }
@@ -3568,6 +4902,10 @@ fn bridge_observations(
             sell_amount: U256::from(100),
             buy_amount: U256::from(99),
             fee_amount: U256::ZERO,
+            settlement_gas_used: None,
+            settlement_effective_gas_price: None,
+            executed_fee: None,
+            executed_fee_token: None,
         }),
         delivered: Some(seen),
         bridge_handoff: Some(SwapBridgeHandoff {
@@ -4020,31 +5358,271 @@ fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &m
     });
 }
 
+/// A filled order's outcome shows what it received against its minimum. Its fee row waits for
+/// the fee the orderbook charged, which the swap reads once per session on its own route, also
+/// after verification ends routine polling: a failed read isn't repeated until the next session.
+#[gpui::test]
+fn a_filled_order_reads_its_executed_fee_once_per_session(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{SwapObservation, SwapOrderObservations, SwapTradeAmounts};
+
+    let stubs = SwapStubs::start();
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        let delivery = SwapDelivery::External {
+            receiver: Address::repeat_byte(0x51),
+        };
+        let (uid, observed) = placed_swap_with(executors, operation, delivery, |bounds| {
+            bounds.gas_share_bps = Some(2_500);
+        });
+        let seen = SwapObservation {
+            block: observed.block(),
+            transaction_hash: Some(alloy::primitives::B256::repeat_byte(40)),
+        };
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                SwapOrderObservations {
+                    pre_hook_executed: Some(seen),
+                    traded: Some(seen),
+                    delivered: Some(seen),
+                    trade_amounts: Some(SwapTradeAmounts {
+                        sell_amount: U256::from(100),
+                        buy_amount: U256::from(99),
+                        fee_amount: U256::ZERO,
+                        settlement_gas_used: Some(250_000),
+                        settlement_effective_gas_price: Some(2_000_000_000),
+                        executed_fee: None,
+                        executed_fee_token: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // One pass of the orderbook poller, or `false` when it has nothing to ask.
+        let poll = |cx: &mut gpui::VisualTestContext| {
+            let hints = cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.next_order_hints(cx)
+                })
+            });
+            let Some((_, owner, requests)) = hints else {
+                return false;
+            };
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0].fee && !requests[0].hint,
+                "a verified order asks only for its fee"
+            );
+            let results = runtime.block_on(fetch_order_hints(owner, requests));
+            cx.update(|_, cx| swaps.update(cx, |swaps, cx| swaps.apply_order_hints(results, cx)));
+            true
+        };
+        let executed_fee = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| swaps.update(cx, |swaps, _| swaps.reload_records()));
+            swaps.read_with(cx, |swaps, _| {
+                let order = swaps.record(operation)?.swap()?.orders().last()?;
+                order
+                    .observations()
+                    .trade_amounts?
+                    .executed_fee
+                    .zip(order.observations().trade_amounts?.executed_fee_token)
+            })
+        };
+        let show = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| swaps.show_detail(operation, window, cx));
+                window.draw(cx).clear(cx);
+            });
+        };
+
+        // The orderbook is unreachable: nothing is recorded, and nothing is asked again.
+        let unreachable = orderbook_at("http://127.0.0.1:1/mainnet".parse().unwrap(), runtime);
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                swaps.tracking.entry(operation).or_default().orderbook = Some(unreachable);
+            });
+        });
+        assert!(poll(cx));
+        assert_eq!(executed_fee(cx), None);
+        assert!(
+            !poll(cx),
+            "a failed fee read isn't repeated in the same session"
+        );
+        show(cx);
+        assert!(cx.debug_bounds("swap-outcome-received").is_some());
+        assert!(cx.debug_bounds("swap-outcome-minimum").is_some());
+        assert!(
+            cx.debug_bounds("swap-outcome-gas").is_none(),
+            "no fee row without the charged fee"
+        );
+
+        // The next session asks once on the swap's route, and the fee persists.
+        let orderbook = stub_orderbook(&stubs, runtime);
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                let tracking = swaps.tracking.entry(operation).or_default();
+                tracking.fee_asked.clear();
+                tracking.orderbook = Some(orderbook);
+            });
+        });
+        assert!(poll(cx));
+        let requests = stubs.order_requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with(&format!("/api/v1/orders/{}", uid.0)));
+        assert_eq!(
+            executed_fee(cx),
+            Some((U256::from(STUB_EXECUTED_FEE), Address::repeat_byte(2)))
+        );
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| swaps.tracking.clear());
+        });
+        assert!(!poll(cx), "a recorded fee is never asked for again");
+        assert_eq!(stubs.order_requests().len(), 1);
+        show(cx);
+        assert!(cx.debug_bounds("swap-outcome-gas").is_some());
+    });
+}
+
+/// An order that expired unfilled is a Not filled warning with its terms and where the funds
+/// are. Swap again reopens the form with the share, tolerance and validity it was signed with.
+#[gpui::test]
+fn an_unfilled_expiry_shows_its_terms_and_swaps_again_with_them(cx: &mut TestAppContext) {
+    unfilled_expiry(cx, false);
+}
+
+/// A record from before gas shares expires without share-specific rows, and Swap again keeps
+/// its tolerance but falls back to Balanced and the profile's validity.
+#[gpui::test]
+fn a_legacy_unfilled_expiry_swaps_again_with_balanced(cx: &mut TestAppContext) {
+    unfilled_expiry(cx, true);
+}
+
+fn unfilled_expiry(cx: &mut TestAppContext, legacy: bool) {
+    use crate::root::public_action::PublicActionStepStatus;
+    use wallet_ops::vault::{
+        SwapObservation, SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
+    };
+
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        let (uid, observed) =
+            placed_swap_with(executors, operation, SwapDelivery::Reshield, |bounds| {
+                bounds.slippage_bps = 120;
+                if !legacy {
+                    bounds.gas_share_bps = Some(1_000);
+                    bounds.gas_estimate = Some(U256::from(40));
+                    bounds.gas_allowance = Some(U256::from(4));
+                    bounds.gas_price_wei = Some(1_180_000_000);
+                    bounds.valid_for_secs = Some(1_800);
+                }
+            });
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                SwapOrderObservations {
+                    pre_hook_dead: Some(SwapPreHookDeath {
+                        cause: SwapPreHookDeathCause::Expired,
+                        observation: SwapObservation {
+                            block: observed.block(),
+                            transaction_hash: None,
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // A quote the reopened form schedules goes nowhere.
+        let unreachable = orderbook_at("http://127.0.0.1:1/mainnet".parse().unwrap(), runtime);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.tracking.entry(operation).or_default().orderbook = Some(unreachable);
+                let record = swaps.record(operation).unwrap();
+                let stage = swaps.stage(record);
+                assert_eq!(
+                    stage,
+                    SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired))
+                );
+                let steps = model::swap_steps(stage, &swaps.labels(record, cx));
+                let ended = steps.last().unwrap();
+                assert_eq!(
+                    (ended.label.as_str(), ended.status),
+                    ("Not filled", PublicActionStepStatus::Warning)
+                );
+                let covered = if legacy {
+                    "No solver filled it before the order expired at "
+                } else {
+                    "No solver covered "
+                };
+                assert!(ended.detail.starts_with(covered), "{}", ended.detail);
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("swap-not-filled").is_some());
+        assert!(cx.debug_bounds("swap-outcome-minimum").is_some());
+        for selector in ["swap-not-filled-gas", "swap-not-filled-gas-price"] {
+            assert_eq!(
+                cx.debug_bounds(selector).is_some(),
+                !legacy,
+                "{selector} for a legacy record: {legacy}"
+            );
+        }
+
+        let retry = cx.debug_bounds("swap-progress-retry").unwrap();
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            let swaps = swaps.read(cx);
+            let form = swaps.form.as_ref().expect("Swap again opens the form");
+            assert_eq!(form.slippage_bps, 120);
+            let expected = if legacy {
+                (GAS_SHARE_BALANCED_BPS, swaps.default_valid_for(cx))
+            } else {
+                (1_000, Duration::from_mins(30))
+            };
+            assert_eq!((form.gas_share_bps, form.valid_for), expected);
+        });
+    });
+}
+
 const STUB_USDC: Address = alloy::primitives::address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 /// What the stub orderbook quotes for any sell amount: 0.0004 ETH.
 const STUB_BUY_AMOUNT: u64 = 400_000_000_000_000;
+/// The fee the stub orderbook reports it charged any order, in `Address::repeat_byte(2)`.
+const STUB_EXECUTED_FEE: u64 = 464_572;
 
 /// Local stand-ins for the chain RPC, the `CoW` orderbook and the bridge providers, served from
 /// their own thread, so a quote goes through the real planning and review without live
 /// services. The RPC answers `eth_gasPrice` and fails everything else, like the unreachable RPC
-/// of other tests. The orderbook quotes [`STUB_BUY_AMOUNT`] for any order and keeps each
-/// request's body. Across and 1Click list the routes of [`stub_bridge_list`] and quote as
+/// of other tests, with a gas price of 1 wei unless set. The orderbook quotes
+/// [`STUB_BUY_AMOUNT`] for any order, with no network fee unless set, and keeps each request's
+/// body, and reports every order
+/// fulfilled with [`STUB_EXECUTED_FEE`], keeping each report's path. Across and 1Click list the routes of [`stub_bridge_list`] and quote as
 /// [`stub_bridge_reply`] describes.
 struct SwapStubs {
     url: reqwest::Url,
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    order_requests: Arc<std::sync::Mutex<Vec<String>>>,
     across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
+    across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
+    fee_amount: Arc<std::sync::atomic::AtomicU64>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// What the stub providers quote with: Across deposits into the swap chain's `spoke_pool` and
-/// keeps `across_fee_bps` of the amount.
+/// keeps `across_fee_bps` of the amount, after `across_delay_ms`. Requests to a path starting
+/// with one of `failing` get a 503.
 #[derive(Clone)]
 struct StubBridge {
     spoke_pool: Address,
     across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
+    across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl SwapStubs {
@@ -4056,9 +5634,17 @@ impl SwapStubs {
             .unwrap();
         let quotes = Arc::<std::sync::Mutex<Vec<serde_json::Value>>>::default();
         let bridge_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let order_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
         let across_fee_bps = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        let across_delay_ms = Arc::<std::sync::atomic::AtomicU64>::default();
+        let failing = Arc::<std::sync::Mutex<Vec<&'static str>>>::default();
+        let gas_price_wei = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let served_gas_price = Arc::clone(&gas_price_wei);
+        let fee_amount = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let served_fee_amount = Arc::clone(&fee_amount);
         let recorded = Arc::clone(&quotes);
         let recorded_bridge = Arc::clone(&bridge_requests);
+        let recorded_orders = Arc::clone(&order_requests);
         let bridge = StubBridge {
             spoke_pool: wallet_ops::settings::build_effective_chain_configs(
                 &wallet_ops::settings::WalletSettings::default(),
@@ -4070,6 +5656,8 @@ impl SwapStubs {
             .unwrap()
             .spoke_pool(),
             across_fee_bps: Arc::clone(&across_fee_bps),
+            across_delay_ms: Arc::clone(&across_delay_ms),
+            failing: Arc::clone(&failing),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
@@ -4085,7 +5673,10 @@ impl SwapStubs {
                             stream,
                             Arc::clone(&recorded),
                             Arc::clone(&recorded_bridge),
+                            Arc::clone(&recorded_orders),
                             bridge.clone(),
+                            Arc::clone(&served_gas_price),
+                            Arc::clone(&served_fee_amount),
                         ));
                     }
                 };
@@ -4099,7 +5690,12 @@ impl SwapStubs {
             url,
             quotes,
             bridge_requests,
+            order_requests,
             across_fee_bps,
+            across_delay_ms,
+            failing,
+            gas_price_wei,
+            fee_amount,
             stop: Some(stop),
             thread: Some(thread),
         }
@@ -4109,6 +5705,31 @@ impl SwapStubs {
     fn set_across_fee_bps(&self, bps: u64) {
         self.across_fee_bps
             .store(bps, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Have Across hold each fee quote it is asked for from now on for `delay`.
+    fn set_across_delay(&self, delay: Duration) {
+        self.across_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Have the providers answer 503 to paths starting with one of `prefixes` from now on.
+    fn set_failing(&self, prefixes: &[&'static str]) {
+        *self.failing.lock().unwrap() = prefixes.to_vec();
+    }
+
+    /// Have the RPC report `wei` as its gas price from now on.
+    fn set_gas_price_wei(&self, wei: u64) {
+        self.gas_price_wei
+            .store(wei, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Have the orderbook quote `fee` of the sell amount as its network fee from now on.
+    fn set_fee_amount(&self, fee: u64) {
+        self.fee_amount
+            .store(fee, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn rpc(&self) -> reqwest::Url {
@@ -4128,6 +5749,11 @@ impl SwapStubs {
     fn bridge_requests(&self) -> Vec<String> {
         self.bridge_requests.lock().unwrap().clone()
     }
+
+    /// The paths of the orderbook's order reports so far.
+    fn order_requests(&self) -> Vec<String> {
+        self.order_requests.lock().unwrap().clone()
+    }
 }
 
 impl Drop for SwapStubs {
@@ -4146,7 +5772,10 @@ async fn stub_response(
     stream: tokio::net::TcpStream,
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    order_requests: Arc<std::sync::Mutex<Vec<String>>>,
     bridge: StubBridge,
+    gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
+    fee_amount: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
     let mut stream = tokio::io::BufReader::new(stream);
@@ -4173,8 +5802,25 @@ async fn stub_response(
     }
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let path = request_line.split(' ').nth(1).unwrap_or_default();
+    let failing = bridge
+        .failing
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|prefix| path.starts_with(prefix));
+    let status = if failing {
+        "503 Service Unavailable"
+    } else {
+        "200 OK"
+    };
     let reply = if path.starts_with("/across/") || path.starts_with("/near/") {
         bridge_requests.lock().unwrap().push(path.to_owned());
+        if path.starts_with("/across/suggested-fees") {
+            let delay = bridge
+                .across_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         stub_bridge_reply(path, &body, &bridge)
     } else if request_line.contains("/api/v1/quote") {
         // Price the sell token so that one buy-token base unit is worth one wei, which keeps
@@ -4187,11 +5833,21 @@ async fn stub_response(
                 || "1".to_owned(),
                 |amount| (STUB_BUY_AMOUNT as f64 / amount).to_string(),
             );
+        // The network fee comes out of the sell amount, as `CoW` quotes a sell order.
+        let fee = U256::from(fee_amount.load(std::sync::atomic::Ordering::Relaxed));
+        let sell_amount = body["sellAmountBeforeFee"]
+            .as_str()
+            .and_then(|amount| amount.parse::<U256>().ok())
+            .map_or_else(
+                || body["sellAmountBeforeFee"].clone(),
+                |amount| amount.saturating_sub(fee).to_string().into(),
+            );
         let reply = serde_json::json!({
             "quote": {
                 "sellToken": body["sellToken"], "buyToken": body["buyToken"],
-                "sellAmount": body["sellAmountBeforeFee"],
-                "buyAmount": STUB_BUY_AMOUNT.to_string(), "validTo": 1, "feeAmount": "0",
+                "sellAmount": sell_amount,
+                "buyAmount": STUB_BUY_AMOUNT.to_string(), "validTo": 1,
+                "feeAmount": fee.to_string(),
                 "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": sell_token_price, "kind": "sell",
                 "partiallyFillable": false
             },
@@ -4199,8 +5855,16 @@ async fn stub_response(
         });
         quotes.lock().unwrap().push(body);
         reply
+    } else if path.contains("/api/v1/orders/") {
+        order_requests.lock().unwrap().push(path.to_owned());
+        serde_json::json!({
+            "status": "fulfilled",
+            "executedFee": STUB_EXECUTED_FEE.to_string(),
+            "executedFeeToken": Address::repeat_byte(2),
+        })
     } else if body["method"] == "eth_gasPrice" {
-        serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": "0x1"})
+        let price = gas_price_wei.load(std::sync::atomic::Ordering::Relaxed);
+        serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": format!("{price:#x}")})
     } else {
         serde_json::json!({
             "jsonrpc": "2.0", "id": body["id"],
@@ -4212,7 +5876,7 @@ async fn stub_response(
         .get_mut()
         .write_all(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                 reply.len()
             )
             .as_bytes(),
@@ -4428,6 +6092,11 @@ fn enable_stub_chain(root: &mut WalletRoot, stubs: &SwapStubs, chain_id: u64) {
 
 /// An orderbook client for the stub orderbook, on a direct route.
 fn stub_orderbook(stubs: &SwapStubs, runtime: &tokio::runtime::Runtime) -> CowOrderbookClient {
+    orderbook_at(stubs.orderbook(), runtime)
+}
+
+/// An orderbook client for `url`, on a direct route.
+fn orderbook_at(url: reqwest::Url, runtime: &tokio::runtime::Runtime) -> CowOrderbookClient {
     let directory = tempfile::tempdir().unwrap();
     runtime.block_on(async {
         let http = wallet_ops::build_wallet_network_context(wallet_ops::WalletNetworkConfig {
@@ -4437,12 +6106,7 @@ fn stub_orderbook(stubs: &SwapStubs, runtime: &tokio::runtime::Runtime) -> CowOr
         })
         .await
         .unwrap();
-        CowOrderbookClient::new(
-            http.operation_http_client().await.unwrap(),
-            stubs.orderbook(),
-            1,
-        )
-        .unwrap()
+        CowOrderbookClient::new(http.operation_http_client().await.unwrap(), url, 1).unwrap()
     })
 }
 
@@ -4485,10 +6149,43 @@ fn ready_review(
     })
 }
 
+/// The form's quote once no bridge refresh is under way.
+fn refreshed_review(
+    swaps: &Entity<PrivateSwapsView>,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) -> Arc<SwapReview> {
+    drive_until(cx, runtime, |cx| {
+        swaps.read_with(cx, |swaps, _| {
+            swaps.form.as_ref().unwrap().quote_task.is_none()
+        })
+    });
+    ready_review(swaps, runtime, cx)
+}
+
+/// The amounts of the Across fee quotes asked for so far.
+fn across_fee_amounts(stubs: &SwapStubs) -> Vec<U256> {
+    stubs
+        .bridge_requests()
+        .iter()
+        .filter(|path| path.starts_with("/across/suggested-fees"))
+        .map(|path| {
+            reqwest::Url::parse(&format!("http://stub{path}"))
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "amount")
+                .unwrap()
+                .1
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
 /// An approval saved with a swap's setup, of 1 USDC for ETH delivered to `receiver`. Every term
 /// the stub quote leads to is within it, so an unchanged requote is confirm-only. Without a
-/// `hook_cost`, the order needs review again.
-fn external_approval(receiver: Address, hook_cost: Option<U256>) -> SwapApproval {
+/// `gas_allowance`, it was saved before gas shares and the order needs review again.
+fn external_approval(receiver: Address, gas_allowance: Option<U256>) -> SwapApproval {
     let mut approval = test_approval();
     let bounds = &mut approval.bounds;
     bounds.sell_amount = U256::from(997_500);
@@ -4499,7 +6196,9 @@ fn external_approval(receiver: Address, hook_cost: Option<U256>) -> SwapApproval
     bounds.shield_fee_bps = U256::ZERO;
     bounds.pre_hook_gas_limit = u64::MAX;
     bounds.post_hook_gas_limit = None;
-    bounds.hook_cost = hook_cost;
+    bounds.gas_share_bps = gas_allowance.map(|_| wallet_ops::cow::GAS_SHARE_BALANCED_BPS);
+    bounds.gas_allowance = gas_allowance;
+    bounds.valid_for_secs = Some(600);
     approval.delivery = SwapDelivery::External { receiver };
     approval.tokens = Some(wallet_ops::vault::SwapApprovalTokens {
         sell: STUB_USDC,
@@ -4608,4 +6307,118 @@ fn restarted_swaps(
         });
         swaps
     })
+}
+
+/// A new swap of 1 USDC for USDT to the private balance, planned from a 10 USDC stub note and
+/// quoted through the stub orderbook.
+fn open_private_form(
+    root: &Entity<WalletRoot>,
+    swaps: &Entity<PrivateSwapsView>,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let orderbook = stub_orderbook(stubs, runtime);
+    cx.update(|window, cx| {
+        root.update(cx, |root, _| {
+            root.effective_token_registry = wallet_ops::settings::build_effective_token_registry(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap();
+        });
+        swaps.update(cx, |swaps, cx| {
+            swaps
+                .owner
+                .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
+            swaps.open_form(
+                None,
+                STUB_USDC,
+                Some(STUB_USDT),
+                Some(U256::from(1_000_000)),
+                None,
+                SwapDelivery::Reshield,
+                window,
+                cx,
+            );
+            swaps.form.as_mut().unwrap().orderbook = Some(orderbook);
+            swaps.schedule_quote(window, cx);
+        });
+    });
+}
+
+/// The stub RPC gas price at which the gas estimate is about `fraction_bps` of the best case,
+/// from a `review` quoted at 1 wei, whose cushioned price of 2 wei values one buy-token base
+/// unit at one wei.
+fn gas_price_for(review: &SwapReview, fraction_bps: u64) -> u64 {
+    let units = review.gas_estimate() / U256::from(2);
+    let target = review.best_case() * U256::from(fraction_bps) / U256::from(10_000);
+    // A price of 4k wei is cushioned to 5k.
+    (target / (units * U256::from(5))).saturating_to::<u64>() * 4
+}
+
+/// The form's quote again, once the stub RPC reports `wei` as its gas price.
+fn requote_at_gas(
+    swaps: &Entity<PrivateSwapsView>,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    wei: u64,
+    cx: &mut gpui::VisualTestContext,
+) -> Arc<SwapReview> {
+    stubs.set_gas_price_wei(wei);
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| swaps.schedule_quote(window, cx));
+    });
+    ready_review(swaps, runtime, cx)
+}
+
+/// Emit the gas slider's `Change` to `value`, or its `Release` when `release`, as a drag does.
+fn move_gas_slider(
+    swaps: &Entity<PrivateSwapsView>,
+    value: f32,
+    release: bool,
+    cx: &mut gpui::VisualTestContext,
+) {
+    use gpui_component::slider::SliderValue;
+    cx.update(|_, cx| {
+        let slider = swaps.read(cx).form.as_ref().unwrap().gas_slider.clone();
+        slider.update(cx, |_, cx| {
+            cx.emit(if release {
+                SliderEvent::Release(SliderValue::Single(value))
+            } else {
+                SliderEvent::Change(SliderValue::Single(value))
+            });
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// Open the gas bar with the edit button unless it is open, focus it, as a click or Tab does,
+/// and draw the form.
+fn focus_gas_bar(swaps: &Entity<PrivateSwapsView>, cx: &mut gpui::VisualTestContext) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    if !swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().gas_bar_open()) {
+        let edit = cx.debug_bounds("swap-gas-edit-minimum").unwrap();
+        cx.simulate_click(edit.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let focus = swaps.read(cx).form.as_ref().unwrap().gas_bar_focus.clone();
+        focus.focus(window, cx);
+        window.draw(cx).clear(cx);
+    });
+}
+
+/// The review's Gas row: the gas the user pays of the gas estimate, in money.
+fn gas_row(swaps: &PrivateSwapsView, review: &SwapReview, cx: &App) -> (String, String) {
+    let buy = review.plan().buy_token();
+    (
+        "Gas".to_owned(),
+        format!(
+            "{} · up to {} of ≈ {}",
+            gas_share_name(review.gas_share_bps()),
+            swaps.gas_money(buy, review.gas_allowance(), cx),
+            swaps.gas_money(buy, review.gas_estimate(), cx)
+        ),
+    )
 }

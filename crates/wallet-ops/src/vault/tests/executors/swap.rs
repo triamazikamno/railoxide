@@ -99,6 +99,11 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
             updated_at: Some(1_699_990_000),
         }],
         destination_minimum: None,
+        gas_share_bps: None,
+        gas_estimate: None,
+        gas_allowance: None,
+        gas_price_wei: None,
+        valid_for_secs: None,
     };
     let attempt = |digest: u8, valid_to: u32, hooks: u8, post_nonce: u64| SwapAttempt {
         submission: None,
@@ -669,6 +674,10 @@ fn swap_records_written_by_the_external_build_decode_unchanged() {
         sell_amount: U256::from(9_975),
         buy_amount: U256::from(10_100),
         fee_amount: U256::ZERO,
+        settlement_gas_used: None,
+        settlement_effective_gas_price: None,
+        executed_fee: None,
+        executed_fee_token: None,
     };
     let saved = SavedRecord {
         version: 1,
@@ -781,6 +790,110 @@ fn swap_records_written_by_the_external_build_decode_unchanged() {
 }
 
 #[test]
+fn swap_records_written_before_gas_shares_decode_without_them() {
+    // Match the named MessagePack approval bounds and trade amounts of the Bridge build: no gas
+    // share, gas figures, validity, settlement gas or executed fee.
+    #[derive(serde::Serialize)]
+    struct EarlierBounds {
+        sell_amount: U256,
+        unshield_amount: Option<U256>,
+        unshield_fee_bps: U256,
+        buy_amount: U256,
+        private_minimum: U256,
+        shield_fee_bps: U256,
+        slippage_bps: u32,
+        pre_hook_gas_limit: u64,
+        post_hook_gas_limit: Option<u64>,
+        hook_cost: Option<U256>,
+        anchors: Vec<SwapAnchorObservation>,
+        destination_minimum: Option<U256>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierApproval {
+        bounds: EarlierBounds,
+        price_verified: Option<bool>,
+        price_acknowledged: bool,
+        delivery: SwapDelivery,
+        tokens: Option<SwapApprovalTokens>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierTradeAmounts {
+        sell_amount: U256,
+        buy_amount: U256,
+        fee_amount: U256,
+    }
+    fn reencode<T: serde::de::DeserializeOwned>(value: &impl serde::Serialize) -> T {
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(value).unwrap()).unwrap()
+    }
+    let approval: SwapApproval = reencode(&EarlierApproval {
+        bounds: EarlierBounds {
+            sell_amount: U256::from(9_975),
+            unshield_amount: Some(U256::from(10_000)),
+            unshield_fee_bps: U256::from(25),
+            buy_amount: U256::from(9_999),
+            private_minimum: U256::from(9_975),
+            shield_fee_bps: U256::from(25),
+            slippage_bps: 50,
+            pre_hook_gas_limit: 900_000,
+            post_hook_gas_limit: Some(300_000),
+            hook_cost: Some(U256::from(7)),
+            anchors: Vec::new(),
+            destination_minimum: None,
+        },
+        price_verified: Some(true),
+        price_acknowledged: false,
+        delivery: SwapDelivery::Reshield,
+        tokens: None,
+    });
+    let bounds = &approval.bounds;
+    assert_eq!(
+        (bounds.slippage_bps, bounds.hook_cost),
+        (50, Some(U256::from(7)))
+    );
+    assert_eq!(
+        (
+            bounds.gas_share_bps,
+            bounds.gas_estimate,
+            bounds.gas_allowance,
+            bounds.gas_price_wei,
+            bounds.valid_for_secs
+        ),
+        (None, None, None, None, None)
+    );
+    let amounts: SwapTradeAmounts = reencode(&EarlierTradeAmounts {
+        sell_amount: U256::from(9_975),
+        buy_amount: U256::from(10_100),
+        fee_amount: U256::ZERO,
+    });
+    assert_eq!(
+        (
+            amounts.settlement_gas_used,
+            amounts.settlement_effective_gas_price,
+            amounts.executed_fee,
+            amounts.executed_fee_token
+        ),
+        (None, None, None, None)
+    );
+
+    // Records with the new fields keep them, including gas prices beyond `u64`.
+    let mut current = approval.clone();
+    current.bounds.gas_share_bps = Some(2_500);
+    current.bounds.gas_estimate = Some(U256::from(5_900_000));
+    current.bounds.gas_allowance = Some(U256::from(1_475_000));
+    current.bounds.gas_price_wei = Some(u128::MAX);
+    current.bounds.valid_for_secs = Some(1_800);
+    assert_eq!(reencode::<SwapApproval>(&current), current);
+    let settled = SwapTradeAmounts {
+        settlement_gas_used: Some(1_234_567),
+        settlement_effective_gas_price: Some(u128::from(u64::MAX) + 1),
+        executed_fee: Some(U256::from(1_413_251)),
+        executed_fee_token: Some(Address::repeat_byte(6)),
+        ..amounts
+    };
+    assert_eq!(reencode::<SwapTradeAmounts>(&settled), settled);
+}
+
+#[test]
 fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_next() {
     let (root, db, vault) = desktop_store_with_vault();
     let view = Arc::new(import_wallet_with_metadata(
@@ -865,6 +978,11 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
             hook_cost: Some(U256::ZERO),
             anchors: Vec::new(),
             destination_minimum: None,
+            gas_share_bps: None,
+            gas_estimate: None,
+            gas_allowance: None,
+            gas_price_wei: None,
+            valid_for_secs: None,
         },
         invalidates: None,
         pre_hook: hook(
@@ -935,6 +1053,10 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
         sell_amount: U256::from(9_975),
         buy_amount: U256::from(9_975),
         fee_amount: U256::ZERO,
+        settlement_gas_used: None,
+        settlement_effective_gas_price: None,
+        executed_fee: None,
+        executed_fee_token: None,
     };
     let credit = SwapShieldObservation {
         observation: traded,
@@ -1106,6 +1228,11 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
                     hook_cost: Some(U256::ZERO),
                     anchors: Vec::new(),
                     destination_minimum: Some(U256::from(9_900)),
+                    gas_share_bps: None,
+                    gas_estimate: None,
+                    gas_allowance: None,
+                    gas_price_wei: None,
+                    valid_for_secs: None,
                 },
                 invalidates: None,
                 pre_hook: hook(
@@ -1221,6 +1348,10 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         sell_amount: U256::from(9_975),
         buy_amount: U256::from(10_000),
         fee_amount: U256::ZERO,
+        settlement_gas_used: None,
+        settlement_effective_gas_price: None,
+        executed_fee: None,
+        executed_fee_token: None,
     };
     let deposit = SwapBridgeHandoff {
         observation: traded,

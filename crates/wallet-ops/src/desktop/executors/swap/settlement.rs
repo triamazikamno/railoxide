@@ -18,6 +18,7 @@ use super::observation::{SwapSettlement, issued, shielded_amount};
 use super::order::cow_buy_token;
 use crate::ExecutorOwner;
 use crate::block_observer::fetch_checked_block_receipts;
+use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
@@ -91,6 +92,47 @@ impl ExecutorOwner {
         Err(eyre!(
             "Settlement verification is unavailable. The swap will be checked again."
         ))
+    }
+
+    /// Read the orderbook's executed fee of an order whose trade is verified, through the
+    /// swap's own orderbook route, and persist it with the trade's amounts. The request carries
+    /// only the order UID, and the fee is a hint for display, never an outcome. Nothing is
+    /// requested before the trade is recorded or once its fee is, including after a restart.
+    /// A failed read records nothing and isn't retried here.
+    pub async fn observe_swap_executed_fee(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        orderbook: &CowOrderbookClient,
+    ) -> Result<()> {
+        let record = self
+            .swap_record(operation)?
+            .ok_or_else(|| eyre!("swap is unavailable"))?;
+        let observations = record
+            .swap()
+            .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
+            .ok_or_else(|| eyre!("swap order is unavailable"))?
+            .observations();
+        // A trade recorded before amounts were kept has nowhere to keep the fee.
+        if observations.traded.is_none()
+            || observations
+                .trade_amounts
+                .is_none_or(|amounts| amounts.executed_fee.is_some())
+        {
+            return Ok(());
+        }
+        let fee = self
+            .while_active(async { Ok(orderbook.order_executed_fee(&uid).await?) })
+            .await?;
+        let Some(fee) = fee else {
+            return Ok(());
+        };
+        let _guard = self.lock_activity().await;
+        self.ensure_active()?;
+        self.store
+            .record_swap_executed_fee(operation, uid, fee.amount, fee.token)?;
+        self.notify_change();
+        Ok(())
     }
 }
 
@@ -295,6 +337,12 @@ async fn read_settlement(
                     sell_amount: trade.sellAmount,
                     buy_amount: trade.buyAmount,
                     fee_amount: trade.feeAmount,
+                    // The settlement's cost comes from the receipt already read, the one
+                    // that emits this Trade.
+                    settlement_gas_used: Some(receipt.gas_used()),
+                    settlement_effective_gas_price: Some(receipt.effective_gas_price()),
+                    executed_fee: None,
+                    executed_fee_token: None,
                 },
                 credit,
                 handoff,

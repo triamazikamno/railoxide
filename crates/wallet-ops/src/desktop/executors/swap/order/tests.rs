@@ -6,6 +6,7 @@ use railgun_wallet::{Note, UtxoCommitmentKind, UtxoSource};
 use super::super::bridge::{across_bridge_quote, near_bridge_quote};
 use super::*;
 use crate::bridge::{AcrossFeeQuote, BridgeDestination, NearAssets, OneClickDryQuote};
+use crate::cow::{GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS};
 use crate::vault::ExecutorNonceObservation;
 
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
@@ -144,7 +145,7 @@ fn external_delivery_prices_only_the_pre_hook_and_no_shield_fee() {
     );
     assert!(external.app_data_len() < reshield.app_data_len());
 
-    // 10,002 quoted less a 1-unit hook cost and 1 bp slippage delivers 9,999.
+    // 10,002 quoted less 1 bp tolerance and a 1-unit gas allowance delivers 9,999.
     let quote: CowQuote = serde_json::from_value(serde_json::json!({
         "quote": {
             "sellToken": WETH, "buyToken": USDC,
@@ -169,6 +170,8 @@ fn external_delivery_prices_only_the_pre_hook_and_no_shield_fee() {
             U256::from(25),
             U256::from(25),
             1,
+            GAS_SHARE_BALANCED_BPS,
+            Duration::from_mins(10),
             1,
             U256::ZERO,
             OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
@@ -325,6 +328,8 @@ fn bridge_review() -> SwapReview {
         U256::from(25),
         U256::from(25),
         1,
+        GAS_SHARE_BALANCED_BPS,
+        Duration::from_mins(10),
         1,
         U256::ZERO,
         OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
@@ -431,43 +436,35 @@ fn across_plans_price_and_size_the_deposit_post_hook() {
     assert!(reshield.app_data_len() < reshielding.app_data_len());
 }
 
-// A fixed Across deposit is only part of the user's outcome. Estimate the remaining payout
-// after gas, then charge the shield fee only on that remainder. The deposit uses a 25% gas-price
-// cushion; the estimate uses the raw RPC price, independently of CoW's price.
+// One pricing pass sets the minimum from the gas share for every delivery: the quote's swap gas
+// and the hooks' gas at the RPC price with its 25% cushion, independently of CoW's price, and
+// the shield fee only for Private delivery. A fixed Across deposit is the order's buy amount,
+// and the source-chain return is bounded by the best case, less the shield fee on the surplus.
 #[test]
-fn estimated_outcome_deducts_gas_and_shields_only_the_across_surplus() {
-    for surplus in [BridgeSurplus::Reshield, BridgeSurplus::KeepInAccount] {
-        let plan = plan_for(SwapDelivery::Bridge(BridgeDelivery {
+fn review_prices_the_gas_share_once_and_reprices_without_requests() {
+    // A network fee of 2,500 sell units is worth 25,062 buy units at the quoted rate.
+    let quote: CowQuote = serde_json::from_value(serde_json::json!({
+        "quote": {
+            "sellToken": WETH, "buyToken": USDC,
+            "sellAmount": "997500", "buyAmount": "10000000",
+            "validTo": 1, "feeAmount": "2500", "gasAmount": "100000", "gasPrice": "99",
+            "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+        },
+        "expiration": "", "id": 7, "verified": true
+    }))
+    .unwrap();
+    let best_case = U256::from(10_025_062);
+    let across = |surplus| {
+        SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             surplus,
             ..near_delivery()
-        }));
-        let quote: CowQuote = serde_json::from_value(serde_json::json!({
-            "quote": {
-                "sellToken": WETH, "buyToken": USDC,
-                "sellAmount": "997500", "buyAmount": "10000000",
-                "validTo": 1, "feeAmount": "0", "gasAmount": "0", "gasPrice": "99",
-                "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
-            },
-            "expiration": "", "id": 7, "verified": true
-        }))
-        .unwrap();
-        let rate = NativeBuyRate::Anchor(uint!(1_000_000_000_000_000_000_U256));
-        let bound = price_order_limit(&OrderLimitParams {
-            quote: &quote.quote,
-            hook_gas: plan.hook_gas_estimate(),
-            // 2 wei + 25%, rounded up to a whole wei.
-            gas_price_wei: 3,
-            hook_data_cost_wei: U256::from(100_000),
-            native_rate: rate,
-            slippage_bps: 100,
-            shield_fee_bps: U256::ZERO,
         })
-        .unwrap();
-        let expected_hook_cost = U256::from(plan.expected_hook_gas() * 2 + 100_000);
-        let review = price_swap_review(
-            plan,
-            quote,
+    };
+    let price_at = |plan: &SwapInputPlan, gas_share_bps, gas_price_wei| {
+        price_swap_review(
+            plan.clone(),
+            quote.clone(),
             SwapPrice::Verified {
                 rate: PairAnchorRate {
                     sell_rate: U256::ONE,
@@ -478,34 +475,132 @@ fn estimated_outcome_deducts_gas_and_shields_only_the_across_surplus() {
             U256::from(25),
             U256::from(25),
             100,
-            2,
+            gas_share_bps,
+            Duration::from_mins(30),
+            gas_price_wei,
             U256::from(100_000),
             OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
         )
-        .unwrap();
+    };
+    let price = |plan: &SwapInputPlan, gas_share_bps| price_at(plan, gas_share_bps, 1).unwrap();
+    for delivery in [
+        SwapDelivery::Reshield,
+        SwapDelivery::External {
+            receiver: Address::repeat_byte(0x77),
+        },
+        across(BridgeSurplus::Reshield),
+        across(BridgeSurplus::KeepInAccount),
+    ] {
+        let plan = plan_for(delivery);
+        let review = price(&plan, GAS_SHARE_BALANCED_BPS);
+        // 1 wei + 25%, rounded up to a whole wei, for swap and hook gas, plus the data cost.
+        let gas_estimate = U256::from((100_000 + plan.hook_gas_estimate()) * 2 + 100_000);
         assert_eq!(
-            review.limit, bound,
-            "the fixed deposit must use the cushioned RPC price"
+            (
+                review.best_case(),
+                review.gas_estimate(),
+                review.gas_allowance()
+            ),
+            (
+                best_case,
+                gas_estimate,
+                gas_estimate.div_ceil(U256::from(4))
+            ),
+            "{delivery:?}"
         );
-        assert_eq!(review.estimated_hook_cost(), expected_hook_cost);
-        assert!(review.estimated_hook_cost() < review.hook_cost());
-        let bought = U256::from(10_000_000) - review.estimated_hook_cost();
-        let gross_surplus = bought - bound.buy_amount;
-        let fee = if surplus == BridgeSurplus::Reshield {
-            gross_surplus * U256::from(25) / U256::from(10_000)
-        } else {
-            U256::ZERO
+        let pre_fee = best_case * U256::from(9_900) / U256::from(10_000) - review.gas_allowance();
+        let shield_fee_bps = match delivery {
+            SwapDelivery::Reshield => U256::from(25),
+            _ => U256::ZERO,
         };
-        assert!(gross_surplus > U256::ZERO);
-        assert_eq!(review.estimated_source_surplus(), Some(gross_surplus - fee));
-        assert_eq!(review.shield_fee_on_output(bought), fee);
-        assert_eq!(review.shield_fee_on_output(bound.buy_amount), U256::ZERO);
-        // The return and deposit together account for the payout after gas and shield fees.
+        let minimum = pre_fee - pre_fee * shield_fee_bps / U256::from(10_000);
+        assert_eq!(review.suggested_private_minimum(), minimum, "{delivery:?}");
+        assert_eq!(review.valid_for(), Duration::from_mins(30));
+
+        if let SwapDelivery::Bridge(BridgeDelivery { surplus, .. }) = delivery {
+            // The Across deposit is the order's buy amount, which is the minimum.
+            assert_eq!(review.limit.buy_amount, minimum);
+            let gross_surplus = best_case - minimum;
+            let fee = if surplus == BridgeSurplus::Reshield {
+                gross_surplus * U256::from(25) / U256::from(10_000)
+            } else {
+                U256::ZERO
+            };
+            assert_eq!(review.estimated_source_surplus(), Some(gross_surplus - fee));
+            assert_eq!(review.shield_fee_on_output(best_case), fee);
+            assert_eq!(review.shield_fee_on_output(minimum), U256::ZERO);
+        } else {
+            assert_eq!(review.estimated_source_surplus(), None);
+        }
+
+        // Another share reprices the same quote and gas inputs, and needs no request: the
+        // result equals a fresh review at that share. A bridge leg quoted for the old amount
+        // is dropped.
+        let mut bridged = review.clone();
+        bridged.bridge = Some(SwapBridgeQuote {
+            provider: BridgeProvider::Across,
+            destination_minimum: minimum,
+            expected_output: minimum,
+            fee: Some(U256::ZERO),
+            leg: BridgeLegPrice::SameAsset,
+            fill_time_sec: None,
+        });
+        for share in [0, GAS_SHARE_TIGHT_BPS, GAS_SHARE_LOOSE_BPS] {
+            let repriced = bridged.with_gas_share(share).unwrap();
+            let fresh = price(&plan, share);
+            assert_eq!(repriced.limit, fresh.limit, "{delivery:?} {share}");
+            assert_eq!(repriced.gas_share_bps(), share);
+            assert!(repriced.bridge().is_none());
+        }
+
+        // Another receiver changes only the plan's delivery: the plan equals a fresh one for
+        // that receiver, and the limit, the validity and the bridge leg stay as quoted.
+        let receiver = Address::repeat_byte(0x78);
+        let moved = bridged.with_receiver(receiver);
+        let delivered = match delivery {
+            SwapDelivery::Reshield => delivery,
+            SwapDelivery::External { .. } => SwapDelivery::External { receiver },
+            SwapDelivery::Bridge(bridge) => {
+                SwapDelivery::Bridge(BridgeDelivery { receiver, ..bridge })
+            }
+        };
+        // Each fresh plan reserves its own operation.
+        let mut expected = plan_for(delivered);
+        expected.executor = moved.plan.executor;
+        assert_eq!(moved.plan, expected, "{delivery:?}");
+        assert_eq!(moved.limit, bridged.limit, "{delivery:?}");
         assert_eq!(
-            review.estimated_source_surplus().unwrap() + bound.buy_amount + fee,
-            bought
+            (moved.gas_share_bps(), moved.valid_for(), moved.bridge()),
+            (
+                bridged.gas_share_bps(),
+                bridged.valid_for(),
+                bridged.bridge()
+            ),
+            "{delivery:?}"
         );
     }
+
+    // Gas of about 60 million buy units exhausts Balanced's minimum but leaves Tight's
+    // positive, so the review falls back to Tight and reports it. When Tight fails too, pricing
+    // fails.
+    let plan = plan_for(SwapDelivery::Reshield);
+    let units = 100_000 + plan.hook_gas_estimate();
+    // A price of 4k wei is cushioned to 5k wei.
+    let gas_price_wei = u128::from(4 * (12_000_000 / units));
+    let fallback = price_at(&plan, GAS_SHARE_BALANCED_BPS, gas_price_wei).unwrap();
+    assert_eq!(fallback.gas_share_bps(), GAS_SHARE_TIGHT_BPS);
+    assert_eq!(
+        fallback.limit,
+        price_at(&plan, GAS_SHARE_TIGHT_BPS, gas_price_wei)
+            .unwrap()
+            .limit
+    );
+    assert!(matches!(
+        price_at(&plan, GAS_SHARE_BALANCED_BPS, gas_price_wei * 10)
+            .unwrap_err()
+            .downcast_ref::<OrderLimitError>(),
+        Some(OrderLimitError::HookCostExceedsOutput { .. })
+    ));
     assert_eq!(
         bridge_review().estimated_source_surplus(),
         None,
@@ -626,6 +721,179 @@ fn a_lower_destination_minimum_needs_a_new_review() {
         Some(SwapReviewChange::DestinationMinimum {
             approved: U256::ZERO,
             current: U256::from(1_001),
+        })
+    );
+}
+
+// A requote after setup that falls short of the approved minimums by at most a fifth of the
+// approved allowed gas is signed at those minimums. A larger shortfall needs a new review. One
+// wei is one buy unit here, so the rollup data cost sets the gas estimate directly.
+#[test]
+fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
+    let price_at = |delivery, buy_amount: U256, data_cost: U256, gas_price_wei: u128| {
+        let quote: CowQuote = serde_json::from_value(serde_json::json!({
+            "quote": {
+                "sellToken": WETH, "buyToken": USDC,
+                "sellAmount": "997500", "buyAmount": buy_amount.to_string(),
+                "validTo": 1, "feeAmount": "2500", "gasAmount": "0", "gasPrice": "0",
+                "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        }))
+        .unwrap();
+        price_swap_review(
+            plan_for(delivery),
+            quote,
+            SwapPrice::Verified {
+                rate: PairAnchorRate {
+                    sell_rate: U256::ONE,
+                    buy_rate: uint!(1_000_000_000_000_000_000_U256),
+                },
+                observations: Vec::new(),
+            },
+            U256::from(25),
+            U256::from(25),
+            100,
+            GAS_SHARE_BALANCED_BPS,
+            Duration::from_mins(30),
+            gas_price_wei,
+            data_cost,
+            OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        )
+        .unwrap()
+    };
+    let price = |delivery, buy_amount, data_cost| price_at(delivery, buy_amount, data_cost, 1);
+    let (bought, data_cost) = (U256::from(10_000_000), U256::from(4_000_000));
+    // Balanced deducts a quarter of the gas estimate, so four more wei allow one more unit.
+    let gas_up = |allowance: U256| data_cost + U256::from(4) * allowance;
+
+    for delivery in [
+        SwapDelivery::Reshield,
+        SwapDelivery::External {
+            receiver: Address::repeat_byte(0x77),
+        },
+    ] {
+        let reviewed = price(delivery, bought, data_cost);
+        let approval = reviewed
+            .approval(reviewed.suggested_private_minimum(), false)
+            .unwrap();
+        let (minimum, allowance) = (approval.bounds.private_minimum, reviewed.gas_allowance());
+        let cushion = allowance / U256::from(5);
+        // At its own minimum the order leaves room for exactly the allowed gas.
+        assert_eq!(reviewed.gas_allowance_for(minimum).unwrap(), allowance);
+
+        // More gas, one unit inside the cushion: the order keeps the approved minimum.
+        let fresh = price(delivery, bought, gas_up(cushion - U256::ONE));
+        assert_eq!(fresh.gas_allowance(), allowance + cushion - U256::ONE);
+        assert!(fresh.suggested_private_minimum() < minimum);
+        assert_eq!(fresh.approval_change(&approval), None, "{delivery:?}");
+        assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
+        // Two units beyond it, which the shield fee's rounding can't cover.
+        let fresh = price(delivery, bought, gas_up(cushion + U256::from(2)));
+        assert_eq!(
+            fresh.approval_change(&approval),
+            Some(SwapReviewChange::GasAllowance {
+                approved: allowance,
+                current: allowance + cushion + U256::from(2),
+            }),
+            "{delivery:?}"
+        );
+
+        // A lower quote at the same gas is taken from the allowed gas the same way.
+        let fresh = price(delivery, bought - cushion / U256::from(2), data_cost);
+        assert!(fresh.suggested_private_minimum() < minimum);
+        assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
+        // The order then leaves room for that much less gas.
+        let shortfall = fresh.buy_amount_for(minimum).unwrap() - fresh.limit.buy_amount;
+        assert_eq!(
+            fresh.gas_allowance_for(minimum).unwrap(),
+            fresh.gas_allowance() - shortfall,
+            "{delivery:?}"
+        );
+        let fresh = price(delivery, bought - cushion * U256::from(2), data_cost);
+        assert_eq!(
+            fresh.approval_change(&approval),
+            Some(SwapReviewChange::Minimum {
+                approved: minimum,
+                current: fresh.suggested_private_minimum(),
+            }),
+            "{delivery:?}"
+        );
+
+        // The shortfall must also fit the fresh allowed gas. With gas far lower, a quote lower
+        // by the gas saved and half the cushion falls short by more than is allowed now.
+        let low_gas = data_cost / U256::from(100);
+        let saved = allowance - price_at(delivery, bought, low_gas, 0).gas_allowance();
+        let fresh = price_at(
+            delivery,
+            bought - saved - cushion / U256::from(2),
+            low_gas,
+            0,
+        );
+        let shortfall = fresh.buy_amount_for(minimum).unwrap() - fresh.limit.buy_amount;
+        assert!(
+            fresh.gas_allowance() < shortfall && shortfall <= cushion,
+            "{delivery:?}"
+        );
+        assert_eq!(
+            fresh.approval_change(&approval),
+            Some(SwapReviewChange::Minimum {
+                approved: minimum,
+                current: fresh.suggested_private_minimum(),
+            }),
+            "{delivery:?}"
+        );
+
+        // A better quote at lower gas keeps the approved minimum, and the order leaves room
+        // for the allowed gas and the gain, here more than the whole gas estimate.
+        let fresh = price_at(delivery, bought * U256::from(2), low_gas, 0);
+        assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
+        let gain = fresh.limit.buy_amount - fresh.buy_amount_for(minimum).unwrap();
+        let room = fresh.gas_allowance_for(minimum).unwrap();
+        assert_eq!(room, fresh.gas_allowance() + gain, "{delivery:?}");
+        assert!(room > fresh.gas_estimate(), "{delivery:?}");
+    }
+
+    // A Bridge order buys its deposit. A bridge quote below the approved destination minimum
+    // raises the deposit until the provider delivers that minimum again.
+    let delivery = SwapDelivery::Bridge(near_delivery());
+    let bridged = |review: &SwapReview, destination_minimum: u64| {
+        let mut review = review.clone();
+        review.bridge = Some(SwapBridgeQuote {
+            provider: BridgeProvider::NearIntents,
+            destination_minimum: U256::from(destination_minimum),
+            expected_output: U256::from(destination_minimum),
+            fee: Some(U256::ZERO),
+            leg: BridgeLegPrice::SameAsset,
+            fill_time_sec: None,
+        });
+        review
+    };
+    let reviewed = bridged(&price(delivery, bought, data_cost), 1_000_000);
+    let deposit = reviewed.suggested_private_minimum();
+    let approval = reviewed.approval(deposit, false).unwrap();
+    let cushion = reviewed.gas_allowance() / U256::from(5);
+
+    // 0.1% less on the destination: the deposit grows by that and the 5 bps margin.
+    let scaled = (deposit * U256::from(1_000_000)).div_ceil(U256::from(999_000));
+    let raised = scaled + (scaled * U256::from(5)).div_ceil(U256::from(10_000));
+    assert!(raised > deposit && raised - deposit <= cushion);
+    let fresh = bridged(&reviewed, 999_000);
+    assert_eq!(fresh.approval_change(&approval), None);
+    assert_eq!(fresh.approved_order_minimum(&approval), Ok(raised));
+    // With more gas as well, the scaled deposit is below the approved one, which is kept.
+    let fresh = bridged(
+        &price(delivery, bought, gas_up(cushion / U256::from(2))),
+        999_000,
+    );
+    assert!(fresh.suggested_private_minimum() < deposit);
+    assert_eq!(fresh.approved_order_minimum(&approval), Ok(deposit));
+    // Half the destination minimum would double the deposit.
+    assert_eq!(
+        bridged(&reviewed, 500_000).approval_change(&approval),
+        Some(SwapReviewChange::DestinationMinimum {
+            approved: U256::from(1_000_000),
+            current: U256::from(500_000),
         })
     );
 }

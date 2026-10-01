@@ -240,6 +240,7 @@ async fn across_fee_quotes_send_only_tokens_chains_and_amount() {
     assert_eq!(
         query_keys(&url),
         [
+            "allowUnmatchedDecimals",
             "amount",
             "destinationChainId",
             "inputToken",
@@ -321,6 +322,8 @@ async fn across_errors_tell_rate_limits_from_outages_and_small_amounts() {
             "",
             BridgeApiError::Unavailable {
                 api: BridgeApi::Across,
+                operation: "fee quote",
+                endpoint: String::new(),
                 status: 503,
             },
         ),
@@ -336,6 +339,21 @@ async fn across_errors_tell_rate_limits_from_outages_and_small_amounts() {
             .suggested_fees(&request)
             .await
             .expect_err("error response");
+        // The mock's host differs per case.
+        let error = match error {
+            BridgeApiError::Unavailable {
+                api,
+                operation,
+                status,
+                ..
+            } => BridgeApiError::Unavailable {
+                api,
+                operation,
+                endpoint: String::new(),
+                status,
+            },
+            other => other,
+        };
         assert_eq!(error, expected, "HTTP {status}");
         assert!(error.to_string().contains("Across"), "{error}");
     }

@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::b256;
+use alloy::primitives::{address, b256};
 use broadcaster_core::contracts::cow::{
     AppData, AppDataHook, ORDER_KIND_SELL, TOKEN_BALANCE_ERC20,
 };
@@ -43,6 +43,10 @@ const QUOTE_RESPONSE: &str = r#"{
   "verified": true,
   "protocolFeeBps": "2"
 }"#;
+
+/// A live mainnet quote of 0.1 WETH for USDC with a nonzero protocol fee, captured on
+/// 2026-09-30. Its `buyAmount` is net of both the network fee and the protocol fee.
+const PROTOCOL_FEE_QUOTE_RESPONSE: &str = r#"{"quote":{"sellToken":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","buyToken":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","receiver":"0x1111111111111111111111111111111111111111","sellAmount":"99474893617383870","buyAmount":"267722966","validTo":1790788483,"appData":"{}","appDataHash":"0xb48d38f93eaa084033fc5970bf96e559c33c4cdc07d889ab00b4d63f9590739d","feeAmount":"525106382616130","gasAmount":"232610","gasPrice":"2257454033","sellTokenPrice":"1","kind":"sell","partiallyFillable":false,"sellTokenBalance":"erc20","buyTokenBalance":"erc20","signingScheme":"eip712"},"from":"0x1111111111111111111111111111111111111111","expiration":"2026-09-30T17:06:48.160625682Z","id":1405054097,"verified":true,"protocolFeeBps":"2"}"#;
 
 const APP_DATA_TOO_LARGE_RESPONSE: &str = r#"{"errorType":"InvalidAppData","description":"app data has byte size 90112 which is larger than limit 81920"}"#;
 
@@ -274,6 +278,50 @@ async fn quote_request_carries_no_hooks_or_signed_payloads() {
     assert!(!serialized.contains("callData"));
 }
 
+#[test]
+fn live_quote_parses_its_protocol_fee_and_gas() {
+    let quote: CowQuote = serde_json::from_str(PROTOCOL_FEE_QUOTE_RESPONSE).unwrap();
+    assert_eq!(quote.protocol_fee_bps.as_deref(), Some("2"));
+    assert_eq!(quote.quote.gas_amount, "232610");
+    assert_eq!(quote.quote.fee_amount, U256::from(525_106_382_616_130_u64));
+}
+
+/// `CoW`'s protocol fee is reconstructed from the net `buyAmount`, while the best case adds back
+/// only the network fee.
+#[test]
+fn protocol_fee_is_shown_only_when_the_quote_states_it() {
+    let quote: CowQuote = serde_json::from_str(PROTOCOL_FEE_QUOTE_RESPONSE).unwrap();
+    // 267,722,966 * 2 / 9,998.
+    assert_eq!(quote_protocol_fee(&quote), Some(U256::from(53_555)));
+    let limit = price_order_limit(&OrderLimitParams {
+        quote: &quote.quote,
+        quote_gas_units: quote_gas_units(&quote.quote).unwrap(),
+        hook_gas: 0,
+        gas_price_wei: 0,
+        hook_data_cost_wei: U256::ZERO,
+        native_rate: NativeBuyRate::Anchor(U256::ONE),
+        price_tolerance_bps: 0,
+        gas_share_bps: 0,
+        shield_fee_bps: U256::ZERO,
+    })
+    .unwrap();
+    // A network fee of 1,413,251 at the quoted rate.
+    assert_eq!(limit.best_case, U256::from(269_136_217));
+
+    // The USDC to USDT quote from the same capture stated a fractional fee:
+    // 8,539,024 * 0.3 / 9,999.7.
+    let mut fractional = quote.clone();
+    fractional.quote.buy_amount = U256::from(8_539_024);
+    fractional.protocol_fee_bps = Some("0.3".to_owned());
+    assert_eq!(quote_protocol_fee(&fractional), Some(U256::from(256)));
+
+    let omitted = CowQuote {
+        protocol_fee_bps: None,
+        ..quote
+    };
+    assert_eq!(quote_protocol_fee(&omitted), None);
+}
+
 #[tokio::test]
 async fn order_submission_sends_full_app_data_and_returns_uid() {
     let uid = format!("\"0x{}\"", "ab".repeat(56));
@@ -394,7 +442,7 @@ fn filled_order_response(uid: &str) -> String {
 }
 
 #[tokio::test]
-async fn order_hints_read_the_status_and_trade_block_from_the_uid_alone() {
+async fn order_hints_read_the_status_trade_block_and_fee_from_the_uid_alone() {
     let uid = OrderUid(FixedBytes::repeat_byte(0xba));
     let uid_hex = uid.0.to_string();
 
@@ -417,14 +465,24 @@ async fn order_hints_read_the_status_and_trade_block_from_the_uid_alone() {
         test_client(base_url).order_trade_block(&uid).await,
         Ok(Some(26_063_930))
     );
+    let (base_url, recorded_fee) =
+        spawn_orderbook_mock(200, &filled_order_response(&uid_hex)).await;
+    assert_eq!(
+        test_client(base_url).order_executed_fee(&uid).await,
+        Ok(Some(CowExecutedFee {
+            amount: U256::from(464_572),
+            token: address!("dac17f958d2ee523a2206206994597c13d831ec7"),
+        }))
+    );
 
-    // Both reads are plain GETs identified by the order UID only.
+    // Every read is a plain GET identified by the order UID only.
     for (recorded, path) in [
         (recorded, format!("/mainnet/api/v1/orders/{uid_hex}")),
         (
             recorded_trades,
             format!("/mainnet/api/v1/trades?orderUid={uid_hex}"),
         ),
+        (recorded_fee, format!("/mainnet/api/v1/orders/{uid_hex}")),
     ] {
         let recorded = recorded.lock().expect("recorded requests");
         let [request] = recorded.as_slice() else {

@@ -1,7 +1,7 @@
 use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
 use super::*;
-use crate::cow::{CowOrderbookClient, CowQuote};
-use crate::settings::BridgeReceiverRejection;
+use crate::cow::{CowOrderbookClient, CowQuote, GAS_SHARE_BALANCED_BPS};
+use crate::settings::{BridgeReceiverRejection, SwapReceiverRejection};
 use crate::{
     OperationHttpClient, OperationNetworkIsolation, SwapAmountPlan, SwapAmountRequest,
     SwapOrderOutcome, SwapPrice, SwapReviewChange, SwapReviewRequest, SwapSetupStatus,
@@ -243,6 +243,14 @@ fn change_output_poi(commitment: B256) -> local_db::PendingOutputPoiContextRecor
     }
 }
 
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 pub(super) fn submitted_order(body: &Value) -> Order {
     let field = |name: &str| body[name].as_str().unwrap().to_owned();
     Order {
@@ -381,6 +389,8 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
         owner.review_swap(SwapReviewRequest {
             plan: plan.clone(),
             slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(10),
             orderbook: &orderbook,
             anchor_cache: Some(&cache),
             token_registry: &tokens,
@@ -397,7 +407,7 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
     // 1 gwei from RPC with the swap's 25% cushion, at 3,000 USDC/ETH.
     // Applying the broadcaster buffer as well would inflate this allowance.
     assert_eq!(
-        review.hook_cost(),
+        review.gas_estimate(),
         (U256::from(plan.hook_gas_estimate()) * U256::from(15)).div_ceil(U256::from(4))
     );
     // Configured oracles with no cached rates still produce a quote. The user must
@@ -406,6 +416,8 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
         .review_swap(SwapReviewRequest {
             plan: plan.clone(),
             slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(10),
             orderbook: &orderbook,
             anchor_cache: Some(&crate::TokenAnchorRateCache::new()),
             token_registry: &tokens,
@@ -423,6 +435,8 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
         .review_swap(SwapReviewRequest {
             plan: plan.clone(),
             slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(10),
             orderbook: &orderbook,
             anchor_cache: None,
             token_registry: &tokens,
@@ -451,6 +465,8 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
         .review_swap(SwapReviewRequest {
             plan,
             slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(10),
             orderbook: &orderbook,
             anchor_cache: Some(&cache),
             token_registry: &tokens,
@@ -681,10 +697,14 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     let anchors = crate::TokenAnchorRateCache::new();
     anchors.store_rate(1, WETH, U256::from(997_500));
     anchors.store_rate(1, USDC, U256::from(3_000_000_000_u64));
+    // The user chose a 30-minute validity for this Private delivery swap.
+    let quoted_from = unix_now();
     let review = owner
         .review_swap(SwapReviewRequest {
             plan,
             slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(30),
             orderbook: &CowOrderbookClient::new(
                 OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
                 quote_url,
@@ -697,8 +717,12 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         })
         .await
         .unwrap();
+    let quoted_until = unix_now();
     quote_task.abort();
     assert!(matches!(review.price(), SwapPrice::Verified { .. }));
+    assert_eq!(review.valid_for(), Duration::from_mins(30));
+    let quote_valid_to = quotes.lock().unwrap()[0]["validTo"].as_u64().unwrap();
+    assert!((quoted_from + 1_800..=quoted_until + 1_800).contains(&quote_valid_to));
     // Railgun keeps 0.25% of the 1,000,000 the pre-hook unshields. The quote prices what the
     // executor then holds, and the order sells it.
     let sell_amount = U256::from(997_500);
@@ -823,6 +847,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         preparing.shutdown().await;
         store.reconcile(operation, observed, &[setup_won]).unwrap();
     }
+    let signed_from = unix_now();
     assert!(
         first()
             .await
@@ -830,6 +855,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             .downcast_ref::<crate::cow::CowApiError>()
             .is_some()
     );
+    let signed_until = unix_now();
     // Reload through a new store handle. The signature survives interruption, and no
     // signing authorization or proof is needed to resend the exact original request.
     let restored_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
@@ -957,6 +983,9 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     );
     assert_eq!((order.receiver, uid.owner()), (executor, executor));
     assert_eq!(order.buyAmount, buy_amount);
+    // The 30-minute approval expires 30 minutes after signing, and the record keeps it.
+    assert!((signed_from + 1_800..=signed_until + 1_800).contains(&u64::from(order.validTo)));
+    assert_eq!(saved.bounds().valid_for_secs, Some(1_800));
     let signature = body["signature"]
         .as_str()
         .unwrap()
@@ -1142,6 +1171,8 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         U256::from(25),
         U256::from(25),
         50,
+        GAS_SHARE_BALANCED_BPS,
+        Duration::from_mins(10),
         1,
         U256::ZERO,
         isolation,
@@ -1287,7 +1318,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
     }))
     .unwrap();
     let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
-    let price = |shield_fee: u64, unshield_fee: u64| {
+    let price_at = |shield_fee: u64, unshield_fee: u64, gas_price_wei: u128| {
         crate::price_swap_review(
             plan.clone(),
             quote.clone(),
@@ -1295,24 +1326,44 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             U256::from(shield_fee),
             U256::from(unshield_fee),
             50,
-            1_000_000_000,
+            GAS_SHARE_BALANCED_BPS,
+            Duration::from_mins(10),
+            gas_price_wei,
             U256::ZERO,
             isolation,
         )
         .unwrap()
     };
+    let price = |shield_fee, unshield_fee| price_at(shield_fee, unshield_fee, 1_000_000_000);
     let review = price(25, 25);
     // At 1 gwei plus 25% and this quote's rate of at least 3,000 USDC/ETH, price the
     // estimated hook gas. The declared limits' margin only caps execution and isn't priced.
     let estimated_gas = plan.hook_gas_estimate();
     let declared_gas = plan.pre_hook_gas_limit() + plan.post_hook_gas_limit().unwrap();
     assert!(estimated_gas < declared_gas);
-    assert!(review.hook_cost() * U256::from(4) >= U256::from(estimated_gas) * U256::from(15));
-    assert!(review.hook_cost() * U256::from(4) < U256::from(declared_gas) * U256::from(15));
+    assert!(review.gas_estimate() * U256::from(4) >= U256::from(estimated_gas) * U256::from(15));
+    assert!(review.gas_estimate() * U256::from(4) < U256::from(declared_gas) * U256::from(15));
     let private_minimum = review.suggested_private_minimum();
     // An unverified price is approved only with the user's acknowledgement.
     assert!(review.approval(private_minimum, false).is_err());
     let approval = review.approval(private_minimum, true).unwrap();
+    // The approval binds the gas share it was priced at, and the uncushioned gas price.
+    assert_eq!(
+        (
+            approval.bounds.gas_share_bps,
+            approval.bounds.gas_estimate,
+            approval.bounds.gas_allowance,
+            approval.bounds.gas_price_wei,
+            approval.bounds.valid_for_secs,
+        ),
+        (
+            Some(GAS_SHARE_BALANCED_BPS),
+            Some(review.gas_estimate()),
+            Some(review.gas_allowance()),
+            Some(1_000_000_000),
+            Some(600),
+        )
+    );
     // After setup the entered amount is planned again; the order sells it less the fee.
     assert_eq!(
         (approval.bounds.spend_amount(), approval.bounds.sell_amount),
@@ -1330,23 +1381,49 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
         .unwrap();
     assert_eq!(record.swap_approval(), Some(&approval));
 
-    // After setup the fresh review keeps the approval unless the fee or the minimum moved.
+    // After setup the fresh review keeps the approval unless a fee or the validity moved, or
+    // the minimum or the allowed gas moved beyond a fifth of the approved allowed gas.
     assert_eq!(review.approval_change(&approval), None);
-    let mut cheaper = approval.clone();
-    cheaper.bounds.hook_cost = Some(review.hook_cost().saturating_sub(U256::ONE));
-    assert_eq!(
-        review.approval_change(&cheaper),
-        Some(SwapReviewChange::HookCost)
-    );
+    // A setup approval saved before gas shares needs a full review.
     let mut older = approval.clone();
-    older.bounds.hook_cost = None;
+    older.bounds.gas_share_bps = None;
+    older.bounds.gas_estimate = None;
+    older.bounds.gas_allowance = None;
+    older.bounds.gas_price_wei = None;
+    older.bounds.valid_for_secs = None;
     assert_eq!(
         review.approval_change(&older),
-        Some(SwapReviewChange::HookCost)
+        Some(SwapReviewChange::GasShare)
     );
-    let mut higher_cost_limit = approval.clone();
-    higher_cost_limit.bounds.hook_cost = Some(review.hook_cost() + U256::ONE);
-    assert_eq!(review.approval_change(&higher_cost_limit), None);
+    // Gas 10% higher is signed at the approved minimum; 30% higher needs a new review.
+    let pricier = price_at(25, 25, 1_100_000_000);
+    assert!(pricier.suggested_private_minimum() < private_minimum);
+    assert_eq!(
+        pricier.approved_order_minimum(&approval),
+        Ok(private_minimum)
+    );
+    let pricier = price_at(25, 25, 1_300_000_000);
+    assert_eq!(
+        pricier.approval_change(&approval),
+        Some(SwapReviewChange::GasAllowance {
+            approved: review.gas_allowance(),
+            current: pricier.gas_allowance(),
+        })
+    );
+    let mut longer = approval.clone();
+    longer.bounds.valid_for_secs = Some(1_800);
+    assert_eq!(
+        review.approval_change(&longer),
+        Some(SwapReviewChange::Validity {
+            approved: 1_800,
+            current: 600,
+        })
+    );
+    // A lower gas estimate only raises the minimum, so the approval still holds.
+    let cheaper = price_at(25, 25, 500_000_000);
+    assert!(cheaper.gas_estimate() < review.gas_estimate());
+    assert!(cheaper.suggested_private_minimum() > private_minimum);
+    assert_eq!(cheaper.approval_change(&approval), None);
 
     assert_eq!(
         price(30, 25).approval_change(&approval),
@@ -1362,12 +1439,13 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             current: U256::from(30),
         })
     );
+    // An approved minimum that the quote misses by the whole allowed gas.
     let mut higher = approval.clone();
-    higher.bounds.private_minimum = private_minimum + U256::ONE;
+    higher.bounds.private_minimum = private_minimum + review.gas_allowance();
     assert_eq!(
         review.approval_change(&higher),
         Some(SwapReviewChange::Minimum {
-            approved: private_minimum + U256::ONE,
+            approved: private_minimum + review.gas_allowance(),
             current: private_minimum,
         })
     );
@@ -1574,7 +1652,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     }))
     .unwrap();
     let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
-    let review = |buy_token, delivery| {
+    let review_at = |buy_token, delivery, gas_price_wei: u128| {
         let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
             &builder,
             &swap_profile,
@@ -1600,7 +1678,9 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             U256::from(25),
             U256::from(25),
             50,
-            1,
+            GAS_SHARE_BALANCED_BPS,
+            Duration::from_mins(10),
+            gas_price_wei,
             U256::ZERO,
             isolation,
         )
@@ -1618,9 +1698,9 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         }
         review
     };
+    let review = |buy_token, delivery| review_at(buy_token, delivery, 1);
     let first = review(Address::ZERO, approved);
     let changed = review(Address::ZERO, moved);
-    let private_minimum = changed.suggested_private_minimum();
 
     // The receiver's address is part of the approved terms; its label is not, so the same
     // address keeps the approval.
@@ -1676,10 +1756,13 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             issue!($review, None)
         };
         ($review:expr, $bridge:expr) => {
+            issue!($review, $bridge, $review.suggested_private_minimum())
+        };
+        ($review:expr, $bridge:expr, $private_minimum:expr) => {
             owner
                 .issue_swap_order(crate::SwapOrderSigning {
                     review: $review,
-                    private_minimum: $review.suggested_private_minimum(),
+                    private_minimum: $private_minimum,
                     price_acknowledged: true,
                     transactions: vec![transaction.clone()],
                     inputs: std::slice::from_ref(&input),
@@ -1833,6 +1916,28 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             Some(&rejection)
         );
     }
+    // A quote carries the zero address until a receiver is entered. An External order to it is
+    // refused as well.
+    let unaddressed = review(
+        Address::ZERO,
+        SwapDelivery::External {
+            receiver: Address::ZERO,
+        },
+    );
+    owner
+        .record_swap_approval(
+            operation,
+            unaddressed
+                .approval(unaddressed.suggested_private_minimum(), true)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        issue!(&unaddressed)
+            .unwrap_err()
+            .downcast_ref::<SwapReceiverRejection>(),
+        Some(&SwapReceiverRejection::ZeroAddress)
+    );
     owner
         .record_swap_approval(operation, bridge_approval)
         .unwrap();
@@ -1841,13 +1946,25 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     assert_eq!(record().issued().len(), 1);
     assert!(submissions.lock().unwrap().is_empty());
 
-    // Once the user approves the new receiver, the same order is signed and persisted. Its
-    // submission response is lost, and the resubmission rebuilds the identical order.
-    owner
-        .record_swap_approval(operation, changed.approval(private_minimum, true).unwrap())
+    // The user approves the new receiver at a gas estimate of an eighth of the quote. The
+    // requote after setup finds gas 10% higher, within a fifth of the approved allowed gas, so
+    // the order is signed at the approved minimum and persisted. Its submission response is
+    // lost, and the resubmission rebuilds the identical order.
+    let gas_price_wei = 100_000_000_000_000_000 / u128::from(changed.plan().hook_gas_estimate());
+    let reviewed = review_at(Address::ZERO, moved, gas_price_wei);
+    let approval = reviewed
+        .approval(reviewed.suggested_private_minimum(), true)
         .unwrap();
+    let private_minimum = approval.bounds.private_minimum;
+    let requote = review_at(Address::ZERO, moved, gas_price_wei + gas_price_wei / 10);
+    assert!(requote.suggested_private_minimum() < private_minimum);
+    assert_eq!(
+        requote.approved_order_minimum(&approval),
+        Ok(private_minimum)
+    );
+    owner.record_swap_approval(operation, approval).unwrap();
     assert!(
-        issue!(&changed)
+        issue!(&requote, None, private_minimum)
             .unwrap_err()
             .downcast_ref::<crate::cow::CowApiError>()
             .is_some()
@@ -1856,6 +1973,15 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     let saved = signed.swap().unwrap().orders()[0].clone();
     assert_eq!(saved.delivery(), moved);
     assert!(saved.post_hook().is_none());
+    // The attempt records the gas its minimum leaves room for, less than the requote's own
+    // allowed gas. The setup approval keeps the gas it was approved with.
+    let room = requote.gas_allowance_for(private_minimum).unwrap();
+    assert!(room < requote.gas_allowance());
+    assert_eq!(saved.bounds().gas_allowance, Some(room));
+    assert_eq!(
+        signed.swap_approval().unwrap().bounds.gas_allowance,
+        Some(reviewed.gas_allowance())
+    );
     let [_, pre_hook] = signed.issued() else {
         panic!("an External order issues only its pre-hook");
     };
@@ -2048,36 +2174,7 @@ impl BridgeOrderFixture {
         .unwrap() else {
             panic!("one note fits one order");
         };
-        let quote: CowQuote = serde_json::from_value(json!({
-            "quote": {
-                "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
-                "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
-                "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
-                "kind": "sell", "partiallyFillable": false
-            },
-            "expiration": "", "id": 7, "verified": true
-        }))
-        .unwrap();
-        let mut review = crate::price_swap_review(
-            plan,
-            quote,
-            SwapPrice::Unverified,
-            U256::from(25),
-            U256::from(25),
-            50,
-            1,
-            U256::ZERO,
-            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
-        )
-        .unwrap();
-        review.set_bridge_for_tests(crate::SwapBridgeQuote {
-            provider: delivery.provider,
-            destination_minimum: U256::from(1_000),
-            expected_output: U256::from(1_010),
-            fee: Some(U256::ZERO),
-            leg: crate::BridgeLegPrice::SameAsset,
-            fill_time_sec: None,
-        });
+        let review = Self::review_at(plan, swap_profile, delivery.provider, 1, 1_000);
         let transaction = Transaction {
             proof: SnarkProof::default(),
             merkleRoot: B256::ZERO,
@@ -2095,6 +2192,51 @@ impl BridgeOrderFixture {
         }
     }
 
+    /// `plan`'s review at `gas_price_wei`, with a bridge quote whose destination minimum is
+    /// `destination_minimum`.
+    fn review_at(
+        plan: crate::SwapInputPlan,
+        swap_profile: &crate::settings::SwapProfile,
+        provider: BridgeProvider,
+        gas_price_wei: u128,
+        destination_minimum: u64,
+    ) -> crate::SwapReview {
+        let quote: CowQuote = serde_json::from_value(json!({
+            "quote": {
+                "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
+                "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
+                "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
+                "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        }))
+        .unwrap();
+        let mut review = crate::price_swap_review(
+            plan,
+            quote,
+            SwapPrice::Unverified,
+            U256::from(25),
+            U256::from(25),
+            50,
+            GAS_SHARE_BALANCED_BPS,
+            // As a reviewed Bridge order, whatever validity was requested.
+            swap_profile.valid_to_window(),
+            gas_price_wei,
+            U256::ZERO,
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        )
+        .unwrap();
+        review.set_bridge_for_tests(crate::SwapBridgeQuote {
+            provider,
+            destination_minimum: U256::from(destination_minimum),
+            expected_output: U256::from(destination_minimum + 10),
+            fee: Some(U256::ZERO),
+            leg: crate::BridgeLegPrice::SameAsset,
+            fill_time_sec: None,
+        });
+        review
+    }
+
     /// Sign the reviewed order over `route` for the approved minimums.
     async fn issue(
         &self,
@@ -2102,10 +2244,29 @@ impl BridgeOrderFixture {
         orderbook: &CowOrderbookClient,
         route: crate::SwapBridgeRoute<'_>,
     ) -> eyre::Result<SwapOrderOutcome> {
+        self.issue_with(
+            owner,
+            orderbook,
+            route,
+            &self.review,
+            self.review.suggested_private_minimum(),
+        )
+        .await
+    }
+
+    /// Sign `review` over `route` for `private_minimum` and the approved destination minimum.
+    async fn issue_with(
+        &self,
+        owner: &ExecutorOwner,
+        orderbook: &CowOrderbookClient,
+        route: crate::SwapBridgeRoute<'_>,
+        review: &crate::SwapReview,
+        private_minimum: U256,
+    ) -> eyre::Result<SwapOrderOutcome> {
         owner
             .issue_swap_order(crate::SwapOrderSigning {
-                review: &self.review,
-                private_minimum: self.review.suggested_private_minimum(),
+                review,
+                private_minimum,
                 price_acknowledged: true,
                 transactions: vec![self.transaction.clone()],
                 inputs: std::slice::from_ref(&self.input),
@@ -2178,7 +2339,6 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     let fixture =
         BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
     let executor = fixture.executor;
-    let buy_amount = fixture.review.suggested_private_minimum();
 
     // The quote's output and fill deadline, in seconds after the request.
     let quoted = Arc::new(Mutex::new((U256::from(999), 3 * 60 * 60)));
@@ -2243,6 +2403,83 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
         destination_chain: chains.get(137).unwrap(),
     };
 
+    // A Bridge review keeps the profile's validity even when another is requested, since its
+    // bridge leg is quoted for that window.
+    let (quote_url, quotes, quote_task) = spawn_quote_stub(
+        json!({
+            "quote": {
+                "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
+                "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
+                "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
+                "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        }),
+        None,
+    )
+    .await;
+    let window = swap_profile.valid_to_window().as_secs();
+    let quoted_from = unix_now();
+    let reviewed = owner
+        .review_swap(SwapReviewRequest {
+            plan: fixture.review.plan().clone(),
+            slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(30),
+            orderbook: &CowOrderbookClient::new(
+                OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+                quote_url,
+                1,
+            )
+            .unwrap(),
+            anchor_cache: None,
+            token_registry: &crate::settings::EffectiveTokenRegistry {
+                tokens: std::collections::BTreeMap::new(),
+            },
+            bridge: Some(route),
+        })
+        .await
+        .unwrap();
+    let quoted_until = unix_now();
+    quote_task.abort();
+    assert_eq!(reviewed.valid_for(), swap_profile.valid_to_window());
+    let quote_valid_to = quotes.lock().unwrap()[0]["validTo"].as_u64().unwrap();
+    assert!((quoted_from + window..=quoted_until + window).contains(&quote_valid_to));
+
+    // Another gas share prices the held quote again and asks only Across, for the new buy
+    // amount. The orderbook stub is gone, so a `CoW` request would fail.
+    *quoted.lock().unwrap() = (U256::from(1_234), 3 * 60 * 60);
+    let requoted = owner
+        .requote_swap_bridge(
+            &reviewed,
+            crate::cow::GAS_SHARE_TIGHT_BPS,
+            route,
+            None,
+            &crate::settings::EffectiveTokenRegistry {
+                tokens: std::collections::BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    *quoted.lock().unwrap() = (U256::from(999), 3 * 60 * 60);
+    let requoted_amount = requoted.suggested_private_minimum();
+    assert_ne!(requoted_amount, reviewed.suggested_private_minimum());
+    let (path, _) = across_requests.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        path.contains(&format!("amount={requoted_amount}")),
+        "{path}"
+    );
+    assert_eq!(requoted.gas_share_bps(), crate::cow::GAS_SHARE_TIGHT_BPS);
+    assert_eq!(
+        requoted.bridge().unwrap().destination_minimum,
+        U256::from(1_234)
+    );
+    assert_eq!(
+        (requoted.quote(), requoted.valid_for()),
+        (reviewed.quote(), reviewed.valid_for())
+    );
+    assert_eq!(quotes.lock().unwrap().len(), 1);
+
     assert_eq!(
         fixture.issue(&owner, &orderbook, route).await.unwrap(),
         SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
@@ -2260,17 +2497,44 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     );
     fixture.assert_unsigned(&store, &submissions);
 
+    // The approval allows gas of about 3% of the quote. The requote after setup finds gas 1%
+    // higher and an Across output of 999 for its own deposit. Raising the deposit to deliver
+    // 1,000 again costs less than a fifth of the approved allowed gas, so no review is needed.
+    let plan = fixture.review.plan().clone();
+    let gas_price_wei = 100_000_000_000_000_000 / u128::from(plan.hook_gas_estimate());
+    let reviewed = BridgeOrderFixture::review_at(
+        plan.clone(),
+        &swap_profile,
+        delivery.provider,
+        gas_price_wei,
+        1_000,
+    );
+    let approval = reviewed
+        .approval(reviewed.suggested_private_minimum(), true)
+        .unwrap();
+    let requote = BridgeOrderFixture::review_at(
+        plan,
+        &swap_profile,
+        delivery.provider,
+        gas_price_wei + gas_price_wei / 100,
+        999,
+    );
+    let buy_amount = requote.approved_order_minimum(&approval).unwrap();
+    assert!(buy_amount > approval.bounds.private_minimum);
+
     // The order is persisted with the quote's terms and sent. Its response is lost, and the
     // resubmission rebuilds the identical order.
     *quoted.lock().unwrap() = (U256::from(1_005), 3 * 60 * 60);
+    let signed_from = unix_now();
     assert!(
         fixture
-            .issue(&owner, &orderbook, route)
+            .issue_with(&owner, &orderbook, route, &requote, buy_amount)
             .await
             .unwrap_err()
             .downcast_ref::<crate::cow::CowApiError>()
             .is_some()
     );
+    let signed_until = unix_now();
     let (path, _) = across_requests.lock().unwrap().last().cloned().unwrap();
     assert!(path.contains(&format!("amount={buy_amount}")), "{path}");
     let saved = fixture.record(&store).swap().unwrap().orders()[0].clone();
@@ -2307,6 +2571,11 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     assert!(*persisted, "the terms are durable before the order request");
     assert_eq!(body, resent);
     assert_eq!(submitted_order(body).receiver, executor);
+    // The Bridge order is valid for the profile's window after signing.
+    assert!(
+        (signed_from + window..=signed_until + window)
+            .contains(&u64::from(submitted_order(body).validTo))
+    );
 
     // The post-hook guards, approves and deposits the buy amount, then shields the surplus.
     let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
@@ -2338,6 +2607,7 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
         ),
         (WETH, POLYGON_WETH, U256::from(137))
     );
+    // The raised deposit still pays exactly the approved destination minimum.
     assert_eq!(
         (deposit.inputAmount, deposit.outputAmount),
         (buy_amount, U256::from(1_000))

@@ -111,10 +111,14 @@ impl SwapStage {
         )
     }
 
-    /// Ended swaps stay in My orders only. Dismissal hides stalled swaps; ongoing swaps remain
-    /// visible even if their account is hidden.
-    pub(in crate::root) const fn is_shown_on_private_tab(self, dismissed: bool) -> bool {
-        !self.has_ended() && (!dismissed || !self.is_dismissible())
+    /// Ended swaps stay in My orders only. Expired orders may be hidden while their outcome
+    /// is unresolved; dismissal never changes their observations or reservations.
+    pub(in crate::root) const fn is_shown_on_private_tab(
+        self,
+        dismissed: bool,
+        past_valid_to: bool,
+    ) -> bool {
+        !self.has_ended() && (!dismissed || !swap_actions(self, past_valid_to).dismiss)
     }
 }
 
@@ -475,6 +479,10 @@ pub(in crate::root) struct SwapLabels {
     pub(in crate::root) receiver: Option<String>,
     /// "0.3787 ETH", the least the receiver gets while the order can fill.
     pub(in crate::root) minimum: Option<String>,
+    /// "$4.42", the latest order's gas estimate beyond the gas it allowed, which no solver
+    /// covered if it expired unfilled. `None` without a recorded gas share or when the share
+    /// covered all of it.
+    pub(in crate::root) uncovered_gas: Option<String>,
     /// A Bridge swap's destination. `None` for delivery on the swap's own network.
     pub(in crate::root) bridge: Option<SwapBridgeLabels>,
 }
@@ -805,7 +813,7 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     let expiry = || {
         labels.expires.as_ref().map_or_else(String::new, |at| {
             if labels.lapsed {
-                format!("Expired at {at} · check status")
+                format!("Expired at {at} · awaiting confirmation")
             } else {
                 format!("Expires {at}")
             }
@@ -976,18 +984,29 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
         SwapStage::Order(
             SwapOrderState::Bridging | SwapOrderState::Refunding | SwapOrderState::NeedsAttention,
         ) => vec![setup(Done, ""), open(Done, String::new())],
+        // An unfilled expiry is a normal result of a tight minimum, so it's a warning with
+        // its likely reason, not an error.
         SwapStage::Order(SwapOrderState::AttemptEnded(cause)) => vec![
             setup(Done, ""),
             step(
                 match cause {
-                    SwapPreHookDeathCause::Expired => "Order expired",
+                    SwapPreHookDeathCause::Expired => "Not filled",
                     SwapPreHookDeathCause::Cancellation => "Order cancelled",
                     SwapPreHookDeathCause::Recovery
                     | SwapPreHookDeathCause::OlderPostHook
                     | SwapPreHookDeathCause::Unknown => "Order ended",
                 },
                 if cause == SwapPreHookDeathCause::Expired {
-                    "No solver filled it at your price. Nothing was unshielded.".into()
+                    let at = labels
+                        .expires
+                        .as_ref()
+                        .map_or_else(String::new, |at| format!(" at {at}"));
+                    match &labels.uncovered_gas {
+                        Some(rest) => format!(
+                            "No solver covered {rest} of the gas before the order expired{at}."
+                        ),
+                        None => format!("No solver filled it before the order expired{at}."),
+                    }
                 } else {
                     "Nothing was unshielded.".into()
                 },
@@ -1191,7 +1210,7 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
 
 /// A traded order's outcome, from its approved bounds and canonical observations. Amounts are
 /// base units of the sell token for `spent`, `unshield_fee` and `limit_sell`, and of the buy
-/// token otherwise.
+/// token otherwise, except `gas`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::root) struct SwapOutcome {
     /// The private spend, and Railgun's unshield fee taken from it.
@@ -1203,42 +1222,89 @@ pub(in crate::root) struct SwapOutcome {
     /// Executed amounts from the settlement's Trade event. `None` in records from before they
     /// were kept.
     pub(in crate::root) trade: Option<SwapTradeAmounts>,
-    /// The executed buy above the minimum, and its share of the executed buy in basis points,
-    /// as `CoW` reports surplus.
-    pub(in crate::root) surplus: Option<(U256, u64)>,
+    /// The approved least the receiver gets: after the shield fee for Private delivery.
+    pub(in crate::root) private_minimum: U256,
+    /// What was delivered: the private credit for Private delivery, or the trade's buy amount
+    /// for a Public address. `None` until it's recorded, and for Bridge delivery.
+    pub(in crate::root) received: Option<U256>,
+    /// `received` above `private_minimum`. `None` when it isn't above, or isn't recorded.
+    pub(in crate::root) above_minimum: Option<U256>,
     /// The amount the post-hook's shield credited privately, and the shield fee its event
     /// charged. The fee is `None` when it wasn't recorded.
     pub(in crate::root) received_privately: Option<(U256, Option<U256>)>,
+    /// The fee the orderbook charged the order, beside the settlement's gas cost. `None`
+    /// unless all of its figures are recorded.
+    pub(in crate::root) gas: Option<SwapOutcomeGas>,
     pub(in crate::root) settlement: Option<B256>,
 }
 
-/// The outcome of an order once its trade is observed.
+/// The fee a filled order was charged, and the settlement transaction's own gas cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::root) struct SwapOutcomeGas {
+    /// The orderbook's executed fee, in `fee_token` base units: everything the order was
+    /// charged, network and protocol fees together.
+    pub(in crate::root) fee: U256,
+    pub(in crate::root) fee_token: Address,
+    /// The settlement's gas used times its effective gas price, in wei of the native token.
+    /// The settlement batches every trade it settles, so this is its whole cost.
+    pub(in crate::root) settlement_cost: U256,
+}
+
+/// The outcome of an order delivered as `delivery` once its trade is observed.
 pub(in crate::root) fn swap_outcome(
     bounds: &SwapApprovedBounds,
     observed: &SwapOrderObservations,
+    delivery: SwapDelivery,
 ) -> Option<SwapOutcome> {
     let traded = observed.traded?;
-    let basis = U256::from(10_000u32);
     let trade = observed.trade_amounts;
+    let received_privately = observed
+        .settlement_credit
+        .or(observed.shielded)
+        .map(|shield| (shield.private_amount, shield.fee));
+    let received = match delivery {
+        SwapDelivery::Reshield => received_privately.map(|(amount, _)| amount),
+        // The trade paid the receiver directly.
+        SwapDelivery::External { .. } => trade.map(|trade| trade.buy_amount),
+        SwapDelivery::Bridge(_) => None,
+    };
+    let gas = trade.and_then(|trade| {
+        Some(SwapOutcomeGas {
+            fee: trade.executed_fee?,
+            fee_token: trade.executed_fee_token?,
+            settlement_cost: U256::from(trade.settlement_gas_used?)
+                .saturating_mul(U256::from(trade.settlement_effective_gas_price?)),
+        })
+    });
     Some(SwapOutcome {
         spent: bounds.spend_amount(),
         unshield_fee: bounds.spend_amount().saturating_sub(bounds.sell_amount),
         limit_sell: bounds.sell_amount,
         minimum: bounds.buy_amount,
         trade,
-        surplus: trade
-            .filter(|trade| trade.buy_amount > bounds.buy_amount)
-            .map(|trade| {
-                let surplus = trade.buy_amount - bounds.buy_amount;
-                let share = surplus.saturating_mul(basis) / trade.buy_amount;
-                (surplus, u64::try_from(share).unwrap_or(u64::MAX))
-            }),
-        received_privately: observed
-            .settlement_credit
-            .or(observed.shielded)
-            .map(|shield| (shield.private_amount, shield.fee)),
+        private_minimum: bounds.private_minimum,
+        received,
+        above_minimum: received
+            .filter(|received| *received > bounds.private_minimum)
+            .map(|received| received - bounds.private_minimum),
+        received_privately,
+        gas,
         settlement: traded.transaction_hash,
     })
+}
+
+/// Whether `order` traded on this network with the settlement's gas cost recorded but not the
+/// fee the orderbook charged, the one figure the outcome's fee row still lacks. Trades recorded
+/// before the gas cost was kept can't show the row, so their fee isn't asked for.
+pub(in crate::root) fn needs_executed_fee(order: &SwapOrderRecord) -> bool {
+    let observed = order.observations();
+    !matches!(order.delivery(), SwapDelivery::Bridge(_))
+        && observed.traded.is_some()
+        && observed.trade_amounts.is_some_and(|amounts| {
+            amounts.executed_fee.is_none()
+                && amounts.settlement_gas_used.is_some()
+                && amounts.settlement_effective_gas_price.is_some()
+        })
 }
 
 /// An action the progress dialog offers. `Err` carries the reason it's disabled.
@@ -1268,16 +1334,13 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
         SwapStage::SubmissionPending
         | SwapStage::SubmissionRejected
         | SwapStage::Order(SwapOrderState::Open) => SwapActions {
-            cancel: Some(if past_valid_to {
-                Err("The order has expired. Cancelling isn't needed.")
-            } else {
-                Ok(())
-            }),
+            cancel: if past_valid_to { None } else { Some(Ok(())) },
             retry: if past_valid_to {
                 Some(Err("Retry is available once the expiry is final."))
             } else {
                 None
             },
+            dismiss: past_valid_to,
             ..none
         },
         SwapStage::Order(SwapOrderState::PreHookOnly { expired: false }) => SwapActions {
@@ -1285,6 +1348,7 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
                 "The unshield already ran, so the order can still fill until it expires.",
             )),
             recover: true,
+            dismiss: past_valid_to,
             ..none
         },
         SwapStage::Order(SwapOrderState::AttemptEnded(_)) => SwapActions {
@@ -1555,6 +1619,7 @@ mod tests {
             received: None,
             receiver: None,
             minimum: None,
+            uncovered_gas: None,
             bridge: None,
         }
     }
@@ -1659,10 +1724,14 @@ mod tests {
                             | SwapOrderState::PreHookOnly { expired: false }
                     )
             );
-            assert_eq!(stage.is_shown_on_private_tab(true), ongoing, "{stage:?}");
+            assert_eq!(
+                stage.is_shown_on_private_tab(true, false),
+                ongoing,
+                "{stage:?}"
+            );
             // Ended swaps leave the Private tab by themselves; the rest stay until dismissed.
             assert_eq!(
-                stage.is_shown_on_private_tab(false),
+                stage.is_shown_on_private_tab(false, false),
                 !stage.has_ended(),
                 "{stage:?}"
             );
@@ -1896,9 +1965,9 @@ mod tests {
     }
 
     #[test]
-    fn local_expiry_disables_cancel_and_waits_for_a_final_expiry_before_retry() {
+    fn local_expiry_hides_cancel_and_waits_for_a_final_expiry_before_retry() {
         let actions = swap_actions(SwapStage::Order(SwapOrderState::Open), true);
-        assert!(matches!(actions.cancel, Some(Err(_))));
+        assert!(actions.cancel.is_none());
         assert!(matches!(actions.retry, Some(Err(_))));
     }
 
@@ -2109,6 +2178,11 @@ mod tests {
             hook_cost: None,
             anchors: Vec::new(),
             destination_minimum: None,
+            gas_share_bps: None,
+            gas_estimate: None,
+            gas_allowance: None,
+            gas_price_wei: None,
+            valid_for_secs: None,
         };
         let settlement = B256::repeat_byte(0x51);
         let observed = SwapOrderObservations {
@@ -2120,20 +2194,110 @@ mod tests {
                 sell_amount: U256::from(49_875_000u64),
                 buy_amount: U256::from(49_404_100_000_000_000_000u128),
                 fee_amount: U256::ZERO,
+                settlement_gas_used: None,
+                settlement_effective_gas_price: None,
+                executed_fee: None,
+                executed_fee_token: None,
             }),
             ..SwapOrderObservations::default()
         };
-        let outcome = swap_outcome(&bounds, &observed).expect("traded");
+        let reshield = SwapDelivery::Reshield;
+        let outcome = swap_outcome(&bounds, &observed, reshield).expect("traded");
         assert_eq!(
             (outcome.spent, outcome.unshield_fee),
             (U256::from(50_000_000u64), U256::from(125_000u64))
         );
-        // CoW's surplus share: 6.7867 DAI of the executed 49.4041 DAI.
-        assert_eq!(
-            outcome.surplus,
-            Some((U256::from(6_786_700_000_000_000_000u128), 1_373))
-        );
         assert_eq!(outcome.settlement, Some(settlement));
+        // Private delivery is measured by its credit, which isn't recorded yet.
+        assert_eq!((outcome.received, outcome.above_minimum), (None, None));
+        // A Public address receiver got the whole trade: 6.8932435 DAI above its 42.5108565
+        // DAI minimum.
+        let external = SwapDelivery::External {
+            receiver: Address::repeat_byte(7),
+        };
+        let paid = swap_outcome(&bounds, &observed, external).expect("traded");
+        assert_eq!(
+            (paid.private_minimum, paid.received, paid.above_minimum),
+            (
+                bounds.private_minimum,
+                Some(U256::from(49_404_100_000_000_000_000u128)),
+                Some(U256::from(6_893_243_500_000_000_000u128))
+            )
+        );
+        // The credit after the shield fee, 49.28058975 DAI, against the same minimum.
+        let credited = swap_outcome(
+            &bounds,
+            &SwapOrderObservations {
+                shielded: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "observation": observed.traded.expect("traded"),
+                        "private_amount": U256::from(49_280_589_750_000_000_000u128),
+                        "fee": U256::from(123_510_250_000_000_000u128),
+                    }))
+                    .unwrap(),
+                ),
+                ..observed
+            },
+            reshield,
+        )
+        .expect("traded");
+        assert_eq!(
+            (credited.received, credited.above_minimum),
+            (
+                Some(U256::from(49_280_589_750_000_000_000u128)),
+                Some(U256::from(6_769_733_250_000_000_000u128))
+            )
+        );
+        // The fee row needs the orderbook's fee and the settlement receipt's cost, all four
+        // figures; any one missing leaves it out.
+        let dai = Address::repeat_byte(0xda);
+        let charged = SwapTradeAmounts {
+            settlement_gas_used: Some(250_000),
+            settlement_effective_gas_price: Some(2_000_000_000),
+            executed_fee: Some(U256::from(100_000_000_000_000_000u128)),
+            executed_fee_token: Some(dai),
+            ..observed.trade_amounts.expect("amounts")
+        };
+        let gas = |amounts| {
+            swap_outcome(
+                &bounds,
+                &SwapOrderObservations {
+                    trade_amounts: Some(amounts),
+                    ..observed
+                },
+                reshield,
+            )
+            .expect("traded")
+            .gas
+        };
+        assert_eq!(
+            gas(charged),
+            Some(SwapOutcomeGas {
+                fee: U256::from(100_000_000_000_000_000u128),
+                fee_token: dai,
+                settlement_cost: U256::from(500_000_000_000_000u128),
+            })
+        );
+        for partial in [
+            SwapTradeAmounts {
+                executed_fee: None,
+                ..charged
+            },
+            SwapTradeAmounts {
+                executed_fee_token: None,
+                ..charged
+            },
+            SwapTradeAmounts {
+                settlement_gas_used: None,
+                ..charged
+            },
+            SwapTradeAmounts {
+                settlement_effective_gas_price: None,
+                ..charged
+            },
+        ] {
+            assert_eq!(gas(partial), None);
+        }
         // The shield fee is the one its event charged, not derived from the approved rate
         // (997_899 at 25 bps would give 2_501). A shield recorded without one shows no fee.
         let received = |fee: Option<U256>| {
@@ -2150,6 +2314,7 @@ mod tests {
                     shielded: Some(shield),
                     ..observed
                 },
+                reshield,
             )
             .expect("traded")
             .received_privately
@@ -2166,12 +2331,16 @@ mod tests {
                 trade_amounts: None,
                 ..observed
             },
+            external,
         )
         .expect("traded");
-        assert_eq!((legacy.trade, legacy.surplus), (None, None));
+        assert_eq!(
+            (legacy.trade, legacy.received, legacy.gas),
+            (None, None, None)
+        );
         assert_eq!(legacy.minimum, bounds.buy_amount);
         assert_eq!(
-            swap_outcome(&bounds, &SwapOrderObservations::default()),
+            swap_outcome(&bounds, &SwapOrderObservations::default(), reshield),
             None
         );
     }

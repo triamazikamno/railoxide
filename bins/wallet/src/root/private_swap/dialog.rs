@@ -472,9 +472,10 @@ impl PrivateSwapsView {
             .count()
     }
 
-    /// When a swap started: its first order's `validTo` less the profile's order window, or for
-    /// a swap without orders, when its stealth account was reserved. Without a profile, the
-    /// first order's expiry, labeled as such.
+    /// When a swap started: its first order's `validTo` less the validity it was signed with,
+    /// or the profile's order window for records without one, or for a swap without orders,
+    /// when its stealth account was reserved. Without either validity, the first order's
+    /// expiry, labeled as such.
     pub(super) fn swap_started(
         &self,
         record: &ExecutorRecord,
@@ -484,7 +485,11 @@ impl PrivateSwapsView {
         let Some(range) = range else {
             return record.created_at().map(|at| ("Started", at));
         };
-        let valid_to = u64::from(record.swap()?.orders().get(range.start)?.valid_to());
+        let first = record.swap()?.orders().get(range.start)?;
+        let valid_to = u64::from(first.valid_to());
+        if let Some(valid_for) = first.bounds().valid_for_secs {
+            return Some(("Started", valid_to.saturating_sub(u64::from(valid_for))));
+        }
         Some(
             self.swap_profile(cx)
                 .map_or(("Order valid until", valid_to), |profile| {

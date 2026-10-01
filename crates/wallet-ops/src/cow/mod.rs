@@ -31,9 +31,10 @@ mod pricing;
 mod tests;
 
 pub use pricing::{
-    NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams, PreHookCalls,
-    across_post_hook_gas, hook_gas_limit, order_buy_amount, post_hook_gas, pre_hook_gas,
-    price_order_limit,
+    GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit,
+    OrderLimitError, OrderLimitParams, PreHookCalls, across_post_hook_gas, hook_gas_limit,
+    order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit, quote_gas_units,
+    quote_protocol_fee,
 };
 
 /// Hook-free app data sent with every quote request. `CoW` documents `"{}"` as the app data
@@ -206,6 +207,16 @@ pub struct CowOrderStatusReport {
     pub status: CowOrderStatusHint,
 }
 
+/// The fee the orderbook reports it charged a filled order. It is a hint for display and
+/// never establishes a swap outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowExecutedFee {
+    /// `executedFee`, in `token` base units.
+    pub amount: U256,
+    /// `executedFeeToken`.
+    pub token: Address,
+}
+
 /// Orderbook client bound to one swap's network route.
 #[derive(Clone)]
 pub struct CowOrderbookClient {
@@ -329,6 +340,27 @@ impl CowOrderbookClient {
         Ok(CowOrderStatusReport {
             status: order.status,
         })
+    }
+
+    /// `GET /api/v1/orders/{uid}`: the fee the orderbook reports it charged the order, or
+    /// `None` when the report has none. It is a hint and never a swap outcome. The request
+    /// carries only the order UID.
+    pub async fn order_executed_fee(
+        &self,
+        uid: &OrderUid,
+    ) -> Result<Option<CowExecutedFee>, CowApiError> {
+        let uid = uid.0.to_string();
+        let request = self
+            .http
+            .client()
+            .get(self.endpoint(&["api", "v1", "orders", &uid]));
+        let order: OrderExecutedFeeBody = self
+            .execute("order fee", request, COW_REQUEST_TIMEOUT)
+            .await?;
+        Ok(order
+            .executed_fee
+            .zip(order.executed_fee_token)
+            .map(|(amount, token)| CowExecutedFee { amount, token }))
     }
 
     /// `GET /api/v1/trades?orderUid={uid}`: the block of the order's latest reported trade.
@@ -523,6 +555,16 @@ struct OrderCreationBody<'a> {
 #[serde(rename_all = "camelCase")]
 struct OrderStatusBody {
     status: CowOrderStatusHint,
+}
+
+/// The fields of `Order` the executed fee reads.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderExecutedFeeBody {
+    #[serde(default)]
+    executed_fee: Option<U256>,
+    #[serde(default)]
+    executed_fee_token: Option<Address>,
 }
 
 /// The field of `Trade` the trade block reads.

@@ -76,6 +76,13 @@ fn software_shareable_viewing_key_matches_sdk_vector() {
     assert_eq!(&*shareable_key, SDK_VECTOR_SHAREABLE_VIEWING_KEY);
     assert_eq!(receive_address, SDK_VECTOR_ADDRESS);
     assert_eq!(receive_address, derived_address);
+    assert_eq!(
+        decode_shareable_viewing_key(&shareable_key)
+            .derive_address(None)
+            .expect("decode exported wallet address")
+            .to_string(),
+        receive_address,
+    );
     assert!(matches!(
         store.export_wallet_shareable_viewing_key("wrong password", wallet_id),
         Err(VaultError::UnlockFailed)

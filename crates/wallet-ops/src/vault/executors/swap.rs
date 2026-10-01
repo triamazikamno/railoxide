@@ -316,12 +316,15 @@ pub struct SwapApprovedBounds {
     /// `M`, the minimum received privately after the shield fee.
     pub private_minimum: U256,
     pub shield_fee_bps: U256,
+    /// The price tolerance applied to the quote's best case, in basis points. Records from
+    /// before gas shares applied it after deducting all gas; the name is kept for decoding.
     pub slippage_bps: u32,
     pub pre_hook_gas_limit: u64,
     /// `None` for an order without a post-hook.
     #[serde(default)]
     pub post_hook_gas_limit: Option<u64>,
-    /// The reviewed maximum network and hook cost, in buy-token units.
+    /// The reviewed gas estimate in buy-token units, the same as `gas_estimate` in records with
+    /// a gas share. Earlier records hold the network and hook cost their minimum deducted.
     #[serde(default)]
     pub hook_cost: Option<U256>,
     pub anchors: Vec<SwapAnchorObservation>,
@@ -329,6 +332,29 @@ pub struct SwapApprovedBounds {
     /// amount or 1Click's `minAmountOut`. `None` for same-chain delivery.
     #[serde(default)]
     pub destination_minimum: Option<U256>,
+    /// The selected share of `gas_estimate` the quote was priced at, in basis points of 10,000.
+    /// `None` in records from before gas shares.
+    #[serde(default)]
+    pub gas_share_bps: Option<u16>,
+    /// The gas estimate in buy-token units: the quote's swap gas and the hooks' conservative gas
+    /// at the RPC gas price with its 25% cushion, plus any rollup data cost. `None` in records
+    /// from before gas shares.
+    #[serde(default)]
+    pub gas_estimate: Option<U256>,
+    /// The allowed gas in buy-token units. For an approval, `gas_share_bps` of `gas_estimate`
+    /// rounded up. For an order attempt, the gas the signed minimum leaves room for, which
+    /// differs from that share when the order kept an approved minimum; older attempt records
+    /// hold the share. `None` in records from before gas shares.
+    #[serde(default)]
+    pub gas_allowance: Option<U256>,
+    /// The RPC gas price in wei at quote time, without the cushion. `None` in records from
+    /// before gas shares.
+    #[serde(default)]
+    pub gas_price_wei: Option<u128>,
+    /// How long the order is valid after signing, in seconds. `None` in records from before
+    /// the validity was chosen, whose orders used the swap profile's window.
+    #[serde(default)]
+    pub valid_for_secs: Option<u32>,
 }
 
 impl SwapApprovedBounds {
@@ -409,13 +435,29 @@ pub struct SwapShieldObservation {
     pub fee: Option<U256>,
 }
 
-/// Executed amounts from the order's canonical settlement `Trade` event, kept with `traded`.
+/// Executed amounts from the order's canonical settlement `Trade` event, kept with `traded`,
+/// and the settlement's gas cost and the fee the orderbook charged when they were read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapTradeAmounts {
     pub sell_amount: U256,
     pub buy_amount: U256,
     /// The order's signed fee, in the sell token. Zero for orders without one.
     pub fee_amount: U256,
+    /// `gasUsed` of the settlement transaction's receipt. `None` until it is recorded, and in
+    /// older records.
+    #[serde(default)]
+    pub settlement_gas_used: Option<u64>,
+    /// `effectiveGasPrice` in wei of the settlement transaction's receipt. `None` until it is
+    /// recorded, and in older records.
+    #[serde(default)]
+    pub settlement_effective_gas_price: Option<u128>,
+    /// The orderbook's `executedFee` for the order, in `executed_fee_token` base units. It is
+    /// reported by the orderbook and is not chain evidence. `None` until it is read.
+    #[serde(default)]
+    pub executed_fee: Option<U256>,
+    /// The orderbook's `executedFeeToken`. `None` until it is read.
+    #[serde(default)]
+    pub executed_fee_token: Option<Address>,
 }
 
 /// What consumed the pre-hook's nonce, or `Expired` when `validTo` passed first.
@@ -1327,6 +1369,20 @@ impl ExecutorStore {
             {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
+            // The same trade keeps what was read about it since it was recorded: the orderbook's
+            // executed fee, and the settlement gas from an earlier receipt.
+            let amounts = match order.observations.trade_amounts {
+                Some(known) if order.observations.traded.is_some() => SwapTradeAmounts {
+                    settlement_gas_used: known.settlement_gas_used.or(amounts.settlement_gas_used),
+                    settlement_effective_gas_price: known
+                        .settlement_effective_gas_price
+                        .or(amounts.settlement_effective_gas_price),
+                    executed_fee: known.executed_fee.or(amounts.executed_fee),
+                    executed_fee_token: known.executed_fee_token.or(amounts.executed_fee_token),
+                    ..amounts
+                },
+                _ => amounts,
+            };
             order.observations.traded = Some(traded);
             order.observations.trade_amounts = Some(amounts);
             if let Some(credit) = credit {
@@ -1338,6 +1394,38 @@ impl ExecutorStore {
             if delivered {
                 order.observations.delivered = Some(traded);
                 order.observations.undelivered = None;
+            }
+            Ok(())
+        })
+    }
+
+    /// Persist the orderbook's executed fee with the amounts of an order's recorded trade. The
+    /// fee is the orderbook's report, not chain evidence. A recorded fee is never replaced,
+    /// though recording one again is accepted.
+    pub(crate) fn record_swap_executed_fee(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        fee: U256,
+        token: Address,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let order = record
+                .swap
+                .as_mut()
+                .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if order.observations.traded.is_none() {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
+            let amounts = order
+                .observations
+                .trade_amounts
+                .as_mut()
+                .ok_or(ExecutorStoreError::InvalidRecord)?;
+            if amounts.executed_fee.is_none() {
+                amounts.executed_fee = Some(fee);
+                amounts.executed_fee_token = Some(token);
             }
             Ok(())
         })

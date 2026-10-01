@@ -57,9 +57,9 @@ use super::simulation::{PreHookSimulation, simulate_pre_hook};
 use super::{DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, trace_step};
 use crate::cow::{
     CowApiError, CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters,
-    CowSellQuoteRequest, NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams,
-    PreHookCalls, across_post_hook_gas, hook_gas_limit, order_buy_amount, post_hook_gas,
-    pre_hook_gas, price_order_limit,
+    CowSellQuoteRequest, GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit, OrderLimitError,
+    OrderLimitParams, PreHookCalls, across_post_hook_gas, hook_gas_limit, order_buy_amount,
+    post_hook_gas, pre_hook_gas, price_order_limit, quote_gas_units, quote_protocol_fee,
 };
 use crate::desktop::{
     artifact_source, effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
@@ -94,6 +94,16 @@ const WIDEST_PRE_HOOK_TRANSACTION: TransactionShape = TransactionShape {
 };
 
 const SWAP_SPEND_OPERATION: &str = "private swap pre-hook";
+
+/// Divisor of the approved allowed gas that gives a first order's cushion: a fifth, 20%. A
+/// requote after setup that falls short of the approved minimums by at most this much, in
+/// buy-token base units, is signed at those minimums without a new review. The order then
+/// leaves solvers that much less for gas.
+const APPROVAL_CUSHION_DIVISOR: u64 = 5;
+
+/// Margin added to a Bridge deposit scaled up to the approved destination minimum, in basis
+/// points of the deposit, for the provider's quote of the larger amount.
+const BRIDGE_DEPOSIT_MARGIN_BPS: u64 = 5;
 
 /// An amount to plan for a swap, before or after its executor's setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,13 +232,6 @@ impl SwapInputPlan {
         Ok(request)
     }
 
-    fn expected_hook_gas(&self) -> u64 {
-        self.pre_hook_gas(GasEstimateMode::Expected).saturating_add(
-            swap_post_hook_gas(self.gas_model, self.delivery, GasEstimateMode::Expected)
-                .unwrap_or(0),
-        )
-    }
-
     fn pre_hook_gas(&self, mode: GasEstimateMode) -> u64 {
         pre_hook_gas(
             self.gas_model,
@@ -296,7 +299,8 @@ pub enum SwapPrice {
 /// Terms the user reviews before approving a private minimum. The review screen shows them
 /// with the fixed approval disclosures: the order, its hooks, and its input nullifiers become
 /// public once submitted; a later spend of unfilled inputs is linkable to the swap; the setup
-/// cost is paid even without a fill; hook gas is charged to the sell amount; and a pre-hook run
+/// cost is paid even without a fill; the user pays at most the chosen share of the gas
+/// estimate, and without a solver covering the rest the order doesn't fill; and a pre-hook run
 /// without a fill costs both the unshield and the shield fee in recovery.
 #[derive(Debug, Clone)]
 pub struct SwapReview {
@@ -304,16 +308,34 @@ pub struct SwapReview {
     quote: CowQuoteParameters,
     quote_id: Option<i64>,
     limit: OrderLimit,
-    estimated_hook_cost: U256,
+    gas: SwapGasPricing,
+    gas_share_bps: u16,
+    /// How long the order is valid after signing. Bridge delivery uses the profile's window.
+    valid_for: Duration,
+    /// `CoW`'s protocol fee in buy-token units, when the quote states it.
+    cow_fee: Option<U256>,
     surplus_shield_fee_bps: U256,
     shield_fee_bps: U256,
     unshield_fee_bps: U256,
     sell_amount: U256,
+    /// The price tolerance on the best case, in basis points.
     slippage_bps: u32,
     price: SwapPrice,
     isolation: OperationNetworkIsolation,
     /// The bridge leg, for Bridge delivery.
     bridge: Option<SwapBridgeQuote>,
+}
+
+/// Quote-time inputs of the gas estimate, kept so that another gas share reprices without I/O.
+#[derive(Debug, Clone, Copy)]
+struct SwapGasPricing {
+    quote_gas_units: u64,
+    /// The RPC gas price in wei, without the cushion.
+    gas_price_wei: u128,
+    /// `gas_price_wei` with the 25% cushion, which prices the gas estimate.
+    limit_gas_price_wei: u128,
+    hook_data_cost_wei: U256,
+    native_rate: NativeBuyRate,
 }
 
 impl SwapReview {
@@ -326,23 +348,77 @@ impl SwapReview {
     pub const fn quote(&self) -> &CowQuoteParameters {
         &self.quote
     }
-    /// Estimated hook gas cost in buy-token base units, taken off the quoted output.
+    /// The quoted buy amount with `CoW`'s network fee added back, in buy-token base units.
     #[must_use]
-    pub const fn hook_cost(&self) -> U256 {
-        self.limit.hook_cost
+    pub const fn best_case(&self) -> U256 {
+        self.limit.best_case
     }
-    /// Expected hook cost for display. Signing still uses the conservative `hook_cost`.
+    /// The gas estimate in buy-token base units: the quote's swap gas and the hooks'
+    /// conservative gas at the cushioned RPC price, plus any rollup data cost.
     #[must_use]
-    pub const fn estimated_hook_cost(&self) -> U256 {
-        self.estimated_hook_cost
+    pub const fn gas_estimate(&self) -> U256 {
+        self.limit.gas_estimate
+    }
+    /// The share of the gas estimate the minimum deducts, in buy-token base units.
+    #[must_use]
+    pub const fn gas_allowance(&self) -> U256 {
+        self.limit.gas_allowance
+    }
+    /// The share of the gas estimate the minimum deducts, in basis points of 10,000.
+    #[must_use]
+    pub const fn gas_share_bps(&self) -> u16 {
+        self.gas_share_bps
+    }
+    /// The RPC gas price in wei at quote time, without the cushion.
+    #[must_use]
+    pub const fn gas_price_wei(&self) -> u128 {
+        self.gas.gas_price_wei
+    }
+    /// How long the order is valid after signing.
+    #[must_use]
+    pub const fn valid_for(&self) -> Duration {
+        self.valid_for
+    }
+    /// `CoW`'s protocol fee in buy-token base units, already deducted from the quote. `None`
+    /// when the quote doesn't state it.
+    #[must_use]
+    pub const fn cow_fee(&self) -> Option<U256> {
+        self.cow_fee
     }
 
-    /// Expected `CoW` payout after its quoted fee and the expected hook cost, before delivery.
+    /// This review priced at another gas share, without I/O. A Bridge delivery's bridge leg was
+    /// quoted for the old order amount, so it is cleared and must be quoted again.
+    pub fn with_gas_share(&self, gas_share_bps: u16) -> Result<Self> {
+        let limit = swap_order_limit(
+            &self.plan,
+            &self.quote,
+            self.gas,
+            self.slippage_bps,
+            gas_share_bps,
+            self.shield_fee_bps,
+        )?;
+        Ok(Self {
+            limit,
+            gas_share_bps,
+            bridge: None,
+            ..self.clone()
+        })
+    }
+
+    /// This review delivering to `receiver`, without I/O. Neither quote names the receiver, and
+    /// the plan sizes it as one static ABI word, so every other term, the bridge leg included,
+    /// stays as quoted. Reshield delivery has no receiver and is returned unchanged.
     #[must_use]
-    pub const fn estimated_buy_amount(&self) -> U256 {
-        self.quote
-            .buy_amount
-            .saturating_sub(self.estimated_hook_cost)
+    pub fn with_receiver(&self, receiver: Address) -> Self {
+        let mut review = self.clone();
+        match &mut review.plan.delivery {
+            SwapDelivery::Reshield => {}
+            SwapDelivery::External { receiver: current }
+            | SwapDelivery::Bridge(BridgeDelivery {
+                receiver: current, ..
+            }) => *current = receiver,
+        }
+        review
     }
 
     /// Shield fee for a `CoW` payout. Across shields only what remains after its fixed deposit.
@@ -365,8 +441,9 @@ impl SwapReview {
         }
     }
 
-    /// Estimated source-chain return after hook costs and any surplus shield fee.
-    /// Only Across deposits a fixed amount and leaves surplus on the source chain.
+    /// Upper bound of the source-chain return: the best case, reached when solvers pay all
+    /// gas, less the fixed deposit and any surplus shield fee. Only Across deposits a fixed
+    /// amount and leaves surplus on the source chain.
     #[must_use]
     pub fn estimated_source_surplus(&self) -> Option<U256> {
         matches!(
@@ -377,10 +454,9 @@ impl SwapReview {
             })
         )
         .then(|| {
-            let bought = self.estimated_buy_amount();
-            bought
-                .saturating_sub(self.limit.buy_amount)
-                .saturating_sub(self.shield_fee_on_output(bought))
+            let best = self.best_case();
+            best.saturating_sub(self.limit.buy_amount)
+                .saturating_sub(self.shield_fee_on_output(best))
         })
     }
     /// Suggested minimum received privately after the shield fee, or for External delivery,
@@ -404,6 +480,7 @@ impl SwapReview {
     pub const fn sell_amount(&self) -> U256 {
         self.sell_amount
     }
+    /// The price tolerance on the best case, in basis points.
     #[must_use]
     pub const fn slippage_bps(&self) -> u32 {
         self.slippage_bps
@@ -441,6 +518,18 @@ impl SwapReview {
     pub fn buy_amount_for(&self, private_minimum: U256) -> Result<U256> {
         Ok(order_buy_amount(private_minimum, self.shield_fee_bps)?)
     }
+    /// The gas an order signed at `private_minimum` leaves room for, in buy-token base units:
+    /// this review's buy amount and allowed gas, less that minimum's buy amount. It is
+    /// [`Self::gas_allowance`] at the suggested minimum, less below a higher minimum, and more
+    /// above a lower one, where it can exceed the gas estimate.
+    pub fn gas_allowance_for(&self, private_minimum: U256) -> Result<U256> {
+        Ok(self
+            .limit
+            .buy_amount
+            .checked_add(self.limit.gas_allowance)
+            .ok_or(OrderLimitError::Overflow)?
+            .saturating_sub(self.buy_amount_for(private_minimum)?))
+    }
 
     /// The terms to persist when the user approves this review with its setup.
     pub fn approval(
@@ -462,12 +551,17 @@ impl SwapReview {
                 slippage_bps: self.slippage_bps,
                 pre_hook_gas_limit: self.plan.pre_hook_gas_limit(),
                 post_hook_gas_limit: self.plan.post_hook_gas_limit(),
-                hook_cost: Some(self.hook_cost()),
+                hook_cost: Some(self.gas_estimate()),
                 anchors: match &self.price {
                     SwapPrice::Verified { observations, .. } => observations.clone(),
                     SwapPrice::Unverified => Vec::new(),
                 },
                 destination_minimum,
+                gas_share_bps: Some(self.gas_share_bps),
+                gas_estimate: Some(self.gas_estimate()),
+                gas_allowance: Some(self.gas_allowance()),
+                gas_price_wei: Some(self.gas.gas_price_wei),
+                valid_for_secs: Some(self.valid_for_secs()?),
             },
             price_verified: Some(self.price_verified()),
             price_acknowledged,
@@ -479,54 +573,87 @@ impl SwapReview {
         })
     }
 
-    /// How this fresh review, planned for the approved amount and slippage once the setup is
-    /// confirmed, differs from the approval. `None` means the order can be signed with the
-    /// approved minimum: a better quote only adds surplus. Another delivery kind or receiver
-    /// address, a lower suggested minimum or destination minimum, another Railgun fee the order
-    /// depends on, or another kind of price check needs a new review.
+    /// How this fresh review, planned for the approved amount, price tolerance, gas share and
+    /// validity once the setup is confirmed, differs from the approval. `None` means the order
+    /// can be signed with [`Self::approved_order_minimum`]: a better quote or a lower gas
+    /// estimate only adds surplus, and a shortfall within the cushion is taken from the allowed
+    /// gas. Another delivery kind or receiver address, a suggested minimum, destination minimum
+    /// or allowed gas that moved beyond the cushion, a higher declared gas limit, another
+    /// validity, another Railgun fee the order depends on, or another kind of price check needs
+    /// a new review, and so does an approval saved before gas shares.
     #[must_use]
     pub fn approval_change(&self, approval: &SwapApproval) -> Option<SwapReviewChange> {
+        self.approved_order_minimum(approval).err()
+    }
+
+    /// The private minimum to sign the approved first order with, or what needs a new review:
+    /// see [`Self::approval_change`]. It is the approved minimum, except for a Bridge delivery
+    /// whose fresh bridge quote is below the approved destination minimum: its deposit is
+    /// raised until the provider delivers that minimum again.
+    pub fn approved_order_minimum(
+        &self,
+        approval: &SwapApproval,
+    ) -> Result<U256, SwapReviewChange> {
         // Only the parsed address counts; a receiver's label isn't part of the delivery.
         if self.plan.delivery != approval.delivery {
-            return Some(SwapReviewChange::Delivery);
+            return Err(SwapReviewChange::Delivery);
         }
         let approved = &approval.bounds;
         // An External order carries no shield, so it doesn't depend on the shield fee.
         if matches!(self.plan.delivery, SwapDelivery::Reshield)
             && self.shield_fee_bps != approved.shield_fee_bps
         {
-            return Some(SwapReviewChange::ShieldFee {
+            return Err(SwapReviewChange::ShieldFee {
                 approved: approved.shield_fee_bps,
                 current: self.shield_fee_bps,
             });
         }
         if self.unshield_fee_bps != approved.unshield_fee_bps {
-            return Some(SwapReviewChange::UnshieldFee {
+            return Err(SwapReviewChange::UnshieldFee {
                 approved: approved.unshield_fee_bps,
                 current: self.unshield_fee_bps,
             });
         }
-        if approved
-            .hook_cost
-            .is_none_or(|cost| self.hook_cost() > cost)
-            || self.plan.pre_hook_gas_limit() > approved.pre_hook_gas_limit
+        let (Some(_), Some(approved_allowance)) = (approved.gas_share_bps, approved.gas_allowance)
+        else {
+            return Err(SwapReviewChange::GasShare);
+        };
+        if self.plan.pre_hook_gas_limit() > approved.pre_hook_gas_limit
             || self.plan.post_hook_gas_limit().is_some_and(|current| {
                 approved
                     .post_hook_gas_limit
                     .is_none_or(|limit| current > limit)
             })
         {
-            return Some(SwapReviewChange::HookCost);
+            return Err(SwapReviewChange::HookCost);
+        }
+        // Within the cushion, more allowed gas or a lower minimum needs no review.
+        let cushioned = self.cushioned_minimum(approved, approved_allowance);
+        if cushioned.is_none() && self.gas_allowance() > approved_allowance {
+            return Err(SwapReviewChange::GasAllowance {
+                approved: approved_allowance,
+                current: self.gas_allowance(),
+            });
+        }
+        let current_validity = self.valid_for.as_secs();
+        if approved.valid_for_secs.map(u64::from) != Some(current_validity) {
+            return Err(SwapReviewChange::Validity {
+                approved: approved.valid_for_secs.map_or(0, u64::from),
+                current: current_validity,
+            });
         }
         let was_verified = approval
             .price_verified
             .unwrap_or(!approved.anchors.is_empty());
         if self.price_verified() != was_verified {
-            return Some(SwapReviewChange::PriceVerification);
+            return Err(SwapReviewChange::PriceVerification);
+        }
+        if let Some(minimum) = cushioned {
+            return Ok(minimum);
         }
         let current = self.suggested_private_minimum();
         if current < approved.private_minimum {
-            return Some(SwapReviewChange::Minimum {
+            return Err(SwapReviewChange::Minimum {
                 approved: approved.private_minimum,
                 current,
             });
@@ -540,12 +667,61 @@ impl SwapReview {
                 .destination_minimum
                 .is_none_or(|minimum| destination < minimum)
         {
-            return Some(SwapReviewChange::DestinationMinimum {
+            return Err(SwapReviewChange::DestinationMinimum {
                 approved: approved.destination_minimum.unwrap_or_default(),
                 current: destination,
             });
         }
-        None
+        Ok(approved.private_minimum)
+    }
+
+    /// The private minimum that keeps the approved minimums when this review's own order
+    /// falls short of them by at most the cushion, a fifth of the approved allowed gas. It is
+    /// the approved minimum, or for a Bridge delivery quoted below the approved destination
+    /// minimum, the deposit scaled up to it: `ceil(deposit * approved / quoted)` plus the
+    /// margin, and at least the approved deposit. The shortfall is that minimum's buy amount
+    /// less this review's, and it also stays within this review's allowed gas, so the order
+    /// never asks for more than the best case after the price tolerance. `None` when the
+    /// shortfall is larger, or for a Bridge delivery without a quote or an approved destination
+    /// minimum.
+    fn cushioned_minimum(
+        &self,
+        approved: &SwapApprovedBounds,
+        approved_allowance: U256,
+    ) -> Option<U256> {
+        let quoted_buy_amount = self.limit.buy_amount;
+        let minimum = if matches!(self.plan.delivery, SwapDelivery::Bridge(_)) {
+            let approved_destination = approved.destination_minimum?;
+            let quoted_destination = self.bridge?.destination_minimum;
+            if quoted_destination >= approved_destination {
+                approved.private_minimum
+            } else if quoted_destination.is_zero() {
+                return None;
+            } else {
+                // Bridge orders carry no shield, so the deposit is the private minimum.
+                let scaled = quoted_buy_amount
+                    .checked_mul(approved_destination)?
+                    .div_ceil(quoted_destination);
+                let margin = scaled
+                    .checked_mul(U256::from(BRIDGE_DEPOSIT_MARGIN_BPS))?
+                    .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
+                scaled.checked_add(margin)?.max(approved.private_minimum)
+            }
+        } else {
+            approved.private_minimum
+        };
+        let shortfall = self
+            .buy_amount_for(minimum)
+            .ok()?
+            .saturating_sub(quoted_buy_amount);
+        let cushion = approved_allowance / U256::from(APPROVAL_CUSHION_DIVISOR);
+        (shortfall <= cushion && shortfall <= self.gas_allowance()).then_some(minimum)
+    }
+
+    /// The validity in whole seconds, as the approval records it.
+    fn valid_for_secs(&self) -> Result<u32> {
+        u32::try_from(self.valid_for.as_secs())
+            .map_err(|_| eyre!("the order's validity is out of range"))
     }
 
     /// A Bridge delivery needs its bridge quote and a nonzero `destination_minimum`; other
@@ -582,7 +758,13 @@ impl SwapReview {
 
 pub struct SwapReviewRequest<'a> {
     pub plan: SwapInputPlan,
+    /// The price tolerance on the best case, in basis points.
     pub slippage_bps: u32,
+    /// The share of the gas estimate the minimum deducts, in basis points of 10,000.
+    pub gas_share_bps: u16,
+    /// How long the order is valid after signing. Bridge delivery ignores it and uses the swap
+    /// profile's window.
+    pub valid_for: Duration,
     /// The swap's own orderbook client, kept for its order submission.
     pub orderbook: &'a CowOrderbookClient,
     /// `None` when returning for unverified-price acknowledgement. Signing also uses the
@@ -625,8 +807,22 @@ pub enum SwapReviewChange {
     /// destination, receiver, token or surplus choice differs from the approval. This always
     /// needs a full review.
     Delivery,
-    /// A displayed network/hook limit increased, or an older approval lacks it.
+    /// A declared hook gas limit increased, or the pre-hook must now invalidate another order.
     HookCost,
+    /// The approval was saved before gas shares and records neither a share nor the allowed
+    /// gas. It needs a full review.
+    GasShare,
+    /// The fresh review allows more gas than the approval, in buy-token base units.
+    GasAllowance {
+        approved: U256,
+        current: U256,
+    },
+    /// The order's validity differs from the approved one, in seconds. An approval without a
+    /// recorded validity reports zero.
+    Validity {
+        approved: u64,
+        current: u64,
+    },
     ShieldFee {
         approved: U256,
         current: U256,
@@ -784,9 +980,15 @@ pub(crate) fn plan_swap_inputs(
 }
 
 /// Price the order limit for a hook-free quote of the order's sell amount, the plan's amount
-/// after the unshield fee: hook gas, slippage, and for Reshield delivery the shield fee. External
-/// and Bridge orders carry no shield of the buy amount, so their reviews use a shield fee of zero
-/// and their buy amount is the approved minimum.
+/// after the unshield fee: the gas share, the price tolerance, and for Reshield delivery the
+/// shield fee. External and Bridge orders carry no shield of the buy amount, so their reviews
+/// use a shield fee of zero and their buy amount is the approved minimum. `valid_for` is the
+/// order's effective validity, the swap profile's window for Bridge delivery.
+///
+/// When the requested gas share leaves no positive minimum and is above the Tight preset, the
+/// review is priced at Tight instead, and its `gas_share_bps()` reports Tight, so a form can
+/// still show the quote while its chosen preset is unavailable. The caller keeps the share it
+/// requested, so a later requote tries it again. If Tight fails too, the error is returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn price_swap_review(
     plan: SwapInputPlan,
@@ -795,6 +997,8 @@ pub(crate) fn price_swap_review(
     shield_fee_bps: U256,
     unshield_fee_bps: U256,
     slippage_bps: u32,
+    gas_share_bps: u16,
+    valid_for: Duration,
     gas_price_wei: u128,
     hook_data_cost_wei: U256,
     isolation: OperationNetworkIsolation,
@@ -809,58 +1013,61 @@ pub(crate) fn price_swap_review(
         SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
         SwapPrice::Unverified => NativeBuyRate::Quote,
     };
-    let params = OrderLimitParams {
-        quote: &quote.quote,
-        hook_gas: plan.hook_gas_estimate(),
+    // The gas estimate, and thus the minimum and an Across deposit, allows a 25% gas-price
+    // increase, rounded upward to whole wei. Neither changes the hooks' execution gas limits
+    // or applies the broadcaster's separate gas-price buffer.
+    let gas = SwapGasPricing {
+        quote_gas_units: quote_gas_units(&quote.quote)?,
         gas_price_wei,
+        limit_gas_price_wei: gas_price_wei
+            .checked_add(gas_price_wei.div_ceil(4))
+            .ok_or(OrderLimitError::Overflow)?,
         hook_data_cost_wei,
         native_rate,
-        slippage_bps,
-        shield_fee_bps,
     };
-    // The displayed estimate uses the current RPC price. The signed minimum, and thus an
-    // Across deposit, allow a 25% increase, rounded upward to whole wei. Neither changes the
-    // hooks' execution gas limits or applies the broadcaster's separate gas-price buffer.
-    let limit_gas_price_wei = gas_price_wei
-        .checked_add(gas_price_wei.div_ceil(4))
-        .ok_or(OrderLimitError::Overflow)?;
     tracing::debug!(
         target: "swap_quote",
         step = "gas_price_comparison",
         cow_gas_price_wei = %quote.quote.gas_price,
         rpc_gas_price_wei = gas_price_wei,
-        estimated_gas_price_wei = gas_price_wei,
-        limit_gas_price_wei,
-        "priced hooks from RPC gas"
+        limit_gas_price_wei = gas.limit_gas_price_wei,
+        quote_gas_units = gas.quote_gas_units,
+        gas_share_bps,
+        "priced swap and hook gas from RPC gas"
     );
-    let limit = price_order_limit(&OrderLimitParams {
-        gas_price_wei: limit_gas_price_wei,
-        ..params
-    })
-    .map_err(|error| match error {
-        // Report the wallet's buy token, not CoW's native buy address.
-        OrderLimitError::HookCostExceedsOutput {
-            hook_cost,
-            quoted_output,
-            ..
-        } => OrderLimitError::HookCostExceedsOutput {
-            buy_token: plan.buy_token,
-            hook_cost,
-            quoted_output,
-        },
-        error => error,
-    })?;
-    let estimated_hook_cost = price_order_limit(&OrderLimitParams {
-        hook_gas: plan.expected_hook_gas(),
-        ..params
-    })?
-    .hook_cost;
+    let limit = swap_order_limit(
+        &plan,
+        &quote.quote,
+        gas,
+        slippage_bps,
+        gas_share_bps,
+        shield_fee_bps,
+    );
+    let (limit, gas_share_bps) = match limit {
+        Err(OrderLimitError::HookCostExceedsOutput { .. })
+            if gas_share_bps > GAS_SHARE_TIGHT_BPS =>
+        {
+            let limit = swap_order_limit(
+                &plan,
+                &quote.quote,
+                gas,
+                slippage_bps,
+                GAS_SHARE_TIGHT_BPS,
+                shield_fee_bps,
+            )?;
+            (limit, GAS_SHARE_TIGHT_BPS)
+        }
+        limit => (limit?, gas_share_bps),
+    };
     Ok(SwapReview {
+        cow_fee: quote_protocol_fee(&quote),
         plan,
         quote: quote.quote,
         quote_id: quote.id,
         limit,
-        estimated_hook_cost,
+        gas,
+        gas_share_bps,
+        valid_for,
         surplus_shield_fee_bps,
         shield_fee_bps,
         unshield_fee_bps,
@@ -869,6 +1076,41 @@ pub(crate) fn price_swap_review(
         price,
         isolation,
         bridge: None,
+    })
+}
+
+/// The order limit of `quote` at `gas_share_bps`. A nonpositive minimum names the wallet's buy
+/// token, not `CoW`'s native buy address.
+fn swap_order_limit(
+    plan: &SwapInputPlan,
+    quote: &CowQuoteParameters,
+    gas: SwapGasPricing,
+    price_tolerance_bps: u32,
+    gas_share_bps: u16,
+    shield_fee_bps: U256,
+) -> Result<OrderLimit, OrderLimitError> {
+    price_order_limit(&OrderLimitParams {
+        quote,
+        quote_gas_units: gas.quote_gas_units,
+        hook_gas: plan.hook_gas_estimate(),
+        gas_price_wei: gas.limit_gas_price_wei,
+        hook_data_cost_wei: gas.hook_data_cost_wei,
+        native_rate: gas.native_rate,
+        price_tolerance_bps,
+        gas_share_bps,
+        shield_fee_bps,
+    })
+    .map_err(|error| match error {
+        OrderLimitError::HookCostExceedsOutput {
+            gas_estimate,
+            best_case,
+            ..
+        } => OrderLimitError::HookCostExceedsOutput {
+            buy_token: plan.buy_token,
+            gas_estimate,
+            best_case,
+        },
+        error => error,
     })
 }
 
@@ -1018,6 +1260,8 @@ impl ExecutorOwner {
         let SwapReviewRequest {
             plan,
             slippage_bps,
+            gas_share_bps,
+            valid_for,
             orderbook,
             anchor_cache,
             token_registry,
@@ -1025,6 +1269,12 @@ impl ExecutorOwner {
         } = request;
         let profile = self.swap_order_profile()?;
         let bridge = bridge_route(&plan, bridge)?;
+        // A bridge leg is quoted for the profile's window.
+        let valid_for = if matches!(plan.delivery, SwapDelivery::Bridge(_)) {
+            profile.valid_to_window()
+        } else {
+            valid_for
+        };
         if let Some(operation) = plan.operation() {
             self.swap_account_record(operation)?
                 .ok_or_else(|| eyre!("swap executor is unavailable"))?;
@@ -1043,7 +1293,7 @@ impl ExecutorOwner {
                 .quote_sell(&swap_quote_request(
                     &plan,
                     sell_amount,
-                    valid_to_after(SystemTime::now(), profile.valid_to_window())?,
+                    valid_to_after(SystemTime::now(), valid_for)?,
                 ))
                 .await;
             tracing::debug!(
@@ -1122,6 +1372,8 @@ impl ExecutorOwner {
             shield_fee_bps,
             unshield_fee_bps,
             slippage_bps,
+            gas_share_bps,
+            valid_for,
             gas_price_wei,
             hook_data_cost_wei,
             orderbook.isolation(),
@@ -1151,6 +1403,45 @@ impl ExecutorOwner {
             review.bridge = Some(quote?);
         }
         Ok(review)
+    }
+
+    /// `review` at another gas share, with its bridge leg quoted again on `route` for the new
+    /// order buy amount. The `CoW` quote, the gas inputs, the plan and the validity stay as they
+    /// were reviewed, and the orderbook isn't asked.
+    pub async fn requote_swap_bridge(
+        &self,
+        review: &SwapReview,
+        gas_share_bps: u16,
+        route: SwapBridgeRoute<'_>,
+        anchor_cache: Option<&TokenAnchorRateCache>,
+        token_registry: &EffectiveTokenRegistry,
+    ) -> Result<SwapReview> {
+        self.while_active(Box::pin(async {
+            let profile = self.swap_order_profile()?;
+            let Some((delivery, route)) = bridge_route(&review.plan, Some(route))? else {
+                return Err(eyre!("only a bridge swap has a bridge leg to quote"));
+            };
+            if let Some(operation) = review.plan.operation() {
+                self.swap_account_record(operation)?
+                    .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+            }
+            let mut repriced = review.with_gas_share(gas_share_bps)?;
+            // Bridge orders carry no shield, so the buy amount is the suggested minimum.
+            repriced.bridge = Some(
+                self.quote_swap_bridge(
+                    route,
+                    delivery,
+                    &profile,
+                    repriced.limit.buy_amount,
+                    repriced.slippage_bps,
+                    anchor_cache,
+                    token_registry,
+                )
+                .await?,
+            );
+            Ok(repriced)
+        }))
+        .await
     }
 
     /// Prove the planned pre-hook, or reuse the recorded proof when a retry spends the same
@@ -1379,6 +1670,8 @@ impl ExecutorOwner {
         let (operation, executor) = (delegated.operation(), delegated.executor());
         let buy_amount =
             review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
+        // The attempt records the gas the signed minimum leaves room for.
+        let gas_allowance = review.gas_allowance_for(private_minimum)?;
         let bridge = bridge_route(plan, bridge)?;
         let profile = self.swap_order_profile()?;
         self.ensure_active()?;
@@ -1454,7 +1747,9 @@ impl ExecutorOwner {
                 }
             };
 
-        let valid_to = valid_to_after(SystemTime::now(), profile.valid_to_window())?;
+        // Bridge reviews carry the profile's window.
+        let valid_for_secs = review.valid_for_secs()?;
+        let valid_to = valid_to_after(SystemTime::now(), review.valid_for)?;
         // The provider quotes the approved order before anything is signed. A 1Click quote
         // names the receiver, so it follows every check above.
         let bridge_terms = match bridge {
@@ -1663,9 +1958,14 @@ impl ExecutorOwner {
                         post_hook_gas_limit: post_hook
                             .as_ref()
                             .map(|(_, _, _, gas_limit)| *gas_limit),
-                        hook_cost: Some(review.hook_cost()),
+                        hook_cost: Some(review.gas_estimate()),
                         anchors,
                         destination_minimum,
+                        gas_share_bps: Some(review.gas_share_bps),
+                        gas_estimate: Some(review.gas_estimate()),
+                        gas_allowance: Some(gas_allowance),
+                        gas_price_wei: Some(review.gas.gas_price_wei),
+                        valid_for_secs: Some(valid_for_secs),
                     },
                     invalidates: plan.invalidates,
                     pre_hook: IssuedExecutorPayload::new(

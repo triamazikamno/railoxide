@@ -1,25 +1,27 @@
-//! Hook gas estimate and order limit for a private swap.
+//! Gas estimate and order limit for a private swap.
 //!
-//! `CoW` quote verification doesn't count hook gas (design decision 5), so the wallet estimates
-//! it here and prices it in the buy token at the caller's RPC gas price. The review adds a
-//! gas-price cushion for the minimum, then deducts hook costs and slippage from the quote.
-//! Actual solver fees can differ from this allowance. The declared gas limit only caps
-//! execution and is not priced. The gas estimate depends only on the chain and
-//! transaction shapes. It reads no chain state and sends nothing to an RPC, so it works before
-//! delegation and never exposes a signed hook.
+//! The order limit starts from the quote's best case: `CoW`'s quoted buy amount with its network
+//! fee added back at the quoted trading rate. The wallet prices one gas estimate: the quote's
+//! swap gas units plus the conservative gas of the order's hooks, at the caller's cushioned RPC
+//! gas price, plus any rollup data cost. `CoW`'s quoted gas price never enters it. The user's
+//! gas share of that estimate, the price tolerance on the best case, and for Private delivery
+//! the shield fee are deducted to give the minimum. Solvers may charge less gas than the share
+//! allows, and the surplus still reaches the user. The declared gas limit only caps execution
+//! and is not priced. The hook gas estimate depends only on the chain and transaction shapes.
+//! It reads no chain state and sends nothing to an RPC, so it works before delegation and never
+//! exposes a signed hook.
 //!
 //! # Calibration
 //!
-//! Gas here is what a hook adds to a settlement: the hook call's own gas, the trampoline's call
-//! overhead, and the hook calldata. It errs high on purpose. A high estimate only lowers the
+//! Hook gas here is what a hook adds to a settlement: the hook call's own gas, the trampoline's
+//! call overhead, and the hook calldata. It errs high on purpose. A high estimate only lowers the
 //! guaranteed minimum, and the surplus still reaches the user. A low one makes the order
 //! unattractive to solvers.
 //!
 //! The Railgun parts come from the shared per-chain model, [`RailgunGasModel`], in its
-//! [`GasEstimateMode::UpperBound`] mode for signing limits and
-//! [`GasEstimateMode::Expected`] mode for displayed outcomes: the `RelayAdapt7702` execute
-//! ([`RailgunGasModel::executor`]), the pre-hook's `transact`, and the post-hook's one-leaf
-//! shield. Its docs hold the calibration and the per-chain samples. Only the calls a hook adds
+//! [`GasEstimateMode::UpperBound`] mode for the gas estimate and signing limits: the
+//! `RelayAdapt7702` execute ([`RailgunGasModel::executor`]), the pre-hook's `transact`, and the
+//! post-hook's one-leaf shield. Its docs hold the calibration and the per-chain samples. Only the calls a hook adds
 //! around them are measured here, on anvil 1.7.1 mainnet forks at blocks 26,060,041, 26,060,057
 //! and 26,060,078 with the executor delegated to `RelayAdapt7702` `0x05ae…d963`, running through
 //! a copy of `HooksTrampoline` with fresh executors so every slot starts cold. They don't depend
@@ -41,7 +43,7 @@ use alloy::primitives::{Address, U256, uint};
 use broadcaster_core::contracts::shield::{ShieldFeeError, min_shield_amount};
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel, TransactionShape};
 
-use super::CowQuoteParameters;
+use super::{CowQuote, CowQuoteParameters};
 use crate::{FEE_BASIS_POINTS_DENOMINATOR, railgun_protocol_fee_amount};
 
 /// The pre-hook's deadline guard, first exact approval, and trampoline call overhead.
@@ -58,6 +60,13 @@ const ACROSS_APPROVE_GAS: u64 = 30_000;
 const ACROSS_DEPOSIT_GAS: u64 = 60_000;
 
 const WEI_PER_NATIVE: U256 = uint!(1_000_000_000_000_000_000_U256);
+
+/// The Tight preset: the order's minimum deducts 10% of the gas estimate.
+pub const GAS_SHARE_TIGHT_BPS: u16 = 1_000;
+/// The Balanced preset and a new swap's default: 25% of the gas estimate.
+pub const GAS_SHARE_BALANCED_BPS: u16 = 2_500;
+/// The Loose preset: the whole gas estimate.
+pub const GAS_SHARE_LOOSE_BPS: u16 = 10_000;
 
 /// Calls a pre-hook makes besides the deadline guard and the exact approval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -141,26 +150,36 @@ pub struct OrderLimitParams<'a> {
     /// `sellAmount + feeAmount`, `buyAmount` is the expected output after `CoW`'s network and
     /// protocol fees.
     pub quote: &'a CowQuoteParameters,
-    /// Sum of the gas estimates of the order's hooks, without the declared limits' margin: the
+    /// The quote's swap gas units, from [`quote_gas_units`].
+    pub quote_gas_units: u64,
+    /// Sum of the conservative gas estimates of the order's hooks, in
+    /// [`GasEstimateMode::UpperBound`] mode and without the declared limits' margin: the
     /// pre-hook, and any post-hook.
     pub hook_gas: u64,
-    /// RPC gas price in wei, including any cushion selected by the caller. The quote's gas
-    /// price does not change the hook allowance.
+    /// RPC gas price in wei, including the cushion selected by the caller. It prices both the
+    /// swap gas and the hook gas. The quote's gas price is never read.
     pub gas_price_wei: u128,
     /// Additional native cost for posting the hooks' calldata on rollups.
     pub hook_data_cost_wei: U256,
     pub native_rate: NativeBuyRate,
-    pub slippage_bps: u32,
+    /// Price tolerance applied to the best case, in basis points.
+    pub price_tolerance_bps: u32,
+    /// Share of the gas estimate the minimum deducts, in basis points of 10,000.
+    pub gas_share_bps: u16,
     /// Zero for an order that pays an External receiver and so carries no shield.
     pub shield_fee_bps: U256,
 }
 
-/// The order limit for a quote.
+/// The order limit for a quote. Amounts are in buy-token base units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderLimit {
-    /// Hook gas cost in buy-token base units.
-    pub hook_cost: U256,
-    /// Suggested minimum received privately, after the shield fee.
+    /// The quoted buy amount with `CoW`'s network fee added back at the quoted trading rate.
+    pub best_case: U256,
+    /// The gas estimate: swap and hook gas at the cushioned RPC price, plus rollup data cost.
+    pub gas_estimate: U256,
+    /// The share of `gas_estimate` the minimum deducts, rounded up.
+    pub gas_allowance: U256,
+    /// Suggested minimum received privately after the shield fee, or by an External receiver.
     pub min_received: U256,
     /// The order's `buyAmount` for `min_received`.
     pub buy_amount: U256,
@@ -168,74 +187,150 @@ pub struct OrderLimit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OrderLimitError {
-    #[error("hook gas costs at least the quoted output")]
+    /// The allowed gas leaves no positive minimum.
+    #[error("gas costs at least the quoted output")]
     HookCostExceedsOutput {
         buy_token: Address,
-        /// Estimated hook cost in buy-token base units.
-        hook_cost: U256,
-        /// Quoted output before hook costs, in buy-token base units.
-        quoted_output: U256,
+        /// The gas estimate in buy-token base units.
+        gas_estimate: U256,
+        /// The quote's best case, in buy-token base units.
+        best_case: U256,
     },
-    #[error("nothing is left to receive after slippage and the shield fee")]
+    #[error("nothing is left to receive after the price tolerance and the shield fee")]
     NothingToReceive,
-    #[error("slippage must be below 10000 basis points")]
-    InvalidSlippage,
+    #[error("the price tolerance must be below 10000 basis points")]
+    InvalidPriceTolerance,
+    #[error("the gas share must be at most 10000 basis points")]
+    InvalidGasShare,
     #[error("the quote's native price can't be used")]
     InvalidQuotePrice,
+    #[error("the quote's gas amount can't be used")]
+    InvalidQuoteGas,
     #[error(transparent)]
     ShieldFee(#[from] ShieldFeeError),
     #[error("order amounts overflow")]
     Overflow,
 }
 
-/// Prices hook gas, slippage, and the shield fee into the order limit.
+/// Prices the gas share, the price tolerance, and the shield fee into the order limit.
 ///
-/// The suggested minimum is
-/// `M = net((quoted - ceil(hook_cost)) * (10000 - slippage) / 10000)`, where `net` is Railgun's
-/// inclusive shield fee deduction, `x - floor(x * fee / 10000)`. The order's `buyAmount` is
-/// [`order_buy_amount`] of `M`. Every rounding lowers `M`: the hook cost and the quote-derived
-/// rate round up, and slippage rounds down. `M` is thus never more than the quote supports, and
-/// `buyAmount` never exceeds the amount delivered after slippage.
+/// With the best case `best = buyAmount + floor(feeAmount * buyAmount / sellAmount)`, the gas
+/// estimate `G = ceil(((swap_gas + hook_gas) * gas_price + data_cost) * rate / 1e18)` and the
+/// allowance `A = ceil(G * share / 10000)`, the suggested minimum is
+/// `M = net(floor(best * (10000 - tolerance) / 10000) - A)`, where `net` is Railgun's inclusive
+/// shield fee deduction, `x - floor(x * fee / 10000)`. A nonpositive amount before `net` is
+/// [`OrderLimitError::HookCostExceedsOutput`]. The order's `buyAmount` is [`order_buy_amount`]
+/// of `M`. Every rounding lowers `M`:
+/// the gas estimate, the allowance and the quote-derived rate round up, and the network fee and
+/// the tolerance round down. `M` is thus never more than the quote supports, and `buyAmount`
+/// never exceeds the amount delivered after the tolerance and the allowance.
 pub fn price_order_limit(params: &OrderLimitParams<'_>) -> Result<OrderLimit, OrderLimitError> {
-    let slippage = U256::from(params.slippage_bps);
-    if slippage >= FEE_BASIS_POINTS_DENOMINATOR {
-        return Err(OrderLimitError::InvalidSlippage);
+    let tolerance = U256::from(params.price_tolerance_bps);
+    if tolerance >= FEE_BASIS_POINTS_DENOMINATOR {
+        return Err(OrderLimitError::InvalidPriceTolerance);
+    }
+    let share = U256::from(params.gas_share_bps);
+    if share > FEE_BASIS_POINTS_DENOMINATOR {
+        return Err(OrderLimitError::InvalidGasShare);
     }
     if params.shield_fee_bps >= FEE_BASIS_POINTS_DENOMINATOR {
         return Err(ShieldFeeError::FeeTooHigh.into());
     }
+    let quote = params.quote;
+    if quote.sell_amount.is_zero() {
+        return Err(OrderLimitError::InvalidQuotePrice);
+    }
     let rate = match params.native_rate {
         NativeBuyRate::Anchor(rate) => rate,
-        NativeBuyRate::Quote => quote_native_to_buy_rate(params.quote)?,
+        NativeBuyRate::Quote => quote_native_to_buy_rate(quote)?,
     };
-    let hook_wei = U256::from(params.hook_gas)
+    let gas_wei = (U256::from(params.quote_gas_units) + U256::from(params.hook_gas))
         .checked_mul(U256::from(params.gas_price_wei))
         .and_then(|cost| cost.checked_add(params.hook_data_cost_wei))
         .ok_or(OrderLimitError::Overflow)?;
-    let hook_cost = hook_wei
+    let gas_estimate = gas_wei
         .checked_mul(rate)
         .ok_or(OrderLimitError::Overflow)?
         .div_ceil(WEI_PER_NATIVE);
-    let after_hooks = params
-        .quote
+    let network_fee = quote
+        .fee_amount
+        .checked_mul(quote.buy_amount)
+        .ok_or(OrderLimitError::Overflow)?
+        / quote.sell_amount;
+    let best_case = quote
         .buy_amount
-        .checked_sub(hook_cost)
-        .filter(|amount| !amount.is_zero())
-        .ok_or(OrderLimitError::HookCostExceedsOutput {
-            buy_token: params.quote.buy_token,
-            hook_cost,
-            quoted_output: params.quote.buy_amount,
-        })?;
-    let delivered = after_hooks
-        .checked_mul(FEE_BASIS_POINTS_DENOMINATOR - slippage)
+        .checked_add(network_fee)
+        .ok_or(OrderLimitError::Overflow)?;
+    let gas_allowance = gas_estimate
+        .checked_mul(share)
+        .ok_or(OrderLimitError::Overflow)?
+        .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
+    let tolerated = best_case
+        .checked_mul(FEE_BASIS_POINTS_DENOMINATOR - tolerance)
         .ok_or(OrderLimitError::Overflow)?
         / FEE_BASIS_POINTS_DENOMINATOR;
-    let min_received = delivered - railgun_protocol_fee_amount(delivered, params.shield_fee_bps);
+    let pre_fee = tolerated
+        .checked_sub(gas_allowance)
+        .filter(|amount| !amount.is_zero())
+        .ok_or(OrderLimitError::HookCostExceedsOutput {
+            buy_token: quote.buy_token,
+            gas_estimate,
+            best_case,
+        })?;
+    let min_received = pre_fee - railgun_protocol_fee_amount(pre_fee, params.shield_fee_bps);
     Ok(OrderLimit {
-        hook_cost,
+        best_case,
+        gas_estimate,
+        gas_allowance,
         min_received,
         buy_amount: order_buy_amount(min_received, params.shield_fee_bps)?,
     })
+}
+
+/// The quote's swap gas units from its `gasAmount`, rounded up to a whole unit.
+pub fn quote_gas_units(quote: &CowQuoteParameters) -> Result<u64, OrderLimitError> {
+    let (mantissa, exponent) =
+        parse_decimal(&quote.gas_amount).ok_or(OrderLimitError::InvalidQuoteGas)?;
+    let power = U256::from(10_u8).checked_pow(U256::from(exponent.unsigned_abs()));
+    let units = if exponent >= 0 {
+        power.and_then(|power| mantissa.checked_mul(power))
+    } else {
+        // A divisor beyond `U256` leaves less than one unit, which rounds up to one.
+        Some(power.map_or_else(
+            || {
+                if mantissa.is_zero() {
+                    U256::ZERO
+                } else {
+                    U256::ONE
+                }
+            },
+            |power| mantissa.div_ceil(power),
+        ))
+    };
+    units
+        .and_then(|units| u64::try_from(units).ok())
+        .ok_or(OrderLimitError::InvalidQuoteGas)
+}
+
+/// `CoW`'s protocol fee for display, in buy-token base units. A sell quote's `buyAmount` is
+/// already net of it, so it is `floor(buyAmount * bps / (10000 - bps))` for the quote's
+/// possibly fractional `protocolFeeBps`. `None` when the quote omits the fee or states one
+/// that can't be used.
+#[must_use]
+pub fn quote_protocol_fee(quote: &CowQuote) -> Option<U256> {
+    let (mantissa, exponent) = parse_decimal(quote.protocol_fee_bps.as_deref()?)?;
+    let power = U256::from(10_u8).checked_pow(U256::from(exponent.unsigned_abs()))?;
+    // bps = numerator / scale, in integers.
+    let (numerator, scale) = if exponent >= 0 {
+        (mantissa.checked_mul(power)?, U256::ONE)
+    } else {
+        (mantissa, power)
+    };
+    let denominator = FEE_BASIS_POINTS_DENOMINATOR
+        .checked_mul(scale)?
+        .checked_sub(numerator)
+        .filter(|denominator| !denominator.is_zero())?;
+    Some(quote.quote.buy_amount.checked_mul(numerator)? / denominator)
 }
 
 /// The order's `buyAmount` for a minimum received privately: the smallest amount whose net
@@ -393,93 +488,166 @@ mod tests {
         assert!(post_hook_gas(&POLYGON_GAS_MODEL, GasEstimateMode::UpperBound) >= 936_417);
     }
 
+    /// The spec's Balanced example with the other presets' extremes: a best case of 9.9586
+    /// USDT, a 0.1% tolerance, a 5.90 USDT gas estimate from 200,000 swap and 1,800,000 hook gas
+    /// at 1 gwei and 2,950 USDT per ETH, and a 25 bp shield fee.
     #[test]
-    fn order_limit_prices_hook_gas_slippage_and_shield_fee() {
-        // 1,000 USDC quoted; 2M gas at 1 gwei costs 6 USDC at 3,000 USDC/native.
-        // A rollup's additional 0.001 native data cost must also reduce the order limit.
-        let quote = quote(1, 1_000_000_000, "1");
-        for (data_cost, total_cost, received) in [
-            (0_u64, 6_000_000_u64, 986_557_425_u64),
-            (1_000_000_000_000_000, 9_000_000, 983_579_888),
-        ] {
-            let limit = price_order_limit(&OrderLimitParams {
-                quote: &quote,
-                hook_gas: 2_000_000,
-                gas_price_wei: 1_000_000_000,
-                hook_data_cost_wei: U256::from(data_cost),
-                native_rate: NativeBuyRate::Anchor(U256::from(3_000_000_000_u64)),
-                slippage_bps: 50,
-                shield_fee_bps: U256::from(25),
-            })
-            .unwrap();
-            assert_eq!(limit.hook_cost, U256::from(total_cost));
-            assert_eq!(limit.min_received, U256::from(received));
-            assert_eq!(
-                limit.buy_amount,
-                min_shield_amount(limit.min_received, U256::from(25)).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn order_limit_uses_the_supplied_gas_price_without_a_cow_floor() {
-        // A 10 USDC swap quoted about 9.12 USDT, but CoW's 1.34 gwei
-        // inflated the hook allowance. Price 2M gas at the supplied 0.25 gwei.
-        let quote = quote(10_000_000, 9_120_000, "1");
+    fn gas_share_deducts_its_part_of_one_gas_estimate() {
+        let mut quote = quote(1_000_000, 9_958_600, "1");
+        quote.gas_amount = "200000".to_owned();
+        quote.gas_price = "1339699137".to_owned();
         let params = OrderLimitParams {
             quote: &quote,
-            hook_gas: 2_000_000,
-            gas_price_wei: 250_000_000,
+            quote_gas_units: quote_gas_units(&quote).unwrap(),
+            hook_gas: 1_800_000,
+            gas_price_wei: 1_000_000_000,
             hook_data_cost_wei: U256::ZERO,
-            native_rate: NativeBuyRate::Anchor(U256::from(3_000_000_000_u64)),
-            slippage_bps: 50,
+            native_rate: NativeBuyRate::Anchor(U256::from(2_950_000_000_u64)),
+            price_tolerance_bps: 10,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
             shield_fee_bps: U256::from(25),
         };
-        let limit = price_order_limit(&params).unwrap();
-        assert_eq!(limit.hook_cost, U256::from(1_500_000));
-        assert_eq!(limit.min_received, U256::from(7_562_946));
-
-        // Raising the supplied price still lowers the minimum.
-        let higher = price_order_limit(&OrderLimitParams {
-            gas_price_wei: 1_000_000_000,
-            ..params
-        })
-        .unwrap();
-        assert!(higher.hook_cost > limit.hook_cost);
-        assert!(higher.min_received < limit.min_received);
+        // 9.9586 * 0.999 = 9.948641 before any gas; 25% of 5.90 USDT is 1.475 USDT.
+        for (share, allowance, pre_fee, received) in [
+            (0, 0_u64, 9_948_641_u64, 9_923_770_u64),
+            (GAS_SHARE_BALANCED_BPS, 1_475_000, 8_473_641, 8_452_457),
+            (GAS_SHARE_LOOSE_BPS, 5_900_000, 4_048_641, 4_038_520),
+        ] {
+            let limit = price_order_limit(&OrderLimitParams {
+                gas_share_bps: share,
+                ..params
+            })
+            .unwrap();
+            assert_eq!(
+                (limit.best_case, limit.gas_estimate, limit.gas_allowance),
+                (
+                    U256::from(9_958_600),
+                    U256::from(5_900_000),
+                    U256::from(allowance)
+                ),
+                "{share}"
+            );
+            assert_eq!(limit.min_received, U256::from(received), "{share}");
+            assert_eq!(limit.buy_amount, U256::from(pre_fee), "{share}");
+        }
 
         // The quote's gas price is informational, even if it cannot be parsed.
-        for cow_price in ["1339699137", "1e100", "NaN"] {
+        let limit = price_order_limit(&params).unwrap();
+        for cow_price in ["1", "1e100", "NaN"] {
             let mut quote = quote.clone();
             quote.gas_price = cow_price.into();
             assert_eq!(
                 price_order_limit(&OrderLimitParams {
                     quote: &quote,
                     ..params
-                })
-                .unwrap(),
-                limit
+                }),
+                Ok(limit),
+                "{cow_price}"
+            );
+        }
+        assert_eq!(
+            price_order_limit(&OrderLimitParams {
+                gas_share_bps: GAS_SHARE_LOOSE_BPS + 1,
+                ..params
+            }),
+            Err(OrderLimitError::InvalidGasShare)
+        );
+    }
+
+    /// Without a network fee, swap gas or tolerance, Loose deducts the whole hook cost like the
+    /// minimum before gas shares: `net(buyAmount - ceil(hook_cost))`.
+    #[test]
+    fn loose_share_matches_the_minimum_before_gas_shares() {
+        // 1,000 USDC quoted; 2M gas at 1 gwei costs 6 USDC at 3,000 USDC/native, and a rollup's
+        // additional 0.001 native data cost 3 USDC more.
+        let quote = quote(1, 1_000_000_000, "1");
+        for (data_cost, hook_cost) in [(0_u64, 6_000_000_u64), (1_000_000_000_000_000, 9_000_000)] {
+            let limit = price_order_limit(&OrderLimitParams {
+                quote: &quote,
+                quote_gas_units: 0,
+                hook_gas: 2_000_000,
+                gas_price_wei: 1_000_000_000,
+                hook_data_cost_wei: U256::from(data_cost),
+                native_rate: NativeBuyRate::Anchor(U256::from(3_000_000_000_u64)),
+                price_tolerance_bps: 0,
+                gas_share_bps: GAS_SHARE_LOOSE_BPS,
+                shield_fee_bps: U256::from(25),
+            })
+            .unwrap();
+            let delivered = quote.buy_amount - U256::from(hook_cost);
+            let previous = delivered - delivered * U256::from(25) / U256::from(10_000);
+            assert_eq!(limit.gas_estimate, U256::from(hook_cost));
+            assert_eq!(limit.gas_allowance, limit.gas_estimate);
+            assert_eq!(limit.min_received, previous);
+            assert_eq!(
+                limit.buy_amount,
+                min_shield_amount(previous, U256::from(25)).unwrap()
             );
         }
     }
 
     #[test]
     fn rounding_never_overstates_the_minimum() {
-        // 1 wei of gas cost rounds up to one base unit; 10,001 * 0.9999 rounds down to 9,999.
+        // 1 wei of gas cost rounds up to one base unit, and so does any share of it;
+        // 10,002 * 0.9999 rounds down to 10,000.
         let quote = quote(1, 10_002, "1");
-        let limit = price_order_limit(&OrderLimitParams {
+        let params = OrderLimitParams {
             quote: &quote,
+            quote_gas_units: 0,
             hook_gas: 1,
             gas_price_wei: 1,
             hook_data_cost_wei: U256::ZERO,
             native_rate: NativeBuyRate::Anchor(U256::ONE),
-            slippage_bps: 1,
+            price_tolerance_bps: 1,
+            gas_share_bps: GAS_SHARE_LOOSE_BPS,
             shield_fee_bps: U256::from(25),
-        })
-        .unwrap();
-        assert_eq!(limit.hook_cost, U256::ONE);
-        assert_eq!(limit.min_received, U256::from(9_975));
-        assert_eq!(limit.buy_amount, U256::from(9_999));
+        };
+        for share in [GAS_SHARE_TIGHT_BPS, GAS_SHARE_LOOSE_BPS] {
+            let limit = price_order_limit(&OrderLimitParams {
+                gas_share_bps: share,
+                ..params
+            })
+            .unwrap();
+            assert_eq!(
+                (limit.gas_estimate, limit.gas_allowance),
+                (U256::ONE, U256::ONE)
+            );
+            assert_eq!(limit.min_received, U256::from(9_975));
+            assert_eq!(limit.buy_amount, U256::from(9_999));
+        }
+
+        // The network fee converts at the quoted rate and rounds down: 10,002 / 4 is 2,500.5.
+        let mut with_fee = self::quote(4, 10_002, "1");
+        with_fee.fee_amount = U256::ONE;
+        assert_eq!(
+            price_order_limit(&OrderLimitParams {
+                quote: &with_fee,
+                ..params
+            })
+            .unwrap()
+            .best_case,
+            U256::from(12_502)
+        );
+
+        // Fractional swap gas rounds up; an unusable amount stops pricing.
+        for (gas, units) in [
+            ("232610", 232_610),
+            ("232610.2", 232_611),
+            ("2.3261E5", 232_610),
+        ] {
+            let mut quote = quote.clone();
+            quote.gas_amount = gas.into();
+            assert_eq!(quote_gas_units(&quote), Ok(units), "{gas}");
+        }
+        for gas in ["", "NaN", "-1", "1e30"] {
+            let mut quote = quote.clone();
+            quote.gas_amount = gas.into();
+            assert_eq!(
+                quote_gas_units(&quote),
+                Err(OrderLimitError::InvalidQuoteGas),
+                "{gas}"
+            );
+        }
 
         // A quote-derived rate of 1e18 / 3 rounds up.
         let quote = self::quote(1, 1, "3");
@@ -510,16 +678,18 @@ mod tests {
     }
 
     #[test]
-    fn hook_cost_at_or_above_the_output_is_rejected() {
+    fn allowed_gas_at_or_above_the_output_is_rejected_with_the_gas_estimate() {
         let mut quote = quote(1, 6_000_000, "1");
         quote.buy_token = Address::repeat_byte(2);
         let params = OrderLimitParams {
             quote: &quote,
+            quote_gas_units: 0,
             hook_gas: 2_000_000,
             gas_price_wei: 1_000_000_000,
             hook_data_cost_wei: U256::ZERO,
             native_rate: NativeBuyRate::Anchor(U256::from(3_000_000_000_u64)),
-            slippage_bps: 0,
+            price_tolerance_bps: 0,
+            gas_share_bps: GAS_SHARE_LOOSE_BPS,
             shield_fee_bps: U256::from(25),
         };
         for hook_gas in [2_000_000, 3_000_000] {
@@ -527,10 +697,18 @@ mod tests {
                 price_order_limit(&OrderLimitParams { hook_gas, ..params }),
                 Err(OrderLimitError::HookCostExceedsOutput {
                     buy_token: quote.buy_token,
-                    hook_cost: U256::from(hook_gas * 3),
-                    quoted_output: quote.buy_amount,
+                    gas_estimate: U256::from(hook_gas * 3),
+                    best_case: quote.buy_amount,
                 })
             );
         }
+        // A smaller share of the same estimate leaves a positive minimum.
+        assert!(
+            price_order_limit(&OrderLimitParams {
+                gas_share_bps: GAS_SHARE_BALANCED_BPS,
+                ..params
+            })
+            .is_ok()
+        );
     }
 }

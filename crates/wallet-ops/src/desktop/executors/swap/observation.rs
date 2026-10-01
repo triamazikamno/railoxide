@@ -670,6 +670,10 @@ async fn read_swap_facts(
                     sell_amount: trade.sellAmount,
                     buy_amount: trade.buyAmount,
                     fee_amount: trade.feeAmount,
+                    settlement_gas_used: None,
+                    settlement_effective_gas_price: None,
+                    executed_fee: None,
+                    executed_fee_token: None,
                 });
                 break;
             }

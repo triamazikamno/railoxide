@@ -125,7 +125,9 @@ impl AcrossClient {
             .collect())
     }
 
-    /// `GET /suggested-fees` with only the tokens, chains and amount.
+    /// `GET /suggested-fees` with only the tokens, chains and amount. The output amount is in
+    /// the output token's units, whose decimals may differ from the input's, as for USDC and
+    /// USDT on BNB Chain; Across refuses such a pair unless the request allows it.
     pub async fn suggested_fees(
         &self,
         request: &AcrossFeeRequest,
@@ -143,6 +145,7 @@ impl AcrossClient {
                 ("originChainId", origin.as_str()),
                 ("destinationChainId", destination.as_str()),
                 ("amount", amount.as_str()),
+                ("allowUnmatchedDecimals", "true"),
             ],
         );
         let fees: SuggestedFeesBody = self.inner.json("fee quote", request).await?;

@@ -6,24 +6,28 @@ use std::time::{Duration, Instant};
 use super::DeliveryMode;
 use alloy::primitives::U256;
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
-    prelude::FluentBuilder as _, px, relative, rgb,
+    Anchor, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::ButtonVariants,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList},
     input::{InputEvent, InputState},
+    popover::Popover,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text, app_text};
-use ui::private_action::asset_row;
+use ui::controls::{
+    app_amount_text, app_button, app_button_base, app_masked_input, app_muted_text,
+    app_strong_text, app_text,
+};
+use ui::hint::hint_card;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
 #[cfg(feature = "hardware")]
@@ -60,6 +64,8 @@ const SUMMARY_RECIPIENT_SUFFIX_CHARS: usize = 8;
 const SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS: usize = 28;
 /// Wide enough for the longest lifetime label, "Until vault locks/app closes".
 const SPEND_AUTHORIZATION_LIFETIME_SELECT_WIDTH: gpui::Pixels = px(248.0);
+/// The least height of a compact row, which fits its info button.
+const SUMMARY_COMPACT_ROW_MIN_HEIGHT: gpui::Pixels = px(26.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationLifetime {
@@ -184,7 +190,7 @@ impl SpendAuthorizationCache {
 pub(super) enum SpendAuthorizationIntent {
     ExecutorGasPassword {
         intent: Box<Self>,
-        summary: SpendAuthorizationSummary,
+        summary: Box<SpendAuthorizationSummary>,
         payer: String,
     },
     StealthAccounts(
@@ -513,16 +519,17 @@ pub(super) struct SpendAuthorizationSummary {
     title: Arc<str>,
     detail: Arc<str>,
     confirm_label: Arc<str>,
-    context: Option<SpendAuthorizationContext>,
-    asset_pair: Option<[SpendAuthorizationAsset; 2]>,
+    context: Option<Arc<str>>,
+    cards: Option<[SpendAuthorizationCard; 2]>,
     rows: Vec<SpendAuthorizationSummaryRow>,
+    compact_rows: bool,
     warnings: Vec<Arc<str>>,
     payload: Option<SpendAuthorizationPayload>,
     requires_explicit_review: bool,
-    progress: Option<SpendAuthorizationProgress>,
+    steps: Option<SpendAuthorizationSteps>,
     title_chip: Option<Arc<str>>,
     details: Option<SpendAuthorizationDetails>,
-    once_lifetime_note: Option<Arc<str>>,
+    disclosure: Option<SpendAuthorizationDisclosure>,
 }
 
 impl SpendAuthorizationSummary {
@@ -536,15 +543,16 @@ impl SpendAuthorizationSummary {
             detail: detail.into(),
             confirm_label: "Authorize and continue".into(),
             context: None,
-            asset_pair: None,
+            cards: None,
             rows,
+            compact_rows: false,
             warnings: Vec::new(),
             payload: None,
             requires_explicit_review: false,
-            progress: None,
+            steps: None,
             title_chip: None,
             details: None,
-            once_lifetime_note: None,
+            disclosure: None,
         }
     }
 
@@ -554,28 +562,37 @@ impl SpendAuthorizationSummary {
     }
 
     pub(super) fn with_context(mut self, context: impl Into<Arc<str>>) -> Self {
-        self.context = Some(SpendAuthorizationContext::Text(context.into()));
+        self.context = Some(context.into());
         self
     }
 
-    pub(super) fn with_info_context(
+    /// Two cards above the rows: what the spend gives up, then what it receives.
+    pub(super) fn with_cards(
         mut self,
-        title: impl Into<Arc<str>>,
-        message: impl Into<Arc<str>>,
+        sell: SpendAuthorizationCard,
+        receive: SpendAuthorizationCard,
     ) -> Self {
-        self.context = Some(SpendAuthorizationContext::Info {
-            title: title.into(),
-            message: message.into(),
+        self.cards = Some([sell, receive]);
+        self
+    }
+
+    /// Show each row on one line, its value right-aligned and its hint behind an info button.
+    pub(super) const fn with_compact_rows(mut self) -> Self {
+        self.compact_rows = true;
+        self
+    }
+
+    /// An alert under the rows that names what the spend makes public. `summary` is its
+    /// message under the hint's title, and the hint's card holds the full text.
+    pub(super) fn with_disclosure(
+        mut self,
+        summary: impl Into<Arc<str>>,
+        hint: SpendAuthorizationHint,
+    ) -> Self {
+        self.disclosure = Some(SpendAuthorizationDisclosure {
+            summary: summary.into(),
+            hint,
         });
-        self
-    }
-
-    pub(super) fn with_asset_pair(
-        mut self,
-        sell: SpendAuthorizationAsset,
-        buy: SpendAuthorizationAsset,
-    ) -> Self {
-        self.asset_pair = Some([sell, buy]);
         self
     }
 
@@ -584,17 +601,18 @@ impl SpendAuthorizationSummary {
         self
     }
 
-    /// A step indicator under the title: `step` of `total` dots filled, then `note`.
-    pub(super) fn with_progress(
+    /// A stepper under the title: the steps named by `labels`, of which `current`, counted
+    /// from one, is the one this dialog authorizes. `hint` explains them.
+    pub(super) fn with_steps<L: Into<Arc<str>>>(
         mut self,
-        step: usize,
-        total: usize,
-        note: impl Into<Arc<str>>,
+        current: usize,
+        labels: impl IntoIterator<Item = L>,
+        hint: SpendAuthorizationHint,
     ) -> Self {
-        self.progress = Some(SpendAuthorizationProgress {
-            step,
-            total,
-            note: note.into(),
+        self.steps = Some(SpendAuthorizationSteps {
+            current,
+            labels: labels.into_iter().map(Into::into).collect(),
+            hint,
         });
         self
     }
@@ -605,7 +623,7 @@ impl SpendAuthorizationSummary {
         self
     }
 
-    /// A collapsed disclosure under the rows. With it, the rows and the disclosure share a card.
+    /// A collapsed disclosure under the rows, laid out as one more compact row.
     pub(super) fn with_details<L, V>(
         mut self,
         title: impl Into<Arc<str>>,
@@ -626,12 +644,6 @@ impl SpendAuthorizationSummary {
                 .collect(),
             note: note.map(Arc::from),
         });
-        self
-    }
-
-    /// A hint under the lifetime select while it offers only this spend.
-    pub(super) fn with_once_lifetime_note(mut self, note: impl Into<Arc<str>>) -> Self {
-        self.once_lifetime_note = Some(note.into());
         self
     }
 
@@ -685,21 +697,170 @@ impl SpendAuthorizationSummary {
         })
     }
 
-    /// The context's message, under its title when it has one.
+    /// The details disclosure's note.
     #[cfg(test)]
-    pub(in crate::root) fn context_for_test(&self) -> Option<String> {
-        self.context.as_ref().map(|context| match context {
-            SpendAuthorizationContext::Text(message)
-            | SpendAuthorizationContext::Info { message, .. } => message.to_string(),
+    pub(in crate::root) fn details_note_for_test(&self) -> Option<String> {
+        self.details
+            .as_ref()
+            .and_then(|details| details.note.as_deref().map(str::to_owned))
+    }
+
+    /// The text of the hint behind the info button of the row labelled `label`.
+    #[cfg(test)]
+    pub(in crate::root) fn row_hint_for_test(&self, label: &str) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|row| row.label.as_ref() == label)
+            .and_then(|row| row.hint.as_ref())
+            .map(SpendAuthorizationHint::text_for_test)
+    }
+
+    /// The disclosure alert's summary, its card's text, and whether it warns.
+    #[cfg(test)]
+    pub(in crate::root) fn disclosure_for_test(&self) -> Option<(String, String, bool)> {
+        self.disclosure.as_ref().map(|disclosure| {
+            (
+                disclosure.summary.to_string(),
+                disclosure.hint.text_for_test(),
+                disclosure.hint.warning.is_some(),
+            )
+        })
+    }
+
+    /// The Receive card's label, amount and text lines.
+    #[cfg(test)]
+    pub(in crate::root) fn receive_card_for_test(&self) -> Option<(String, String, Vec<String>)> {
+        self.cards.as_ref().map(|[_, receive]| {
+            (
+                receive.label.to_string(),
+                receive.amount.to_string(),
+                receive
+                    .lines
+                    .iter()
+                    .filter_map(|line| match line {
+                        SpendAuthorizationCardLine::Text {
+                            before,
+                            strong,
+                            after,
+                        } => Some(
+                            [before, strong, after]
+                                .into_iter()
+                                .filter(|part| !part.is_empty())
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        SpendAuthorizationCardLine::Receiver { .. } => None,
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    /// The Sell and Receive cards' amount changes, each with whether it is adverse.
+    #[cfg(test)]
+    pub(in crate::root) fn card_deltas_for_test(&self) -> [Option<(String, bool)>; 2] {
+        self.cards.as_ref().map_or([None, None], |cards| {
+            cards.each_ref().map(|card| {
+                card.delta
+                    .as_ref()
+                    .map(|delta| (delta.text.clone(), delta.adverse))
+            })
+        })
+    }
+
+    /// The amount change of the row labelled `label`, and whether it is adverse.
+    #[cfg(test)]
+    pub(in crate::root) fn row_delta_for_test(&self, label: &str) -> Option<(String, bool)> {
+        self.rows
+            .iter()
+            .find(|row| row.label.as_ref() == label)
+            .and_then(|row| row.delta.as_ref())
+            .map(|delta| (delta.text.clone(), delta.adverse))
+    }
+
+    /// The address the Receive card's receiver line copies and shows on hover, and the label
+    /// the hover shows before it.
+    #[cfg(test)]
+    pub(in crate::root) fn receiver_for_test(&self) -> Option<(String, Option<String>)> {
+        self.cards.as_ref().and_then(|[_, receive]| {
+            receive.lines.iter().find_map(|line| match line {
+                SpendAuthorizationCardLine::Receiver { address, label } => {
+                    Some((address.to_string(), label.as_deref().map(str::to_owned)))
+                }
+                SpendAuthorizationCardLine::Text { .. } => None,
+            })
         })
     }
 }
 
+/// An explanation behind an info button: a card of paragraphs under a title, shown on hover
+/// and, on click or from the keyboard, in a popover.
 #[derive(Clone)]
-struct SpendAuthorizationProgress {
-    step: usize,
-    total: usize,
-    note: Arc<str>,
+pub(super) struct SpendAuthorizationHint {
+    title: Arc<str>,
+    paragraphs: Vec<Arc<str>>,
+    warning: Option<Arc<str>>,
+    fact: Option<(Arc<str>, Arc<str>)>,
+}
+
+impl SpendAuthorizationHint {
+    pub(super) fn new<P: Into<Arc<str>>>(
+        title: impl Into<Arc<str>>,
+        paragraphs: impl IntoIterator<Item = P>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            paragraphs: paragraphs.into_iter().map(Into::into).collect(),
+            warning: None,
+            fact: None,
+        }
+    }
+
+    /// A last paragraph in the warning colour, which the title takes too.
+    pub(super) fn with_warning(mut self, warning: impl Into<Arc<str>>) -> Self {
+        self.warning = Some(warning.into());
+        self
+    }
+
+    /// A label and its value on a line under the paragraphs.
+    pub(super) fn with_fact(
+        mut self,
+        label: impl Into<Arc<str>>,
+        value: impl Into<Arc<str>>,
+    ) -> Self {
+        self.fact = Some((label.into(), value.into()));
+        self
+    }
+
+    /// The card's text below its title, one paragraph per line.
+    #[cfg(test)]
+    fn text_for_test(&self) -> String {
+        self.paragraphs
+            .iter()
+            .chain(&self.warning)
+            .map(ToString::to_string)
+            .chain(
+                self.fact
+                    .iter()
+                    .map(|(label, value)| format!("{label} {value}")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Clone)]
+struct SpendAuthorizationSteps {
+    current: usize,
+    labels: Vec<Arc<str>>,
+    hint: SpendAuthorizationHint,
+}
+
+#[derive(Clone)]
+struct SpendAuthorizationDisclosure {
+    summary: Arc<str>,
+    hint: SpendAuthorizationHint,
 }
 
 #[derive(Clone)]
@@ -710,24 +871,103 @@ struct SpendAuthorizationDetails {
     note: Option<Arc<str>>,
 }
 
+/// An amount card of a review: a small label, the token's icon and amount, the amount's
+/// change beside it, the amount's USD value at the right edge, then small lines.
 #[derive(Clone)]
-enum SpendAuthorizationContext {
-    Text(Arc<str>),
-    Info { title: Arc<str>, message: Arc<str> },
-}
-
-#[derive(Clone)]
-pub(super) struct SpendAuthorizationAsset {
+pub(super) struct SpendAuthorizationCard {
     label: Arc<str>,
+    amount: Arc<str>,
+    delta: Option<SpendAuthorizationAmountDelta>,
     icon: Option<WalletIconSource>,
+    usd: Option<Arc<str>>,
+    lines: Vec<SpendAuthorizationCardLine>,
 }
 
-impl SpendAuthorizationAsset {
-    pub(super) fn new(label: impl Into<Arc<str>>, icon: Option<WalletIconSource>) -> Self {
+#[derive(Clone)]
+enum SpendAuthorizationCardLine {
+    /// `strong` stands out between `before` and `after`. Empty parts are left out.
+    Text {
+        before: Arc<str>,
+        strong: Arc<str>,
+        after: Arc<str>,
+    },
+    /// "to" and the shortened `address`, with a copy button for the full address. Hovering
+    /// shows the full address, after `label` when it has one.
+    Receiver {
+        address: Arc<str>,
+        label: Option<Arc<str>>,
+    },
+}
+
+impl SpendAuthorizationCard {
+    pub(super) fn new(
+        label: impl Into<Arc<str>>,
+        amount: impl Into<Arc<str>>,
+        icon: Option<WalletIconSource>,
+    ) -> Self {
         Self {
             label: label.into(),
+            amount: amount.into(),
+            delta: None,
             icon,
+            usd: None,
+            lines: Vec::new(),
         }
+    }
+
+    /// The signed difference of the card's amount from `previous`, beside the amount.
+    pub(super) fn with_amount_change(
+        mut self,
+        previous: Option<U256>,
+        current: U256,
+        higher_is_worse: bool,
+        format_amount: impl FnOnce(U256) -> String,
+    ) -> Self {
+        self.delta = SpendAuthorizationAmountDelta::between(
+            previous,
+            current,
+            higher_is_worse,
+            format_amount,
+        );
+        self
+    }
+
+    pub(super) fn with_usd(mut self, usd: Option<String>) -> Self {
+        self.usd = usd.map(Arc::from);
+        self
+    }
+
+    pub(super) fn with_line(self, text: impl Into<Arc<str>>) -> Self {
+        self.with_emphasis(text, "", "")
+    }
+
+    /// A line whose `strong` part stands out between `before` and `after`.
+    pub(super) fn with_emphasis(
+        mut self,
+        before: impl Into<Arc<str>>,
+        strong: impl Into<Arc<str>>,
+        after: impl Into<Arc<str>>,
+    ) -> Self {
+        self.lines.push(SpendAuthorizationCardLine::Text {
+            before: before.into(),
+            strong: strong.into(),
+            after: after.into(),
+        });
+        self
+    }
+
+    /// A line naming the receiver by its shortened `address`, which it copies and shows on
+    /// hover in full. `label` is the wallet's name for the address, when it has one.
+    pub(super) fn with_receiver(
+        mut self,
+        address: impl Into<Arc<str>>,
+        label: Option<String>,
+    ) -> Self {
+        self.lines.push(SpendAuthorizationCardLine::Receiver {
+            address: address.into(),
+            label: label.map(Arc::from),
+        });
+        self
     }
 }
 
@@ -806,17 +1046,37 @@ pub(super) struct SpendAuthorizationSummaryRow {
     value: Arc<str>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
-    /// The value is an address shown in full, with `address_label` above it when known.
-    full_address: bool,
-    address_label: Option<Arc<str>>,
     delta: Option<SpendAuthorizationAmountDelta>,
-    note: Option<Arc<str>>,
+    hint: Option<SpendAuthorizationHint>,
 }
 
 #[derive(Clone)]
 struct SpendAuthorizationAmountDelta {
     text: String,
     adverse: bool,
+}
+
+impl SpendAuthorizationAmountDelta {
+    /// The signed difference of `current` from `previous`, formatted by `format_amount`. `None`
+    /// without a previous amount or when the two are equal.
+    fn between(
+        previous: Option<U256>,
+        current: U256,
+        higher_is_worse: bool,
+        format_amount: impl FnOnce(U256) -> String,
+    ) -> Option<Self> {
+        let previous = previous.filter(|previous| *previous != current)?;
+        let increased = current > previous;
+        let (sign, magnitude) = if increased {
+            ("+", current - previous)
+        } else {
+            ("−", previous - current)
+        };
+        Some(Self {
+            text: format!("{sign}{}", format_amount(magnitude)),
+            adverse: increased == higher_is_worse,
+        })
+    }
 }
 
 impl SpendAuthorizationSummaryRow {
@@ -826,16 +1086,14 @@ impl SpendAuthorizationSummaryRow {
             value: value.into(),
             icon_path: None,
             shortened_copyable: false,
-            full_address: false,
-            address_label: None,
             delta: None,
-            note: None,
+            hint: None,
         }
     }
 
-    /// A muted line under the value. Shown for plain and icon values.
-    pub(super) fn with_note(mut self, note: impl Into<Arc<str>>) -> Self {
-        self.note = Some(note.into());
+    /// An explanation behind an info button at the row's end. Shown for compact rows.
+    pub(super) fn with_hint(mut self, hint: SpendAuthorizationHint) -> Self {
+        self.hint = Some(hint);
         self
     }
 
@@ -849,14 +1107,6 @@ impl SpendAuthorizationSummaryRow {
         self
     }
 
-    /// Show the value, an address, in full with a copy button, so every character can be
-    /// checked before signing. `label` names it above the address when known.
-    pub(super) fn with_full_address(mut self, label: Option<String>) -> Self {
-        self.full_address = true;
-        self.address_label = label.map(Arc::from);
-        self
-    }
-
     pub(super) fn with_amount_change(
         mut self,
         previous: Option<U256>,
@@ -864,37 +1114,18 @@ impl SpendAuthorizationSummaryRow {
         higher_is_worse: bool,
         format_amount: impl FnOnce(U256) -> String,
     ) -> Self {
-        if let Some(previous) = previous.filter(|previous| *previous != current) {
-            let increased = current > previous;
-            let (sign, magnitude) = if increased {
-                ("+", current - previous)
-            } else {
-                ("−", previous - current)
-            };
-            self.delta = Some(SpendAuthorizationAmountDelta {
-                text: format!("{sign}{}", format_amount(magnitude)),
-                adverse: increased == higher_is_worse,
-            });
-        }
+        self.delta = SpendAuthorizationAmountDelta::between(
+            previous,
+            current,
+            higher_is_worse,
+            format_amount,
+        );
         self
     }
 
     #[cfg(test)]
     pub(in crate::root) fn values_for_test(&self) -> (String, String) {
         (self.label.to_string(), self.value.to_string())
-    }
-
-    /// A full-address row's address label and note.
-    #[cfg(test)]
-    pub(in crate::root) fn full_address_for_test(
-        &self,
-    ) -> Option<(Option<String>, Option<String>)> {
-        self.full_address.then(|| {
-            (
-                self.address_label.as_deref().map(str::to_owned),
-                self.note.as_deref().map(str::to_owned),
-            )
-        })
     }
 }
 
@@ -1358,19 +1589,12 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             })
             .into_any_element()
         });
-        let once_lifetime_note = self
-            .summary
-            .once_lifetime_note
-            .as_ref()
-            .filter(|_| self.lifetime == SpendAuthorizationLifetime::Once);
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
-            .when_some(self.summary.progress.as_ref(), |this, progress| {
-                this.child(render_spend_authorization_progress(progress))
-            })
+            .children(render_spend_authorization_steps(&self.summary))
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
@@ -1380,7 +1604,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                 cx,
             ))
             .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(render_spend_authorization_context(context))
+                this.child(app_muted_text(context.to_string()).whitespace_normal())
             })
             .children(
                 self.summary
@@ -1405,13 +1629,6 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                     &self.lifetime_select,
                     self.pending || self.cancelled,
                 ))
-                .when_some(once_lifetime_note, |this, note| {
-                    this.child(
-                        app_muted_text(note.to_string())
-                            .text_xs()
-                            .whitespace_normal(),
-                    )
-                })
             })
             .when(
                 self.review_authorization.is_none()
@@ -1515,15 +1732,13 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .when_some(self.summary.progress.as_ref(), |this, progress| {
-                this.child(render_spend_authorization_progress(progress))
-            })
+            .children(render_spend_authorization_steps(&self.summary))
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
             .child(render_spend_authorization_summary(&self.summary, details, cx))
             .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(render_spend_authorization_context(context))
+                this.child(app_muted_text(context.to_string()).whitespace_normal())
             })
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(
@@ -1609,49 +1824,48 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     }
 }
 
-/// The summary's asset pair and rows. With `details`, the rows and the details disclosure
-/// share a card.
+/// The summary's cards, rows, details disclosure and disclosure alert. Compact rows and the
+/// details disclosure form one list.
 fn render_spend_authorization_summary(
     summary: &SpendAuthorizationSummary,
     details: Option<AnyElement>,
     cx: &App,
 ) -> gpui::Div {
-    let rows = DescriptionList::vertical()
-        .large()
-        .bordered(false)
-        .columns(1)
-        .children(
-            summary
-                .rows
-                .iter()
-                .enumerate()
-                .map(|(row_index, row)| spend_authorization_summary_item(row_index, row, cx)),
-        );
+    let rows =
+        if summary.compact_rows {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .children(summary.rows.iter().enumerate().map(|(row_index, row)| {
+                    render_spend_authorization_compact_row(row_index, row, cx)
+                }))
+                .into_any_element()
+        } else {
+            DescriptionList::vertical()
+                .large()
+                .bordered(false)
+                .columns(1)
+                .children(
+                    summary.rows.iter().enumerate().map(|(row_index, row)| {
+                        spend_authorization_summary_item(row_index, row, cx)
+                    }),
+                )
+                .into_any_element()
+        };
     div()
         .w_full()
         .min_w_0()
         .flex()
         .flex_col()
         .gap_3()
-        .when_some(summary.asset_pair.as_ref(), |this, [sell, buy]| {
-            this.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .text_size(theme::APP_TEXT_SIZE)
-                    .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
-                    .child(asset_row(
-                        sell.label.to_string(),
-                        sell.icon.clone().map(Into::into),
-                    ))
-                    .child(app_text("→"))
-                    .child(asset_row(
-                        buy.label.to_string(),
-                        buy.icon.clone().map(Into::into),
-                    )),
-            )
+        .when_some(summary.cards.as_ref(), |this, cards| {
+            this.child(div().w_full().min_w_0().flex().flex_col().gap_1().children(
+                cards.iter().enumerate().map(|(card_index, card)| {
+                    render_spend_authorization_card(card_index, card, cx)
+                }),
+            ))
         })
         .map(|this| match details {
             Some(details) => this.child(
@@ -1660,25 +1874,390 @@ fn render_spend_authorization_summary(
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER_SUBTLE))
-                    .bg(rgb(theme::SETTINGS_INPUT_SURFACE))
                     .child(rows)
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(theme::BORDER_SUBTLE))
-                            .child(details),
-                    ),
+                    .child(details),
             ),
             None => this.child(rows),
         })
+        .when_some(summary.disclosure.as_ref(), |this, disclosure| {
+            this.child(render_spend_authorization_disclosure(disclosure))
+        })
+}
+
+/// A change's text at the small size: in the danger colour when adverse, else the success
+/// colour.
+fn spend_authorization_delta_text(delta: &SpendAuthorizationAmountDelta, cx: &App) -> gpui::Div {
+    app_text(delta.text.clone())
+        .flex_none()
+        .text_xs()
+        .whitespace_nowrap()
+        .text_color(if delta.adverse {
+            cx.theme().danger
+        } else {
+            cx.theme().success
+        })
+}
+
+/// A card's label, its icon and amount with the amount's change beside it and the USD value at
+/// the right edge, then its lines.
+fn render_spend_authorization_card(
+    card_index: usize,
+    card: &SpendAuthorizationCard,
+    cx: &App,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .bg(rgb(theme::SURFACE))
+        .child(app_muted_text(card.label.to_string()).text_xs())
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .children(
+                    card.icon
+                        .clone()
+                        .map(|icon| img(icon).size(px(20.0)).rounded_full().flex_none()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_baseline()
+                        .gap_x_2()
+                        .child(
+                            app_amount_text(card.amount.to_string())
+                                .min_w_0()
+                                .text_color(rgb(theme::TEXT))
+                                .whitespace_normal(),
+                        )
+                        .children(
+                            card.delta
+                                .as_ref()
+                                .map(|delta| spend_authorization_delta_text(delta, cx)),
+                        ),
+                )
+                .children(card.usd.as_ref().map(|usd| {
+                    app_muted_text(usd.to_string())
+                        .flex_none()
+                        .whitespace_nowrap()
+                })),
+        )
+        .children(card.lines.iter().map(|line| {
+            match line {
+                SpendAuthorizationCardLine::Text {
+                    before,
+                    strong,
+                    after,
+                } => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_baseline()
+                    .gap_x_1()
+                    .when(!before.is_empty(), |this| {
+                        this.child(app_muted_text(before.to_string()).text_xs())
+                    })
+                    .when(!strong.is_empty(), |this| {
+                        this.child(app_strong_text(strong.to_string()).text_xs())
+                    })
+                    .when(!after.is_empty(), |this| {
+                        this.child(app_muted_text(after.to_string()).text_xs())
+                    }),
+                SpendAuthorizationCardLine::Receiver { address, label } => {
+                    let (full_address, label) = (address.to_string(), label.clone());
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(app_muted_text("to").text_xs())
+                        .child(
+                            div()
+                                .id(("wallet-spend-auth-card-receiver", card_index))
+                                .min_w_0()
+                                .tooltip(move |window, cx| {
+                                    let (full_address, label) =
+                                        (full_address.clone(), label.clone());
+                                    Tooltip::element(move |_, _| {
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .children(label.as_ref().map(ToString::to_string))
+                                            .child(
+                                                div()
+                                                    .font_family(APP_MONO_FONT_FAMILY)
+                                                    .child(full_address.clone()),
+                                            )
+                                    })
+                                    .build(window, cx)
+                                })
+                                .child(
+                                    app_text(spend_authorization_recipient_display(address))
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT))
+                                        .font_family(APP_MONO_FONT_FAMILY),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("wallet-spend-auth-card-copy-action", card_index))
+                                .flex_none()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Copy receiver").build(window, cx)
+                                })
+                                .child(clipboard_with_toast(
+                                    ("wallet-spend-auth-card-copy", card_index),
+                                    address.to_string(),
+                                )),
+                        )
+                }
+            }
+        }))
+}
+
+/// A row on one line: its label, its value at the right, the value's change, and a slot for
+/// its info button. The slot stays empty without a hint, so the values line up.
+fn render_spend_authorization_compact_row(
+    row_index: usize,
+    row: &SpendAuthorizationSummaryRow,
+    cx: &App,
+) -> gpui::Div {
+    let value = if row.shortened_copyable {
+        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .child(
+                app_text(spend_authorization_recipient_display(row.value.as_ref()))
+                    .min_w_0()
+                    .text_color(rgb(theme::TEXT))
+                    .font_family(APP_MONO_FONT_FAMILY),
+            )
+            .child(
+                div()
+                    .id(("wallet-spend-auth-copy-action", row_index))
+                    .flex_none()
+                    .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
+                    .child(clipboard_with_toast(
+                        ("wallet-spend-auth-copy", row_index),
+                        row.value.to_string(),
+                    )),
+            )
+    } else {
+        app_text(row.value.to_string())
+            .flex_1()
+            .min_w_0()
+            .text_right()
+            .text_color(rgb(theme::TEXT))
+            .whitespace_normal()
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            app_muted_text(row.label.to_string())
+                .flex_none()
+                .whitespace_nowrap(),
+        )
+        .child(value)
+        .children(
+            row.delta
+                .as_ref()
+                .map(|delta| spend_authorization_delta_text(delta, cx)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .size_5()
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(row.hint.as_ref().map(|hint| {
+                    spend_authorization_hint(
+                        format!("wallet-spend-auth-row-hint-{row_index}"),
+                        hint,
+                        None,
+                    )
+                })),
+        )
+}
+
+/// The disclosure alert: the hint's title, the summary as its message, and an info button
+/// inside its right edge. The whole alert shows the hint's card on hover and opens it on click.
+/// A hint with a warning makes it a warning alert.
+fn render_spend_authorization_disclosure(disclosure: &SpendAuthorizationDisclosure) -> gpui::Div {
+    let id = "wallet-spend-auth-disclosure-alert";
+    let summary = disclosure.summary.to_string();
+    let alert = if disclosure.hint.warning.is_some() {
+        Alert::warning(id, summary)
+    } else {
+        Alert::info(id, summary)
+    };
+    div().w_full().min_w_0().child(spend_authorization_hint(
+        "wallet-spend-auth-disclosure",
+        &disclosure.hint,
+        Some(
+            alert
+                .title(disclosure.hint.title.to_string())
+                .small()
+                // Room for the info button.
+                .pr_10()
+                .into_any_element(),
+        ),
+    ))
+}
+
+/// An info button for `hint`: the hint's card as a tooltip on hover, and in a popover on click
+/// or from the keyboard. Escape closes the popover and returns focus to the button. With
+/// `line`, the button sits inside that element's right edge, and the whole element shows and
+/// opens the card.
+fn spend_authorization_hint(
+    id: impl Into<SharedString>,
+    hint: &SpendAuthorizationHint,
+    line: Option<AnyElement>,
+) -> Popover {
+    let id = id.into();
+    let content = hint.clone();
+    Popover::new(id.clone())
+        .anchor(Anchor::TopRight)
+        .trigger(SpendAuthorizationHintTrigger {
+            id,
+            hint: hint.clone(),
+            line,
+            open: false,
+        })
+        .content(move |_, window, _| spend_authorization_hint_card(&content, window))
+}
+
+/// A hint popover's trigger. The popover marks it selected while open, which drops the hover
+/// tooltip so the card doesn't show twice.
+#[derive(IntoElement)]
+struct SpendAuthorizationHintTrigger {
+    id: SharedString,
+    hint: SpendAuthorizationHint,
+    line: Option<AnyElement>,
+    open: bool,
+}
+
+impl Selectable for SpendAuthorizationHintTrigger {
+    fn selected(mut self, selected: bool) -> Self {
+        self.open = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.open
+    }
+}
+
+impl RenderOnce for SpendAuthorizationHintTrigger {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let Self {
+            id,
+            hint,
+            line,
+            open,
+        } = self;
+        let button = app_button_base(SharedString::from(format!("{id}-button")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Info)
+            .selected(open)
+            .accessibility_label(hint.title.to_string());
+        let selector = id.to_string();
+        div()
+            .id(SharedString::from(format!("{id}-hover")))
+            .debug_selector(move || selector)
+            .map(|this| match line {
+                Some(line) => this
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .child(line)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_2()
+                            .flex()
+                            .items_center()
+                            .child(button),
+                    ),
+                None => this.flex_none().child(button),
+            })
+            .when(!open, |this| {
+                this.tooltip(move |window, cx| {
+                    let hint = hint.clone();
+                    Tooltip::element(move |window, _| spend_authorization_hint_card(&hint, window))
+                        .build(window, cx)
+                })
+            })
+    }
+}
+
+/// `hint` as a hint card: its paragraphs under the title, then its warning in the warning
+/// colour, which the title takes too, then its fact under a rule.
+fn spend_authorization_hint_card(hint: &SpendAuthorizationHint, window: &Window) -> gpui::Div {
+    let title_color = if hint.warning.is_some() {
+        theme::WARNING
+    } else {
+        theme::INFO
+    };
+    hint_card(hint.title.to_string(), title_color, window)
+        .children(
+            hint.paragraphs
+                .iter()
+                .map(|paragraph| div().whitespace_normal().child(paragraph.to_string())),
+        )
+        .children(hint.warning.as_ref().map(|warning| {
+            div()
+                .whitespace_normal()
+                .text_color(rgb(theme::WARNING))
+                .child(warning.to_string())
+        }))
+        .children(hint.fact.as_ref().map(|(label, value)| {
+            div()
+                .w_full()
+                .pt_1()
+                .border_t_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(label.to_string()),
+                )
+                .child(div().flex_none().child(value.to_string()))
+        }))
 }
 
 /// A dialog title, with the summary's chip beside it when it has one.
@@ -1705,39 +2284,102 @@ fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
         )
 }
 
-fn render_spend_authorization_progress(progress: &SpendAuthorizationProgress) -> gpui::Div {
-    div()
+/// The summary's stepper, when it has steps: numbered badges and their labels joined by a
+/// connector, with an info button at the end. A completed step shows a check in the success
+/// colour, the current one a filled badge, and a later one an outlined badge and a muted label.
+fn render_spend_authorization_steps(summary: &SpendAuthorizationSummary) -> Option<gpui::Div> {
+    let steps = summary.steps.as_ref()?;
+    let mut strip = div()
         .w_full()
         .min_w_0()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap_2()
-        .child(
+        .py_2()
+        .pl_3()
+        .pr_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .bg(rgb(theme::SURFACE_HOVER_SUBTLE));
+    for (index, label) in steps.labels.iter().enumerate() {
+        let number = index + 1;
+        let (done, current) = (number < steps.current, number == steps.current);
+        if index > 0 {
+            // The connector out of a completed step.
+            strip = strip.child(div().flex_1().min_w(px(16.0)).h(px(1.0)).bg(rgb(
+                if index < steps.current {
+                    theme::SUCCESS
+                } else {
+                    theme::BORDER_STRONG
+                },
+            )));
+        }
+        let badge = div()
+            .flex_none()
+            .size(px(22.0))
+            .rounded_full()
+            .border_1()
+            .flex()
+            .items_center()
+            .justify_center();
+        let badge = if done {
+            badge
+                .border_color(rgb(theme::SUCCESS))
+                .bg(rgb(theme::SUCCESS))
+                .child(
+                    Icon::new(IconName::Check)
+                        .xsmall()
+                        .text_color(rgb(theme::PRIMARY_FOREGROUND)),
+                )
+        } else if current {
+            badge
+                .border_color(rgb(theme::PRIMARY))
+                .bg(rgb(theme::PRIMARY))
+                .child(
+                    app_text(number.to_string())
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(theme::PRIMARY_FOREGROUND)),
+                )
+        } else {
+            badge.border_color(rgb(theme::BORDER_STRONG)).child(
+                app_muted_text(number.to_string())
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD),
+            )
+        };
+        let label_color = if done {
+            theme::SUCCESS
+        } else if current {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        };
+        strip = strip.child(
             div()
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap_1()
-                .children((0..progress.total).map(|index| {
-                    div()
-                        .size(px(8.0))
-                        .rounded_full()
-                        .bg(rgb(if index < progress.step {
-                            theme::PRIMARY
-                        } else {
-                            theme::BORDER
-                        }))
-                })),
-        )
-        .child(
-            app_text(progress.note.to_string())
-                .min_w_0()
-                .text_xs()
-                .text_color(rgb(theme::PRIMARY))
-                .whitespace_normal(),
-        )
+                .gap_2()
+                .child(badge)
+                .child(
+                    app_text(label.to_string())
+                        .whitespace_nowrap()
+                        .text_color(rgb(label_color)),
+                ),
+        );
+    }
+    Some(strip.child(spend_authorization_hint(
+        "wallet-spend-auth-steps-hint",
+        &steps.hint,
+        None,
+    )))
 }
 
+/// The details disclosure as one more compact row: its title, its summary at the right, and a
+/// chevron where the rows have their info button. Open, its rows and note follow, indented.
 fn render_spend_authorization_details(
     details: &SpendAuthorizationDetails,
     open: bool,
@@ -1750,34 +2392,40 @@ fn render_spend_authorization_details(
             div()
                 .id("wallet-spend-auth-details-toggle")
                 .w_full()
+                .min_w_0()
+                .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
                 .flex()
                 .items_center()
-                .justify_between()
                 .gap_2()
                 .cursor_pointer()
                 .on_click(on_toggle)
-                .child(app_text(details.title.to_string()).flex_none())
+                .child(
+                    app_muted_text(details.title.to_string())
+                        .flex_none()
+                        .whitespace_nowrap(),
+                )
+                .child(
+                    app_text(details.collapsed_summary.to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .text_right()
+                        .text_color(rgb(theme::TEXT))
+                        .whitespace_normal(),
+                )
                 .child(
                     div()
-                        .min_w_0()
+                        .flex_none()
+                        .size_5()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .when(!open, |this| {
-                            this.child(
-                                app_muted_text(details.collapsed_summary.to_string())
-                                    .min_w_0()
-                                    .truncate(),
-                            )
-                        })
+                        .justify_center()
                         .child(
-                            gpui_component::Icon::new(if open {
-                                gpui_component::IconName::ChevronUp
+                            Icon::new(if open {
+                                IconName::ChevronUp
                             } else {
-                                gpui_component::IconName::ChevronDown
+                                IconName::ChevronDown
                             })
-                            .xsmall()
-                            .flex_none(),
+                            .xsmall(),
                         ),
                 ),
         )
@@ -1788,47 +2436,51 @@ fn render_spend_authorization_details(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .pt_2()
-                .children(details.rows.iter().map(|(label, value)| {
+                .py_1()
+                // The rows end where the values above end, clear of the chevron's column.
+                .pr(px(28.0))
+                .child(
                     div()
-                        .w_full()
                         .min_w_0()
+                        .ml_1()
+                        .pl_3()
                         .flex()
-                        .items_start()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            app_muted_text(label.to_string())
-                                .flex_none()
-                                .whitespace_nowrap(),
-                        )
-                        .child(
-                            app_text(value.to_string())
-                                .flex_1()
+                        .flex_col()
+                        .gap_1()
+                        .border_l_1()
+                        .border_color(rgb(theme::BORDER_SUBTLE))
+                        .children(details.rows.iter().map(|(label, value)| {
+                            div()
+                                .w_full()
                                 .min_w_0()
-                                .text_right()
-                                .text_color(rgb(theme::TEXT))
-                                .whitespace_normal(),
-                        )
-                }))
+                                .flex()
+                                .items_start()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    app_muted_text(label.to_string())
+                                        .flex_none()
+                                        .whitespace_nowrap(),
+                                )
+                                .child(
+                                    app_text(value.to_string())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_right()
+                                        .text_color(rgb(theme::TEXT))
+                                        .whitespace_normal(),
+                                )
+                        })),
+                )
                 .when_some(details.note.as_ref(), |this, note| {
-                    this.child(app_muted_text(note.to_string()).pt_1().whitespace_normal())
+                    this.child(
+                        app_muted_text(note.to_string())
+                            .pl_4()
+                            .text_xs()
+                            .whitespace_normal(),
+                    )
                 }),
         )
-}
-
-fn render_spend_authorization_context(context: &SpendAuthorizationContext) -> AnyElement {
-    match context {
-        SpendAuthorizationContext::Text(message) => app_muted_text(message.to_string())
-            .whitespace_normal()
-            .into_any_element(),
-        SpendAuthorizationContext::Info { title, message } => {
-            Alert::info("wallet-spend-auth-context", message.to_string())
-                .title(title.to_string())
-                .small()
-                .into_any_element()
-        }
-    }
 }
 
 fn render_spend_authorization_payload(
@@ -1903,73 +2555,21 @@ fn spend_authorization_summary_value(
     cx: &App,
 ) -> AnyElement {
     if let Some(icon_path) = row.icon_path.clone() {
-        return spend_authorization_value_with_note(
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .py(px(2.0))
-                .text_color(rgb(theme::TEXT))
-                .child(img(icon_path).size(px(20.0)).rounded_full().flex_none())
-                .child(
-                    app_text(row.value.to_string())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .whitespace_normal(),
-                ),
-            row.note.as_deref(),
-        );
-    }
-
-    if row.full_address {
-        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
         return div()
             .w_full()
             .min_w(px(0.0))
             .flex()
-            .flex_col()
+            .items_center()
+            .gap_1()
             .py(px(2.0))
-            .children(row.address_label.as_ref().map(|label| {
-                app_text(label.to_string())
-                    .min_w(px(0.0))
-                    .text_color(rgb(theme::TEXT))
-                    .whitespace_normal()
-            }))
+            .text_color(rgb(theme::TEXT))
+            .child(img(icon_path).size(px(20.0)).rounded_full().flex_none())
             .child(
-                div()
-                    .w_full()
+                app_text(row.value.to_string())
+                    .flex_1()
                     .min_w(px(0.0))
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .child(
-                        app_text(row.value.to_string())
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .text_color(rgb(theme::TEXT))
-                            .font_family(APP_MONO_FONT_FAMILY)
-                            .whitespace_normal(),
-                    )
-                    .child(
-                        div()
-                            .id(("wallet-spend-auth-copy-action", row_index))
-                            .flex_none()
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(copy_tooltip.clone()).build(window, cx)
-                            })
-                            .child(clipboard_with_toast(
-                                ("wallet-spend-auth-copy", row_index),
-                                row.value.to_string(),
-                            )),
-                    ),
+                    .whitespace_normal(),
             )
-            .children(row.note.as_ref().map(|note| {
-                app_muted_text(note.to_string())
-                    .min_w(px(0.0))
-                    .whitespace_normal()
-            }))
             .into_any_element();
     }
 
@@ -2027,32 +2627,12 @@ fn spend_authorization_summary_value(
             .into_any_element();
     }
 
-    spend_authorization_value_with_note(
-        app_text(row.value.to_string())
-            .w_full()
-            .min_w(px(0.0))
-            .py(px(2.0))
-            .text_color(rgb(theme::TEXT))
-            .whitespace_normal(),
-        row.note.as_deref(),
-    )
-}
-
-fn spend_authorization_value_with_note(value: gpui::Div, note: Option<&str>) -> AnyElement {
-    let Some(note) = note else {
-        return value.into_any_element();
-    };
-    div()
+    app_text(row.value.to_string())
         .w_full()
         .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .child(value)
-        .child(
-            app_muted_text(note.to_owned())
-                .min_w(px(0.0))
-                .whitespace_normal(),
-        )
+        .py(px(2.0))
+        .text_color(rgb(theme::TEXT))
+        .whitespace_normal()
         .into_any_element()
 }
 
@@ -2174,7 +2754,7 @@ impl WalletRoot {
                 self.open_spend_authorization_dialog(
                     SpendAuthorizationIntent::ExecutorGasPassword {
                         intent: Box::new(intent),
-                        summary: summary.clone(),
+                        summary: Box::new(summary.clone()),
                         payer,
                     },
                     summary.requiring_explicit_review(),
@@ -2362,9 +2942,7 @@ impl WalletRoot {
                     .flex_col()
                     .gap_3()
                     .child(spend_authorization_title(&summary.title, summary.title_chip.as_deref()))
-                    .when_some(summary.progress.as_ref(), |this, progress| {
-                        this.child(render_spend_authorization_progress(progress))
-                    })
+                    .children(render_spend_authorization_steps(&summary))
                     .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
                     .child(render_spend_authorization_summary(
                         &summary,
@@ -2823,7 +3401,7 @@ impl WalletRoot {
                         password,
                         seed_session,
                     },
-                    summary,
+                    *summary,
                     window,
                     cx,
                 );

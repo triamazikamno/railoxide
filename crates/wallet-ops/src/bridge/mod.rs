@@ -75,8 +75,13 @@ pub enum BridgeApiError {
     Randomness,
     #[error("{api} rate-limited the request")]
     RateLimited { api: BridgeApi },
-    #[error("{api} is unavailable (HTTP {status})")]
-    Unavailable { api: BridgeApi, status: u16 },
+    #[error("{api} is unavailable: the {operation} request to {endpoint} returned HTTP {status}")]
+    Unavailable {
+        api: BridgeApi,
+        operation: &'static str,
+        endpoint: String,
+        status: u16,
+    },
     #[error("the {api} {operation} request to {endpoint} timed out")]
     Timeout {
         api: BridgeApi,
@@ -98,9 +103,14 @@ pub enum BridgeApiError {
     NotFound { api: BridgeApi },
     #[error("the amount is too small for Across")]
     AmountTooLow,
-    #[error("{api} rejected the request ({code}, HTTP {status}){}", message_suffix(.message))]
+    #[error(
+        "{api} rejected the {operation} request to {endpoint} ({code}, HTTP {status}){}",
+        message_suffix(.message)
+    )]
     Rejected {
         api: BridgeApi,
+        operation: &'static str,
+        endpoint: String,
         status: u16,
         code: String,
         message: String,
@@ -114,9 +124,16 @@ impl BridgeApiError {
     fn without_message(&self) -> Self {
         match self {
             Self::Rejected {
-                api, status, code, ..
+                api,
+                operation,
+                endpoint,
+                status,
+                code,
+                ..
             } => Self::Rejected {
                 api: *api,
+                operation,
+                endpoint: endpoint.clone(),
                 status: *status,
                 code: code.clone(),
                 message: String::new(),
@@ -236,7 +253,13 @@ impl BridgeHttp {
                 body.extend_from_slice(&chunk);
             }
             if !status.is_success() {
-                return Err(classify_error_response(self.api, status, &body));
+                return Err(classify_error_response(
+                    self.api,
+                    operation,
+                    redact_url_for_display(&self.base_url),
+                    status,
+                    &body,
+                ));
             }
             parse(body)
         }
@@ -284,14 +307,23 @@ impl BridgeHttp {
 }
 
 /// Map a provider error response. Messages are kept for display but not logged, because they
-/// can echo request data.
-fn classify_error_response(api: BridgeApi, status: StatusCode, body: &[u8]) -> BridgeApiError {
+/// can echo request data. `operation` and `endpoint`, the host without credentials or path, name
+/// the request a provider refused, so a user can check it themselves.
+fn classify_error_response(
+    api: BridgeApi,
+    operation: &'static str,
+    endpoint: String,
+    status: StatusCode,
+    body: &[u8],
+) -> BridgeApiError {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return BridgeApiError::RateLimited { api };
     }
     if status.is_server_error() {
         return BridgeApiError::Unavailable {
             api,
+            operation,
+            endpoint,
             status: status.as_u16(),
         };
     }
@@ -309,6 +341,8 @@ fn classify_error_response(api: BridgeApi, status: StatusCode, body: &[u8]) -> B
     }
     BridgeApiError::Rejected {
         api,
+        operation,
+        endpoint,
         status: status.as_u16(),
         code: code.unwrap_or_else(|| "unknown".to_owned()),
         message: error
