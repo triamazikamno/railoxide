@@ -2907,9 +2907,12 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         &request.effective_chain,
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
-        Some(request.vault_password.as_str()),
+        request
+            .vault_password
+            .as_ref()
+            .map(|password| password.as_str()),
         request.protected_software_seed_session.as_deref(),
-        None,
+        Some(request.spend_authorization),
         request.trezor_pin_matrix_provider,
         prepared.public_account_uuid,
         Arc::clone(&request.session),

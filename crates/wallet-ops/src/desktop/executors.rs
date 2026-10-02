@@ -41,6 +41,7 @@ pub use observation::ExecutorTransactionIdentity;
 pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;
 pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
+pub(crate) use swap::Transfer;
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapExecutor, SwapInputPlan,

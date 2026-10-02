@@ -8,6 +8,7 @@ use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
 use alloy::network::{BlockResponse as _, ReceiptResponse as _, TransactionResponse as _};
 use alloy::primitives::{Address, B256, FixedBytes};
 use alloy::providers::{DynProvider, Provider as _};
+use alloy::rpc::types::Log;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, eyre};
 
@@ -364,11 +365,18 @@ impl BlockObserver {
     }
 }
 
-pub(crate) async fn resolve_transaction_sender_by_block(
+/// A transaction's sender and receipt logs, matched locally within its whole block.
+#[derive(Debug)]
+pub(crate) struct SourceTransaction {
+    pub(crate) from: Address,
+    pub(crate) logs: Vec<Log>,
+}
+
+pub(crate) async fn resolve_source_transaction_by_block(
     query_rpc_pool: &QueryRpcPool,
     block_number: u64,
     tx_hash: FixedBytes<32>,
-) -> Result<Address> {
+) -> Result<SourceTransaction> {
     let providers = query_rpc_pool.available_providers();
     if providers.is_empty() {
         return Err(eyre!(
@@ -376,50 +384,68 @@ pub(crate) async fn resolve_transaction_sender_by_block(
         ));
     }
     for provider in providers {
-        let Ok(Some(sender)) = fetch_full_block_sender(&provider, block_number, tx_hash).await
-        else {
+        let Some(source) = fetch_source_transaction(&provider, block_number, tx_hash).await else {
             query_rpc_pool.mark_bad_provider(&provider);
             let rpc = crate::http::redact_url_for_display(&provider.url);
             tracing::warn!(%rpc, "source block transaction resolution failed");
             continue;
         };
-        return Ok(sender);
+        return Ok(source);
     }
     Err(eyre!(
         "privacy-preserving source transaction resolution is unavailable"
     ))
 }
 
-async fn fetch_full_block_sender(
+/// `None` covers every failed, unsupported or inconsistent read; the caller tries the next
+/// provider and never falls back to an exact-hash request.
+async fn fetch_source_transaction(
     provider: &ProviderHandle,
     block_number: u64,
     tx_hash: FixedBytes<32>,
-) -> std::result::Result<Option<Address>, ()> {
-    let Some(block) = provider
+) -> Option<SourceTransaction> {
+    let block = provider
         .provider
         .get_block_by_number(block_number.into())
         .full()
         .await
-        .map_err(|_| ())?
-    else {
-        return Ok(None);
-    };
+        .ok()??;
     if block.header().number() != block_number {
-        return Ok(None);
+        return None;
     }
 
     let mut sender = None;
     let mut matches = 0;
     let BlockTransactions::Full(transactions) = block.transactions() else {
-        return Ok(None);
+        return None;
     };
+    let mut hashes = Vec::with_capacity(transactions.len());
     for transaction in transactions {
+        hashes.push(transaction.tx_hash());
         if transaction.tx_hash() == tx_hash {
             matches += 1;
             sender = Some(transaction.from());
         }
     }
-    if matches == 1 { Ok(sender) } else { Ok(None) }
+    if matches != 1 {
+        return None;
+    }
+    let from = sender?;
+
+    let receipts = fetch_checked_block_receipts(
+        &provider.provider,
+        BlockNumHash::new(block_number, block.header().hash()),
+        &hashes,
+    )
+    .await
+    .ok()?;
+    let receipt = receipts
+        .into_iter()
+        .find(|receipt| receipt.transaction_hash() == tx_hash)?;
+    Some(SourceTransaction {
+        from,
+        logs: receipt.inner.logs().to_vec(),
+    })
 }
 
 async fn fetch_block(provider: &ProviderHandle, number: u64) -> BlockFetch {
@@ -1419,26 +1445,106 @@ mod tests {
         let target_hash = known_full_transaction_hash();
         let decoy_hash = B256::from([0x77; 32]);
         let sender = Address::from([0x88; 20]);
-        let (url, request_rx, task) = spawn_rpc_script(1, move |request| {
-            assert_eq!(request["method"], "eth_getBlockByNumber");
-            assert_eq!(request["params"], json!(["0x9", true]));
-            Ok(block(
-                9,
-                B256::from([0x99; 32]),
-                B256::from([0x01; 32]),
-                &[
-                    full_legacy_transaction("0x43ec", decoy_hash, Address::from([0x70; 20])),
-                    full_legacy_transaction("0x43eb", target_hash, sender),
-                ],
-            ))
-        });
+        let block_hash = B256::from([0x99; 32]);
+        let token = Address::from([0x44; 20]);
+        let (url, request_rx, task) =
+            spawn_rpc_script(2, move |request| match request["method"].as_str() {
+                Some("eth_getBlockByNumber") => {
+                    assert_eq!(request["params"], json!(["0x9", true]));
+                    Ok(block(
+                        9,
+                        block_hash,
+                        B256::from([0x01; 32]),
+                        &[
+                            full_legacy_transaction(
+                                "0x43ec",
+                                decoy_hash,
+                                Address::from([0x70; 20]),
+                            ),
+                            full_legacy_transaction("0x43eb", target_hash, sender),
+                        ],
+                    ))
+                }
+                Some("eth_getBlockReceipts") => {
+                    assert_eq!(request["params"], json!([block_hash.to_string()]));
+                    let mut target = receipt(target_hash, 9, block_hash, 1);
+                    target["logs"] = json!([{
+                        "address": token,
+                        "topics": [B256::from([0x55; 32])],
+                        "data": "0x",
+                        "blockHash": block_hash,
+                        "blockNumber": quantity(9),
+                        "transactionHash": target_hash,
+                        "transactionIndex": quantity(0),
+                        "logIndex": quantity(0),
+                        "removed": false,
+                    }]);
+                    Ok(json!([receipt(decoy_hash, 9, block_hash, 1), target]))
+                }
+                method => panic!("unexpected RPC method {method:?}"),
+            });
         let pool = test_pool(url);
-        let origin = resolve_transaction_sender_by_block(&pool, 9, target_hash)
+        let source = resolve_source_transaction_by_block(&pool, 9, target_hash)
             .await
-            .expect("resolve source sender");
-        assert_eq!(origin, sender);
+            .expect("resolve source transaction");
+        assert_eq!(source.from, sender);
+        assert_eq!(source.logs.len(), 1);
+        assert_eq!(source.logs[0].address(), token);
         task.join().expect("RPC fixture task");
-        assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
+        let requests = request_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str())
+                .collect::<Vec<_>>(),
+            [Some("eth_getBlockByNumber"), Some("eth_getBlockReceipts")]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_resolution_fails_over_when_block_receipts_are_unsupported() {
+        let target_hash = known_full_transaction_hash();
+        let sender = Address::from([0x8a; 20]);
+        let block_hash = B256::from([0x9b; 32]);
+        let source_block = move || {
+            block(
+                9,
+                block_hash,
+                B256::from([0x01; 32]),
+                &[full_legacy_transaction("0x43eb", target_hash, sender)],
+            )
+        };
+        let (unsupported_url, unsupported_requests, unsupported_task) =
+            spawn_rpc_script(2, move |request| match request["method"].as_str() {
+                Some("eth_getBlockByNumber") => Ok(source_block()),
+                Some("eth_getBlockReceipts") => Err(json!({
+                    "code": -32601,
+                    "message": "method not found",
+                })),
+                method => panic!("unexpected RPC method {method:?}"),
+            });
+        let (valid_url, valid_requests, valid_task) =
+            spawn_rpc_script(2, move |request| match request["method"].as_str() {
+                Some("eth_getBlockByNumber") => Ok(source_block()),
+                Some("eth_getBlockReceipts") => Ok(json!([receipt(target_hash, 9, block_hash, 1)])),
+                method => panic!("unexpected RPC method {method:?}"),
+            });
+        let pool = Arc::new(QueryRpcPool::with_http_client(
+            vec![unsupported_url, valid_url],
+            Duration::from_mins(1),
+            reqwest::Client::new(),
+        ));
+        let source = resolve_source_transaction_by_block(&pool, 9, target_hash)
+            .await
+            .expect("fail over to a provider with block receipts");
+        assert_eq!(source.from, sender);
+        assert_eq!(pool.available_providers().len(), 1);
+        unsupported_task
+            .join()
+            .expect("unsupported RPC fixture task");
+        valid_task.join().expect("valid RPC fixture task");
+        assert_no_exact_hash_methods(&unsupported_requests.try_iter().collect::<Vec<_>>());
+        assert_no_exact_hash_methods(&valid_requests.try_iter().collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -1446,24 +1552,27 @@ mod tests {
         let target_hash = known_full_transaction_hash();
         let sender = Address::from([0x89; 20]);
         let (null_url, null_requests, null_task) = spawn_rpc_script(1, |_| Ok(Value::Null));
-        let (valid_url, valid_requests, valid_task) = spawn_rpc_script(1, move |request| {
-            assert_eq!(request["method"], "eth_getBlockByNumber");
-            Ok(block(
-                9,
-                B256::from([0x9a; 32]),
-                B256::from([0x01; 32]),
-                &[full_legacy_transaction("0x43eb", target_hash, sender)],
-            ))
-        });
+        let block_hash = B256::from([0x9a; 32]);
+        let (valid_url, valid_requests, valid_task) =
+            spawn_rpc_script(2, move |request| match request["method"].as_str() {
+                Some("eth_getBlockByNumber") => Ok(block(
+                    9,
+                    block_hash,
+                    B256::from([0x01; 32]),
+                    &[full_legacy_transaction("0x43eb", target_hash, sender)],
+                )),
+                Some("eth_getBlockReceipts") => Ok(json!([receipt(target_hash, 9, block_hash, 1)])),
+                method => panic!("unexpected RPC method {method:?}"),
+            });
         let pool = Arc::new(QueryRpcPool::with_http_client(
             vec![null_url, valid_url],
             Duration::ZERO,
             reqwest::Client::new(),
         ));
-        let origin = resolve_transaction_sender_by_block(&pool, 9, target_hash)
+        let source = resolve_source_transaction_by_block(&pool, 9, target_hash)
             .await
             .expect("fail over to valid source block provider");
-        assert_eq!(origin, sender);
+        assert_eq!(source.from, sender);
         null_task.join().expect("null RPC fixture task");
         valid_task.join().expect("valid RPC fixture task");
         assert_no_exact_hash_methods(&null_requests.try_iter().collect::<Vec<_>>());
@@ -1483,7 +1592,7 @@ mod tests {
             ))
         });
         let pool = test_pool(url);
-        let error = resolve_transaction_sender_by_block(&pool, 9, target_hash)
+        let error = resolve_source_transaction_by_block(&pool, 9, target_hash)
             .await
             .expect_err("hash-only source body must fail");
         assert!(error.to_string().contains("source transaction resolution"));

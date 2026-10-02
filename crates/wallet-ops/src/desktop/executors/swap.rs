@@ -49,6 +49,7 @@ pub(crate) use order::{
 pub(super) use recovery::swap_recovery_call_bound;
 #[cfg(test)]
 pub(crate) use recovery::{swap_cancellation_admitted, swap_recovery_calls};
+pub(crate) use settlement::Transfer;
 
 /// Neutral purpose recorded for swap executors; the tokens stay in the setup approval and
 /// the order terms.

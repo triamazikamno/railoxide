@@ -246,7 +246,7 @@ pub(super) enum SpendAuthorizationIntent {
 }
 
 impl SpendAuthorizationIntent {
-    fn hardware_executor_action(
+    pub(super) fn hardware_executor_action(
         &self,
         root: &WalletRoot,
     ) -> Option<wallet_ops::HardwareExecutorAction> {
@@ -285,6 +285,9 @@ impl SpendAuthorizationIntent {
                     account: account.public_account_uuid.clone(),
                     operation: source.operation(),
                 });
+            }
+            Self::BlockedShieldRefund(utxo_id) => {
+                return root.blocked_shield_refund_executor_gas_payment(*utxo_id);
             }
             Self::PublicSend(draft) => (
                 draft.public_account_source,

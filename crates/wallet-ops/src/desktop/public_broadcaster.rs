@@ -1,11 +1,13 @@
 use super::*;
+use alloy::rpc::types::Log;
 use alloy::uint;
 use eyre::eyre;
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel, TransactGasShape};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::block_observer::resolve_transaction_sender_by_block;
+use crate::block_observer::resolve_source_transaction_by_block;
+use crate::desktop::executors::Transfer;
 
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCandidate {
@@ -983,6 +985,8 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
         &request.effective_chain,
         utxo.source.block_number,
         utxo.source.tx_hash,
+        utxo.token_address(),
+        utxo.note.value,
         http,
     )
     .await
@@ -1001,22 +1005,106 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
         .vault_store
         .list_active_public_accounts_for_session(&request.view_session)
         .wrap_err("load active public accounts")?;
-    Ok(blocked_shield_rescue_eligibility_for_origin(
-        Some(origin),
+    let eligibility = blocked_shield_rescue_eligibility_for_origin(Some(origin), &accounts);
+    if eligibility.eligible {
+        return Ok(eligibility);
+    }
+    let stealth_accounts: Vec<Address> = match request
+        .session
+        .executor_owner()
+        .map(|owner| owner.records())
+    {
+        Some(Ok(records)) => records
+            .iter()
+            .filter_map(vault::ExecutorRecord::address)
+            .collect(),
+        Some(Err(_)) => {
+            tracing::warn!("read stealth accounts for blocked Shield origin failed");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    Ok(blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
         &accounts,
+        &stealth_accounts,
     ))
 }
 
+/// Resolve the account that funded a Shield: the refund origin of its blocked UTXO.
 pub async fn resolve_source_tx_origin(
     chain_id: u64,
     effective_chain: &settings::EffectiveChainConfig,
     source_block_number: u64,
     source_tx_hash: FixedBytes<32>,
+    token: Address,
+    value: U256,
     http: &HttpContext,
 ) -> Result<Address> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
+    // The delegate RelayAdapt7702 never holds tokens, so it is not a shared RelayAdapt here.
+    let mut relay_adapts = vec![chain.relay_adapt_contract];
+    relay_adapts.extend_from_slice(
+        effective_chain
+            .require_railgun()?
+            .deployment
+            .relay_adapt_history,
+    );
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    resolve_transaction_sender_by_block(&query_rpc_pool, source_block_number, source_tx_hash).await
+    let source =
+        resolve_source_transaction_by_block(&query_rpc_pool, source_block_number, source_tx_hash)
+            .await?;
+    shield_funding_account(
+        &source.logs,
+        token,
+        value,
+        chain.railgun_contract,
+        &relay_adapts,
+        source.from,
+    )
+    .ok_or_else(|| eyre!("source transaction has ambiguous Shield funding accounts"))
+}
+
+/// The account the Railgun contract pulled a Shield's tokens from, read from the Shield
+/// transaction's receipt logs. A shared `RelayAdapt` funder, or a receipt without a matching
+/// Transfer, resolves to `from`. `None` means several accounts funded Shields of `token`
+/// that `value` cannot tell apart.
+pub(crate) fn shield_funding_account(
+    logs: &[Log],
+    token: Address,
+    value: U256,
+    railgun: Address,
+    relay_adapts: &[Address],
+    from: Address,
+) -> Option<Address> {
+    let transfers = logs
+        .iter()
+        .filter(|log| log.address() == token)
+        .filter_map(|log| log.log_decode::<Transfer>().ok())
+        .map(|log| log.inner.data)
+        .filter(|transfer| transfer.to == railgun)
+        .collect::<Vec<_>>();
+    let Some(first) = transfers.first() else {
+        return Some(from);
+    };
+    let funder = if transfers.iter().all(|transfer| transfer.from == first.from) {
+        first.from
+    } else {
+        let mut matching = transfers
+            .iter()
+            .filter(|transfer| transfer.value == value)
+            .map(|transfer| transfer.from);
+        let funder = matching.next()?;
+        if matching.any(|other| other != funder) {
+            return None;
+        }
+        funder
+    };
+    Some(if relay_adapts.contains(&funder) {
+        from
+    } else {
+        funder
+    })
 }
 
 pub(crate) fn blocked_shield_rescue_candidate_from_records(
@@ -1080,6 +1168,27 @@ pub(crate) fn blocked_shield_rescue_eligibility_for_origin(
         public_account_uuid: Some(account.public_account_uuid.clone()),
         public_account_label: account.label.clone(),
     }
+}
+
+/// Eligibility for a resolved origin. An unmatched origin that is one of the wallet's
+/// stealth accounts gets a reason that points to Add to Public.
+pub(crate) fn blocked_shield_rescue_eligibility_for_resolved_origin(
+    origin: Address,
+    active_public_accounts: &[vault::PublicAccountMetadata],
+    stealth_accounts: &[Address],
+) -> BlockedShieldRescueEligibility {
+    let eligibility =
+        blocked_shield_rescue_eligibility_for_origin(Some(origin), active_public_accounts);
+    if eligibility.eligible || !stealth_accounts.contains(&origin) {
+        return eligibility;
+    }
+    blocked_shield_rescue_disabled(
+        &format!(
+            "The Shield came from stealth account {}. Add it to Public from Stealth accounts and send it native currency for gas, then refund.",
+            origin.to_checksum(None)
+        ),
+        Some(origin),
+    )
 }
 
 pub(super) fn blocked_shield_rescue_disabled(

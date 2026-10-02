@@ -278,13 +278,50 @@ impl WalletRoot {
         let Some(origin_address) = rescue.origin_address.clone() else {
             return;
         };
-        let summary = blocked_shield_refund_authorization_summary(row, rescue, &origin_address);
-        let intent = if self.selected_wallet_source().is_hardware_derived() {
+        let intent = self.blocked_shield_refund_authorization_intent(utxo_id);
+        let device_only = self.selected_wallet_source().is_hardware_derived()
+            && matches!(intent, SpendAuthorizationIntent::BlockedShieldRefund(_));
+        let summary =
+            blocked_shield_refund_authorization_summary(row, rescue, &origin_address, device_only);
+        self.request_spend_authorization(intent, summary, window, cx);
+    }
+
+    /// The gas approval for a refund whose matched origin is a stealth account in Public.
+    /// A hardware wallet derives that account's signer on the device, so no vault password
+    /// can stand in for it.
+    pub(super) fn blocked_shield_refund_executor_gas_payment(
+        &self,
+        utxo_id: BlockedShieldRescueUtxoId,
+    ) -> Option<wallet_ops::HardwareExecutorAction> {
+        let rescue = self
+            .blocked_shield_rescue_rows
+            .get(&utxo_id)
+            .map(BlockedShieldRescueRowState::info)
+            .filter(|rescue| rescue.eligible)?;
+        let account =
+            self.selected_self_broadcast_gas_payer_account(rescue.public_account_uuid.as_deref())?;
+        let wallet_ops::vault::PublicAccountSource::ExecutorDerived(source) = account.source else {
+            return None;
+        };
+        Some(wallet_ops::HardwareExecutorAction::GasPayment {
+            account: account.public_account_uuid.clone(),
+            operation: source.operation(),
+        })
+    }
+
+    pub(super) fn blocked_shield_refund_authorization_intent(
+        &self,
+        utxo_id: BlockedShieldRescueUtxoId,
+    ) -> SpendAuthorizationIntent {
+        if self.selected_wallet_source().is_hardware_derived()
+            && self
+                .blocked_shield_refund_executor_gas_payment(utxo_id)
+                .is_none()
+        {
             SpendAuthorizationIntent::BlockedShieldRefundGasPassword(utxo_id)
         } else {
             SpendAuthorizationIntent::BlockedShieldRefund(utxo_id)
-        };
-        self.request_spend_authorization(intent, summary, window, cx);
+        }
     }
 
     pub(super) fn request_blocked_shield_refund_hardware_authorization(
@@ -311,7 +348,8 @@ impl WalletRoot {
             tracing::warn!("blocked Shield hardware refund requested without origin address");
             return;
         };
-        let summary = blocked_shield_refund_authorization_summary(&row, rescue, &origin_address);
+        let summary =
+            blocked_shield_refund_authorization_summary(&row, rescue, &origin_address, false);
         self.open_hardware_spend_authorization_dialog(
             HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
                 utxo_id,
@@ -425,29 +463,6 @@ impl WalletRoot {
         else {
             return;
         };
-        let password = if let Some(password) = vault_password {
-            password
-        } else {
-            let password = match &spend_authorization {
-                DesktopPrivateSpendAuthorization::VaultPassword(password)
-                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
-                    password
-                }
-                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
-                | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
-                | DesktopPrivateSpendAuthorization::HardwarePublic => {
-                    tracing::warn!(
-                        "blocked Shield refund self-broadcast requested without gas-payer password"
-                    );
-                    self.set_vault_error(
-                    "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
-                    cx,
-                );
-                    return;
-                }
-            };
-            password.clone()
-        };
         let protected_seed_session = spend_authorization.protected_seed_session();
         let Some(session) = self.selected_chain_session() else {
             tracing::warn!("blocked Shield refund requested without selected chain session");
@@ -477,6 +492,34 @@ impl WalletRoot {
         let Some(public_account_uuid) = rescue.public_account_uuid.clone() else {
             tracing::warn!("blocked Shield refund requested without origin public account");
             return;
+        };
+        let password = if let Some(password) = vault_password {
+            Some(password)
+        } else {
+            match &spend_authorization {
+                DesktopPrivateSpendAuthorization::VaultPassword(password)
+                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
+                    Some(password.clone())
+                }
+                // Only the device approval scoped to the origin account signs its gas.
+                DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)
+                    if hardware.is_gas_payment_for(&public_account_uuid) =>
+                {
+                    None
+                }
+                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
+                | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                | DesktopPrivateSpendAuthorization::HardwarePublic => {
+                    tracing::warn!(
+                        "blocked Shield refund self-broadcast requested without gas-payer password"
+                    );
+                    self.set_vault_error(
+                    "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
+                    cx,
+                );
+                    return;
+                }
+            }
         };
         let transaction_tracking = match self
             .public_transaction_tracking_context(self.selected_chain, &public_account_uuid)
@@ -1830,6 +1873,7 @@ fn blocked_shield_refund_authorization_summary(
     row: &UtxoDisplayRow,
     rescue: &BlockedShieldRescueInfo,
     origin_address: &str,
+    device_only: bool,
 ) -> SpendAuthorizationSummary {
     let gas_payer = rescue
         .public_account_label
@@ -1837,7 +1881,11 @@ fn blocked_shield_refund_authorization_summary(
         .map_or_else(|| origin_address.to_string(), std::clone::Clone::clone);
     SpendAuthorizationSummary::new(
         "Blocked Shield refund",
-        "Enter your vault password to authorize this refund.",
+        if device_only {
+            "Approve this refund on your hardware wallet."
+        } else {
+            "Enter your vault password to authorize this refund."
+        },
         vec![
             SpendAuthorizationSummaryRow::new("Amount", format!("{} {}", row.amount, row.token))
                 .with_icon(row.token_icon_path.clone()),

@@ -802,6 +802,31 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
     );
     assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
     assert!(record.reserved_inputs().contains(&swap.input));
+
+    // A blocked reshield is refunded to the stealth account that funded it, not the solver.
+    let shielded = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.address() == RAILGUN)
+        .filter_map(|log| log.log_decode::<Shield>().ok())
+        .flat_map(|log| log.inner.data.commitments)
+        .find(|preimage| preimage.token.tokenAddress == USDC)
+        .map(|preimage| U256::from(preimage.value))
+        .expect("the post-hook shields the bought USDC");
+    let origin = crate::resolve_source_tx_origin(
+        1,
+        &wallet.chain,
+        settled,
+        receipt.transaction_hash,
+        USDC,
+        shielded,
+        &HttpContext::direct_for_tests(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(origin, swap.executor);
+    assert_ne!(origin, receipt.from);
     wallet.finish().await;
 }
 

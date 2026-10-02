@@ -678,7 +678,7 @@ pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
-    pub vault_password: Zeroizing<String>,
+    pub vault_password: Option<Zeroizing<String>>,
     pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub utxo_id: BlockedShieldRescueUtxoId,
