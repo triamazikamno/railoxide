@@ -305,6 +305,37 @@ impl HardwareExecutorAuthorizationRequest {
             }),
         })
     }
+
+    /// Complete this request and `destination`'s from one device session's derivation, for the
+    /// two setups of a private Bridge swap. Both are `Execute` actions of the same wallet
+    /// session on different chains. Each authorization is bound to its own owner and action,
+    /// as [`Self::complete`] binds one.
+    pub fn complete_with_destination(
+        self,
+        destination: Self,
+        descriptor: &HardwareDerivationDescriptor,
+        entropy: &[u8],
+    ) -> Result<(HardwareExecutorAuthorization, HardwareExecutorAuthorization)> {
+        if !matches!(
+            (&self.action, &destination.action),
+            (
+                HardwareExecutorAction::Execute(_),
+                HardwareExecutorAction::Execute(_)
+            )
+        ) || !self.view.is_same_wallet_session(&destination.view)
+            || self.owner.chain.chain_id == destination.owner.chain.chain_id
+        {
+            return Err(eyre!(
+                "hardware approval for both networks needs one wallet session's executor actions on two networks"
+            ));
+        }
+        self.owner.ensure_active()?;
+        destination.owner.ensure_active()?;
+        Ok((
+            self.complete(descriptor, entropy)?,
+            destination.complete(descriptor, entropy)?,
+        ))
+    }
 }
 
 impl HardwareExecutorAuthorization {

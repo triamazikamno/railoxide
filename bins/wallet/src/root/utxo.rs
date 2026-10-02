@@ -22,7 +22,9 @@ use gpui_component::{
 };
 use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_asset_path};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+};
 use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 #[cfg(feature = "hardware")]
@@ -435,6 +437,9 @@ impl WalletRoot {
                     BlockedShieldRescueRowState::from_info(info.clone()),
                 );
                 root.sync_utxo_table(cx);
+                if !info.eligible {
+                    Self::show_blocked_shield_refund_unavailable_dialog(&info, window, cx);
+                }
                 if info.eligible
                     && !root.blocked_shield_refunds_in_flight.contains(&utxo_id)
                     && let Some(row) = root.active_blocked_shield_rescue_display_row(utxo_id)
@@ -446,6 +451,65 @@ impl WalletRoot {
         })
         .detach();
         cx.notify();
+    }
+
+    fn show_blocked_shield_refund_unavailable_dialog(
+        info: &BlockedShieldRescueInfo,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let message = info
+            .disabled_reason
+            .clone()
+            .unwrap_or_else(|| "Blocked Shield refund is unavailable.".to_owned());
+        let origin_address = info.origin_address.clone();
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            dialog
+                .w((window.viewport_size().width * 0.92).min(window.rem_size() * 30.0))
+                .max_h(dialog_max_height(window))
+                .title(app_strong_text("Refund unavailable"))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(app_text(message.clone()).whitespace_normal())
+                        .when_some(origin_address.clone(), |this, address| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(app_muted_text("Origin account"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                app_text(address.clone())
+                                                    .font_family(APP_MONO_FONT_FAMILY)
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate(),
+                                            )
+                                            .child(
+                                                clipboard_with_toast(
+                                                    "wallet-blocked-shield-refund-origin-copy",
+                                                    address,
+                                                )
+                                                .tooltip("Copy origin account address"),
+                                            ),
+                                    ),
+                            )
+                        }),
+                )
+                .footer(
+                    app_button("wallet-blocked-shield-refund-unavailable-close", "Close")
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                )
+        });
     }
 
     pub(super) fn submit_blocked_shield_refund_authorized(
@@ -1846,6 +1910,7 @@ fn blocked_shield_refund_action(
     )))
     .xsmall()
     .danger()
+    .loading(blocked_shield_refund_origin_resolving(row))
     .child("Refund");
     if rescue.eligible || can_start_blocked_shield_origin_resolution(row, rescue) {
         let row = row.clone();
@@ -1857,7 +1922,12 @@ fn blocked_shield_refund_action(
             });
         });
         if !rescue.eligible {
-            button = button.tooltip("Check source transaction origin before refund");
+            button = button.tooltip(
+                rescue
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "Check source transaction origin before refund".to_owned()),
+            );
         }
     } else {
         let reason = rescue

@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use super::*;
 
@@ -10,6 +10,7 @@ pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     active_wallet_scope: AsyncMutex<ActiveWalletScope>,
+    wallet_startups: AsyncRwLock<()>,
     executor_owners: Mutex<ExecutorOwners>,
 }
 
@@ -130,6 +131,7 @@ impl WalletSessionStore {
             db,
             sync_manager,
             active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
+            wallet_startups: AsyncRwLock::new(()),
             executor_owners: Mutex::new(ExecutorOwners::default()),
         })
     }
@@ -172,12 +174,18 @@ impl WalletSessionStore {
         let wallet_id = request.view_session.wallet_id().to_owned();
         let mut active_scope = self.active_wallet_scope.lock().await;
         if active_scope.requires_replacement(request.wallet_scope_generation, &wallet_id)? {
+            // Replacement must not remove actors while an admitted startup still creates them.
+            let _exclusive_startups = self.wallet_startups.write().await;
             self.invalidate_executor_owners(request.wallet_scope_generation);
             self.shutdown_superseded_executor_owners(request.wallet_scope_generation)
                 .await;
             self.sync_manager.remove_all_wallets().await;
             active_scope.replace(request.wallet_scope_generation, wallet_id);
         }
+        // Admit this startup while the scope is locked, then let other chains in the same
+        // scope start concurrently. The shared guard prevents replacement until it finishes.
+        let _startup = self.wallet_startups.read().await;
+        drop(active_scope);
 
         let chain_id = request.chain_id;
         let executor_view = Arc::clone(&request.view_session);
@@ -646,6 +654,141 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chain_startups_overlap_but_wallet_replacement_waits_for_them() {
+        use futures_util::poll;
+        use tokio::net::TcpListener;
+
+        let root_dir = std::env::temp_dir().join(format!(
+            "concurrent-chain-startup-{}",
+            vault::generate_opaque_id().unwrap()
+        ));
+        let vault = vault::DesktopVaultStore::open(root_dir.clone()).unwrap();
+        let password = "synthetic startup concurrency password";
+        vault
+            .create_vault_with_params(password, vault::KdfParams::new(1024, 1, 1))
+            .unwrap();
+        let wallet_id = vault::generate_opaque_id().unwrap();
+        let metadata = vault
+            .new_wallet_metadata(
+                password,
+                &wallet_id,
+                0,
+                vault::WalletSource::Imported,
+                "Test",
+            )
+            .unwrap();
+        vault.import_wallet_mnemonic_with_metadata(
+            password, &wallet_id, 0, "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", &metadata,
+        ).unwrap();
+        let view = Arc::new(vault.load_view_session(password, &wallet_id).unwrap());
+        let poi = PoiReadSource::PoiProxy {
+            rpc_url: Url::parse("http://127.0.0.1:1").unwrap().into(),
+        };
+        let sessions = Arc::new(WalletSessionStore::from_db(vault.db(), poi.clone()).unwrap());
+        let http = HttpContext::direct_for_tests();
+        let chains =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default()).unwrap();
+        let owner = sessions
+            .create_executor_owner(
+                1,
+                view.clone(),
+                chains.get(1).unwrap().clone(),
+                http.clone(),
+            )
+            .unwrap();
+        let request = |chain_id, generation, listener: &TcpListener| {
+            let mut chain = chains.get(chain_id).unwrap().clone();
+            chain.rpc_route = crate::RpcChainRoute::new(
+                chain_id,
+                vec![Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()],
+            );
+            let private = chain.railgun.as_mut().unwrap();
+            private.archive_rpc_url = None;
+            private.sync.quick_sync_endpoint = None;
+            private.sync.indexed_artifact_source = None;
+            ViewWalletChainSessionRequest {
+                view_session: view.clone(),
+                wallet_scope_generation: generation,
+                chain_id,
+                effective_chain: chain,
+                sync_start_policy: DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                init_block_number: Some(0),
+                sync_to_block: Some(0),
+                use_indexed_wallet_catch_up: false,
+                poi_read_source: poi.clone(),
+                rewind_wallet_cache: false,
+                progress_tx: None,
+            }
+        };
+        let start = |request| {
+            let sessions = Arc::clone(&sessions);
+            let http = http.clone();
+            tokio::spawn(async move {
+                Box::pin(sessions.start_view_wallet_session_immediate(request, &http)).await
+            })
+        };
+
+        let polygon = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let first = start(request(137, 1, &polygon));
+        let held_polygon = tokio::time::timeout(Duration::from_secs(2), polygon.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        // Polygon never answers. Arbitrum must still reach its own RPC independently.
+        let arbitrum = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let second = start(request(42161, 1, &arbitrum));
+        let held_arbitrum = tokio::time::timeout(Duration::from_secs(2), arbitrum.accept())
+            .await
+            .expect("a stalled chain must not block another chain's startup")
+            .unwrap();
+        assert!(!first.is_finished() && !second.is_finished());
+        second.abort();
+        assert!(matches!(second.await, Err(error) if error.is_cancelled()));
+        drop(held_arbitrum);
+
+        // A new wallet generation must wait for the old startup before retiring its owners.
+        let replacement_rpc = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut replacement = Box::pin(
+            sessions.start_view_wallet_session_immediate(request(56, 2, &replacement_rpc), &http),
+        );
+        assert!(poll!(replacement.as_mut()).is_pending());
+        assert!(
+            owner.records().is_ok(),
+            "replacement must wait for the old startup"
+        );
+        first.abort();
+        assert!(matches!(first.await, Err(error) if error.is_cancelled()));
+        drop(held_polygon);
+        let held_replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut replacement => panic!("replacement RPC should still be pending"),
+                connection = replacement_rpc.accept() => connection.unwrap(),
+            }
+        })
+        .await
+        .expect("cancelling the old startup must unblock replacement");
+        assert!(
+            owner.records().is_err(),
+            "the old owner is retired before replacement starts"
+        );
+        drop(replacement);
+        drop(held_replacement);
+        sessions.shutdown().await;
+        drop(owner);
+        drop(sessions);
+        drop(view);
+        drop(vault);
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn executor_lifecycle_cancels_reads_and_rejects_stale_owners_without_losing_records() {

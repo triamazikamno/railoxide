@@ -104,6 +104,9 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
         gas_allowance: None,
         gas_price_wei: None,
         valid_for_secs: None,
+        destination_shield_fee_bps: None,
+        delivery_allowance: None,
+        destination_setup_fee: None,
     };
     let attempt = |digest: u8, valid_to: u32, hooks: u8, post_nonce: u64| SwapAttempt {
         submission: None,
@@ -141,6 +144,29 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
     assert!(matches!(
         store.record_swap_attempt(operation, attempt(30, 1_000, 31, 3)),
         Err(ExecutorStoreError::OutstandingNonce)
+    ));
+    // A destination reservation cannot become an origin account, even before its shield is
+    // issued and even if a caller bypasses the reusable-account list.
+    let destination = ExecutorOperationId::random().unwrap();
+    let destination_executor = Address::repeat_byte(90);
+    store
+        .reserve_swap_destination(
+            destination,
+            delegate,
+            SwapDestinationRecord {
+                origin_chain: 137,
+                origin_operation: ExecutorOperationId::random().unwrap(),
+                destination_token: Address::repeat_byte(6),
+                outcome: None,
+            },
+        )
+        .unwrap();
+    set_up(&store, destination, delegate, destination_executor);
+    let mut unrelated = first.clone();
+    unrelated.uid = OrderUid::new(B256::repeat_byte(30), destination_executor, 1_000);
+    assert!(matches!(
+        store.record_swap_attempt(destination, unrelated),
+        Err(ExecutorStoreError::OperationMismatch)
     ));
     store.record_swap_attempt(operation, first.clone()).unwrap();
 
@@ -775,6 +801,7 @@ fn swap_records_written_by_the_external_build_decode_unchanged() {
             receiver,
             destination_token: Address::repeat_byte(10),
             surplus,
+            private: None,
         });
         bridged.bounds.destination_minimum = Some(U256::from(9_900));
         bridged.tokens = Some(SwapApprovalTokens {
@@ -983,6 +1010,9 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
             gas_allowance: None,
             gas_price_wei: None,
             valid_for_secs: None,
+            destination_shield_fee_bps: None,
+            delivery_allowance: None,
+            destination_setup_fee: None,
         },
         invalidates: None,
         pre_hook: hook(
@@ -1171,6 +1201,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         receiver,
         destination_token: Address::repeat_byte(10),
         surplus: BridgeSurplus::KeepInAccount,
+        private: None,
     };
     let near = BridgeDelivery {
         provider: BridgeProvider::NearIntents,
@@ -1178,6 +1209,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         receiver,
         destination_token: Address::ZERO,
         surplus: BridgeSurplus::BridgedByProvider,
+        private: None,
     };
     let across_terms = BridgeOrderTerms::Across(AcrossOrderTerms {
         spoke_pool: Address::repeat_byte(11),
@@ -1189,6 +1221,8 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         fill_deadline: 1_700_021_600,
         exclusive_relayer: Address::ZERO,
         exclusivity_parameter: 0,
+        recipient: None,
+        message_hash: None,
     });
     let near_terms = BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
         deposit_address: Address::repeat_byte(12),
@@ -1233,6 +1267,9 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
                     gas_allowance: None,
                     gas_price_wei: None,
                     valid_for_secs: None,
+                    destination_shield_fee_bps: None,
+                    delivery_allowance: None,
+                    destination_setup_fee: None,
                 },
                 invalidates: None,
                 pre_hook: hook(
@@ -1409,6 +1446,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         block: BlockNumHash::new(500, B256::repeat_byte(60)),
         transaction_hash: B256::repeat_byte(61),
         output_amount: U256::from(output_amount),
+        shielded: false,
     };
     // Across may fill a deposit it reported expired. Only a verified fill of at least the
     // approved minimum replaces the refund.
@@ -1581,6 +1619,632 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         store.record_swap_bridge_outcome(operation, order.uid(), verified(9_900)),
         Err(ExecutorStoreError::InvalidRecord)
     ));
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn swap_records_written_before_private_bridge_delivery_decode_without_it() {
+    // Match the named MessagePack shapes of the build before private Bridge delivery: no private
+    // terms, deposit recipient or message hash, destination bounds, shielded flag, or
+    // destination link.
+    #[derive(serde::Serialize)]
+    struct EarlierBridge {
+        provider: BridgeProvider,
+        destination_chain: u64,
+        receiver: Address,
+        destination_token: Address,
+        surplus: BridgeSurplus,
+    }
+    #[derive(serde::Serialize)]
+    enum EarlierDelivery {
+        Bridge(EarlierBridge),
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierAcross {
+        spoke_pool: Address,
+        input_token: Address,
+        output_token: Address,
+        input_amount: U256,
+        output_amount: U256,
+        quote_timestamp: u32,
+        fill_deadline: u32,
+        exclusive_relayer: Address,
+        exclusivity_parameter: u32,
+    }
+    #[derive(serde::Serialize)]
+    enum EarlierBridgeTerms {
+        Across(EarlierAcross),
+    }
+    #[derive(serde::Serialize)]
+    enum EarlierOutcome {
+        DeliveredVerified {
+            block: BlockNumHash,
+            transaction_hash: B256,
+            output_amount: U256,
+        },
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierBounds {
+        sell_amount: U256,
+        unshield_amount: Option<U256>,
+        unshield_fee_bps: U256,
+        buy_amount: U256,
+        private_minimum: U256,
+        shield_fee_bps: U256,
+        slippage_bps: u32,
+        pre_hook_gas_limit: u64,
+        post_hook_gas_limit: Option<u64>,
+        hook_cost: Option<U256>,
+        anchors: Vec<SwapAnchorObservation>,
+        destination_minimum: Option<U256>,
+        gas_share_bps: Option<u16>,
+        gas_estimate: Option<U256>,
+        gas_allowance: Option<U256>,
+        gas_price_wei: Option<u128>,
+        valid_for_secs: Option<u32>,
+    }
+    #[derive(serde::Serialize)]
+    struct EarlierApproval {
+        bounds: EarlierBounds,
+        price_verified: Option<bool>,
+        price_acknowledged: bool,
+        delivery: EarlierDelivery,
+        tokens: Option<SwapApprovalTokens>,
+    }
+    #[derive(serde::Serialize)]
+    struct SavedRecord {
+        version: u32,
+        derivation: ExecutorDerivationScheme,
+        origin: ExecutorRecordOrigin,
+        operation: ExecutorOperationId,
+        index: u32,
+        address: Address,
+        delegate: Address,
+        retired: bool,
+        issued: Vec<IssuedExecutorPayload>,
+        swap_approval: EarlierApproval,
+    }
+    fn reencode<T: serde::de::DeserializeOwned>(value: &impl serde::Serialize) -> T {
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(value).unwrap()).unwrap()
+    }
+    let receiver = Address::repeat_byte(9);
+    let (sell, buy) = (Address::repeat_byte(5), Address::repeat_byte(6));
+    let record: ExecutorRecord = reencode(&SavedRecord {
+        version: 1,
+        derivation: ExecutorDerivationScheme::Railgun7702V1,
+        origin: ExecutorRecordOrigin::Reserved,
+        operation: ExecutorOperationId::random().unwrap(),
+        index: 7,
+        address: Address::repeat_byte(2),
+        delegate: Address::repeat_byte(1),
+        retired: false,
+        issued: Vec::new(),
+        swap_approval: EarlierApproval {
+            bounds: EarlierBounds {
+                sell_amount: U256::from(9_975),
+                unshield_amount: Some(U256::from(10_000)),
+                unshield_fee_bps: U256::from(25),
+                buy_amount: U256::from(9_975),
+                private_minimum: U256::from(9_975),
+                shield_fee_bps: U256::ZERO,
+                slippage_bps: 50,
+                pre_hook_gas_limit: 900_000,
+                post_hook_gas_limit: Some(400_000),
+                hook_cost: Some(U256::ZERO),
+                anchors: Vec::new(),
+                destination_minimum: Some(U256::from(9_900)),
+                gas_share_bps: Some(2_500),
+                gas_estimate: Some(U256::from(40)),
+                gas_allowance: Some(U256::from(10)),
+                gas_price_wei: Some(7),
+                valid_for_secs: Some(1_800),
+            },
+            price_verified: Some(true),
+            price_acknowledged: false,
+            delivery: EarlierDelivery::Bridge(EarlierBridge {
+                provider: BridgeProvider::Across,
+                destination_chain: 137,
+                receiver,
+                destination_token: Address::repeat_byte(10),
+                surplus: BridgeSurplus::KeepInAccount,
+            }),
+            tokens: Some(SwapApprovalTokens { sell, buy }),
+        },
+    });
+    assert_eq!(
+        (record.swap_destination(), record.destination_operation()),
+        (None, None)
+    );
+    let approval = record.swap_approval().unwrap();
+    let delivery = BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: 137,
+        receiver,
+        destination_token: Address::repeat_byte(10),
+        surplus: BridgeSurplus::KeepInAccount,
+        private: None,
+    };
+    assert_eq!(approval.delivery, SwapDelivery::Bridge(delivery));
+    assert_eq!(
+        (
+            approval.bounds.valid_for_secs,
+            approval.bounds.destination_shield_fee_bps,
+            approval.bounds.delivery_allowance,
+            approval.bounds.destination_setup_fee
+        ),
+        (Some(1_800), None, None, None)
+    );
+    let BridgeOrderTerms::Across(terms) = reencode(&EarlierBridgeTerms::Across(EarlierAcross {
+        spoke_pool: Address::repeat_byte(11),
+        input_token: buy,
+        output_token: Address::repeat_byte(10),
+        input_amount: U256::from(9_975),
+        output_amount: U256::from(9_900),
+        quote_timestamp: 1_700_000_000,
+        fill_deadline: 1_700_021_600,
+        exclusive_relayer: Address::ZERO,
+        exclusivity_parameter: 0,
+    })) else {
+        panic!("Across terms decode as Across terms");
+    };
+    assert_eq!((terms.recipient, terms.message_hash), (None, None));
+    // The deposit of such a record pays the receiver with an empty message.
+    assert_eq!(
+        (
+            terms.deposit_recipient(delivery),
+            terms.deposit_message_hash()
+        ),
+        (receiver, B256::ZERO)
+    );
+    let block = BlockNumHash::new(500, B256::repeat_byte(60));
+    assert_eq!(
+        reencode::<SwapBridgeOutcome>(&EarlierOutcome::DeliveredVerified {
+            block,
+            transaction_hash: B256::repeat_byte(61),
+            output_amount: U256::from(9_900),
+        }),
+        SwapBridgeOutcome::DeliveredVerified {
+            block,
+            transaction_hash: B256::repeat_byte(61),
+            output_amount: U256::from(9_900),
+            shielded: false,
+        }
+    );
+
+    // A private Across approval and its order terms keep the new fields.
+    let mut private = approval.clone();
+    let private_delivery = BridgeDelivery {
+        private: Some(BridgePrivateDelivery {
+            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+        }),
+        ..delivery
+    };
+    private.delivery = SwapDelivery::Bridge(private_delivery);
+    private.bounds.destination_shield_fee_bps = Some(U256::from(25));
+    private.bounds.delivery_allowance = Some(U256::from(120));
+    private.bounds.destination_setup_fee = Some(U256::from(3));
+    assert_eq!(reencode::<SwapApproval>(&private), private);
+    let private_terms = AcrossOrderTerms {
+        recipient: Some(Address::repeat_byte(12)),
+        message_hash: Some(B256::repeat_byte(13)),
+        ..terms
+    };
+    assert_eq!(reencode::<AcrossOrderTerms>(&private_terms), private_terms);
+    assert_eq!(
+        (
+            private_terms.deposit_recipient(private_delivery),
+            private_terms.deposit_message_hash()
+        ),
+        (Address::repeat_byte(12), B256::repeat_byte(13))
+    );
+}
+
+/// Bind the reserved account `operation` to `executor` and let its delegation-only setup win
+/// nonce 0. Returns the reconciled observation at nonce 1.
+fn set_up(
+    store: &ExecutorStore,
+    operation: ExecutorOperationId,
+    delegate: Address,
+    executor: Address,
+) -> ExecutorNonceObservation {
+    store.bind_address(operation, executor).unwrap();
+    let before_setup =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    store.reconcile(operation, before_setup, &[]).unwrap();
+    store
+        .record_issued(
+            operation,
+            hook(
+                ExecutorPayloadPurpose::Operation,
+                0,
+                3,
+                delegate,
+                before_setup,
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+    let setup_won = (
+        B256::repeat_byte(3),
+        ExecutorPayloadInclusion::new(
+            BlockNumHash::new(11, B256::repeat_byte(11)),
+            B256::repeat_byte(4),
+            ExecutorExecutionResult::Executed,
+        ),
+    );
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    store.reconcile(operation, observed, &[setup_won]).unwrap();
+    observed
+}
+
+#[test]
+fn swap_destination_records_link_to_their_origin_and_unreferenced_ones_retire() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let origin_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let delegate = Address::repeat_byte(1);
+    let token = Address::repeat_byte(10);
+    let [origin, linked, unreferenced, issued, missing] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let serves = |origin_operation| SwapDestinationRecord {
+        origin_chain: 1,
+        origin_operation,
+        destination_token: token,
+        outcome: None,
+    };
+
+    // The destination is reserved first, then the origin with the link to it.
+    let reserved = store
+        .reserve_swap_destination(linked, delegate, serves(origin))
+        .unwrap();
+    assert_eq!(reserved.swap_destination(), Some(serves(origin)));
+    assert_eq!(reserved.assets(), &[ExecutorAsset::Erc20(token)]);
+    let reserve_origin = |destination| {
+        origin_store.reserve_with_swap_approval(
+            origin,
+            delegate,
+            Some("Private swap"),
+            &[],
+            None,
+            destination,
+        )
+    };
+    assert_eq!(
+        reserve_origin(Some(linked))
+            .unwrap()
+            .destination_operation(),
+        Some(linked)
+    );
+    // A reservation is returned again only for the same link, and a destination is on
+    // another chain than its swap.
+    assert!(matches!(
+        reserve_origin(None),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    assert!(matches!(
+        store.reserve_swap_destination(linked, delegate, serves(missing)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    assert!(matches!(
+        origin_store.reserve_swap_destination(missing, delegate, serves(origin)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+
+    // A crash between the two reservations leaves a destination that no swap references. It
+    // retires on load unless it already issued a payload. Live reconciliation cannot tell
+    // these apart from reservations that are still being prepared.
+    for operation in [unreferenced, issued] {
+        store
+            .reserve_swap_destination(operation, delegate, serves(missing))
+            .unwrap();
+    }
+    set_up(&store, issued, delegate, Address::repeat_byte(3));
+    assert!(!store.reconcile_swap_destinations().unwrap());
+    let retired = |operation| {
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+            .is_retired()
+    };
+    assert_eq!(
+        (retired(linked), retired(unreferenced), retired(issued)),
+        (false, false, false)
+    );
+    assert!(store.reconcile_swap_destinations_on_load().unwrap());
+    assert_eq!(
+        (retired(linked), retired(unreferenced), retired(issued)),
+        (false, true, false)
+    );
+    assert!(!store.reconcile_swap_destinations_on_load().unwrap());
+    drop(origin_store);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let origin_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let delegate = Address::repeat_byte(1);
+    let (executor, destination_executor) = (Address::repeat_byte(2), Address::repeat_byte(9));
+    let (sell, buy, token) = (
+        Address::repeat_byte(5),
+        Address::repeat_byte(6),
+        Address::repeat_byte(10),
+    );
+    let (origin, destination) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    store
+        .reserve_swap_destination(
+            destination,
+            delegate,
+            SwapDestinationRecord {
+                origin_chain: 1,
+                origin_operation: origin,
+                destination_token: token,
+                outcome: None,
+            },
+        )
+        .unwrap();
+    origin_store
+        .reserve_with_swap_approval(
+            origin,
+            delegate,
+            Some("Private swap"),
+            &[ExecutorAsset::Erc20(sell)],
+            None,
+            Some(destination),
+        )
+        .unwrap();
+    let observed = set_up(&store, destination, delegate, destination_executor);
+    assert_eq!(set_up(&origin_store, origin, delegate, executor), observed);
+
+    // The shield is signed at the destination account's nonce after its setup. Only a
+    // destination account takes one.
+    let shield = |hash: u8| {
+        hook(
+            ExecutorPayloadPurpose::SwapDestinationShield,
+            1,
+            hash,
+            delegate,
+            observed,
+            Vec::new(),
+        )
+    };
+    assert!(matches!(
+        origin_store.record_issued(origin, shield(70)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    let issued = store.record_issued(destination, shield(70)).unwrap();
+    // Recovery admission asks the first two: whether a payload competes at the recovery's
+    // nonce, and whether its review warns of one.
+    let outstanding = |record: &ExecutorRecord| {
+        (
+            record.is_outstanding_at(&record.issued()[1], U256::ONE),
+            record.has_competing_payloads(),
+            record.has_unresolved_issued_work(),
+        )
+    };
+    assert_eq!(outstanding(&issued), (true, true, true));
+    // A retry signs again at the same nonce, and both stay recorded.
+    let issued = store.record_issued(destination, shield(71)).unwrap();
+    assert_eq!((issued.issued().len(), issued.is_retired()), (3, false));
+
+    // The origin's private Across order names the destination account as its receiver.
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
+        2,
+        3,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    let inputs = vec![ExecutorInputIdentity::from_utxo(&input)];
+    let uid = OrderUid::new(B256::repeat_byte(30), executor, 1_000);
+    origin_store
+        .record_swap_attempt(
+            origin,
+            SwapAttempt {
+                terms: SwapTerms::new(
+                    sell,
+                    buy,
+                    SwapRecipient::new(U256::from(7), [8; 32]),
+                    B256::repeat_byte(3),
+                ),
+                proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+                uid,
+                submission: None,
+                delivery: SwapDelivery::Bridge(BridgeDelivery {
+                    provider: BridgeProvider::Across,
+                    destination_chain: 137,
+                    receiver: destination_executor,
+                    destination_token: token,
+                    surplus: BridgeSurplus::KeepInAccount,
+                    private: Some(BridgePrivateDelivery {
+                        on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+                    }),
+                }),
+                bounds: SwapApprovedBounds {
+                    sell_amount: U256::from(9_975),
+                    unshield_amount: Some(U256::from(10_000)),
+                    unshield_fee_bps: U256::from(25),
+                    buy_amount: U256::from(9_975),
+                    private_minimum: U256::from(9_975),
+                    shield_fee_bps: U256::ZERO,
+                    slippage_bps: 50,
+                    pre_hook_gas_limit: 900_000,
+                    post_hook_gas_limit: Some(400_000),
+                    hook_cost: Some(U256::ZERO),
+                    anchors: Vec::new(),
+                    destination_minimum: Some(U256::from(9_900)),
+                    gas_share_bps: None,
+                    gas_estimate: None,
+                    gas_allowance: None,
+                    gas_price_wei: None,
+                    valid_for_secs: None,
+                    destination_shield_fee_bps: Some(U256::from(25)),
+                    delivery_allowance: Some(U256::from(120)),
+                    destination_setup_fee: Some(U256::from(3)),
+                },
+                invalidates: None,
+                pre_hook: hook(
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    1,
+                    31,
+                    delegate,
+                    observed,
+                    inputs,
+                ),
+                post_hook: Some(hook(
+                    ExecutorPayloadPurpose::SwapPostHook,
+                    2,
+                    32,
+                    delegate,
+                    observed,
+                    Vec::new(),
+                )),
+                bridge: Some(BridgeOrderTerms::Across(AcrossOrderTerms {
+                    spoke_pool: Address::repeat_byte(11),
+                    input_token: buy,
+                    output_token: token,
+                    input_amount: U256::from(9_975),
+                    output_amount: U256::from(9_900),
+                    quote_timestamp: 1_700_000_000,
+                    fill_deadline: 1_700_021_600,
+                    exclusive_relayer: Address::ZERO,
+                    exclusivity_parameter: 0,
+                    recipient: Some(Address::repeat_byte(12)),
+                    message_hash: Some(B256::repeat_byte(13)),
+                })),
+            },
+        )
+        .unwrap();
+    let traded = SwapObservation {
+        block: BlockNumHash::new(13, B256::repeat_byte(13)),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    origin_store
+        .record_swap_settlement(
+            origin,
+            uid,
+            traded,
+            SwapTradeAmounts {
+                sell_amount: U256::from(9_975),
+                buy_amount: U256::from(10_000),
+                fee_amount: U256::ZERO,
+                settlement_gas_used: None,
+                settlement_effective_gas_price: None,
+                executed_fee: None,
+                executed_fee_token: None,
+            },
+            None,
+            Some(SwapBridgeHandoff {
+                observation: traded,
+                deposit_id: Some(U256::from(77)),
+            }),
+        )
+        .unwrap();
+    let destination_record = || {
+        assert!(store.reconcile_swap_destinations().unwrap());
+        store.records().unwrap().remove(0)
+    };
+    let outcome = |record: &ExecutorRecord| record.swap_destination().unwrap().outcome;
+
+    // An expiry/refund report does not revoke the published shield signature. Public signing
+    // and recovery must still treat it as outstanding at the unchanged destination nonce.
+    origin_store
+        .record_swap_bridge_outcome(origin, uid, SwapBridgeOutcome::Refunding)
+        .unwrap();
+    let unfilled = destination_record();
+    assert_eq!(outcome(&unfilled), Some(SwapDestinationOutcome::Unfilled));
+    assert_eq!(outstanding(&unfilled), (true, true, true));
+    // A retry's newly signed shield can be funded again.
+    let reissued = store.record_issued(destination, shield(72)).unwrap();
+    assert_eq!(outcome(&reissued), None);
+    assert_eq!(outstanding(&reissued), (true, true, true));
+    assert_eq!(
+        outcome(&destination_record()),
+        Some(SwapDestinationOutcome::Unfilled)
+    );
+
+    // Across may fill a deposit it reported expired. A private delivery's fill either shields
+    // or leaves the token in the destination account, where the shield can still run.
+    let block = BlockNumHash::new(500, B256::repeat_byte(60));
+    let transaction_hash = B256::repeat_byte(61);
+    assert!(matches!(
+        origin_store.record_swap_bridge_outcome(
+            origin,
+            uid,
+            SwapBridgeOutcome::DeliveredVerified {
+                block,
+                transaction_hash,
+                output_amount: U256::from(9_900),
+                shielded: false,
+            },
+        ),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    let held = origin_store
+        .record_swap_bridge_outcome(
+            origin,
+            uid,
+            SwapBridgeOutcome::HeldOnDestination {
+                block,
+                transaction_hash,
+                amount: U256::from(9_900),
+            },
+        )
+        .unwrap();
+    assert!(!held.swap().unwrap().admits_attempt());
+    let held = destination_record();
+    assert_eq!(
+        outcome(&held),
+        Some(SwapDestinationOutcome::Held {
+            block,
+            transaction_hash,
+        })
+    );
+    assert_eq!(outstanding(&held), (true, true, true));
+    // Canonical nonce consumption, rather than a provider outcome, resolves the signature.
+    let setup = &held.issued()[0];
+    let consumed = store
+        .reconcile(
+            destination,
+            ExecutorNonceObservation::new(block, U256::from(2)),
+            &[(setup.hash(), setup.inclusion().unwrap())],
+        )
+        .unwrap();
+    assert!(!consumed.is_outstanding_at(&consumed.issued()[1], U256::from(2)));
+    assert!(!consumed.has_competing_payloads());
+    assert!(!consumed.has_unresolved_issued_work());
+    drop(origin_store);
     drop(store);
     drop(view);
     drop(vault);

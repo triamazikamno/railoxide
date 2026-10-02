@@ -34,6 +34,13 @@
 //! - [`HOOK_GUARD_GAS`]: the post-hook's self-transfer guard and the trampoline's call overhead.
 //!   Whole post-hooks measured 803,508 to 820,094 across tokens at the tree's position at the
 //!   time, and 855,936 at leaf index 32,768.
+//! - [`ACROSS_MESSAGE_GAS`]: what the handler message of a private delivery adds to the Across
+//!   post-hook's `depositV3`: up to 22,920 execution gas plus 12,180 calldata gas on the
+//!   Ethereum fork measured on 2026-10-02, with both surplus choices.
+//! - [`ACROSS_HANDLER_GAS`] and [`ACROSS_PLAIN_FILL_GAS`]: what Across's `MulticallHandler` adds
+//!   to a fill that delivers privately, and the gas of a plain fill. On the Polygon fork
+//!   measured on 2026-10-02 the handler used 55,877 gas besides the shield, and a plain fill
+//!   used 102,895 gas. The full measurements are in the private Bridge change's verification.
 //!
 //! The first leaf of a fresh tree costs more than the upper bound, up to 902,453 for a post-hook
 //! (`cbBTC` with Railgun and treasury balances starting at zero). That happens once per 65,536
@@ -58,6 +65,21 @@ const ACROSS_APPROVE_GAS: u64 = 30_000;
 /// The Across post-hook's `depositV3`. Measured at most 42,339 on forks of all four chains; a
 /// `SpokePool` that holds none of the token adds about 17,100.
 const ACROSS_DEPOSIT_GAS: u64 = 60_000;
+/// What a private delivery's handler message adds to the Across post-hook's `depositV3`: its
+/// calldata in the hook and its data in the `FundsDeposited` event. Measured at most 35,100
+/// additional execution and calldata gas on an Ethereum fork with both surplus choices.
+const ACROSS_MESSAGE_GAS: u64 = 40_000;
+/// What Across's `MulticallHandler` adds to a fill on the destination chain: its
+/// `handleV3AcrossMessage`, the drain transfer to the stealth account, the call into the
+/// account, and the message's calldata in the fill. The Polygon fork measured 55,877 gas
+/// inside the handler besides the shield. The remaining margin covers calldata and different
+/// token storage states.
+const ACROSS_HANDLER_GAS: u64 = 150_000;
+/// The gas of a plain single fill, which [`DeliveryAllowanceRate::QuoteScaled`] divides by. 48
+/// single plain fills sampled on 2026-10-02 used 92,106 to 159,195 gas, with per-chain medians
+/// of 114,843 (Ethereum), 99,382 (BNB Chain), 140,869 (Polygon) and 120,676 (Arbitrum One). A
+/// value near the low end makes the allowance err high.
+const ACROSS_PLAIN_FILL_GAS: u64 = 100_000;
 
 const WEI_PER_NATIVE: U256 = uint!(1_000_000_000_000_000_000_U256);
 
@@ -105,23 +127,37 @@ pub const fn post_hook_gas(model: &RailgunGasModel, mode: GasEstimateMode) -> u6
 }
 
 /// Estimated gas of the Across post-hook `multicall`: the guard, the approval of the
-/// `SpokePool` and the deposit, and with `reshield_surplus` a full-balance shield of one leaf.
+/// `SpokePool` and the deposit, with `private_delivery` the deposit's handler message, and with
+/// `reshield_surplus` a full-balance shield of one leaf.
 #[must_use]
 pub const fn across_post_hook_gas(
     model: &RailgunGasModel,
     reshield_surplus: bool,
+    private_delivery: bool,
     mode: GasEstimateMode,
 ) -> u64 {
     let calls = model
         .executor()
         .saturating_add(HOOK_GUARD_GAS)
         .saturating_add(ACROSS_APPROVE_GAS)
-        .saturating_add(ACROSS_DEPOSIT_GAS);
+        .saturating_add(ACROSS_DEPOSIT_GAS)
+        .saturating_add(if private_delivery {
+            ACROSS_MESSAGE_GAS
+        } else {
+            0
+        });
     if reshield_surplus {
         calls.saturating_add(model.shield(mode, 1))
     } else {
         calls
     }
+}
+
+/// Estimated gas a private delivery adds to an Across fill on the destination chain: the
+/// handler's instructions and the destination account's post-hook `multicall`.
+#[must_use]
+pub const fn private_delivery_gas(model: &RailgunGasModel, mode: GasEstimateMode) -> u64 {
+    ACROSS_HANDLER_GAS.saturating_add(post_hook_gas(model, mode))
 }
 
 /// Gas limit to declare for a hook in the app data: the estimate plus 10%. The margin covers
@@ -196,6 +232,14 @@ pub enum OrderLimitError {
         /// The quote's best case, in buy-token base units.
         best_case: U256,
     },
+    /// The delivery allowance leaves no positive destination minimum.
+    #[error("the delivery cost on the destination network is at least the bridged amount")]
+    DeliveryAllowanceExceedsOutput {
+        /// The allowance in destination-token base units.
+        allowance: U256,
+        /// The bridge quote's output, in destination-token base units.
+        output: U256,
+    },
     #[error("nothing is left to receive after the price tolerance and the shield fee")]
     NothingToReceive,
     #[error("the price tolerance must be below 10000 basis points")]
@@ -210,6 +254,74 @@ pub enum OrderLimitError {
     ShieldFee(#[from] ShieldFeeError),
     #[error("order amounts overflow")]
     Overflow,
+}
+
+/// How to convert the destination chain's native gas cost into the destination token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryAllowanceRate {
+    /// Destination-token base units per whole native token, from the destination chain's
+    /// cached anchor.
+    Anchor(U256),
+    /// The destination token is the chain's wrapped native token: one base unit per wei.
+    Par,
+    /// No anchor is cached. Scale the quote's own relayer gas fee, in destination-token base
+    /// units, by `gas / ACROSS_PLAIN_FILL_GAS`. The gas price isn't used.
+    QuoteScaled { relayer_gas_fee: U256 },
+}
+
+/// Inputs to [`delivery_allowance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryAllowanceParams {
+    /// Gas the delivery adds to the fill, from [`private_delivery_gas`].
+    pub gas: u64,
+    /// The destination chain's RPC gas price in wei, including the cushion selected by the
+    /// caller.
+    pub gas_price_wei: u128,
+    /// Rollup data cost of the fill's message on the destination chain, zero elsewhere.
+    pub data_cost_wei: U256,
+    pub rate: DeliveryAllowanceRate,
+}
+
+/// The delivery allowance of a private Bridge delivery, in destination-token base units: what
+/// the relayer pays on the destination chain beyond a plain fill.
+///
+/// With an anchor it is `ceil((gas * gas_price + data_cost) * rate / 1e18)`, and at par
+/// `gas * gas_price + data_cost`. Scaled from the quote it is
+/// `ceil(relayer_gas_fee * gas / ACROSS_PLAIN_FILL_GAS)`: the data cost can't be converted
+/// without a rate, so it is left to the signing-time quote. Every rounding raises the
+/// allowance.
+pub fn delivery_allowance(params: &DeliveryAllowanceParams) -> Result<U256, OrderLimitError> {
+    let gas = U256::from(params.gas);
+    let wei = || {
+        gas.checked_mul(U256::from(params.gas_price_wei))
+            .and_then(|cost| cost.checked_add(params.data_cost_wei))
+            .ok_or(OrderLimitError::Overflow)
+    };
+    match params.rate {
+        DeliveryAllowanceRate::Anchor(rate) => Ok(wei()?
+            .checked_mul(rate)
+            .ok_or(OrderLimitError::Overflow)?
+            .div_ceil(WEI_PER_NATIVE)),
+        DeliveryAllowanceRate::Par => wei(),
+        DeliveryAllowanceRate::QuoteScaled { relayer_gas_fee } => Ok(relayer_gas_fee
+            .checked_mul(gas)
+            .ok_or(OrderLimitError::Overflow)?
+            .div_ceil(U256::from(ACROSS_PLAIN_FILL_GAS))),
+    }
+}
+
+/// The destination minimum of a private Bridge delivery: the quote's output less `allowance`.
+pub fn destination_minimum_after_allowance(
+    quote_output: U256,
+    allowance: U256,
+) -> Result<U256, OrderLimitError> {
+    quote_output
+        .checked_sub(allowance)
+        .filter(|minimum| !minimum.is_zero())
+        .ok_or(OrderLimitError::DeliveryAllowanceExceedsOutput {
+            allowance,
+            output: quote_output,
+        })
 }
 
 /// Prices the gas share, the price tolerance, and the shield fee into the order limit.
@@ -710,5 +822,73 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn delivery_allowance_converts_by_anchor_par_or_the_quotes_gas_fee() {
+        // 1,000,000 gas at 2 gwei is 0.002 native, and a rollup's data cost adds 0.001.
+        let params = DeliveryAllowanceParams {
+            gas: 1_000_000,
+            gas_price_wei: 2_000_000_000,
+            data_cost_wei: U256::from(1_000_000_000_000_000_u64),
+            rate: DeliveryAllowanceRate::Par,
+        };
+        let wei = U256::from(3_000_000_000_000_000_u64);
+        for (rate, allowance) in [
+            // 0.003 native at 3,000 USDC per native is 9 USDC.
+            (
+                DeliveryAllowanceRate::Anchor(U256::from(3_000_000_000_u64)),
+                U256::from(9_000_000),
+            ),
+            // 0.003 * 3,000.000001 is 9,000,000.003 base units, which rounds up.
+            (
+                DeliveryAllowanceRate::Anchor(U256::from(3_000_000_001_u64)),
+                U256::from(9_000_001),
+            ),
+            (DeliveryAllowanceRate::Par, wei),
+            // 8,329 * 1,000,000 / 100,000 is 83,290; neither the price nor the data cost counts.
+            (
+                DeliveryAllowanceRate::QuoteScaled {
+                    relayer_gas_fee: U256::from(8_329),
+                },
+                U256::from(83_290),
+            ),
+        ] {
+            assert_eq!(
+                delivery_allowance(&DeliveryAllowanceParams { rate, ..params }),
+                Ok(allowance),
+                "{rate:?}"
+            );
+        }
+        // 8,329 * 1,000,001 / 100,000 is 83,290.08329, which rounds up.
+        assert_eq!(
+            delivery_allowance(&DeliveryAllowanceParams {
+                gas: 1_000_001,
+                rate: DeliveryAllowanceRate::QuoteScaled {
+                    relayer_gas_fee: U256::from(8_329),
+                },
+                ..params
+            }),
+            Ok(U256::from(83_291))
+        );
+        assert_eq!(
+            delivery_allowance(&DeliveryAllowanceParams {
+                rate: DeliveryAllowanceRate::Anchor(U256::MAX),
+                ..params
+            }),
+            Err(OrderLimitError::Overflow)
+        );
+
+        let output = U256::from(9_000_000);
+        assert_eq!(
+            destination_minimum_after_allowance(output, U256::from(83_290)),
+            Ok(U256::from(8_916_710))
+        );
+        for allowance in [output, output + U256::ONE] {
+            assert_eq!(
+                destination_minimum_after_allowance(output, allowance),
+                Err(OrderLimitError::DeliveryAllowanceExceedsOutput { allowance, output })
+            );
+        }
     }
 }

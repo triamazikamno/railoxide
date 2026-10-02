@@ -3,7 +3,7 @@ use broadcaster_core::contracts::cow::OrderUid;
 use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorInputIdentity, ExecutorOperationId,
     ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStore,
-    ExecutorStoreError, FixedBytes, IssuedExecutorPayload, Serialize, U256,
+    ExecutorStoreError, FixedBytes, IssuedExecutorPayload, Serialize, SwapDestinationOutcome, U256,
 };
 
 /// Public components of the Railgun address that every post-hook of one swap
@@ -196,6 +196,24 @@ pub enum BridgeSurplus {
     BridgedByProvider,
 }
 
+/// What a private Bridge delivery's handler message does when the destination shield fails.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeShieldFailure {
+    /// The handler message names no fallback, so a fill whose shield fails can't complete and
+    /// Across refunds the deposit on the swap's chain.
+    #[default]
+    RefundOnOrigin,
+    /// The message names the destination stealth account as fallback, so the fill completes and
+    /// the account holds the tokens.
+    KeepOnDestination,
+}
+
+/// The terms of a Bridge delivery that shields to the wallet on the destination chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgePrivateDelivery {
+    pub on_shield_failure: BridgeShieldFailure,
+}
+
 /// The destination terms of a Bridge order, all bound by its approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeDelivery {
@@ -207,9 +225,22 @@ pub struct BridgeDelivery {
     /// on Ethereum or Arbitrum One reaches receivers without code as ETH.
     pub destination_token: Address,
     pub surplus: BridgeSurplus,
+    /// `Some` when the delivery shields to the wallet on the destination chain. `receiver` is
+    /// then the destination stealth account. `None` in records from before private delivery.
+    #[serde(default)]
+    pub private: Option<BridgePrivateDelivery>,
 }
 
 impl BridgeDelivery {
+    #[must_use]
+    pub const fn is_private(&self) -> bool {
+        self.private.is_some()
+    }
+    /// Only Across runs a call on delivery, so NEAR Intents has no private delivery.
+    #[must_use]
+    pub const fn has_valid_private_delivery(&self) -> bool {
+        self.private.is_none() || matches!(self.provider, BridgeProvider::Across)
+    }
     /// Across reshields or keeps surplus; NEAR Intents always bridges it.
     #[must_use]
     pub const fn has_valid_surplus(&self) -> bool {
@@ -243,8 +274,11 @@ impl BridgeOrderTerms {
     }
 }
 
-/// The signed `depositV3` arguments besides the depositor (the executor), the recipient (the
-/// delivery's receiver), the destination chain and the empty message.
+/// The signed `depositV3` arguments besides the depositor (the executor) and the destination
+/// chain. A private delivery's deposit pays `recipient`, Across's handler, with a message of
+/// hash `message_hash`; the message itself is in the recorded post-hook. Without them, as in
+/// every record from before private delivery, it pays the delivery's receiver with an empty
+/// message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcrossOrderTerms {
     pub spoke_pool: Address,
@@ -258,6 +292,24 @@ pub struct AcrossOrderTerms {
     pub fill_deadline: u32,
     pub exclusive_relayer: Address,
     pub exclusivity_parameter: u32,
+    #[serde(default)]
+    pub recipient: Option<Address>,
+    #[serde(default)]
+    pub message_hash: Option<B256>,
+}
+
+impl AcrossOrderTerms {
+    /// The deposit's signed recipient.
+    #[must_use]
+    pub fn deposit_recipient(&self, delivery: BridgeDelivery) -> Address {
+        self.recipient.unwrap_or(delivery.receiver)
+    }
+    /// What `FilledRelay.messageHash` holds for the deposit: zero for an empty message, and
+    /// otherwise the message's keccak256 hash.
+    #[must_use]
+    pub fn deposit_message_hash(&self) -> B256 {
+        self.message_hash.unwrap_or(B256::ZERO)
+    }
 }
 
 /// A verified 1Click quote the order pays into.
@@ -355,6 +407,18 @@ pub struct SwapApprovedBounds {
     /// the validity was chosen, whose orders used the swap profile's window.
     #[serde(default)]
     pub valid_for_secs: Option<u32>,
+    /// The destination chain's shield fee rate, in basis points, that a private Bridge
+    /// delivery's approval binds. `None` for other deliveries.
+    #[serde(default)]
+    pub destination_shield_fee_bps: Option<U256>,
+    /// The gas allowance deducted from the Across output for a private Bridge delivery's fill,
+    /// in destination-token base units. `None` for other deliveries.
+    #[serde(default)]
+    pub delivery_allowance: Option<U256>,
+    /// The approved maximum private setup fee on the destination chain, in its fee token.
+    /// `None` for other deliveries.
+    #[serde(default)]
+    pub destination_setup_fee: Option<U256>,
 }
 
 impl SwapApprovedBounds {
@@ -559,17 +623,22 @@ pub struct SwapBridgeHandoff {
     pub deposit_id: Option<U256>,
 }
 
-/// `DeliveredVerified`, `DeliveredReported` and `Refunding` are final. `NeedsAttention` stops
-/// automatic polling, but an explicit status check may replace it. An explicit check may also
-/// replace an Across `Refunding` with `DeliveredVerified` once it verifies the matching fill.
+/// `DeliveredVerified`, `DeliveredReported`, `Refunding` and `HeldOnDestination` are final.
+/// `NeedsAttention` stops automatic polling, but an explicit status check may replace it. An
+/// explicit check may also replace an Across `Refunding` with `DeliveredVerified` or
+/// `HeldOnDestination` once it verifies the matching fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapBridgeOutcome {
     /// Across's fill, checked in the destination chain's finalized receipts. `output_amount` is
-    /// the fill's executed amount, at least the signed one.
+    /// the fill's executed amount, at least the signed one. `shielded` is set when the fill's
+    /// receipt also holds the transfer to the destination stealth account and its shield;
+    /// `output_amount` is then the amount the account received, before Railgun's shield fee.
     DeliveredVerified {
         block: BlockNumHash,
         transaction_hash: B256,
         output_amount: U256,
+        #[serde(default)]
+        shielded: bool,
     },
     /// Success as reported by 1Click, not checked on the destination chain.
     DeliveredReported {
@@ -580,6 +649,13 @@ pub enum SwapBridgeOutcome {
     Refunding,
     /// 1Click reported a failed or incomplete deposit.
     NeedsAttention,
+    /// A private delivery's fill completed and the destination stealth account holds `amount`
+    /// of the token, with no shield in that receipt.
+    HeldOnDestination {
+        block: BlockNumHash,
+        transaction_hash: B256,
+        amount: U256,
+    },
 }
 
 impl SwapBridgeOutcome {
@@ -785,7 +861,8 @@ impl ExecutorRecord {
                     inclusion.block.number <= cutoff
                         && inclusion.result == super::ExecutorExecutionResult::Executed
                 }),
-                ExecutorPayloadPurpose::Recovery => false,
+                ExecutorPayloadPurpose::Recovery
+                | ExecutorPayloadPurpose::SwapDestinationShield => false,
             })
     }
 
@@ -868,12 +945,66 @@ impl ExecutorRecord {
     /// outstanding at the nonce it was signed for, with one exception: a swap pre-hook whose
     /// order validity ended at finalized depth while its nonce stayed unused can never run.
     /// A swap post-hook, signed for the nonce after its pre-hook's, is therefore outstanding
-    /// only once that nonce is current.
+    /// only once that nonce is current. A destination shield has no expiry: even a verified
+    /// bridge refund leaves it executable if the account is funded at its signed nonce.
     #[must_use]
     pub fn is_outstanding_at(&self, payload: &IssuedExecutorPayload, current: U256) -> bool {
         payload.nonce == current
             && (payload.purpose != ExecutorPayloadPurpose::SwapPreHook
                 || !self.swap_pre_hook_expired(payload.hash))
+    }
+
+    /// What became of the shield payload of the destination stealth account `receiver`, from
+    /// this origin record's private Bridge orders to it. A shield in any order's fill wins,
+    /// then a fill that left the token in the account. Otherwise only the latest order counts,
+    /// since a retry can still be filled.
+    pub(super) fn swap_destination_outcome(
+        &self,
+        receiver: Address,
+    ) -> Option<SwapDestinationOutcome> {
+        let orders = || {
+            self.swap
+                .iter()
+                .flat_map(|swap| &swap.orders)
+                .filter(move |order| {
+                    matches!(
+                        order.delivery,
+                        SwapDelivery::Bridge(bridge)
+                            if bridge.is_private() && bridge.receiver == receiver
+                    )
+                })
+        };
+        orders()
+            .find_map(|order| match order.observations.bridge_outcome {
+                Some(SwapBridgeOutcome::DeliveredVerified {
+                    shielded: true,
+                    block,
+                    transaction_hash,
+                    ..
+                }) => Some(SwapDestinationOutcome::Shielded {
+                    block,
+                    transaction_hash,
+                }),
+                _ => None,
+            })
+            .or_else(|| {
+                orders().find_map(|order| match order.observations.bridge_outcome {
+                    Some(SwapBridgeOutcome::HeldOnDestination {
+                        block,
+                        transaction_hash,
+                        ..
+                    }) => Some(SwapDestinationOutcome::Held {
+                        block,
+                        transaction_hash,
+                    }),
+                    _ => None,
+                })
+            })
+            .or_else(|| {
+                (orders().next_back()?.observations.bridge_outcome
+                    == Some(SwapBridgeOutcome::Refunding))
+                .then_some(SwapDestinationOutcome::Unfilled)
+            })
     }
 
     /// Whether a recorded payload holds a nonce past `current`, so the record is ahead of
@@ -888,8 +1019,9 @@ impl ExecutorRecord {
     }
 
     /// Whether a recovery review warns of a competing payload. Unresolved payloads compete.
-    /// Swap hooks run inside settlements, where direct-call reconciliation never resolves
-    /// them, so they compete only while outstanding at the last reconciled nonce.
+    /// Swap hooks run inside settlements, and a destination shield inside a relayer's fill,
+    /// where direct-call reconciliation never resolves them, so they compete only while
+    /// outstanding at the last reconciled nonce.
     #[must_use]
     pub fn has_competing_payloads(&self) -> bool {
         self.issued.iter().any(|payload| {
@@ -898,19 +1030,24 @@ impl ExecutorRecord {
                 Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
             ) && (!matches!(
                 payload.purpose,
-                ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook
+                ExecutorPayloadPurpose::SwapPreHook
+                    | ExecutorPayloadPurpose::SwapPostHook
+                    | ExecutorPayloadPurpose::SwapDestinationShield
             ) || self
                 .nonce_observation
                 .is_none_or(|observed| self.is_outstanding_at(payload, observed.nonce)))
         })
     }
 
-    /// A swap hook runs inside a settlement, where direct-call reconciliation never resolves
-    /// it. Once the reconciled nonce is past its own, its signature can no longer execute.
+    /// A swap hook runs inside a settlement, and a destination shield inside a relayer's fill,
+    /// where direct-call reconciliation never resolves it. Once the reconciled nonce is past
+    /// its own, its signature can no longer execute.
     pub(super) fn swap_hook_nonce_passed(&self, payload: &IssuedExecutorPayload) -> bool {
         matches!(
             payload.purpose,
-            ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook
+            ExecutorPayloadPurpose::SwapPreHook
+                | ExecutorPayloadPurpose::SwapPostHook
+                | ExecutorPayloadPurpose::SwapDestinationShield
         ) && self
             .nonce_observation
             .is_some_and(|observed| observed.nonce > payload.nonce)
@@ -1008,12 +1145,22 @@ impl ExecutorRecord {
     }
 }
 
-/// A Bridge order carries its own provider's terms and a surplus that provider supports. Other
-/// orders carry none.
+/// A Bridge order carries its own provider's terms and a surplus that provider supports. Across
+/// terms name a recipient and a message hash exactly for a private delivery, which only Across
+/// offers. Other orders carry none.
 fn bridge_terms_fit(delivery: SwapDelivery, bridge: Option<&BridgeOrderTerms>) -> bool {
     match (delivery, bridge) {
         (SwapDelivery::Bridge(delivery), Some(terms)) => {
-            terms.provider() == delivery.provider && delivery.has_valid_surplus()
+            terms.provider() == delivery.provider
+                && delivery.has_valid_surplus()
+                && delivery.has_valid_private_delivery()
+                && match terms {
+                    BridgeOrderTerms::Across(terms) => {
+                        terms.recipient.is_some() == delivery.is_private()
+                            && terms.message_hash.is_some() == delivery.is_private()
+                    }
+                    BridgeOrderTerms::NearIntents(_) => true,
+                }
         }
         (SwapDelivery::Bridge(_), None) => false,
         (SwapDelivery::Reshield | SwapDelivery::External { .. }, bridge) => bridge.is_none(),
@@ -1076,6 +1223,7 @@ impl ExecutorStore {
                 .as_ref()
                 .map_or(&[][..], |swap| swap.orders.as_slice());
             if record.retired && record.swap.is_none()
+                || record.swap_destination.is_some()
                 || record.swap_setup_stopped
                 || record.address != Some(uid.owner())
                 || record.public_account_uuid.is_some()
@@ -1434,8 +1582,9 @@ impl ExecutorStore {
     /// Persist a Bridge order's destination outcome after its hand-off. A final outcome is
     /// never replaced, though recording it again is accepted; `NeedsAttention` may be
     /// replaced by any outcome. The one exception is an Across `Refunding` without a verified
-    /// refund, which a verified delivery replaces. A verified delivery must meet the approved
-    /// destination minimum.
+    /// refund, which a verified fill replaces. A verified delivery must meet the approved
+    /// destination minimum. A private delivery's fill is recorded as a shielded delivery or as
+    /// held on the destination chain, and no other delivery takes either.
     pub fn record_swap_bridge_outcome(
         &self,
         operation: ExecutorOperationId,
@@ -1448,9 +1597,16 @@ impl ExecutorStore {
                 .as_mut()
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
-            if !matches!(order.delivery, SwapDelivery::Bridge(_)) {
+            let SwapDelivery::Bridge(delivery) = order.delivery else {
                 return Err(ExecutorStoreError::OperationMismatch);
-            }
+            };
+            let private_fits = match outcome {
+                SwapBridgeOutcome::DeliveredVerified { shielded, .. } => {
+                    shielded == delivery.is_private()
+                }
+                SwapBridgeOutcome::HeldOnDestination { .. } => delivery.is_private(),
+                _ => true,
+            };
             let below_minimum = match outcome {
                 SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => order
                     .bounds
@@ -1462,10 +1618,15 @@ impl ExecutorStore {
             // chain rules that fill out.
             let corrects_refund = order.observations.bridge_outcome
                 == Some(SwapBridgeOutcome::Refunding)
-                && matches!(outcome, SwapBridgeOutcome::DeliveredVerified { .. })
+                && matches!(
+                    outcome,
+                    SwapBridgeOutcome::DeliveredVerified { .. }
+                        | SwapBridgeOutcome::HeldOnDestination { .. }
+                )
                 && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
                 && order.observations.bridge_refund.is_none();
             if order.observations.bridge_handoff.is_none()
+                || !private_fits
                 || below_minimum
                 || order
                     .observations

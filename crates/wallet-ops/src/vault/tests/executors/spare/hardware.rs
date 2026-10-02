@@ -1,7 +1,13 @@
+use super::swap_setup::{
+    DESTINATION_CHAIN, broadcaster, destination_chain_config, private_bridge_approval,
+};
 use super::*;
 use crate::public_wallet::{WalletConnectPersonalSignRequest, walletconnect_sign_personal_message};
 use crate::signer::EvmTransactionSigner as _;
-use crate::{DesktopPrivateSpendAuthorization, HardwareExecutorAction};
+use crate::{
+    DesktopPrivateSpendAuthorization, HardwareExecutorAction, PrivateBridgeSetupPreparation,
+    prepare_private_bridge_setup,
+};
 
 pub(in crate::vault::tests::executors) fn hardware_view(
     vault: &DesktopVaultStore,
@@ -630,6 +636,147 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
     assert!(fresh.signer(&vault, &view, "recovery private fee").is_ok());
     owner.shutdown().await;
     drop(owner);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let descriptor = test_hardware_descriptor(1);
+    let view = hardware_view(&vault, &descriptor);
+    let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    let candidate = broadcaster(origin_chain.accepted_executor_profile().unwrap().delegate());
+    let mut destination_candidate = broadcaster(
+        destination_chain
+            .accepted_executor_profile()
+            .unwrap()
+            .delegate(),
+    );
+    destination_candidate.chain_id = DESTINATION_CHAIN;
+    let [origin, destination] = [origin_chain, destination_chain].map(|chain| {
+        Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
+        )
+    });
+    let (operation, destination_operation) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    let request = |owner: &Arc<ExecutorOwner>, operation| {
+        owner
+            .hardware_authorization_request(
+                view.clone(),
+                HardwareExecutorAction::Execute(operation),
+            )
+            .unwrap()
+    };
+    // One device session completes two requests only for two chains.
+    assert!(
+        request(&origin, operation)
+            .complete_with_destination(
+                request(&origin, destination_operation),
+                &descriptor,
+                &[42; 32]
+            )
+            .is_err()
+    );
+    let (authorization, destination_authorization) = request(&origin, operation)
+        .complete_with_destination(
+            request(&destination, destination_operation),
+            &descriptor,
+            &[42; 32],
+        )
+        .unwrap();
+    let authorization = DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(authorization));
+    let destination_authorization =
+        DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(destination_authorization));
+    // Each authorization is bound to its own chain's owner, also for the same action.
+    for (owner, operation, candidate, authorization) in [
+        (
+            &destination,
+            operation,
+            destination_candidate.clone(),
+            &authorization,
+        ),
+        (
+            &origin,
+            destination_operation,
+            candidate.clone(),
+            &destination_authorization,
+        ),
+    ] {
+        let delivery = ExecutorDelivery::PublicBroadcaster(Box::new(candidate));
+        assert!(
+            owner
+                .prepare_operation(operation, delivery, authorization, &[], None)
+                .await
+                .is_err()
+        );
+        assert!(owner.records().unwrap().is_empty());
+    }
+
+    let prepared = prepare_private_bridge_setup(
+        &origin,
+        &destination,
+        PrivateBridgeSetupPreparation {
+            operation,
+            destination_operation,
+            candidate,
+            destination_candidate,
+            approval: private_bridge_approval(),
+            authorization: &authorization,
+            destination_authorization: &destination_authorization,
+        },
+    )
+    .await
+    .unwrap();
+    // Each account is the software derivation from the device's seed for its own chain.
+    let (seed, _) = vault
+        .hardware_seed_and_signer_for_session(&view, &descriptor, &[42; 32])
+        .unwrap();
+    for (owner, operation, chain_id, prepared) in [
+        (&origin, operation, 1, &prepared.origin),
+        (
+            &destination,
+            destination_operation,
+            DESTINATION_CHAIN,
+            &prepared.destination,
+        ),
+    ] {
+        let index = owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+            .index();
+        let expected = railgun_wallet::keys::derive_executor_signer(
+            &seed,
+            view.derivation_index(),
+            chain_id,
+            index,
+        )
+        .unwrap();
+        assert_eq!(prepared.context().executor, expected.address());
+    }
+    assert_ne!(
+        prepared.origin.context().executor,
+        prepared.destination.context().executor
+    );
+    origin.shutdown().await;
+    destination.shutdown().await;
+    drop((origin, destination));
     drop(view);
     drop(vault);
     drop(db);

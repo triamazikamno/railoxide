@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use alloy::primitives::{Address, U256, address, b256};
+use alloy::primitives::{Address, Bytes, U256, address, b256};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -219,6 +219,9 @@ async fn across_fee_quotes_send_only_tokens_chains_and_amount() {
         AcrossFeeQuote {
             output_amount: U256::from(9_995_714_u64),
             total_relay_fee_total: U256::from(4_286_u64),
+            total_relay_fee_pct: U256::from(428_600_000_000_000_u64),
+            relayer_gas_fee_total: U256::from(3_286_u64),
+            relayer_gas_fee_pct: U256::from(328_600_000_000_000_u64),
             lp_fee_total: U256::ZERO,
             timestamp: 1_790_718_359,
             fill_deadline: 1_790_725_559,
@@ -251,6 +254,81 @@ async fn across_fee_quotes_send_only_tokens_chains_and_amount() {
     assert!(
         url.query_pairs()
             .any(|(key, value)| key == "amount" && value == "10000000")
+    );
+    // 9,995,714 / (1 - 0.0004286) is the 10,000,000 input, and 0.03286% of it is the fee the
+    // quote states in the input token, which has the output token's decimals here.
+    assert_eq!(
+        quote.relayer_gas_fee_in_output(),
+        Some(U256::from(3_286_u64))
+    );
+}
+
+#[tokio::test]
+async fn across_message_quotes_add_the_recipient_and_message() {
+    let (base_url, recorded) = spawn_fixed(200, ACROSS_SUGGESTED_FEES).await;
+    let handler = address!("9295ee1d8C5b022Be115A2AD3c30C72E34e7F096");
+    let request = AcrossMessageFeeRequest {
+        fee: AcrossFeeRequest {
+            input_token: address!("af88d065e77c8cC2239327C5EDb3A432268e5831"),
+            output_token: address!("3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+            origin_chain: 42161,
+            destination_chain: 137,
+            amount: U256::from(10_000_000_u64),
+        },
+        recipient: handler,
+        message: Bytes::from_static(&[0xab, 0xcd, 0x01]),
+    };
+
+    across(base_url)
+        .suggested_fees_with_message(&request)
+        .await
+        .unwrap();
+
+    let (_, url, _) = only_request(&recorded);
+    assert_eq!(url.path(), "/api/suggested-fees");
+    assert_eq!(
+        query_keys(&url),
+        [
+            "allowUnmatchedDecimals",
+            "amount",
+            "destinationChainId",
+            "inputToken",
+            "message",
+            "originChainId",
+            "outputToken",
+            "recipient"
+        ]
+    );
+    let sent = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    };
+    assert_eq!(
+        sent("recipient").as_deref(),
+        Some("0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096")
+    );
+    assert_eq!(sent("message").as_deref(), Some("0xabcd01"));
+
+    // The preview quote for the same pair sends neither.
+    let (base_url, recorded) = spawn_fixed(200, ACROSS_SUGGESTED_FEES).await;
+    across(base_url).suggested_fees(&request.fee).await.unwrap();
+    let (_, url, _) = only_request(&recorded);
+    assert!(
+        !url.query_pairs()
+            .any(|(key, _)| key == "recipient" || key == "message")
+    );
+
+    // A message that reverts in Across's simulation gets no quote, and the echoed fill
+    // transaction isn't kept.
+    let (base_url, _) = spawn_fixed(
+        400,
+        r#"{"type":"AcrossApiError","code":"SIMULATION_ERROR","status":400,"message":"execution reverted","transaction":{"to":"0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096","data":"0xabcd01"}}"#,
+    )
+    .await;
+    assert_eq!(
+        across(base_url).suggested_fees_with_message(&request).await,
+        Err(BridgeApiError::FillSimulationFailed)
     );
 }
 

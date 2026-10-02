@@ -130,6 +130,19 @@ impl PreparedExecutorOperation {
     }
 }
 
+/// What a prepared operation's reservation stores beside its account.
+pub(super) enum OperationReservation<'a> {
+    /// An ordinary reservation, or a new swap's, whose record is created holding
+    /// `swap_approval` and the link to its destination stealth account.
+    Operation {
+        purpose_summary: Option<&'a str>,
+        swap_approval: Option<&'a crate::vault::SwapApproval>,
+        destination_operation: Option<ExecutorOperationId>,
+    },
+    /// A private Bridge swap's destination stealth account on this chain.
+    SwapDestination(crate::vault::SwapDestinationRecord),
+}
+
 /// Returning this value is signed-data handoff: its payload is already durable.
 pub struct IssuedExecutorTransaction {
     operation: ExecutorOperationId,
@@ -331,27 +344,55 @@ impl ExecutorOwner {
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
     ) -> Result<PreparedExecutorOperation> {
-        self.prepare_operation_with_swap_approval(
+        self.prepare_reserved_operation(
             operation,
             delivery,
             authorization,
             assets,
-            purpose_summary,
-            None,
+            OperationReservation::Operation {
+                purpose_summary,
+                swap_approval: None,
+                destination_operation: None,
+            },
         )
         .await
     }
 
-    /// [`Self::prepare_operation`] for a new swap, whose record is created holding
-    /// `swap_approval`. A reservation that already exists keeps its own approval.
-    pub(super) async fn prepare_operation_with_swap_approval(
+    fn reserve_operation(
+        &self,
+        operation: ExecutorOperationId,
+        delegate: Address,
+        assets: &[ExecutorAsset],
+        reservation: &OperationReservation<'_>,
+    ) -> Result<crate::vault::ExecutorRecord> {
+        Ok(match reservation {
+            OperationReservation::Operation {
+                purpose_summary,
+                swap_approval,
+                destination_operation,
+            } => self.store.reserve_with_swap_approval(
+                operation,
+                delegate,
+                *purpose_summary,
+                assets,
+                swap_approval.cloned(),
+                *destination_operation,
+            )?,
+            OperationReservation::SwapDestination(destination) => self
+                .store
+                .reserve_swap_destination(operation, delegate, *destination)?,
+        })
+    }
+
+    /// [`Self::prepare_operation`] with the reservation `reservation` describes. A reservation
+    /// that already exists keeps its own approval.
+    pub(super) async fn prepare_reserved_operation(
         &self,
         operation: ExecutorOperationId,
         delivery: ExecutorDelivery,
         authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
-        purpose_summary: Option<&str>,
-        swap_approval: Option<crate::vault::SwapApproval>,
+        reservation: OperationReservation<'_>,
     ) -> Result<PreparedExecutorOperation> {
         self.require_executor_authorization(
             authorization,
@@ -395,13 +436,7 @@ impl ExecutorOwner {
         }
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "reserve_and_derive", "started");
-        let record = self.store.reserve_with_swap_approval(
-            operation,
-            profile.delegate(),
-            purpose_summary,
-            assets,
-            swap_approval.clone(),
-        )?;
+        let record = self.reserve_operation(operation, profile.delegate(), assets, &reservation)?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(
@@ -473,13 +508,7 @@ impl ExecutorOwner {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let record = self.store.reserve_with_swap_approval(
-            operation,
-            profile.delegate(),
-            purpose_summary,
-            assets,
-            swap_approval,
-        )?;
+        let record = self.reserve_operation(operation, profile.delegate(), assets, &reservation)?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(

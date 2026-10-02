@@ -1598,7 +1598,8 @@ fn private_blocked_shield_row(
                 )
                 .child(
                     app_muted_text(format!("{} · {}", status, short_hash(&row.source_tx_hash)))
-                        .text_size(px(12.0)),
+                        .text_size(px(12.0))
+                        .whitespace_normal(),
                 ),
         )
         .child(action)
@@ -1619,13 +1620,13 @@ fn blocked_shield_status_label(row: &UtxoDisplayRow) -> String {
     if rescue.eligible {
         return "Refund available".to_string();
     }
+    if let Some(reason) = &rescue.disabled_reason {
+        return reason.clone();
+    }
     if blocked_shield_refund_action_available(row) {
         return "Origin check needed".to_string();
     }
-    rescue
-        .disabled_reason
-        .clone()
-        .unwrap_or_else(|| "Refund unavailable".to_string())
+    "Refund unavailable".to_string()
 }
 
 fn private_pending_shield_wait_label(wait: Option<PrivatePendingShieldWait>) -> Option<String> {

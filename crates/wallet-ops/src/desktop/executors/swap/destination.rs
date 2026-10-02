@@ -2,7 +2,9 @@
 //!
 //! Across's deposit record only locates the fill block. Delivery is verified from the
 //! destination chain's finalized whole-block receipts, and only block identifiers reach that
-//! chain's RPC. NEAR Intents delivery is 1Click's report and isn't verified on chain.
+//! chain's RPC. A private delivery's fill pays Across's handler, and the same receipt then shows
+//! whether the destination stealth account received the token and shielded it. NEAR Intents
+//! delivery is 1Click's report and isn't verified on chain.
 //!
 //! An explicit status check of a refunding Across order also verifies the refund on this chain.
 //! The refund transaction Across names is looked up only for its block number, and the refund
@@ -182,10 +184,19 @@ impl ExecutorOwner {
         };
         resolve_effective_chain_rpc_route(fill.delivery.destination_chain, destination)?;
         // Only the destination chain's own SpokePool emits fills that deliver the deposit.
-        let spoke_pool = destination
+        let profile = destination
             .bridge_profile()
-            .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
-            .spoke_pool();
+            .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?;
+        let spoke_pool = profile.spoke_pool();
+        // Only a private delivery's fill is followed by a shield on the destination chain.
+        let shield = if fill.delivery.is_private() {
+            Some(ExpectedShield {
+                handler: profile.multicall_handler(),
+                railgun: destination.require_railgun()?.deployment.contract,
+            })
+        } else {
+            None
+        };
         let endpoints = ObservationEndpoints::new(destination, &self.http);
         for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
@@ -197,6 +208,7 @@ impl ExecutorOwner {
                     number,
                     spoke_pool,
                     &fill,
+                    shield,
                 )),
             )
             .instrument(span)
@@ -321,9 +333,12 @@ struct ExpectedFill {
 
 impl ExpectedFill {
     /// The event keeps the signed output amount. The executed one can be higher: a slow fill
-    /// pays the deposit less the LP fee.
+    /// pays the deposit less the LP fee. The recipient is the delivery's receiver, or Across's
+    /// handler for a private delivery, whose message hash is then the signed message's. An
+    /// empty message has a zero hash.
     fn matches(&self, fill: &SpokePool::FilledRelay) -> bool {
-        let recipient = address_to_bytes32(self.delivery.receiver);
+        let recipient = address_to_bytes32(self.terms.deposit_recipient(self.delivery));
+        let message_hash = self.terms.deposit_message_hash();
         fill.originChainId == U256::from(self.origin_chain)
             && fill.depositId == self.deposit_id
             && fill.depositor == address_to_bytes32(self.executor)
@@ -332,11 +347,77 @@ impl ExpectedFill {
             && fill.inputAmount == self.terms.input_amount
             && fill.outputToken == address_to_bytes32(self.terms.output_token)
             && fill.outputAmount == self.terms.output_amount
-            // A relayer may fill with a depositor-signed update; only the signed receiver, and
-            // at least the signed amount, deliver.
+            && fill.messageHash == message_hash
+            // A relayer may fill with a depositor-signed update; only the signed receiver and
+            // message, and at least the signed amount, deliver.
             && fill.relayExecutionInfo.updatedRecipient == recipient
+            && fill.relayExecutionInfo.updatedMessageHash == message_hash
             && fill.relayExecutionInfo.updatedOutputAmount >= self.terms.output_amount
     }
+
+    /// What the matching fill's receipt establishes. `executed` is the fill's executed amount
+    /// and `logs` are its receipt's. Without `shield` the fill itself delivers. With it, the
+    /// handler must have passed at least the signed amount of the destination token to the
+    /// destination stealth account, or the fill is not delivery evidence. A later transfer of
+    /// that token from the account to Railgun shows its shield ran; Railgun's fee goes to its
+    /// treasury in a separate transfer. Without that transfer the account holds the token.
+    fn outcome(
+        &self,
+        shield: Option<ExpectedShield>,
+        block: BlockNumHash,
+        transaction_hash: B256,
+        executed: U256,
+        logs: &[Log],
+    ) -> Option<SwapBridgeOutcome> {
+        let Some(shield) = shield else {
+            return Some(SwapBridgeOutcome::DeliveredVerified {
+                block,
+                transaction_hash,
+                output_amount: executed,
+                shielded: false,
+            });
+        };
+        let account = self.delivery.receiver;
+        let mut transfers = logs
+            .iter()
+            .filter(|log| log.address() == self.terms.output_token)
+            .filter_map(|log| Some(log.log_decode::<Transfer>().ok()?.inner.data));
+        let received = transfers
+            .find(|transfer| {
+                transfer.from == shield.handler
+                    && transfer.to == account
+                    && transfer.value >= self.terms.output_amount
+            })?
+            .value;
+        let shielded = transfers.any(|transfer| {
+            transfer.from == account && transfer.to == shield.railgun && !transfer.value.is_zero()
+        });
+        Some(if shielded {
+            // The gross amount the handler passed to the account, before Railgun's shield fee.
+            // It is what the store compares with the approved destination minimum.
+            SwapBridgeOutcome::DeliveredVerified {
+                block,
+                transaction_hash,
+                output_amount: received,
+                shielded: true,
+            }
+        } else {
+            SwapBridgeOutcome::HeldOnDestination {
+                block,
+                transaction_hash,
+                amount: received,
+            }
+        })
+    }
+}
+
+/// Where a private delivery's fill is passed on and shielded on the destination chain.
+#[derive(Clone, Copy)]
+struct ExpectedShield {
+    /// Across's handler, the fill's recipient.
+    handler: Address,
+    /// The destination chain's Railgun contract.
+    railgun: Address,
 }
 
 /// The transfer that refunds an Across deposit to the executor on this chain.
@@ -363,13 +444,15 @@ impl ExpectedRefund {
 
 /// Match `fill` in the finalized receipts of block `number`, sending only block identifiers.
 /// A block that isn't final yet, has no matching fill, or left the canonical chain during the
-/// read leaves no outcome. The outcome carries the fill's executed amount.
+/// read leaves no outcome, as does a private delivery's fill that didn't reach the destination
+/// stealth account. `shield` is given for a private delivery. See [`ExpectedFill::outcome`].
 async fn read_fill(
     provider: &DynProvider,
     finality_depth: u64,
     number: u64,
     spoke_pool: Address,
     fill: &ExpectedFill,
+    shield: Option<ExpectedShield>,
 ) -> Result<Option<SwapBridgeOutcome>> {
     let Some((identity, receipts)) = finalized_receipts(provider, finality_depth, number).await?
     else {
@@ -391,18 +474,21 @@ async fn read_fill(
             if found.is_some() {
                 return Err(eyre!("fill block contains ambiguous fill evidence"));
             }
-            found = Some(SwapBridgeOutcome::DeliveredVerified {
-                block: identity,
-                transaction_hash: receipt.transaction_hash(),
-                output_amount: event.relayExecutionInfo.updatedOutputAmount,
-            });
+            found = Some(fill.outcome(
+                shield,
+                identity,
+                receipt.transaction_hash(),
+                event.relayExecutionInfo.updatedOutputAmount,
+                receipt.inner.logs(),
+            ));
         }
     }
-    if found.is_none() {
+    let Some(outcome) = found.flatten() else {
         return Ok(None);
-    }
-    let canonical = still_canonical(provider, identity).await?;
-    Ok(found.filter(|_| canonical))
+    };
+    Ok(still_canonical(provider, identity)
+        .await?
+        .then_some(outcome))
 }
 
 /// Match `refund` in the finalized receipts of the block that includes `refund_tx`. Only that
@@ -509,5 +595,6 @@ const fn outcome_label(outcome: Option<SwapBridgeOutcome>) -> &'static str {
         Some(SwapBridgeOutcome::DeliveredReported { .. }) => "delivered_reported",
         Some(SwapBridgeOutcome::Refunding) => "refunding",
         Some(SwapBridgeOutcome::NeedsAttention) => "needs_attention",
+        Some(SwapBridgeOutcome::HeldOnDestination { .. }) => "held_on_destination",
     }
 }

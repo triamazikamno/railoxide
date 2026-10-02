@@ -25,8 +25,8 @@ use wallet_ops::{
     settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
     swap_setup_recorded_executed,
     vault::{
-        ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload, SwapBridgeOutcome,
-        SwapDelivery, SwapOrderRecord,
+        BridgeDelivery, ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload,
+        SwapApprovedBounds, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
     },
 };
 
@@ -40,8 +40,9 @@ mod progress;
 
 use form::SwapForm;
 use model::{
-    SwapBridgeLabels, SwapFillHint, SwapLabels, bridge_sent_amount, swap_history_start,
-    swap_observation_range,
+    SwapBridgeLabels, SwapFillHint, SwapLabels, SwapPrivateBridgeLabels, SwapSetupLabels,
+    SwapSetupProgress, SwapStepAccount, bridge_sent_amount, swap_history_start,
+    swap_observation_range, swap_private_delivery,
 };
 pub(super) use model::{
     SwapStage, swap_account_status, swap_delivery, swap_pair_label, swap_recovery_token,
@@ -65,37 +66,89 @@ pub(super) struct PrivateSwapsPanel {
     view: Entity<PrivateSwapsView>,
 }
 
-/// A spend the user authorizes for a swap: its setup with the approved order, the order, or an
-/// early cancellation.
+/// A spend the user authorizes for a swap: its setup with the approved order, a private Bridge
+/// swap's destination setup sent again, the order, or an early cancellation.
 pub(super) struct SwapAuthorization {
     session: Arc<WalletSession>,
+    destination_session: Option<Arc<WalletSession>>,
     action: SwapAction,
+    /// A private Bridge swap's destination network and its stealth account there, when the
+    /// action also signs for that account. One approval then gives an authorization for each
+    /// network.
+    destination: Option<(u64, ExecutorOperationId)>,
 }
 
 #[derive(Clone)]
 enum SwapAction {
     Setup(Box<form::SetupApproval>),
+    /// Only the destination stealth account's setup of a private Bridge swap, on its network.
+    DestinationSetup(Box<form::DestinationRetry>),
     Order(Box<form::OrderApproval>),
     Cancel(Box<progress::CancelApproval>),
+}
+
+impl SwapAction {
+    /// The swap the action belongs to.
+    fn operation(&self) -> ExecutorOperationId {
+        match self {
+            Self::Setup(approval) => approval.operation,
+            Self::DestinationSetup(approval) => approval.operation,
+            Self::Order(approval) => approval.operation,
+            Self::Cancel(approval) => approval.operation,
+        }
+    }
 }
 
 impl SwapAuthorization {
     pub(super) fn hardware_executor_action(&self) -> HardwareExecutorAction {
         match &self.action {
             SwapAction::Setup(approval) => HardwareExecutorAction::Execute(approval.operation),
+            SwapAction::DestinationSetup(approval) => {
+                HardwareExecutorAction::Execute(approval.setup.operation)
+            }
             SwapAction::Order(approval) => HardwareExecutorAction::Execute(approval.operation),
             SwapAction::Cancel(approval) => HardwareExecutorAction::Recover(approval.operation),
         }
     }
 
-    pub(super) const fn session(&self) -> &Arc<WalletSession> {
-        &self.session
+    /// The network whose executor owner approves [`Self::hardware_executor_action`]: the
+    /// swap's own, or the destination network for a setup sent there by itself.
+    #[cfg(feature = "hardware")]
+    pub(super) fn hardware_executor_chain(&self) -> u64 {
+        match &self.action {
+            SwapAction::DestinationSetup(approval) => approval.setup.chain_id,
+            _ => self.session.chain_id,
+        }
+    }
+
+    /// The destination network and the executor action a hardware wallet approves there in the
+    /// same device session, for a private Bridge swap's setup or order.
+    #[cfg(feature = "hardware")]
+    pub(super) fn hardware_destination_action(&self) -> Option<(u64, HardwareExecutorAction)> {
+        self.destination
+            .map(|(chain_id, operation)| (chain_id, HardwareExecutorAction::Execute(operation)))
+    }
+
+    /// Every session used for review must still be installed when approval completes.
+    pub(super) fn sessions_are_current(&self, root: &WalletRoot) -> bool {
+        use super::chain_load::ChainUtxoState;
+        root.stealth_session_is_current(&self.session)
+            && self.destination_session.as_ref().is_none_or(|expected| {
+                matches!(
+                    root.chain_states.get(&expected.chain_id),
+                    Some(ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. })
+                        if Arc::ptr_eq(session, expected)
+                )
+            })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwapJobKind {
     Setup,
+    /// A private Bridge swap's destination setup is estimated again before its retry is
+    /// reviewed. Nothing is signed.
+    SetupQuote,
     /// The approved terms are quoted again once the setup is confirmed. Nothing is signed.
     Requote,
     Order,
@@ -185,6 +238,17 @@ struct SwapTracking {
     /// Stage of the setup handed to a broadcaster in this session.
     setup_stage: Option<watch::Receiver<TransactionGenerationStage>>,
     setup_watch: Option<Task<()>>,
+    /// The last setup observation of a private Bridge swap's destination stealth account, read
+    /// on its own network.
+    destination_setup: Option<SwapSetupStatus>,
+    /// The next block of the destination network to observe.
+    destination_cursor: Option<u64>,
+    /// When the last observation of the destination account reached its network's confirmed
+    /// block.
+    destination_read_at: Option<Instant>,
+    /// The delivered token in the destination stealth account, and the block it was read at,
+    /// from this session's last explicit check of held proceeds. Recovery there opens with it.
+    destination_balance: Option<(U256, alloy::eips::BlockNumHash)>,
     /// An early cancellation was handed to a broadcaster; the observation decides the winner.
     cancelling: bool,
     /// The user approved this swap's setup in this session: once the setup is confirmed, the
@@ -240,6 +304,10 @@ pub(super) struct PrivateSwapsView {
     /// it changes, so wakes during a pass coalesce into one follow-up pass.
     observation_wake: watch::Sender<u64>,
     tracking: BTreeMap<ExecutorOperationId, SwapTracking>,
+    /// Each private Bridge swap's destination stealth account record, by the swap's operation,
+    /// as last read from the destination network's own executor records. An entry exists once
+    /// that network's session is loaded, and holds `None` when no such record is there.
+    destinations: BTreeMap<ExecutorOperationId, Option<ExecutorRecord>>,
     /// My orders' open swaps, counted again whenever the view changes rather than on every
     /// frame.
     open_orders: usize,
@@ -319,6 +387,7 @@ impl WalletRoot {
                 view.pending_authorization = None;
                 view.reapproval = None;
                 view.tracking.clear();
+                view.destinations.clear();
                 view.records.clear();
                 cx.notify();
             });
@@ -436,6 +505,7 @@ impl PrivateSwapsView {
                         if this.session_is_current(cx) {
                             if reload {
                                 this.reload_records();
+                                this.reload_destinations(cx);
                                 this.refresh_form_assets(cx);
                             }
                             cx.notify();
@@ -479,6 +549,7 @@ impl PrivateSwapsView {
                     if woken {
                         this.continue_form_after_observation(window, cx);
                     }
+                    this.refresh_destinations(cx);
                     this.continue_approved_swaps(window, cx);
                     let (runtime, owner, mut pages) = this.next_observations(cx)?;
                     if !catchup.is_empty() {
@@ -541,6 +612,7 @@ impl PrivateSwapsView {
             setup_inclusions: None,
             observation_wake,
             tracking: BTreeMap::new(),
+            destinations: BTreeMap::new(),
             open_orders: 0,
             dialog: None,
             orders_filter: None,
@@ -654,28 +726,215 @@ impl PrivateSwapsView {
             .tracking
             .get(&operation)
             .and_then(|tracking| tracking.setup);
-        swap_stage(
-            record,
-            match setup {
-                // A setup recorded as executed for the accepted delegate is ready without
-                // this session reading the account, so `swap_stage` uses the recorded
-                // outcome. That readiness can outlast a reorg until reconciliation; order
-                // preparation checks the delegation afresh before anything is signed.
-                None | Some(SwapSetupStatus::Pending) if self.setup_recorded_executed(record) => {
-                    None
-                }
-                // Any other stored execution waits for this session's account check, and a
-                // failure that check reported stands.
-                setup => setup.or(Some(SwapSetupStatus::Pending)),
-            },
-            submitting,
-        )
+        account_stage(record, self.session.chain_id, setup, submitting)
     }
 
     /// Whether the record's setup is recorded as executed for this chain's accepted delegate.
     fn setup_recorded_executed(&self, record: &ExecutorRecord) -> bool {
-        ExecutorProfile::accepted(self.session.chain_id, record.delegate())
-            .is_some_and(|profile| swap_setup_recorded_executed(record, profile))
+        setup_recorded_executed_on(self.session.chain_id, record)
+    }
+
+    /// The wallet session and executor owner of `chain_id`, a private Bridge swap's destination
+    /// network, once that network's session is loaded.
+    pub(super) fn destination_owner(
+        &self,
+        chain_id: u64,
+        cx: &gpui::App,
+    ) -> Option<(Arc<WalletSession>, Arc<ExecutorOwner>)> {
+        use super::chain_load::ChainUtxoState;
+        let root = self.root.upgrade()?;
+        match root.read(cx).chain_states.get(&chain_id)? {
+            ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. } => {
+                Some((Arc::clone(session), session.executor_owner()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::destination_owner`] once `chain_id`'s private sync is ready, for a setup or an
+    /// order that spends or signs there. Otherwise what the user is told. A network that isn't
+    /// loaded starts loading.
+    fn ready_destination(
+        &self,
+        chain_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) -> Result<(Arc<WalletSession>, Arc<ExecutorOwner>), String> {
+        use super::chain_load::ChainUtxoState;
+        let network = form::network_name(chain_id);
+        let root = self
+            .root
+            .upgrade()
+            .ok_or_else(|| "The wallet session ended.".to_owned())?;
+        match root.read(cx).chain_states.get(&chain_id) {
+            Some(ChainUtxoState::Ready { session, .. }) => {
+                let owner = session.executor_owner().ok_or_else(|| {
+                    format!("Stealth accounts aren't available on {network} for this wallet.")
+                })?;
+                return Ok((Arc::clone(session), owner));
+            }
+            Some(ChainUtxoState::Syncing { .. } | ChainUtxoState::Loading { .. }) => {
+                return Err(format!(
+                    "{network} is still syncing. Try again once it is ready. Nothing was sent."
+                ));
+            }
+            Some(ChainUtxoState::Error { .. }) => {
+                return Err(format!(
+                    "{network} couldn't be synced. Switch to {network} to see why, then try again. Nothing was sent."
+                ));
+            }
+            None | Some(ChainUtxoState::Idle) => {}
+        }
+        self.ensure_destination_load(chain_id, cx);
+        Err(format!(
+            "{network} isn't loaded yet. It is loading now. Try again once it is ready. Nothing was sent."
+        ))
+    }
+
+    /// Read each private Bridge swap's destination stealth account again from the destination
+    /// network's executor records. Networks that aren't loaded are left out.
+    fn reload_destinations(&mut self, cx: &gpui::App) {
+        let mut loaded = BTreeMap::new();
+        let mut destinations = BTreeMap::new();
+        for record in &self.records {
+            let (Some(delivery), Some(operation)) = (
+                swap_private_delivery(record),
+                record.destination_operation(),
+            ) else {
+                continue;
+            };
+            let records = loaded
+                .entry(delivery.destination_chain)
+                .or_insert_with_key(|chain_id| {
+                    let (_, owner) = self.destination_owner(*chain_id, cx)?;
+                    owner.records().ok()
+                });
+            if let Some(records) = records {
+                destinations.insert(
+                    record.operation(),
+                    records
+                        .iter()
+                        .find(|destination| destination.operation() == operation)
+                        .cloned(),
+                );
+            }
+        }
+        self.destinations = destinations;
+    }
+
+    /// Start loading the destination network of each private Bridge swap that is still being
+    /// set up, whose destination account only that network's session can tell about, then read
+    /// the destination accounts again.
+    fn refresh_destinations(&mut self, cx: &mut Context<'_, Self>) {
+        let chains = self
+            .records
+            .iter()
+            .filter(|record| {
+                record.swap().is_none() && !record.is_retired() && !record.is_swap_setup_stopped()
+            })
+            .filter_map(swap_private_delivery)
+            .map(|delivery| delivery.destination_chain)
+            .collect::<BTreeSet<_>>();
+        for chain_id in chains {
+            self.ensure_destination_load(chain_id, cx);
+        }
+        let known = std::mem::take(&mut self.destinations);
+        self.reload_destinations(cx);
+        if self.destinations != known {
+            cx.notify();
+        }
+    }
+
+    /// Start loading `chain_id`'s wallet session unless it is loaded, loading, or failed to
+    /// load. The root starts it after this update, since a load replaces per-chain views.
+    fn ensure_destination_load(&self, chain_id: u64, cx: &mut Context<'_, Self>) {
+        use super::chain_load::ChainUtxoState;
+        let idle = self.root.upgrade().is_some_and(|root| {
+            matches!(
+                root.read(cx).chain_states.get(&chain_id),
+                None | Some(ChainUtxoState::Idle)
+            )
+        });
+        if !idle {
+            return;
+        }
+        let root = self.root.clone();
+        cx.defer(move |cx| {
+            let _ = root.update(cx, |root, cx| root.ensure_chain_load(chain_id, cx));
+        });
+    }
+
+    /// A private Bridge swap's destination stealth account record, when its network's records
+    /// were read and hold the account `delivery` names.
+    fn destination_account(
+        &self,
+        record: &ExecutorRecord,
+        delivery: BridgeDelivery,
+    ) -> Option<&ExecutorRecord> {
+        self.destinations
+            .get(&record.operation())?
+            .as_ref()
+            .filter(|destination| destination.address() == Some(delivery.receiver))
+    }
+
+    /// Whether this session's setup job covers `operation`. It sends both setups of a private
+    /// Bridge swap.
+    fn submitting_setup(&self, operation: ExecutorOperationId) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup)
+    }
+
+    /// How far the setup of a private Bridge swap's destination stealth account is, before the
+    /// swap's first order.
+    fn destination_setup_progress(
+        &self,
+        record: &ExecutorRecord,
+        delivery: BridgeDelivery,
+    ) -> SwapSetupProgress {
+        let operation = record.operation();
+        match self.destinations.get(&operation) {
+            None => SwapSetupProgress::NetworkLoading,
+            Some(None) => SwapSetupProgress::NotSent,
+            Some(Some(destination)) => account_setup_progress(
+                destination,
+                delivery.destination_chain,
+                self.tracking
+                    .get(&operation)
+                    .and_then(|tracking| tracking.destination_setup),
+                self.submitting_setup(operation),
+            ),
+        }
+    }
+
+    /// Have the destination network's owner, when that network is loaded, settle the
+    /// destination stealth account of the private Bridge swap `operation` from the swap's
+    /// recorded bridge outcome. It runs on the runtime, and that owner's change is picked up
+    /// with the next read of the destination accounts.
+    fn reconcile_destination(&self, operation: ExecutorOperationId, cx: &gpui::App) {
+        let Some(delivery) = self.record(operation).and_then(swap_private_delivery) else {
+            return;
+        };
+        let Some((_, owner)) = self.destination_owner(delivery.destination_chain, cx) else {
+            return;
+        };
+        drop(self.runtime.spawn_blocking(move || {
+            // A failed write is repeated by the owner's next reconciliation.
+            let _ = owner.reconcile_swap_destinations();
+        }));
+    }
+
+    /// Whether a recovery on the destination network returned the proceeds a private Bridge
+    /// swap's destination stealth account held. Only that network's loaded records tell.
+    fn held_proceeds_recovered(&self, record: &ExecutorRecord, delivery: BridgeDelivery) -> bool {
+        let held = record
+            .swap()
+            .and_then(|swap| swap.orders().last())
+            .and_then(|order| match order.observations().bridge_outcome {
+                Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) => Some(block.number),
+                _ => None,
+            });
+        held.zip(self.destination_account(record, delivery))
+            .is_some_and(|(block, destination)| model::held_proceeds_recovered(destination, block))
     }
 
     /// A new submission must not borrow the previous order's outcome. Once its own order is
@@ -693,12 +952,28 @@ impl PrivateSwapsView {
             })
     }
 
-    /// Presentation only; signing and observation still use the durable account stage.
+    /// Presentation only; signing and observation still use the durable account stage. A
+    /// private Bridge swap also shows its destination stealth account's setup, and a recovery
+    /// of held proceeds on the destination network.
     fn progress_stage(&self, record: &ExecutorRecord) -> SwapStage {
         if self.pending_order(record).is_some() {
-            SwapStage::Ready
-        } else {
-            self.stage(record)
+            return SwapStage::Ready;
+        }
+        let stage = self.stage(record);
+        let Some(delivery) = swap_private_delivery(record) else {
+            return stage;
+        };
+        match stage {
+            SwapStage::Ready | SwapStage::Approved => model::private_bridge_setup_stage(
+                stage,
+                self.destination_setup_progress(record, delivery),
+            ),
+            SwapStage::Order(SwapOrderState::HeldOnDestination)
+                if self.held_proceeds_recovered(record, delivery) =>
+            {
+                SwapStage::Recovered
+            }
+            _ => stage,
         }
     }
 
@@ -776,13 +1051,14 @@ impl PrivateSwapsView {
     fn labels(&self, record: &ExecutorRecord, cx: &gpui::App) -> SwapLabels {
         if let Some(pending) = self.pending_order(record) {
             let labels = self.order_labels(
+                record,
                 (pending.sell, pending.buy),
                 Some(pending.amount),
                 None,
                 None,
                 cx,
             );
-            let bridge = self.bridge_labels(pending.delivery, pending.buy, None, None, cx);
+            let bridge = self.bridge_labels(record, pending.delivery, pending.buy, None, None, cx);
             return SwapLabels {
                 pair: bridge_pair_label(&labels, bridge.as_ref()),
                 receiver: self.receiver_name(pending.delivery, cx),
@@ -812,16 +1088,21 @@ impl PrivateSwapsView {
                 .and_then(|tracking| tracking.amount)
         });
         let order = record.swap().and_then(|swap| swap.orders().last());
-        let labels = self.order_labels((sell, buy), amount, order, self.fill_hint(record, cx), cx);
+        let labels = self.order_labels(
+            record,
+            (sell, buy),
+            amount,
+            order,
+            self.fill_hint(record, cx),
+            cx,
+        );
         if order.is_some() {
             return labels;
         }
         // Before its first order, the swap delivers as approved with its setup.
         let delivery = swap_delivery(record);
-        let destination_minimum = record
-            .swap_approval()
-            .and_then(|approval| approval.bounds.destination_minimum);
-        let bridge = self.bridge_labels(delivery, buy, None, destination_minimum, cx);
+        let approved = record.swap_approval().map(|approval| &approval.bounds);
+        let bridge = self.bridge_labels(record, delivery, buy, None, approved, cx);
         SwapLabels {
             pair: bridge_pair_label(&labels, bridge.as_ref()),
             receiver: self.receiver_name(delivery, cx),
@@ -860,10 +1141,11 @@ impl PrivateSwapsView {
             ))
     }
 
-    /// Display strings for one swap: `amount` of `sell` for `buy`, with `order` its latest
-    /// order when it has one.
+    /// Display strings for one swap of `record`: `amount` of `sell` for `buy`, with `order`
+    /// its latest order when it has one.
     fn order_labels(
         &self,
+        record: &ExecutorRecord,
         (sell, buy): (Address, Address),
         amount: Option<U256>,
         order: Option<&SwapOrderRecord>,
@@ -885,15 +1167,27 @@ impl PrivateSwapsView {
                 // The destination network's token and amount, verified or reported.
                 SwapDelivery::Bridge(bridge) => {
                     let amount = match observed.bridge_outcome? {
+                        // The destination stealth account shielded this, less the shield fee.
+                        SwapBridgeOutcome::DeliveredVerified {
+                            output_amount,
+                            shielded: true,
+                            ..
+                        } => Some(model::private_delivery_credit(
+                            output_amount,
+                            order.bounds(),
+                        )),
                         SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => {
                             Some(output_amount)
                         }
                         SwapBridgeOutcome::DeliveredReported { amount_out, .. } => amount_out,
-                        SwapBridgeOutcome::Refunding | SwapBridgeOutcome::NeedsAttention => None,
+                        // Held proceeds weren't received; the bridge labels name them.
+                        SwapBridgeOutcome::Refunding
+                        | SwapBridgeOutcome::NeedsAttention
+                        | SwapBridgeOutcome::HeldOnDestination { .. } => None,
                     }?;
                     return Some(self.network_token_amount(
                         bridge.destination_chain,
-                        self.bridge_received_token(bridge, cx),
+                        self.delivered_token(bridge, cx),
                         amount,
                         cx,
                     ));
@@ -902,8 +1196,9 @@ impl PrivateSwapsView {
             amount.map(|amount| self.token_amount(buy, amount, cx))
         });
         let valid_to = order.map(|order| u64::from(order.valid_to()));
-        let bridge = order
-            .and_then(|order| self.bridge_labels(order.delivery(), buy, Some(order), None, cx));
+        let bridge = order.and_then(|order| {
+            self.bridge_labels(record, order.delivery(), buy, Some(order), None, cx)
+        });
         SwapLabels {
             pair: swap_pair_label(
                 &sell_label,
@@ -939,27 +1234,37 @@ impl PrivateSwapsView {
 
     /// How swaps name a Bridge delivery of `buy`: its network, provider and receiver, and from
     /// `order`, what it handed to the bridge and its approved destination minimum. Before an
-    /// order exists, `destination_minimum` is the one approved with the setup. `None` for
-    /// delivery on this network.
+    /// order exists, `approved` holds the bounds approved with the setup. A private delivery
+    /// also names both stealth accounts of `record`'s swap and what the destination account
+    /// holds. `None` for delivery on this network.
     fn bridge_labels(
         &self,
+        record: &ExecutorRecord,
         delivery: SwapDelivery,
         buy: Address,
         order: Option<&SwapOrderRecord>,
-        destination_minimum: Option<U256>,
+        approved: Option<&SwapApprovedBounds>,
         cx: &gpui::App,
     ) -> Option<SwapBridgeLabels> {
         let SwapDelivery::Bridge(bridge) = delivery else {
             return None;
         };
+        let token = self.delivered_token(bridge, cx);
+        let destination_amount =
+            |amount| self.network_token_amount(bridge.destination_chain, token, amount, cx);
+        let private = bridge.is_private().then(|| SwapPrivateBridgeLabels {
+            setups: self.setup_labels(record, bridge, order.is_some(), cx),
+            held: order.and_then(|order| match order.observations().bridge_outcome {
+                Some(SwapBridgeOutcome::HeldOnDestination { amount, .. }) => {
+                    Some(destination_amount(amount))
+                }
+                _ => None,
+            }),
+        });
         Some(SwapBridgeLabels {
             provider: bridge.provider,
             network: form::network_name(bridge.destination_chain),
-            token: self.network_token_symbol(
-                bridge.destination_chain,
-                self.bridge_received_token(bridge, cx),
-                cx,
-            ),
+            token: self.network_token_symbol(bridge.destination_chain, token, cx),
             origin: form::network_name(self.session.chain_id),
             receiver: self
                 .receiver_label(bridge.receiver, cx)
@@ -968,17 +1273,88 @@ impl PrivateSwapsView {
                 .and_then(bridge_sent_amount)
                 .map(|amount| self.token_amount(buy, amount, cx)),
             minimum: order
-                .and_then(|order| order.bounds().destination_minimum)
-                .or(destination_minimum)
-                .map(|minimum| {
-                    self.network_token_amount(
-                        bridge.destination_chain,
-                        self.bridge_received_token(bridge, cx),
-                        minimum,
-                        cx,
-                    )
+                .map(SwapOrderRecord::bounds)
+                .or(approved)
+                .and_then(|bounds| Some((bounds, bounds.destination_minimum?)))
+                .map(|(bounds, minimum)| {
+                    // The private balance gets the minimum less the destination shield fee.
+                    destination_amount(if bridge.is_private() {
+                        model::private_delivery_credit(minimum, bounds)
+                    } else {
+                        minimum
+                    })
                 }),
+            private,
         })
+    }
+
+    /// The token a Bridge `delivery` pays out, as swaps name it. A private delivery shields
+    /// the destination token itself, so a wrapped native token stays wrapped.
+    fn delivered_token(&self, delivery: BridgeDelivery, cx: &gpui::App) -> Address {
+        if delivery.is_private() {
+            delivery.destination_token
+        } else {
+            self.bridge_received_token(delivery, cx)
+        }
+    }
+
+    /// The setup of each stealth account of a private Bridge swap, the swap's own network
+    /// first. `placed` tells that the order these labels describe exists, which needs both
+    /// accounts set up.
+    fn setup_labels(
+        &self,
+        record: &ExecutorRecord,
+        delivery: BridgeDelivery,
+        placed: bool,
+        cx: &gpui::App,
+    ) -> [SwapSetupLabels; 2] {
+        let operation = record.operation();
+        let tracking = self.tracking.get(&operation);
+        let origin = if placed {
+            SwapSetupProgress::Done
+        } else {
+            account_setup_progress(
+                record,
+                self.session.chain_id,
+                tracking.and_then(|tracking| tracking.setup),
+                self.submitting_setup(operation),
+            )
+        };
+        // What this session knows the swap's own setup waits for.
+        let waiting = match origin {
+            SwapSetupProgress::Submitting => tracking
+                .and_then(|tracking| tracking.setup_stage.as_ref())
+                .map(|stage| stage.borrow().label().to_owned()),
+            SwapSetupProgress::Pending => self.setup_confirmation_detail(record, cx),
+            _ => None,
+        };
+        let destination = self.destination_account(record, delivery);
+        [
+            SwapSetupLabels {
+                network: form::network_name(self.session.chain_id),
+                account: record.address().map(|address| SwapStepAccount {
+                    index: Some(record.index()),
+                    address,
+                }),
+                progress: origin,
+                block: model::swap_setup_block(record),
+                detail: waiting,
+            },
+            SwapSetupLabels {
+                network: form::network_name(delivery.destination_chain),
+                account: Some(SwapStepAccount {
+                    index: destination.map(ExecutorRecord::index),
+                    address: delivery.receiver,
+                }),
+                progress: if placed {
+                    SwapSetupProgress::Done
+                } else {
+                    self.destination_setup_progress(record, delivery)
+                },
+                block: destination.and_then(model::swap_setup_block),
+                detail: None,
+            },
+        ]
     }
 
     /// How swaps name a Public address receiver: the wallet's label for it, or its short
@@ -1099,17 +1475,14 @@ impl PrivateSwapsView {
                         settlement: Some((order.uid(), block)),
                         // Settlement checks do not page through account history or catch up.
                         range: confirmed..confirmed.saturating_add(1),
+                        destination: None,
                     });
                 }
                 // A setup recorded as executed for the accepted delegate is already ready and
                 // not observed, so this only reaches a delegate the check will refuse.
                 let needs_delegation = record.swap().is_none()
                     && tracking.is_none_or(|tracking| tracking.setup.is_none())
-                    && record.issued().iter().any(|payload| {
-                        payload.purpose() == wallet_ops::vault::ExecutorPayloadPurpose::Operation
-                            && record.recorded_payload_status(payload.hash())
-                                == Some(wallet_ops::vault::ExecutorPayloadStatus::Executed)
-                    });
+                    && has_executed_setup(record);
                 let cursor = if needs_delegation {
                     confirmed
                 } else {
@@ -1122,10 +1495,75 @@ impl PrivateSwapsView {
                     setup: record.swap().is_none(),
                     settlement: None,
                     range: swap_observation_range(cursor, confirmed),
+                    destination: None,
                 })
             })
+            .chain(
+                self.records
+                    .iter()
+                    .filter(|record| Some(record.operation()) != busy)
+                    .filter_map(|record| self.destination_observation(record, cx)),
+            )
             .collect::<Vec<_>>();
         (!pages.is_empty()).then(|| (self.runtime.clone(), Arc::clone(&self.owner), pages))
+    }
+
+    /// The next observation of a private Bridge swap's destination stealth account, on its own
+    /// network and through that network's owner, while its setup is unconfirmed and the swap
+    /// has no order. It is paced like the swap's own setup.
+    fn destination_observation(
+        &self,
+        record: &ExecutorRecord,
+        cx: &gpui::App,
+    ) -> Option<ObservationPage> {
+        if record.swap().is_some() || record.is_retired() || record.is_swap_setup_stopped() {
+            return None;
+        }
+        let delivery = swap_private_delivery(record)?;
+        let chain_id = delivery.destination_chain;
+        let destination = self.destination_account(record, delivery)?;
+        let tracking = self.tracking.get(&record.operation());
+        let observed = tracking.and_then(|tracking| tracking.destination_setup);
+        if account_stage(destination, chain_id, observed, false) != SwapStage::SetupPending {
+            return None;
+        }
+        let (_, owner) = self.destination_owner(chain_id, cx)?;
+        let root = self.root.upgrade()?;
+        let root = root.read(cx);
+        let confirmed = root.confirmed_block(chain_id)?;
+        let finality_depth = root
+            .effective_chain_configs
+            .get(chain_id)
+            .map(|chain| chain.finality_depth);
+        if setup_read_deferred(
+            destination,
+            setup_recorded_executed_on(chain_id, destination),
+            confirmed,
+            finality_depth,
+            tracking.and_then(|tracking| tracking.destination_read_at),
+            None,
+        ) {
+            return None;
+        }
+        // An executed setup for a delegate the check will refuse, as for the swap's own.
+        let cursor = if observed.is_none() && has_executed_setup(destination) {
+            confirmed
+        } else {
+            tracking
+                .and_then(|tracking| tracking.destination_cursor)
+                .or_else(|| swap_history_start(destination))?
+        };
+        Some(ObservationPage {
+            operation: destination.operation(),
+            setup: true,
+            settlement: None,
+            range: swap_observation_range(cursor, confirmed),
+            destination: Some(DestinationPage {
+                owner,
+                origin: record.operation(),
+                confirmed,
+            }),
+        })
     }
 
     /// Orders to ask the orderbook about in this pass, at most one report each. An open order
@@ -1207,6 +1645,7 @@ impl PrivateSwapsView {
             return;
         }
         let now = Instant::now();
+        let mut settled = Vec::new();
         for result in results {
             let tracking = self.tracking.entry(result.operation).or_default();
             if tracking.orderbook.is_none() {
@@ -1219,6 +1658,7 @@ impl PrivateSwapsView {
             for (uid, outcome) in result.bridges {
                 if outcome {
                     tracking.bridge_polls.remove(&uid);
+                    settled.push(result.operation);
                 } else {
                     let attempts = tracking
                         .bridge_polls
@@ -1249,6 +1689,9 @@ impl PrivateSwapsView {
                     None
                 },
             });
+        }
+        for operation in settled {
+            self.reconcile_destination(operation, cx);
         }
         // Forget orders that are no longer tracked, such as those with a recorded outcome.
         let records = &self.records;
@@ -1285,39 +1728,15 @@ impl PrivateSwapsView {
         confirmed: u64,
         finality_depth: Option<u64>,
     ) -> bool {
-        if record.swap().is_some() {
-            return false;
-        }
-        // The latest setup attempt decides, so a retry is observed at the normal pace until
-        // it is handed off.
-        let Some(latest) = latest_setup(record) else {
-            return false;
-        };
-        if setup_included(latest) || self.setup_recorded_executed(record) {
-            return false;
-        }
-        let history_start = latest.context().history_start();
-        let located = !latest.transaction_hashes().is_empty();
-        if located
-            && finality_depth.is_some_and(|depth| confirmed < history_start.saturating_add(depth))
-        {
-            return true;
-        }
-        let stale = confirmed.saturating_sub(history_start) > STALE_SETUP_BLOCKS;
         let tracking = self.tracking.get(&record.operation());
-        let read_at = tracking.and_then(|tracking| tracking.setup_read_at);
-        let last = if located {
-            read_at.max(
-                tracking
-                    .and_then(|tracking| tracking.located_at)
-                    .filter(|(hash, _)| *hash == latest.hash())
-                    .map(|(_, at)| at),
-            )
-        } else {
-            read_at
-        };
-        (located || stale)
-            && last.is_some_and(|at| at.elapsed() < DEFERRED_SETUP_OBSERVATION_INTERVAL)
+        setup_read_deferred(
+            record,
+            self.setup_recorded_executed(record),
+            confirmed,
+            finality_depth,
+            tracking.and_then(|tracking| tracking.setup_read_at),
+            tracking.and_then(|tracking| tracking.located_at),
+        )
     }
 
     fn apply_observations(
@@ -1332,6 +1751,36 @@ impl PrivateSwapsView {
         let confirmed = self.confirmed_block(cx);
         let mut catchup = Vec::new();
         for result in results {
+            // Another task updated the account during this background read. Keep the page
+            // due for the next pass; no action failed and no stale result may advance it.
+            if result
+                .outcome
+                .as_ref()
+                .is_err_and(eyre::Report::is::<wallet_ops::ExecutorRecordChanged>)
+            {
+                continue;
+            }
+            // A destination account's page is kept with its swap, against its own network's
+            // confirmed block.
+            if let Some((origin, confirmed)) = result.destination {
+                let tracking = self.tracking.entry(origin).or_default();
+                match result.outcome {
+                    Ok(setup) => {
+                        tracking.destination_cursor = Some(result.range_end);
+                        tracking.error = None;
+                        if result.range_end <= confirmed {
+                            catchup.push(result.operation);
+                        } else {
+                            tracking.destination_read_at = Some(Instant::now());
+                        }
+                        if setup.is_some() {
+                            tracking.destination_setup = setup;
+                        }
+                    }
+                    Err(error) => tracking.error = Some(format!("{error:#}")),
+                }
+                continue;
+            }
             let tracking = self.tracking.entry(result.operation).or_default();
             match result.outcome {
                 Ok(setup) => {
@@ -1346,10 +1795,11 @@ impl PrivateSwapsView {
                         tracking.setup = setup;
                     }
                 }
-                Err(error) => tracking.error = Some(error),
+                Err(error) => tracking.error = Some(format!("{error:#}")),
             }
         }
         self.reload_records();
+        self.reload_destinations(cx);
         // A cancellation is settled once canonical observation says which payload won.
         let settled = self
             .records
@@ -1378,8 +1828,13 @@ impl PrivateSwapsView {
         let next = self
             .records
             .iter()
+            // A private Bridge swap's order also waits for its destination account's setup.
             .filter(|record| {
-                !record.is_swap_setup_stopped() && self.stage(record) == SwapStage::Approved
+                !record.is_swap_setup_stopped()
+                    && self.stage(record) == SwapStage::Approved
+                    && swap_private_delivery(record).is_none_or(|delivery| {
+                        self.destination_setup_progress(record, delivery) == SwapSetupProgress::Done
+                    })
             })
             .map(ExecutorRecord::operation)
             .find(|operation| {
@@ -1427,6 +1882,12 @@ impl PrivateSwapsView {
                 }
                 this.job = None;
                 this.reload_records();
+                if kind == SwapJobKind::Check {
+                    // A check may persist an outcome before a later RPC fails. Reconcile
+                    // the destination on either result, just as routine bridge polls do.
+                    this.reconcile_destination(operation, cx);
+                }
+                this.reload_destinations(cx);
                 match result {
                     Ok(Ok(value)) => apply(this, value, window, cx),
                     Ok(Err(error)) => {
@@ -1494,16 +1955,38 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let destination = self.authorized_destination(&action);
+        let destination_chain = match &action {
+            SwapAction::Setup(approval) => approval.destination_account().map(|(chain, _)| chain),
+            SwapAction::DestinationSetup(approval) => Some(approval.setup.chain_id),
+            SwapAction::Order(approval) => approval
+                .private_delivery()
+                .map(|delivery| delivery.destination_chain),
+            SwapAction::Cancel(_) => None,
+        };
+        let destination_session = match destination_chain {
+            Some(chain) => match self.ready_destination(chain, cx) {
+                Ok((session, _)) => Some(session),
+                Err(error) => {
+                    self.fail(action.operation(), error);
+                    cx.notify();
+                    return;
+                }
+            },
+            None => None,
+        };
         let command = Arc::new(SwapAuthorization {
             session: Arc::clone(&self.session),
+            destination_session,
             action,
+            destination,
         });
         self.pending_authorization = Some(Arc::clone(&command));
         let view = cx.entity();
         // Reviews require explicit approval; the confirm-only step for an approved order
         // accepts a remembered spend authorization.
         let _ = self.root.update(cx, |root, cx| {
-            if root.stealth_session_is_current(&command.session) {
+            if command.sessions_are_current(root) {
                 root.request_spend_authorization(
                     SpendAuthorizationIntent::PrivateSwap(view, command),
                     summary,
@@ -1513,6 +1996,21 @@ impl PrivateSwapsView {
             }
         });
         cx.notify();
+    }
+
+    /// The destination stealth account `action` also signs for: a private Bridge swap's, when
+    /// its setup sets that account up, or its order pre-signs that account's shield.
+    fn authorized_destination(&self, action: &SwapAction) -> Option<(u64, ExecutorOperationId)> {
+        match action {
+            SwapAction::Setup(approval) => approval.destination_account(),
+            SwapAction::Order(approval) => {
+                let delivery = approval.private_delivery()?;
+                let operation = self.record(approval.operation)?.destination_operation()?;
+                Some((delivery.destination_chain, operation))
+            }
+            // A setup sent again on the destination network is authorized there itself.
+            SwapAction::DestinationSetup(_) | SwapAction::Cancel(_) => None,
+        }
     }
 
     pub(super) fn cancel_authorization(
@@ -1530,10 +2028,15 @@ impl PrivateSwapsView {
         }
     }
 
+    /// Continue the action `command` asked authorization for. A private Bridge swap's setup or
+    /// order also signs on its destination network: a hardware wallet's approval arrives with
+    /// `destination`, the second authorization of the same device session, and a software
+    /// wallet's `authorization` is duplicated for it.
     pub(super) fn continue_authorized(
         &mut self,
         command: &Arc<SwapAuthorization>,
         authorization: DesktopPrivateSpendAuthorization,
+        destination: Option<DesktopPrivateSpendAuthorization>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1542,15 +2045,34 @@ impl PrivateSwapsView {
             .take()
             .is_some_and(|current| Arc::ptr_eq(&current, command))
             || !self.session_is_current(cx)
+            || !self
+                .root
+                .upgrade()
+                .is_some_and(|root| command.sessions_are_current(root.read(cx)))
         {
             return;
         }
+        let destination = match (destination, command.destination) {
+            (_, None) => None,
+            (Some(destination), Some(_)) => Some(destination),
+            (None, Some(_)) => match authorization.for_destination() {
+                Ok(destination) => Some(destination),
+                Err(error) => {
+                    self.fail(command.action.operation(), format!("{error:#}"));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
         match command.action.clone() {
             SwapAction::Setup(approval) => {
-                self.submit_setup(*approval, authorization, window, cx);
+                self.submit_setup(*approval, authorization, destination, window, cx);
+            }
+            SwapAction::DestinationSetup(approval) => {
+                self.submit_destination_setup(*approval, authorization, window, cx);
             }
             SwapAction::Order(approval) => {
-                self.submit_order(*approval, authorization, window, cx);
+                self.submit_order(*approval, authorization, destination, window, cx);
             }
             SwapAction::Cancel(approval) => {
                 self.submit_cancellation(*approval, authorization, window, cx);
@@ -1569,9 +2091,11 @@ impl PrivateSwapsView {
             .flatten()
     }
 
-    /// Candidates and policy for paying a broadcaster in `fee_token` for this swap's executor.
+    /// Candidates and policy for paying a broadcaster on `chain_id` in `fee_token` for a swap's
+    /// executor there.
     fn broadcaster_candidates(
         &self,
+        chain_id: u64,
         fee_token: Address,
         allow_out_of_range: bool,
         favorites_only: bool,
@@ -1583,7 +2107,7 @@ impl PrivateSwapsView {
         let root = root.read(cx);
         let Some(profile) = root
             .effective_chain_configs
-            .get(self.session.chain_id)
+            .get(chain_id)
             .and_then(wallet_ops::settings::EffectiveChainConfig::accepted_executor_profile)
         else {
             return Vec::new();
@@ -1592,17 +2116,74 @@ impl PrivateSwapsView {
         wallet_ops::fee_policy_eligible_public_broadcasters(
             &super::public_broadcaster::public_broadcaster_candidates_for_route(
                 &root.monitor_fee_rows(),
-                self.session.chain_id,
+                chain_id,
                 fee_token,
                 None,
                 Some(profile),
                 policy,
                 root.public_broadcaster_anchor_cache
-                    .cached_rate(self.session.chain_id, fee_token),
+                    .cached_rate(chain_id, fee_token),
                 &root.public_broadcaster_trust_filter(favorites_only),
             ),
             policy,
         )
+    }
+}
+
+/// Whether `record`'s setup is recorded as executed for the accepted delegate of `chain_id`,
+/// the record's own network.
+fn setup_recorded_executed_on(chain_id: u64, record: &ExecutorRecord) -> bool {
+    ExecutorProfile::accepted(chain_id, record.delegate())
+        .is_some_and(|profile| swap_setup_recorded_executed(record, profile))
+}
+
+/// The stage `record` gives on `chain_id`, its own network, with `setup` this session's last
+/// observation of its setup.
+fn account_stage(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    setup: Option<SwapSetupStatus>,
+    submitting: bool,
+) -> SwapStage {
+    swap_stage(
+        record,
+        match setup {
+            // A setup recorded as executed for the accepted delegate is ready without
+            // this session reading the account, so `swap_stage` uses the recorded
+            // outcome. That readiness can outlast a reorg until reconciliation; order
+            // preparation checks the delegation afresh before anything is signed.
+            None | Some(SwapSetupStatus::Pending)
+                if setup_recorded_executed_on(chain_id, record) =>
+            {
+                None
+            }
+            // Any other stored execution waits for this session's account check, and a
+            // failure that check reported stands.
+            setup => setup.or(Some(SwapSetupStatus::Pending)),
+        },
+        submitting,
+    )
+}
+
+/// How far one stealth account's setup is, apart from the other account of a private Bridge
+/// swap. A setup job sends both setups, so only an account that isn't set up shows as
+/// submitting.
+fn account_setup_progress(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    setup: Option<SwapSetupStatus>,
+    submitting: bool,
+) -> SwapSetupProgress {
+    let stage = account_stage(record, chain_id, setup, false);
+    if submitting
+        && matches!(
+            stage,
+            SwapStage::SetupNotSent | SwapStage::SetupPending | SwapStage::SetupFailed
+        )
+    {
+        SwapSetupProgress::Submitting
+    } else {
+        model::swap_setup_progress(stage)
     }
 }
 
@@ -1623,6 +2204,59 @@ fn setup_included(payload: &IssuedExecutorPayload) -> bool {
                 | wallet_ops::vault::ExecutorExecutionResult::MissingEffects
         )
     })
+}
+
+/// Whether a record holds a setup recorded as executed, for any delegate.
+fn has_executed_setup(record: &ExecutorRecord) -> bool {
+    record.issued().iter().any(|payload| {
+        payload.purpose() == wallet_ops::vault::ExecutorPayloadPurpose::Operation
+            && record.recorded_payload_status(payload.hash())
+                == Some(wallet_ops::vault::ExecutorPayloadStatus::Executed)
+    })
+}
+
+/// Whether the next account read of a setup waits, as
+/// [`PrivateSwapsView::setup_observation_deferred`] describes. `recorded_executed` tells that
+/// the setup is recorded as executed for its network's accepted delegate. `read_at` is when
+/// this session's last read reached the confirmed block, and `located_at` the hand-off of the
+/// latest attempt in this session.
+fn setup_read_deferred(
+    record: &ExecutorRecord,
+    recorded_executed: bool,
+    confirmed: u64,
+    finality_depth: Option<u64>,
+    read_at: Option<Instant>,
+    located_at: Option<(B256, Instant)>,
+) -> bool {
+    if record.swap().is_some() {
+        return false;
+    }
+    // The latest setup attempt decides, so a retry is observed at the normal pace until
+    // it is handed off.
+    let Some(latest) = latest_setup(record) else {
+        return false;
+    };
+    if setup_included(latest) || recorded_executed {
+        return false;
+    }
+    let history_start = latest.context().history_start();
+    let located = !latest.transaction_hashes().is_empty();
+    if located
+        && finality_depth.is_some_and(|depth| confirmed < history_start.saturating_add(depth))
+    {
+        return true;
+    }
+    let stale = confirmed.saturating_sub(history_start) > STALE_SETUP_BLOCKS;
+    let last = if located {
+        read_at.max(
+            located_at
+                .filter(|(hash, _)| *hash == latest.hash())
+                .map(|(_, at)| at),
+        )
+    } else {
+        read_at
+    };
+    (located || stale) && last.is_some_and(|at| at.elapsed() < DEFERRED_SETUP_OBSERVATION_INTERVAL)
 }
 
 /// The latest setup attempt of a record: the one with the latest history start.
@@ -1651,12 +2285,25 @@ struct ObservationPage {
     /// An orderbook hint or a previously verified trade locates a whole-block receipt read.
     settlement: Option<(OrderUid, u64)>,
     range: std::ops::Range<u64>,
+    /// Set when `operation` is a private Bridge swap's destination stealth account, which
+    /// its own network's owner observes.
+    destination: Option<DestinationPage>,
+}
+
+struct DestinationPage {
+    owner: Arc<ExecutorOwner>,
+    /// The swap the destination account serves, on this view's network.
+    origin: ExecutorOperationId,
+    /// The destination network's confirmed block.
+    confirmed: u64,
 }
 
 struct ObservationResult {
     operation: ExecutorOperationId,
     range_end: u64,
-    outcome: Result<Option<SwapSetupStatus>, String>,
+    outcome: eyre::Result<Option<SwapSetupStatus>>,
+    /// A destination account's swap and its network's confirmed block.
+    destination: Option<(ExecutorOperationId, u64)>,
 }
 
 struct HintRequest {
@@ -1766,6 +2413,10 @@ async fn observe_pages(
 ) -> Vec<ObservationResult> {
     let mut results = Vec::with_capacity(pages.len());
     for page in pages {
+        let owner = page
+            .destination
+            .as_ref()
+            .map_or(&owner, |destination| &destination.owner);
         let outcome = if let Some((uid, block)) = page.settlement {
             Box::pin(owner.observe_swap_settlement(page.operation, uid, block))
                 .await
@@ -1782,7 +2433,10 @@ async fn observe_pages(
         results.push(ObservationResult {
             operation: page.operation,
             range_end: page.range.end,
-            outcome: outcome.map_err(|error| format!("{error:#}")),
+            outcome,
+            destination: page
+                .destination
+                .map(|destination| (destination.origin, destination.confirmed)),
         });
     }
     results

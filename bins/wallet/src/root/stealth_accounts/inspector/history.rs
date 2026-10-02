@@ -162,7 +162,12 @@ pub(super) fn recorded_outcomes(record: &ExecutorRecord) -> Vec<String> {
                     "Recovery effects missing"
                 }
                 // Not iterated above; swap hook outcomes are not summarized here yet.
-                (ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook, _) => {
+                (
+                    ExecutorPayloadPurpose::SwapPreHook
+                    | ExecutorPayloadPurpose::SwapPostHook
+                    | ExecutorPayloadPurpose::SwapDestinationShield,
+                    _,
+                ) => {
                     continue;
                 }
             };

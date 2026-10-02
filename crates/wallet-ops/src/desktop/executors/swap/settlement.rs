@@ -4,7 +4,7 @@
 //! delivery, or its Across deposit for Bridge delivery.
 
 use alloy::network::{AnyRpcBlock, ReceiptResponse as _, primitives::HeaderResponse as _};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, keccak256};
 use alloy::providers::{DynProvider, EthGetBlock, Provider as _};
 use alloy::rpc::types::Log;
 use alloy::sol_types::{SolCall as _, SolEvent as _};
@@ -432,7 +432,8 @@ fn executor_funded(logs: &[Log], terms: &AcrossOrderTerms, executor: Address) ->
 
 /// Whether `deposit` is the one the Across post-hook signed for this order. The event
 /// carries the resolved exclusivity deadline rather than the signed parameter, so that
-/// isn't compared.
+/// isn't compared. A private delivery's deposit pays Across's handler with the signed message;
+/// any other deposit carries no message.
 fn signed_deposit(
     deposit: &SpokePool::FundsDeposited,
     terms: &AcrossOrderTerms,
@@ -440,7 +441,11 @@ fn signed_deposit(
     executor: Address,
 ) -> bool {
     deposit.depositor == address_to_bytes32(executor)
-        && deposit.recipient == address_to_bytes32(delivery.receiver)
+        && deposit.recipient == address_to_bytes32(terms.deposit_recipient(delivery))
+        && match terms.message_hash {
+            Some(hash) => keccak256(&deposit.message) == hash,
+            None => deposit.message.is_empty(),
+        }
         && deposit.destinationChainId == U256::from(delivery.destination_chain)
         && deposit.inputToken == address_to_bytes32(terms.input_token)
         && deposit.outputToken == address_to_bytes32(terms.output_token)

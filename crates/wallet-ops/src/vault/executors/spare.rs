@@ -131,6 +131,8 @@ impl ExecutorStore {
             swap_approval: None,
             swap_setup_stopped: false,
             released_payloads: Vec::new(),
+            swap_destination: None,
+            destination_operation: None,
         };
         updates.push(self.seal(
             RecordKind::ExecutorOperation,

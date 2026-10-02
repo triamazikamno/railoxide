@@ -375,7 +375,7 @@ impl SpendAuthorizationIntent {
             return root.stealth_session_is_current(command.session());
         }
         if let Self::PrivateSwap(_, command) = self {
-            return root.stealth_session_is_current(command.session());
+            return command.sessions_are_current(root);
         }
         if let Self::ExecutorUnshield(key, review, _) = self
             && !root
@@ -497,9 +497,15 @@ enum HardwareSpendAuthorizationError {
     Executor(String),
 }
 
+/// The authorization, a private Bridge swap's second one for its destination network from the
+/// same device session, and the refreshed hardware session.
 #[cfg(feature = "hardware")]
 type HardwareSpendAuthorizationTaskOutput = Result<
-    (DesktopPrivateSpendAuthorization, HardwareProfileSession),
+    (
+        DesktopPrivateSpendAuthorization,
+        Option<DesktopPrivateSpendAuthorization>,
+        HardwareProfileSession,
+    ),
     HardwareSpendAuthorizationError,
 >;
 
@@ -1278,7 +1284,7 @@ impl HardwareSpendAuthorizationDialogContent {
                             }
                             dialog.pending = false;
                             match result {
-                                Ok(Ok((authorization, hardware_session))) => {
+                                Ok(Ok((authorization, destination, hardware_session))) => {
                                     let root = dialog.root.clone();
                                     if root.read(cx).active_wallet_generation != approved_generation
                                         || !approved_view.as_ref().zip(root.read(cx).view_session.as_ref())
@@ -1305,9 +1311,10 @@ impl HardwareSpendAuthorizationDialogContent {
                                         );
                                         match completion {
                                             HardwareSpendAuthorizationCompletion::Continue(intent) | HardwareSpendAuthorizationCompletion::ExecutorWithGasPayer { intent, .. } => {
-                                                root.continue_authorized_spend(
+                                                root.continue_authorized_spend_with_destination(
                                                     intent,
                                                     authorization,
+                                                    destination,
                                                     window,
                                                     cx,
                                                 );
@@ -3180,9 +3187,19 @@ impl WalletRoot {
                     })?;
                 Some(action)
             }
-            Some(intent) => intent
-                .hardware_executor_action(self)
-                .map(|action| (self.selected_chain, action)),
+            Some(intent) => {
+                // A swap's setup sent again on its destination network is approved by that
+                // network's owner.
+                let chain_id = match &intent {
+                    SpendAuthorizationIntent::PrivateSwap(_, command) => {
+                        command.hardware_executor_chain()
+                    }
+                    _ => self.selected_chain,
+                };
+                intent
+                    .hardware_executor_action(self)
+                    .map(|action| (chain_id, action))
+            }
             None => None,
         };
         let executor_request = executor_action
@@ -3197,6 +3214,24 @@ impl WalletRoot {
                     .map_err(|error| Arc::<str>::from(error.to_string()))
             })
             .transpose()?;
+        // A private Bridge swap also signs for its stealth account on the destination network,
+        // approved in the same device session.
+        let destination_request = match completion.private_intent() {
+            Some(SpendAuthorizationIntent::PrivateSwap(_, command)) => command
+                .hardware_destination_action()
+                .map(|(chain_id, action)| {
+                    self.executor_owner_for_public_chain(chain_id)
+                        .ok_or_else(|| {
+                            Arc::<str>::from(
+                                "Wait for the swap's destination network to load before authorizing this swap",
+                            )
+                        })?
+                        .hardware_authorization_request(Arc::clone(&view_session), action)
+                        .map_err(|error| Arc::<str>::from(error.to_string()))
+                })
+                .transpose()?,
+            _ => None,
+        };
         let gas_payer = if let HardwareSpendAuthorizationCompletion::ExecutorWithGasPayer {
             payer,
             password,
@@ -3247,7 +3282,7 @@ impl WalletRoot {
                 descriptor,
                 trezor_app_passphrase,
                 trezor_pin_matrix_provider,
-                executor_request,
+                executor_request.map(|request| (request, destination_request)),
             )
             .await
         }))
@@ -3403,6 +3438,20 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.continue_authorized_spend_with_destination(intent, authorization, None, window, cx);
+    }
+
+    /// [`Self::continue_authorized_spend`] with `destination`, the authorization a hardware
+    /// wallet's device session also gave for a private Bridge swap's destination network. Only
+    /// a private swap takes one.
+    fn continue_authorized_spend_with_destination(
+        &mut self,
+        intent: SpendAuthorizationIntent,
+        authorization: DesktopPrivateSpendAuthorization,
+        destination: Option<DesktopPrivateSpendAuthorization>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if !intent.private_review_current(self) {
             return;
         }
@@ -3448,7 +3497,7 @@ impl WalletRoot {
                 // The swap view reads WalletRoot to validate its session. Release this update first.
                 window.defer(cx, move |window, cx| {
                     view.update(cx, |view, cx| {
-                        view.continue_authorized(&command, authorization, window, cx);
+                        view.continue_authorized(&command, authorization, destination, window, cx);
                     });
                 });
             }
@@ -3705,15 +3754,17 @@ async fn derive_hardware_spend_authorization(
     descriptor: HardwareDerivationDescriptor,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
-    executor_request: Option<wallet_ops::HardwareExecutorAuthorizationRequest>,
-) -> Result<
-    (DesktopPrivateSpendAuthorization, HardwareProfileSession),
-    HardwareSpendAuthorizationError,
-> {
-    if let Some(request) = &executor_request {
-        request
-            .ensure_active()
-            .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
+    executor_requests: Option<(
+        wallet_ops::HardwareExecutorAuthorizationRequest,
+        Option<wallet_ops::HardwareExecutorAuthorizationRequest>,
+    )>,
+) -> HardwareSpendAuthorizationTaskOutput {
+    if let Some((request, destination)) = &executor_requests {
+        for request in std::iter::once(request).chain(destination) {
+            request
+                .ensure_active()
+                .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
+        }
     }
     hardware_session.verify_descriptor(&descriptor)?;
     let entropy = match descriptor.device_kind {
@@ -3745,12 +3796,34 @@ async fn derive_hardware_spend_authorization(
             synthetic_entropy_from_hardware_output(&descriptor, output)?
         }
     };
-    if let Some(request) = executor_request {
-        let authorization = request
-            .complete(&descriptor, entropy.expose_secret())
-            .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
+    if let Some((request, destination)) = executor_requests {
+        // A private Bridge swap's two requests are completed from this one device response.
+        let (authorization, destination) = match destination {
+            Some(destination) => {
+                let (authorization, destination) = request
+                    .complete_with_destination(destination, &descriptor, entropy.expose_secret())
+                    .map_err(|error| {
+                        HardwareSpendAuthorizationError::Executor(error.to_string())
+                    })?;
+                (
+                    authorization,
+                    Some(DesktopPrivateSpendAuthorization::HardwareExecutor(
+                        Box::new(destination),
+                    )),
+                )
+            }
+            None => (
+                request
+                    .complete(&descriptor, entropy.expose_secret())
+                    .map_err(|error| {
+                        HardwareSpendAuthorizationError::Executor(error.to_string())
+                    })?,
+                None,
+            ),
+        };
         return Ok((
             DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(authorization)),
+            destination,
             hardware_session,
         ));
     }
@@ -3761,6 +3834,7 @@ async fn derive_hardware_spend_authorization(
     )?;
     Ok((
         DesktopPrivateSpendAuthorization::PreauthorizedSigner(signer),
+        None,
         hardware_session,
     ))
 }

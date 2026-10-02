@@ -104,24 +104,27 @@ const ARBITRUM_SWAP_PROFILE: SwapProfile = SwapProfile {
 };
 
 /// Built-in cross-chain delivery parameters for one chain: the bridge providers' API roots,
-/// Across's `SpokePool` and 1Click's pinned quote-signing key. Not user-editable and not
-/// persisted.
+/// Across's `SpokePool` and `MulticallHandler`, and 1Click's pinned quote-signing key. Not
+/// user-editable and not persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeProfile {
     chain_id: u64,
     across_api_base: &'static str,
     spoke_pool: Address,
+    multicall_handler: Address,
     one_click_api_base: &'static str,
     one_click_blockchain: &'static str,
     one_click_quote_key: &'static str,
 }
 
 // SpokePools are the Across proxies whose implementations contain `depositV3`, checked on-chain
-// on 2026-09-29.
+// on 2026-09-29. Multicall handlers are Across's `MulticallHandler` deployments, checked
+// on-chain on 2026-10-02; BNB Smart Chain's is at its own address.
 const MAINNET_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
     chain_id: 1,
     across_api_base: "https://app.across.to/api",
     spoke_pool: address!("5c7BCd6E7De5423a257D81B442095A1a6ced35C5"),
+    multicall_handler: address!("924a9f036260DdD5808007E1AA95f08eD08aA569"),
     one_click_api_base: "https://1click.chaindefuser.com",
     one_click_blockchain: "eth",
     // `ONE_CLICK_MANAGER_PUB_KEY` in 1Click's TypeScript SDK 0.1.26.
@@ -130,6 +133,7 @@ const MAINNET_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
 const BNB_BRIDGE_PROFILE: BridgeProfile = BridgeProfile {
     chain_id: 56,
     spoke_pool: address!("4e8E101924eDE233C13e2D8622DC8aED2872d505"),
+    multicall_handler: address!("AC537C12fE8f544D712d71ED4376a502EEa944d7"),
     one_click_blockchain: "bsc",
     ..MAINNET_BRIDGE_PROFILE
 };
@@ -158,6 +162,11 @@ impl BridgeProfile {
     #[must_use]
     pub const fn spoke_pool(&self) -> Address {
         self.spoke_pool
+    }
+    /// Across's `MulticallHandler`, the deposit recipient of a private delivery.
+    #[must_use]
+    pub const fn multicall_handler(&self) -> Address {
+        self.multicall_handler
     }
     #[must_use]
     pub const fn one_click_api_base(&self) -> &'static str {
@@ -479,6 +488,12 @@ mod tests {
                 let bridge = bridge.expect("every swap chain can bridge");
                 assert_eq!(bridge.chain_id(), chain.chain_id);
                 assert_ne!(bridge.spoke_pool(), Address::ZERO);
+                let handler = if chain.chain_id == 56 {
+                    address!("AC537C12fE8f544D712d71ED4376a502EEa944d7")
+                } else {
+                    address!("924a9f036260DdD5808007E1AA95f08eD08aA569")
+                };
+                assert_eq!(bridge.multicall_handler(), handler);
             } else if chain.built_in && ![1, 56, 137, 42161].contains(&chain.chain_id) {
                 assert!(bridge.is_none(), "chain {}", chain.chain_id);
                 unsupported_built_in += 1;

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    Anchor, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    Anchor, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _,
     ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
     Window, div, prelude::FluentBuilder as _, relative, rems, rgb,
@@ -27,13 +27,11 @@ use gpui_component::{
     button::{Button, ButtonGroup, ButtonVariants as _},
     checkbox::Checkbox,
     collapsible::Collapsible,
-    combobox::{Combobox, ComboboxEvent, ComboboxState},
     input::{Enter as InputEnter, InputEvent, InputState},
     popover::Popover,
-    select::{Caret, SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     slider::{Slider, SliderEvent, SliderState},
     spinner::Spinner,
-    tag::Tag,
     tooltip::Tooltip,
 };
 use ui::controls::{
@@ -45,11 +43,12 @@ use ui::recipient_picker::RecipientPickerEvent;
 use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, ExecutorRecoveryFeeEstimate,
-    OperationNetworkIsolation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, QuoteDeviationError, SwapAmountPlan, SwapAmountRequest,
-    SwapBridgeClients, SwapBridgeRoute, SwapExecutor, SwapOrderOutcome, SwapOrderRequest,
-    SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
-    TokenAnchorRateCache, TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    OperationNetworkIsolation, PrivateBridgeSetupPreparation, PublicBroadcasterCandidate,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, QuoteDeviationError, SwapAmountPlan,
+    SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext,
+    SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapReview, SwapReviewChange,
+    SwapReviewRequest, SwapSetupRequest, SyncProgressUpdate, TokenAnchorRateCache,
+    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
     bridge::{
         BridgeApiError, BridgeDestination, across_destination_tokens, near_destination_tokens,
     },
@@ -57,33 +56,41 @@ use wallet_ops::{
         CowOrderbookClient, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
         OrderLimitError,
     },
-    default_public_broadcaster_fee_limit,
+    default_public_broadcaster_fee_limit, prepare_private_bridge_setup,
     settings::{
         BridgeProfile, BridgeReceiverRejection, EffectiveChainConfig, EffectiveTokenRegistry,
         SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
         resolve_effective_chain_rpc_route, swap_destination_tokens,
     },
+    submit_private_bridge_setups,
     vault::{
-        BridgeDelivery, BridgeProvider, BridgeSurplus, ExecutorOperationId, ExecutorRecord,
-        SwapApproval, SwapApprovedBounds, SwapDelivery,
+        BridgeDelivery, BridgePrivateDelivery, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
+        ExecutorOperationId, ExecutorRecord, SwapApproval, SwapApprovedBounds, SwapDelivery,
     },
 };
 
+use self::buy_picker::{
+    BuyNetwork, BuyPicker, NetworkAvailability, NetworkSync, NetworkUnavailable,
+    PrivateNetworkFacts, ensure_buy_picker_bindings, network_token_icon,
+    private_network_availability, public_network_availability,
+};
 use super::dialog::{SwapDialogView, powered_by_cow};
 use super::model::{
-    SwapFormMode as FormMode, SwapStage, format_bps_percent, provider_name, quote_anchor_delta_bps,
-    swap_cost_bps, swap_form_mode, swap_total_cost,
+    SwapFormMode as FormMode, SwapSetupProgress, SwapStage, format_bps_percent,
+    private_delivery_credit, provider_name, quote_anchor_delta_bps, swap_cost_bps, swap_form_mode,
+    swap_total_cost,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-    SwapAction, SwapJobKind, swap_delivery, swap_sell_amount, swap_tokens,
+    SwapAction, SwapJobKind, swap_delivery, swap_private_delivery, swap_sell_amount, swap_tokens,
 };
-use crate::assets::RailgunActionIcon;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 use crate::root::broadcaster_picker::{
     BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL, BroadcasterChoice,
     BroadcasterPickerFeeEstimateContext, BroadcasterPickerTarget, broadcaster_candidate_label,
     selected_broadcaster_label,
 };
+use crate::root::chain_load::ChainUtxoState;
 use crate::root::private_action::{
     PrivateActionAssetSelectItem, RecipientOption, UnshieldAsset, fee_token_selector,
     form_recipient_picker, private_action_asset_select_items, recipient_suggestion_moved,
@@ -101,7 +108,7 @@ use crate::root::spend_authorization::{
 };
 use crate::root::stealth_accounts::{RecoveryPickerContext, same_offer};
 use crate::root::{
-    COST_ESTIMATE_DEBOUNCE, DeliveryFormKind, format_token_amount_ceiling_for_display,
+    COST_ESTIMATE_DEBOUNCE, DeliveryFormKind, WalletRoot, format_token_amount_ceiling_for_display,
     format_unshield_amount_input, format_value_with_usd_label, native_wrapped_output_labels,
     new_text_input, parse_address,
 };
@@ -141,8 +148,12 @@ const EXTERNAL_DELIVERY_DISCLOSURE: &str = "The order names the receiver, and th
 const NEAR_INTENTS_DISCLAIMER: &str = "A bridge operator holds the funds between the deposit and delivery. Refunds depend on the 1Click service and aren't guaranteed.";
 /// The steps of a new swap, as its reviews' stepper names them.
 const SWAP_STEPS: [&str; 2] = ["Set up stealth account", "Place order"];
+/// The steps of a private Bridge swap, which sets up a stealth account on each network.
+const PRIVATE_BRIDGE_SWAP_STEPS: [&str; 2] = ["Set up stealth accounts", "Place order"];
 const SAME_TOKEN_BRIDGE: &str =
     "Same-token bridging isn't supported. Choose another token to receive, or sell something else.";
+const DESTINATION_AUTHORIZATION_MISSING: &str =
+    "The approval didn't cover the destination network. Review the swap again. Nothing was sent.";
 
 /// Pay more of the gas: move the gas bar's knob one step toward "you pay all gas".
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
@@ -269,10 +280,83 @@ pub(super) struct SetupApproval {
     buy: Address,
     candidate: PublicBroadcasterCandidate,
     maximum_private_fee: U256,
+    /// The wallet's broadcaster network client, which delivers to broadcasters of every network.
     waku: Arc<WakuDeliveryClient>,
-    /// Persisted with the setup: the approved amount, minimum, fee and price check.
+    /// A private Bridge swap's destination stealth account, when this approval sets it up too.
+    destination: Option<DestinationSetup>,
+    /// Persisted with the setup: the approved amount, minimum, fee and price check. For a
+    /// private Bridge swap it binds the destination setup's fee limit.
     approval: SwapApproval,
     orderbook: Option<CowOrderbookClient>,
+}
+
+impl SetupApproval {
+    /// The destination network and the stealth account there that this approval also sets up.
+    pub(super) fn destination_account(&self) -> Option<(u64, ExecutorOperationId)> {
+        self.destination
+            .as_ref()
+            .map(|destination| (destination.chain_id, destination.operation))
+    }
+
+    /// What the review's Pay now row shows: the setup fee on `chain_id`, the swap's own
+    /// network, then the destination network's.
+    fn fees(&self, chain_id: u64) -> Vec<SetupFee> {
+        let fee = |chain_id, candidate: &PublicBroadcasterCandidate, maximum| SetupFee {
+            chain_id,
+            token: candidate.token,
+            maximum,
+            broadcaster: broadcaster_candidate_label(candidate),
+        };
+        std::iter::once(fee(chain_id, &self.candidate, self.maximum_private_fee))
+            .chain(self.destination.as_ref().map(|destination| {
+                fee(
+                    destination.chain_id,
+                    &destination.candidate,
+                    destination.maximum_private_fee,
+                )
+            }))
+            .collect()
+    }
+}
+
+/// The setup of a private Bridge swap's destination stealth account, through a broadcaster on
+/// its own network and paid from the private balance there.
+#[derive(Clone)]
+pub(super) struct DestinationSetup {
+    pub(super) chain_id: u64,
+    /// A new operation, or the account's saved one when its setup is sent again.
+    pub(super) operation: ExecutorOperationId,
+    candidate: PublicBroadcasterCandidate,
+    maximum_private_fee: U256,
+}
+
+/// A private Bridge swap's destination setup the user approved to send again by itself, once
+/// the swap's own stealth account is set up.
+#[derive(Clone)]
+pub(super) struct DestinationRetry {
+    /// The swap, on its own network.
+    pub(super) operation: ExecutorOperationId,
+    pub(super) setup: DestinationSetup,
+    waku: Arc<WakuDeliveryClient>,
+    /// The swap's approval with this review's fee limit, when it is above the approved one. It
+    /// is saved before the setup is sent.
+    approval: Option<SwapApproval>,
+}
+
+/// One setup fee of a review: at most `maximum` of `token`, paid to `broadcaster` on `chain_id`.
+struct SetupFee {
+    chain_id: u64,
+    token: Address,
+    maximum: U256,
+    broadcaster: String,
+}
+
+/// Whose setup a route pays for: the swap's own stealth account, or a private Bridge swap's
+/// destination stealth account on its network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupSide {
+    Origin,
+    Destination,
 }
 
 /// The order terms the user approved, for a stealth account that is set up.
@@ -292,6 +376,16 @@ pub(super) struct OrderApproval {
     /// Approved in a full review rather than the confirm-only step. Only a full review replaces
     /// the approval saved with the setup, which binds the swap's first order.
     full_review: bool,
+}
+
+impl OrderApproval {
+    /// The order's delivery, when it shields on another network.
+    pub(super) fn private_delivery(&self) -> Option<BridgeDelivery> {
+        match self.review.plan().delivery() {
+            SwapDelivery::Bridge(delivery) if delivery.is_private() => Some(delivery),
+            _ => None,
+        }
+    }
 }
 
 /// The route a Bridge review was quoted with, kept for signing its order.
@@ -355,6 +449,15 @@ impl SetupRoute {
         self.estimate_task = None;
         self.next_estimate = None;
         self.estimate_revision = self.estimate_revision.wrapping_add(1);
+    }
+
+    /// The route holds a fee token, its options or an estimate, as one that is in use does.
+    const fn is_used(&self) -> bool {
+        self.fee_token.is_some()
+            || !self.fee_options.is_empty()
+            || self.estimate.is_some()
+            || self.estimate_error.is_some()
+            || self.estimate_task.is_some()
     }
 
     fn choice(&self) -> BroadcasterChoice {
@@ -421,115 +524,6 @@ struct SwapBuyItem {
     near_only: bool,
 }
 
-impl SelectItem for SwapBuyItem {
-    type Value = Address;
-
-    fn title(&self) -> SharedString {
-        self.asset.title()
-    }
-
-    fn display_title(&self) -> Option<gpui::AnyElement> {
-        self.asset.display_title()
-    }
-
-    fn render(&self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(self.asset.render(window, cx))
-            .when(self.near_only, |row| {
-                row.child(
-                    Tag::secondary()
-                        .outline()
-                        .small()
-                        .rounded_full()
-                        .flex_none()
-                        .text_xs()
-                        .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
-                        .child("NEAR"),
-                )
-            })
-    }
-
-    fn value(&self) -> &Self::Value {
-        self.asset.value()
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        self.asset.matches(query)
-    }
-}
-
-/// A delivery network: the swap's own, or another built-in chain a bridge reaches. A chain
-/// that isn't enabled with RPC endpoints is listed with the reason and can't be chosen.
-#[derive(Clone)]
-struct NetworkSelectItem {
-    chain_id: u64,
-    label: SharedString,
-    this_network: bool,
-    unavailable: Option<SharedString>,
-}
-
-impl SelectItem for NetworkSelectItem {
-    type Value = u64;
-
-    fn title(&self) -> SharedString {
-        if self.this_network {
-            format!("{} (this network)", self.label).into()
-        } else {
-            self.label.clone()
-        }
-    }
-
-    fn display_title(&self) -> Option<gpui::AnyElement> {
-        Some(
-            ui::wallet_identity::chain_label_row(
-                self.title(),
-                railgun_ui::chain_icon_asset_path(self.chain_id),
-            )
-            .into_any_element(),
-        )
-    }
-
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(ui::wallet_identity::chain_label_row(
-                        self.label.clone(),
-                        railgun_ui::chain_icon_asset_path(self.chain_id),
-                    ))
-                    .when(self.this_network, |row| {
-                        row.child(app_muted_text("This network").text_xs())
-                    }),
-            )
-            .children(
-                self.unavailable
-                    .clone()
-                    .map(|reason| app_muted_text(reason).text_xs().whitespace_normal()),
-            )
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.chain_id
-    }
-
-    fn disabled(&self) -> bool {
-        self.unavailable.is_some()
-    }
-}
-
 /// A bridge provider. One without a route for the Buy token is listed with the reason and
 /// can't be chosen.
 #[derive(Clone)]
@@ -581,6 +575,13 @@ enum ReceiveTo {
 /// Why the form has no delivery to review.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DeliveryProblem {
+    /// The form's network, kept when Receive to changed, can't take Private balance; the line
+    /// under Receive to says why. While it is `syncing`, the wallet's sync there may still
+    /// resolve it.
+    Network {
+        problem: SharedString,
+        syncing: bool,
+    },
     /// The receiver as entered can't be used; the line under the Receiver field says why.
     Receiver(SharedString),
     /// No provider delivers the Buy token on the chosen network yet; the Buy panel and the
@@ -627,13 +628,19 @@ struct BridgeChoices {
     chosen: Option<BridgeProvider>,
     /// Across's surplus choice; NEAR Intents always bridges the surplus.
     surplus: BridgeSurplus,
+    /// What a private delivery does when its shield on the destination network can't run.
+    shield_failure: BridgeShieldFailure,
     /// Keyed by sell token and destination network. A missing entry is loading.
     routes: HashMap<(Address, u64), eyre::Result<BridgeRoutes>>,
-    routes_task: Option<((Address, u64), Task<()>)>,
+    /// The routes being fetched, by the same key: the form's network's, and those of a network
+    /// the Buy picker shows.
+    routes_tasks: HashMap<(Address, u64), Task<()>>,
     /// The unreachable provider notice's popover. Reloaded routes close it.
     notice_open: bool,
     /// The Provider row's hint popover. Reloaded routes close it.
     provider_hint_open: bool,
+    /// The "If the shield fails" row's hint popover.
+    failure_hint_open: bool,
 }
 
 /// Where a Bridge swap stands with the chosen network's routes and Buy token.
@@ -666,6 +673,8 @@ struct BridgeTerms {
     token: Address,
     provider: BridgeProvider,
     surplus: BridgeSurplus,
+    /// A private delivery's failure choice.
+    private: Option<BridgePrivateDelivery>,
 }
 
 /// What the form's quote was requested for, apart from a Public address receiver. The quote
@@ -689,17 +698,19 @@ pub(super) struct SwapForm {
     account_select: Option<Entity<SelectState<SearchableVec<SwapAccountSelectItem>>>>,
     sell: Address,
     /// The selected Buy asset: an ERC-20 on the swap's network, see [`SwapForm::order_buy`],
-    /// or on another network, the token delivered there, `Address::ZERO` for its native asset.
+    /// or on another network, the token delivered there, `Address::ZERO` for its native asset,
+    /// which only a Public address receives.
     buy: Option<Address>,
     /// A Public address receives the wrapped native Buy asset as the native asset. Reset to
     /// wrapped when the Buy asset changes or delivery goes back to Private.
     native_output: bool,
     sell_select: Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
-    buy_select: Entity<ComboboxState<SearchableVec<SwapBuyItem>>>,
-    /// A Public address on another network makes the swap a Bridge swap. `None` is the swap's
-    /// own network, and Private delivery always has it.
+    /// The Buy token button's picker, which sets the delivery kind, the network and the Buy
+    /// asset together.
+    picker: BuyPicker,
+    /// Delivery on another network makes the swap a Bridge swap. `None` is the swap's own
+    /// network. Receive to keeps it, so it may be one the delivery kind can't take.
     network: Option<u64>,
-    network_select: Entity<SelectState<SearchableVec<NetworkSelectItem>>>,
     provider_select: Entity<SelectState<SearchableVec<ProviderSelectItem>>>,
     bridge: BridgeChoices,
     amount_input: Entity<InputState>,
@@ -733,6 +744,13 @@ pub(super) struct SwapForm {
     /// delivery a quote is requested for.
     delivery: Result<SwapDelivery, DeliveryProblem>,
     route: SetupRoute,
+    /// The setup route of a private Bridge swap's destination stealth account, on its network.
+    /// Unused for any other delivery, and once that account is set up.
+    destination_route: SetupRoute,
+    /// The route the broadcaster picker was opened for.
+    broadcaster_side: SetupSide,
+    /// The account select names two new accounts, which a private Bridge swap sets up.
+    two_accounts: bool,
     assets: FormAssets,
     quote: QuoteState,
     quote_task: Option<Task<()>>,
@@ -765,6 +783,33 @@ pub(super) struct SwapForm {
 impl SwapForm {
     pub(super) const fn operation(&self) -> Option<ExecutorOperationId> {
         self.operation
+    }
+
+    /// The form delivers to the private balance on another network, which makes the swap a
+    /// private Bridge swap with a stealth account on each network.
+    const fn private_bridge(&self) -> bool {
+        matches!(self.receive_to, ReceiveTo::PrivateBalance) && self.network.is_some()
+    }
+
+    /// A private delivery's terms as the form has them.
+    const fn private_delivery(&self) -> BridgePrivateDelivery {
+        BridgePrivateDelivery {
+            on_shield_failure: self.bridge.shield_failure,
+        }
+    }
+
+    const fn setup_route(&self, side: SetupSide) -> &SetupRoute {
+        match side {
+            SetupSide::Origin => &self.route,
+            SetupSide::Destination => &self.destination_route,
+        }
+    }
+
+    const fn setup_route_mut(&mut self, side: SetupSide) -> &mut SetupRoute {
+        match side {
+            SetupSide::Origin => &mut self.route,
+            SetupSide::Destination => &mut self.destination_route,
+        }
     }
 
     /// The token the order buys: the native marker, `Address::ZERO`, for native output, and
@@ -819,7 +864,8 @@ impl SwapForm {
     }
 
     /// The receiver the form's quote carries: the entered one once it can be used, and until
-    /// then `Address::ZERO`, a placeholder that signing refuses.
+    /// then `Address::ZERO`, a placeholder that signing refuses. A private Bridge delivery
+    /// carries the placeholder until its destination stealth account is reserved.
     const fn quote_receiver(&self) -> Address {
         match &self.delivery {
             Ok(
@@ -833,11 +879,12 @@ impl SwapForm {
     /// The delivery to quote. No quote names the receiver, so a receiver that can't be used
     /// yet doesn't hold the quote back: the delivery then goes to the placeholder of
     /// [`Self::quote_receiver`], and [`Self::review_problem`] refuses the review. `None` while
-    /// a Bridge swap has no provider for the Buy token.
+    /// a Bridge swap has no provider for the Buy token, or its network can't take the delivery
+    /// kind.
     fn quote_delivery(&self) -> Option<SwapDelivery> {
         match &self.delivery {
             Ok(delivery) => Some(*delivery),
-            Err(DeliveryProblem::Bridge) => None,
+            Err(DeliveryProblem::Bridge | DeliveryProblem::Network { .. }) => None,
             Err(DeliveryProblem::Receiver(_)) => {
                 let receiver = Address::ZERO;
                 let Some(network) = self.network else {
@@ -850,6 +897,7 @@ impl SwapForm {
                     receiver,
                     destination_token: terms.token,
                     surplus: terms.surplus,
+                    private: None,
                 }))
             }
         }
@@ -857,7 +905,9 @@ impl SwapForm {
 
     fn review_problem(&self, review: &Arc<SwapReview>) -> Option<SharedString> {
         match &self.delivery {
-            Err(DeliveryProblem::Receiver(problem)) => Some(problem.clone()),
+            Err(DeliveryProblem::Network { problem, .. } | DeliveryProblem::Receiver(problem)) => {
+                Some(problem.clone())
+            }
             Err(DeliveryProblem::Bridge) => Some("Choose a token the bridge delivers.".into()),
             Ok(delivery) if *delivery != review.plan().delivery() => {
                 Some("Wait for the quote.".into())
@@ -902,10 +952,17 @@ impl SwapForm {
         let Some(token) = self.buy else {
             return BridgeState::NoToken;
         };
-        let (across, near) = (
-            routes.across_for(token),
-            destination_for(&routes.near, token),
-        );
+        // Only Across can shield on delivery, and it shields the wrapped native token as
+        // itself.
+        let private = self.receive_to == ReceiveTo::PrivateBalance;
+        let (across, near) = if private {
+            (destination_for(&routes.across, token), None)
+        } else {
+            (
+                routes.across_for(token),
+                destination_for(&routes.near, token),
+            )
+        };
         let (destination, provider) = match (self.bridge.chosen, across, near) {
             (Some(BridgeProvider::NearIntents), _, Some(near)) | (_, None, Some(near)) => {
                 (near, BridgeProvider::NearIntents)
@@ -916,8 +973,10 @@ impl SwapForm {
             }
             (_, None, None) => {
                 return match &routes.unavailable {
-                    Some((provider, _)) => BridgeState::Unreachable(*provider),
-                    None => BridgeState::Unavailable,
+                    Some((provider, _)) if !private || *provider == BridgeProvider::Across => {
+                        BridgeState::Unreachable(*provider)
+                    }
+                    _ => BridgeState::Unavailable,
                 };
             }
         };
@@ -952,6 +1011,7 @@ impl SwapForm {
             token: destination.destination_token,
             provider,
             surplus: bridge_surplus(provider, self.bridge.surplus),
+            private: self.private_bridge().then(|| self.private_delivery()),
         })
     }
 
@@ -1034,10 +1094,23 @@ struct QuoteResult {
 }
 
 enum SetupOutcome {
-    /// The broadcaster's answer for the setup.
-    Sent(PublicBroadcasterResultKind),
+    /// The broadcaster's answer for the swap's own setup, and for a private Bridge swap's
+    /// destination setup when it was sent too. Each stands by itself.
+    Sent {
+        origin: eyre::Result<PublicBroadcasterResultKind>,
+        destination: Option<eyre::Result<PublicBroadcasterResultKind>>,
+    },
     /// The approved amount no longer fits one order; nothing was paid.
     TooLarge,
+}
+
+/// A private Bridge swap's destination setup with what sends it: its network's session and
+/// owner, and the authorization for the stealth account there.
+struct DestinationSubmission {
+    setup: DestinationSetup,
+    session: Arc<WalletSession>,
+    owner: Arc<ExecutorOwner>,
+    authorization: DesktopPrivateSpendAuthorization,
 }
 
 /// Plan the notes without proving, for a stand-in executor before setup or from recorded
@@ -1430,7 +1503,7 @@ impl PrivateSwapsView {
             cx,
         );
         // Offer this account even when it can't swap now; its check explains why.
-        let items = self.swap_account_items(Some(&record), cx);
+        let items = self.swap_account_items(Some(&record), false, cx);
         if let Some(select) = self
             .form
             .as_ref()
@@ -1444,10 +1517,12 @@ impl PrivateSwapsView {
     }
 
     /// The accounts a new swap can use: a new one first, then set-up accounts, newest first.
-    /// `chosen` is listed even when the local rules leave it out.
+    /// `chosen` is listed even when the local rules leave it out. With `two_accounts`, the new
+    /// entry names the two accounts a private Bridge swap sets up.
     fn swap_account_items(
         &self,
         chosen: Option<&ExecutorRecord>,
+        two_accounts: bool,
         cx: &App,
     ) -> Vec<SwapAccountSelectItem> {
         let mut accounts = self
@@ -1485,7 +1560,12 @@ impl PrivateSwapsView {
         let mut items = vec![SwapAccountSelectItem {
             operation: None,
             address: None,
-            label: "New account (recommended)".into(),
+            label: if two_accounts {
+                "New accounts (recommended)"
+            } else {
+                "New account (recommended)"
+            }
+            .into(),
         }];
         items.extend(
             accounts
@@ -1539,6 +1619,7 @@ impl PrivateSwapsView {
             // unlinked there.
             form.set_orderbook(None, None);
             form.route.invalidate_estimate();
+            form.destination_route.invalidate_estimate();
         }
         let current = form.operation;
         if select.read(cx).selected_value() != Some(&current) {
@@ -1644,10 +1725,9 @@ impl PrivateSwapsView {
 
     /// Open the form with its fields filled in, and the order `terms` a reopened swap restores.
     /// A native `buy`, which only a Public address `delivery` receives, fills in as the wrapped
-    /// native Buy asset with native output, before the Buy options are built or a quote is
-    /// scheduled. A Bridge `delivery` fills in its
-    /// network, provider, surplus choice and destination token, which replaces `buy`, the token
-    /// handed to the provider.
+    /// native Buy asset with native output, before a quote is scheduled. A Bridge `delivery`
+    /// fills in its network, provider, surplus choice and destination token, which replaces
+    /// `buy`, the token handed to the provider. A private one is Private balance on its network.
     #[allow(clippy::too_many_arguments)]
     fn open_form(
         &mut self,
@@ -1661,9 +1741,14 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         ensure_gas_bar_bindings(cx);
+        ensure_buy_picker_bindings(cx);
         let terms = terms.unwrap_or_default();
         let (receive_to, receiver) = match delivery {
-            SwapDelivery::Reshield => (ReceiveTo::PrivateBalance, String::new()),
+            // A private Bridge delivery's receiver is its destination stealth account.
+            SwapDelivery::Reshield
+            | SwapDelivery::Bridge(BridgeDelivery {
+                private: Some(_), ..
+            }) => (ReceiveTo::PrivateBalance, String::new()),
             SwapDelivery::External { receiver }
             | SwapDelivery::Bridge(BridgeDelivery { receiver, .. }) => {
                 (ReceiveTo::PublicAddress, receiver.to_checksum(None))
@@ -1672,10 +1757,12 @@ impl PrivateSwapsView {
         let mut bridge = BridgeChoices {
             chosen: None,
             surplus: BridgeSurplus::Reshield,
+            shield_failure: BridgeShieldFailure::default(),
             routes: HashMap::new(),
-            routes_task: None,
+            routes_tasks: HashMap::new(),
             notice_open: false,
             provider_hint_open: false,
+            failure_hint_open: false,
         };
         let (network, buy, native_output) = match (delivery, buy) {
             (SwapDelivery::Bridge(delivery), _) => {
@@ -1683,6 +1770,9 @@ impl PrivateSwapsView {
                 bridge.chosen = Some(delivery.provider);
                 if delivery.surplus == BridgeSurplus::KeepInAccount {
                     bridge.surplus = BridgeSurplus::KeepInAccount;
+                }
+                if let Some(private) = delivery.private {
+                    bridge.shield_failure = private.on_shield_failure;
                 }
                 (
                     Some(delivery.destination_chain),
@@ -1699,34 +1789,11 @@ impl PrivateSwapsView {
         let assets = self.form_assets(operation, sell, cx);
         let sell_items = private_action_asset_select_items(&assets.sell_assets);
         let sell_index = select_index(&sell_items, sell);
-        // A Bridge swap's Buy list fills in once its network's routes load.
-        let buy_items = if network.is_some() {
-            Vec::new()
-        } else {
-            same_chain_buy_items(self.buy_items(sell, cx))
-        };
-        let buy_selected = buy.and_then(|buy| buy_index(&buy_items, buy));
-        let network_items = self.network_items(cx);
-        let network_index = network_items
-            .iter()
-            .position(|item| item.chain_id == network.unwrap_or(self.session.chain_id))
-            .map(|index| gpui_component::IndexPath::default().row(index));
+        let picker = BuyPicker::new(network.unwrap_or(self.session.chain_id), window, cx);
         let decimals = self.token_decimals(sell, cx);
         let sell_select = cx.new(|cx| {
             SelectState::new(SearchableVec::new(sell_items), sell_index, window, cx)
                 .searchable(true)
-        });
-        let buy_select = cx.new(|cx| {
-            ComboboxState::new(
-                SearchableVec::new(buy_items),
-                buy_selected.into_iter().collect(),
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
-        let network_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(network_items), network_index, window, cx)
         });
         // Filled in once the network's routes and the Buy token give a provider.
         let provider_select = cx.new(|cx| {
@@ -1764,8 +1831,9 @@ impl PrivateSwapsView {
                 input.set_value(receiver.clone(), window, cx);
             });
         }
+        let two_accounts = receive_to == ReceiveTo::PrivateBalance && network.is_some();
         let account_select = operation.is_none().then(|| {
-            let items = self.swap_account_items(None, cx);
+            let items = self.swap_account_items(None, two_accounts, cx);
             cx.new(|cx| {
                 SelectState::new(
                     SearchableVec::new(items),
@@ -1805,22 +1873,16 @@ impl PrivateSwapsView {
                 },
             ),
             cx.subscribe_in(
-                &buy_select,
+                &picker.search,
                 window,
-                |this, _, event: &ComboboxEvent<SearchableVec<SwapBuyItem>>, window, cx| {
-                    if let ComboboxEvent::Confirm(tokens) = event
-                        && let Some(token) = tokens.first()
+                |this, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change)
+                        && this
+                            .form
+                            .as_ref()
+                            .is_some_and(|form| form.picker.search == *input)
                     {
-                        this.set_form_buy(*token, window, cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
-                &network_select,
-                window,
-                |this, _, event: &SelectEvent<SearchableVec<NetworkSelectItem>>, window, cx| {
-                    if let SelectEvent::Confirm(Some(chain_id)) = event {
-                        this.set_form_network(*chain_id, window, cx);
+                        this.buy_picker_searched(cx);
                     }
                 },
             ),
@@ -1912,9 +1974,8 @@ impl PrivateSwapsView {
             buy,
             native_output,
             sell_select,
-            buy_select,
+            picker,
             network,
-            network_select,
             provider_select,
             bridge,
             amount_input,
@@ -1936,6 +1997,9 @@ impl PrivateSwapsView {
             receiver_suggestions_scroll: ScrollHandle::new(),
             delivery: Ok(SwapDelivery::Reshield),
             route: SetupRoute::default(),
+            destination_route: SetupRoute::default(),
+            broadcaster_side: SetupSide::Origin,
+            two_accounts,
             assets,
             quote: QuoteState::Idle,
             quote_task: None,
@@ -1957,7 +2021,13 @@ impl PrivateSwapsView {
         // A prefilled receiver is checked again, against this form's stealth account.
         form.delivery = self.form_delivery(&form, cx);
         self.form = Some(form);
-        self.start_setup_route_updates(cx);
+        self.start_setup_route_updates(window, cx);
+        // A restored private Bridge delivery needs its network's session.
+        if receive_to == ReceiveTo::PrivateBalance
+            && let Some(network) = network
+        {
+            self.load_private_networks(Some(network), cx);
+        }
         self.load_bridge_routes(window, cx);
         self.schedule_quote(window, cx);
         self.show_view(SwapDialogView::Form, window, cx);
@@ -2074,26 +2144,36 @@ impl PrivateSwapsView {
     /// A Bridge swap's destination list: what either provider delivers, native first. Tokens
     /// only NEAR Intents delivers carry its tag. The wrapped native token Across unwraps is
     /// listed as the native asset. The sell token's own asset stays listed, so picking it
-    /// explains why the pair isn't bridged.
-    fn bridge_buy_items(&self, network: u64, routes: &BridgeRoutes, cx: &App) -> Vec<SwapBuyItem> {
+    /// explains why the pair isn't bridged. A `private` delivery lists only what Across
+    /// delivers, the wrapped native token as itself, and never the sell token's own asset.
+    fn bridge_buy_items(
+        &self,
+        network: u64,
+        routes: &BridgeRoutes,
+        private: bool,
+        cx: &App,
+    ) -> Vec<SwapBuyItem> {
         let mut items: Vec<SwapBuyItem> = Vec::new();
-        for (token, destination, near_only) in routes
-            .across
+        let across = routes.across.iter().map(|destination| {
+            let token = if private {
+                destination.destination_token
+            } else {
+                routes.across_buy_token(destination)
+            };
+            (token, destination, false)
+        });
+        let others = routes
+            .near
             .iter()
-            .map(|destination| (routes.across_buy_token(destination), destination, false))
-            .chain(
-                routes
-                    .near
-                    .iter()
-                    .map(|destination| (destination.destination_token, destination, true)),
-            )
+            .map(|destination| (destination.destination_token, destination, true))
             .chain(
                 routes
                     .same_asset
                     .iter()
                     .map(|destination| (destination.destination_token, destination, false)),
             )
-        {
+            .filter(|_| !private);
+        for (token, destination, near_only) in across.chain(others) {
             if items.iter().any(|item| item.asset.token == token) {
                 continue;
             }
@@ -2119,40 +2199,33 @@ impl PrivateSwapsView {
         items
     }
 
-    /// The Buy list for the form's network and sell token. A Bridge swap's is empty until its
-    /// routes load.
-    fn buy_select_items(&self, form: &SwapForm, cx: &App) -> Vec<SwapBuyItem> {
-        match form.network {
+    /// The Buy list of `network`, or of the swap's own, for the form's sell token and delivery
+    /// kind. Another network's is empty until its routes load.
+    fn buy_items_on(&self, form: &SwapForm, network: Option<u64>, cx: &App) -> Vec<SwapBuyItem> {
+        match network {
             None => same_chain_buy_items(self.buy_items(form.sell, cx)),
             Some(network) => match form.bridge.routes.get(&(form.sell, network)) {
-                Some(Ok(routes)) => self.bridge_buy_items(network, routes, cx),
+                Some(Ok(routes)) => self.bridge_buy_items(
+                    network,
+                    routes,
+                    form.receive_to == ReceiveTo::PrivateBalance,
+                    cx,
+                ),
                 _ => Vec::new(),
             },
         }
     }
 
-    /// Rebuild the Buy list and select the form's Buy asset in it.
-    fn refresh_buy_items(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let items = self.buy_select_items(form, cx);
-        let selected = form.buy.and_then(|buy| buy_index(&items, buy));
-        form.buy_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(items), window, cx);
-            select.set_selected_indices(selected, window, cx);
-        });
-    }
-
-    /// The networks a Public address can receive on: this one first, then the other built-in
-    /// chains a bridge reaches. One that isn't enabled with RPC endpoints can't be chosen.
-    fn network_items(&self, cx: &App) -> Vec<NetworkSelectItem> {
+    /// The networks `receive_to` can deliver on: this one first, then the other built-in
+    /// chains a bridge reaches. One that fails a condition of the delivery kind is listed with
+    /// the reason and can't be picked.
+    fn network_items(&self, receive_to: ReceiveTo, cx: &App) -> Vec<BuyNetwork> {
         let own = self.session.chain_id;
-        let mut items = vec![NetworkSelectItem {
+        let mut items = vec![BuyNetwork {
             chain_id: own,
             label: network_name(own).into(),
             this_network: true,
-            unavailable: None,
+            availability: NetworkAvailability::Available,
         }];
         let Some(root) = self.root.upgrade() else {
             return items;
@@ -2170,20 +2243,93 @@ impl PrivateSwapsView {
             root.effective_chain_configs
                 .values()
                 .filter(|chain| chain.chain_id != own && chain.bridge_profile().is_some())
-                .map(|chain| {
-                    let label = network_name(chain.chain_id);
-                    let unavailable = resolve_effective_chain_rpc_route(chain.chain_id, chain)
-                        .is_err()
-                        .then(|| format!("Enable {label} with RPC endpoints first").into());
-                    NetworkSelectItem {
-                        chain_id: chain.chain_id,
-                        label: label.into(),
-                        this_network: false,
-                        unavailable,
-                    }
+                .map(|chain| BuyNetwork {
+                    chain_id: chain.chain_id,
+                    label: network_name(chain.chain_id).into(),
+                    this_network: false,
+                    availability: self
+                        .checked_destination_availability(root, receive_to, chain, cx),
                 }),
         );
         items
+    }
+
+    /// Whether `receive_to` can deliver on `network`, another chain. `None` when no bridge
+    /// reaches it from the swap's chain.
+    fn network_availability(
+        &self,
+        receive_to: ReceiveTo,
+        network: u64,
+        cx: &App,
+    ) -> Option<NetworkAvailability> {
+        let root = self.root.upgrade()?;
+        let root = root.read(cx);
+        root.effective_chain_configs
+            .get(self.session.chain_id)?
+            .bridge_profile()?;
+        let chain = root.effective_chain_configs.get(network)?;
+        chain.bridge_profile()?;
+        Some(self.checked_destination_availability(root, receive_to, chain, cx))
+    }
+
+    fn checked_destination_availability(
+        &self,
+        root: &WalletRoot,
+        receive_to: ReceiveTo,
+        chain: &EffectiveChainConfig,
+        cx: &App,
+    ) -> NetworkAvailability {
+        match destination_availability(root, receive_to, chain) {
+            NetworkAvailability::Available if receive_to == ReceiveTo::PrivateBalance => {
+                self.network_setup_availability(chain.chain_id, cx)
+            }
+            availability => availability,
+        }
+    }
+
+    /// Start loading the wallet's session of the chains Private balance could deliver on that
+    /// aren't loaded, or of `only` that one of them. A chain that is loading or loaded is left
+    /// as it is.
+    fn load_private_networks(&self, only: Option<u64>, cx: &mut Context<'_, Self>) {
+        let own = self.session.chain_id;
+        let Some(root) = self.root.upgrade() else {
+            return;
+        };
+        let chains = root
+            .read(cx)
+            .effective_chain_configs
+            .values()
+            .filter(|chain| {
+                chain.chain_id != own
+                    && only.is_none_or(|only| only == chain.chain_id)
+                    && chain.bridge_profile().is_some()
+                    && chain.swap_profile().is_some()
+                    && resolve_effective_chain_rpc_route(chain.chain_id, chain).is_ok()
+            })
+            .map(|chain| chain.chain_id)
+            .collect::<Vec<_>>();
+        if chains.is_empty() {
+            return;
+        }
+        root.update(cx, |root, cx| {
+            for chain_id in chains {
+                root.ensure_chain_load(chain_id, cx);
+            }
+        });
+    }
+
+    /// The wallet's private totals on `network`, by token.
+    fn private_totals(&self, form: &SwapForm, network: u64, cx: &App) -> Vec<(Address, U256)> {
+        if network == self.session.chain_id {
+            return form.assets.totals.clone();
+        }
+        self.root.upgrade().map_or_else(Vec::new, |root| {
+            root.read(cx)
+                .private_action_asset_options(DeliveryFormKind::Unshield, network)
+                .into_iter()
+                .map(|asset| (asset.token, asset.total))
+                .collect()
+        })
     }
 
     /// The swap network's bridge parameters.
@@ -2207,23 +2353,31 @@ impl PrivateSwapsView {
             .cloned()
     }
 
-    /// Fetch the routes of the form's network for its sell token, unless they are known or
-    /// already loading. A missing entry reads as loading.
+    /// Fetch the routes of the form's network, and of another one the open Buy picker shows,
+    /// for the form's sell token.
     fn load_bridge_routes(&mut self, window: &Window, cx: &Context<'_, Self>) {
+        let own = self.session.chain_id;
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        let Some(network) = form.network else {
+        let shown = form
+            .picker
+            .open
+            .then_some(form.picker.network)
+            .filter(|shown| *shown != own && form.network != Some(*shown));
+        for network in form.network.into_iter().chain(shown) {
+            self.load_network_routes(network, window, cx);
+        }
+    }
+
+    /// Fetch the routes of `network` for the form's sell token, unless they are known or
+    /// already loading. A missing entry reads as loading.
+    fn load_network_routes(&mut self, network: u64, window: &Window, cx: &Context<'_, Self>) {
+        let Some(form) = self.form.as_ref() else {
             return;
         };
         let key = (form.sell, network);
-        if form.bridge.routes.contains_key(&key)
-            || form
-                .bridge
-                .routes_task
-                .as_ref()
-                .is_some_and(|(loading, _)| *loading == key)
-        {
+        if form.bridge.routes.contains_key(&key) || form.bridge.routes_tasks.contains_key(&key) {
             return;
         }
         let Some(root) = self.root.upgrade() else {
@@ -2278,7 +2432,7 @@ impl PrivateSwapsView {
             });
         });
         if let Some(form) = self.form.as_mut() {
-            form.bridge.routes_task = Some((key, task));
+            form.bridge.routes_tasks.insert(key, task);
         }
     }
 
@@ -2293,18 +2447,9 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        if form.operation != operation
-            || form
-                .bridge
-                .routes_task
-                .as_ref()
-                .is_none_or(|(loading, _)| *loading != key)
-        {
+        if form.operation != operation || form.bridge.routes_tasks.remove(&key).is_none() {
             return;
         }
-        form.bridge.routes_task = None;
-        form.bridge.notice_open = false;
-        form.bridge.provider_hint_open = false;
         let routes = match result {
             Some(result) => {
                 // The form keeps its own route when it got one meanwhile.
@@ -2326,19 +2471,26 @@ impl PrivateSwapsView {
             return;
         };
         form.bridge.routes.insert(key, routes);
+        // Routes only the Buy picker shows leave the form's delivery and its quote as they are.
+        if (form.sell, form.network) != (key.0, Some(key.1)) {
+            cx.notify();
+            return;
+        }
+        form.bridge.notice_open = false;
+        form.bridge.provider_hint_open = false;
         self.bridge_choices_changed(window, cx);
     }
 
-    /// Ask the providers again on a fresh route, as quote retries do.
+    /// Ask the providers again on a fresh route, as quote retries do: for every network whose
+    /// routes failed or lack a provider.
     fn retry_bridge_routes(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let Some(network) = form.network else {
-            return;
-        };
-        form.bridge.routes.remove(&(form.sell, network));
-        form.bridge.routes_task = None;
+        form.bridge
+            .routes
+            .retain(|_, routes| matches!(routes, Ok(routes) if routes.unavailable.is_none()));
+        form.bridge.routes_tasks.clear();
         form.bridge.notice_open = false;
         form.bridge.provider_hint_open = false;
         form.set_orderbook(None, None);
@@ -2352,12 +2504,43 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// The network, Buy token, provider, routes or sell token changed: rebuild the Buy and
-    /// Provider lists, check the delivery again and quote it, which clears acknowledgements.
+    /// The network, Buy token, provider, routes or sell token changed: rebuild the Provider
+    /// list, check the delivery again and quote it, which clears acknowledgements.
     fn bridge_choices_changed(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.refresh_buy_items(window, cx);
         self.refresh_provider_select(window, cx);
+        self.refresh_account_select(window, cx);
+        // A private Bridge delivery's destination account has a setup route of its own.
+        self.refresh_setup_route(cx);
         self.delivery_changed(window, cx);
+    }
+
+    /// Name the account select's new entry for the delivery: a private Bridge swap sets up a
+    /// stealth account on each network. The selected account stays.
+    fn refresh_account_select(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let two_accounts = form.private_bridge();
+        let Some(select) = form
+            .account_select
+            .clone()
+            .filter(|_| form.two_accounts != two_accounts)
+        else {
+            return;
+        };
+        let current = form.operation;
+        let items = self.swap_account_items(
+            current.and_then(|operation| self.record(operation)),
+            two_accounts,
+            cx,
+        );
+        select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(items), window, cx);
+            select.set_selected_value(&current, window, cx);
+        });
+        if let Some(form) = self.form.as_mut() {
+            form.two_accounts = two_accounts;
+        }
     }
 
     /// List both providers, each unavailable one with its reason, and select the one the Buy
@@ -2481,7 +2664,6 @@ impl PrivateSwapsView {
         self.refresh_form_assets(cx);
         // A Bridge swap's routes depend on the sell token.
         self.load_bridge_routes(window, cx);
-        self.refresh_buy_items(window, cx);
         self.refresh_provider_select(window, cx);
         self.refresh_setup_route(cx);
         self.refresh_form_delivery(cx);
@@ -2506,28 +2688,6 @@ impl PrivateSwapsView {
         }
         self.schedule_quote(window, cx);
         cx.notify();
-    }
-
-    /// Deliver on `chain_id`: another network makes the swap a Bridge swap. Its Buy tokens are
-    /// that network's, so the Buy asset and any provider choice reset.
-    fn set_form_network(&mut self, chain_id: u64, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let network = (chain_id != self.session.chain_id).then_some(chain_id);
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        if form.network == network
-            || form.receive_to != ReceiveTo::PublicAddress
-            || (form.operation.is_some() && !form.reuse_account)
-        {
-            return;
-        }
-        form.network = network;
-        form.buy = None;
-        form.native_output = false;
-        form.bridge.chosen = None;
-        form.error = None;
-        self.load_bridge_routes(window, cx);
-        self.bridge_choices_changed(window, cx);
     }
 
     fn set_form_provider(
@@ -2575,6 +2735,27 @@ impl PrivateSwapsView {
         self.delivery_changed(window, cx);
     }
 
+    /// Choose what a private Bridge delivery does when its shield on the destination network
+    /// can't run. The choice is part of the delivery, so the swap is quoted again, which clears
+    /// the acknowledgements.
+    fn set_form_shield_failure(
+        &mut self,
+        choice: BridgeShieldFailure,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        if form.bridge.shield_failure == choice || self.is_retry(form) {
+            return;
+        }
+        if let Some(form) = self.form.as_mut() {
+            form.bridge.shield_failure = choice;
+        }
+        self.delivery_changed(window, cx);
+    }
+
     /// Pay the wrapped native Buy asset to the Public address as the native asset, or as the
     /// wrapped token. The order's buy token changes, so the swap is quoted again.
     fn set_native_output(&mut self, native: bool, window: &Window, cx: &mut Context<'_, Self>) {
@@ -2596,8 +2777,10 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// Choose where the bought token goes. Only a Public address can receive the native asset,
-    /// so any change returns the output to the wrapped token.
+    /// Choose where the bought token goes, from the form's Receive to or the Buy picker's
+    /// switch. Only a Public address can receive the native asset, so any change returns the
+    /// output to the wrapped token. The network and the Buy asset stay: when the network can't
+    /// take the new delivery kind, [`Self::form_delivery`] says why, and nothing is quoted.
     fn set_receive_to(
         &mut self,
         receive_to: ReceiveTo,
@@ -2610,24 +2793,37 @@ impl PrivateSwapsView {
         if self.receive_to_locked(form) || form.receive_to == receive_to {
             return;
         }
-        let own = self.session.chain_id;
+        // Across pays a Public address the wrapped native token as the native asset, and
+        // shields it as the wrapped token. The Buy asset is the same route either way.
+        let unwrapped = self
+            .destination_chain(form, cx)
+            .and_then(|chain| across_unwrapped_token(&chain));
         let Some(form) = self.form.as_mut() else {
             return;
         };
         form.receive_to = receive_to;
         form.native_output = false;
         form.set_receiver_suggestions((false, None));
-        // Private delivery stays on the swap's network, whose tokens the Buy list holds.
-        if receive_to == ReceiveTo::PrivateBalance && form.network.take().is_some() {
-            form.buy = None;
-            form.bridge.chosen = None;
-            form.network_select.update(cx, |select, cx| {
-                select.set_selected_value(&own, window, cx);
-            });
-            self.bridge_choices_changed(window, cx);
-            return;
+        if let Some(wrapped) = unwrapped {
+            match (receive_to, form.buy) {
+                (ReceiveTo::PrivateBalance, Some(Address::ZERO)) => form.buy = Some(wrapped),
+                (ReceiveTo::PublicAddress, Some(buy)) if buy == wrapped => {
+                    form.buy = Some(Address::ZERO);
+                }
+                _ => {}
+            }
         }
-        self.delivery_changed(window, cx);
+        let network = form.network;
+        // Private balance on the kept network needs the wallet's session there.
+        if receive_to == ReceiveTo::PrivateBalance && network.is_some() {
+            self.load_private_networks(network, cx);
+        }
+        self.settle_buy_picker(window, cx);
+        if network.is_some() {
+            self.bridge_choices_changed(window, cx);
+        } else {
+            self.delivery_changed(window, cx);
+        }
     }
 
     /// The receiver input changed: search the suggestions, then check and quote the entry.
@@ -2796,14 +2992,17 @@ impl PrivateSwapsView {
         }
     }
 
-    /// The delivery the form's choices and receiver give. The receiver parses as Private
-    /// Unshield's recipients do, and mustn't be one of the swap's own addresses. A new swap has
-    /// no stealth account to compare until it's reserved; signing checks it then. On another
-    /// network, the receiver is checked against that network's contracts, and the Buy token
-    /// needs a provider.
+    /// The delivery the form's choices and receiver give. Private balance on another network
+    /// needs that network to take it. The receiver parses as Private Unshield's recipients do,
+    /// and mustn't be one of the swap's own addresses. A new swap has no stealth account to
+    /// compare until it's reserved; signing checks it then. On another network, the receiver is
+    /// checked against that network's contracts, and the Buy token needs a provider.
     fn form_delivery(&self, form: &SwapForm, cx: &App) -> Result<SwapDelivery, DeliveryProblem> {
         if form.receive_to == ReceiveTo::PrivateBalance {
-            return Ok(SwapDelivery::Reshield);
+            return match form.network {
+                None => Ok(SwapDelivery::Reshield),
+                Some(network) => self.private_bridge_delivery(form, network, cx),
+            };
         }
         let receiver_problem = |problem: &'static str| DeliveryProblem::Receiver(problem.into());
         let entered = form.receiver_value.trim();
@@ -2838,6 +3037,64 @@ impl PrivateSwapsView {
             .check_receiver(railgun, executor, receiver)
             .map_err(|rejection| receiver_problem(receiver_rejection_message(rejection)))?;
         Ok(SwapDelivery::External { receiver })
+    }
+
+    /// A Bridge delivery that shields to the wallet on `network`, which Across alone can do. A
+    /// new swap sets up a stealth account there, so the network must still meet Private
+    /// balance's conditions; a started swap met them when it was approved. The receiver is that
+    /// stealth account, unknown until it is reserved: `Address::ZERO` stands in, as no quote
+    /// names it. A started swap's approval or last order names the account it reserved.
+    fn private_bridge_delivery(
+        &self,
+        form: &SwapForm,
+        network: u64,
+        cx: &App,
+    ) -> Result<SwapDelivery, DeliveryProblem> {
+        let name = network_name(network);
+        // The destination stealth account is linked to the swap's own account when that account
+        // is reserved, so an account that is set up can't take one.
+        if form.reuse_account {
+            return Err(DeliveryProblem::Network {
+                problem: format!(
+                    "Private balance on {name} needs new stealth accounts. Choose New accounts, or use Public address."
+                )
+                .into(),
+                syncing: false,
+            });
+        }
+        if form.operation.is_none() {
+            let availability = self
+                .network_availability(ReceiveTo::PrivateBalance, network, cx)
+                .unwrap_or(NetworkAvailability::Unavailable(
+                    NetworkUnavailable::PublicOnly,
+                ));
+            if let Some(problem) = availability.private_problem(&name) {
+                return Err(DeliveryProblem::Network {
+                    problem: problem.into(),
+                    syncing: matches!(
+                        availability,
+                        NetworkAvailability::Syncing(_) | NetworkAvailability::CheckingFee
+                    ),
+                });
+            }
+        }
+        let BridgeState::Ready { destination, .. } = form.bridge_state() else {
+            return Err(DeliveryProblem::Bridge);
+        };
+        let receiver = form
+            .operation
+            .and_then(|operation| self.record(operation))
+            .and_then(swap_private_delivery)
+            .filter(|delivery| delivery.destination_chain == network)
+            .map_or(Address::ZERO, |delivery| delivery.receiver);
+        Ok(SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: network,
+            receiver,
+            destination_token: destination.destination_token,
+            surplus: bridge_surplus(BridgeProvider::Across, form.bridge.surplus),
+            private: Some(form.private_delivery()),
+        }))
     }
 
     /// A Bridge delivery to `receiver` on `network`, which mustn't be one of that network's
@@ -2884,6 +3141,7 @@ impl PrivateSwapsView {
             receiver,
             destination_token: destination.destination_token,
             surplus: bridge_surplus(provider, form.bridge.surplus),
+            private: None,
         }))
     }
 
@@ -3201,18 +3459,18 @@ impl PrivateSwapsView {
 
     // Setup route
 
-    fn start_setup_route_updates(&mut self, cx: &mut Context<'_, Self>) {
+    fn start_setup_route_updates(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         if let Some(root) = self.root.upgrade() {
             root.update(cx, |root, _| root.public_broadcaster_anchor_refresh.wake());
         }
         self.refresh_setup_route(cx);
-        let task = cx.spawn(async move |view, cx| {
+        let task = cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor()
                     .timer(BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL)
                     .await;
                 let active = view
-                    .update(cx, |view, cx| {
+                    .update_in(cx, |view, window, cx| {
                         if view.form.is_none() || !view.session_is_current(cx) {
                             return false;
                         }
@@ -3220,6 +3478,7 @@ impl PrivateSwapsView {
                         if view.update_setup_route(cx) == Some(true) {
                             cx.notify();
                         }
+                        view.refresh_destination_network(window, cx);
                         true
                     })
                     .unwrap_or(false);
@@ -3233,8 +3492,39 @@ impl PrivateSwapsView {
         }
     }
 
+    /// Another network's sync and private funds change outside the form. Read them again
+    /// while the Buy picker lists them, and while Private balance depends on the form's
+    /// network: once that network can or can't take it any more, the delivery is checked and
+    /// quoted again.
+    fn refresh_destination_network(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.refresh_network_funding(cx);
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        if form.picker.open {
+            cx.notify();
+        }
+        if form.receive_to != ReceiveTo::PrivateBalance || form.network.is_none() || self.busy() {
+            return;
+        }
+        let delivery = self.form_delivery(form, cx);
+        if delivery.is_ok() != form.delivery.is_ok() {
+            self.delivery_changed(window, cx);
+        } else if delivery != form.delivery {
+            // Only the reason changed, such as the sync's progress.
+            if let Some(form) = self.form.as_mut() {
+                form.delivery = delivery;
+            }
+            cx.notify();
+        }
+    }
+
+    /// The fee tokens the private balance on `chain_id` can pay a setup broadcaster there with,
+    /// the one selected, and its candidates. `preferred` is selected while `current` has no
+    /// eligible broadcaster.
     pub(super) fn setup_fee_route(
         &self,
+        chain_id: u64,
         preferred: Address,
         current: Option<Address>,
         allow_out_of_range: bool,
@@ -3249,7 +3539,6 @@ impl PrivateSwapsView {
             return (Vec::new(), None, Vec::new());
         };
         let root = root_entity.read(cx);
-        let chain_id = self.session.chain_id;
         let Some(profile) = root
             .effective_chain_configs
             .get(chain_id)
@@ -3288,9 +3577,57 @@ impl PrivateSwapsView {
             )
         });
         let candidates = token
-            .map(|token| self.broadcaster_candidates(token, allow_out_of_range, favorites_only, cx))
+            .map(|token| {
+                self.broadcaster_candidates(chain_id, token, allow_out_of_range, favorites_only, cx)
+            })
             .unwrap_or_default();
         (options, token, candidates)
+    }
+
+    /// The network of the stealth account `side` sets up for the form's swap. The destination
+    /// side has one while a private Bridge delivery's destination account needs its setup.
+    fn setup_chain(&self, form: &SwapForm, side: SetupSide) -> Option<u64> {
+        match side {
+            SetupSide::Origin => Some(self.session.chain_id),
+            SetupSide::Destination => self.destination_setup_chain(form),
+        }
+    }
+
+    /// The network of a private Bridge delivery's destination stealth account, while the
+    /// form's review sets that account up: for a new swap, and for a started one whose
+    /// destination setup wasn't sent or failed. A setup that is on its way or confirmed isn't
+    /// sent again here. While the network isn't loaded, its records can't tell, so the setup
+    /// stays part of the review until they are read.
+    fn destination_setup_chain(&self, form: &SwapForm) -> Option<u64> {
+        let network = form.network.filter(|_| form.private_bridge())?;
+        let progress = form
+            .operation
+            .filter(|_| !form.reuse_account)
+            .and_then(|operation| self.record(operation))
+            .and_then(|record| Some((record, swap_private_delivery(record)?)))
+            .map(|(record, delivery)| self.destination_setup_progress(record, delivery));
+        match progress {
+            Some(
+                SwapSetupProgress::Submitting
+                | SwapSetupProgress::Pending
+                | SwapSetupProgress::Done,
+            ) => None,
+            Some(
+                SwapSetupProgress::NotSent
+                | SwapSetupProgress::NetworkLoading
+                | SwapSetupProgress::Failed,
+            )
+            | None => Some(network),
+        }
+    }
+
+    /// A started private Bridge swap's destination stealth account, which its own account's
+    /// record links to.
+    fn destination_operation(&self, form: &SwapForm) -> Option<ExecutorOperationId> {
+        form.operation
+            .filter(|_| !form.reuse_account)
+            .and_then(|operation| self.record(operation))
+            .and_then(ExecutorRecord::destination_operation)
     }
 
     fn refresh_setup_route(&mut self, cx: &mut Context<'_, Self>) {
@@ -3299,22 +3636,54 @@ impl PrivateSwapsView {
         }
     }
 
-    /// Read the setup route again. `None` when the form has no setup route to update;
-    /// otherwise whether anything the form or the broadcaster picker shows changed.
+    /// Read the setup routes again: the swap's own network's, and a private Bridge swap's
+    /// destination network's. `None` when the form has no setup route to update; otherwise
+    /// whether anything the form or the broadcaster picker shows changed.
     fn update_setup_route(&mut self, cx: &mut Context<'_, Self>) -> Option<bool> {
         let form = self.form.as_ref()?;
         if !matches!(self.form_mode(form), FormMode::Setup { .. }) || self.busy() {
             return None;
         }
+        let destination = self.destination_setup_chain(form);
+        let mut changed = self.update_route(SetupSide::Origin, self.session.chain_id, cx)?;
+        if let Some(chain_id) = destination {
+            changed |= self.update_route(SetupSide::Destination, chain_id, cx)?;
+        } else {
+            // Another delivery leaves no destination account to set up.
+            let route = &mut self.form.as_mut()?.destination_route;
+            if route.is_used() {
+                *route = SetupRoute::default();
+                changed = true;
+            }
+        }
+        Some(changed)
+    }
+
+    /// Read `side`'s setup route on `chain_id` again, and estimate its fee when one is due.
+    /// Whether anything the form or the broadcaster picker shows changed.
+    fn update_route(
+        &mut self,
+        side: SetupSide,
+        chain_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<bool> {
+        let form = self.form.as_ref()?;
+        let route = form.setup_route(side);
+        // Each setup is paid from the private balance on its own network: by default in the
+        // token sold there, and on the destination network in the token delivered.
+        let preferred = match side {
+            SetupSide::Origin => form.sell,
+            SetupSide::Destination => form.buy.unwrap_or_default(),
+        };
         let (options, token, candidates) = self.setup_fee_route(
-            form.sell,
-            form.route.fee_token,
-            form.route.allow_out_of_range,
-            form.route.favorites_only,
+            chain_id,
+            preferred,
+            route.fee_token,
+            route.allow_out_of_range,
+            route.favorites_only,
             cx,
         );
-        let form = self.form.as_mut()?;
-        let route = &mut form.route;
+        let route = self.form.as_mut()?.setup_route_mut(side);
         let quote_changed = route.estimate_candidate.as_ref().is_some_and(|quoted| {
             !candidates
                 .iter()
@@ -3343,23 +3712,26 @@ impl PrivateSwapsView {
                     .next_estimate
                     .is_some_and(|next| Instant::now() >= next));
         if due {
-            self.schedule_setup_estimate(cx);
+            self.schedule_setup_estimate(side, cx);
         }
         Some(quote_changed || token_changed || choice_changed || shown_changed || due)
     }
 
-    fn schedule_setup_estimate(&mut self, cx: &mut Context<'_, Self>) {
+    /// Estimate `side`'s setup fee with its network's own session and owner, which read the
+    /// private balance the fee is paid from.
+    fn schedule_setup_estimate(&mut self, side: SetupSide, cx: &mut Context<'_, Self>) {
         let Some(root) = self.root.upgrade() else {
             return;
         };
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        if form.route.candidates.is_empty() {
+        let route = form.setup_route(side);
+        if route.candidates.is_empty() {
             return;
         }
         let selection =
-            form.route
+            route
                 .selected
                 .as_ref()
                 .map_or(PublicBroadcasterSelection::Random, |address| {
@@ -3370,23 +3742,37 @@ impl PrivateSwapsView {
         let candidate = {
             let root = root.read(cx);
             wallet_ops::select_public_broadcaster_with_policy_and_trust(
-                &form.route.candidates,
+                &route.candidates,
                 &selection,
-                root.public_broadcaster_fee_policy(form.route.allow_out_of_range),
-                &root.public_broadcaster_trust_filter(form.route.favorites_only),
+                root.public_broadcaster_fee_policy(route.allow_out_of_range),
+                &root.public_broadcaster_trust_filter(route.favorites_only),
             )
         };
         let Ok(candidate) = candidate else {
             return;
         };
-        let owner = Arc::clone(&self.owner);
-        let session = Arc::clone(&self.session);
+        // A setup sent again is estimated for its reserved account, from its own fee notes.
+        let (session, owner, operation) = match side {
+            SetupSide::Origin => (
+                Arc::clone(&self.session),
+                Arc::clone(&self.owner),
+                form.operation,
+            ),
+            SetupSide::Destination => {
+                let Some((session, owner)) = self
+                    .destination_setup_chain(form)
+                    .and_then(|chain_id| self.destination_owner(chain_id, cx))
+                else {
+                    return;
+                };
+                (session, owner, self.destination_operation(form))
+            }
+        };
         let runtime = self.runtime.clone();
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let operation = form.operation;
-        let route = &mut form.route;
+        let route = form.setup_route_mut(side);
         route.estimate_revision = route.estimate_revision.wrapping_add(1);
         let revision = route.estimate_revision;
         route.estimate_candidate = Some(candidate.clone());
@@ -3406,7 +3792,7 @@ impl PrivateSwapsView {
                 let Some(form) = view.form.as_mut() else {
                     return;
                 };
-                let route = &mut form.route;
+                let route = form.setup_route_mut(side);
                 if route.estimate_revision != revision {
                     return;
                 }
@@ -3429,20 +3815,20 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// The broadcaster picker's view of the setup route.
+    /// The broadcaster picker's view of the setup route it was opened for.
     pub(in crate::root) fn setup_picker_context(&self) -> Option<RecoveryPickerContext> {
         let form = self.form.as_ref()?;
+        let route = form.setup_route(form.broadcaster_side);
         Some(RecoveryPickerContext {
-            chain_id: self.session.chain_id,
-            token: form.route.fee_token?,
-            choice: form.route.choice(),
-            candidates: form.route.candidates.clone(),
-            allow_out_of_range: form.route.allow_out_of_range,
-            favorites_only: form.route.favorites_only,
+            chain_id: self.setup_chain(form, form.broadcaster_side)?,
+            token: route.fee_token?,
+            choice: route.choice(),
+            candidates: route.candidates.clone(),
+            allow_out_of_range: route.allow_out_of_range,
+            favorites_only: route.favorites_only,
             busy: self.busy(),
-            estimating: form.route.estimate_task.is_some(),
-            fee_context: form
-                .route
+            estimating: route.estimate_task.is_some(),
+            fee_context: route
                 .estimate
                 .as_ref()
                 .map(BroadcasterPickerFeeEstimateContext::from),
@@ -3460,8 +3846,10 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        form.route.allow_out_of_range = checked;
-        form.route.invalidate_estimate();
+        let side = form.broadcaster_side;
+        let route = form.setup_route_mut(side);
+        route.allow_out_of_range = checked;
+        route.invalidate_estimate();
         self.refresh_setup_route(cx);
     }
 
@@ -3478,18 +3866,19 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        if !form
-            .route
+        let side = form.broadcaster_side;
+        let route = form.setup_route_mut(side);
+        if !route
             .candidates
             .iter()
             .any(|candidate| candidate.railgun_address == address)
         {
             return;
         }
-        form.route.selected = Some(address);
-        form.route.invalidate_estimate();
+        route.selected = Some(address);
+        route.invalidate_estimate();
         let input = form.amount_input.clone();
-        self.schedule_setup_estimate(cx);
+        self.schedule_setup_estimate(side, cx);
         input.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -3511,8 +3900,9 @@ impl PrivateSwapsView {
                 return;
             }
         };
+        let fees = approval.fees(self.session.chain_id);
         let summary = self
-            .swap_summary(&review, Some(&approval), None, None, cx)
+            .swap_summary(&review, Some(&fees), None, None, cx)
             .requiring_explicit_review();
         self.request_authorization(SwapAction::Setup(Box::new(approval)), summary, window, cx);
     }
@@ -3552,9 +3942,24 @@ impl PrivateSwapsView {
             return Err("The broadcaster quote changed. Wait for a new estimate.".into());
         }
         let waku = waku.ok_or("Wait for the broadcaster network connection, then try again.")?;
-        let approval = review
+        let mut approval = review
             .approval(review.suggested_private_minimum(), form.price_acknowledged)
             .map_err(|error| format!("{error:#}"))?;
+        let destination = match self.destination_setup_chain(form) {
+            Some(chain_id) => Some(self.destination_setup(form, chain_id)?),
+            None => None,
+        };
+        // A private Bridge swap's approval binds its destination setup's fee limit: this
+        // review's, or the one saved with a setup that isn't sent again.
+        approval.bounds.destination_setup_fee = match &destination {
+            Some(destination) => Some(destination.maximum_private_fee),
+            None => form
+                .operation
+                .filter(|_| form.private_bridge())
+                .and_then(|operation| self.record(operation))
+                .and_then(ExecutorRecord::swap_approval)
+                .and_then(|saved| saved.bounds.destination_setup_fee),
+        };
         let operation = match form.operation {
             Some(operation) => operation,
             None => ExecutorOperationId::random().map_err(|error| error.to_string())?,
@@ -3568,6 +3973,7 @@ impl PrivateSwapsView {
                 candidate: candidate.clone(),
                 maximum_private_fee: default_public_broadcaster_fee_limit(estimate.fee_amount()),
                 waku,
+                destination,
                 approval,
                 orderbook: form.orderbook.clone(),
             },
@@ -3575,17 +3981,89 @@ impl PrivateSwapsView {
         ))
     }
 
+    /// The setup of the destination stealth account on `chain_id` as the form's destination
+    /// route estimates it: for a new account, or the started swap's reserved one.
+    fn destination_setup(
+        &self,
+        form: &SwapForm,
+        chain_id: u64,
+    ) -> Result<DestinationSetup, String> {
+        let network = network_name(chain_id);
+        let route = &form.destination_route;
+        let estimate = route
+            .estimate
+            .as_ref()
+            .ok_or_else(|| format!("Wait for the setup fee estimate on {network}."))?;
+        let candidate = estimate.broadcaster();
+        if !route
+            .candidates
+            .iter()
+            .any(|current| same_offer(current, candidate))
+        {
+            return Err(format!(
+                "The broadcaster quote on {network} changed. Wait for a new estimate."
+            ));
+        }
+        let operation = match self.destination_operation(form) {
+            Some(operation) => operation,
+            None => ExecutorOperationId::random().map_err(|error| error.to_string())?,
+        };
+        Ok(DestinationSetup {
+            chain_id,
+            operation,
+            candidate: candidate.clone(),
+            maximum_private_fee: default_public_broadcaster_fee_limit(estimate.fee_amount()),
+        })
+    }
+
     /// Reserve the stealth account, check that the approved amount still fits one order,
     /// persist the approval, and hand the setup to the broadcaster. Nothing is paid when the
     /// amount no longer fits. The order follows once the setup is confirmed.
+    ///
+    /// A private Bridge swap also sets up its destination stealth account, through that
+    /// network's session and owner with `destination_authorization`. A new swap reserves the
+    /// destination account first, so the saved approval names it, and both setups are sent at
+    /// the same time. Each setup's result is reported by itself.
     pub(super) fn submit_setup(
         &mut self,
         approval: SetupApproval,
         authorization: DesktopPrivateSpendAuthorization,
+        destination_authorization: Option<DesktopPrivateSpendAuthorization>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let operation = approval.operation;
+        let destination = match approval.destination.clone() {
+            Some(setup) => {
+                let submission =
+                    self.ready_destination(setup.chain_id, cx)
+                        .and_then(|(session, owner)| {
+                            Ok(DestinationSubmission {
+                                setup,
+                                session,
+                                owner,
+                                authorization: destination_authorization
+                                    .ok_or(DESTINATION_AUTHORIZATION_MISSING)?,
+                            })
+                        });
+                match submission {
+                    Ok(submission) => Some(submission),
+                    Err(error) => {
+                        self.fail(operation, error.clone());
+                        // A new swap has no record yet, so its form says why nothing was sent.
+                        if let Some(form) = self.form.as_mut() {
+                            form.set_error(error);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        let networks = destination
+            .as_ref()
+            .map(|destination| (self.chain_label(), network_name(destination.setup.chain_id)));
         let (progress, receiver) =
             tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
         let mut changes = receiver.clone();
@@ -3611,6 +4089,11 @@ impl PrivateSwapsView {
         tracking.cursor = None;
         tracking.setup_read_at = None;
         tracking.located_at = None;
+        if destination.is_some() {
+            tracking.destination_setup = None;
+            tracking.destination_cursor = None;
+            tracking.destination_read_at = None;
+        }
         tracking.error = None;
         tracking.setup_stage = Some(receiver);
         tracking.setup_watch = Some(watch);
@@ -3623,25 +4106,75 @@ impl PrivateSwapsView {
             operation,
             SwapJobKind::Setup,
             async move {
-                let prepared = if approval.resume {
-                    Box::pin(owner.resume_swap_setup(operation, approval.candidate, &authorization))
-                        .await?
-                } else {
+                let SetupApproval {
+                    resume,
+                    sell,
+                    buy,
+                    candidate,
+                    maximum_private_fee,
+                    waku,
+                    approval: mut saved,
+                    ..
+                } = approval;
+                // A destination account that can't be reserved again doesn't hold back the
+                // swap's own setup.
+                let (prepared, prepared_destination) = match &destination {
+                    Some(destination) if resume => (
+                        Box::pin(owner.resume_swap_setup(operation, candidate, &authorization))
+                            .await?,
+                        Some(
+                            Box::pin(destination.owner.resume_swap_setup(
+                                destination.setup.operation,
+                                destination.setup.candidate.clone(),
+                                &destination.authorization,
+                            ))
+                            .await,
+                        ),
+                    ),
+                    Some(destination) => {
+                        // The new record holds the approval from its first write, with the
+                        // destination account as its delivery's receiver.
+                        let prepared = Box::pin(prepare_private_bridge_setup(
+                            &owner,
+                            &destination.owner,
+                            PrivateBridgeSetupPreparation {
+                                operation,
+                                destination_operation: destination.setup.operation,
+                                candidate,
+                                destination_candidate: destination.setup.candidate.clone(),
+                                approval: saved,
+                                authorization: &authorization,
+                                destination_authorization: &destination.authorization,
+                            },
+                        ))
+                        .await?;
+                        saved = prepared.approval;
+                        (prepared.origin, Some(Ok(prepared.destination)))
+                    }
+                    None if resume => (
+                        Box::pin(owner.resume_swap_setup(operation, candidate, &authorization))
+                            .await?,
+                        None,
+                    ),
                     // The new record holds the approval from its first write.
-                    Box::pin(owner.prepare_swap_setup(
-                        operation,
-                        approval.candidate,
-                        approval.approval.clone(),
-                        &authorization,
-                    ))
-                    .await?
+                    None => (
+                        Box::pin(owner.prepare_swap_setup(
+                            operation,
+                            candidate,
+                            saved.clone(),
+                            None,
+                            &authorization,
+                        ))
+                        .await?,
+                        None,
+                    ),
                 };
                 let reserved = SwapExecutor::reserved(&prepared)?;
                 let request = SwapAmountRequest {
-                    sell_token: approval.sell,
-                    buy_token: approval.buy,
-                    amount: approval.approval.bounds.spend_amount(),
-                    delivery: approval.approval.delivery,
+                    sell_token: sell,
+                    buy_token: buy,
+                    amount: saved.bounds.spend_amount(),
+                    delivery: saved.delivery,
                     byte_budget,
                 };
                 let planning_owner = Arc::clone(&owner);
@@ -3656,32 +4189,82 @@ impl PrivateSwapsView {
                 }
                 // A resumed setup's record keeps its earlier approval until the user authorized
                 // this review.
-                if approval.resume {
-                    owner.record_swap_approval(operation, approval.approval)?;
+                if resume {
+                    owner.record_swap_approval(operation, saved)?;
                 }
-                let outcome = Box::pin(owner.submit_swap_setup(
-                    &prepared,
-                    SwapSetupRequest {
-                        maximum_private_fee: approval.maximum_private_fee,
-                        session,
-                        authorization,
-                        waku: approval.waku,
-                        verify_proof: true,
-                        progress_tx: Some(progress),
-                        response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-                        republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
-                    },
-                ))
-                .await?;
-                Ok(SetupOutcome::Sent(outcome.result))
+                let request = SwapSetupRequest {
+                    maximum_private_fee,
+                    session,
+                    authorization,
+                    waku: Arc::clone(&waku),
+                    verify_proof: true,
+                    progress_tx: Some(progress),
+                    response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+                    republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                };
+                let (origin, destination) = match (destination, prepared_destination) {
+                    (Some(destination), Some(Ok(prepared_destination))) => {
+                        let destination_request = SwapSetupRequest {
+                            maximum_private_fee: destination.setup.maximum_private_fee,
+                            session: destination.session,
+                            authorization: destination.authorization,
+                            waku,
+                            verify_proof: true,
+                            progress_tx: None,
+                            response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+                            republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                        };
+                        let (origin, sent) = Box::pin(submit_private_bridge_setups(
+                            (owner.as_ref(), &prepared, request),
+                            (
+                                destination.owner.as_ref(),
+                                &prepared_destination,
+                                destination_request,
+                            ),
+                        ))
+                        .await;
+                        (origin, Some(sent))
+                    }
+                    (_, Some(Err(error))) => (
+                        Box::pin(owner.submit_swap_setup(&prepared, request)).await,
+                        Some(Err(error)),
+                    ),
+                    _ => (
+                        Box::pin(owner.submit_swap_setup(&prepared, request)).await,
+                        None,
+                    ),
+                };
+                Ok(SetupOutcome::Sent {
+                    origin: origin.map(|outcome| outcome.result),
+                    destination: destination.map(|sent| sent.map(|outcome| outcome.result)),
+                })
             },
             move |this, outcome, window, cx| {
                 let tracking = this.tracking.entry(operation).or_default();
                 tracking.setup_stage = None;
                 tracking.setup_watch = None;
                 match outcome {
-                    SetupOutcome::Sent(result) => {
-                        tracking.error = broadcaster_result_problem(&result, "setup");
+                    SetupOutcome::Sent {
+                        origin,
+                        destination,
+                    } => {
+                        let failed = origin.is_err();
+                        let origin = match origin {
+                            Ok(result) => broadcaster_result_problem(&result, "setup"),
+                            Err(error) => Some(this.job_error(&error, cx)),
+                        };
+                        let destination = destination.and_then(|sent| match sent {
+                            Ok(result) => broadcaster_result_problem(&result, "setup"),
+                            Err(error) => Some(format!("{error:#}")),
+                        });
+                        let problem = setup_problems(origin, destination, networks.as_ref());
+                        // A setup that wasn't handed off fails as before, also in the form.
+                        match problem {
+                            Some(problem) if failed => this.fail(operation, problem),
+                            problem => {
+                                this.tracking.entry(operation).or_default().error = problem;
+                            }
+                        }
                     }
                     SetupOutcome::TooLarge => {
                         tracking.auto_place = false;
@@ -3701,6 +4284,262 @@ impl PrivateSwapsView {
         );
         // The detail follows the setup and then the order it places.
         self.show_detail(operation, window, cx);
+    }
+
+    /// Send only the destination stealth account's setup again for the private Bridge swap
+    /// `operation`, whose own account is set up: estimate its fee afresh through the
+    /// destination network's owner, then open its review.
+    pub(super) fn retry_destination_setup(
+        &mut self,
+        operation: ExecutorOperationId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        let Some((delivery, destination_operation)) = self.record(operation).and_then(|record| {
+            Some((
+                swap_private_delivery(record)?,
+                record.destination_operation()?,
+            ))
+        }) else {
+            return;
+        };
+        let chain_id = delivery.destination_chain;
+        let (session, owner) = match self.ready_destination(chain_id, cx) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.fail(operation, error);
+                cx.notify();
+                return;
+            }
+        };
+        let (_, token, candidates) =
+            self.setup_fee_route(chain_id, delivery.destination_token, None, false, false, cx);
+        let candidate = token.and_then(|_| {
+            let root = self.root.upgrade()?;
+            let root = root.read(cx);
+            wallet_ops::select_public_broadcaster_with_policy_and_trust(
+                &candidates,
+                &PublicBroadcasterSelection::Random,
+                root.public_broadcaster_fee_policy(false),
+                &root.public_broadcaster_trust_filter(false),
+            )
+            .ok()
+        });
+        let Some(candidate) = candidate else {
+            self.fail(
+                operation,
+                format!(
+                    "No compatible broadcaster on {0} accepts a private fee token you hold there. Add private funds on {0}, or try again later.",
+                    network_name(chain_id)
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        self.start_job(
+            operation,
+            SwapJobKind::SetupQuote,
+            async move {
+                Box::pin(owner.estimate_swap_setup_fee(
+                    &session,
+                    Some(destination_operation),
+                    candidate,
+                ))
+                .await
+            },
+            move |this, estimate, window, cx| {
+                this.review_destination_setup(
+                    operation,
+                    chain_id,
+                    destination_operation,
+                    &estimate,
+                    window,
+                    cx,
+                );
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The review of a destination setup sent again by itself, with its fresh fee `estimate`.
+    /// The fee limit approved with the swap binds it: a higher one is named, and approving the
+    /// review saves the swap's approval with the new limit before the setup is sent.
+    fn review_destination_setup(
+        &mut self,
+        operation: ExecutorOperationId,
+        chain_id: u64,
+        destination_operation: ExecutorOperationId,
+        estimate: &ExecutorRecoveryFeeEstimate,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(saved) = self
+            .record(operation)
+            .filter(|record| record.swap().is_none())
+            .and_then(ExecutorRecord::swap_approval)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(waku) = self.broadcaster_network(cx) else {
+            self.fail(
+                operation,
+                "Wait for the broadcaster network connection, then try again.".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let candidate = estimate.broadcaster().clone();
+        let maximum = default_public_broadcaster_fee_limit(estimate.fee_amount());
+        let approved = saved.bounds.destination_setup_fee;
+        let raised = approved.is_none_or(|approved| maximum > approved);
+        let network = network_name(chain_id);
+        let fee = SetupFee {
+            chain_id,
+            token: candidate.token,
+            maximum,
+            broadcaster: broadcaster_candidate_label(&candidate),
+        };
+        let amount = |amount: U256| {
+            let root = self.root.upgrade();
+            format_token_amount_ceiling_for_display(
+                chain_id,
+                candidate.token,
+                amount,
+                root.as_ref()
+                    .map(|root| &root.read(cx).effective_token_registry),
+            )
+        };
+        let mut rows = vec![
+            self.setup_fee_row(std::slice::from_ref(&fee), cx)
+                .with_amount_change(approved, maximum, true, amount),
+        ];
+        if let SwapDelivery::Bridge(delivery) = saved.delivery {
+            rows.push(
+                SpendAuthorizationSummaryRow::new(
+                    "Stealth account",
+                    delivery.receiver.to_checksum(None),
+                )
+                .with_shortened_copyable(),
+            );
+        }
+        let warnings = match approved.filter(|_| raised) {
+            Some(approved) => vec![Arc::from(format!(
+                "The setup fee on {network} is above the {} you approved. Approving this review saves the new limit.",
+                amount(approved)
+            ))],
+            None => Vec::new(),
+        };
+        let summary = SpendAuthorizationSummary::new(
+            "Set up stealth account",
+            format!(
+                "The setup on {} is confirmed and isn't paid again. The swap's order is placed once this setup is confirmed too.",
+                self.chain_label()
+            ),
+            rows,
+        )
+        .with_title_chip(network)
+        .with_compact_rows()
+        .with_confirm_label("Create stealth account")
+        .with_warnings(warnings)
+        .requiring_explicit_review();
+        let retry = DestinationRetry {
+            operation,
+            setup: DestinationSetup {
+                chain_id,
+                operation: destination_operation,
+                candidate,
+                maximum_private_fee: maximum,
+            },
+            waku,
+            approval: raised.then(|| {
+                let mut approval = saved;
+                approval.bounds.destination_setup_fee = Some(maximum);
+                approval
+            }),
+        };
+        self.request_authorization(
+            SwapAction::DestinationSetup(Box::new(retry)),
+            summary,
+            window,
+            cx,
+        );
+    }
+
+    /// Hand the approved destination setup to its broadcaster through the destination
+    /// network's session and owner. The swap's own setup stays as it is, and the order follows
+    /// once this one is confirmed.
+    pub(super) fn submit_destination_setup(
+        &mut self,
+        retry: DestinationRetry,
+        authorization: DesktopPrivateSpendAuthorization,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let operation = retry.operation;
+        let (session, destination_owner) = match self.ready_destination(retry.setup.chain_id, cx) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.fail(operation, error);
+                cx.notify();
+                return;
+            }
+        };
+        let network = network_name(retry.setup.chain_id);
+        // The new attempt is observed from its own start.
+        let tracking = self.tracking.entry(operation).or_default();
+        tracking.destination_setup = None;
+        tracking.destination_cursor = None;
+        tracking.destination_read_at = None;
+        tracking.error = None;
+        tracking.auto_place = true;
+        let owner = Arc::clone(&self.owner);
+        self.start_job(
+            operation,
+            SwapJobKind::Setup,
+            async move {
+                // A fee above the approved limit was reviewed, and its approval is saved first.
+                if let Some(approval) = retry.approval {
+                    owner.record_swap_approval(operation, approval)?;
+                }
+                let prepared = Box::pin(destination_owner.resume_swap_setup(
+                    retry.setup.operation,
+                    retry.setup.candidate,
+                    &authorization,
+                ))
+                .await?;
+                let outcome = Box::pin(destination_owner.submit_swap_setup(
+                    &prepared,
+                    SwapSetupRequest {
+                        maximum_private_fee: retry.setup.maximum_private_fee,
+                        session,
+                        authorization,
+                        waku: retry.waku,
+                        verify_proof: true,
+                        progress_tx: None,
+                        response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+                        republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                    },
+                ))
+                .await?;
+                Ok(outcome.result)
+            },
+            move |this, result, window, cx| {
+                this.tracking.entry(operation).or_default().error =
+                    broadcaster_result_problem(&result, "setup")
+                        .map(|problem| format!("{network}: {problem}"));
+                if !window.has_active_dialog(cx) {
+                    this.show_detail(operation, window, cx);
+                }
+                cx.notify();
+            },
+            window,
+            cx,
+        );
     }
 
     // Quote and order
@@ -4125,11 +4964,14 @@ impl PrivateSwapsView {
                 .get(&operation)
                 .and_then(|tracking| tracking.orderbook.clone())
         });
-        let problem = form.review_problem(review).or_else(|| {
-            orderbook
-                .is_none()
-                .then_some("The swap's orderbook route isn't ready. Refresh the quote.".into())
-        });
+        let problem = form
+            .review_problem(review)
+            .or_else(|| self.destination_order_problem(form).map(Into::into))
+            .or_else(|| {
+                orderbook
+                    .is_none()
+                    .then_some("The swap's orderbook route isn't ready. Refresh the quote.".into())
+            });
         let (Some(orderbook), None) = (orderbook, &problem) else {
             if let Some(form) = self.form.as_mut() {
                 form.error = problem.map(|problem| problem.to_string());
@@ -4166,6 +5008,27 @@ impl PrivateSwapsView {
         self.request_authorization(SwapAction::Order(Box::new(approval)), summary, window, cx);
     }
 
+    /// Why a private Bridge swap's order can't be reviewed yet: its stealth account on the
+    /// destination network isn't confirmed as set up, which signing the order needs. `None`
+    /// for any other swap.
+    fn destination_order_problem(&self, form: &SwapForm) -> Option<String> {
+        let record = self.record(form.operation.filter(|_| !form.reuse_account)?)?;
+        let delivery = swap_private_delivery(record).filter(|_| form.private_bridge())?;
+        let network = network_name(delivery.destination_chain);
+        match self.destination_setup_progress(record, delivery) {
+            SwapSetupProgress::Done => None,
+            SwapSetupProgress::NotSent | SwapSetupProgress::Failed => Some(format!(
+                "The stealth account on {network} isn't set up. Retry its setup from the swap's details first."
+            )),
+            SwapSetupProgress::NetworkLoading => Some(format!(
+                "Wait for {network} to load, so the stealth account there can be checked."
+            )),
+            SwapSetupProgress::Submitting | SwapSetupProgress::Pending => Some(format!(
+                "Wait for the stealth account's setup on {network} to be confirmed."
+            )),
+        }
+    }
+
     /// How `review` differs from the approval saved with the swap's setup, while that approval
     /// still binds the first order.
     fn first_order_change(
@@ -4196,13 +5059,14 @@ impl PrivateSwapsView {
         .then_some(&approval.bounds)
     }
 
-    /// The single review of a swap. With `setup`, a new swap's setup and its order, placed once
-    /// the setup is confirmed; without, an order for a stealth account that is set up. With
-    /// `approved`, the amounts that differ from those bounds show their difference.
+    /// The single review of a swap. With `setup`, the fees of a new swap's setup, which the
+    /// review approves with its order, placed once the setup is confirmed; without, an order
+    /// for a stealth account that is set up. With `approved`, the amounts that differ from
+    /// those bounds show their difference.
     fn swap_summary(
         &self,
         review: &SwapReview,
-        setup: Option<&SetupApproval>,
+        setup: Option<&[SetupFee]>,
         change: Option<SwapReviewChange>,
         approved: Option<&SwapApprovedBounds>,
         cx: &App,
@@ -4213,28 +5077,8 @@ impl PrivateSwapsView {
         let slippage = format_bps_percent(u64::from(review.slippage_bps()));
         let chain = self.chain_label();
         let mut rows = Vec::new();
-        if let Some(setup) = setup {
-            let root = self.root.upgrade();
-            let maximum_fee = format_token_amount_ceiling_for_display(
-                self.session.chain_id,
-                setup.candidate.token,
-                setup.maximum_private_fee,
-                root.as_ref()
-                    .map(|root| &root.read(cx).effective_token_registry),
-            );
-            rows.push(
-                SpendAuthorizationSummaryRow::new(
-                    "Pay now",
-                    format!("up to {maximum_fee} · not refunded"),
-                )
-                .with_hint(SpendAuthorizationHint::new(
-                    "Setup fee",
-                    [format!(
-                        "Paid to broadcaster {} from your private balance to create the stealth account. Not refunded if the order doesn't fill.",
-                        broadcaster_candidate_label(&setup.candidate)
-                    )],
-                )),
-            );
+        if let Some(fees) = setup {
+            rows.push(self.setup_fee_row(fees, cx));
         }
         // A Bridge order buys exactly this and deposits it with its provider.
         let minimum = self.token_amount(buy, review.suggested_private_minimum(), cx);
@@ -4242,7 +5086,30 @@ impl PrivateSwapsView {
             SwapDelivery::Bridge(delivery) => Some(delivery),
             _ => None,
         };
+        let private = bridge.filter(BridgeDelivery::is_private);
         let receive = match bridge.zip(review.bridge()) {
+            // The deposit fixes the destination minimum, less the shield fee there. Better
+            // execution leaves surplus on the source chain, shown in the Returned row.
+            Some((delivery, quote)) if delivery.is_private() => self
+                .bridge_receive_card(delivery, None, quote.received_minimum(), cx)
+                .with_amount_change(
+                    approved.and_then(|approved| {
+                        Some(private_delivery_credit(
+                            approved.destination_minimum?,
+                            approved,
+                        ))
+                    }),
+                    quote.received_minimum(),
+                    false,
+                    |amount| {
+                        self.network_token_amount(
+                            delivery.destination_chain,
+                            delivery.destination_token,
+                            amount,
+                            cx,
+                        )
+                    },
+                ),
             Some((delivery, quote)) => self
                 .bridge_receive_card(
                     delivery,
@@ -4323,6 +5190,9 @@ impl PrivateSwapsView {
         if let Some(delivery) = bridge {
             rows.push(self.bridge_row(delivery, buy, Some(review), surplus.is_some(), cx));
         }
+        if let Some(delivery) = private {
+            rows.push(self.shield_failure_row(delivery, buy, cx));
+        }
         if plan.swap_executor().is_reused() {
             rows.push(
                 SpendAuthorizationSummaryRow::new(
@@ -4396,6 +5266,12 @@ impl PrivateSwapsView {
                 public.push(EXTERNAL_DELIVERY_DISCLOSURE.to_owned());
                 Some((receiver, self.token_symbol(buy, cx)))
             }
+            // The receiver is the swap's own stealth account on the destination network, so no
+            // account of the user's is named.
+            SwapDelivery::Bridge(delivery) if delivery.is_private() => {
+                public = self.private_bridge_disclosure(delivery);
+                None
+            }
             SwapDelivery::Bridge(delivery) => {
                 public.push(self.bridge_disclosure(delivery));
                 Some((
@@ -4417,7 +5293,15 @@ impl PrivateSwapsView {
             .as_ref()
             .and_then(|(receiver, received)| self.own_account_warning(*receiver, received, cx));
         let public_summary = match (&receiver, &own_account_warning) {
-            (None, _) => "the order and the notes it spends".to_owned(),
+            (None, _) => private.map_or_else(
+                || "the order and the notes it spends".to_owned(),
+                |delivery| {
+                    format!(
+                        "this swap, and that it shields on {}",
+                        network_name(delivery.destination_chain)
+                    )
+                },
+            ),
             (Some((receiver, _)), Some(_)) => format!(
                 "this swap, and {} as its receiver",
                 spend_authorization_recipient_display(&receiver.to_checksum(None))
@@ -4425,10 +5309,13 @@ impl PrivateSwapsView {
             (Some(_), None) => "the order, the receiver and the amount".to_owned(),
         };
         let public = SpendAuthorizationHint::new("What becomes public", public);
-        let (title, confirm_label) = if setup.is_some() {
-            ("Set up stealth account and swap", "Create stealth account")
-        } else {
-            ("Private swap", "Swap")
+        let (title, confirm_label) = match setup {
+            Some([_]) => ("Set up stealth account and swap", "Create stealth account"),
+            Some(_) => (
+                "Set up stealth accounts and swap",
+                "Create stealth accounts",
+            ),
+            None => ("Private swap", "Swap"),
         };
         let summary = SpendAuthorizationSummary::new(title, "", rows)
             .with_title_chip(chain)
@@ -4459,7 +5346,11 @@ impl PrivateSwapsView {
             )
             .with_confirm_label(confirm_label);
         let summary = if setup.is_some() {
-            summary.with_steps(1, SWAP_STEPS, swap_steps_hint())
+            summary.with_steps(
+                1,
+                swap_steps(private.is_some()),
+                swap_steps_hint(private.is_some()),
+            )
         } else {
             summary
         };
@@ -4495,6 +5386,108 @@ impl PrivateSwapsView {
                     "{label} becomes publicly linked to this swap: anyone can see that it received {received} from a Railgun spend."
                 )
             })
+    }
+
+    /// The review's Pay now row: each setup's fee limit in its own token, and behind the info
+    /// button, who is paid from which private balance.
+    fn setup_fee_row(&self, fees: &[SetupFee], cx: &App) -> SpendAuthorizationSummaryRow {
+        let root = self.root.upgrade();
+        let registry = root
+            .as_ref()
+            .map(|root| &root.read(cx).effective_token_registry);
+        let amount = |fee: &SetupFee| {
+            format_token_amount_ceiling_for_display(fee.chain_id, fee.token, fee.maximum, registry)
+        };
+        let total = fees.iter().map(amount).collect::<Vec<_>>().join(" + ");
+        let hint = match fees {
+            [fee] => SpendAuthorizationHint::new(
+                "Setup fee",
+                [format!(
+                    "Paid to broadcaster {} from your private balance to create the stealth account. Not refunded if the order doesn't fill.",
+                    fee.broadcaster
+                )],
+            ),
+            fees => SpendAuthorizationHint::new(
+                "Setup fees",
+                [
+                    format!(
+                        "Up to {}, each paid to a broadcaster from your private balance on that network.",
+                        fees.iter()
+                            .map(|fee| format!("{} on {}", amount(fee), network_name(fee.chain_id)))
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    ),
+                    "Neither is refunded if the order doesn't fill.".to_owned(),
+                ],
+            ),
+        };
+        SpendAuthorizationSummaryRow::new("Pay now", format!("up to {total} · not refunded"))
+            .with_hint(hint)
+    }
+
+    /// A private Bridge swap's "If the shield fails" row: the choice its delivery carries, and
+    /// behind the info button what that choice does with the `bought` token's deposit.
+    fn shield_failure_row(
+        &self,
+        delivery: BridgeDelivery,
+        bought: Address,
+        cx: &App,
+    ) -> SpendAuthorizationSummaryRow {
+        let (origin, destination) = (self.chain_label(), network_name(delivery.destination_chain));
+        let choice = delivery
+            .private
+            .map(|private| private.on_shield_failure)
+            .unwrap_or_default();
+        let label = shield_failure_label(choice, &origin, &destination);
+        let paragraphs = match choice {
+            BridgeShieldFailure::RefundOnOrigin => [
+                format!(
+                    "If the shield can't run, the delivery doesn't happen. Across returns the {} to the stealth account on {origin} after the deposit expires, usually within a few hours.",
+                    self.token_symbol(bought, cx)
+                ),
+                "Recovering it costs a shield fee and a broadcaster fee.".to_owned(),
+            ],
+            BridgeShieldFailure::KeepOnDestination => [
+                format!(
+                    "If the shield can't run, the {} stays in the stealth account on {destination}, publicly visible, until you recover it there.",
+                    self.network_token_symbol(
+                        delivery.destination_chain,
+                        delivery.destination_token,
+                        cx
+                    )
+                ),
+                format!(
+                    "Relayers price this option less precisely, so the deposit is more likely to go unfilled and be refunded on {origin}."
+                ),
+            ],
+        };
+        SpendAuthorizationSummaryRow::new("If the shield fails", label.clone())
+            .with_hint(SpendAuthorizationHint::new(label, paragraphs))
+    }
+
+    /// What a private Bridge swap makes public, for What becomes public: the deposit names the
+    /// destination stealth account and its shield, which links the two networks, while the
+    /// private address stays private. Keeping the tokens after a failed shield leaves them in
+    /// view.
+    fn private_bridge_disclosure(&self, delivery: BridgeDelivery) -> Vec<String> {
+        let (origin, destination) = (self.chain_label(), network_name(delivery.destination_chain));
+        let mut public = vec![
+            format!("The order, the notes it spends, and the Across deposit on {origin}."),
+            format!(
+                "The deposit names a stealth account on {destination} and the shield it runs. Anyone can see that this swap on {origin} became a shield of about this amount on {destination} at about this time."
+            ),
+            format!(
+                "Your private address and what you do with the funds on {destination} afterwards stay private."
+            ),
+        ];
+        if delivery.private.map(|private| private.on_shield_failure)
+            == Some(BridgeShieldFailure::KeepOnDestination)
+        {
+            public.push(format!(
+                "If the shield can't run, the tokens stay in the stealth account on {destination}, where they are publicly visible until you recover them."
+            ));
+        }
+        public
     }
 
     /// The review's Sell card.
@@ -4555,7 +5548,8 @@ impl PrivateSwapsView {
 
     /// A Bridge swap's Receive card, in its network's token. Across delivers exactly the
     /// `minimum`; 1Click at least the `minimum`, and about `expected` when it is known for this
-    /// order.
+    /// order. A private delivery shows the guaranteed credit after the shield fee there;
+    /// better execution does not increase the fixed Across deposit's destination amount.
     fn bridge_receive_card(
         &self,
         delivery: BridgeDelivery,
@@ -4585,21 +5579,26 @@ impl PrivateSwapsView {
                     }),
             )
         };
-        let card = match delivery.provider {
-            BridgeProvider::Across => card("exactly"),
-            BridgeProvider::NearIntents => {
-                let card = card("at least");
-                match expected {
-                    Some(expected) => card.with_emphasis(
-                        "about",
-                        self.network_bare_amount(network, token, expected, cx),
-                        "expected",
-                    ),
-                    None => card,
-                }
-            }
+        let estimate = |card: SpendAuthorizationCard, before: &str, after: &str| match expected {
+            Some(expected) => card.with_emphasis(
+                before,
+                self.network_bare_amount(network, token, expected, cx),
+                after,
+            ),
+            None => card,
         };
-        self.with_receiver_line(card, delivery.receiver, cx)
+        match (delivery.provider, delivery.is_private()) {
+            // The receiver is the swap's own stealth account there, which shields what it gets.
+            (BridgeProvider::Across, true) => card("at least").with_line("to your private balance"),
+            (BridgeProvider::Across, false) => {
+                self.with_receiver_line(card("exactly"), delivery.receiver, cx)
+            }
+            (BridgeProvider::NearIntents, _) => self.with_receiver_line(
+                estimate(card("at least"), "about", "expected"),
+                delivery.receiver,
+                cx,
+            ),
+        }
     }
 
     /// A Bridge swap's Bridge row: its provider and, in the full `review`, its fee, with the
@@ -4622,12 +5621,39 @@ impl PrivateSwapsView {
         let (value, mut paragraphs) = match delivery.provider {
             BridgeProvider::Across => {
                 let fee = fee.map(|fee| self.token_amount(bought, fee, cx));
-                let mut paragraphs = vec!["Relayers usually fill within a few minutes.".to_owned()];
-                if let Some(fee) = &fee {
-                    paragraphs.push(format!(
-                        "The {fee} fee covers relayer and LP fees and is already out of the amount you receive."
-                    ));
-                }
+                // A private delivery's allowance for the shield's gas on the destination
+                // network, without its symbol for the row and with it for the card.
+                let allowance = review
+                    .and_then(SwapReview::bridge)
+                    .and_then(|bridge| bridge.private)
+                    .map(|private| {
+                        let (network, token) =
+                            (delivery.destination_chain, delivery.destination_token);
+                        let allowance = private.delivery_allowance;
+                        (
+                            self.network_bare_amount(network, token, allowance, cx),
+                            self.network_token_amount(network, token, allowance, cx),
+                        )
+                    });
+                let mut paragraphs = if let (Some(fee), Some((_, allowance))) = (&fee, &allowance) {
+                    vec![
+                        format!(
+                            "Across charges {fee}. Shielding on delivery costs the relayer extra gas on {}, estimated at {allowance}.",
+                            network_name(delivery.destination_chain)
+                        ),
+                        "The estimate is checked against Across's own quote when the order is placed."
+                            .to_owned(),
+                    ]
+                } else {
+                    let mut paragraphs =
+                        vec!["Relayers usually fill within a few minutes.".to_owned()];
+                    if let Some(fee) = &fee {
+                        paragraphs.push(format!(
+                            "The {fee} fee covers relayer and LP fees and is already out of the amount you receive."
+                        ));
+                    }
+                    paragraphs
+                };
                 if !returned {
                     paragraphs.push(match delivery.surplus {
                         BridgeSurplus::KeepInAccount => {
@@ -4637,10 +5663,13 @@ impl PrivateSwapsView {
                     });
                 }
                 (
-                    fee.map_or_else(
-                        || provider.to_owned(),
-                        |fee| format!("{provider} · fee {fee}"),
-                    ),
+                    match (fee, allowance) {
+                        (Some(fee), Some((allowance, _))) => {
+                            format!("{provider} · {fee} + ≈ {allowance} delivery")
+                        }
+                        (Some(fee), None) => format!("{provider} · fee {fee}"),
+                        (None, _) => provider.to_owned(),
+                    },
                     paragraphs,
                 )
             }
@@ -4680,10 +5709,16 @@ impl PrivateSwapsView {
         if let Some(review) = review
             && delivery.provider == BridgeProvider::Across
         {
-            paragraphs.push(format!(
-                "If the deposit isn't filled before it expires, Across refunds the {} to the stealth account on {chain}, usually within a few hours. Recovering it to your private balance costs a shield fee and a broadcaster fee.",
-                self.token_amount(bought, review.suggested_private_minimum(), cx)
-            ));
+            paragraphs.push(if delivery.is_private() {
+                format!(
+                    "If the deposit isn't filled before it expires, Across refunds it to the stealth account on {chain}, usually within a few hours."
+                )
+            } else {
+                format!(
+                    "If the deposit isn't filled before it expires, Across refunds the {} to the stealth account on {chain}, usually within a few hours. Recovering it to your private balance costs a shield fee and a broadcaster fee.",
+                    self.token_amount(bought, review.suggested_private_minimum(), cx)
+                )
+            });
         }
         SpendAuthorizationSummaryRow::new("Bridge", value)
             .with_hint(SpendAuthorizationHint::new(provider, paragraphs))
@@ -4719,6 +5754,12 @@ impl PrivateSwapsView {
             return;
         };
         if self.stage(record) != SwapStage::Approved {
+            return;
+        }
+        // A private Bridge swap's order also waits for its destination account's setup.
+        if swap_private_delivery(record).is_some_and(|delivery| {
+            self.destination_setup_progress(record, delivery) != SwapSetupProgress::Done
+        }) {
             return;
         }
         let (Some((sell, buy)), Some(approval)) = (swap_tokens(record), record.swap_approval())
@@ -4906,6 +5947,14 @@ impl PrivateSwapsView {
             approval.review.bridge(),
             approval.destination_minimum,
         ) {
+            // The private balance gets the approved minimum less the shield fee there.
+            (Some(delivery), Some(quote), Some(minimum)) if delivery.is_private() => {
+                let approved = SwapBridgeQuote {
+                    destination_minimum: minimum,
+                    ..*quote
+                };
+                self.bridge_receive_card(delivery, None, approved.received_minimum(), cx)
+            }
             (Some(delivery), Some(quote), Some(minimum)) => {
                 // The estimate was quoted for the review's own deposit.
                 let expected = Some(quote.expected_output).filter(|expected| {
@@ -4916,9 +5965,11 @@ impl PrivateSwapsView {
             }
             _ => self.receive_card(&approval.review, approval.private_minimum, cx),
         };
+        let private = bridge.filter(BridgeDelivery::is_private);
         let rows = bridge
             .map(|delivery| self.bridge_row(delivery, buy, None, false, cx))
             .into_iter()
+            .chain(private.map(|delivery| self.shield_failure_row(delivery, buy, cx)))
             .collect();
         let checked = bridge.map_or_else(
             || {
@@ -4926,16 +5977,28 @@ impl PrivateSwapsView {
                     .to_owned()
             },
             |delivery| {
-                format!(
-                    "The order keeps the minimum you approved. Costs and the {} quote were checked again.",
-                    provider_name(delivery.provider)
-                )
+                if delivery.is_private() {
+                    format!(
+                        "The order keeps the minimum you approved. Costs, the {} quote and the shield fee on {} were checked again.",
+                        provider_name(delivery.provider),
+                        network_name(delivery.destination_chain)
+                    )
+                } else {
+                    format!(
+                        "The order keeps the minimum you approved. Costs and the {} quote were checked again.",
+                        provider_name(delivery.provider)
+                    )
+                }
             },
         );
         Ok(
             SpendAuthorizationSummary::new("Place swap order", checked, rows)
                 .with_title_chip(self.chain_label())
-                .with_steps(2, SWAP_STEPS, swap_steps_hint())
+                .with_steps(
+                    2,
+                    swap_steps(private.is_some()),
+                    swap_steps_hint(private.is_some()),
+                )
                 .with_cards(self.sell_card(sell, plan.amount(), cx), receive)
                 .with_compact_rows()
                 .with_details(
@@ -4956,10 +6019,14 @@ impl PrivateSwapsView {
         )
     }
 
+    /// Sign and submit the approved order. A private Bridge order also pre-signs its shield on
+    /// the destination network, through that network's session and owner with
+    /// `destination_authorization`.
     pub(super) fn submit_order(
         &mut self,
         approval: OrderApproval,
         authorization: DesktopPrivateSpendAuthorization,
+        destination_authorization: Option<DesktopPrivateSpendAuthorization>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -4968,6 +6035,29 @@ impl PrivateSwapsView {
         }
         let Some(root) = self.root.upgrade() else {
             return;
+        };
+        let destination = match approval.private_delivery() {
+            Some(delivery) => {
+                let context = self
+                    .ready_destination(delivery.destination_chain, cx)
+                    .and_then(|(session, owner)| {
+                        Ok(SwapDestinationContext {
+                            owner,
+                            session,
+                            authorization: destination_authorization
+                                .ok_or(DESTINATION_AUTHORIZATION_MISSING)?,
+                        })
+                    });
+                match context {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        self.fail(approval.operation, error);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            None => None,
         };
         let (anchors, tokens) = {
             let root = root.read(cx);
@@ -4980,14 +6070,20 @@ impl PrivateSwapsView {
         let plan = approval.review.plan();
         // A first order must match the approval saved with its setup. After a full review the
         // user authorized, the reviewed terms replace it; a confirm-only step never does.
-        let replacement = (approval.full_review
-            && self
-                .record(operation)
-                .is_some_and(|record| record.swap().is_none() && record.swap_approval().is_some()))
-        .then(|| {
+        let saved = self
+            .record(operation)
+            .filter(|record| record.swap().is_none())
+            .and_then(ExecutorRecord::swap_approval);
+        // The destination setup's fee limit was approved with that setup, and stays bound.
+        let destination_setup_fee = saved.and_then(|saved| saved.bounds.destination_setup_fee);
+        let replacement = (approval.full_review && saved.is_some()).then(|| {
             approval
                 .review
                 .approval(approval.private_minimum, approval.price_acknowledged)
+                .map(|mut replacement| {
+                    replacement.bounds.destination_setup_fee = destination_setup_fee;
+                    replacement
+                })
         });
         let pending = super::PendingSwapOrder {
             previous_order: self
@@ -5028,6 +6124,7 @@ impl PrivateSwapsView {
                     token_registry: &tokens,
                     bridge: approval.bridge.as_ref().map(QuotedBridge::route),
                     destination_minimum: approval.destination_minimum,
+                    destination,
                     verify_proof: true,
                 }))
                 .await
@@ -5272,6 +6369,15 @@ impl PrivateSwapsView {
         }
     }
 
+    fn set_failure_hint_open(&mut self, open: bool, cx: &mut Context<'_, Self>) {
+        if let Some(form) = self.form.as_mut()
+            && form.bridge.failure_hint_open != open
+        {
+            form.bridge.failure_hint_open = open;
+            cx.notify();
+        }
+    }
+
     fn toggle_details(&mut self, cx: &mut Context<'_, Self>) {
         if let Some(form) = self.form.as_mut() {
             form.details_open = !form.details_open;
@@ -5287,40 +6393,38 @@ impl PrivateSwapsView {
         let (sell, Some(buy)) = (form.sell, form.buy) else {
             return;
         };
-        let (input, sell_select, buy_select) = (
-            form.amount_input.clone(),
-            form.sell_select.clone(),
-            form.buy_select.clone(),
-        );
+        let (input, sell_select) = (form.amount_input.clone(), form.sell_select.clone());
         input.update(cx, |input, cx| input.set_value("", window, cx));
         sell_select.update(cx, |select, cx| {
             select.set_selected_value(&buy, window, cx);
         });
         self.set_form_sell(buy, window, cx);
         self.set_form_buy(sell, window, cx);
-        buy_select.update(cx, |select, cx| {
-            select.set_selected_values(&[sell], window, cx);
-        });
     }
 
-    /// Open the broadcaster picker on top of the swap dialog. The popover draws above dialogs,
-    /// so it closes first, and focus moves to the amount, where the picker returns it.
+    /// Open the broadcaster picker for `side`'s setup route, on top of the swap dialog. The
+    /// popover draws above dialogs, so it closes first, and focus moves to the amount, where
+    /// the picker returns it.
     fn choose_specific_setup_broadcaster(
         &mut self,
+        side: SetupSide,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Some((chain_id, token)) = self.form.as_ref().and_then(|form| {
+            self.setup_chain(form, side)
+                .zip(form.setup_route(side).fee_token)
+        }) else {
+            return;
+        };
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let Some(token) = form.route.fee_token else {
-            return;
-        };
+        form.broadcaster_side = side;
         form.settings_open = false;
         let input = form.amount_input.clone();
         input.read(cx).focus_handle(cx).focus(window, cx);
         let target = BroadcasterPickerTarget::Swap(cx.weak_entity());
-        let chain_id = self.session.chain_id;
         let _ = self.root.update(cx, |root, cx| {
             root.open_broadcaster_picker_for_target(
                 target,
@@ -5368,18 +6472,22 @@ impl PrivateSwapsView {
         self.network_usd_micro_value(
             delivery.destination_chain,
             delivery.destination_token,
-            bridge.expected_output,
+            if bridge.private.is_some() {
+                bridge.received_minimum()
+            } else {
+                bridge.expected_output
+            },
             cx,
         )
         .or_else(|| {
-            // Across delivers the same asset. Its fixed deposit less the relay fee is
+            // Across delivers the same asset. Its fixed deposit less all delivery costs is
             // already in source-token units, so no destination decimals or $1 peg are assumed.
             if bridge.provider != BridgeProvider::Across {
                 return None;
             }
             let received = review
                 .suggested_private_minimum()
-                .checked_sub(bridge.fee?)?;
+                .checked_sub(bridge_cost(review))?;
             self.usd_micro_value(review.plan().buy_token(), received, cx)
         })
     }
@@ -5490,7 +6598,14 @@ impl PrivateSwapsView {
         // In whole percent, rounded down, as the 20% threshold reads.
         let share = format_bps_percent(bps / 100 * 100);
         let fee = bridge_fee(review);
-        let mut message = if fee.is_zero() {
+        let delivery_cost = private_delivery_cost(review);
+        let mut message = if !delivery_cost.is_zero() {
+            format!(
+                "You allow paying up to {gas} of source gas, a {} bridge fee and {} for destination gas and shielding, {share} of this swap.",
+                self.gas_money(buy, fee, cx),
+                self.gas_money(buy, delivery_cost, cx)
+            )
+        } else if fee.is_zero() {
             format!("You allow paying up to {gas} of gas, {share} of this swap.")
         } else {
             format!(
@@ -5521,6 +6636,49 @@ impl PrivateSwapsView {
             .iter()
             .find(|(asset, _)| *asset == token)?;
         Some(self.token_amount(token, *total, cx))
+    }
+
+    /// The private balance of `token` on `network`, another one, when the wallet holds any:
+    /// "312.40 USDC private on Arbitrum One".
+    fn destination_balance_label(
+        &self,
+        form: &SwapForm,
+        network: u64,
+        token: Address,
+        cx: &App,
+    ) -> Option<String> {
+        let (_, total) = self
+            .private_totals(form, network, cx)
+            .into_iter()
+            .find(|(asset, _)| *asset == token)?;
+        Some(format!(
+            "{} private on {}",
+            self.network_token_amount(network, token, total, cx),
+            network_name(network)
+        ))
+    }
+
+    /// The Buy asset as its button names it: the symbol its row in the Buy picker has, and its
+    /// icon.
+    fn buy_token_display(
+        &self,
+        form: &SwapForm,
+        cx: &App,
+    ) -> Option<(String, Option<WalletIconSource>)> {
+        let token = form.buy?;
+        let network = form.network.unwrap_or(self.session.chain_id);
+        let metadata = self.chain_token_metadata(network, token, cx);
+        // A provider's token takes the provider's symbol, as its row does.
+        let listed = match form.bridge_state() {
+            BridgeState::Ready { destination, .. } if destination.destination_token == token => {
+                Some(destination.symbol.clone())
+            }
+            _ => None,
+        };
+        let symbol = listed
+            .or_else(|| metadata.as_ref().map(|metadata| metadata.symbol.clone()))
+            .unwrap_or_else(|| railgun_ui::short_address(&token));
+        Some((symbol, metadata.and_then(|metadata| metadata.icon_path)))
     }
 
     /// [`Self::bare_amount`] of a token on `network`, such as a Bridge swap's destination.
@@ -5576,40 +6734,117 @@ impl PrivateSwapsView {
         ))
     }
 
-    /// "Setup ≈ 0.0001 WETH · $0.28 · random broadcaster", or where the estimate stands.
-    fn setup_line(&self, form: &SwapForm, cx: &App) -> String {
-        if let Some(estimate) = &form.route.estimate {
-            let broadcaster = if form.route.selected.is_some() {
-                selected_broadcaster_label(&form.route.choice(), &form.route.candidates)
-            } else {
-                "random broadcaster".to_owned()
-            };
-            let (token, fee) = (estimate.broadcaster().token, estimate.fee_amount());
-            return format!(
-                "Setup ≈ {} · {broadcaster}",
-                self.with_usd(self.token_amount(token, fee, cx), token, fee, cx)
-            );
+    /// "Setup ≈ 0.0001 WETH · $0.28 · random broadcaster", or where the estimate stands. A
+    /// private Bridge swap's line gives one fee per network, "Setup ≈ 0.42 DAI on Ethereum ·
+    /// ≈ 0.05 USDC on Arbitrum One", or names the network whose estimate it waits for. The
+    /// flag tells that the line is a problem the user has to solve there.
+    fn setup_line(&self, form: &SwapForm, cx: &App) -> (String, bool) {
+        let Some(destination) = self.destination_setup_chain(form) else {
+            if let Some(estimate) = &form.route.estimate {
+                let broadcaster = if form.route.selected.is_some() {
+                    selected_broadcaster_label(&form.route.choice(), &form.route.candidates)
+                } else {
+                    "random broadcaster".to_owned()
+                };
+                let (token, fee) = (estimate.broadcaster().token, estimate.fee_amount());
+                return (
+                    format!(
+                        "Setup ≈ {} · {broadcaster}",
+                        self.with_usd(self.token_amount(token, fee, cx), token, fee, cx)
+                    ),
+                    false,
+                );
+            }
+            let (status, _) = self.setup_status(&form.route, SetupSide::Origin, None, cx);
+            return (format!("Setup · {status}"), false);
+        };
+        let sides = [
+            (SetupSide::Origin, self.session.chain_id),
+            (SetupSide::Destination, destination),
+        ];
+        let fees = sides
+            .iter()
+            .filter_map(|(side, chain_id)| {
+                let estimate = form.setup_route(*side).estimate.as_ref()?;
+                Some(format!(
+                    "≈ {} on {}",
+                    self.chain_amount(
+                        *chain_id,
+                        estimate.broadcaster().token,
+                        estimate.fee_amount(),
+                        cx
+                    ),
+                    network_name(*chain_id)
+                ))
+            })
+            .collect::<Vec<_>>();
+        // The first network without an estimate says where its own stands.
+        match sides
+            .iter()
+            .find(|(side, _)| form.setup_route(*side).estimate.is_none())
+        {
+            Some((side, chain_id)) => {
+                let (status, problem) =
+                    self.setup_status(form.setup_route(*side), *side, Some(*chain_id), cx);
+                (
+                    format!("Setup on {} · {status}", network_name(*chain_id)),
+                    problem,
+                )
+            }
+            None => (format!("Setup {}", fees.join(" · ")), false),
         }
-        let status = if let Some(error) = &form.route.estimate_error {
+    }
+
+    /// Where `route`'s estimate stands while it has none, and whether that is a problem the
+    /// user has to solve. A private Bridge swap names `network`, the route's own.
+    fn setup_status(
+        &self,
+        route: &SetupRoute,
+        side: SetupSide,
+        network: Option<u64>,
+        cx: &App,
+    ) -> (String, bool) {
+        let there = if side == SetupSide::Destination {
+            " there"
+        } else {
+            ""
+        };
+        if let Some(error) = &route.estimate_error {
             // The fee token's spendable balance can't cover the fee: say so in its units.
-            match (
+            let status = match (
                 crate::root::private_action::form_error_max_immediately_spendable(error),
-                &form.route.estimate_candidate,
+                &route.estimate_candidate,
             ) {
                 (Some(spendable), Some(candidate)) => format!(
-                    "the fee is more than the {} you can spend right now",
-                    self.token_amount(candidate.token, spendable, cx)
+                    "the fee is more than the {} you can spend{there} right now",
+                    self.chain_amount(candidate.chain_id, candidate.token, spendable, cx)
                 ),
                 _ => error.clone(),
-            }
-        } else if form.route.estimate_task.is_some() {
-            "Estimating…".into()
-        } else if form.route.fee_options.is_empty() {
-            "No spendable private fee token".into()
+            };
+            return (status, true);
+        }
+        let status = if route.estimate_task.is_some() {
+            "Estimating…"
+        } else if network.is_some_and(|chain_id| {
+            side == SetupSide::Destination && self.destination_owner(chain_id, cx).is_none()
+        }) {
+            "Waiting for the network to load"
+        } else if route.fee_options.is_empty() {
+            "No spendable private fee token"
         } else {
-            "Waiting for a compatible broadcaster".into()
+            "Waiting for a compatible broadcaster"
         };
-        format!("Setup · {status}")
+        (status.to_owned(), false)
+    }
+
+    /// [`Self::token_amount`] on the swap's own network, and [`Self::network_token_amount`] on
+    /// another one.
+    fn chain_amount(&self, chain_id: u64, token: Address, amount: U256, cx: &App) -> String {
+        if chain_id == self.session.chain_id {
+            self.token_amount(token, amount, cx)
+        } else {
+            self.network_token_amount(chain_id, token, amount, cx)
+        }
     }
 
     /// The form and its footer: the credit, Cancel, and the form's primary action.
@@ -5715,8 +6950,14 @@ impl PrivateSwapsView {
             FormMode::Setup { .. } | FormMode::SettingUp | FormMode::Order => {
                 // A new swap's review also approves its setup, so it needs the setup's fee.
                 let ready = match mode {
-                    FormMode::Setup { .. } => quoted && form.route.estimate.is_some(),
-                    FormMode::Order => quoted,
+                    // A private Bridge swap's review approves a setup on each network.
+                    FormMode::Setup { .. } => {
+                        quoted
+                            && form.route.estimate.is_some()
+                            && (self.destination_setup_chain(form).is_none()
+                                || form.destination_route.estimate.is_some())
+                    }
+                    FormMode::Order => quoted && self.destination_order_problem(form).is_none(),
                     FormMode::SettingUp | FormMode::Placed => false,
                 };
                 app_button("swap-form-review", "Review…")
@@ -5852,8 +7093,9 @@ impl PrivateSwapsView {
             .children(too_large)
     }
 
-    /// The Buy panel: the guaranteed minimum, its token, the price check and the best case, and
-    /// the gas strip. The flip button sits on the seam above it.
+    /// The Buy panel: the delivery network in its label, the guaranteed minimum, its token's
+    /// button, which opens the Buy picker, the price check and the best case, and the gas
+    /// strip. The flip button sits on the seam above it.
     fn render_buy_panel(
         &self,
         form: &SwapForm,
@@ -5874,16 +7116,24 @@ impl PrivateSwapsView {
             self.strip_amount(form, review, StripScale::of(review).show(minimum), cx)
         });
         // A quote's amount is a minimum, which the label says, so the amount starts at the
-        // panel's edge like the Sell amount.
-        let (title, balance) = match (form.network, amount.is_some()) {
-            (Some(network), true) => (format!("Buy on {}, at least", network_name(network)), None),
-            (Some(network), false) => (format!("Buy on {}", network_name(network)), None),
-            (None, quoted) => (
-                if quoted { "Buy at least" } else { "Buy" }.to_owned(),
-                form.buy
-                    .and_then(|buy| self.private_balance_label(form, buy, cx)),
-            ),
+        // panel's edge like the Sell amount. The form has no other network control, so the
+        // label names the network the Buy asset is delivered on.
+        let network = network_name(form.network.unwrap_or(self.session.chain_id));
+        let title = if amount.is_some() {
+            format!("Buy on {network}, at least")
+        } else {
+            format!("Buy on {network}")
         };
+        // The wallet's private balance of the Buy asset where it is delivered.
+        let balance = form
+            .buy
+            .and_then(|buy| match (form.network, form.receive_to) {
+                (None, _) => self.private_balance_label(form, buy, cx),
+                (Some(network), ReceiveTo::PrivateBalance) => {
+                    self.destination_balance_label(form, network, buy, cx)
+                }
+                (Some(_), ReceiveTo::PublicAddress) => None,
+            });
         let same_token = matches!(form.bridge_state(), BridgeState::SameToken);
         // The strip's row is drawn before the quote is ready too, so the panel keeps its height.
         let strip = review.is_some()
@@ -5909,51 +7159,8 @@ impl PrivateSwapsView {
                     )
                     .children(self.render_bridge_notice(form, cx))
                     .child(
-                        token_pill(
-                            Combobox::new(&form.buy_select)
-                                .w_full()
-                                .placeholder("Select asset")
-                                .disabled(locked || !editable)
-                                .render_trigger(|trigger, _, cx| {
-                                    let title = trigger.selection().first().map_or_else(
-                                        || {
-                                            div()
-                                                .child(
-                                                    trigger
-                                                        .placeholder()
-                                                        .cloned()
-                                                        .unwrap_or_default(),
-                                                )
-                                                .into_any_element()
-                                        },
-                                        |(_, item)| {
-                                            item.display_title()
-                                                .unwrap_or_else(|| item.title().into_any_element())
-                                        },
-                                    );
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(if trigger.is_disabled() {
-                                            cx.theme().muted_foreground
-                                        } else {
-                                            cx.theme().foreground
-                                        })
-                                        .child(div().flex_1().min_w_0().child(title))
-                                        .child(
-                                            Caret::new(trigger.size())
-                                                .text_color(cx.theme().muted_foreground),
-                                        )
-                                })
-                                .when(form.buy.is_none() && editable && !locked, |select| {
-                                    select
-                                        .border_color(cx.theme().primary.opacity(0.65))
-                                        .bg(cx.theme().primary.opacity(0.12))
-                                }),
-                        )
-                        .debug_selector(|| "swap-buy-selector".into()),
+                        token_pill(self.render_buy_token(form, editable && !locked, cx))
+                            .debug_selector(|| "swap-buy-selector".into()),
                     ),
             )
             .child(
@@ -5975,6 +7182,50 @@ impl PrivateSwapsView {
             )
             .children(self.render_native_output(form, editable, locked, cx))
             .children(strip.then(|| self.render_gas_strip(form, review, editable, cx)))
+    }
+
+    /// The Buy token button, with the delivery network's badge on the token's icon, and the
+    /// Buy picker it opens. The picker takes the keyboard in its search, and gives it back when
+    /// it closes. A swap whose tokens are fixed has the button alone.
+    fn render_buy_token(
+        &self,
+        form: &SwapForm,
+        enabled: bool,
+        cx: &Context<'_, Self>,
+    ) -> gpui::AnyElement {
+        let network = form.network.unwrap_or(self.session.chain_id);
+        let token = self.buy_token_display(form, cx);
+        let label = token
+            .as_ref()
+            .map_or_else(|| "Select asset".to_owned(), |(symbol, _)| symbol.clone());
+        app_button_base("swap-buy-token")
+            .outline()
+            .w_full()
+            .disabled(!enabled)
+            .accessibility_label(format!("Buy token: {label}"))
+            .when(token.is_none() && enabled, |button| {
+                button
+                    .border_color(cx.theme().primary.opacity(0.65))
+                    .bg(cx.theme().primary.opacity(0.12))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(token.map(|(_, icon)| network_token_icon(icon, network)))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .xsmall()
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+            )
+            .on_click(cx.listener(|view, _, window, cx| view.open_buy_picker(window, cx)))
+            .into_any_element()
     }
 
     /// Private Unshield's native/wrapped output switch, offered while a Public address receives
@@ -6078,6 +7329,10 @@ impl PrivateSwapsView {
             .flex_wrap()
             .items_center()
             .gap_x_2();
+        // A network that can't take the delivery kind is explained under Receive to.
+        if matches!(form.delivery, Err(DeliveryProblem::Network { .. })) {
+            return line;
+        }
         // Until a provider delivers the Buy token, the line says why a Bridge swap can't be
         // quoted.
         let network = network_name(form.network.unwrap_or(self.session.chain_id));
@@ -6272,7 +7527,11 @@ impl PrivateSwapsView {
         cx: &Context<'_, Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let provider = form.bridge_unavailable()?;
-        if matches!(form.bridge_state(), BridgeState::Unreachable(_)) {
+        // Private balance lists only what Across delivers, so nothing of NEAR Intents' is
+        // missing.
+        if form.receive_to == ReceiveTo::PrivateBalance
+            || matches!(form.bridge_state(), BridgeState::Unreachable(_))
+        {
             return None;
         }
         let provider = provider_name(provider);
@@ -6993,10 +8252,12 @@ impl PrivateSwapsView {
         )
     }
 
-    /// Receive to, and for a Public address the Receiver with its suggestions. Under the
-    /// receiver: why it can't be used, and for native output, that a contract wallet may not
-    /// accept it. A retry keeps its attempt's delivery, and a set-up native pair keeps its
-    /// Public address.
+    /// Receive to, and for a Public address the Receiver with its suggestions. Under Receive
+    /// to: why the form's network can't take Private balance. Under the receiver: why it can't
+    /// be used, and for native output, that a contract wallet may not accept it. A retry keeps
+    /// its attempt's delivery, and a set-up native pair keeps its Public address. On another
+    /// network, a Public address has the Provider and Surplus rows, and Private balance, which
+    /// only Across delivers, the "If the shield fails" and Surplus rows.
     fn render_delivery(
         &self,
         form: &SwapForm,
@@ -7011,36 +8272,76 @@ impl PrivateSwapsView {
                 }),
             )
         };
-        let rows = div().w_full().flex().flex_col().gap_4().child(labeled_row(
-            "Receive to",
-            div().flex().child(
-                ButtonGroup::new("swap-receive-to")
-                    .outline()
-                    .compact()
-                    .disabled(disabled)
-                    .child(choice(
-                        "swap-receive-private",
-                        "Private balance",
-                        ReceiveTo::PrivateBalance,
-                    ))
-                    .child(choice(
-                        "swap-receive-public",
-                        "Public address",
-                        ReceiveTo::PublicAddress,
-                    )),
-            ),
-        ));
-        if form.receive_to == ReceiveTo::PrivateBalance {
-            return rows;
-        }
-        // Another network changes the Buy tokens, so a set-up swap's fixed pair keeps its own.
-        let locked = form.operation.is_some() && !form.reuse_account;
-        let rows = rows.child(labeled_row(
-            "Network",
-            Select::new(&form.network_select)
+        // A sync under way resolves by itself, so only a network that needs the user is an
+        // error.
+        let network_problem = match &form.delivery {
+            Err(DeliveryProblem::Network { problem, syncing }) => {
+                let error = !*syncing;
+                Some(
+                    div()
+                        .debug_selector(|| "swap-receive-to-problem".into())
+                        // Under the control, past the label and the row's gap.
+                        .pl(rems(ACCOUNT_LABEL_WIDTH + 0.5))
+                        .flex()
+                        .items_start()
+                        .gap_1()
+                        .when(error, |line| {
+                            line.child(
+                                Icon::new(IconName::CircleX)
+                                    .xsmall()
+                                    .flex_none()
+                                    .text_color(cx.theme().danger),
+                            )
+                        })
+                        .child(
+                            app_muted_text(problem.clone())
+                                .text_xs()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .when(error, |line| line.text_color(cx.theme().danger)),
+                        ),
+                )
+            }
+            _ => None,
+        };
+        let rows = div().w_full().flex().flex_col().gap_4().child(
+            div()
                 .w_full()
-                .disabled(!editable || locked),
-        ));
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(labeled_row(
+                    "Receive to",
+                    div().flex().child(
+                        ButtonGroup::new("swap-receive-to")
+                            .outline()
+                            .compact()
+                            .disabled(disabled)
+                            .child(choice(
+                                "swap-receive-private",
+                                "Private balance",
+                                ReceiveTo::PrivateBalance,
+                            ))
+                            .child(choice(
+                                "swap-receive-public",
+                                "Public address",
+                                ReceiveTo::PublicAddress,
+                            )),
+                    ),
+                ))
+                .children(network_problem),
+        );
+        // A set-up swap's fixed pair keeps its delivery's terms.
+        let locked = form.operation.is_some() && !form.reuse_account;
+        if form.receive_to == ReceiveTo::PrivateBalance {
+            let across = form
+                .network
+                .filter(|_| matches!(form.delivery, Ok(SwapDelivery::Bridge(_))));
+            return rows.when_some(across, |rows, network| {
+                rows.child(self.render_shield_failure_row(form, network, editable && !locked, cx))
+                    .child(self.render_surplus_row(form, editable && !locked, cx))
+            });
+        }
         let view = cx.entity();
         let save_root = self.root.clone();
         let picker = form_recipient_picker(
@@ -7126,9 +8427,10 @@ impl PrivateSwapsView {
     }
 
     /// The token a Bridge `delivery` pays out, as swaps name it: the native asset for the
-    /// wrapped native token Across unwraps.
+    /// wrapped native token Across unwraps. A private delivery shields the wrapped token.
     pub(super) fn bridge_received_token(&self, delivery: BridgeDelivery, cx: &App) -> Address {
         let unwrapped = delivery.provider == BridgeProvider::Across
+            && !delivery.is_private()
             && self.root.upgrade().and_then(|root| {
                 root.read(cx)
                     .effective_chain_configs
@@ -7345,6 +8647,140 @@ impl PrivateSwapsView {
         )
     }
 
+    /// A private Bridge delivery's choice for a shield on `network` that can't run: refund the
+    /// deposit on the swap's network, or keep the tokens in the stealth account there. The
+    /// labels name the network the funds end up on, and the info button explains both.
+    fn render_shield_failure_row(
+        &self,
+        form: &SwapForm,
+        network: u64,
+        editable: bool,
+        cx: &Context<'_, Self>,
+    ) -> gpui::Div {
+        let disabled = !editable || self.is_retry(form);
+        let (origin, destination) = (self.chain_label(), network_name(network));
+        let choice = |id: &'static str, failure: BridgeShieldFailure| {
+            app_segment_button(
+                id,
+                shield_failure_label(failure, &origin, &destination),
+                form.bridge.shield_failure == failure,
+                disabled,
+                None,
+            )
+            .debug_selector(move || id.into())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_form_shield_failure(failure, window, cx);
+            }))
+        };
+        labeled_row(
+            "If the shield fails",
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .child(
+                    ButtonGroup::new("swap-shield-failure")
+                        .outline()
+                        .compact()
+                        .disabled(disabled)
+                        .child(choice(
+                            "swap-shield-failure-refund",
+                            BridgeShieldFailure::RefundOnOrigin,
+                        ))
+                        .child(choice(
+                            "swap-shield-failure-keep",
+                            BridgeShieldFailure::KeepOnDestination,
+                        )),
+                )
+                .child(self.render_shield_failure_hint(form, network, cx)),
+        )
+    }
+
+    /// The failure choice's hint button: a tooltip on hover, and a popover on click or from the
+    /// keyboard. The card says what the choice is about and what each option does with the
+    /// delivered token.
+    fn render_shield_failure_hint(
+        &self,
+        form: &SwapForm,
+        network: u64,
+        cx: &Context<'_, Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (origin, destination) = (self.chain_label(), network_name(network));
+        // The deposit is refunded in the token the order buys, and delivered in the Buy token.
+        let (bought, delivered) = match form.bridge_state() {
+            BridgeState::Ready {
+                destination: route, ..
+            } => (
+                self.token_symbol(route.intermediate, cx),
+                route.symbol.clone(),
+            ),
+            _ => ("tokens".to_owned(), "tokens".to_owned()),
+        };
+        let text: Arc<[(Option<String>, String)]> = Arc::from([
+            (
+                None,
+                format!(
+                    "The swap shields on {destination} in the same transaction that delivers it. This choice covers the rare case where that shield can't run."
+                ),
+            ),
+            (
+                Some(shield_failure_label(
+                    BridgeShieldFailure::RefundOnOrigin,
+                    &origin,
+                    &destination,
+                )),
+                format!(
+                    "The delivery doesn't happen. Across returns the {bought} to the stealth account on {origin} after the deposit expires, usually within a few hours. Recovering it costs a shield fee and a broadcaster fee."
+                ),
+            ),
+            (
+                Some(shield_failure_label(
+                    BridgeShieldFailure::KeepOnDestination,
+                    &origin,
+                    &destination,
+                )),
+                format!(
+                    "The delivery happens, and the {delivered} stays in the stealth account on {destination}, where it is publicly visible until you recover it. Relayers price this option less precisely, so the deposit is more likely to go unfilled."
+                ),
+            ),
+        ]);
+        let view = cx.entity();
+        let open = form.bridge.failure_hint_open;
+        let tooltip_text = Arc::clone(&text);
+        div()
+            .id("swap-shield-failure-hint")
+            .debug_selector(|| "swap-shield-failure-hint".into())
+            .flex_none()
+            .when(!open, |this| {
+                this.tooltip(move |window, cx| {
+                    let text = Arc::clone(&tooltip_text);
+                    Tooltip::element(move |window, _| shield_failure_card(&text, window))
+                        .build(window, cx)
+                })
+            })
+            .child(
+                Popover::new("swap-shield-failure-hint-popover")
+                    .anchor(Anchor::TopRight)
+                    .open(open)
+                    .on_open_change(move |open, _, cx| {
+                        view.update(cx, |view, cx| view.set_failure_hint_open(*open, cx));
+                    })
+                    .trigger(
+                        app_button_base("swap-shield-failure-hint-trigger")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Info)
+                            .accessibility_label("About a shield that fails")
+                            .debug_selector(|| "swap-shield-failure-hint-trigger".into()),
+                    )
+                    .content(move |_, window, _| {
+                        shield_failure_card(&text, window)
+                            .debug_selector(|| "swap-shield-failure-hint-content".into())
+                    }),
+            )
+    }
+
     /// Across's choice for what `CoW` pays above the deposit: reshield it, or leave it in the
     /// stealth account. The provider's hint explains it.
     fn render_surplus_row(
@@ -7437,9 +8873,10 @@ impl PrivateSwapsView {
             )
             .text_xs()
             .whitespace_normal(),
-            FormMode::Setup { .. } => app_muted_text(self.setup_line(form, cx))
-                .text_xs()
-                .whitespace_normal(),
+            FormMode::Setup { .. } => {
+                let (line, problem) = self.setup_line(form, cx);
+                setup_fee_line(line, problem, cx)
+            }
             FormMode::Order if form.reuse_account => self.render_reuse_warning(form),
             FormMode::Order => {
                 app_muted_text("Already set up for this swap. No setup fee.").text_xs()
@@ -7483,12 +8920,17 @@ impl PrivateSwapsView {
                     .items_start()
                     .gap_2()
                     .child(
-                        app_muted_text("Stealth account")
-                            .w(rems(ACCOUNT_LABEL_WIDTH))
-                            .h_8()
-                            .flex_none()
-                            .flex()
-                            .items_center(),
+                        // A private Bridge swap has a stealth account on each network.
+                        app_muted_text(if form.private_bridge() {
+                            "Stealth accounts"
+                        } else {
+                            "Stealth account"
+                        })
+                        .w(rems(ACCOUNT_LABEL_WIDTH))
+                        .h_8()
+                        .flex_none()
+                        .flex()
+                        .items_center(),
                     )
                     .child(
                         div()
@@ -7521,20 +8963,41 @@ impl PrivateSwapsView {
     }
 
     /// The gear that opens the setup broadcaster settings: fee token, Random or Specific
-    /// broadcaster, favorites only, and out-of-range fees.
+    /// broadcaster, favorites only, and out-of-range fees. A private Bridge swap has them once
+    /// per network, each under its network's name.
     fn render_setup_settings(&self, form: &SwapForm, cx: &Context<'_, Self>) -> Popover {
         let view = cx.entity();
         let open_view = view.clone();
-        let choice = form.route.choice();
-        let route = SetupRouteSettings {
-            fee_options: form.route.fee_options.clone(),
-            fee_token: form.route.fee_token.unwrap_or_default(),
-            allow_out_of_range: form.route.allow_out_of_range,
-            favorites_only: form.route.favorites_only,
-            random_selected: form.route.selected.is_none(),
-            specific_label: selected_broadcaster_label(&choice, &form.route.candidates),
-            candidate_count: form.route.candidates.len(),
-            busy: self.busy(),
+        let busy = self.busy();
+        let routes = [SetupSide::Origin, SetupSide::Destination]
+            .into_iter()
+            .filter_map(|side| {
+                let chain_id = self.setup_chain(form, side)?;
+                let route = form.setup_route(side);
+                Some((
+                    side,
+                    network_name(chain_id),
+                    SetupRouteSettings {
+                        fee_options: route.fee_options.clone(),
+                        fee_token: route.fee_token.unwrap_or_default(),
+                        allow_out_of_range: route.allow_out_of_range,
+                        favorites_only: route.favorites_only,
+                        random_selected: route.selected.is_none(),
+                        specific_label: selected_broadcaster_label(
+                            &route.choice(),
+                            &route.candidates,
+                        ),
+                        candidate_count: route.candidates.len(),
+                        busy,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let two_networks = routes.len() > 1;
+        let label = if two_networks {
+            "Setup broadcasters"
+        } else {
+            "Setup broadcaster"
         };
         Popover::new("swap-setup-settings")
             .anchor(Anchor::TopRight)
@@ -7548,10 +9011,38 @@ impl PrivateSwapsView {
                 app_button_base("swap-setup-settings-trigger")
                     .ghost()
                     .icon(IconName::Settings)
-                    .accessibility_label("Setup broadcaster")
-                    .tooltip("Setup broadcaster"),
+                    .accessibility_label(label)
+                    .tooltip(label),
             )
-            .content(move |_, _, _| setup_route_settings(view.clone(), &route).w(rems(24.)))
+            .content(move |_, _, _| {
+                div()
+                    .w(rems(24.))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .when(two_networks, |content| {
+                        content.child(app_strong_text("Setup fees"))
+                    })
+                    .children(routes.iter().map(|(side, network, route)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .when(two_networks, |settings| {
+                                settings.child(app_muted_text(network.clone()).text_xs())
+                            })
+                            .child(setup_route_settings(view.clone(), *side, route))
+                    }))
+                    .when(two_networks, |content| {
+                        content.child(
+                            app_muted_text(
+                                "Each account is set up by a broadcaster on its own network, paid from your private balance there.",
+                            )
+                            .text_xs()
+                            .whitespace_normal(),
+                        )
+                    })
+            })
     }
 
     /// The rate and total costs; expanded, Railgun's and `CoW`'s fees, the gas estimate and the
@@ -7817,7 +9308,8 @@ impl PrivateSwapsView {
 
     /// A Bridge quote's Bridge fee, in the bought token, and what the receiver gets on the
     /// destination network in place of Receive at least: Across's exact output, or NEAR
-    /// Intents' minimum. Other quotes have neither.
+    /// Intents' minimum. A private delivery has its costs there instead: the delivery allowance
+    /// and the shield fee's rate. Other quotes have none of them.
     fn bridge_detail_rows(&self, review: &SwapReview, cx: &App) -> Vec<gpui::Div> {
         let (SwapDelivery::Bridge(delivery), Some(bridge)) =
             (review.plan().delivery(), review.bridge())
@@ -7848,13 +9340,52 @@ impl PrivateSwapsView {
                     )))
                     .child(app_muted_text(provider)),
                 true,
-                Some(format!(
-                    "{provider}'s fee, already out of the amount below."
-                )),
+                Some(if bridge.private.is_some() {
+                    format!("{provider}'s fee, already out of the minimum you receive.")
+                } else {
+                    format!("{provider}'s fee, already out of the amount below.")
+                }),
             )
         }));
+        let network = network_name(delivery.destination_chain);
+        // A private delivery's costs on its network. The Buy card shows what is left of them.
+        if let Some(private) = bridge.private {
+            let percent = format_bps_percent(
+                u64::try_from(private.destination_shield_fee_bps).unwrap_or(u64::MAX),
+            );
+            rows.push(detail_row(
+                format!("Delivery on {network}"),
+                app_text(format!(
+                    "≈ {}",
+                    self.network_token_amount(
+                        delivery.destination_chain,
+                        delivery.destination_token,
+                        private.delivery_allowance,
+                        cx
+                    )
+                )),
+                true,
+                Some(format!(
+                    "What shielding on delivery costs the relayer in gas on {network}. An estimate, checked against Across's own quote when the order is placed."
+                )),
+            ));
+            rows.push(detail_row(
+                format!("Railgun shield on {network}"),
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap_1()
+                    .child(app_text(percent))
+                    .child(app_muted_text("of what you receive")),
+                true,
+                Some(format!(
+                    "Railgun's fee on shielding the delivered tokens to your private balance on {network}."
+                )),
+            ));
+            return rows;
+        }
         rows.push(detail_row(
-            format!("Receive on {}", network_name(delivery.destination_chain)),
+            format!("Receive on {network}"),
             match delivery.provider {
                 BridgeProvider::Across => div()
                     .flex()
@@ -7997,7 +9528,14 @@ impl PrivateSwapsView {
                     .items_center()
                     .gap_2()
                     .child(Spinner::new().small())
-                    .child(app_text(format!("Setting up the swap's stealth account · {status}"))),
+                    .child(app_text(format!(
+                        "Setting up the swap's stealth {} · {status}",
+                        if form.private_bridge() {
+                            "accounts"
+                        } else {
+                            "account"
+                        }
+                    ))),
             )
             .children(
                 tracking
@@ -8024,13 +9562,6 @@ fn select_index(
     items
         .iter()
         .position(|item| item.token == token)
-        .map(|index| gpui_component::IndexPath::default().row(index))
-}
-
-fn buy_index(items: &[SwapBuyItem], token: Address) -> Option<gpui_component::IndexPath> {
-    items
-        .iter()
-        .position(|item| item.asset.token == token)
         .map(|index| gpui_component::IndexPath::default().row(index))
 }
 
@@ -8082,6 +9613,71 @@ const fn bridge_surplus(provider: BridgeProvider, chosen: BridgeSurplus) -> Brid
 
 pub(super) fn network_name(chain_id: u64) -> String {
     railgun_ui::chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned)
+}
+
+/// Whether `receive_to` can deliver on `chain`, another built-in chain a bridge reaches. A
+/// Public address needs only its RPC endpoints. Private balance also needs an accepted swap
+/// profile, the wallet's private sync ready in this session, and private funds for the
+/// destination stealth account's setup.
+fn destination_availability(
+    root: &WalletRoot,
+    receive_to: ReceiveTo,
+    chain: &EffectiveChainConfig,
+) -> NetworkAvailability {
+    let rpc = resolve_effective_chain_rpc_route(chain.chain_id, chain).is_ok();
+    match receive_to {
+        ReceiveTo::PublicAddress => public_network_availability(rpc),
+        ReceiveTo::PrivateBalance => private_network_availability(PrivateNetworkFacts {
+            rpc,
+            swap_profile: chain.swap_profile().is_some(),
+            sync: network_sync(root.chain_states.get(&chain.chain_id)),
+            funded: destination_setup_funded(root, chain),
+        }),
+    }
+}
+
+/// Where the wallet's private sync of a chain stands. A chain without a session yet reads as
+/// loading: opening the Buy picker starts it.
+fn network_sync(state: Option<&ChainUtxoState>) -> NetworkSync {
+    match state {
+        Some(ChainUtxoState::Ready { .. }) => NetworkSync::Ready,
+        Some(ChainUtxoState::Error { .. }) => NetworkSync::Failed,
+        Some(state) => NetworkSync::Loading(state.progress().map(SyncProgressUpdate::percent)),
+        None => NetworkSync::Loading(None),
+    }
+}
+
+/// Whether the wallet could pay a broadcaster for a stealth account's setup on `chain`: some
+/// POI-verified, spendable private balance there is in a token that a broadcaster compatible
+/// with the chain's executor profile accepts, under the fee policy and trust filter a new
+/// setup route starts with. The picker then checks that balance against the setup estimate.
+fn destination_setup_funded(root: &WalletRoot, chain: &EffectiveChainConfig) -> bool {
+    let chain_id = chain.chain_id;
+    let Some(profile) = chain.accepted_executor_profile() else {
+        return false;
+    };
+    let Some(snapshot) = root
+        .chain_states
+        .get(&chain_id)
+        .and_then(ChainUtxoState::snapshot)
+    else {
+        return false;
+    };
+    public_broadcaster_fee_token_options_from_snapshot(
+        snapshot,
+        &root.monitor_fee_rows(),
+        None,
+        Some(profile),
+        root.public_broadcaster_fee_policy(false),
+        &root.public_broadcaster_trust_filter(false),
+        Some(&root.effective_token_registry),
+        |token| {
+            root.public_broadcaster_anchor_cache
+                .cached_rate(chain_id, token)
+        },
+    )
+    .iter()
+    .any(|option| option.eligible_broadcaster_count > 0)
 }
 
 /// The token a Bridge review delivers on its network. Only a Bridge review has one.
@@ -8149,31 +9745,40 @@ struct SetupRouteSettings {
     busy: bool,
 }
 
-/// The shared broadcaster settings with the fee token selector, driving the swap's setup route.
+/// The shared broadcaster settings with the fee token selector, driving `side`'s setup route.
 /// Specific broadcaster opens the broadcaster picker on top of the swap dialog.
 fn setup_route_settings(
     view: Entity<PrivateSwapsView>,
+    side: SetupSide,
     route: &SetupRouteSettings,
 ) -> gpui::Stateful<gpui::Div> {
     use ui::private_action::BroadcasterSettingsEvent as Event;
+    let (token_id, settings_id) = match side {
+        SetupSide::Origin => ("swap-setup-fee-token", "swap-setup-broadcaster-settings"),
+        SetupSide::Destination => (
+            "swap-destination-setup-fee-token",
+            "swap-destination-setup-broadcaster-settings",
+        ),
+    };
     let fee_view = view.clone();
     let fee_token = fee_token_selector(
-        "swap-setup-fee-token".into(),
+        token_id.into(),
         &route.fee_options,
         route.fee_token,
         route.busy,
         move |token, _, cx| {
             fee_view.update(cx, |view, cx| {
                 if let Some(form) = view.form.as_mut() {
-                    form.route.fee_token = Some(token);
-                    form.route.invalidate_estimate();
+                    let route = form.setup_route_mut(side);
+                    route.fee_token = Some(token);
+                    route.invalidate_estimate();
                 }
                 view.refresh_setup_route(cx);
             });
         },
     );
     ui::private_action::broadcaster_settings_fields(
-        "swap-setup-broadcaster-settings",
+        settings_id,
         ui::private_action::BroadcasterSettings {
             allow_out_of_range: route.allow_out_of_range,
             favorites_only: route.favorites_only,
@@ -8187,23 +9792,63 @@ fn setup_route_settings(
         move |event, window, cx| {
             view.update(cx, |view, cx| {
                 if matches!(event, Event::ChooseSpecific) {
-                    view.choose_specific_setup_broadcaster(window, cx);
+                    view.choose_specific_setup_broadcaster(side, window, cx);
                     return;
                 }
                 let Some(form) = view.form.as_mut() else {
                     return;
                 };
+                let route = form.setup_route_mut(side);
                 match event {
-                    Event::Random => form.route.selected = None,
-                    Event::AllowOutOfRange(value) => form.route.allow_out_of_range = value,
-                    Event::FavoritesOnly(value) => form.route.favorites_only = value,
+                    Event::Random => route.selected = None,
+                    Event::AllowOutOfRange(value) => route.allow_out_of_range = value,
+                    Event::FavoritesOnly(value) => route.favorites_only = value,
                     Event::ChooseSpecific => {}
                 }
-                form.route.invalidate_estimate();
+                route.invalidate_estimate();
                 view.refresh_setup_route(cx);
             });
         },
     )
+}
+
+/// The line under the stealth account select while a setup is quoted. A `problem` the user has
+/// to solve is in the danger colour behind its icon, like the line under Receive to.
+fn setup_fee_line(line: String, problem: bool, cx: &App) -> gpui::Div {
+    let text = app_muted_text(line).text_xs().whitespace_normal();
+    if !problem {
+        return text;
+    }
+    div()
+        .debug_selector(|| "swap-setup-problem".into())
+        .flex()
+        .items_start()
+        .gap_1()
+        .child(
+            Icon::new(IconName::CircleX)
+                .xsmall()
+                .flex_none()
+                .text_color(cx.theme().danger),
+        )
+        .child(text.min_w_0().text_color(cx.theme().danger))
+}
+
+/// The failure choice's hint card: paragraphs under the title, the two options' led by their
+/// labels.
+fn shield_failure_card(text: &[(Option<String>, String)], window: &Window) -> gpui::Div {
+    hint_card("If the shield fails", theme::INFO, window).children(text.iter().map(
+        |(label, paragraph)| {
+            div()
+                .flex()
+                .flex_col()
+                .children(
+                    label
+                        .clone()
+                        .map(|label| div().font_weight(FontWeight::MEDIUM).child(label)),
+                )
+                .child(div().whitespace_normal().child(paragraph.clone()))
+        },
+    ))
 }
 
 /// The quote against the anchor price, and the reading behind it.
@@ -8303,16 +9948,40 @@ fn source_return_hint(review: &SwapReview, deposit: &str, chain: &str) -> String
     }
 }
 
+/// A new swap's steps, as its reviews' stepper names them. A private Bridge swap sets up
+/// `two_accounts`.
+const fn swap_steps(two_accounts: bool) -> [&'static str; 2] {
+    if two_accounts {
+        PRIVATE_BRIDGE_SWAP_STEPS
+    } else {
+        SWAP_STEPS
+    }
+}
+
 /// The stepper's explanation of a new swap's two steps.
-fn swap_steps_hint() -> SpendAuthorizationHint {
+fn swap_steps_hint(two_accounts: bool) -> SpendAuthorizationHint {
+    let setup = if two_accounts {
+        "1. Set up stealth accounts. A broadcaster on each network creates a one-time account for this swap, and you pay both setup fees."
+    } else {
+        "1. Set up stealth account. A broadcaster creates a one-time account for this swap, and you pay the setup fee."
+    };
     SpendAuthorizationHint::new(
         "Two steps",
         [
-            "1. Set up stealth account. A broadcaster creates a one-time account for this swap, and you pay the setup fee.",
+            setup,
             "2. Place order. Once setup confirms, the wallet checks the quote again and asks you to confirm. If the terms changed, you review them first.",
             "With \"Just this spend\", you enter the password again for step 2.",
         ],
     )
+}
+
+/// A failure choice as its control and the review name it, after the network the funds end up
+/// on: the swap's `origin`, or the `destination`.
+fn shield_failure_label(choice: BridgeShieldFailure, origin: &str, destination: &str) -> String {
+    match choice {
+        BridgeShieldFailure::RefundOnOrigin => format!("Refund on {origin}"),
+        BridgeShieldFailure::KeepOnDestination => format!("Keep on {destination}"),
+    }
 }
 
 const fn source_return_note(review: &SwapReview) -> &'static str {
@@ -8366,11 +10035,11 @@ fn authorized_cost_bps(best: U256, spent: U256, sold: U256, minimum: U256) -> u6
 }
 
 /// A review's authorized costs, when they are high enough to need Swap anyway. A Bridge
-/// swap's minimum is its destination minimum, valued as the deposit less the bridge fee.
+/// swap's minimum is its destination credit, valued as the deposit less all delivery costs.
 fn authorized_high_cost(review: &SwapReview) -> Option<u64> {
     let minimum = review
         .suggested_private_minimum()
-        .saturating_sub(bridge_fee(review));
+        .saturating_sub(bridge_cost(review));
     let bps = authorized_cost_bps(
         review.best_case(),
         review.plan().amount(),
@@ -8481,8 +10150,9 @@ impl GasBar {
 }
 
 /// Converts the order's amounts, in the bought token, to the amounts the gas strip shows: for
-/// a Bridge swap, its destination token, at the quote's ratio of destination minimum to
-/// deposit. That ratio holds until the bridge quote a share change asks for.
+/// a Bridge swap, its destination token, at the quote's ratio of the minimum received there to
+/// the deposit. A private delivery receives its destination minimum less the shield fee there.
+/// That ratio holds until the bridge quote a share change asks for.
 #[derive(Clone, Copy)]
 struct StripScale {
     shown: U256,
@@ -8493,7 +10163,7 @@ impl StripScale {
     fn of(review: &SwapReview) -> Self {
         match review.bridge() {
             Some(bridge) if !review.suggested_private_minimum().is_zero() => Self {
-                shown: bridge.destination_minimum,
+                shown: bridge.received_minimum(),
                 ordered: review.suggested_private_minimum(),
             },
             _ => Self {
@@ -8663,7 +10333,7 @@ fn expected_output(review: &SwapReview) -> U256 {
     let quoted = expected_payout(review);
     quoted
         .saturating_sub(shield_fee_on(review, quoted))
-        .saturating_sub(bridge_fee(review))
+        .saturating_sub(bridge_cost(review))
 }
 
 /// The `CoW` payout if solvers charge the allowed gas, before delivery.
@@ -8677,6 +10347,31 @@ fn bridge_fee(review: &SwapReview) -> U256 {
         .bridge()
         .and_then(|bridge| bridge.fee)
         .unwrap_or_default()
+}
+
+/// Provider fees plus private destination gas and shielding, in buy-token base units.
+fn bridge_cost(review: &SwapReview) -> U256 {
+    bridge_fee(review).saturating_add(private_delivery_cost(review))
+}
+
+/// Value the private delivery's deductions at Across's same-asset quote ratio. The source
+/// deposit less the provider fee corresponds to `quoted_output` before destination costs;
+/// scaling the net credit avoids assuming equal token decimals on the two chains.
+fn private_delivery_cost(review: &SwapReview) -> U256 {
+    let Some((bridge, private)) = review
+        .bridge()
+        .and_then(|bridge| bridge.private.map(|private| (bridge, private)))
+    else {
+        return U256::ZERO;
+    };
+    let before_delivery = review
+        .suggested_private_minimum()
+        .saturating_sub(bridge_fee(review));
+    let retained = before_delivery
+        .saturating_mul(bridge.received_minimum())
+        .checked_div(private.quoted_output)
+        .unwrap_or_default();
+    before_delivery.saturating_sub(retained)
 }
 
 /// Railgun's shield fee on a buy-token amount.
@@ -8869,6 +10564,9 @@ const fn review_change_label(change: SwapReviewChange) -> &'static str {
         SwapReviewChange::GasAllowance { .. } => "the gas you allow increased",
         SwapReviewChange::Validity { .. } => "the order validity changed",
         SwapReviewChange::ShieldFee { .. } => "the Railgun shield fee changed",
+        SwapReviewChange::DestinationShieldFee { .. } => {
+            "the Railgun shield fee on the destination network changed"
+        }
         SwapReviewChange::UnshieldFee { .. } => "the Railgun unshield fee changed",
         SwapReviewChange::QuoteDeviates => "the quote now deviates from the anchor price",
         SwapReviewChange::PriceVerification => "the price check changed",
@@ -8877,7 +10575,28 @@ const fn review_change_label(change: SwapReviewChange) -> &'static str {
             "the current quote no longer supports the minimum you approved"
         }
         SwapReviewChange::DestinationMinimum { .. } => "the bridge quote is below your minimum",
+        SwapReviewChange::DeliveryAllowance { .. } => {
+            "shielding on the destination network costs more gas, which leaves less than your minimum"
+        }
     }
+}
+
+/// What a setup submission leaves for the user to know, from each setup's own problem. A
+/// private Bridge swap's two setups are named by their `networks`: the swap's own, then the
+/// destination's.
+fn setup_problems(
+    origin: Option<String>,
+    destination: Option<String>,
+    networks: Option<&(String, String)>,
+) -> Option<String> {
+    let Some((origin_network, destination_network)) = networks else {
+        return origin;
+    };
+    let problems = [(origin_network, origin), (destination_network, destination)]
+        .into_iter()
+        .filter_map(|(network, problem)| Some(format!("{network}: {}", problem?)))
+        .collect::<Vec<_>>();
+    (!problems.is_empty()).then(|| problems.join(" "))
 }
 
 /// What a broadcaster's answer leaves for the user to know. `None` when it accepted.
@@ -8895,6 +10614,9 @@ pub(super) fn broadcaster_result_problem(
         )),
     }
 }
+
+#[path = "buy_picker.rs"]
+mod buy_picker;
 
 #[cfg(test)]
 #[path = "ui_tests.rs"]

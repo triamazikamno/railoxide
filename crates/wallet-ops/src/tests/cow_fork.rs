@@ -1,6 +1,8 @@
 //! Opt-in Ethereum mainnet fork for private swap scenarios.
 //!
-//! Tests using it are `#[ignore]`d and read `ETH_FORK_RPC_URL`. Set `ANVIL_BIN`
+//! Tests using it are `#[ignore]`d and read `ETH_FORK_RPC_URL`. Tests that also
+//! fork the destination chain of a private Bridge delivery read that chain's RPC
+//! from `DESTINATION_FORK_RPC_URL`. Set `ANVIL_BIN`
 //! when `anvil` is not on `PATH`. Railgun accepts any proof when
 //! `tx.origin == 0x…dEaD` (its `VERIFICATION_BYPASS`); verification still runs,
 //! so gas matches real proofs. Every transaction here is sent from that address,
@@ -24,6 +26,7 @@ use broadcaster_core::contracts::railgun::{
 use url::Url;
 
 pub(crate) const FORK_RPC_URL_ENV: &str = "ETH_FORK_RPC_URL";
+pub(crate) const DESTINATION_FORK_RPC_URL_ENV: &str = "DESTINATION_FORK_RPC_URL";
 /// Railgun's `VERIFICATION_BYPASS` origin, used as sender and solver.
 pub(crate) const VERIFICATION_BYPASS: Address =
     address!("000000000000000000000000000000000000dEaD");
@@ -89,7 +92,7 @@ pub(crate) struct RailgunTree {
     pub(crate) root: B256,
 }
 
-/// A Prague mainnet fork on a free local port, stopped on drop.
+/// A Prague fork of one chain on a free local port, stopped on drop.
 pub(crate) struct ForkChain {
     child: Child,
     url: Url,
@@ -104,44 +107,9 @@ impl Drop for ForkChain {
 }
 
 impl ForkChain {
-    /// Spawn the fork, impersonate the bypass origin, and allow it as a solver.
+    /// Spawn the mainnet fork, impersonate the bypass origin, and allow it as a solver.
     pub(crate) async fn start() -> Self {
-        let fork_url = std::env::var(FORK_RPC_URL_ENV)
-            .unwrap_or_else(|_| panic!("{FORK_RPC_URL_ENV} is not set"));
-        let port = loop {
-            let port = TcpListener::bind("127.0.0.1:0")
-                .and_then(|listener| listener.local_addr())
-                .expect("free port")
-                .port();
-            // Another local service owns this port.
-            if port != 8547 {
-                break port;
-            }
-        };
-        let child = Command::new(std::env::var("ANVIL_BIN").unwrap_or_else(|_| "anvil".to_owned()))
-            .args(["--fork-url", fork_url.as_str(), "--hardfork", "prague"])
-            .args(["--port", port.to_string().as_str()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn anvil");
-        let url: Url = format!("http://127.0.0.1:{port}").parse().unwrap();
-        let provider = ProviderBuilder::new().connect_http(url.clone()).erased();
-        let fork = Self {
-            child,
-            url,
-            provider,
-        };
-        let mut ready = false;
-        for _ in 0..120 {
-            if fork.provider.get_chain_id().await.ok() == Some(1) {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        assert!(ready, "anvil did not start a mainnet fork");
-        fork.impersonate(VERIFICATION_BYPASS).await;
+        let fork = Self::spawn(FORK_RPC_URL_ENV, 1).await;
         let manager = fork
             .call(
                 SOLVER_AUTHENTICATION,
@@ -165,6 +133,62 @@ impl ForkChain {
             )
             .await;
         assert!(receipt.status(), "the bypass origin becomes a solver");
+        fork
+    }
+
+    /// Spawn the fork of `chain_id`, the destination chain of a private Bridge delivery, and
+    /// impersonate the bypass origin. No order settles there, so it has no solver.
+    pub(crate) async fn start_destination(chain_id: u64) -> Self {
+        Self::spawn(DESTINATION_FORK_RPC_URL_ENV, chain_id).await
+    }
+
+    /// Spawn a fork of the chain `chain_id` from the RPC that `url_env` names, and impersonate
+    /// the bypass origin.
+    async fn spawn(url_env: &str, chain_id: u64) -> Self {
+        let fork_url = std::env::var(url_env).unwrap_or_else(|_| panic!("{url_env} is not set"));
+        let port = loop {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("free port")
+                .port();
+            // Another local service owns this port.
+            if port != 8547 {
+                break port;
+            }
+        };
+        let child = Command::new(std::env::var("ANVIL_BIN").unwrap_or_else(|_| "anvil".to_owned()))
+            .args(["--fork-url", fork_url.as_str(), "--hardfork", "prague"])
+            .args(["--port", port.to_string().as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn anvil");
+        let url: Url = format!("http://127.0.0.1:{port}").parse().unwrap();
+        // Snapshot reverts also rewind account nonces. Read them from the fork for each send.
+        let provider = ProviderBuilder::default()
+            .with_gas_estimation()
+            .with_simple_nonce_management()
+            .fetch_chain_id()
+            .connect_http(url.clone())
+            .erased();
+        let fork = Self {
+            child,
+            url,
+            provider,
+        };
+        let mut ready = false;
+        for _ in 0..120 {
+            if fork.provider.get_chain_id().await.ok() == Some(chain_id) {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            ready,
+            "anvil did not start a fork of chain {chain_id} from {url_env}"
+        );
+        fork.impersonate(VERIFICATION_BYPASS).await;
         fork
     }
 
@@ -213,6 +237,78 @@ impl ForkChain {
     /// Later blocks are `seconds` further ahead of the local clock.
     pub(crate) async fn increase_time(&self, seconds: u64) {
         self.raw("evm_increaseTime", (U256::from(seconds),)).await;
+    }
+
+    /// Snapshot the fork's state, for [`Self::revert`].
+    pub(crate) async fn snapshot(&self) -> U256 {
+        self.provider
+            .raw_request("evm_snapshot".into(), ())
+            .await
+            .unwrap_or_else(|error| panic!("evm_snapshot: {error}"))
+    }
+
+    /// Return to the state at `snapshot`, which anvil then discards.
+    pub(crate) async fn revert(&self, snapshot: U256) {
+        let reverted: bool = self
+            .provider
+            .raw_request("evm_revert".into(), (snapshot,))
+            .await
+            .unwrap_or_else(|error| panic!("evm_revert: {error}"));
+        assert!(reverted, "the fork returns to its snapshot");
+    }
+
+    pub(crate) async fn storage_at(&self, account: Address, slot: U256) -> U256 {
+        self.provider.get_storage_at(account, slot).await.unwrap()
+    }
+
+    pub(crate) async fn set_storage(&self, account: Address, slot: U256, value: U256) {
+        self.raw("anvil_setStorageAt", (account, slot, B256::from(value)))
+            .await;
+    }
+
+    /// Why `transaction` would revert on the latest state, or `None` if it would succeed.
+    pub(crate) async fn revert_reason(&self, transaction: TransactionRequest) -> Option<String> {
+        self.provider
+            .call(transaction)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    }
+
+    /// Gas used by the first call to `to` in `transaction` whose input starts with `input`,
+    /// from anvil's call tracer. `None` when the trace is unavailable or has no such call.
+    pub(crate) async fn call_gas(
+        &self,
+        transaction: B256,
+        to: Address,
+        input: &[u8],
+    ) -> Option<u64> {
+        fn find(frame: &serde_json::Value, to: &str, input: &str) -> Option<u64> {
+            let field = |name: &str| frame[name].as_str().map(str::to_lowercase);
+            if field("to").as_deref() == Some(to)
+                && field("input").is_some_and(|data| data.starts_with(input))
+            {
+                let used = field("gasUsed")?;
+                return u64::from_str_radix(used.trim_start_matches("0x"), 16).ok();
+            }
+            frame["calls"]
+                .as_array()?
+                .iter()
+                .find_map(|call| find(call, to, input))
+        }
+        let trace: serde_json::Value = self
+            .provider
+            .raw_request(
+                "debug_traceTransaction".into(),
+                (transaction, serde_json::json!({"tracer": "callTracer"})),
+            )
+            .await
+            .ok()?;
+        find(
+            &trace,
+            &format!("{to:#x}"),
+            &Bytes::copy_from_slice(input).to_string(),
+        )
     }
 
     pub(crate) async fn block_number(&self) -> u64 {
@@ -272,10 +368,15 @@ impl ForkChain {
     }
 
     pub(crate) async fn railgun_tree(&self) -> RailgunTree {
-        let number = self.call(RAILGUN, ForkRailgun::treeNumberCall {}).await;
+        self.railgun_tree_of(RAILGUN).await
+    }
+
+    /// The current tree of the Railgun contract `railgun` on this fork's chain.
+    pub(crate) async fn railgun_tree_of(&self, railgun: Address) -> RailgunTree {
+        let number = self.call(railgun, ForkRailgun::treeNumberCall {}).await;
         RailgunTree {
             number: u16::try_from(number).unwrap(),
-            root: self.call(RAILGUN, ForkRailgun::merkleRootCall {}).await,
+            root: self.call(railgun, ForkRailgun::merkleRootCall {}).await,
         }
     }
 

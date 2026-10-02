@@ -247,6 +247,30 @@ impl WalletRoot {
         }
     }
 
+    /// Switch to `chain_id` and open recovery of its stealth account `operation` for `asset`,
+    /// as [`Self::open_stealth_account_recovery`] does. A private Bridge swap on another
+    /// network uses this for proceeds its destination stealth account holds. The switch
+    /// closes every dialog, so recovery keeps the focus it takes. Nothing happens while
+    /// `chain_id`'s session isn't loaded.
+    pub(super) fn open_stealth_account_recovery_on(
+        &mut self,
+        chain_id: u64,
+        operation: ExecutorOperationId,
+        asset: ExecutorAsset,
+        checked: Option<(U256, alloy::eips::BlockNumHash)>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. }) =
+            self.chain_states.get(&chain_id)
+        else {
+            return;
+        };
+        let target = StealthAccountTarget::new(session, operation);
+        self.select_chain(chain_id, window, cx);
+        self.open_stealth_account_recovery(&target, asset, checked, None, window, cx);
+    }
+
     pub(super) fn render_stealth_accounts_button(
         &self,
         root: &Entity<Self>,

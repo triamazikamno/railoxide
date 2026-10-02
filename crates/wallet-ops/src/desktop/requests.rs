@@ -225,6 +225,24 @@ impl DesktopPrivateSpendAuthorization {
         }
     }
 
+    /// The same software authorization for the destination chain's setup of a private Bridge
+    /// swap, which consumes its own value. A hardware approval is bound to one owner and
+    /// action; pair two with `HardwareExecutorAuthorizationRequest::complete_with_destination`.
+    pub fn for_destination(&self) -> Result<Self> {
+        match self {
+            Self::VaultPassword(password) => Ok(Self::VaultPassword(password.clone())),
+            Self::ProtectedSoftwareSeed { password, session } => Ok(Self::ProtectedSoftwareSeed {
+                password: password.clone(),
+                session: Arc::clone(session),
+            }),
+            Self::PreauthorizedSigner(_) | Self::HardwareExecutor(_) | Self::HardwarePublic => {
+                Err(eyre!(
+                    "this authorization covers one network; authorize the destination network's setup separately"
+                ))
+            }
+        }
+    }
+
     #[must_use]
     pub fn protected_seed_session(&self) -> Option<Arc<vault::ProtectedSoftwareSeedSession>> {
         match self {

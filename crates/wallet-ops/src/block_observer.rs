@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use alloy::consensus::BlockHeader as _;
 use alloy::eips::BlockNumHash;
-use alloy::network::AnyTransactionReceipt;
 use alloy::network::primitives::{BlockTransactions, HeaderResponse as _};
+use alloy::network::{AnyRpcBlock, AnyTransactionReceipt};
 use alloy::network::{BlockResponse as _, ReceiptResponse as _, TransactionResponse as _};
 use alloy::primitives::{Address, B256, FixedBytes};
 use alloy::providers::{DynProvider, Provider as _};
 use alloy::rpc::types::Log;
+use alloy::transports::{RpcError, TransportError};
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr as _, eyre};
 
 use crate::public_wallet::{PublicTransactionFamily, PublicTransactionTrackingContext};
 use crate::{RpcBroker, TxReceiptOutput};
@@ -378,46 +379,52 @@ pub(crate) async fn resolve_source_transaction_by_block(
     tx_hash: FixedBytes<32>,
 ) -> Result<SourceTransaction> {
     let providers = query_rpc_pool.available_providers();
-    if providers.is_empty() {
-        return Err(eyre!(
-            "privacy-preserving source transaction resolution is unavailable"
-        ));
-    }
+    let mut last_error = None;
     for provider in providers {
-        let Some(source) = fetch_source_transaction(&provider, block_number, tx_hash).await else {
-            query_rpc_pool.mark_bad_provider(&provider);
-            let rpc = crate::http::redact_url_for_display(&provider.url);
-            tracing::warn!(%rpc, "source block transaction resolution failed");
-            continue;
-        };
-        return Ok(source);
+        match fetch_source_transaction(&provider, block_number, tx_hash).await {
+            Ok(source) => return Ok(source),
+            Err(error) => {
+                query_rpc_pool.mark_bad_provider(&provider);
+                let rpc = crate::http::redact_url_for_display(&provider.url);
+                tracing::warn!(%rpc, error = %format_args!("{error:#}"), "source block transaction resolution failed");
+                last_error = Some(error);
+            }
+        }
     }
-    Err(eyre!(
-        "privacy-preserving source transaction resolution is unavailable"
-    ))
+    Err(last_error.unwrap_or_else(|| eyre!("no RPC endpoints are available")))
+        .wrap_err("privacy-preserving source transaction resolution is unavailable")
 }
 
-/// `None` covers every failed, unsupported or inconsistent read; the caller tries the next
-/// provider and never falls back to an exact-hash request.
+/// Errors contain only local descriptions and numeric RPC/HTTP codes. The caller tries the
+/// next provider and never falls back to an exact-hash request.
 async fn fetch_source_transaction(
     provider: &ProviderHandle,
     block_number: u64,
     tx_hash: FixedBytes<32>,
-) -> Option<SourceTransaction> {
+) -> Result<SourceTransaction> {
+    // A full block may contain chain-specific envelopes unrelated to the target transaction.
     let block = provider
         .provider
-        .get_block_by_number(block_number.into())
-        .full()
+        .client()
+        .request::<_, Option<AnyRpcBlock>>(
+            "eth_getBlockByNumber",
+            (alloy::eips::BlockNumberOrTag::Number(block_number), true),
+        )
         .await
-        .ok()??;
+        .map_err(|error| eyre!("eth_getBlockByNumber: {}", rpc_failure_reason(&error)))?
+        .ok_or_else(|| eyre!("eth_getBlockByNumber returned no block"))?;
     if block.header().number() != block_number {
-        return None;
+        return Err(eyre!(
+            "eth_getBlockByNumber returned the wrong block number"
+        ));
     }
 
     let mut sender = None;
     let mut matches = 0;
     let BlockTransactions::Full(transactions) = block.transactions() else {
-        return None;
+        return Err(eyre!(
+            "eth_getBlockByNumber omitted full transaction bodies"
+        ));
     };
     let mut hashes = Vec::with_capacity(transactions.len());
     for transaction in transactions {
@@ -428,9 +435,11 @@ async fn fetch_source_transaction(
         }
     }
     if matches != 1 {
-        return None;
+        return Err(eyre!(
+            "source transaction matched {matches} entries in the block; expected one"
+        ));
     }
-    let from = sender?;
+    let from = sender.ok_or_else(|| eyre!("source transaction sender is unavailable"))?;
 
     let receipts = fetch_checked_block_receipts(
         &provider.provider,
@@ -438,11 +447,12 @@ async fn fetch_source_transaction(
         &hashes,
     )
     .await
-    .ok()?;
+    .wrap_err("eth_getBlockReceipts")?;
     let receipt = receipts
         .into_iter()
-        .find(|receipt| receipt.transaction_hash() == tx_hash)?;
-    Some(SourceTransaction {
+        .find(|receipt| receipt.transaction_hash() == tx_hash)
+        .ok_or_else(|| eyre!("eth_getBlockReceipts omitted the source transaction receipt"))?;
+    Ok(SourceTransaction {
         from,
         logs: receipt.inner.logs().to_vec(),
     })
@@ -485,7 +495,7 @@ async fn fetch_receipt(
     {
         Ok(receipts) => receipts,
         Err(BlockReceiptsError::Unsupported) => return ReceiptFetch::Unsupported,
-        Err(BlockReceiptsError::Failed) => return ReceiptFetch::Failed,
+        Err(BlockReceiptsError::Failed(_)) => return ReceiptFetch::Failed,
         Err(BlockReceiptsError::Invalid) => return ReceiptFetch::Invalid,
     };
     let Some(receipt) = receipts
@@ -508,11 +518,29 @@ async fn fetch_receipt(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum BlockReceiptsError {
+    #[error("method is unsupported (RPC -32601)")]
     Unsupported,
-    Failed,
+    #[error("{0}")]
+    Failed(String),
+    #[error("receipts are missing, incomplete, or inconsistent with the block")]
     Invalid,
+}
+
+/// RPC error messages and response bodies may contain credentials or wallet identifiers.
+/// Preserve the failure category and status code without formatting those opaque strings.
+fn rpc_failure_reason(error: &TransportError) -> String {
+    match error {
+        RpcError::ErrorResp(payload) => format!("RPC error {}", payload.code),
+        RpcError::Transport(error) => error.as_http_error().map_or_else(
+            || "transport failure".to_owned(),
+            |error| format!("HTTP {}", error.status),
+        ),
+        RpcError::DeserError { .. } => "response could not be decoded".to_owned(),
+        RpcError::NullResp => "no RPC response".to_owned(),
+        _ => "RPC client failure".to_owned(),
+    }
 }
 
 /// Read a whole block's receipts and match identities locally. Executor outcome
@@ -541,7 +569,7 @@ pub(crate) async fn fetch_checked_block_receipts(
         {
             return Err(BlockReceiptsError::Unsupported);
         }
-        Err(_) => return Err(BlockReceiptsError::Failed),
+        Err(error) => return Err(BlockReceiptsError::Failed(rpc_failure_reason(&error))),
     };
     let expected = transactions.iter().copied().collect::<HashSet<_>>();
     if expected.len() != transactions.len() || receipts.len() != transactions.len() {
@@ -1451,16 +1479,18 @@ mod tests {
             spawn_rpc_script(2, move |request| match request["method"].as_str() {
                 Some("eth_getBlockByNumber") => {
                     assert_eq!(request["params"], json!(["0x9", true]));
+                    // Arbitrum blocks also contain chain-specific system transactions.
+                    // An unrelated envelope must not prevent resolving the Shield source.
+                    let mut decoy =
+                        full_legacy_transaction("0x43ec", decoy_hash, Address::from([0x70; 20]));
+                    decoy["type"] = json!("0x6a");
+                    decoy["requestId"] = json!(B256::repeat_byte(0x42));
                     Ok(block(
                         9,
                         block_hash,
                         B256::from([0x01; 32]),
                         &[
-                            full_legacy_transaction(
-                                "0x43ec",
-                                decoy_hash,
-                                Address::from([0x70; 20]),
-                            ),
+                            decoy,
                             full_legacy_transaction("0x43eb", target_hash, sender),
                         ],
                     ))
@@ -1479,7 +1509,9 @@ mod tests {
                         "logIndex": quantity(0),
                         "removed": false,
                     }]);
-                    Ok(json!([receipt(decoy_hash, 9, block_hash, 1), target]))
+                    let mut decoy = receipt(decoy_hash, 9, block_hash, 1);
+                    decoy["type"] = json!("0x6a");
+                    Ok(json!([decoy, target]))
                 }
                 method => panic!("unexpected RPC method {method:?}"),
             });
@@ -1499,6 +1531,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("eth_getBlockByNumber"), Some("eth_getBlockReceipts")]
         );
+    }
+
+    #[tokio::test]
+    async fn source_resolution_reports_failure_context_without_rpc_payloads() {
+        let target_hash = known_full_transaction_hash();
+        let sender = Address::from([0x8a; 20]);
+        let block_hash = B256::from([0x9b; 32]);
+        for failing_method in ["eth_getBlockByNumber", "eth_getBlockReceipts"] {
+            let request_count = if failing_method == "eth_getBlockByNumber" {
+                1
+            } else {
+                2
+            };
+            let (url, request_rx, task) = spawn_rpc_script(request_count, move |request| {
+                if request["method"] == failing_method {
+                    return Err(json!({
+                        "code": -32602,
+                        "message": format!("credential-secret: source transaction {target_hash}"),
+                        "data": { "credential": "payload-secret" },
+                    }));
+                }
+                assert_eq!(request["method"], "eth_getBlockByNumber");
+                Ok(block(
+                    9,
+                    block_hash,
+                    B256::from([0x01; 32]),
+                    &[full_legacy_transaction("0x43eb", target_hash, sender)],
+                ))
+            });
+            let pool = test_pool(url);
+            let error = resolve_source_transaction_by_block(&pool, 9, target_hash)
+                .await
+                .expect_err("failed source lookup must retain safe diagnostics");
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains(failing_method), "{diagnostic}");
+            assert!(diagnostic.contains("-32602"), "{diagnostic}");
+            assert!(!diagnostic.contains("credential-secret"));
+            assert!(!diagnostic.contains("payload-secret"));
+            assert!(!diagnostic.contains(&target_hash.to_string()));
+            task.join().expect("RPC fixture task");
+            assert_no_exact_hash_methods(&request_rx.try_iter().collect::<Vec<_>>());
+        }
     }
 
     #[tokio::test]

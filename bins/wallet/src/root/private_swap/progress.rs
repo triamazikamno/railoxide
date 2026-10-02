@@ -34,9 +34,10 @@ use wallet_ops::{
 use super::dialog::{SwapDialogView, settled_by_cow};
 use super::form::{broadcaster_result_problem, format_gwei, gas_share_name, network_name};
 use super::model::{
-    SwapActions, SwapOrderGroup, SwapStage, SwapStep, bridge_sent_amount, needs_executed_fee,
-    provider_name, record_swap_ranges, swap_actions, swap_order_group, swap_order_stage,
-    swap_outcome, swap_private_minimum, swap_steps, swap_valid_to, swaps_card_line,
+    SwapActions, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep, SwapStepAccount,
+    bridge_sent_amount, needs_executed_fee, private_delivery_credit, provider_name,
+    record_swap_ranges, swap_actions, swap_order_group, swap_order_stage, swap_outcome,
+    swap_private_delivery, swap_private_minimum, swap_steps, swap_valid_to, swaps_card_line,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -50,7 +51,8 @@ use crate::root::public_action::PublicActionStepStatus;
 use crate::root::spend_authorization::{SpendAuthorizationSummary, SpendAuthorizationSummaryRow};
 use crate::root::stealth_accounts::StealthAccountTarget;
 use crate::root::submission_progress::{
-    SubmissionProgressStep, render_submission_progress_stepper,
+    SubmissionProgressGroup, SubmissionProgressStep, SubmissionProgressSubstep,
+    render_submission_progress_groups,
 };
 use crate::root::utxo::short_hash;
 
@@ -192,6 +194,27 @@ impl PrivateSwapsView {
         if let Some(problem) = self.setup_retry_problem(record) {
             actions.resume = actions.resume.map(|_| Err(problem));
         }
+        // A private Bridge swap whose own account is set up waits for its destination
+        // account's setup, which the swap's own setup actions don't cover. A setup there that
+        // failed or was never sent is retried by itself.
+        let destination_setup = swap_private_delivery(record)
+            .filter(|_| {
+                !stopped
+                    && pending.is_none()
+                    && matches!(self.stage(record), SwapStage::Ready | SwapStage::Approved)
+            })
+            .map(|delivery| (delivery, self.destination_setup_progress(record, delivery)))
+            .filter(|(_, progress)| *progress != SwapSetupProgress::Done);
+        let retry_destination = destination_setup.and_then(|(delivery, progress)| {
+            matches!(
+                progress,
+                SwapSetupProgress::NotSent | SwapSetupProgress::Failed
+            )
+            .then_some(delivery.destination_chain)
+        });
+        if destination_setup.is_some() {
+            actions.resume = None;
+        }
         if cancelling {
             actions.cancel = actions
                 .cancel
@@ -209,12 +232,14 @@ impl PrivateSwapsView {
             .into_iter()
             .enumerate()
             .map(|(index, mut step)| {
-                let detail = if index == 0
+                // A setup step with sub-steps shows each account's progress on its own.
+                let setup = index == 0 && step.children.is_empty();
+                let detail = if setup
                     && stage == SwapStage::SetupSubmitting
                     && let Some(setup_stage) = setup_stage
                 {
                     setup_stage.label().to_owned()
-                } else if index == 0
+                } else if setup
                     && stage == SwapStage::SetupPending
                     && let Some(detail) = self.setup_confirmation_detail(record, cx)
                 {
@@ -231,7 +256,7 @@ impl PrivateSwapsView {
                 } else {
                     step.detail.clone()
                 };
-                progress_step(
+                progress_group(
                     &step,
                     detail,
                     format!("swap-step-{}-{index}", operation.opaque_id()),
@@ -240,14 +265,24 @@ impl PrivateSwapsView {
         let error = tracking
             .and_then(|tracking| tracking.error.clone())
             .or_else(|| self.error.clone());
-        let note = if stopped {
+        let note: Option<SharedString> = if stopped {
             Some(
-                "This setup was stopped, so no order will be placed. Its stealth account stays in Stealth accounts.",
+                "This setup was stopped, so no order will be placed. Its stealth account stays in Stealth accounts."
+                    .into(),
             )
         } else if record.is_hidden() && actions.dismiss {
-            Some("Removed from the Private tab. Tracking continues in My orders.")
+            Some("Removed from the Private tab. Tracking continues in My orders.".into())
+        } else if let Some(chain_id) = retry_destination {
+            Some(
+                format!(
+                    "Retry sends only the setup on {} again. The fee already paid on {} isn't paid again. Nothing was unshielded.",
+                    network_name(chain_id),
+                    network_name(self.session.chain_id)
+                )
+                .into(),
+            )
         } else {
-            progress_note(stage)
+            progress_note(stage).map(Into::into)
         };
         let latest = pending
             .is_none()
@@ -300,7 +335,7 @@ impl PrivateSwapsView {
             .gap_3()
             .children(
                 shows_steps(stage, outcome.is_some())
-                    .then(|| render_submission_progress_stepper(steps)),
+                    .then(|| render_submission_progress_groups(steps)),
             )
             .children(not_filled)
             .children(facts)
@@ -319,7 +354,14 @@ impl PrivateSwapsView {
             }));
         (
             body,
-            Some(self.render_progress_actions(operation, stage, actions, job, cx)),
+            Some(self.render_progress_actions(
+                operation,
+                stage,
+                actions,
+                retry_destination,
+                job,
+                cx,
+            )),
         )
     }
 
@@ -356,7 +398,7 @@ impl PrivateSwapsView {
             .enumerate()
             .map(|(index, step)| {
                 let detail = step.detail.clone();
-                progress_step(
+                progress_group(
                     &step,
                     detail,
                     format!("swap-step-{}-{first}-{index}", operation.opaque_id()),
@@ -384,7 +426,7 @@ impl PrivateSwapsView {
             .gap_3()
             .children(
                 shows_steps(stage, outcome.is_some())
-                    .then(|| render_submission_progress_stepper(steps)),
+                    .then(|| render_submission_progress_groups(steps)),
             )
             .children(not_filled)
             .children(facts)
@@ -465,7 +507,9 @@ impl PrivateSwapsView {
 
     /// A Bridge swap's facts: its receiver, destination and provider, then what its state
     /// needs, from the provider's deposit and the destination outcome to the settlement on this
-    /// network. A deposit that needs attention shows its address in full.
+    /// network. A deposit that needs attention shows its address in full. A private delivery
+    /// has no receiver: its destination is the private balance on the destination network, and
+    /// held proceeds name the destination stealth account.
     fn render_bridge_facts(
         &self,
         record: &ExecutorRecord,
@@ -478,10 +522,11 @@ impl PrivateSwapsView {
         let network = network_name(delivery.destination_chain);
         let origin = network_name(self.session.chain_id);
         let provider = provider_name(delivery.provider);
+        let private = delivery.is_private();
         let destination_amount = |amount| {
             self.network_token_amount(
                 delivery.destination_chain,
-                self.bridge_received_token(delivery, cx),
+                self.delivered_token(delivery, cx),
                 amount,
                 cx,
             )
@@ -496,16 +541,27 @@ impl PrivateSwapsView {
             Some(BridgeOrderTerms::NearIntents(near)) => (None, Some(near)),
             None => (None, None),
         };
-        let minimum = order.map_or_else(
-            || {
-                record
-                    .swap_approval()
-                    .and_then(|approval| approval.bounds.destination_minimum)
-            },
-            |order| order.bounds().destination_minimum,
+        let bounds = order
+            .map(SwapOrderRecord::bounds)
+            .or_else(|| record.swap_approval().map(|approval| &approval.bounds));
+        // The private balance gets the minimum less the destination network's shield fee.
+        let minimum = bounds.and_then(|bounds| {
+            let minimum = bounds.destination_minimum?;
+            Some(if private {
+                private_delivery_credit(minimum, bounds)
+            } else {
+                minimum
+            })
+        });
+        let receiver = (!private).then(|| self.receiver_row(delivery.receiver, cx));
+        let destination = fact_row(
+            "Destination",
+            app_text(if private {
+                format!("Private balance on {network}")
+            } else {
+                network.clone()
+            }),
         );
-        let receiver = self.receiver_row(delivery.receiver, cx);
-        let destination = fact_row("Destination", app_text(network.clone()));
         let provider_row = fact_row("Provider", app_text(provider));
         let deposit = observed
             .bridge_handoff
@@ -557,20 +613,39 @@ impl PrivateSwapsView {
         let mut note = None;
         match stage {
             SwapStage::Order(SwapOrderState::Done) => {
-                rows.push(receiver);
+                rows.extend(receiver);
                 match observed.bridge_outcome {
                     Some(SwapBridgeOutcome::DeliveredVerified {
                         block,
                         output_amount,
+                        shielded,
                         ..
                     }) => {
-                        rows.push(fact_row(
-                            "Delivered",
-                            amount_with_note(
-                                destination_amount(output_amount),
-                                format!("on {network}"),
-                            ),
-                        ));
+                        if private {
+                            // What the destination stealth account shielded, less the fee.
+                            let received =
+                                bounds.filter(|_| shielded).map_or(output_amount, |bounds| {
+                                    private_delivery_credit(output_amount, bounds)
+                                });
+                            rows.push(fact_row(
+                                "Received",
+                                amount_with_note(
+                                    destination_amount(received),
+                                    minimum.map_or_else(String::new, |minimum| {
+                                        format!("(minimum {})", destination_amount(minimum))
+                                    }),
+                                ),
+                            ));
+                            rows.push(destination);
+                        } else {
+                            rows.push(fact_row(
+                                "Delivered",
+                                amount_with_note(
+                                    destination_amount(output_amount),
+                                    format!("on {network}"),
+                                ),
+                            ));
+                        }
                         // A post-hook that reshields the surplus credits it privately.
                         rows.extend(buy.zip(observed.settlement_credit).map(|(buy, credit)| {
                             fact_row(
@@ -600,7 +675,9 @@ impl PrivateSwapsView {
                                 railgun_ui::format_token_amount(U256::from(block.number), 0)
                             )),
                         ));
-                        rows.push(fact_row("Settled by", settled_by_cow()));
+                        if !private {
+                            rows.push(fact_row("Settled by", settled_by_cow()));
+                        }
                     }
                     Some(SwapBridgeOutcome::DeliveredReported {
                         amount_out,
@@ -640,7 +717,8 @@ impl PrivateSwapsView {
                 rows.extend(settlement);
             }
             SwapStage::Order(SwapOrderState::Refunding) => {
-                rows.extend([receiver, provider_row]);
+                rows.extend(receiver);
+                rows.push(provider_row);
                 rows.extend(deposit);
                 rows.extend(across.map(|across| {
                     fact_row(
@@ -662,7 +740,8 @@ impl PrivateSwapsView {
                             fact_row("Amount sent", app_text(self.token_amount(buy, sent, cx)))
                         }),
                 );
-                rows.extend([receiver, destination, provider_row]);
+                rows.extend(receiver);
+                rows.extend([destination, provider_row]);
                 rows.extend(settlement);
                 note = Some(format!(
                     "Give {provider} support the deposit address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
@@ -671,12 +750,53 @@ impl PrivateSwapsView {
             }
             // The Across post-hook didn't run, so there's no deposit.
             SwapStage::Order(SwapOrderState::NotDelivered) => {
-                rows.extend([receiver, destination, provider_row]);
+                rows.extend(receiver);
+                rows.extend([destination, provider_row]);
                 rows.extend(settlement);
                 rows.extend(checked);
             }
+            // The fill completed without its shield: the destination stealth account, the
+            // fill, and what this session's last explicit check found in the account.
+            SwapStage::Order(SwapOrderState::HeldOnDestination) => {
+                rows.push(fact_row(
+                    format!("Account on {network}"),
+                    stealth_account(
+                        "swap-held-account",
+                        SwapStepAccount {
+                            index: self
+                                .destination_account(record, delivery)
+                                .map(ExecutorRecord::index),
+                            address: delivery.receiver,
+                        },
+                    ),
+                ));
+                rows.push(provider_row);
+                if let Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) =
+                    observed.bridge_outcome
+                {
+                    rows.push(fact_row(
+                        "Fill",
+                        app_text(format!(
+                            "{network} block {}",
+                            railgun_ui::format_token_amount(U256::from(block.number), 0)
+                        )),
+                    ));
+                }
+                rows.extend(
+                    self.tracking
+                        .get(&record.operation())
+                        .and_then(|tracking| tracking.destination_balance)
+                        .map(|(balance, _)| {
+                            fact_row("In stealth account", app_text(destination_amount(balance)))
+                        }),
+                );
+                note = Some(format!(
+                    "Recover on {network}… shields it to your private balance on {network} for the shield fee and a broadcaster fee, paid from your private balance there."
+                ));
+            }
             SwapStage::Order(SwapOrderState::Traded | SwapOrderState::Bridging) => {
-                rows.extend([receiver, destination, provider_row]);
+                rows.extend(receiver);
+                rows.extend([destination, provider_row]);
                 rows.extend(deposit);
                 rows.extend(settlement);
                 rows.extend(started);
@@ -689,7 +809,8 @@ impl PrivateSwapsView {
                     rows.push(hash_row("Order ID", order_id, copy_id, "Copy order ID"));
                     rows.push(fact_row("Settled by", settled_by_cow()));
                 }
-                rows.extend([receiver, destination, provider_row]);
+                rows.extend(receiver);
+                rows.extend([destination, provider_row]);
                 // Across delivers its exact output; NEAR Intents at least its minimum.
                 rows.extend(
                     minimum
@@ -1096,6 +1217,7 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         stage: SwapStage,
         actions: super::model::SwapActions,
+        retry_destination: Option<u64>,
         job: Option<SwapJobKind>,
         cx: &Context<'_, Self>,
     ) -> gpui::Div {
@@ -1163,11 +1285,14 @@ impl PrivateSwapsView {
                     )
                 )
         });
+        // Held proceeds are looked for in the destination stealth account, on its network.
+        let held = stage.is_held_on_destination();
         let check = record
             .and_then(|record| record.swap())
             .and_then(|swap| swap.orders().last())
             .filter(|order| {
                 bridge_check
+                    || held
                     || (stage.is_observed()
                         && (u64::from(order.valid_to()) < now_unix()
                             || stage == SwapStage::Order(SwapOrderState::Traded)))
@@ -1187,6 +1312,7 @@ impl PrivateSwapsView {
                     .when(checking, |button| button.icon(IconName::LoaderCircle))
                     .loading(checking)
                     .tooltip(match stage {
+                        _ if held => "Checks the destination stealth account's balance with that network's RPC provider",
                         _ if !bridge_check => "Checks this stealth account's state with the RPC provider for retry or recovery",
                         SwapStage::Order(SwapOrderState::NeedsAttention) => {
                             "Asks the provider about the deposit, then checks this stealth account for a refund"
@@ -1197,7 +1323,9 @@ impl PrivateSwapsView {
                         _ => "Checks this stealth account's balance with the RPC provider",
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if bridge_check {
+                        if held {
+                            this.check_destination_status(operation, window, cx);
+                        } else if bridge_check {
                             this.check_bridge_status(operation, window, cx);
                         } else {
                             this.check_order_status(operation, window, cx);
@@ -1303,6 +1431,46 @@ impl PrivateSwapsView {
                     this.recover(operation, window, cx);
                 }))
         });
+        // Recovery of held proceeds is the destination stealth account's, on its own network,
+        // once that network's records tell the account.
+        let recover_on_destination = record
+            .filter(|_| actions.recover_on_destination)
+            .and_then(|record| Some((record, swap_private_delivery(record)?)))
+            .map(|(record, delivery)| {
+                let network = network_name(delivery.destination_chain);
+                let loaded = self.destination_account(record, delivery).is_some();
+                app_button(
+                    "swap-progress-recover-destination",
+                    format!("Recover on {network}…"),
+                )
+                .debug_selector(|| "swap-progress-recover-destination".into())
+                .small()
+                .flex_none()
+                .disabled(busy || !loaded)
+                .tooltip(if loaded {
+                    format!("Switches to {network} and opens the stealth account's recovery there")
+                } else {
+                    format!("Available once {network} has loaded")
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.recover_on_destination(operation, window, cx);
+                }))
+            });
+        let retry_setup = retry_destination.map(|chain_id| {
+            app_button(
+                "swap-progress-retry-destination",
+                format!("Retry setup on {}…", network_name(chain_id)),
+            )
+            .debug_selector(|| "swap-progress-retry-destination".into())
+            .primary()
+            .small()
+            .flex_none()
+            .loading(job == Some(SwapJobKind::SetupQuote))
+            .disabled(busy)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.retry_destination_setup(operation, window, cx);
+            }))
+        });
         // A removed swap stays in My orders, so its detail opens without this action.
         let remove = (actions.dismiss && !hidden).then(|| {
             app_button("swap-progress-remove", "Remove from Private tab")
@@ -1337,9 +1505,11 @@ impl PrivateSwapsView {
             )
             .children(resubmit)
             .children(resume)
+            .children(retry_setup)
             .children(retry)
             .children(check)
             .children(recover)
+            .children(recover_on_destination)
     }
 
     /// Stop local delivery and automatic continuation. Already issued payloads remain
@@ -1394,7 +1564,9 @@ impl PrivateSwapsView {
         });
     }
 
-    /// The detail stays open and shows the stopped setup, which remains in My orders.
+    /// The detail stays open and shows the stopped setup, which remains in My orders. A
+    /// private Bridge swap's destination stealth account is stopped with it when its network is
+    /// loaded. Otherwise that network's next load stops it.
     fn stop_setup(&mut self, operation: ExecutorOperationId, cx: &mut Context<'_, Self>) -> bool {
         if !self.session_is_current(cx)
             || self
@@ -1403,10 +1575,19 @@ impl PrivateSwapsView {
         {
             return false;
         }
+        let destination = self.record(operation).and_then(|record| {
+            let delivery = swap_private_delivery(record)?;
+            let (_, owner) = self.destination_owner(delivery.destination_chain, cx)?;
+            Some((owner, record.destination_operation()?))
+        });
         if let Err(error) = self.owner.stop_swap_setup(operation) {
             self.fail(operation, error.to_string());
             cx.notify();
             return false;
+        }
+        if let Some((owner, destination_operation)) = destination {
+            // A failed write is repeated when the destination network reconciles its accounts.
+            let _ = owner.stop_swap_setup(destination_operation);
         }
         self.stop_setup_job(operation);
         self.form = None;
@@ -1675,7 +1856,8 @@ impl PrivateSwapsView {
         let Some((sell, _)) = self.record(operation).and_then(swap_tokens) else {
             return;
         };
-        let (_, token, candidates) = self.setup_fee_route(sell, None, false, false, cx);
+        let (_, token, candidates) =
+            self.setup_fee_route(self.session.chain_id, sell, None, false, false, cx);
         let candidate = token.and_then(|_| {
             let root = self.root.upgrade()?;
             let root = root.read(cx);
@@ -1902,6 +2084,102 @@ impl PrivateSwapsView {
         });
     }
 
+    /// Held proceeds are recovered in Stealth accounts on the destination network. Switching
+    /// to that network closes this dialog and replaces this view, so the root does both after
+    /// this update: it switches, then opens the destination stealth account's recovery with
+    /// this session's last check of its balance.
+    fn recover_on_destination(
+        &self,
+        operation: ExecutorOperationId,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(record) = self.record(operation) else {
+            return;
+        };
+        let Some(delivery) = swap_private_delivery(record) else {
+            return;
+        };
+        let Some(destination) = self.destination_account(record, delivery) else {
+            return;
+        };
+        let destination = destination.operation();
+        let checked = self
+            .tracking
+            .get(&operation)
+            .and_then(|tracking| tracking.destination_balance);
+        let root = self.root.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = root.update(cx, |root, cx| {
+                root.open_stealth_account_recovery_on(
+                    delivery.destination_chain,
+                    destination,
+                    ExecutorAsset::Erc20(delivery.destination_token),
+                    checked,
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    /// An explicit check of held proceeds, through the destination network's owner: it settles
+    /// the destination stealth account's record from this swap's outcome, then reads the
+    /// delivered token's balance there, which recovery opens with.
+    fn check_destination_status(
+        &mut self,
+        operation: ExecutorOperationId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(delivery) = self.record(operation).and_then(swap_private_delivery) else {
+            return;
+        };
+        let chain_id = delivery.destination_chain;
+        let destination = self
+            .record(operation)
+            .and_then(|record| self.destination_account(record, delivery))
+            .map(ExecutorRecord::operation);
+        let Some(((_, owner), destination)) = self.destination_owner(chain_id, cx).zip(destination)
+        else {
+            self.ensure_destination_load(chain_id, cx);
+            self.reload_destinations(cx);
+            self.fail(
+                operation,
+                format!(
+                    "{} isn't loaded yet. Check again once it has synced.",
+                    network_name(chain_id)
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let asset = ExecutorAsset::Erc20(delivery.destination_token);
+        self.start_job(
+            operation,
+            SwapJobKind::Check,
+            async move {
+                owner.reconcile_swap_destinations()?;
+                let inspection = owner.inspect_record(destination, &[asset]).await?;
+                Ok(inspection
+                    .balances()
+                    .get(&asset)
+                    .copied()
+                    .flatten()
+                    .map(|balance| (balance, inspection.block())))
+            },
+            move |this, balance, _, _| {
+                let tracking = this.tracking.entry(operation).or_default();
+                if balance.is_some() {
+                    tracking.destination_balance = balance;
+                }
+                tracking.error = None;
+            },
+            window,
+            cx,
+        );
+    }
+
     /// Removal hides the swap's account, which is persisted with the encrypted record. The swap
     /// stays in My orders, and an account that needs attention stays listed in Stealth accounts.
     fn remove_from_private_tab(
@@ -2068,6 +2346,58 @@ fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>)
             orders.len()
         )),
     }
+}
+
+/// A swap step and its sub-steps for the shared stepper. A sub-step names its network and its
+/// stealth account, with a control that copies the account's address, and ends with its block
+/// or what it waits for.
+fn progress_group(step: &SwapStep, detail: String, id: String) -> SubmissionProgressGroup {
+    let substeps = step
+        .children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let key = child.account.map_or_else(
+                || index.to_string(),
+                |account| account.address.to_checksum(None),
+            );
+            SubmissionProgressSubstep {
+                id: SharedString::from(format!("{id}-{key}")),
+                label: child.label.clone(),
+                status: child.status,
+                content: child.account.map(|account| {
+                    stealth_account("swap-step-account", account).into_any_element()
+                }),
+                outcome: child.detail.clone(),
+            }
+        })
+        .collect();
+    SubmissionProgressGroup {
+        step: progress_step(step, detail, id),
+        substeps,
+    }
+}
+
+/// A stealth account's number and short address, with a control that copies the address in
+/// full. `id` tells the account's places on one detail apart.
+fn stealth_account(id: &'static str, account: SwapStepAccount) -> gpui::Div {
+    let short = short_receiver(account.address);
+    let address = account.address.to_checksum(None);
+    let copy_id = SharedString::from(format!("{id}-{address}-copy"));
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            app_muted_text(
+                account
+                    .index
+                    .map_or_else(|| short.clone(), |index| format!("#{index} · {short}")),
+            )
+            .font_family(theme::APP_MONO_FONT_FAMILY),
+        )
+        .child(clipboard_with_toast(copy_id, address).tooltip("Copy stealth account address"))
 }
 
 /// A swap step for the shared stepper, whose body hides a detail equal to its label.
@@ -2254,9 +2584,13 @@ const fn progress_note(stage: SwapStage) -> Option<&'static str> {
         SwapStage::SetupNotSent | SwapStage::SetupFailed => Some(
             "Continue to send the setup again with the same stealth account. Nothing was unshielded.",
         ),
-        // A Bridge swap's facts explain its refund, or what needs attention.
+        // A Bridge swap's facts explain its refund, what needs attention, or the recovery of
+        // held proceeds on the destination network.
         SwapStage::Order(
-            SwapOrderState::Done | SwapOrderState::Refunding | SwapOrderState::NeedsAttention,
+            SwapOrderState::Done
+            | SwapOrderState::Refunding
+            | SwapOrderState::NeedsAttention
+            | SwapOrderState::HeldOnDestination,
         )
         | SwapStage::Recovered => None,
     }

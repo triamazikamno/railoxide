@@ -993,7 +993,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
     {
         Ok(origin) => origin,
         Err(error) => {
-            tracing::warn!(%error, "resolve blocked Shield source origin failed");
+            tracing::warn!(error = %format_args!("{error:#}"), "resolve blocked Shield source origin failed");
             return Ok(blocked_shield_rescue_disabled(
                 "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
                 None,

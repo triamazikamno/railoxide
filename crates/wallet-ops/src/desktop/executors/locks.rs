@@ -377,9 +377,9 @@ fn payload_reason(
 
 fn payload_kind(record: &ExecutorRecord, payload: &IssuedExecutorPayload) -> ExecutorInputLockKind {
     match payload.purpose() {
-        ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook => {
-            ExecutorInputLockKind::SwapOrder
-        }
+        ExecutorPayloadPurpose::SwapPreHook
+        | ExecutorPayloadPurpose::SwapPostHook
+        | ExecutorPayloadPurpose::SwapDestinationShield => ExecutorInputLockKind::SwapOrder,
         ExecutorPayloadPurpose::Recovery => ExecutorInputLockKind::Recovery,
         ExecutorPayloadPurpose::Operation if super::is_swap_record(record) => {
             ExecutorInputLockKind::SwapSetup

@@ -247,8 +247,8 @@ pub(super) async fn submit_self_broadcast_plan(
         );
 
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(3)) => {
+            match wait_for_self_broadcast_poll_or_command(&mut command_rx).await {
+                None => {
                     let observation = observer
                         .as_mut()
                         .expect("self-broadcast observer established")
@@ -299,10 +299,7 @@ pub(super) async fn submit_self_broadcast_plan(
                         });
                     }
                 }
-                command = recv_self_broadcast_command(&mut command_rx) => {
-                    let Some(command) = command else {
-                        continue;
-                    };
+                Some(command) => {
                     let Some(nonce) = nonce else {
                         next_gas_fee = command.gas_fee;
                         break;
@@ -452,6 +449,25 @@ pub(super) async fn recv_self_broadcast_command(
 ) -> Option<SelfBroadcastCommand> {
     let command_rx = command_rx.as_mut()?;
     command_rx.recv().await
+}
+
+/// `None` requests the next receipt poll; a closed command stream is not a poll tick.
+async fn wait_for_self_broadcast_poll_or_command(
+    command_rx: &mut Option<SelfBroadcastCommandReceiver>,
+) -> Option<SelfBroadcastCommand> {
+    let poll = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(poll);
+    loop {
+        tokio::select! {
+            () = &mut poll => return None,
+            command = recv_self_broadcast_command(command_rx), if command_rx.is_some() => {
+                if command.is_some() {
+                    return command;
+                }
+                *command_rx = None;
+            }
+        }
+    }
 }
 
 pub(super) async fn submit_self_broadcast_attempt(
@@ -2382,6 +2398,44 @@ mod tests {
 
     use super::*;
     use serde_json::{Value, json};
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_polling_survives_absent_or_closed_self_broadcast_commands() {
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_tx);
+        for mut command_rx in [None, Some(closed_rx)] {
+            let started = tokio::time::Instant::now();
+            assert!(
+                wait_for_self_broadcast_poll_or_command(&mut command_rx)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(3));
+        }
+
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let mut command_rx = Some(command_rx);
+        let replacement = SelfBroadcastCommand {
+            kind: SelfBroadcastCommandKind::Replacement,
+            gas_fee: SelfBroadcastGasFeeSelection::Auto,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            command_tx.send(replacement).expect("queue replacement");
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_self_broadcast_poll_or_command(&mut command_rx).await,
+            Some(replacement),
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(
+            wait_for_self_broadcast_poll_or_command(&mut command_rx)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
 
     #[test]
     fn self_broadcast_observation_preserves_unknown_hash_and_canonical_winner() {

@@ -8,10 +8,10 @@ use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
     SwapOrderState, SwapSetupStatus, swap_order_state,
     vault::{
-        BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult, ExecutorPayloadInclusion,
-        ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind,
-        SwapApprovedBounds, SwapDelivery, SwapOrderObservations, SwapOrderRecord,
-        SwapPreHookDeathCause, SwapSubmissionStatus, SwapTradeAmounts,
+        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult,
+        ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
+        ExecutorRecoveryStepKind, SwapApprovedBounds, SwapDelivery, SwapOrderObservations,
+        SwapOrderRecord, SwapPreHookDeathCause, SwapSubmissionStatus, SwapTradeAmounts,
     },
 };
 
@@ -63,6 +63,7 @@ impl SwapStage {
                         | SwapOrderState::AttemptEnded(_)
                         | SwapOrderState::NotDelivered
                         | SwapOrderState::Refunding
+                        | SwapOrderState::HeldOnDestination
                         | SwapOrderState::PreHookOnly { expired: true }
                 )
         )
@@ -78,7 +79,9 @@ impl SwapStage {
         )
     }
 
-    /// Funds sit in the stealth account and no order can deliver them any more.
+    /// Funds sit in the swap's own stealth account and no order can deliver them any more.
+    /// Proceeds held by a private Bridge swap's destination account are recovered on that
+    /// network instead, as [`Self::is_held_on_destination`] tells.
     pub(in crate::root) const fn needs_recovery(self) -> bool {
         matches!(
             self,
@@ -90,10 +93,18 @@ impl SwapStage {
         )
     }
 
-    /// The swap asks the user to act: recover its funds, or have a bridge provider resolve its
-    /// deposit.
+    /// A private Bridge swap's fill completed without its shield, so the destination stealth
+    /// account holds the proceeds until they are recovered on that network.
+    pub(in crate::root) const fn is_held_on_destination(self) -> bool {
+        matches!(self, Self::Order(SwapOrderState::HeldOnDestination))
+    }
+
+    /// The swap asks the user to act: recover its funds, here or on the destination network, or
+    /// have a bridge provider resolve its deposit.
     pub(in crate::root) const fn needs_attention(self) -> bool {
-        self.needs_recovery() || matches!(self, Self::Order(SwapOrderState::NeedsAttention))
+        self.needs_recovery()
+            || self.is_held_on_destination()
+            || matches!(self, Self::Order(SwapOrderState::NeedsAttention))
     }
 
     /// Canonical observation can still change this stage.
@@ -502,8 +513,146 @@ pub(in crate::root) struct SwapBridgeLabels {
     /// "248.82 USDC" of the bought token, once traded: what the settlement handed to the
     /// bridge, or what an Across post-hook that didn't run left in the stealth account.
     pub(in crate::root) sent: Option<String>,
-    /// "248.71 USDC", the approved minimum on the destination network.
+    /// "248.71 USDC", the approved minimum on the destination network. For private delivery,
+    /// what the private balance gets after that network's shield fee.
     pub(in crate::root) minimum: Option<String>,
+    /// Set when the swap delivers to the wallet's private balance on the destination network.
+    /// `receiver` is then the destination stealth account, which no copy names as a receiver.
+    pub(in crate::root) private: Option<SwapPrivateBridgeLabels>,
+}
+
+impl SwapBridgeLabels {
+    /// Who gets the proceeds on the destination network, as copy names it after "to".
+    const fn destination(&self) -> &str {
+        if self.private.is_some() {
+            "your private balance"
+        } else {
+            self.receiver.as_str()
+        }
+    }
+}
+
+/// Display strings for a private Bridge swap's two stealth accounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) struct SwapPrivateBridgeLabels {
+    /// Each network's stealth account setup, the swap's own network first.
+    pub(in crate::root) setups: [SwapSetupLabels; 2],
+    /// "992.74 USDC", what the destination stealth account holds after a fill without its
+    /// shield.
+    pub(in crate::root) held: Option<String>,
+}
+
+/// One network's stealth account and how far its setup is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) struct SwapSetupLabels {
+    /// The account's network, such as "Arbitrum One".
+    pub(in crate::root) network: String,
+    /// `None` until the account's address is derived.
+    pub(in crate::root) account: Option<SwapStepAccount>,
+    pub(in crate::root) progress: SwapSetupProgress,
+    /// The block the setup was included in, once recorded.
+    pub(in crate::root) block: Option<u64>,
+    /// What a setup on its way waits for, when this session knows it.
+    pub(in crate::root) detail: Option<String>,
+}
+
+/// The stealth account a setup sub-step names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::root) struct SwapStepAccount {
+    /// The account's number. `None` for a destination account whose network isn't loaded.
+    pub(in crate::root) index: Option<u32>,
+    pub(in crate::root) address: Address,
+}
+
+/// How far one stealth account's setup is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::root) enum SwapSetupProgress {
+    NotSent,
+    /// The account's network isn't loaded in this session, so its records can't be read.
+    NetworkLoading,
+    Submitting,
+    /// Sent, and its delegation isn't confirmed yet.
+    Pending,
+    Done,
+    Failed,
+}
+
+/// One account's setup progress from the stage its own record gives.
+pub(in crate::root) const fn swap_setup_progress(stage: SwapStage) -> SwapSetupProgress {
+    match stage {
+        SwapStage::SetupNotSent => SwapSetupProgress::NotSent,
+        SwapStage::SetupSubmitting => SwapSetupProgress::Submitting,
+        SwapStage::SetupPending => SwapSetupProgress::Pending,
+        SwapStage::SetupFailed | SwapStage::SetupRetired => SwapSetupProgress::Failed,
+        _ => SwapSetupProgress::Done,
+    }
+}
+
+/// A private Bridge swap is set up once both stealth accounts are. With the swap's own account
+/// set up, the destination account's setup decides the stage shown.
+pub(in crate::root) const fn private_bridge_setup_stage(
+    stage: SwapStage,
+    destination: SwapSetupProgress,
+) -> SwapStage {
+    match (stage, destination) {
+        (SwapStage::Ready | SwapStage::Approved, SwapSetupProgress::NotSent) => {
+            SwapStage::SetupNotSent
+        }
+        (SwapStage::Ready | SwapStage::Approved, SwapSetupProgress::Submitting) => {
+            SwapStage::SetupSubmitting
+        }
+        (
+            SwapStage::Ready | SwapStage::Approved,
+            SwapSetupProgress::Pending | SwapSetupProgress::NetworkLoading,
+        ) => SwapStage::SetupPending,
+        (SwapStage::Ready | SwapStage::Approved, SwapSetupProgress::Failed) => {
+            SwapStage::SetupFailed
+        }
+        _ => stage,
+    }
+}
+
+/// The block a record's executed setup was included in.
+pub(in crate::root) fn swap_setup_block(record: &ExecutorRecord) -> Option<u64> {
+    record
+        .issued()
+        .iter()
+        .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
+        .find_map(|payload| {
+            payload
+                .inclusion()
+                .filter(|inclusion| inclusion.result() == ExecutorExecutionResult::Executed)
+                .map(|inclusion| inclusion.block().number)
+        })
+}
+
+/// The record's delivery when it shields to the wallet on another network.
+pub(in crate::root) fn swap_private_delivery(record: &ExecutorRecord) -> Option<BridgeDelivery> {
+    match swap_delivery(record) {
+        SwapDelivery::Bridge(delivery) if delivery.is_private() => Some(delivery),
+        _ => None,
+    }
+}
+
+/// What a private Bridge delivery credits to the private balance: `amount`, which the
+/// destination stealth account shields, less Railgun's shield fee at the rate the order's
+/// approval bound.
+pub(in crate::root) fn private_delivery_credit(amount: U256, bounds: &SwapApprovedBounds) -> U256 {
+    let fee = bounds
+        .destination_shield_fee_bps
+        .map_or(U256::ZERO, |fee_bps| {
+            amount.saturating_mul(fee_bps) / U256::from(10_000u32)
+        });
+    amount.saturating_sub(fee)
+}
+
+/// Whether a recovery on the destination network returned what its stealth account held since
+/// the fill in `held_block`.
+pub(in crate::root) fn held_proceeds_recovered(
+    destination: &ExecutorRecord,
+    held_block: u64,
+) -> bool {
+    recovered_since(destination, held_block)
 }
 
 pub(in crate::root) const fn provider_name(provider: BridgeProvider) -> &'static str {
@@ -572,6 +721,13 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         attention: stage.needs_attention(),
     };
     let bridge = labels.bridge.as_ref();
+    // A private Bridge swap sets up one stealth account on each network.
+    let private = bridge.is_some_and(|bridge| bridge.private.is_some());
+    let set_up = if private {
+        "The stealth accounts are set up."
+    } else {
+        "The stealth account is set up."
+    };
     match stage {
         SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
             if labels.fill_hint.is_some() =>
@@ -588,7 +744,12 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::SetupSubmitting | SwapStage::SetupPending => line(
             format!("Preparing swap of {pair}"),
-            "Setting up the swap's stealth account · waiting for confirmation".into(),
+            if private {
+                "Setting up the swap's stealth accounts · waiting for confirmation"
+            } else {
+                "Setting up the swap's stealth account · waiting for confirmation"
+            }
+            .into(),
         ),
         SwapStage::SetupFailed => line(
             "Swap setup failed".into(),
@@ -596,11 +757,11 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::Ready => line(
             format!("Swap of {pair} is ready to review"),
-            "The stealth account is set up. Review a quote to place the order.".into(),
+            format!("{set_up} Review a quote to place the order."),
         ),
         SwapStage::Approved => line(
             format!("Swap of {pair} is ready to place"),
-            "The stealth account is set up. Confirm to place the order.".into(),
+            format!("{set_up} Confirm to place the order."),
         ),
         SwapStage::SubmissionPending => line(
             format!("Swap of {pair} needs submission"),
@@ -642,9 +803,10 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
                 || "Sent to the bridge".into(),
                 |bridge| {
                     format!(
-                        "Sent to {} · delivering to {} on {}",
+                        "Sent to {} · {} to {} on {}",
                         provider_name(bridge.provider),
-                        bridge.receiver,
+                        if private { "shielding" } else { "delivering" },
+                        bridge.destination(),
                         bridge.network
                     )
                 },
@@ -658,7 +820,7 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
                     received
                         .as_ref()
                         .map_or_else(String::new, |amount| format!("{amount} ")),
-                    bridge.receiver,
+                    bridge.destination(),
                     bridge.network,
                     provider_name(bridge.provider)
                 ),
@@ -716,7 +878,7 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
                     format!(
                         "{} didn't deliver to {} on {}. {} returns to the stealth account on {}.",
                         provider_name(bridge.provider),
-                        bridge.receiver,
+                        bridge.destination(),
                         bridge.network,
                         bridge.sent.as_ref().unwrap_or(&labels.buy_symbol),
                         bridge.origin
@@ -732,7 +894,25 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
                     format!(
                         "{} reported the deposit for {} on {} as failed or incomplete",
                         provider_name(bridge.provider),
-                        bridge.receiver,
+                        bridge.destination(),
+                        bridge.network
+                    )
+                },
+            ),
+        ),
+        // The fill completed without its shield, so recovery is on the destination network.
+        SwapStage::Order(SwapOrderState::HeldOnDestination) => line(
+            format!("Swap of {pair} needs recovery"),
+            bridge.map_or_else(
+                || "The destination stealth account holds the proceeds. Recover them there.".into(),
+                |bridge| {
+                    format!(
+                        "{} is in the stealth account on {}. Recover it there.",
+                        bridge
+                            .private
+                            .as_ref()
+                            .and_then(|private| private.held.as_ref())
+                            .unwrap_or(&bridge.token),
                         bridge.network
                     )
                 },
@@ -777,6 +957,41 @@ pub(in crate::root) struct SwapStep {
     pub(in crate::root) label: String,
     pub(in crate::root) detail: String,
     pub(in crate::root) status: PublicActionStepStatus,
+    /// Sub-steps shown indented under the step, each with its own status. Only a private
+    /// Bridge swap's setup has them, one per network.
+    pub(in crate::root) children: Vec<Self>,
+    /// A sub-step's stealth account. `None` for every other step.
+    pub(in crate::root) account: Option<SwapStepAccount>,
+}
+
+impl SwapStep {
+    fn new(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        status: PublicActionStepStatus,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            status,
+            children: Vec::new(),
+            account: None,
+        }
+    }
+}
+
+/// A step's status from its sub-steps: failed if any failed, done once all are,
+/// and otherwise in progress.
+pub(in crate::root) fn parent_step_status(children: &[SwapStep]) -> PublicActionStepStatus {
+    use PublicActionStepStatus::{Done, Error, Pending};
+    let all = |status| children.iter().all(|child| child.status == status);
+    if children.iter().any(|child| child.status == Error) {
+        Error
+    } else if all(Done) {
+        Done
+    } else {
+        Pending
+    }
 }
 
 const TRADED: &str = "Traded";
@@ -790,7 +1005,11 @@ const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 /// hands off to its bridge instead, as [`bridge_steps`] describes.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     if let Some(bridge) = &labels.bridge {
-        return bridge_steps(stage, labels, bridge);
+        let mut steps = bridge_steps(stage, labels, bridge);
+        if let (Some(private), Some(setup)) = (&bridge.private, steps.first_mut()) {
+            *setup = private_setup_step(stage, private, setup);
+        }
+        return steps;
     }
     let steps = reshield_steps(stage, labels);
     match &labels.receiver {
@@ -801,11 +1020,7 @@ pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<
 
 fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
-    let step = |label: &str, detail: String, status| SwapStep {
-        label: label.to_owned(),
-        detail,
-        status,
-    };
+    let step = |label: &str, detail: String, status| SwapStep::new(label, detail, status);
     let setup = |status, detail: &str| step("Stealth account set up", detail.to_owned(), status);
     let open = |status, detail: String| step("Order open", detail, status);
     let traded = |status| step(TRADED, String::new(), status);
@@ -982,7 +1197,10 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
         // Only Bridge orders reach these states; [`bridge_steps`] adds their hand-off and
         // outcome.
         SwapStage::Order(
-            SwapOrderState::Bridging | SwapOrderState::Refunding | SwapOrderState::NeedsAttention,
+            SwapOrderState::Bridging
+            | SwapOrderState::Refunding
+            | SwapOrderState::NeedsAttention
+            | SwapOrderState::HeldOnDestination,
         ) => vec![setup(Done, ""), open(Done, String::new())],
         // An unfilled expiry is a normal result of a tight minimum, so it's a warning with
         // its likely reason, not an error.
@@ -1063,17 +1281,82 @@ fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> 
         .collect()
 }
 
+/// A private Bridge swap's setup step: "Stealth accounts set up" with one sub-step per network,
+/// each naming its stealth account and the block of its setup or what it waits for. The step's
+/// own status follows its sub-steps, as [`parent_step_status`] derives it.
+fn private_setup_step(
+    stage: SwapStage,
+    private: &SwapPrivateBridgeLabels,
+    setup: &SwapStep,
+) -> SwapStep {
+    use PublicActionStepStatus::{Done, Error, NotStarted, Pending};
+    let children = private
+        .setups
+        .iter()
+        .map(|account| {
+            let (status, detail) = match account.progress {
+                SwapSetupProgress::NotSent => (NotStarted, "Not sent yet".to_owned()),
+                SwapSetupProgress::NetworkLoading => {
+                    (Pending, format!("Waiting for {} to load…", account.network))
+                }
+                SwapSetupProgress::Submitting => (
+                    Pending,
+                    account
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "Submitting…".into()),
+                ),
+                SwapSetupProgress::Pending => (
+                    Pending,
+                    account
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "Waiting for broadcaster…".into()),
+                ),
+                SwapSetupProgress::Done => (
+                    Done,
+                    account
+                        .block
+                        .map_or_else(String::new, |block| format!("block {block}")),
+                ),
+                SwapSetupProgress::Failed => (Error, "Not confirmed".to_owned()),
+            };
+            SwapStep {
+                account: account.account,
+                ..SwapStep::new(account.network.clone(), detail, status)
+            }
+        })
+        .collect::<Vec<_>>();
+    let status = parent_step_status(&children);
+    let failed = children
+        .iter()
+        .filter(|child| child.status == Error)
+        .map(|child| child.label.as_str())
+        .collect::<Vec<_>>();
+    let detail = match stage {
+        // A retired account keeps the reason its swap can't continue.
+        SwapStage::SetupRetired => setup.detail.clone(),
+        _ if failed.is_empty() => String::new(),
+        _ => format!(
+            "The setup on {} wasn't confirmed. Nothing was unshielded.",
+            failed.join(" and ")
+        ),
+    };
+    SwapStep {
+        children,
+        ..SwapStep::new("Stealth accounts set up", detail, status)
+    }
+}
+
 /// A Bridge swap's steps: set up, order open, sent to the bridge once the hand-off is proven,
 /// then delivered on the destination network, labelled verified for Across or reported by NEAR
 /// Intents. Refunding and Needs attention replace the delivered step. An Across post-hook that
-/// didn't run replaces both with the bought token held on the swap's network.
+/// didn't run replaces both with the bought token held on the swap's network. A private Bridge
+/// swap's last step is its shield into the private balance there, and proceeds its destination
+/// stealth account holds replace that step.
 fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
-    let step = |label: String, detail: String, status| SwapStep {
-        label,
-        detail,
-        status,
-    };
+    let step = |label: String, detail: String, status| SwapStep::new(label, detail, status);
     let provider = provider_name(bridge.provider);
     let sent = bridge.sent.as_ref().unwrap_or(&labels.buy_symbol);
     let handed_off = || {
@@ -1089,14 +1372,21 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
             Done,
         )
     };
-    let delivered = format!("Delivered on {}", bridge.network);
+    let private = bridge.private.as_ref();
+    let delivered = if private.is_some() {
+        format!("Private on {}", bridge.network)
+    } else {
+        format!("Delivered on {}", bridge.network)
+    };
     // Across delivers its deposit's exact output; NEAR Intents converts all of it.
     let expected = match (&bridge.minimum, bridge.provider) {
-        (Some(minimum), BridgeProvider::Across) => format!("{minimum} to {}", bridge.receiver),
-        (Some(minimum), BridgeProvider::NearIntents) => {
-            format!("At least {minimum} to {}", bridge.receiver)
+        (Some(minimum), BridgeProvider::Across) => {
+            format!("{minimum} to {}", bridge.destination())
         }
-        (None, _) => format!("To {}", bridge.receiver),
+        (Some(minimum), BridgeProvider::NearIntents) => {
+            format!("At least {minimum} to {}", bridge.destination())
+        }
+        (None, _) => format!("To {}", bridge.destination()),
     };
     let mut steps = reshield_steps(stage, labels);
     let outcome = match stage {
@@ -1131,11 +1421,38 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                     BridgeProvider::Across => format!("{delivered} · verified"),
                     BridgeProvider::NearIntents => format!("{delivered} · reported by {provider}"),
                 },
-                labels.received.as_ref().map_or_else(
-                    || format!("To {}", bridge.receiver),
-                    |received| format!("{received} to {}", bridge.receiver),
-                ),
+                match (&labels.received, private) {
+                    (Some(received), Some(_)) => {
+                        format!("{received} shielded to {}", bridge.destination())
+                    }
+                    (None, Some(_)) => format!("Shielded to {}", bridge.destination()),
+                    (Some(received), None) => format!("{received} to {}", bridge.receiver),
+                    (None, None) => format!("To {}", bridge.receiver),
+                },
                 Done,
+            ),
+        ],
+        SwapStage::Order(SwapOrderState::HeldOnDestination) => vec![
+            handed_off(),
+            step(
+                format!("Held by stealth account on {}", bridge.network),
+                {
+                    let token = &bridge.token;
+                    let account = private
+                        .and_then(|private| private.setups[1].account?.index)
+                        .map_or_else(
+                            || "the stealth account".to_owned(),
+                            |index| format!("stealth account #{index}"),
+                        );
+                    format!(
+                        "{provider} delivered {}, but the shield didn't run. The {token} is in {account} on {}.",
+                        private
+                            .and_then(|private| private.held.as_ref())
+                            .unwrap_or(token),
+                        bridge.network
+                    )
+                },
+                Warning,
             ),
         ],
         SwapStage::Order(SwapOrderState::Refunding) => vec![
@@ -1187,16 +1504,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                         .clone()
                         .unwrap_or_else(|| (NotStarted, String::new()));
                     vec![
-                        SwapStep {
-                            label: BRIDGE_DEPOSIT.into(),
-                            detail,
-                            status,
-                        },
-                        SwapStep {
-                            label: delivered.clone(),
-                            detail: expected.clone(),
-                            status: NotStarted,
-                        },
+                        SwapStep::new(BRIDGE_DEPOSIT, detail, status),
+                        SwapStep::new(delivered.clone(), expected.clone(), NotStarted),
                     ]
                 })
                 .collect();
@@ -1317,6 +1626,8 @@ pub(in crate::root) struct SwapActions {
     /// Set up again or continue to the review in the swap form, or place an approved order.
     pub(in crate::root) resume: SwapActionAvailability,
     pub(in crate::root) recover: bool,
+    /// Recover what a private Bridge swap's destination stealth account holds, on its network.
+    pub(in crate::root) recover_on_destination: bool,
     pub(in crate::root) dismiss: bool,
 }
 
@@ -1328,6 +1639,7 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
         retry: None,
         resume: None,
         recover: false,
+        recover_on_destination: false,
         dismiss: false,
     };
     match stage {
@@ -1381,6 +1693,12 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
             resume: Some(Ok(())),
             ..none
         },
+        // The swap's own stealth account holds nothing; the destination account does.
+        SwapStage::Order(SwapOrderState::HeldOnDestination) => SwapActions {
+            recover_on_destination: true,
+            dismiss: true,
+            ..none
+        },
         SwapStage::SetupSubmitting
         | SwapStage::Recovered
         | SwapStage::Order(
@@ -1415,6 +1733,8 @@ pub(in crate::root) const fn swap_account_status(stage: SwapStage) -> &'static s
         ) => "Recovery needed",
         SwapStage::Order(SwapOrderState::Refunding) => "Refunding",
         SwapStage::Order(SwapOrderState::NeedsAttention) => "Needs attention",
+        // This account holds nothing, so it isn't one that needs recovery.
+        SwapStage::Order(SwapOrderState::HeldOnDestination) => "Held on destination",
         SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)) => {
             "Order expired"
         }
@@ -1431,7 +1751,8 @@ pub(in crate::root) const fn swap_account_status(stage: SwapStage) -> &'static s
 pub(in crate::root) enum SwapOrderGroup {
     /// The swap can still set up, place, fill, or deliver its order.
     Open,
-    /// Funds sit in the stealth account and no order can deliver them any more.
+    /// Funds sit in the stealth account and no order can deliver them any more, or in a
+    /// private Bridge swap's destination stealth account after a fill without its shield.
     NeedsRecovery,
     /// A bridge provider has to resolve the deposit. The wallet can't recover it.
     NeedsAttention,
@@ -1447,7 +1768,7 @@ pub(in crate::root) const fn swap_order_group(
     stopped: bool,
     hidden: bool,
 ) -> SwapOrderGroup {
-    if stage.needs_recovery() {
+    if stage.needs_recovery() || stage.is_held_on_destination() {
         return SwapOrderGroup::NeedsRecovery;
     }
     if stage.needs_attention() {
@@ -1508,6 +1829,10 @@ pub(in crate::root) fn swap_order_status(
         ) => "Needs recovery".into(),
         SwapStage::Order(SwapOrderState::Refunding) => "Refunding".into(),
         SwapStage::Order(SwapOrderState::NeedsAttention) => "Needs attention".into(),
+        SwapStage::Order(SwapOrderState::HeldOnDestination) => labels.bridge.as_ref().map_or_else(
+            || "Held on destination".into(),
+            |bridge| format!("Held on {}", bridge.network),
+        ),
         SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)) => {
             "Expired".into()
         }
@@ -1653,6 +1978,7 @@ mod tests {
             SwapStage::Order(SwapOrderState::NotDelivered),
             SwapStage::Order(SwapOrderState::Refunding),
             SwapStage::Order(SwapOrderState::NeedsAttention),
+            SwapStage::Order(SwapOrderState::HeldOnDestination),
         ];
         stages.extend(
             ENDED
@@ -1690,6 +2016,12 @@ mod tests {
                                 | SwapOrderState::Refunding
                         )
                 ),
+                "{stage:?}"
+            );
+            // Held proceeds are recovered on the destination network, not from this account.
+            assert_eq!(
+                actions.recover_on_destination,
+                stage.is_held_on_destination(),
                 "{stage:?}"
             );
             // A retry is admitted only after the attempt ended; an executed pre-hook blocks it
@@ -1745,8 +2077,14 @@ mod tests {
             );
             assert_eq!(stage.needs_recovery(), needs_recovery, "{stage:?}");
             // A bridge deposit that needs attention asks the user to act, though not to recover.
-            let needs_attention =
-                needs_recovery || stage == SwapStage::Order(SwapOrderState::NeedsAttention);
+            // Held proceeds ask for a recovery on the destination network.
+            let needs_attention = needs_recovery
+                || matches!(
+                    stage,
+                    SwapStage::Order(
+                        SwapOrderState::NeedsAttention | SwapOrderState::HeldOnDestination
+                    )
+                );
             assert_eq!(stage.needs_attention(), needs_attention, "{stage:?}");
             assert_eq!(
                 swap_card_line(stage, &labels()).attention,
@@ -1831,6 +2169,11 @@ mod tests {
                 NeedsRecovery,
             ),
             (SwapStage::Order(SwapOrderState::Refunding), NeedsRecovery),
+            // The wallet can recover held proceeds, on the destination network.
+            (
+                SwapStage::Order(SwapOrderState::HeldOnDestination),
+                NeedsRecovery,
+            ),
             (SwapStage::Order(SwapOrderState::Done), Ended),
             (
                 SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)),
@@ -1857,7 +2200,7 @@ mod tests {
             // themselves. It changes nothing for swaps in flight or needing recovery.
             let shown = swap_order_group(stage, false, false);
             let hidden = swap_order_group(stage, false, true);
-            if stage.is_dismissible() && !stage.needs_recovery() {
+            if stage.is_dismissible() && shown != NeedsRecovery {
                 assert_eq!(hidden, Ended, "{stage:?}");
             } else {
                 assert_eq!(hidden, shown, "{stage:?}");
@@ -1933,6 +2276,7 @@ mod tests {
                 receiver: Address::repeat_byte(3),
                 destination_token: Address::repeat_byte(4),
                 surplus,
+                private: None,
             })
         };
         let across = bridge(BridgeProvider::Across, BridgeSurplus::KeepInAccount);
@@ -2003,6 +2347,7 @@ mod tests {
                 receiver: "Treasury".into(),
                 sent: Some("248.82 USDC".into()),
                 minimum: Some("248.70 USDC".into()),
+                private: None,
             }),
             ..labels()
         };
@@ -2122,6 +2467,196 @@ mod tests {
     }
 
     #[test]
+    fn private_bridge_steps_follow_both_setups_then_the_shield_on_the_destination() {
+        use PublicActionStepStatus::{Done, Error, NotStarted, Pending, Warning};
+        use SwapSetupProgress as Setup;
+        const RECEIVER: &str = "0x9a9A…9a9A";
+        let destination = Address::repeat_byte(0x9a);
+        let private = |origin: Setup, arrival: Setup| {
+            let setup = |network: &str, index, address, progress, block| SwapSetupLabels {
+                network: network.into(),
+                account: Some(SwapStepAccount {
+                    index: Some(index),
+                    address,
+                }),
+                progress,
+                block: (progress == Setup::Done).then_some(block),
+                detail: None,
+            };
+            SwapLabels {
+                received: Some("990.26 USDC".into()),
+                bridge: Some(SwapBridgeLabels {
+                    provider: BridgeProvider::Across,
+                    network: "Arbitrum One".into(),
+                    token: "USDC".into(),
+                    origin: "Ethereum".into(),
+                    receiver: RECEIVER.into(),
+                    sent: Some("993.05 USDC".into()),
+                    minimum: Some("990.12 USDC".into()),
+                    private: Some(SwapPrivateBridgeLabels {
+                        setups: [
+                            setup(
+                                "Ethereum",
+                                191,
+                                Address::repeat_byte(0x4e),
+                                origin,
+                                23_481_902,
+                            ),
+                            setup("Arbitrum One", 57, destination, arrival, 402_118_977),
+                        ],
+                        held: Some("992.74 USDC".into()),
+                    }),
+                }),
+                ..labels()
+            }
+        };
+        let children = |step: &SwapStep| {
+            step.children
+                .iter()
+                .map(|child| (child.label.clone(), child.status, child.detail.clone()))
+                .collect::<Vec<_>>()
+        };
+        let child =
+            |network: &str, status, detail: &str| (network.to_owned(), status, detail.to_owned());
+
+        // One setup confirmed, one on its way: the step is in progress and counts on its
+        // sub-steps, each with its own account.
+        let pending = swap_steps(
+            SwapStage::SetupPending,
+            &private(Setup::Done, Setup::Pending),
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|step| (step.label.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Stealth accounts set up", Pending),
+                ("Order open", NotStarted),
+                ("Bridge deposit", NotStarted),
+                ("Private on Arbitrum One", NotStarted),
+            ]
+        );
+        assert_eq!(
+            children(&pending[0]),
+            [
+                child("Ethereum", Done, "block 23481902"),
+                child("Arbitrum One", Pending, "Waiting for broadcaster…"),
+            ]
+        );
+        assert_eq!(
+            pending[0].children[1].account,
+            Some(SwapStepAccount {
+                index: Some(57),
+                address: destination
+            })
+        );
+        // The parent stays in progress while either network still needs its setup.
+        let step = |stage, origin, arrival| swap_steps(stage, &private(origin, arrival)).remove(0);
+        let loading = step(SwapStage::SetupPending, Setup::Done, Setup::NetworkLoading);
+        assert_eq!(loading.status, Pending);
+        assert_eq!(
+            loading.children[1].detail,
+            "Waiting for Arbitrum One to load…"
+        );
+        assert_eq!(
+            step(SwapStage::SetupNotSent, Setup::NotSent, Setup::NotSent).status,
+            Pending
+        );
+
+        // One failed setup fails the step, whatever the other did, and no order follows.
+        let failed = swap_steps(SwapStage::SetupFailed, &private(Setup::Done, Setup::Failed));
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0].status, Error);
+        assert!(failed[0].detail.contains("Arbitrum One"));
+        assert_eq!(
+            children(&failed[0]),
+            [
+                child("Ethereum", Done, "block 23481902"),
+                child("Arbitrum One", Error, "Not confirmed"),
+            ]
+        );
+        assert_eq!(
+            step(SwapStage::SetupFailed, Setup::Failed, Setup::Pending).status,
+            Error
+        );
+
+        // With both set up, the last step is the shield on the destination network, or what
+        // replaced it.
+        let set_up = private(Setup::Done, Setup::Done);
+        let order = SwapStage::Order;
+        for (state, last, detail) in [
+            (
+                SwapOrderState::Bridging,
+                ("Private on Arbitrum One", Pending),
+                "990.12 USDC to your private balance",
+            ),
+            (
+                SwapOrderState::Done,
+                ("Private on Arbitrum One · verified", Done),
+                "990.26 USDC shielded to your private balance",
+            ),
+            (
+                SwapOrderState::HeldOnDestination,
+                ("Held by stealth account on Arbitrum One", Warning),
+                "Across delivered 992.74 USDC, but the shield didn't run. The USDC is in stealth account #57 on Arbitrum One.",
+            ),
+            (
+                SwapOrderState::Refunding,
+                ("Refunding on Ethereum", Warning),
+                "No relayer filled the deposit",
+            ),
+        ] {
+            let steps = swap_steps(order(state), &set_up);
+            assert_eq!(steps[0].status, Done, "{state:?}");
+            assert_eq!(
+                children(&steps[0]),
+                [
+                    child("Ethereum", Done, "block 23481902"),
+                    child("Arbitrum One", Done, "block 402118977"),
+                ],
+                "{state:?}"
+            );
+            let shown = steps.last().unwrap();
+            assert_eq!((shown.label.as_str(), shown.status), last, "{state:?}");
+            assert!(shown.detail.starts_with(detail), "{}", shown.detail);
+        }
+        assert_eq!(
+            swap_card_line(order(SwapOrderState::Bridging), &set_up).detail,
+            "Sent to Across · shielding to your private balance on Arbitrum One"
+        );
+        // Held proceeds are the wallet's to recover, on the destination network.
+        let held = order(SwapOrderState::HeldOnDestination);
+        for hidden in [false, true] {
+            assert_eq!(
+                swap_order_group(held, false, hidden),
+                SwapOrderGroup::NeedsRecovery
+            );
+        }
+        assert_eq!(
+            swap_order_status(held, false, &set_up),
+            "Held on Arbitrum One"
+        );
+        let card = swap_card_line(held, &set_up);
+        assert!(card.attention && card.detail.contains("992.74 USDC"));
+
+        // The destination stealth account is never named as a receiver.
+        for stage in every_stage() {
+            let steps = swap_steps(stage, &set_up);
+            let card = swap_card_line(stage, &set_up);
+            assert!(
+                steps
+                    .iter()
+                    .flat_map(|step| std::iter::once(step).chain(&step.children))
+                    .flat_map(|step| [&step.label, &step.detail])
+                    .chain([&card.title, &card.detail])
+                    .all(|text| !text.contains(RECEIVER)),
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_reported_fill_shows_the_trade_confirming_until_observation_records_it() {
         use PublicActionStepStatus::{Done, NotStarted, Pending};
         // The orderbook reports the fill 5 blocks after the trade, and even past the local
@@ -2183,6 +2718,9 @@ mod tests {
             gas_allowance: None,
             gas_price_wei: None,
             valid_for_secs: None,
+            destination_shield_fee_bps: None,
+            delivery_allowance: None,
+            destination_setup_fee: None,
         };
         let settlement = B256::repeat_byte(0x51);
         let observed = SwapOrderObservations {

@@ -1,6 +1,6 @@
 //! The swap dialog. One dialog shows the swap form, My orders, or one swap's order detail, and a
-//! back button moves between them. Escape and × close it. Only the broadcaster picker, the spend
-//! authorization review, stealth-account recovery and confirmations open on top of it.
+//! back button moves between them. Escape and × close it. The asset and broadcaster pickers,
+//! spend authorization review, stealth-account recovery and confirmations open on top of it.
 //!
 //! Background work may change the dialog only while it has focus and shows the swap the work
 //! belongs to, so a quote or order result never replaces or interrupts another dialog.
@@ -31,7 +31,8 @@ use wallet_ops::{
 
 use super::model::{
     SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount, provider_name, record_swap_ranges,
-    swap_delivery, swap_order_group, swap_order_stage, swap_order_status, swap_private_minimum,
+    swap_delivery, swap_order_group, swap_order_stage, swap_order_status, swap_private_delivery,
+    swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -253,8 +254,23 @@ impl PrivateSwapsView {
             self.form = None;
             self.error = None;
         }
+        self.load_detail_destination(view, cx);
         self.focus_view(view, window, cx);
         cx.notify();
+    }
+
+    /// A private Bridge swap's detail tells about its destination stealth account, which only
+    /// the destination network's session knows. Opening the detail starts loading that network
+    /// and reads the account again.
+    fn load_detail_destination(&mut self, view: SwapDialogView, cx: &mut Context<'_, Self>) {
+        let SwapDialogView::Detail(operation) = view else {
+            return;
+        };
+        let Some(delivery) = self.record(operation).and_then(swap_private_delivery) else {
+            return;
+        };
+        self.ensure_destination_load(delivery.destination_chain, cx);
+        self.reload_destinations(cx);
     }
 
     fn open_swap_dialog(
@@ -308,6 +324,7 @@ impl PrivateSwapsView {
             outcome_fees_open: false,
             outcome_details_open: false,
         });
+        self.load_detail_destination(view, cx);
         self.focus_view(view, window, cx);
         cx.notify();
     }
@@ -532,6 +549,7 @@ impl PrivateSwapsView {
     ) -> SwapLabels {
         let tokens = order_tokens(record, order).unwrap_or_default();
         self.order_labels(
+            record,
             tokens,
             Some(order.bounds().spend_amount()),
             Some(order),
@@ -609,10 +627,12 @@ impl PrivateSwapsView {
                     .truncate(),
             )
             .when_some(completed, |row, delivery| {
-                // Completed means back in the private balance; a Public address swap was
-                // delivered to its receiver.
+                // Completed means back in the private balance, here or on a private Bridge
+                // swap's destination network; a Public address swap was delivered to its
+                // receiver.
                 let label = match delivery {
                     SwapDelivery::Reshield => "Completed",
+                    SwapDelivery::Bridge(bridge) if bridge.is_private() => "Completed",
                     SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => "Delivered",
                 };
                 row.child(
@@ -850,9 +870,18 @@ impl PrivateSwapsView {
                 value: format!("≥ {minimum}"),
                 note: None,
             }),
-            SwapOrderGroup::NeedsRecovery => tokens
-                .zip(entry.order)
-                .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
+            SwapOrderGroup::NeedsRecovery => labels
+                .bridge
+                .as_ref()
+                .filter(|_| entry.stage.is_held_on_destination())
+                // What the destination stealth account holds.
+                .and_then(|bridge| bridge.private.as_ref()?.held.clone())
+                .or_else(|| {
+                    tokens
+                        .zip(entry.order)
+                        .filter(|_| !entry.stage.is_held_on_destination())
+                        .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
+                })
                 .map_or(OrderRowAmount::None, |value| OrderRowAmount::Value {
                     value,
                     note: Some(
@@ -910,7 +939,8 @@ impl PrivateSwapsView {
             }
         });
         // A Public address swap names its receiver, and a Bridge swap also its network and
-        // provider. Private swaps return to the private balance.
+        // provider. Private swaps return to the private balance, which a private Bridge swap
+        // names on its destination network.
         let meta = [
             started,
             Some(format!("#{}", record.index())),
@@ -921,7 +951,11 @@ impl PrivateSwapsView {
             labels.bridge.as_ref().map(|bridge| {
                 format!(
                     "to {} on {} · {}",
-                    bridge.receiver,
+                    if bridge.private.is_some() {
+                        "private balance"
+                    } else {
+                        bridge.receiver.as_str()
+                    },
                     bridge.network,
                     provider_name(bridge.provider)
                 )
@@ -949,7 +983,7 @@ impl PrivateSwapsView {
                         SwapDelivery::Bridge(bridge) => self
                             .chain_token_metadata(
                                 bridge.destination_chain,
-                                self.bridge_received_token(bridge, cx),
+                                self.delivered_token(bridge, cx),
                                 cx,
                             )
                             .and_then(|metadata| metadata.icon_path),

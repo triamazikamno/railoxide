@@ -44,15 +44,21 @@ pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
 pub(crate) use swap::Transfer;
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
-    SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapExecutor, SwapInputPlan,
-    SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice, SwapReview, SwapReviewChange,
-    SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, is_swap_record, swap_order_state,
-    swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
+    SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
+    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
+    SwapPrivateBridgeQuote, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
+    SwapSetupStatus, is_swap_record, swap_order_state, swap_setup_recorded_executed,
+    swap_setup_status, swap_submission_outcome,
+};
+pub use swap::{
+    PreparedPrivateBridgeSetup, PrivateBridgeSetupPreparation, is_swap_destination_record,
+    prepare_private_bridge_setup, submit_private_bridge_setups,
 };
 #[cfg(test)]
 pub(crate) use swap::{
-    SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs, price_swap_review, reusable_swap_proof,
-    swap_cancellation_admitted, swap_invalidation, swap_recovery_calls,
+    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs,
+    price_swap_review, reusable_swap_proof, swap_cancellation_admitted, swap_invalidation,
+    swap_recovery_calls,
 };
 
 pub struct ExecutorReconciliationReport {
@@ -60,6 +66,12 @@ pub struct ExecutorReconciliationReport {
     /// The executor's code and the canonical block it was read at, if the history read it.
     code: Option<(BlockNumHash, Bytes)>,
 }
+
+/// The account changed while work used an earlier snapshot. Background observers may
+/// discard the result and read again; signing and other explicit actions still fail.
+#[derive(Debug, thiserror::Error)]
+#[error("The stealth account changed during preparation. Review the operation again.")]
+pub struct ExecutorRecordChanged;
 
 impl ExecutorReconciliationReport {
     #[must_use]
@@ -121,6 +133,11 @@ impl ExecutorOwner {
         http: HttpContext,
     ) -> Result<Self> {
         let store = ExecutorStore::new(db.clone(), view.clone(), chain.chain_id)?;
+        // Settle destination accounts and retire orphaned reservations before admitting work.
+        // A failure leaves orphan cleanup for the next load.
+        if store.reconcile_swap_destinations_on_load().is_err() {
+            tracing::debug!(target: "executor_observation", step = "swap_destinations", "failed");
+        }
         Ok(Self {
             generation,
             view,
@@ -213,6 +230,18 @@ impl ExecutorOwner {
     pub fn records(&self) -> Result<Vec<ExecutorRecord>> {
         self.ensure_active()?;
         Ok(self.store.records()?)
+    }
+
+    /// Called on the destination chain's owner. Records what became of each account's shield
+    /// payload from its origin swap, preserving unlinked reservations still being prepared.
+    /// Returns whether any record changed.
+    pub fn reconcile_swap_destinations(&self) -> Result<bool> {
+        self.ensure_active()?;
+        let changed = self.store.reconcile_swap_destinations()?;
+        if changed {
+            self.notify_change();
+        }
+        Ok(changed)
     }
 
     pub fn set_hidden(&self, operation: ExecutorOperationId, hidden: bool) -> Result<()> {
@@ -354,9 +383,7 @@ impl ExecutorOwner {
             .find(|record| record.operation() == previous.operation())
             != Some(previous)
         {
-            return Err(eyre!(
-                "The stealth account changed during preparation. Review the operation again."
-            ));
+            return Err(ExecutorRecordChanged.into());
         }
         Ok(())
     }

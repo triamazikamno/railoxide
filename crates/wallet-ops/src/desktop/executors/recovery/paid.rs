@@ -99,6 +99,20 @@ pub struct ExecutorPrivateFeeLimitExceeded {
 }
 
 impl ExecutorPrivateFeeLimitExceeded {
+    pub(in crate::desktop::executors) const fn new(
+        purpose: PaidExecutionPurpose,
+        fee_token: Address,
+        maximum: U256,
+        required: U256,
+    ) -> Self {
+        Self {
+            purpose: purpose.label(),
+            fee_token,
+            maximum,
+            required,
+        }
+    }
+
     #[must_use]
     pub const fn fee_token(&self) -> Address {
         self.fee_token
@@ -692,13 +706,7 @@ fn require_private_fee_limit(
     purpose: PaidExecutionPurpose,
 ) -> Result<()> {
     if fee > maximum {
-        return Err(ExecutorPrivateFeeLimitExceeded {
-            purpose: purpose.label(),
-            fee_token,
-            maximum,
-            required: fee,
-        }
-        .into());
+        return Err(ExecutorPrivateFeeLimitExceeded::new(purpose, fee_token, maximum, fee).into());
     }
     Ok(())
 }

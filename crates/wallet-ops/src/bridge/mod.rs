@@ -6,8 +6,9 @@
 //!
 //! Preview requests never carry the swap's receiver or its stealth account: Across fee quotes
 //! have no recipient, message or depositor field, and 1Click dry quotes send fresh random
-//! placeholder addresses. Only [`NearIntentsClient::quote`], called while signing an approved
-//! order, sends the real receiver.
+//! placeholder addresses. Only [`NearIntentsClient::quote`] and
+//! [`AcrossClient::suggested_fees_with_message`], called while signing an approved order, send
+//! the real receiver or the handler message.
 //!
 //! Base URLs are never logged or formatted raw. Failures are logged with the provider, the
 //! operation and the error only, never a URL, request body, receiver or deposit address.
@@ -30,7 +31,8 @@ mod tests;
 mod tokens;
 
 pub use across::{
-    AcrossClient, AcrossDeposit, AcrossDepositStatus, AcrossFeeQuote, AcrossFeeRequest, AcrossRoute,
+    AcrossClient, AcrossDeposit, AcrossDepositStatus, AcrossFeeQuote, AcrossFeeRequest,
+    AcrossMessageFeeRequest, AcrossRoute,
 };
 #[cfg(test)]
 pub(crate) use near_intents::sign_quote_response_for_tests;
@@ -103,6 +105,9 @@ pub enum BridgeApiError {
     NotFound { api: BridgeApi },
     #[error("the amount is too small for Across")]
     AmountTooLow,
+    /// Across simulated the fill of a quote with a message, and it reverted.
+    #[error("Across can't fill this deposit: its message fails in simulation")]
+    FillSimulationFailed,
     #[error(
         "{api} rejected the {operation} request to {endpoint} ({code}, HTTP {status}){}",
         message_suffix(.message)
@@ -331,6 +336,10 @@ fn classify_error_response(
     let code = error.code.or(error.error);
     match (api, code.as_deref()) {
         (BridgeApi::Across, Some("AMOUNT_TOO_LOW")) => return BridgeApiError::AmountTooLow,
+        // The body echoes the simulated fill, so nothing of it is kept.
+        (BridgeApi::Across, Some("SIMULATION_ERROR")) => {
+            return BridgeApiError::FillSimulationFailed;
+        }
         // Across answers 404 for unknown paths too; only this code means "no such deposit".
         (BridgeApi::Across, Some("DepositNotFoundException")) | (BridgeApi::NearIntents, _)
             if status == StatusCode::NOT_FOUND =>

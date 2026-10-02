@@ -2,12 +2,15 @@
 //!
 //! Shapes follow the live `app.across.to/api` responses captured on 2026-09-29.
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, uint};
 use reqwest::Url;
 use serde::Deserialize;
 
 use super::{BridgeApi, BridgeApiError, BridgeHttp, json_uint};
 use crate::http::{OperationHttpClient, OperationNetworkIsolation};
+
+/// The scale of the API's `pct` fields: 1e18 is 100%.
+const PCT_SCALE: U256 = uint!(1_000_000_000_000_000_000_U256);
 
 /// A route an Across deposit can take from the origin chain to the destination chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,11 +32,28 @@ pub struct AcrossFeeRequest {
     pub amount: U256,
 }
 
+/// A fee quote for an approved private-delivery order, requested only while signing it. Unlike
+/// [`AcrossFeeRequest`] it names the fill's recipient, the handler, and carries the handler
+/// message, so Across simulates the real fill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcrossMessageFeeRequest {
+    pub fee: AcrossFeeRequest,
+    pub recipient: Address,
+    pub message: Bytes,
+}
+
 /// The fee quote terms a `depositV3` call needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcrossFeeQuote {
     pub output_amount: U256,
     pub total_relay_fee_total: U256,
+    /// The whole relay fee as a fraction of the input amount, scaled by 1e18.
+    pub total_relay_fee_pct: U256,
+    /// The relayer's gas fee for the fill, in input-token base units. It is part of
+    /// `total_relay_fee_total`.
+    pub relayer_gas_fee_total: U256,
+    /// The relayer's gas fee as a fraction of the input amount, scaled by 1e18.
+    pub relayer_gas_fee_pct: U256,
     pub lp_fee_total: U256,
     /// `quoteTimestamp` for the deposit.
     pub timestamp: u32,
@@ -46,6 +66,26 @@ pub struct AcrossFeeQuote {
     pub min_deposit: U256,
     pub max_deposit: U256,
     pub estimated_fill_time_sec: u64,
+}
+
+impl AcrossFeeQuote {
+    /// The relayer's gas fee in output-token base units, rounded up:
+    /// `ceil(output_amount * relayer_gas_fee_pct / (1e18 - total_relay_fee_pct))`.
+    /// `relayer_gas_fee_total` is in input-token units, whose decimals can differ from the
+    /// output token's, as for USDC on BNB Chain, while the output is the input less the whole
+    /// relay fee, `input * (1 - total_relay_fee_pct)`. `None` when the whole fee is 100% or
+    /// more, or the product overflows.
+    #[must_use]
+    pub fn relayer_gas_fee_in_output(&self) -> Option<U256> {
+        let kept = PCT_SCALE
+            .checked_sub(self.total_relay_fee_pct)
+            .filter(|kept| !kept.is_zero())?;
+        Some(
+            self.output_amount
+                .checked_mul(self.relayer_gas_fee_pct)?
+                .div_ceil(kept),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -132,22 +172,48 @@ impl AcrossClient {
         &self,
         request: &AcrossFeeRequest,
     ) -> Result<AcrossFeeQuote, BridgeApiError> {
+        self.fee_quote(request, &[]).await
+    }
+
+    /// `GET /suggested-fees` with the fill's recipient and message as well. Across simulates
+    /// the fill, and a message that reverts there is [`BridgeApiError::FillSimulationFailed`].
+    pub async fn suggested_fees_with_message(
+        &self,
+        request: &AcrossMessageFeeRequest,
+    ) -> Result<AcrossFeeQuote, BridgeApiError> {
+        let recipient = request.recipient.to_string();
+        let message = request.message.to_string();
+        self.fee_quote(
+            &request.fee,
+            &[
+                ("recipient", recipient.as_str()),
+                ("message", message.as_str()),
+            ],
+        )
+        .await
+    }
+
+    /// `GET /suggested-fees` with `extra` query pairs after the tokens, chains and amount.
+    async fn fee_quote(
+        &self,
+        request: &AcrossFeeRequest,
+        extra: &[(&str, &str)],
+    ) -> Result<AcrossFeeQuote, BridgeApiError> {
         let input_token = request.input_token.to_string();
         let output_token = request.output_token.to_string();
         let origin = request.origin_chain.to_string();
         let destination = request.destination_chain.to_string();
         let amount = request.amount.to_string();
-        let request = self.inner.get(
-            &["suggested-fees"],
-            &[
-                ("inputToken", input_token.as_str()),
-                ("outputToken", output_token.as_str()),
-                ("originChainId", origin.as_str()),
-                ("destinationChainId", destination.as_str()),
-                ("amount", amount.as_str()),
-                ("allowUnmatchedDecimals", "true"),
-            ],
-        );
+        let mut query = vec![
+            ("inputToken", input_token.as_str()),
+            ("outputToken", output_token.as_str()),
+            ("originChainId", origin.as_str()),
+            ("destinationChainId", destination.as_str()),
+            ("amount", amount.as_str()),
+            ("allowUnmatchedDecimals", "true"),
+        ];
+        query.extend_from_slice(extra);
+        let request = self.inner.get(&["suggested-fees"], &query);
         let fees: SuggestedFeesBody = self.inner.json("fee quote", request).await?;
         if fees.is_amount_too_low {
             return Err(BridgeApiError::AmountTooLow);
@@ -155,6 +221,9 @@ impl AcrossClient {
         Ok(AcrossFeeQuote {
             output_amount: fees.output_amount,
             total_relay_fee_total: fees.total_relay_fee.total,
+            total_relay_fee_pct: fees.total_relay_fee.pct,
+            relayer_gas_fee_total: fees.relayer_gas_fee.total,
+            relayer_gas_fee_pct: fees.relayer_gas_fee.pct,
             lp_fee_total: fees.lp_fee.total,
             timestamp: fees.timestamp,
             fill_deadline: fees.fill_deadline,
@@ -220,6 +289,7 @@ struct RouteBody {
 struct SuggestedFeesBody {
     output_amount: U256,
     total_relay_fee: FeeBody,
+    relayer_gas_fee: FeeBody,
     lp_fee: FeeBody,
     #[serde(deserialize_with = "json_uint")]
     timestamp: u32,
@@ -238,6 +308,8 @@ struct SuggestedFeesBody {
 
 #[derive(Deserialize)]
 struct FeeBody {
+    /// A fraction of the input amount, scaled by 1e18.
+    pct: U256,
     total: U256,
 }
 

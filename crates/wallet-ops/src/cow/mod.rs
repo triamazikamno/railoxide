@@ -31,10 +31,11 @@ mod pricing;
 mod tests;
 
 pub use pricing::{
-    GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit,
-    OrderLimitError, OrderLimitParams, PreHookCalls, across_post_hook_gas, hook_gas_limit,
-    order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit, quote_gas_units,
-    quote_protocol_fee,
+    DeliveryAllowanceParams, DeliveryAllowanceRate, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS,
+    GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams,
+    PreHookCalls, across_post_hook_gas, delivery_allowance, destination_minimum_after_allowance,
+    hook_gas_limit, order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit,
+    private_delivery_gas, quote_gas_units, quote_protocol_fee,
 };
 
 /// Hook-free app data sent with every quote request. `CoW` documents `"{}"` as the app data

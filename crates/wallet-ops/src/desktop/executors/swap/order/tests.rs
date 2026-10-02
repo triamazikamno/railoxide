@@ -1,13 +1,18 @@
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{address, uint};
+use alloy::signers::local::PrivateKeySigner;
 use railgun_wallet::tx::GasEstimateMode;
 use railgun_wallet::{Note, UtxoCommitmentKind, UtxoSource};
 
-use super::super::bridge::{across_bridge_quote, near_bridge_quote};
+use super::super::bridge::{
+    SwapPrivateBridgeQuote, across_bridge_quote, delivery_allowance_rate, near_bridge_quote,
+};
 use super::*;
 use crate::bridge::{AcrossFeeQuote, BridgeDestination, NearAssets, OneClickDryQuote};
-use crate::cow::{GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS};
-use crate::vault::ExecutorNonceObservation;
+use crate::cow::{
+    DeliveryAllowanceRate, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
+};
+use crate::vault::{BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation};
 
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
@@ -276,6 +281,18 @@ fn near_delivery() -> BridgeDelivery {
         receiver: Address::repeat_byte(0x99),
         destination_token: Address::repeat_byte(0x94),
         surplus: BridgeSurplus::BridgedByProvider,
+        private: None,
+    }
+}
+
+/// An Across delivery that shields to the wallet from the destination stealth `account`.
+fn private_delivery(account: Address, on_shield_failure: BridgeShieldFailure) -> BridgeDelivery {
+    BridgeDelivery {
+        provider: BridgeProvider::Across,
+        receiver: account,
+        surplus: BridgeSurplus::KeepInAccount,
+        private: Some(BridgePrivateDelivery { on_shield_failure }),
+        ..near_delivery()
     }
 }
 
@@ -305,6 +322,11 @@ fn plan_for(delivery: SwapDelivery) -> SwapInputPlan {
 
 /// A NEAR Intents review whose `CoW` price is verified, without its bridge quote.
 fn bridge_review() -> SwapReview {
+    bridge_review_for(near_delivery())
+}
+
+/// A review of `delivery` whose `CoW` price is verified, without its bridge quote.
+fn bridge_review_for(delivery: BridgeDelivery) -> SwapReview {
     let quote: CowQuote = serde_json::from_value(serde_json::json!({
         "quote": {
             "sellToken": WETH, "buyToken": USDC,
@@ -316,7 +338,7 @@ fn bridge_review() -> SwapReview {
     }))
     .unwrap();
     price_swap_review(
-        plan_for(SwapDelivery::Bridge(near_delivery())),
+        plan_for(SwapDelivery::Bridge(delivery)),
         quote,
         SwapPrice::Verified {
             rate: PairAnchorRate {
@@ -374,13 +396,19 @@ const USDC_TO_BNB: PairAnchorRate = PairAnchorRate {
 
 // Across's output for the buy amount is the destination minimum, and its whole relay fee,
 // which includes the LP fee, is the bridge fee the high-cost check counts: 15% here. The
-// deposit contract comes from the profile, never from the API.
+// deposit contract comes from the profile, never from the API. A private delivery's minimum is
+// that output less the delivery allowance, and what reaches the private balance also pays the
+// destination chain's shield fee.
 #[test]
 fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
     let spoke_pool = Address::repeat_byte(0x5b);
     let fees = AcrossFeeQuote {
         output_amount: U256::from(850_000_000),
         total_relay_fee_total: U256::from(150_000_000),
+        total_relay_fee_pct: U256::ZERO,
+        relayer_gas_fee_total: U256::ZERO,
+        // 0.1% of the input.
+        relayer_gas_fee_pct: uint!(1_000_000_000_000_000_U256),
         lp_fee_total: U256::from(50_000_000),
         timestamp: 1,
         fill_deadline: 2,
@@ -393,7 +421,7 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
         max_deposit: U256::MAX,
         estimated_fill_time_sec: 12,
     };
-    let quote = across_bridge_quote(&fees, spoke_pool).unwrap();
+    let quote = across_bridge_quote(&fees, spoke_pool, None).unwrap();
     assert_eq!(
         (quote.destination_minimum, quote.fee, quote.leg),
         (
@@ -402,7 +430,166 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
             BridgeLegPrice::SameAsset
         )
     );
-    assert!(across_bridge_quote(&fees, Address::repeat_byte(0x5d)).is_err());
+    assert_eq!(
+        (quote.private, quote.received_minimum()),
+        (None, quote.destination_minimum)
+    );
+    assert!(across_bridge_quote(&fees, Address::repeat_byte(0x5d), None).is_err());
+
+    // An allowance of 50 leaves 800 for the destination account, whose shield takes 25 bp, 2.
+    // The relay fee stays the bridge fee.
+    let allowance = U256::from(50_000_000);
+    let private = across_bridge_quote(&fees, spoke_pool, Some(allowance)).unwrap();
+    assert_eq!(
+        (
+            private.destination_minimum,
+            private.expected_output,
+            private.fee
+        ),
+        (
+            U256::from(800_000_000),
+            U256::from(800_000_000),
+            Some(U256::from(150_000_000))
+        )
+    );
+    assert_eq!(
+        private.private,
+        Some(SwapPrivateBridgeQuote {
+            quoted_output: fees.output_amount,
+            delivery_allowance: allowance,
+            destination_shield_fee_bps: RAILGUN_PROTOCOL_FEE_BPS,
+        })
+    );
+    assert_eq!(private.received_minimum(), U256::from(798_000_000));
+    assert_eq!(
+        across_bridge_quote(&fees, spoke_pool, Some(fees.output_amount))
+            .unwrap_err()
+            .downcast_ref::<OrderLimitError>(),
+        Some(&OrderLimitError::DeliveryAllowanceExceedsOutput {
+            allowance: fees.output_amount,
+            output: fees.output_amount,
+        })
+    );
+
+    // The allowance converts at par for the destination chain's wrapped native token, by the
+    // cached anchor for another token, and without one from the quote's own gas fee: 0.1% of
+    // the output here, since the whole fee percentage is zero.
+    let delivery = private_delivery(Address::repeat_byte(0xeb), BridgeShieldFailure::default());
+    let (token, anchor) = (delivery.destination_token, U256::from(600_000_000));
+    for (wrapped_native, anchor, rate) in [
+        (Some(token), Some(anchor), DeliveryAllowanceRate::Par),
+        (
+            Some(WETH),
+            Some(anchor),
+            DeliveryAllowanceRate::Anchor(anchor),
+        ),
+        (
+            Some(WETH),
+            None,
+            DeliveryAllowanceRate::QuoteScaled {
+                relayer_gas_fee: U256::from(850_000),
+            },
+        ),
+    ] {
+        assert_eq!(
+            delivery_allowance_rate(delivery, wrapped_native, anchor, &fees).unwrap(),
+            rate
+        );
+    }
+    // A quote whose fee takes the whole input has no gas fee to scale.
+    let unusable = AcrossFeeQuote {
+        total_relay_fee_pct: uint!(1_000_000_000_000_000_000_U256),
+        ..fees
+    };
+    assert!(delivery_allowance_rate(delivery, Some(WETH), None, &unusable).is_err());
+}
+
+// The plan sizes a private delivery's post-hook with placeholders. It must encode to the length
+// of the post-hook signed later, whose deposit carries the handler message around the
+// destination account's signed shield, with or without a fallback recipient.
+#[test]
+fn private_delivery_placeholder_has_the_signed_post_hooks_length() {
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(7)).unwrap();
+    let (executor, account) = (Address::repeat_byte(0xe0), signer.address());
+    let (handler, spoke_pool) = (Address::repeat_byte(0x7e), Address::repeat_byte(0x5b));
+    let token = near_delivery().destination_token;
+    let amount = U256::from(123_456_789);
+    let calls = guarded_shield_calls(
+        account,
+        token,
+        amount,
+        ShieldRequest {
+            preimage: CommitmentPreimage {
+                npk: B256::repeat_byte(1),
+                token: TokenData::erc20(token),
+                value: U120::ZERO,
+            },
+            ciphertext: ShieldCiphertext {
+                encryptedBundle: [B256::repeat_byte(2); 3],
+                shieldKey: B256::repeat_byte(3),
+            },
+        },
+    )
+    .unwrap();
+    let nonce = U256::from(7);
+    let hash = post_hook_signing_hash(&calls, nonce, 56, account);
+    let shield_multicall = signed_post_hook_calldata(
+        calls,
+        nonce,
+        56,
+        account,
+        &signer.sign_hash_sync(&hash).unwrap(),
+    )
+    .unwrap();
+    for on_shield_failure in [
+        BridgeShieldFailure::RefundOnOrigin,
+        BridgeShieldFailure::KeepOnDestination,
+    ] {
+        let delivery = private_delivery(account, on_shield_failure);
+        let signed = private_bridge_deposit_calls(
+            executor,
+            spoke_pool,
+            SpokePool::depositV3Call {
+                depositor: executor,
+                recipient: handler,
+                inputToken: USDC,
+                outputToken: token,
+                inputAmount: amount,
+                outputAmount: amount,
+                destinationChainId: U256::from(delivery.destination_chain),
+                exclusiveRelayer: Address::repeat_byte(0x77),
+                quoteTimestamp: 1,
+                fillDeadline: 2,
+                exclusivityParameter: 3,
+                message: Bytes::new(),
+            },
+            AcrossPrivateDelivery {
+                handler,
+                destination_executor: account,
+                shield_multicall: shield_multicall.clone(),
+                fallback: (on_shield_failure == BridgeShieldFailure::KeepOnDestination)
+                    .then_some(account),
+            },
+            None,
+        )
+        .unwrap();
+        let placeholder =
+            placeholder_post_hook_calls(executor, USDC, SwapDelivery::Bridge(delivery)).unwrap();
+        assert_eq!(
+            placeholder.abi_encode().len(),
+            signed.abi_encode().len(),
+            "{on_shield_failure:?}"
+        );
+        // The destination chain's data cost is priced for the same message length.
+        let message = SpokePool::depositV3Call::abi_decode(&signed[2].data)
+            .unwrap()
+            .message;
+        assert_eq!(
+            placeholder_private_delivery_message_len(delivery).unwrap(),
+            message.len(),
+            "{on_shield_failure:?}"
+        );
+    }
 }
 
 // An Across post-hook guards, approves the SpokePool and deposits, and with Reshield also
@@ -544,6 +731,7 @@ fn review_prices_the_gas_share_once_and_reprices_without_requests() {
             fee: Some(U256::ZERO),
             leg: BridgeLegPrice::SameAsset,
             fill_time_sec: None,
+            private: None,
         });
         for share in [0, GAS_SHARE_TIGHT_BPS, GAS_SHARE_LOOSE_BPS] {
             let repriced = bridged.with_gas_share(share).unwrap();
@@ -694,6 +882,7 @@ fn a_lower_destination_minimum_needs_a_new_review() {
         fee: Some(U256::ZERO),
         leg: BridgeLegPrice::SameAsset,
         fill_time_sec: None,
+        private: None,
     };
     let mut review = bridge_review();
     review.bridge = Some(quote(1_000));
@@ -721,6 +910,107 @@ fn a_lower_destination_minimum_needs_a_new_review() {
         Some(SwapReviewChange::DestinationMinimum {
             approved: U256::ZERO,
             current: U256::from(1_001),
+        })
+    );
+}
+
+// A private delivery's approval also binds the destination account, the failure choice and the
+// destination shield fee, and records the delivery allowance. Each difference needs a review
+// that names it. The approved allowed gas is one unit here, so the cushion is zero.
+#[test]
+fn a_private_deliverys_destination_terms_need_a_new_review() {
+    let account = Address::repeat_byte(0xeb);
+    let delivery = private_delivery(account, BridgeShieldFailure::RefundOnOrigin);
+    let quote = |output: u64, allowance: u64, shield_fee_bps: u64| SwapBridgeQuote {
+        provider: BridgeProvider::Across,
+        destination_minimum: U256::from(output - allowance),
+        expected_output: U256::from(output - allowance),
+        fee: Some(U256::ZERO),
+        leg: BridgeLegPrice::SameAsset,
+        fill_time_sec: None,
+        private: Some(SwapPrivateBridgeQuote {
+            quoted_output: U256::from(output),
+            delivery_allowance: U256::from(allowance),
+            destination_shield_fee_bps: U256::from(shield_fee_bps),
+        }),
+    };
+    let mut reviewed = bridge_review_for(delivery);
+    reviewed.bridge = Some(quote(1_000, 100, 25));
+    let approval = reviewed
+        .approval(reviewed.suggested_private_minimum(), false)
+        .unwrap();
+    let bounds = &approval.bounds;
+    assert_eq!(
+        (
+            bounds.destination_minimum,
+            bounds.destination_shield_fee_bps,
+            bounds.delivery_allowance
+        ),
+        (
+            Some(U256::from(900)),
+            Some(U256::from(25)),
+            Some(U256::from(100))
+        )
+    );
+    assert_eq!(reviewed.approval_change(&approval), None);
+
+    let requoted = |quote| {
+        let mut review = reviewed.clone();
+        review.bridge = Some(quote);
+        review
+    };
+    let redelivered = |delivery| {
+        let mut review = reviewed.clone();
+        review.plan.delivery = SwapDelivery::Bridge(delivery);
+        review
+    };
+    for (fresh, change) in [
+        (
+            requoted(quote(1_000, 100, 30)),
+            SwapReviewChange::DestinationShieldFee {
+                approved: U256::from(25),
+                current: U256::from(30),
+            },
+        ),
+        // The same output with a higher allowance delivers less: the allowance is the cause.
+        (
+            requoted(quote(1_000, 150, 25)),
+            SwapReviewChange::DeliveryAllowance {
+                approved: U256::from(100),
+                current: U256::from(150),
+            },
+        ),
+        // A lower output at the approved allowance is the bridge quote's own shortfall.
+        (
+            requoted(quote(950, 100, 25)),
+            SwapReviewChange::DestinationMinimum {
+                approved: U256::from(900),
+                current: U256::from(850),
+            },
+        ),
+        (
+            reviewed.with_receiver(Address::repeat_byte(0xec)),
+            SwapReviewChange::Delivery,
+        ),
+        (
+            redelivered(private_delivery(
+                account,
+                BridgeShieldFailure::KeepOnDestination,
+            )),
+            SwapReviewChange::Delivery,
+        ),
+    ] {
+        assert_eq!(fresh.approval_change(&approval), Some(change), "{change:?}");
+    }
+
+    // An approval saved without a destination shield fee can't sign a private delivery.
+    let mut unbound = approval.clone();
+    unbound.bounds.destination_shield_fee_bps = None;
+    assert_eq!(
+        reviewed.approval_change(&unbound),
+        Some(SwapReviewChange::DestinationShieldFee {
+            approved: U256::ZERO,
+            current: U256::from(25),
         })
     );
 }
@@ -866,6 +1156,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             fee: Some(U256::ZERO),
             leg: BridgeLegPrice::SameAsset,
             fill_time_sec: None,
+            private: None,
         });
         review
     };

@@ -1,18 +1,21 @@
-use super::swap_setup::{USDC, WETH, broadcaster, password, setup_approval};
+use super::swap_setup::{
+    DESTINATION_CHAIN, USDC, WETH, broadcaster, destination_chain_config, password, setup_approval,
+};
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote, GAS_SHARE_BALANCED_BPS};
 use crate::settings::{BridgeReceiverRejection, SwapReceiverRejection};
 use crate::{
-    OperationHttpClient, OperationNetworkIsolation, SwapAmountPlan, SwapAmountRequest,
-    SwapOrderOutcome, SwapPrice, SwapReviewChange, SwapReviewRequest, SwapSetupStatus,
-    WalletNetworkMode, swap_setup_status,
+    OperationHttpClient, OperationNetworkIsolation, PrivateBridgeSetupPreparation, SwapAmountPlan,
+    SwapAmountRequest, SwapOrderOutcome, SwapPrice, SwapReviewChange, SwapReviewRequest,
+    SwapSetupStatus, WalletNetworkMode, prepare_private_bridge_setup, swap_setup_status,
 };
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
+use broadcaster_core::contracts::across::{MulticallHandler, SpokePool, private_delivery_message};
 use broadcaster_core::contracts::cow::{
     AppData, BUY_NATIVE_TOKEN, ORDER_KIND_SELL, Order, TOKEN_BALANCE_ERC20, order_digest,
     order_uid, recover_order_signer,
 };
-use broadcaster_core::contracts::railgun::{approveCall, transferCall};
+use broadcaster_core::contracts::railgun::{approveCall, shieldCall, transferCall};
 
 pub(super) type Submissions = Arc<Mutex<Vec<(bool, Value)>>>;
 
@@ -128,6 +131,18 @@ pub(super) async fn spawn_bridge_stub(
     Arc<Mutex<Vec<(String, Value)>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_bridge_stub_with(move |_, body| (200, respond(body))).await
+}
+
+/// [`spawn_bridge_stub`] whose `respond(path, body)` also sees the request's path and chooses
+/// the HTTP status.
+async fn spawn_bridge_stub_with(
+    respond: impl Fn(&str, &Value) -> (u16, String) + Send + 'static,
+) -> (
+    url::Url,
+    Arc<Mutex<Vec<(String, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/api", listener.local_addr().unwrap())
         .parse()
@@ -144,12 +159,13 @@ pub(super) async fn spawn_bridge_stub(
             let Some(body) = read_json_body(&mut stream).await else {
                 continue;
             };
-            let reply = respond(&body);
             let path = request_line.split_whitespace().nth(1).unwrap().to_owned();
+            let (status, reply) = respond(&path, &body);
             recorded.lock().unwrap().push((path, body));
+            let reason = if status == 200 { "OK" } else { "Bad Request" };
             stream
                 .get_mut()
-                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                .write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
                 .await
                 .unwrap();
         }
@@ -554,6 +570,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             operation,
             broadcaster(delegate),
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            None,
             &password(),
         )
         .await
@@ -778,6 +795,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             token_registry: &tokens,
             bridge: None,
             destination_minimum: None,
+            destination: None,
         })
     };
     let first = || issue(vec![pre_hook_transaction.clone()], vec![change.clone()]);
@@ -809,6 +827,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             token_registry: &tokens,
             bridge: None,
             destination_minimum: None,
+            destination: None,
         });
         tokio::pin!(pending);
         tokio::select! {
@@ -1195,6 +1214,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             token_registry: &tokens,
             bridge: None,
             destination_minimum: None,
+            destination: None,
         })
         .await
         .unwrap()
@@ -1249,6 +1269,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             operation,
             broadcaster(delegate),
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            None,
             &password(),
         )
         .await
@@ -1492,6 +1513,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             token_registry: &tokens,
             bridge: None,
             destination_minimum: None,
+            destination: None,
         })
         .await;
     assert!(signed.is_err());
@@ -1554,6 +1576,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             Some("Private swap"),
             &[crate::ExecutorAsset::Erc20(USDC)],
             Some(setup_approval(USDC, Address::ZERO, approved)),
+            None,
         )
         .unwrap();
     let record = store
@@ -1574,6 +1597,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             operation,
             broadcaster(delegate),
             setup_approval(USDC, Address::ZERO, approved),
+            None,
             &password(),
         )
         .await
@@ -1687,13 +1711,14 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .unwrap();
         // A Bridge review carries its bridge quote, whose minimum the approval binds.
         if let SwapDelivery::Bridge(bridge) = delivery {
-            review.set_bridge_for_tests(crate::SwapBridgeQuote {
+            review.set_bridge_for_tests(&crate::SwapBridgeQuote {
                 provider: bridge.provider,
                 destination_minimum: U256::from(1_000),
                 expected_output: U256::from(1_010),
                 fee: Some(U256::ZERO),
                 leg: crate::BridgeLegPrice::SameAsset,
                 fill_time_sec: None,
+                private: None,
             });
         }
         review
@@ -1774,6 +1799,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
                     token_registry: &tokens,
                     bridge: $bridge,
                     destination_minimum: $review.bridge().map(|bridge| bridge.destination_minimum),
+                    destination: None,
                 })
                 .await
         };
@@ -1818,6 +1844,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         receiver: Address::repeat_byte(0x93),
         destination_token: Address::repeat_byte(0x94),
         surplus: BridgeSurplus::BridgedByProvider,
+        private: None,
     };
     let bridge = review(WETH, SwapDelivery::Bridge(bridged));
     let bridge_approval = bridge
@@ -2062,6 +2089,75 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
 const POLYGON_WETH: Address =
     alloy::primitives::address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619");
 
+/// Record `operation`'s setup as the winner of nonce 0 and its account as delegated, observed
+/// at nonce 1.
+fn delegate_setup(
+    store: &ExecutorStore,
+    operation: ExecutorOperationId,
+    profile: crate::settings::ExecutorProfile,
+) -> crate::DelegatedSwapExecutor {
+    let delegate = profile.delegate();
+    let before =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    store.reconcile(operation, before, &[]).unwrap();
+    let setup = B256::repeat_byte(3);
+    store
+        .record_issued(
+            operation,
+            IssuedExecutorPayload::new(
+                U256::ZERO,
+                delegate,
+                setup,
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(Bytes::from_static(b"setup"), before, Vec::new()),
+            ),
+        )
+        .unwrap();
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    let setup_won = (
+        setup,
+        ExecutorPayloadInclusion::new(
+            BlockNumHash::new(11, B256::repeat_byte(11)),
+            B256::repeat_byte(4),
+            ExecutorExecutionResult::Executed,
+        ),
+    );
+    let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+    let code = [
+        EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+        delegate.as_slice(),
+    ]
+    .concat();
+    let SwapSetupStatus::Delegated(delegated) =
+        swap_setup_status(&record, observed.block(), &code, profile)
+    else {
+        panic!("the setup delegated the executor");
+    };
+    delegated
+}
+
+/// An Across fee quote for `output` whose fill deadline is `fill_after` seconds from now.
+fn across_fee_quote(spoke_pool: Address, output: U256, fill_after: u64) -> String {
+    let now = unix_now();
+    json!({
+        "outputAmount": output.to_string(),
+        "totalRelayFee": {"pct": "0", "total": "10"},
+        "relayerGasFee": {"pct": "0", "total": "0"},
+        "lpFee": {"pct": "0", "total": "0"},
+        "timestamp": (now - 5).to_string(),
+        "fillDeadline": (now + fill_after).to_string(),
+        "exclusiveRelayer": Address::repeat_byte(0x77),
+        "exclusivityDeadline": 3,
+        "spokePoolAddress": spoke_pool,
+        "destinationSpokePoolAddress": Address::repeat_byte(0x78),
+        "isAmountTooLow": false,
+        "limits": {"minDeposit": "1", "maxDeposit": "1000000000000000000000"},
+        "estimatedFillTimeSec": 2
+    })
+    .to_string()
+}
+
 /// A delegated swap account from USDC to WETH approved for `delivery`, with one spendable
 /// note, and the reviewed first order with a bridge quote whose destination minimum is 1,000.
 struct BridgeOrderFixture {
@@ -2082,56 +2178,41 @@ impl BridgeOrderFixture {
         swap_profile: &crate::settings::SwapProfile,
         delivery: BridgeDelivery,
     ) -> Self {
-        let delegate = profile.delegate();
         let operation = ExecutorOperationId::random().unwrap();
         let executor = owner
             .prepare_swap_setup(
                 operation,
-                broadcaster(delegate),
+                broadcaster(profile.delegate()),
                 setup_approval(USDC, WETH, SwapDelivery::Bridge(delivery)),
+                None,
                 &password(),
             )
             .await
             .unwrap()
             .context()
             .executor;
-        let before =
-            ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-        store.reconcile(operation, before, &[]).unwrap();
-        let setup = B256::repeat_byte(3);
-        store
-            .record_issued(
-                operation,
-                IssuedExecutorPayload::new(
-                    U256::ZERO,
-                    delegate,
-                    setup,
-                    ExecutorPayloadPurpose::Operation,
-                    ExecutorPayloadContext::new(Bytes::from_static(b"setup"), before, Vec::new()),
-                ),
-            )
-            .unwrap();
-        let observed =
-            ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
-        let setup_won = (
-            setup,
-            ExecutorPayloadInclusion::new(
-                BlockNumHash::new(11, B256::repeat_byte(11)),
-                B256::repeat_byte(4),
-                ExecutorExecutionResult::Executed,
-            ),
-        );
-        let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
-        let code = [
-            EIP7702_DELEGATION_DESIGNATOR.as_slice(),
-            delegate.as_slice(),
-        ]
-        .concat();
-        let SwapSetupStatus::Delegated(delegated) =
-            swap_setup_status(&record, observed.block(), &code, profile)
-        else {
-            panic!("the setup delegated the executor");
-        };
+        Self::after_setup(
+            store,
+            view,
+            profile,
+            swap_profile,
+            operation,
+            executor,
+            delivery,
+        )
+    }
+
+    /// The fixture for `operation`, whose setup for `delivery` is prepared for `executor`.
+    fn after_setup(
+        store: &ExecutorStore,
+        view: &DesktopViewSession,
+        profile: crate::settings::ExecutorProfile,
+        swap_profile: &crate::settings::SwapProfile,
+        operation: ExecutorOperationId,
+        executor: Address,
+        delivery: BridgeDelivery,
+    ) -> Self {
+        let delegated = delegate_setup(store, operation, profile);
 
         let amount = U256::from(1_000_000);
         let input = Utxo::new(
@@ -2226,13 +2307,14 @@ impl BridgeOrderFixture {
             OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
         )
         .unwrap();
-        review.set_bridge_for_tests(crate::SwapBridgeQuote {
+        review.set_bridge_for_tests(&crate::SwapBridgeQuote {
             provider,
             destination_minimum: U256::from(destination_minimum),
             expected_output: U256::from(destination_minimum + 10),
             fee: Some(U256::ZERO),
             leg: crate::BridgeLegPrice::SameAsset,
             fill_time_sec: None,
+            private: None,
         });
         review
     }
@@ -2250,11 +2332,13 @@ impl BridgeOrderFixture {
             route,
             &self.review,
             self.review.suggested_private_minimum(),
+            None,
         )
         .await
     }
 
-    /// Sign `review` over `route` for `private_minimum` and the approved destination minimum.
+    /// Sign `review` over `route` for `private_minimum` and the approved destination minimum,
+    /// with a private delivery's confirmed `destination` account.
     async fn issue_with(
         &self,
         owner: &ExecutorOwner,
@@ -2262,6 +2346,7 @@ impl BridgeOrderFixture {
         route: crate::SwapBridgeRoute<'_>,
         review: &crate::SwapReview,
         private_minimum: U256,
+        destination: Option<crate::SwapDestinationSigning<'_>>,
     ) -> eyre::Result<SwapOrderOutcome> {
         owner
             .issue_swap_order(crate::SwapOrderSigning {
@@ -2280,6 +2365,7 @@ impl BridgeOrderFixture {
                 },
                 bridge: Some(route),
                 destination_minimum: Some(U256::from(1_000)),
+                destination,
             })
             .await
     }
@@ -2335,6 +2421,7 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
         receiver,
         destination_token: POLYGON_WETH,
         surplus: BridgeSurplus::Reshield,
+        private: None,
     };
     let fixture =
         BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
@@ -2345,25 +2432,7 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     let answer = quoted.clone();
     let (across_url, across_requests, across_task) = spawn_bridge_stub(move |_| {
         let (output, fill_after) = *answer.lock().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        json!({
-            "outputAmount": output.to_string(),
-            "totalRelayFee": {"total": "10"},
-            "lpFee": {"total": "0"},
-            "timestamp": (now - 5).to_string(),
-            "fillDeadline": (now + fill_after).to_string(),
-            "exclusiveRelayer": Address::repeat_byte(0x77),
-            "exclusivityDeadline": 3,
-            "spokePoolAddress": spoke_pool,
-            "destinationSpokePoolAddress": Address::repeat_byte(0x78),
-            "isAmountTooLow": false,
-            "limits": {"minDeposit": "1", "maxDeposit": "1000000000000000000000"},
-            "estimatedFillTimeSec": 2
-        })
-        .to_string()
+        across_fee_quote(spoke_pool, output, fill_after)
     })
     .await;
     let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
@@ -2528,7 +2597,7 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     let signed_from = unix_now();
     assert!(
         fixture
-            .issue_with(&owner, &orderbook, route, &requote, buy_amount)
+            .issue_with(&owner, &orderbook, route, &requote, buy_amount, None)
             .await
             .unwrap_err()
             .downcast_ref::<crate::cow::CowApiError>()
@@ -2642,6 +2711,511 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+// A private Across order's destination stealth account signs a guarded shield on the
+// destination chain first. That payload is in its record before the signing-time quote carries
+// the handler message out of the wallet and before the swap's own account signs anything. The
+// post-hook's deposit then pays the handler with that message, whose fallback follows the
+// failure choice. The preview quote names no recipient, message or account.
+#[tokio::test]
+async fn private_across_order_records_the_destination_shield_before_its_deposit_is_signed() {
+    use alloy::sol_types::SolValue as _;
+
+    for on_shield_failure in [
+        BridgeShieldFailure::RefundOnOrigin,
+        BridgeShieldFailure::KeepOnDestination,
+    ] {
+        let rpc = Rpc::start().await;
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = Arc::new(import_wallet_with_metadata(
+            &vault,
+            TEST_WALLET_ID,
+            "Wallet",
+        ));
+        let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+        let profile = origin_chain.accepted_executor_profile().unwrap();
+        let destination_profile = destination_chain.accepted_executor_profile().unwrap();
+        let swap_profile = origin_chain.swap_profile().unwrap();
+        let spoke_pool = origin_chain.bridge_profile().unwrap().spoke_pool();
+        let handler = destination_chain
+            .bridge_profile()
+            .unwrap()
+            .multicall_handler();
+        let [owner, destination_owner] = [origin_chain, destination_chain.clone()].map(|chain| {
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap()
+        });
+        let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+        let destination_store =
+            ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
+
+        // Both accounts are reserved, and the approval saved with the swap names the destination
+        // account as receiver.
+        let (operation, destination_operation) = (
+            ExecutorOperationId::random().unwrap(),
+            ExecutorOperationId::random().unwrap(),
+        );
+        let mut approval = setup_approval(
+            USDC,
+            WETH,
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider: BridgeProvider::Across,
+                destination_chain: DESTINATION_CHAIN,
+                receiver: Address::ZERO,
+                destination_token: POLYGON_WETH,
+                surplus: BridgeSurplus::KeepInAccount,
+                private: Some(BridgePrivateDelivery { on_shield_failure }),
+            }),
+        );
+        approval.bounds.destination_setup_fee = Some(U256::from(1_000));
+        approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
+        let authorization = password();
+        let destination_authorization = authorization.for_destination().unwrap();
+        let mut destination_candidate = broadcaster(destination_profile.delegate());
+        destination_candidate.chain_id = DESTINATION_CHAIN;
+        let prepared = prepare_private_bridge_setup(
+            &owner,
+            &destination_owner,
+            PrivateBridgeSetupPreparation {
+                operation,
+                destination_operation,
+                candidate: broadcaster(profile.delegate()),
+                destination_candidate,
+                approval,
+                authorization: &authorization,
+                destination_authorization: &destination_authorization,
+            },
+        )
+        .await
+        .unwrap();
+        let SwapDelivery::Bridge(delivery) = prepared.approval.delivery else {
+            panic!("the approval keeps its Bridge delivery");
+        };
+        let destination_executor = prepared.destination.context().executor;
+        assert_eq!(delivery.receiver, destination_executor);
+        let destination_record = || {
+            destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == destination_operation)
+                .unwrap()
+        };
+
+        // Before its setup is confirmed, the destination account can't back an order.
+        let error = destination_owner
+            .delegated_swap_destination(
+                destination_operation,
+                9,
+                1,
+                operation,
+                destination_executor,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("destination network"),
+            "{error:#}"
+        );
+        assert!(destination_record().issued().is_empty());
+
+        let fixture = BridgeOrderFixture::after_setup(
+            &store,
+            &view,
+            profile,
+            &swap_profile,
+            operation,
+            prepared.origin.context().executor,
+            delivery,
+        );
+        let executor = fixture.executor;
+        let delegated = delegate_setup(
+            &destination_store,
+            destination_operation,
+            destination_profile,
+        );
+        // A completed destination setup still belongs to its origin swap, even before any
+        // shield has been issued. It must not be offered or previewed for an unrelated swap.
+        assert!(
+            destination_owner
+                .swap_account_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            destination_owner
+                .swap_order_preview(destination_operation, true)
+                .is_err()
+        );
+        let destination = crate::SwapDestinationSigning {
+            owner: &destination_owner,
+            delegated,
+            authorization: &destination_authorization,
+        };
+        let mut review = fixture.review.clone();
+        review.set_bridge_for_tests(&crate::SwapBridgeQuote {
+            provider: BridgeProvider::Across,
+            destination_minimum: U256::from(1_000),
+            expected_output: U256::from(1_000),
+            fee: Some(U256::ZERO),
+            leg: crate::BridgeLegPrice::SameAsset,
+            fill_time_sec: None,
+            private: Some(crate::SwapPrivateBridgeQuote {
+                quoted_output: U256::from(1_050),
+                delivery_allowance: U256::from(50),
+                destination_shield_fee_bps: crate::RAILGUN_PROTOCOL_FEE_BPS,
+            }),
+        });
+
+        // The quote's output, and whether Across's simulation of the message fails. For each
+        // request with a message, the stub records whether the destination account's payload
+        // in that message was already in its record, and whether the swap's own account had
+        // still signed nothing.
+        let quoted = Arc::new(Mutex::new((U256::from(1_005), false)));
+        let answer = quoted.clone();
+        let durable = Arc::new(Mutex::new(Vec::new()));
+        let observed = durable.clone();
+        // A destination owner that the stub closes while it answers the quote.
+        let ending = Arc::new(Mutex::new(None::<Arc<ExecutorOwner>>));
+        let ends = ending.clone();
+        let (stub_db, stub_view) = (db.clone(), view.clone());
+        let (across_url, across_requests, across_task) = spawn_bridge_stub_with(move |path, _| {
+            let url = url::Url::parse(&format!("http://across{path}")).unwrap();
+            if let Some((_, message)) = url.query_pairs().find(|(key, _)| key == "message") {
+                let message = message.parse::<Bytes>().unwrap();
+                let shield = MulticallHandler::Instructions::abi_decode(&message)
+                    .unwrap()
+                    .calls
+                    .swap_remove(1)
+                    .callData;
+                let issued = |chain_id, operation| {
+                    ExecutorStore::new(stub_db.clone(), stub_view.clone(), chain_id)
+                        .unwrap()
+                        .records()
+                        .unwrap()
+                        .into_iter()
+                        .find(|record| record.operation() == operation)
+                        .unwrap()
+                        .issued()
+                        .to_vec()
+                };
+                observed.lock().unwrap().push((
+                    issued(DESTINATION_CHAIN, destination_operation)
+                        .iter()
+                        .any(|payload| {
+                            payload.purpose() == ExecutorPayloadPurpose::SwapDestinationShield
+                                && *payload.context().calldata() == shield
+                        }),
+                    issued(1, operation).len() == 1,
+                ));
+            }
+            if let Some(owner) = ends.lock().unwrap().take() {
+                owner.close();
+            }
+            let (output, simulation_fails) = *answer.lock().unwrap();
+            if simulation_fails {
+                let error = json!({
+                    "type": "AcrossApiError", "code": "SIMULATION_ERROR", "status": 400,
+                    "message": "execution reverted"
+                });
+                (400, error.to_string())
+            } else {
+                (200, across_fee_quote(spoke_pool, output, 3 * 60 * 60))
+            }
+        })
+        .await;
+        let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
+        let (orderbook_url, submissions, orderbook_task) = spawn_orderbook(
+            db.clone(),
+            view.clone(),
+            operation,
+            swap_profile.settlement(),
+        )
+        .await;
+        let orderbook = CowOrderbookClient::new(
+            OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+            orderbook_url,
+            1,
+        )
+        .unwrap();
+        let mut clients = owner.swap_bridge_clients(&orderbook).unwrap();
+        clients.across = crate::bridge::AcrossClient::new(
+            OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+            across_url,
+        )
+        .unwrap();
+        let bridge_destination = crate::bridge::BridgeDestination {
+            destination_token: POLYGON_WETH,
+            intermediate: WETH,
+            symbol: "WETH".to_owned(),
+            same_asset: true,
+            near: None,
+        };
+        let route = crate::SwapBridgeRoute {
+            clients: &clients,
+            destination: &bridge_destination,
+            destination_chain: &destination_chain,
+        };
+        let tokens = crate::settings::EffectiveTokenRegistry {
+            tokens: std::collections::BTreeMap::new(),
+        };
+
+        // The preview asks Across with the tokens, chains and amount only. Without a cached
+        // anchor the delivery allowance is scaled from that quote, so the destination chain's
+        // RPC isn't read.
+        let (quote_url, _, quote_task) = spawn_quote_stub(
+            json!({
+                "quote": {
+                    "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
+                    "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
+                    "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
+                    "kind": "sell", "partiallyFillable": false
+                },
+                "expiration": "", "id": 7, "verified": true
+            }),
+            None,
+        )
+        .await;
+        let previewed = owner
+            .review_swap(SwapReviewRequest {
+                plan: review.plan().clone(),
+                slippage_bps: 50,
+                gas_share_bps: GAS_SHARE_BALANCED_BPS,
+                valid_for: Duration::from_mins(30),
+                orderbook: &CowOrderbookClient::new(
+                    OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+                    quote_url,
+                    1,
+                )
+                .unwrap(),
+                anchor_cache: None,
+                token_registry: &tokens,
+                bridge: Some(route),
+            })
+            .await
+            .unwrap();
+        quote_task.abort();
+        assert!(previewed.bridge().unwrap().private.is_some());
+        let (path, _) = across_requests.lock().unwrap().last().cloned().unwrap();
+        let path = path.to_lowercase();
+        assert!(
+            !path.contains("recipient") && !path.contains("message"),
+            "{path}"
+        );
+        for address in [executor, destination_executor, handler] {
+            assert!(!path.contains(&format!("{address:x}")), "{path}");
+        }
+        assert!(durable.lock().unwrap().is_empty());
+
+        // A private order without its destination account is refused.
+        assert!(
+            fixture
+                .issue_with(
+                    &owner,
+                    &orderbook,
+                    route,
+                    &review,
+                    review.suggested_private_minimum(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        fixture.assert_unsigned(&store, &submissions);
+        assert_eq!(destination_record().issued().len(), 1);
+
+        // A signing-time quote below the approved destination minimum returns to review, and a
+        // message that fails Across's simulation is an error. Neither signs for the swap's own
+        // account.
+        let issue = || {
+            fixture.issue_with(
+                &owner,
+                &orderbook,
+                route,
+                &review,
+                review.suggested_private_minimum(),
+                Some(destination),
+            )
+        };
+        *quoted.lock().unwrap() = (U256::from(999), false);
+        assert_eq!(
+            issue().await.unwrap(),
+            SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+                approved: U256::from(1_000),
+                current: U256::from(999),
+            })
+        );
+        fixture.assert_unsigned(&store, &submissions);
+        *quoted.lock().unwrap() = (U256::from(1_005), true);
+        let error = issue().await.unwrap_err();
+        assert!(
+            error.to_string().contains("fails in its simulation"),
+            "{error:#}"
+        );
+        fixture.assert_unsigned(&store, &submissions);
+
+        // The destination session is needed until the order is signed. One that ends while the
+        // quote is pending stops the order.
+        *quoted.lock().unwrap() = (U256::from(1_005), false);
+        let ended = Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                destination_chain.clone(),
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
+        );
+        *ending.lock().unwrap() = Some(ended.clone());
+        assert!(
+            fixture
+                .issue_with(
+                    &owner,
+                    &orderbook,
+                    route,
+                    &review,
+                    review.suggested_private_minimum(),
+                    Some(crate::SwapDestinationSigning {
+                        owner: &ended,
+                        ..destination
+                    }),
+                )
+                .await
+                .is_err(),
+            "the ended destination session stops the order"
+        );
+        fixture.assert_unsigned(&store, &submissions);
+
+        let SwapOrderOutcome::Submitted { uid } = issue().await.unwrap() else {
+            panic!("the order is submitted");
+        };
+        assert_eq!(
+            *durable.lock().unwrap(),
+            [(true, true); 4],
+            "each message's shield payload is durable before the request, and nothing of the swap's own account is signed yet"
+        );
+
+        // The post-hook guards, approves and deposits for the handler, with the message.
+        let submitted = submissions.lock().unwrap().clone();
+        let [(persisted, body)] = submitted.as_slice() else {
+            panic!("one order request");
+        };
+        assert!(*persisted, "the terms are durable before the order request");
+        let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+            .unwrap()
+            .metadata
+            .hooks;
+        let calls = RelayAdapt7702::multicallCall::abi_decode(&hooks.post[0].call_data)
+            .unwrap()
+            ._calls;
+        assert_eq!(
+            calls.iter().map(|call| call.to).collect::<Vec<_>>(),
+            [executor, WETH, spoke_pool]
+        );
+        let deposit = SpokePool::depositV3Call::abi_decode(&calls[2].data).unwrap();
+        assert_eq!((deposit.depositor, deposit.recipient), (executor, handler));
+        assert_eq!(deposit.outputAmount, U256::from(1_000));
+        let instructions = MulticallHandler::Instructions::abi_decode(&deposit.message).unwrap();
+        let shield_calldata = instructions.calls[1].callData.clone();
+        let fallback = match on_shield_failure {
+            BridgeShieldFailure::RefundOnOrigin => None,
+            BridgeShieldFailure::KeepOnDestination => Some(destination_executor),
+        };
+        let message = private_delivery_message(
+            handler,
+            POLYGON_WETH,
+            destination_executor,
+            shield_calldata.clone(),
+            fallback,
+        );
+        assert_eq!(deposit.message, message);
+
+        // The signing-time quote named the handler and carried that message.
+        let (path, _) = across_requests.lock().unwrap().last().cloned().unwrap();
+        let url = url::Url::parse(&format!("http://across{path}")).unwrap();
+        let sent = |name: &str| {
+            url.query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
+                .unwrap()
+        };
+        assert_eq!(sent("recipient").parse::<Address>().unwrap(), handler);
+        assert_eq!(sent("message").parse::<Bytes>().unwrap(), message);
+
+        // The destination account's record holds that payload at its current nonce: the guard
+        // for the approved destination minimum, then a full-balance shield of the token.
+        let payload = destination_record()
+            .issued()
+            .iter()
+            .find(|payload| *payload.context().calldata() == shield_calldata)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (payload.purpose(), payload.nonce()),
+            (
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                delegated.observed().nonce()
+            )
+        );
+        let shield = RelayAdapt7702::multicallCall::abi_decode(&shield_calldata).unwrap();
+        assert!(shield._requireSuccess);
+        assert_eq!(shield._nonce, delegated.observed().nonce());
+        assert_eq!(
+            shield._calls.iter().map(|call| call.to).collect::<Vec<_>>(),
+            [destination_executor; 2]
+        );
+        let guard = transferCall::abi_decode(&shield._calls[0].data).unwrap();
+        assert_eq!(
+            (guard._transfers[0].to, guard._transfers[0].value),
+            (destination_executor, U256::from(1_000))
+        );
+        let shielded = shieldCall::abi_decode(&shield._calls[1].data).unwrap();
+        let preimage = &shielded._shieldRequests[0].preimage;
+        assert_eq!(preimage.token.tokenAddress, POLYGON_WETH);
+        assert!(preimage.value.is_zero());
+
+        // The order keeps the signed recipient and message hash, and the private terms.
+        let saved = fixture.record(&store).swap().unwrap().orders()[0].clone();
+        assert_eq!(saved.uid(), uid);
+        let Some(BridgeOrderTerms::Across(terms)) = saved.bridge().cloned() else {
+            panic!("an Across order keeps its deposit terms");
+        };
+        assert_eq!(
+            (terms.recipient, terms.message_hash),
+            (Some(handler), Some(alloy::primitives::keccak256(&message)))
+        );
+        assert_eq!(
+            (
+                saved.bounds().destination_shield_fee_bps,
+                saved.bounds().delivery_allowance,
+                saved.bounds().destination_setup_fee,
+            ),
+            (
+                Some(crate::RAILGUN_PROTOCOL_FEE_BPS),
+                Some(U256::from(50)),
+                Some(U256::from(1_000)),
+            )
+        );
+
+        across_task.abort();
+        orderbook_task.abort();
+        owner.shutdown().await;
+        destination_owner.shutdown().await;
+        drop((owner, destination_owner));
+        drop((store, destination_store));
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 // A NEAR Intents order pays the deposit address of a 1Click quote requested while signing,
 // which names the receiver and refunds to the executor, and has no post-hook. A quote that
 // doesn't verify, or that can't deliver the approved minimum, stops signing.
@@ -2673,6 +3247,7 @@ async fn near_intents_order_pays_a_verified_deposit_address() {
         receiver,
         destination_token: Address::repeat_byte(0x94),
         surplus: BridgeSurplus::BridgedByProvider,
+        private: None,
     };
     let fixture =
         BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;

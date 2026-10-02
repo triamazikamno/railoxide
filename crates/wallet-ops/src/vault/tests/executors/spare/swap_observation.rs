@@ -706,6 +706,9 @@ impl Fixture {
                         gas_allowance: None,
                         gas_price_wei: None,
                         valid_for_secs: None,
+                        destination_shield_fee_bps: None,
+                        delivery_allowance: None,
+                        destination_setup_fee: None,
                     },
                     invalidates: None,
                     pre_hook: IssuedExecutorPayload::new(
@@ -1101,6 +1104,9 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
                     gas_allowance: None,
                     gas_price_wei: None,
                     valid_for_secs: None,
+                    destination_shield_fee_bps: None,
+                    delivery_allowance: None,
+                    destination_setup_fee: None,
                 },
                 price_verified: Some(false),
                 price_acknowledged: true,
@@ -2064,10 +2070,7 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
             .await
             .unwrap()
             .unwrap_err();
-        assert!(
-            error.to_string().contains("changed during preparation"),
-            "{error:#}"
-        );
+        assert!(error.is::<crate::ExecutorRecordChanged>(), "{error:#}");
         assert_eq!(
             fixture.record(),
             changed,
@@ -2452,6 +2455,7 @@ fn across_order(spoke_pool: Address) -> (BridgeDelivery, AcrossOrderTerms) {
             receiver: Address::repeat_byte(0x77),
             destination_token: Address::repeat_byte(0xa0),
             surplus: BridgeSurplus::Reshield,
+            private: None,
         },
         AcrossOrderTerms {
             spoke_pool,
@@ -2463,6 +2467,33 @@ fn across_order(spoke_pool: Address) -> (BridgeDelivery, AcrossOrderTerms) {
             fill_deadline: 1_010_000,
             exclusive_relayer: Address::ZERO,
             exclusivity_parameter: 0,
+            recipient: None,
+            message_hash: None,
+        },
+    )
+}
+
+/// The handler message a private order's deposit carries.
+const PRIVATE_MESSAGE: &[u8] = b"drain to the destination account, then call its shield";
+
+/// `across_order` as a private delivery: the deposit pays `handler` with `PRIVATE_MESSAGE`, and
+/// the receiver is the destination stealth account.
+fn private_across_order(
+    spoke_pool: Address,
+    handler: Address,
+) -> (BridgeDelivery, AcrossOrderTerms) {
+    let (delivery, terms) = across_order(spoke_pool);
+    (
+        BridgeDelivery {
+            private: Some(BridgePrivateDelivery {
+                on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+            }),
+            ..delivery
+        },
+        AcrossOrderTerms {
+            recipient: Some(handler),
+            message_hash: Some(keccak256(PRIVATE_MESSAGE)),
+            ..terms
         },
     )
 }
@@ -2480,9 +2511,13 @@ fn signed_deposit(delivery: BridgeDelivery, terms: &AcrossOrderTerms) -> SpokePo
         fillDeadline: terms.fill_deadline,
         exclusivityDeadline: 0,
         depositor: address_to_bytes32(EXECUTOR),
-        recipient: address_to_bytes32(delivery.receiver),
+        recipient: address_to_bytes32(terms.deposit_recipient(delivery)),
         exclusiveRelayer: address_to_bytes32(terms.exclusive_relayer),
-        message: Bytes::new(),
+        message: if terms.message_hash.is_some() {
+            PRIVATE_MESSAGE.into()
+        } else {
+            Bytes::new()
+        },
     }
 }
 
@@ -2550,10 +2585,16 @@ async fn confirm_settlement(fixture: &Fixture, logs: Vec<(Address, LogData)>) ->
 async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
     // 0: the signed deposit, then the reshielded surplus. 1 and 2: a deposit to another
     // recipient, or of another output amount. 3: the post-hook didn't run. 4: the signed
-    // deposit, paid by someone other than the executor.
-    for scenario in 0..5 {
+    // deposit, paid by someone other than the executor. 5: a private order's signed deposit,
+    // which pays the handler with the signed message. 6: that deposit with another message.
+    for scenario in 0..7 {
         let fixture = Fixture::start().await;
-        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        let spoke_pool = fixture.config.bridge_profile().unwrap().spoke_pool();
+        let (delivery, terms) = if scenario >= 5 {
+            private_across_order(spoke_pool, Address::repeat_byte(0x7a))
+        } else {
+            across_order(spoke_pool)
+        };
         fixture.record_delivery_attempt(
             1,
             20,
@@ -2565,6 +2606,7 @@ async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
         match scenario {
             1 => deposit.recipient = address_to_bytes32(Address::repeat_byte(0x78)),
             2 => deposit.outputAmount -= U256::ONE,
+            6 => deposit.message = Bytes::from_static(b"another message"),
             _ => {}
         }
         let mut logs = across_settlement_logs(&fixture, &terms, (scenario != 3).then_some(deposit));
@@ -2581,7 +2623,7 @@ async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
         let record = fixture.record();
         let observed = record.swap().unwrap().orders()[0].observations();
         assert_eq!(observed.traded, Some(traded), "scenario {scenario}");
-        if scenario != 0 {
+        if !matches!(scenario, 0 | 5) {
             // The bought token stays in the executor.
             assert_eq!(
                 state(&record, 0),
@@ -2621,7 +2663,8 @@ async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
                     deposit_id: Some(U256::from(42)),
                 }),
                 Some(traded)
-            )
+            ),
+            "scenario {scenario}"
         );
         assert_eq!(
             observed
@@ -2656,6 +2699,7 @@ async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObserv
             receiver: Address::repeat_byte(0x77),
             destination_token: Address::ZERO,
             surplus: BridgeSurplus::BridgedByProvider,
+            private: None,
         }),
         Some(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
             deposit_address,
@@ -2765,7 +2809,7 @@ fn filled_relay(
     terms: &AcrossOrderTerms,
     deposit_id: u64,
 ) -> SpokePool::FilledRelay {
-    let recipient = address_to_bytes32(delivery.receiver);
+    let recipient = address_to_bytes32(terms.deposit_recipient(delivery));
     SpokePool::FilledRelay {
         inputToken: address_to_bytes32(terms.input_token),
         outputToken: address_to_bytes32(terms.output_token),
@@ -2780,10 +2824,10 @@ fn filled_relay(
         relayer: address_to_bytes32(Address::repeat_byte(0x55)),
         depositor: address_to_bytes32(EXECUTOR),
         recipient,
-        messageHash: B256::ZERO,
+        messageHash: terms.deposit_message_hash(),
         relayExecutionInfo: V3RelayExecutionEventInfo {
             updatedRecipient: recipient,
-            updatedMessageHash: B256::ZERO,
+            updatedMessageHash: terms.deposit_message_hash(),
             updatedOutputAmount: terms.output_amount,
             fillType: 0,
         },
@@ -2807,9 +2851,23 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
     // 0: the deposit's fill. 1: a fill of another deposit. 2: the fill's block is reorged
     // during the read. 3: Across reports the deposit expired. 4: a slow fill, which pays more
     // than the signed output. 5: a fill that executes less than the signed output.
-    for scenario in 0..6 {
+    // A private order, whose record without a message is scenario 0: 6: the fill, the
+    // handler's transfer to the destination stealth account and its shield. 7: the fill and
+    // that transfer, without the shield. 8: a fill executed with another message. 9: Across
+    // reports the deposit expired.
+    for scenario in 0..10 {
         let fixture = Fixture::start().await;
-        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        let (destination, config, server) = across_destination().await;
+        let profile = config.bridge_profile().unwrap();
+        let (spoke_pool, handler) = (profile.spoke_pool(), profile.multicall_handler());
+        let railgun = config.require_railgun().unwrap().deployment.contract;
+        let origin_pool = fixture.config.bridge_profile().unwrap().spoke_pool();
+        let private = scenario >= 6;
+        let (delivery, terms) = if private {
+            private_across_order(origin_pool, handler)
+        } else {
+            across_order(origin_pool)
+        };
         fixture.record_delivery_attempt(
             1,
             20,
@@ -2819,8 +2877,6 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
         );
         let logs = across_settlement_logs(&fixture, &terms, Some(signed_deposit(delivery, &terms)));
         confirm_settlement(&fixture, logs).await;
-        let (destination, config, server) = across_destination().await;
-        let spoke_pool = config.bridge_profile().unwrap().spoke_pool();
         let mut fill = filled_relay(delivery, &terms, if scenario == 1 { 43 } else { 42 });
         let executed = match scenario {
             4 => {
@@ -2831,18 +2887,40 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
             _ => terms.output_amount,
         };
         fill.relayExecutionInfo.updatedOutputAmount = executed;
+        if scenario == 8 {
+            fill.relayExecutionInfo.updatedMessageHash = B256::ZERO;
+        }
+        // The handler passes its whole balance on, which can exceed the fill.
+        let received = executed + U256::from(7);
+        let transfer = |from: Address, to: Address, value: U256| {
+            (
+                terms.output_token,
+                Transfer { from, to, value }.encode_log_data(),
+            )
+        };
+        let mut logs = vec![(spoke_pool, fill.encode_log_data())];
+        if private {
+            logs.push(transfer(handler, delivery.receiver, received));
+            if scenario != 7 {
+                // The shield moves the net amount to Railgun and the fee to its treasury.
+                logs.extend([
+                    transfer(delivery.receiver, railgun, received - U256::from(25)),
+                    transfer(
+                        delivery.receiver,
+                        Address::repeat_byte(0xfe),
+                        U256::from(25),
+                    ),
+                ]);
+            }
+        }
         {
             let mut chain = destination.lock().unwrap();
-            chain.add_addressed_transaction(
-                30,
-                spoke_pool,
-                Bytes::new(),
-                vec![(spoke_pool, fill.encode_log_data())],
-            );
+            chain.add_addressed_transaction(30, spoke_pool, Bytes::new(), logs);
             chain.reorg_on_receipts = scenario == 2;
         }
         // Across's fill transaction, amount and recipient only locate the block.
-        let status = if scenario == 3 { "expired" } else { "filled" };
+        let expired = matches!(scenario, 3 | 9);
+        let status = if expired { "expired" } else { "filled" };
         let deposit = format!(
             r#"{{"deposit":{{"status":"{status}","fillBlockNumber":30,"fillTx":"{}","outputAmount":"1","recipient":"{}","destinationChainId":"42161"}}}}"#,
             B256::repeat_byte(0xf1),
@@ -2852,7 +2930,8 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
             super::swap_order::spawn_bridge_stub(move |_| deposit.clone()).await;
         let clients = bridge_clients(&fixture, &url);
         let first = observe_bridge(&fixture, &clients, &config).await;
-        let outcome = if scenario == 3 {
+        let outcome = if expired {
+            // The destination chain isn't read.
             assert_eq!(first, Some(SwapBridgeOutcome::Refunding));
             assert!(destination.lock().unwrap().rpc_requests.is_empty());
             first
@@ -2864,16 +2943,30 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
             let chain = destination.lock().unwrap();
             let (transaction_hash, transaction, _) = &chain.transactions[0];
             let block = BlockNumHash::new(30, transaction.block_hash.unwrap());
-            // The executed amount is delivered.
-            assert_eq!(
-                outcome,
-                matches!(scenario, 0 | 4).then_some(SwapBridgeOutcome::DeliveredVerified {
+            let transaction_hash = *transaction_hash;
+            // The executed amount is delivered. A private delivery records the amount the
+            // destination stealth account received, shielded or held.
+            let expected = match scenario {
+                0 | 4 => Some(SwapBridgeOutcome::DeliveredVerified {
                     block,
-                    transaction_hash: *transaction_hash,
+                    transaction_hash,
                     output_amount: executed,
+                    shielded: false,
                 }),
-                "scenario {scenario}"
-            );
+                6 => Some(SwapBridgeOutcome::DeliveredVerified {
+                    block,
+                    transaction_hash,
+                    output_amount: received,
+                    shielded: true,
+                }),
+                7 => Some(SwapBridgeOutcome::HeldOnDestination {
+                    block,
+                    transaction_hash,
+                    amount: received,
+                }),
+                _ => None,
+            };
+            assert_eq!(outcome, expected, "scenario {scenario}");
             assert_block_only_requests(&chain.rpc_requests, block);
             outcome
         };
@@ -2893,6 +2986,10 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
                 SwapOrderState::Refunding,
                 SwapOrderState::Done,
                 SwapOrderState::Bridging,
+                SwapOrderState::Done,
+                SwapOrderState::HeldOnDestination,
+                SwapOrderState::Bridging,
+                SwapOrderState::Refunding,
             ][scenario],
             "scenario {scenario}"
         );
@@ -2973,6 +3070,7 @@ async fn an_explicit_check_corrects_an_across_refund_with_a_verified_fill() {
             block: BlockNumHash::new(30, transaction.block_hash.unwrap()),
             transaction_hash: *transaction_hash,
             output_amount: terms.output_amount,
+            shielded: false,
         }
     };
     assert_eq!(outcome, Some(expected));
@@ -3109,6 +3207,7 @@ async fn an_explicit_check_verifies_an_across_refund_on_this_chain() {
                         block: BlockNumHash::new(30, B256::repeat_byte(30)),
                         transaction_hash: B256::repeat_byte(31),
                         output_amount: terms.output_amount,
+                        shielded: false,
                     },
                 ),
                 Err(ExecutorStoreError::InvalidRecord)

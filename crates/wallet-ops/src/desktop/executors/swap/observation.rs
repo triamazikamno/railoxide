@@ -81,6 +81,9 @@ pub enum SwapOrderState {
     /// The bridge provider reported a failed or incomplete deposit. The wallet can't recover
     /// it; an explicit status check may still resolve it.
     NeedsAttention,
+    /// The fill completed without the shield. The destination stealth account holds the token;
+    /// recovery is offered on the destination chain.
+    HeldOnDestination,
     /// The pre-hook can never run. Its inputs are released and a retry may start.
     AttemptEnded(SwapPreHookDeathCause),
 }
@@ -100,6 +103,9 @@ pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
                 None => SwapOrderState::Bridging,
                 Some(outcome) if outcome.is_delivered() => SwapOrderState::Done,
                 Some(SwapBridgeOutcome::Refunding) => SwapOrderState::Refunding,
+                Some(SwapBridgeOutcome::HeldOnDestination { .. }) => {
+                    SwapOrderState::HeldOnDestination
+                }
                 Some(_) => SwapOrderState::NeedsAttention,
             },
             (Some(_), SwapDelivery::Reshield | SwapDelivery::External { .. }) => {
@@ -970,9 +976,9 @@ fn death_cause(
             }
             ExecutorPayloadPurpose::Recovery => SwapPreHookDeathCause::Cancellation,
             ExecutorPayloadPurpose::SwapPostHook => SwapPreHookDeathCause::OlderPostHook,
-            ExecutorPayloadPurpose::Operation | ExecutorPayloadPurpose::SwapPreHook => {
-                SwapPreHookDeathCause::Unknown
-            }
+            ExecutorPayloadPurpose::Operation
+            | ExecutorPayloadPurpose::SwapPreHook
+            | ExecutorPayloadPurpose::SwapDestinationShield => SwapPreHookDeathCause::Unknown,
         };
     }
     // Inside a settlement, a post-hook is identified by its shield, or its recorded Across
