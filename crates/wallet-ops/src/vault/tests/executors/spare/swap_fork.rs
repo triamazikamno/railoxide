@@ -24,12 +24,16 @@ use crate::tests::cow_fork::{
     ForkChain, MULTICALL3, RAILGUN, RailgunTree, VERIFICATION_BYPASS, synthetic_transaction,
     unshield_to,
 };
+use crate::vault::{
+    SwapAccountChoice, SwapAccountRole, SwapAccountUse, SwapApprovedAccount, SwapApprovedAccounts,
+    SwapUseId, SwapUseRecord, SwapUseRole,
+};
 use crate::{
     DelegatedSwapExecutor, ExecutorRecoveryExecution, ExecutorRecoveryFunding,
     IssuedExecutorTransaction, OperationHttpClient, OperationNetworkIsolation,
-    PreparedExecutorOperation, PreparedExecutorRecovery, PrivateBridgeSetupPreparation,
-    SwapAmountPlan, SwapAmountRequest, SwapInputPlan, SwapOrderOutcome, SwapOrderState, SwapPrice,
-    SwapSetupStatus, WalletNetworkMode, prepare_private_bridge_setup, swap_order_state,
+    PreparedExecutorOperation, PreparedExecutorRecovery, SwapAmountPlan, SwapAmountRequest,
+    SwapInputPlan, SwapOrderOutcome, SwapOrderState, SwapPairPreparation, SwapPairSide, SwapPrice,
+    SwapSetupStatus, WalletNetworkMode, prepare_swap_pair, swap_order_state,
 };
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use broadcaster_core::contracts::across::{
@@ -117,6 +121,8 @@ const fn builder() -> railgun_wallet::TransactionBuilder {
 /// A published order of a delegated swap executor.
 struct Swap {
     operation: ExecutorOperationId,
+    /// The swap use the order was signed for.
+    swap_use: SwapUseId,
     executor: Address,
     note: Utxo,
     input: ExecutorInputIdentity,
@@ -142,6 +148,12 @@ struct Wallet {
     destination: Option<Destination>,
     /// The delegated destination stealth account that new private Across orders deliver to.
     destination_account: Option<DelegatedSwapExecutor>,
+    /// The use new orders are signed for, once a swap reuses the wallet's accounts. Until then
+    /// an order belongs to its account's first use.
+    swap_use: Option<SwapUseId>,
+    /// The wallet's notes on the destination chain, which a reused destination account's
+    /// earlier shields are judged from.
+    destination_notes: Option<AcceptedShieldNotes>,
 }
 
 /// The destination chain of private Across orders over its own fork, and the wallet's owner
@@ -149,6 +161,19 @@ struct Wallet {
 struct Destination {
     chain: crate::settings::EffectiveChainConfig,
     owner: ExecutorOwner,
+}
+
+/// The wallet's local notes on the destination chain, as a test states them. The fork wallet
+/// has no synced session to read them from.
+struct AcceptedShieldNotes(Vec<crate::WalletUtxo>);
+
+impl crate::SwapShieldNotes for AcceptedShieldNotes {
+    fn shield_notes(
+        &self,
+        shield: &crate::vault::SwapEarlierShield,
+    ) -> Option<Vec<crate::WalletUtxo>> {
+        Some(crate::notes_of_shield(&self.0, shield))
+    }
 }
 
 impl Wallet {
@@ -185,6 +210,8 @@ impl Wallet {
             pair: (USDC, SwapDelivery::Reshield),
             destination: None,
             destination_account: None,
+            swap_use: None,
+            destination_notes: None,
         }
     }
 
@@ -314,43 +341,203 @@ impl Wallet {
             }),
         );
         approval.bounds.destination_setup_fee = Some(U256::from(1_000));
+        approval.bounds.source_setup_fee = Some(U256::from(1_000));
         approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
-        let prepared = prepare_private_bridge_setup(
+        let operation = ExecutorOperationId::random().unwrap();
+        let prepared = prepare_swap_pair(
             &self.owner,
-            &destination.owner,
-            PrivateBridgeSetupPreparation {
-                operation: ExecutorOperationId::random().unwrap(),
-                destination_operation: ExecutorOperationId::random().unwrap(),
-                candidate: broadcaster(delegate),
-                destination_candidate,
+            Some(&destination.owner),
+            SwapPairPreparation {
+                use_id: SwapUseId::first(operation),
+                source: SwapAccountChoice::New(operation),
+                destination: Some(SwapAccountChoice::New(
+                    ExecutorOperationId::random().unwrap(),
+                )),
+                candidate: Some(broadcaster(delegate)),
+                destination_candidate: Some(destination_candidate),
                 approval,
                 authorization: &authorization,
-                destination_authorization: &destination_authorization,
+                destination_authorization: Some(&destination_authorization),
             },
         )
         .await
         .unwrap();
+        let (SwapPairSide::Setup(origin_setup), Some(SwapPairSide::Setup(destination_setup))) =
+            (&prepared.origin, &prepared.destination)
+        else {
+            panic!("both fresh accounts need setup");
+        };
         let delegated = self
-            .install(
-                fork,
-                &self.owner,
-                &self.chain,
-                &prepared.origin,
-                &authorization,
-            )
+            .install(fork, &self.owner, &self.chain, origin_setup, &authorization)
             .await;
         let destination_account = self
             .install(
                 destination_fork,
                 &destination.owner,
                 &destination.chain,
-                &prepared.destination,
+                destination_setup,
                 &destination_authorization,
             )
             .await;
         self.pair = (USDC, prepared.approval.delivery);
         self.destination_account = Some(destination_account);
         delegated
+    }
+
+    /// Claim both stealth accounts of the delivered private Across swap `placed` for another
+    /// swap under a new use, without a setup on either chain, and admit each at its current
+    /// nonce as the order path does. `notes` are the wallet's local notes on the destination
+    /// chain. New swaps then belong to that use and deliver to the same destination account.
+    /// Returns the swap's own account.
+    async fn reuse_private(
+        &mut self,
+        fork: &ForkChain,
+        destination_fork: &ForkChain,
+        placed: &PrivateDeposit,
+        notes: AcceptedShieldNotes,
+    ) -> DelegatedSwapExecutor {
+        let destination = self.destination.as_ref().unwrap();
+        let authorization = password();
+        let destination_authorization = authorization.for_destination().unwrap();
+        let (operation, destination_operation) =
+            (placed.swap.operation, placed.account.operation());
+        let (executor, destination_executor) = (placed.swap.executor, placed.account.executor());
+
+        // A claim judges recorded outcomes only. The wallet's routine observation records the
+        // nonce that the first swap's fill consumed, and one reconciliation at the final head
+        // stands in for it here.
+        let confirmed = destination_fork.block_number().await - destination.chain.finality_depth;
+        let SwapSetupStatus::Delegated(observed) = destination
+            .owner
+            .observe_swap_setup(destination_operation, confirmed..confirmed + 1)
+            .await
+            .unwrap()
+        else {
+            panic!("the destination account stays delegated");
+        };
+        assert_eq!(
+            observed.observed().nonce(),
+            placed.account.observed().nonce() + U256::ONE
+        );
+
+        let SwapDelivery::Bridge(delivery) = self.pair.1 else {
+            panic!("the reused accounts served a Bridge swap");
+        };
+        // Only a side that needs setup has a setup fee limit, and neither does. The receiver
+        // is a placeholder until the preparation binds the destination account.
+        let mut approval = setup_approval(
+            WETH,
+            USDC,
+            SwapDelivery::Bridge(BridgeDelivery {
+                receiver: Address::ZERO,
+                ..delivery
+            }),
+        );
+        approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
+        let swap_use = SwapUseId::random().unwrap();
+        let issued = || {
+            (
+                self.record(operation).issued().len(),
+                self.destination_record(destination_operation)
+                    .issued()
+                    .len(),
+            )
+        };
+        let issued_before = issued();
+        let prepared = prepare_swap_pair(
+            &self.owner,
+            Some(&destination.owner),
+            SwapPairPreparation {
+                use_id: swap_use,
+                source: SwapAccountChoice::Existing(operation),
+                destination: Some(SwapAccountChoice::Existing(destination_operation)),
+                approval,
+                candidate: None,
+                destination_candidate: None,
+                authorization: &authorization,
+                destination_authorization: Some(&destination_authorization),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Neither account takes a setup, and the preparation signs nothing. The approval binds
+        // both existing accounts and delivers to the same destination account.
+        let prepared_destination = prepared.destination.as_ref().unwrap();
+        assert!(
+            !prepared.origin.requires_setup() && !prepared_destination.requires_setup(),
+            "an existing account takes no setup"
+        );
+        assert_eq!(
+            (prepared.origin.executor(), prepared_destination.executor()),
+            (executor, destination_executor)
+        );
+        let bound = |address| SwapApprovedAccount {
+            address: Some(address),
+            setup: false,
+        };
+        assert_eq!(
+            prepared.approval.accounts,
+            Some(SwapApprovedAccounts {
+                source: bound(executor),
+                destination: Some(bound(destination_executor)),
+            })
+        );
+        assert_eq!(prepared.approval.delivery, self.pair.1);
+        assert_eq!(issued(), issued_before);
+        // Each account keeps its first use as history and is claimed by the new one, which did
+        // not reserve it fresh.
+        for record in [
+            self.record(operation),
+            self.destination_record(destination_operation),
+        ] {
+            assert_eq!(
+                record
+                    .swap_uses()
+                    .iter()
+                    .map(SwapUseRecord::id)
+                    .collect::<Vec<_>>(),
+                [SwapUseId::first(operation), swap_use]
+            );
+            assert_eq!(record.active_swap_use(), Some(swap_use));
+            assert!(!record.swap_use(swap_use).unwrap().is_fresh());
+        }
+
+        // Each account is admitted for the use at its current nonce: the source from its
+        // settled and delivered order, the destination also from the notes of its earlier
+        // shield.
+        let confirmed = fork.block_number().await - self.chain.finality_depth;
+        let source = self
+            .owner
+            .reuse_swap_account(
+                operation,
+                confirmed,
+                SwapAccountRole::Source,
+                SwapAccountUse::Claimed(swap_use),
+            )
+            .await
+            .unwrap()
+            .delegated()
+            .expect("the reused source account is confirmed as delegated");
+        let confirmed = destination_fork.block_number().await - destination.chain.finality_depth;
+        let destination_account = destination
+            .owner
+            .delegated_swap_destination(
+                destination_operation,
+                confirmed,
+                self.chain.chain_id,
+                operation,
+                swap_use,
+                destination_executor,
+                Some(&notes),
+            )
+            .await
+            .unwrap();
+        self.pair = (USDC, prepared.approval.delivery);
+        self.destination_account = Some(destination_account);
+        self.swap_use = Some(swap_use);
+        self.destination_notes = Some(notes);
+        source
     }
 
     /// Deliver `prepared`'s delegation-only setup on `fork`, the fork of `owner`'s `chain`, and
@@ -596,7 +783,12 @@ impl Wallet {
             owner: &self.destination.as_ref().unwrap().owner,
             delegated: self.destination_account.unwrap(),
             authorization: &destination_authorization,
+            notes: self
+                .destination_notes
+                .as_ref()
+                .map(|notes| notes as &dyn crate::SwapShieldNotes),
         });
+        let swap_use = self.swap_use.unwrap_or_else(|| SwapUseId::first(operation));
         let transactions = transactions.unwrap_or_else(|| {
             let record = self
                 .owner
@@ -617,6 +809,7 @@ impl Wallet {
             .owner
             .issue_swap_order(crate::SwapOrderSigning {
                 review: &review,
+                swap_use,
                 private_minimum: review.suggested_private_minimum(),
                 price_acknowledged: true,
                 transactions,
@@ -645,6 +838,7 @@ impl Wallet {
         let app_data = body["appData"].as_str().unwrap();
         Swap {
             operation,
+            swap_use,
             executor,
             input: ExecutorInputIdentity::from_utxo(&notes[0]),
             note: notes[0].clone(),
@@ -778,6 +972,19 @@ impl Wallet {
             .unwrap()
     }
 
+    /// The record of the account `operation` on the destination chain.
+    fn destination_record(&self, operation: ExecutorOperationId) -> ExecutorRecord {
+        self.destination
+            .as_ref()
+            .unwrap()
+            .owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    }
+
     /// Place an Across order with `surplus` handled as chosen from a fresh executor, and
     /// settle it through `GPv2Settlement` with both hooks, paying `SURPLUS` above its limit.
     /// Returns the order, the settlement and the persisted deposit terms, once the
@@ -800,7 +1007,8 @@ impl Wallet {
         swap: Swap,
     ) -> (Swap, TransactionReceipt, AcrossOrderTerms) {
         let record = self.record(swap.operation);
-        let Some(BridgeOrderTerms::Across(terms)) = first_order(&record).bridge().cloned() else {
+        let Some(BridgeOrderTerms::Across(terms)) = order_of(&record, swap.uid).bridge().cloned()
+        else {
             panic!("an Across order keeps its deposit terms");
         };
         let receipt = fork
@@ -947,6 +1155,17 @@ impl Wallet {
 
 fn first_order(record: &ExecutorRecord) -> &SwapOrderRecord {
     &record.swap().unwrap().orders()[0]
+}
+
+/// `record`'s order `uid`.
+fn order_of(record: &ExecutorRecord, uid: OrderUid) -> &SwapOrderRecord {
+    record
+        .swap()
+        .unwrap()
+        .orders()
+        .iter()
+        .find(|order| order.uid() == uid)
+        .unwrap()
 }
 
 /// Deliver an issued executor transaction as its broadcaster would.
@@ -2140,10 +2359,8 @@ struct PrivateDeposit {
     shield: Bytes,
 }
 
-/// Settle a private Across order from fresh stealth accounts on both forks. Its post-hook must
-/// deposit, within its declared gas limit, for the destination chain's handler with the message
-/// that drains the fill to the destination account and runs that account's recorded shield, and
-/// the wallet must record the hand-off.
+/// Settle a private Across order from fresh stealth accounts on both forks, and check its
+/// deposit as [`placed_private_deposit`] does.
 async fn private_deposit(
     wallet: &mut Wallet,
     fork: &ForkChain,
@@ -2151,9 +2368,21 @@ async fn private_deposit(
     surplus: BridgeSurplus,
     on_shield_failure: BridgeShieldFailure,
 ) -> PrivateDeposit {
-    let (swap, receipt, terms) = wallet
+    let settled = wallet
         .settle_private_across(fork, destination_fork, surplus, on_shield_failure)
         .await;
+    placed_private_deposit(wallet, settled, on_shield_failure)
+}
+
+/// The deposit of a settled private Across order, from fresh or reused stealth accounts. Its
+/// post-hook must deposit, within its declared gas limit, for the destination chain's handler
+/// with the message that drains the fill to the destination account and runs the shield that
+/// account signed for the order's swap use, and the wallet must record the hand-off.
+fn placed_private_deposit(
+    wallet: &Wallet,
+    (swap, receipt, terms): (Swap, TransactionReceipt, AcrossOrderTerms),
+    on_shield_failure: BridgeShieldFailure,
+) -> PrivateDeposit {
     let destination = wallet.destination.as_ref().unwrap();
     let account = wallet.destination_account.unwrap();
     let handler = destination
@@ -2161,20 +2390,26 @@ async fn private_deposit(
         .bridge_profile()
         .unwrap()
         .multicall_handler();
-    let shields = destination
-        .owner
-        .records()
-        .unwrap()
-        .into_iter()
-        .find(|record| record.operation() == account.operation())
-        .unwrap()
+    let destination_record = wallet.destination_record(account.operation());
+    let Some(SwapUseRole::Destination {
+        shields: signed, ..
+    }) = destination_record
+        .swap_use(swap.swap_use)
+        .map(SwapUseRecord::role)
+    else {
+        panic!("the destination account serves the order's swap use");
+    };
+    let shields = destination_record
         .issued()
         .iter()
-        .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::SwapDestinationShield)
+        .filter(|payload| {
+            payload.purpose() == ExecutorPayloadPurpose::SwapDestinationShield
+                && signed.contains(&payload.hash())
+        })
         .map(|payload| payload.context().calldata().clone())
         .collect::<Vec<_>>();
     let [shield] = shields.as_slice() else {
-        panic!("the destination account signs one shield");
+        panic!("the destination account signs one shield for the swap use");
     };
     let fallback = match on_shield_failure {
         BridgeShieldFailure::RefundOnOrigin => None,
@@ -2219,7 +2454,7 @@ async fn private_deposit(
     );
     let record = wallet.record(swap.operation);
     assert_eq!(
-        first_order(&record)
+        order_of(&record, swap.uid)
             .observations()
             .bridge_handoff
             .map(|handoff| (handoff.observation.transaction_hash, handoff.deposit_id)),
@@ -2388,10 +2623,74 @@ async fn verify_fill(
     (outcome, settled)
 }
 
+/// What the wallet keeps of `placed`'s swap use: its order, with its terms, identifier,
+/// observations and bridge outcome, and the use's record on the source and on the destination
+/// account, which holds the destination outcome.
+fn use_history(
+    wallet: &Wallet,
+    placed: &PrivateDeposit,
+) -> (
+    SwapOrderRecord,
+    Option<SwapUseRecord>,
+    Option<SwapUseRecord>,
+) {
+    let source = wallet.record(placed.swap.operation);
+    let destination = wallet.destination_record(placed.account.operation());
+    let swap_use = placed.swap.swap_use;
+    (
+        order_of(&source, placed.swap.uid).clone(),
+        source.swap_use(swap_use).cloned(),
+        destination.swap_use(swap_use).cloned(),
+    )
+}
+
+/// The note that `filled`'s shield of `value` of the destination token created, as the wallet's
+/// synced notes hold it once every active POI list accepted it.
+fn accepted_shield_note(
+    wallet: &Wallet,
+    filled: &TransactionReceipt,
+    value: U256,
+) -> crate::WalletUtxo {
+    let mut utxo = Utxo::new(
+        broadcaster_core::notes::Note::new_change(
+            wallet.view.scan_keys().master_public_key,
+            DESTINATION_TOKEN,
+            value,
+            [9; 16],
+        ),
+        0,
+        0,
+        UtxoSource {
+            tx_hash: filled.transaction_hash,
+            block_number: filled.block_number.unwrap(),
+            block_timestamp: 0,
+        },
+        UtxoCommitmentKind::Shield,
+    );
+    for list in poi::poi::default_active_poi_list_keys() {
+        utxo.poi.statuses.insert(list, crate::PoiStatus::Valid);
+    }
+    crate::WalletUtxo::new(utxo)
+}
+
+/// The purpose and nonce of each payload that `record`'s account signed, in signing order.
+fn issued_nonces(record: &ExecutorRecord) -> Vec<(ExecutorPayloadPurpose, U256)> {
+    record
+        .issued()
+        .iter()
+        .map(|payload| (payload.purpose(), payload.nonce()))
+        .collect()
+}
+
 // A relayer's fill of a private Across deposit pays the destination chain's handler, which
 // passes the tokens to the destination stealth account and runs its pre-signed shield, all in
 // the fill's transaction. Before the fill that shield reverts for anyone without using the
 // account's nonce. Without a fallback recipient, a shield that fails reverts the whole fill.
+//
+// Once that swap is delivered and verified, both of its accounts serve a second private swap
+// under a new use, without a setup on either chain. Each signs at its current nonce, the second
+// fill shields to the wallet as the first did, the first swap's payloads can't run again, and
+// what the wallet keeps of the first swap stays as it was.
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
 async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_chain() {
@@ -2557,6 +2856,181 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
                 transaction_hash,
             })
         )
+    );
+
+    // A second swap reuses both accounts. The fork wallet has no synced session, so the POI
+    // verdict of the first shield's note is stubbed here: the note is stated as accepted on
+    // every active list. The delegations, nonces, balances, settlement, fill and shield are
+    // the forks' own.
+    let first = use_history(&wallet, &placed);
+    let source = placed.swap.executor;
+    let source_nonce = execution_nonce(&fork, source).await;
+    let notes = AcceptedShieldNotes(vec![accepted_shield_note(&wallet, &filled, *credited)]);
+    let reused = wallet
+        .reuse_private(&fork, &destination_fork, &placed, notes)
+        .await;
+    assert_eq!(use_history(&wallet, &placed), first);
+    let swap = wallet.swap_from(&fork, reused).await;
+    let settled = wallet.settle_deposit(&fork, swap).await;
+    let again = placed_private_deposit(&wallet, settled, BridgeShieldFailure::RefundOnOrigin);
+    let second_use = again.swap.swap_use;
+    assert_ne!(second_use, placed.swap.swap_use);
+
+    // Each account signed at its current nonce, past every nonce of the first swap, and
+    // neither signed another setup.
+    let source_record = wallet.record(again.swap.operation);
+    assert_eq!(
+        order_of(&source_record, again.swap.uid).use_id(),
+        Some(second_use)
+    );
+    let setup_nonce = source_record.issued()[0].nonce();
+    assert_eq!(source_nonce, setup_nonce + U256::from(3));
+    assert_eq!(
+        issued_nonces(&source_record),
+        [
+            (ExecutorPayloadPurpose::Operation, setup_nonce),
+            (ExecutorPayloadPurpose::SwapPreHook, setup_nonce + U256::ONE),
+            (
+                ExecutorPayloadPurpose::SwapPostHook,
+                setup_nonce + U256::from(2)
+            ),
+            (ExecutorPayloadPurpose::SwapPreHook, source_nonce),
+            (
+                ExecutorPayloadPurpose::SwapPostHook,
+                source_nonce + U256::ONE
+            ),
+        ]
+    );
+    assert_eq!(
+        execution_nonce(&fork, source).await,
+        source_nonce + U256::from(2)
+    );
+    assert_eq!(
+        issued_nonces(&wallet.destination_record(again.account.operation())),
+        [
+            (ExecutorPayloadPurpose::Operation, nonce - U256::ONE),
+            (ExecutorPayloadPurpose::SwapDestinationShield, nonce),
+            (
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                nonce + U256::ONE
+            ),
+        ]
+    );
+    assert_eq!(again.account.observed().nonce(), nonce + U256::ONE);
+    assert_eq!(
+        execution_nonce(&destination_fork, account).await,
+        nonce + U256::ONE
+    );
+
+    // The second fill moves its output through the handler and the same account into Railgun,
+    // less the shield fee, and uses the account's next nonce.
+    assert!(
+        destination_fork.timestamp().await < u64::from(again.terms.fill_deadline),
+        "the destination fork's clock is before the second fill deadline"
+    );
+    let (relayer_before, shielded_before) = (balance(RELAYER).await, balance(railgun).await);
+    let (refilled, reverts) = fill(&destination_fork, spoke_pool, relay_of(&again.deposit)).await;
+    assert!(
+        refilled.status(),
+        "the second fill runs the reused account's shield: {reverts:?}"
+    );
+    let reshields = shields_of(&refilled, railgun, DESTINATION_TOKEN);
+    let [(recredited, refee)] = reshields.as_slice() else {
+        panic!("the second fill shields once");
+    };
+    assert!(!refee.is_zero());
+    assert_eq!(*recredited + *refee, output);
+    assert_eq!(balance(railgun).await, shielded_before + *recredited);
+    assert_eq!(
+        (
+            balance(RELAYER).await,
+            balance(handler).await,
+            balance(account).await
+        ),
+        (relayer_before - output, held_by_handler, U256::ZERO)
+    );
+    assert_eq!(
+        execution_nonce(&destination_fork, account).await,
+        nonce + U256::from(2)
+    );
+
+    // The wallet verifies the second delivery and records it under the second use. The first
+    // use keeps its own outcome, and the first swap's order and uses are what they were.
+    let reblock = BlockNumHash::new(refilled.block_number.unwrap(), refilled.block_hash.unwrap());
+    let redelivered = SwapDestinationOutcome::Shielded {
+        block: reblock,
+        transaction_hash: refilled.transaction_hash,
+    };
+    assert_eq!(
+        verify_fill(&wallet, &destination_fork, &again, &refilled).await,
+        (
+            Some(SwapBridgeOutcome::DeliveredVerified {
+                block: reblock,
+                transaction_hash: refilled.transaction_hash,
+                output_amount: output,
+                shielded: true,
+            }),
+            Some(redelivered)
+        )
+    );
+    let destination_record = wallet.destination_record(again.account.operation());
+    let outcome_of = |swap_use| {
+        destination_record
+            .swap_destination_use(swap_use)
+            .and_then(|served| served.outcome)
+    };
+    assert_eq!(
+        (outcome_of(placed.swap.swap_use), outcome_of(second_use)),
+        (
+            Some(SwapDestinationOutcome::Shielded {
+                block,
+                transaction_hash,
+            }),
+            Some(redelivered)
+        )
+    );
+    assert_eq!(use_history(&wallet, &placed), first);
+
+    // The first swap's payloads stay public and signed, but their nonces are consumed. Its
+    // hooks, replayed on the swap's chain, revert and move nothing.
+    let held = (
+        fork.erc20_balance(WETH, source).await,
+        fork.erc20_balance(USDC, source).await,
+    );
+    for hook in placed.swap.hooks.pre.iter().chain(&placed.swap.hooks.post) {
+        let replayed = fork
+            .send_as_bypass(hook.target, hook.call_data.clone(), 3_000_000)
+            .await;
+        assert!(!replayed.status(), "a hook at a consumed nonce reverts");
+    }
+    assert_eq!(
+        execution_nonce(&fork, source).await,
+        source_nonce + U256::from(2)
+    );
+    assert_eq!(
+        (
+            fork.erc20_balance(WETH, source).await,
+            fork.erc20_balance(USDC, source).await
+        ),
+        held
+    );
+    // Its shield, replayed on the destination chain while the account holds enough to pass
+    // the guard, reverts on its nonce alone and leaves the tokens in the account.
+    destination_fork
+        .add_erc20(DESTINATION_TOKEN, account, output)
+        .await;
+    let shielded = balance(railgun).await;
+    let replayed = destination_fork
+        .send_as_bypass(account, placed.shield.clone(), FILL_GAS)
+        .await;
+    assert!(!replayed.status(), "a shield at a consumed nonce reverts");
+    assert_eq!(
+        (
+            execution_nonce(&destination_fork, account).await,
+            balance(account).await,
+            balance(railgun).await
+        ),
+        (nonce + U256::from(2), output, shielded)
     );
     wallet.finish().await;
 }

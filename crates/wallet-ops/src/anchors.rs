@@ -1181,7 +1181,9 @@ async fn rpc_broker_values_at<C: SolCall + 'static>(
         .submit_calls_decoded_at::<C>(route.clone(), calls, block, origin.into())
         .await?;
     if let Some(error) = total_failure(&results) {
-        return Err(eyre::eyre!("{caller} RPC request failed: {error}"));
+        return Err(
+            eyre::Report::new(error.clone()).wrap_err(format!("{caller} RPC request failed"))
+        );
     }
     Ok(results)
 }
@@ -1937,7 +1939,13 @@ mod tests {
         .await
         .expect_err("unresponsive oracle RPC must time out");
 
-        assert!(format!("{error:#}").contains("timed out"));
+        assert!(
+            matches!(
+                error.downcast_ref::<RpcBrokerError>(),
+                Some(RpcBrokerError::Timeout | RpcBrokerError::TimeoutBeforeDispatch)
+            ),
+            "expected a request timeout, got {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -1986,7 +1994,13 @@ mod tests {
         )
         .await
         .expect_err("unresponsive TWAP RPC must time out");
-        assert!(format!("{error:#}").contains("timed out"));
+        assert!(
+            matches!(
+                error.downcast_ref::<RpcBrokerError>(),
+                Some(RpcBrokerError::Timeout | RpcBrokerError::TimeoutBeforeDispatch)
+            ),
+            "expected a request timeout, got {error:#}"
+        );
     }
 
     #[tokio::test]

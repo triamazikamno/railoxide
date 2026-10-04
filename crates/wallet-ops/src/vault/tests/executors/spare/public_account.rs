@@ -296,6 +296,74 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
             .recovery_transaction_status(tx_hash),
         Some(ExecutorPayloadStatus::Uncertain)
     );
+    // A private Bridge swap's destination account that is registered in Public can't pay a
+    // refund's gas while the shield it signed can still execute at its nonce.
+    let (origin, destination) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    let reserved = store
+        .reserve_swap_destination(
+            destination,
+            record.delegate(),
+            crate::vault::SwapDestinationRecord {
+                origin_chain: 137,
+                origin_operation: origin,
+                destination_token: Address::repeat_byte(10),
+                outcome: None,
+            },
+        )
+        .unwrap();
+    ExecutorStore::new(db.clone(), view.clone(), 137)
+        .unwrap()
+        .reserve_with_swap_approval(
+            origin,
+            record.delegate(),
+            Some("Private swap"),
+            &[],
+            None,
+            Some(destination),
+        )
+        .unwrap();
+    let (_, derived) = vault
+        .executor_spend_signers_for_session(
+            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
+            &view,
+            None,
+            1,
+            reserved.index(),
+        )
+        .unwrap();
+    store.bind_address(destination, derived.address()).unwrap();
+    store.reconcile(destination, observed, &[]).unwrap();
+    store
+        .record_issued(
+            destination,
+            IssuedExecutorPayload::new(
+                U256::ZERO,
+                record.delegate(),
+                B256::repeat_byte(8),
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                ExecutorPayloadContext::new(Bytes::from_static(b"shield"), observed, Vec::new()),
+            ),
+        )
+        .unwrap();
+    let authorization =
+        DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()));
+    let account = owner
+        .register_public_account(destination, &authorization)
+        .await
+        .unwrap();
+    let Err(error) = owner
+        .admit_authorized_gas_signer(&view, &account, &authorization)
+        .await
+    else {
+        panic!("an executable destination shield refuses the gas signer");
+    };
+    assert!(
+        format!("{error:#}").contains("earlier signed operation"),
+        "{error:#}"
+    );
     owner.shutdown().await;
     drop((owner, store, view, vault, db));
     std::fs::remove_dir_all(root).unwrap();

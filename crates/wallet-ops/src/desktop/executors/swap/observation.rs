@@ -157,13 +157,9 @@ impl ExecutorOwner {
         record: &ExecutorRecord,
         range: Range<u64>,
     ) -> Result<Vec<(OrderUid, SwapOrderObservations)>> {
-        let mut chain = self.chain.clone();
-        chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
         trace_step(
             "swap_orders",

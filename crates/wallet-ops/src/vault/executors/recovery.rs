@@ -3,7 +3,7 @@ use alloy::rpc::types::TransactionRequest;
 use super::{
     B256, BlockNumHash, Deserialize, ExecutorExecutionResult, ExecutorOperationId,
     ExecutorPayloadInclusion, ExecutorPayloadStatus, ExecutorRecord, ExecutorStore,
-    ExecutorStoreError, Serialize,
+    ExecutorStoreError, Serialize, SwapUseExpectation, SwapUseId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +178,33 @@ impl ExecutorStore {
         operation: ExecutorOperationId,
         issued: IssuedExecutorRecoveryTransaction,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.record_recovery_transaction_for(operation, SwapUseExpectation::Unchecked, issued)
+    }
+
+    /// Persist an ordinary reviewed recovery under the captured swap claim.
+    pub(crate) fn record_recovery_transaction_for_use(
+        &self,
+        operation: ExecutorOperationId,
+        expected_active_use: Option<SwapUseId>,
+        issued: IssuedExecutorRecoveryTransaction,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.record_recovery_transaction_for(
+            operation,
+            SwapUseExpectation::Exact(expected_active_use),
+            issued,
+        )
+    }
+
+    fn record_recovery_transaction_for(
+        &self,
+        operation: ExecutorOperationId,
+        expected_active_use: SwapUseExpectation,
+        issued: IssuedExecutorRecoveryTransaction,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
         self.update(operation, |record| {
+            if !expected_active_use.matches(record.active_swap_use) {
+                return Err(ExecutorStoreError::SwapUseActive);
+            }
             let transaction = &issued.transaction;
             if record.address.is_none()
                 || transaction.from != record.address

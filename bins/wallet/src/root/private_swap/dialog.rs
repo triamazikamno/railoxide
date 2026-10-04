@@ -5,8 +5,6 @@
 //! Background work may change the dialog only while it has focus and shows the swap the work
 //! belongs to, so a quote or order result never replaces or interrupts another dialog.
 
-use std::ops::Range;
-
 use alloy::primitives::Address;
 use gpui::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
@@ -30,9 +28,9 @@ use wallet_ops::{
 };
 
 use super::model::{
-    SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount, provider_name, record_swap_ranges,
-    swap_delivery, swap_order_group, swap_order_stage, swap_order_status, swap_private_delivery,
-    swap_private_minimum,
+    RecordSwap, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount,
+    provider_name, record_swaps, swap_delivery, swap_order_group, swap_order_stage,
+    swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -53,8 +51,11 @@ pub(super) enum SwapDialogView {
     Orders,
     /// The account's latest swap, which owns the live stage and every action.
     Detail(ExecutorOperationId),
-    /// An earlier swap on a reused stealth account, by the index of its first order. Read only.
-    PastDetail(ExecutorOperationId, usize),
+    /// An earlier swap on a reused stealth account, by its swap use. Read only. The index is
+    /// its first order's, which tells apart the swaps of one use from before swap uses.
+    PastDetail(SwapIdentity, usize),
+    /// A stopped preparation with no order UID, retained across account reuse.
+    CancelledPreparation(SwapIdentity),
 }
 
 pub(super) struct SwapDialog {
@@ -202,7 +203,12 @@ impl PrivateSwapsView {
                 .form
                 .as_ref()
                 .is_some_and(|form| form.operation() == Some(operation)),
-            Some(SwapDialogView::Orders | SwapDialogView::PastDetail(..)) | None => false,
+            Some(
+                SwapDialogView::Orders
+                | SwapDialogView::PastDetail(..)
+                | SwapDialogView::CancelledPreparation(_),
+            )
+            | None => false,
         };
         shown && self.swap_dialog_active(window, cx)
     }
@@ -248,9 +254,14 @@ impl PrivateSwapsView {
             dialog.view = view;
             dialog.outcome_fees_open = false;
             dialog.outcome_details_open = false;
+            // A cancelled preparation is reported until the dialog shows something else.
+            self.cancelled = None;
         }
         self.close_setup_settings(cx);
-        if let SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) = view {
+        if let SwapDialogView::Detail(_)
+        | SwapDialogView::PastDetail(..)
+        | SwapDialogView::CancelledPreparation(_) = view
+        {
             self.form = None;
             self.error = None;
         }
@@ -263,10 +274,17 @@ impl PrivateSwapsView {
     /// the destination network's session knows. Opening the detail starts loading that network
     /// and reads the account again.
     fn load_detail_destination(&mut self, view: SwapDialogView, cx: &mut Context<'_, Self>) {
-        let SwapDialogView::Detail(operation) = view else {
-            return;
+        let delivery = match view {
+            SwapDialogView::Detail(operation) => self
+                .record(operation)
+                .and_then(|record| self.shown_private_delivery(record)),
+            SwapDialogView::CancelledPreparation(swap) => self
+                .record(swap.operation)
+                .and_then(|record| super::model::swap_use_destination(record, swap.swap_use))
+                .map(|(delivery, _)| delivery),
+            _ => None,
         };
-        let Some(delivery) = self.record(operation).and_then(swap_private_delivery) else {
+        let Some(delivery) = delivery else {
             return;
         };
         self.ensure_destination_load(delivery.destination_chain, cx);
@@ -280,10 +298,13 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         window.close_all_dialogs(cx);
+        self.cancelled = None;
         match view {
             SwapDialogView::Form => {}
             SwapDialogView::Orders => self.form = None,
-            SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) => {
+            SwapDialogView::Detail(_)
+            | SwapDialogView::PastDetail(..)
+            | SwapDialogView::CancelledPreparation(_) => {
                 self.form = None;
                 self.error = None;
             }
@@ -343,7 +364,9 @@ impl PrivateSwapsView {
                 let list = self.orders_list(window, cx);
                 list.update(cx, |list, cx| list.focus(window, cx));
             }
-            SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) => {
+            SwapDialogView::Detail(_)
+            | SwapDialogView::PastDetail(..)
+            | SwapDialogView::CancelledPreparation(_) => {
                 if let Some(focus) = self.swap_dialog_focus() {
                     focus.focus(window, cx);
                 }
@@ -380,6 +403,7 @@ impl PrivateSwapsView {
         self.dialog = None;
         self.form = None;
         self.reapproval = None;
+        self.cancelled = None;
         cx.notify();
     }
 
@@ -427,37 +451,66 @@ impl PrivateSwapsView {
     /// setups.
     fn order_entries(&self, cx: &App) -> Vec<OrderEntry<'_>> {
         let mut entries = Vec::new();
-        for record in self
-            .records
-            .iter()
-            .filter(|record| is_swap_record(record) || self.pending_order(record).is_some())
-        {
-            let ranges = record_swap_ranges(record);
+        for record in self.records.iter().filter(|record| {
+            is_swap_record(record)
+                || self.pending_order(record).is_some()
+                || super::model::cancelled_swap_uses(record).next().is_some()
+        }) {
+            let mut has_cancelled = false;
+            for claimed in super::model::cancelled_swap_uses(record) {
+                has_cancelled = true;
+                let swap = SwapIdentity {
+                    operation: record.operation(),
+                    swap_use: claimed.id(),
+                };
+                let attention = self
+                    .cancelled_use(swap, cx)
+                    .is_some_and(|cancelled| cancelled.needs_attention());
+                entries.push(OrderEntry {
+                    record,
+                    view: SwapDialogView::CancelledPreparation(swap),
+                    order: None,
+                    stage: SwapStage::SetupRetired,
+                    group: if attention {
+                        SwapOrderGroup::NeedsAttention
+                    } else {
+                        SwapOrderGroup::Ended
+                    },
+                    started: claimed.started_at().map(|at| ("Started", at)),
+                });
+            }
             let pending = self.pending_order(record);
             let orders = record
                 .swap()
                 .map_or(&[][..], wallet_ops::vault::SwapOperationRecord::orders);
-            let (latest, earlier) = match ranges.split_last() {
-                _ if pending.is_some_and(|pending| pending.starts_new_swap(record)) => {
-                    (None, ranges.as_slice())
-                }
-                Some((latest, earlier)) => (Some(latest), earlier),
-                None => (None, &[][..]),
-            };
-            for range in earlier {
-                let Some(order) = orders.get(range.end - 1) else {
+            let (earlier, latest) = self.record_history(record);
+            for swap in &earlier {
+                let Some(order) = orders.get(swap.orders.end - 1) else {
                     continue;
                 };
                 // An earlier swap ended before the next one could start.
                 let stage = swap_order_stage(record, order);
                 entries.push(OrderEntry {
                     record,
-                    view: SwapDialogView::PastDetail(record.operation(), range.start),
+                    view: SwapDialogView::PastDetail(
+                        SwapIdentity {
+                            operation: record.operation(),
+                            swap_use: swap.swap_use,
+                        },
+                        swap.orders.start,
+                    ),
                     order: Some(order),
                     stage,
                     group: swap_order_group(stage, false, false),
-                    started: self.swap_started(record, Some(range), cx),
+                    started: self.swap_started(record, Some(swap), cx),
                 });
+            }
+            if has_cancelled
+                && orders.is_empty()
+                && pending.is_none()
+                && super::model::prepared_swap_use(record).is_none()
+            {
+                continue;
             }
             let stage = self.progress_stage(record);
             entries.push(OrderEntry {
@@ -471,8 +524,8 @@ impl PrivateSwapsView {
                     record.is_hidden() && pending.is_none(),
                 ),
                 started: pending
-                    .map(|pending| ("Started", pending.started_at))
-                    .or_else(|| self.swap_started(record, latest, cx)),
+                    .map(|pending| ("Started", pending.started(record)))
+                    .or_else(|| self.swap_started(record, latest.as_ref(), cx)),
             });
         }
         entries.sort_by_key(|entry| {
@@ -489,20 +542,47 @@ impl PrivateSwapsView {
             .count()
     }
 
-    /// When a swap started: its first order's `validTo` less the validity it was signed with,
-    /// or the profile's order window for records without one, or for a swap without orders,
-    /// when its stealth account was reserved. Without either validity, the first order's
-    /// expiry, labeled as such.
+    /// The record's swaps that have orders, oldest first, as the earlier ones and the latest,
+    /// which the record's own detail shows. While a draft prepares another swap on the
+    /// account, every swap with an order is an earlier one.
+    pub(super) fn record_history(
+        &self,
+        record: &ExecutorRecord,
+    ) -> (Vec<RecordSwap>, Option<RecordSwap>) {
+        let mut swaps = record_swaps(record);
+        let latest = if self
+            .pending_order(record)
+            .is_some_and(|pending| pending.starts_new_swap(record))
+        {
+            None
+        } else {
+            swaps.pop()
+        };
+        (swaps, latest)
+    }
+
+    /// When a swap started: for a swap that reused its stealth account, when its use claimed
+    /// the account. Otherwise its first order's `validTo` less the validity it was signed
+    /// with, or the profile's order window for records without one, or for a swap without
+    /// orders, when its stealth account was reserved. Without either validity, the first
+    /// order's expiry, labeled as such.
     pub(super) fn swap_started(
         &self,
         record: &ExecutorRecord,
-        range: Option<&Range<usize>>,
+        swap: Option<&RecordSwap>,
         cx: &App,
     ) -> Option<(&'static str, u64)> {
-        let Some(range) = range else {
+        let Some(swap) = swap else {
             return record.created_at().map(|at| ("Started", at));
         };
-        let first = record.swap()?.orders().get(range.start)?;
+        if let Some(claimed) = record
+            .swap_use(swap.swap_use)
+            .filter(|swap_use| !swap_use.is_fresh())
+            .and_then(wallet_ops::vault::SwapUseRecord::started_at)
+        {
+            return Some(("Started", claimed));
+        }
+        let first = record.swap()?.orders().get(swap.orders.start)?;
         let valid_to = u64::from(first.valid_to());
         if let Some(valid_for) = first.bounds().valid_for_secs {
             return Some(("Started", valid_to.saturating_sub(u64::from(valid_for))));
@@ -518,26 +598,20 @@ impl PrivateSwapsView {
         )
     }
 
-    /// An earlier swap of `operation`'s record, by its first order: the record, the swap's
-    /// orders, and its last order.
+    /// The earlier swap `swap` of its stealth account's record, whose first order is `first`:
+    /// the record, the swap's orders, and its last order.
     pub(super) fn past_swap(
         &self,
-        operation: ExecutorOperationId,
+        swap: SwapIdentity,
         first: usize,
-    ) -> Option<(&ExecutorRecord, Range<usize>, &SwapOrderRecord)> {
-        let record = self.record(operation)?;
-        let ranges = record_swap_ranges(record);
-        let earlier = if self
-            .pending_order(record)
-            .is_some_and(|pending| pending.starts_new_swap(record))
-        {
-            ranges.as_slice()
-        } else {
-            ranges.split_last()?.1
-        };
-        let range = earlier.iter().find(|range| range.start == first)?.clone();
-        let order = record.swap()?.orders().get(range.end - 1)?;
-        Some((record, range, order))
+    ) -> Option<(&ExecutorRecord, RecordSwap, &SwapOrderRecord)> {
+        let record = self.record(swap.operation)?;
+        let (earlier, _) = self.record_history(record);
+        let past = earlier
+            .into_iter()
+            .find(|past| past.swap_use == swap.swap_use && past.orders.start == first)?;
+        let order = record.swap()?.orders().get(past.orders.end - 1)?;
+        Some((record, past, order))
     }
 
     /// Display strings for an earlier swap, from its own last order and terms.
@@ -558,8 +632,8 @@ impl PrivateSwapsView {
         )
     }
 
-    fn past_title(&self, operation: ExecutorOperationId, first: usize, cx: &App) -> String {
-        self.past_swap(operation, first).map_or_else(
+    fn past_title(&self, swap: SwapIdentity, first: usize, cx: &App) -> String {
+        self.past_swap(swap, first).map_or_else(
             || "Swap".into(),
             |(record, _, order)| format!("Swap {}", self.past_labels(record, order, cx).pair),
         )
@@ -579,9 +653,16 @@ impl PrivateSwapsView {
                 Some(SwapDialogView::Orders),
                 self.progress_title(operation, cx),
             ),
-            Some(SwapDialogView::PastDetail(operation, first)) => (
+            Some(SwapDialogView::PastDetail(swap, first)) => (
                 Some(SwapDialogView::Orders),
-                self.past_title(operation, first, cx),
+                self.past_title(swap, first, cx),
+            ),
+            Some(SwapDialogView::CancelledPreparation(swap)) => (
+                Some(SwapDialogView::Orders),
+                self.cancelled_use(swap, cx).map_or_else(
+                    || "Swap preparation".to_owned(),
+                    |cancelled| cancelled.title,
+                ),
             ),
             None => (None, "Swap".to_owned()),
         };
@@ -589,8 +670,8 @@ impl PrivateSwapsView {
             Some(SwapDialogView::Detail(operation)) => self
                 .record(operation)
                 .map(|record| (self.progress_stage(record), swap_delivery(record))),
-            Some(SwapDialogView::PastDetail(operation, first)) => self
-                .past_swap(operation, first)
+            Some(SwapDialogView::PastDetail(swap, first)) => self
+                .past_swap(swap, first)
                 .map(|(record, _, order)| (swap_order_stage(record, order), order.delivery())),
             _ => None,
         };
@@ -688,9 +769,10 @@ impl PrivateSwapsView {
             Some(SwapDialogView::Form) => self.render_form(cx),
             Some(SwapDialogView::Orders) => self.render_orders(cx),
             Some(SwapDialogView::Detail(operation)) => self.render_detail(operation, cx),
-            Some(SwapDialogView::PastDetail(operation, first)) => {
-                self.render_past_detail(operation, first, cx)
+            Some(SwapDialogView::PastDetail(swap, first)) => {
+                self.render_past_detail(swap, first, cx)
             }
+            Some(SwapDialogView::CancelledPreparation(swap)) => self.render_cancelled_use(swap, cx),
             None => (app_muted_text("Wallet session ended."), None),
         };
         (
@@ -837,6 +919,31 @@ impl PrivateSwapsView {
 
     fn order_row(&self, entry: &OrderEntry<'_>, cx: &App) -> SwapOrderRow {
         let record = entry.record;
+        if let SwapDialogView::CancelledPreparation(swap) = entry.view {
+            let cancelled = self.cancelled_use(swap, cx);
+            let attention = cancelled
+                .as_ref()
+                .is_some_and(super::progress::CancelledPreparation::needs_attention);
+            return SwapOrderRow {
+                view: entry.view,
+                title: cancelled.map_or_else(
+                    || "Swap preparation".to_owned(),
+                    |cancelled| cancelled.title,
+                ),
+                amount: OrderRowAmount::Muted("Nothing traded"),
+                meta: entry
+                    .started
+                    .map_or_else(String::new, |(_, at)| local_date_time_label(at)),
+                status: if attention {
+                    "Cancelled · check signed work"
+                } else {
+                    "Preparation cancelled"
+                }
+                .to_owned(),
+                attention,
+                icons: [None, None],
+            };
+        }
         let latest = matches!(entry.view, SwapDialogView::Detail(_));
         let pending = latest.then(|| self.pending_order(record)).flatten();
         let tokens = pending
@@ -1043,9 +1150,20 @@ fn order_tokens(record: &ExecutorRecord, order: &SwapOrderRecord) -> Option<(Add
 /// A stable key for a row's element and debug selector.
 fn row_key(view: SwapDialogView) -> String {
     match view {
-        SwapDialogView::PastDetail(operation, first) => {
-            format!("{}-{first}", operation.opaque_id())
+        // One use holds one swap, except orders from before swap uses, which the first
+        // order tells apart.
+        SwapDialogView::PastDetail(swap, first) => {
+            format!(
+                "{}-{}-{first}",
+                swap.operation.opaque_id(),
+                swap.swap_use.opaque_id()
+            )
         }
+        SwapDialogView::CancelledPreparation(swap) => format!(
+            "{}-{}-cancelled",
+            swap.operation.opaque_id(),
+            swap.swap_use.opaque_id()
+        ),
         SwapDialogView::Detail(operation) => operation.opaque_id(),
         SwapDialogView::Form | SwapDialogView::Orders => String::new(),
     }

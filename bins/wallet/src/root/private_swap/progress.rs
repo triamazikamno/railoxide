@@ -25,19 +25,21 @@ use wallet_ops::{
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
     SwapOrderState, WakuDeliveryClient,
     vault::{
-        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId, ExecutorRecord,
-        SwapBridgeOutcome, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
-        SwapSubmissionStatus,
+        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
+        ExecutorPayloadStatus, ExecutorRecord, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
+        SwapPreHookDeathCause, SwapSubmissionStatus, SwapUseId, SwapUseRecord, SwapUseRelease,
+        SwapUseRole,
     },
 };
 
 use super::dialog::{SwapDialogView, settled_by_cow};
 use super::form::{broadcaster_result_problem, format_gwei, gas_share_name, network_name};
 use super::model::{
-    SwapActions, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep, SwapStepAccount,
-    bridge_sent_amount, needs_executed_fee, private_delivery_credit, provider_name,
-    record_swap_ranges, swap_actions, swap_order_group, swap_order_stage, swap_outcome,
-    swap_private_delivery, swap_private_minimum, swap_steps, swap_valid_to, swaps_card_line,
+    SwapActions, SwapIdentity, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep,
+    SwapStepAccount, bridge_sent_amount, needs_executed_fee, prepared_swap_use,
+    private_delivery_credit, provider_name, record_swaps, swap_actions, swap_order_group,
+    swap_order_stage, swap_outcome, swap_private_delivery, swap_private_minimum, swap_steps,
+    swap_use_destination, swap_valid_to, swaps_card_line,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -69,6 +71,68 @@ pub(super) struct CancelApproval {
     candidate: PublicBroadcasterCandidate,
     maximum_private_fee: U256,
     waku: Arc<WakuDeliveryClient>,
+}
+
+/// What cancelling a swap's preparation left of its claims, as its detail reports it.
+pub(super) struct CancelledPreparation {
+    pub(super) operation: ExecutorOperationId,
+    /// The swap's title, as it was while its preparation was shown.
+    pub(super) title: String,
+    /// The swap's own account, then a private Bridge swap's destination account.
+    pub(super) accounts: Vec<CancelledAccount>,
+}
+
+impl CancelledPreparation {
+    pub(super) fn needs_attention(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|account| account.unknown || account.release == SwapUseRelease::IssuedWorkRemains)
+    }
+}
+
+/// Which account of a cancelled preparation the detail describes.
+#[derive(Clone, Copy)]
+enum CancelledAccountRole {
+    Source,
+    Destination,
+}
+
+/// One stealth account of a cancelled preparation.
+pub(super) struct CancelledAccount {
+    role: CancelledAccountRole,
+    network: String,
+    /// `None` for a new account whose address wasn't derived.
+    account: Option<SwapStepAccount>,
+    /// The swap reserved the account fresh. Otherwise it reused an existing one.
+    pub(super) fresh: bool,
+    pub(super) release: SwapUseRelease,
+    /// Destination records are unavailable until their owning session is loaded.
+    unknown: bool,
+}
+
+impl CancelledAccount {
+    /// What the cancellation left of the account. An existing account is released or kept
+    /// reserved, and never retired. A fresh one isn't used again and stays in Stealth
+    /// accounts, with its guards while a setup it sent can still confirm.
+    pub(super) const fn outcome(&self) -> &'static str {
+        if self.unknown {
+            return "Load this network to check its signed work. Cancellation preserves any outstanding nonce and fee-note guards.";
+        }
+        match (self.fresh, self.release) {
+            (false, SwapUseRelease::Released) => {
+                "Released. You can choose this account for another swap."
+            }
+            (false, SwapUseRelease::IssuedWorkRemains) => {
+                "Still reserved. A shield it signed for this swap can still run, so its nonce guard stays until that is resolved."
+            }
+            (true, SwapUseRelease::Released) => {
+                "Preparation stopped with no unresolved signed work. This new account stays in Stealth accounts and isn't used for another swap."
+            }
+            (true, SwapUseRelease::IssuedWorkRemains) => {
+                "Unresolved. Its setup was sent and may still confirm and charge its fee. Its nonce and fee-note guards stay until that is resolved, and the account stays in Stealth accounts for recovery."
+            }
+        }
+    }
 }
 
 impl Render for PrivateSwapsView {
@@ -128,6 +192,10 @@ impl PrivateSwapsView {
     }
 
     pub(super) fn progress_title(&self, operation: ExecutorOperationId, cx: &App) -> String {
+        // A cancelled preparation keeps its swap's name, whatever its account shows next.
+        if let Some(cancelled) = self.cancelled_preparation(operation) {
+            return cancelled.title.clone();
+        }
         self.record(operation).map_or_else(
             || "Swap".into(),
             |record| format!("Swap {}", self.labels(record, cx).pair),
@@ -141,6 +209,9 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         cx: &Context<'_, Self>,
     ) -> (gpui::Div, Option<gpui::Div>) {
+        if let Some(cancelled) = self.cancelled_preparation(operation) {
+            return render_cancelled_preparation(cancelled, cx);
+        }
         let Some(record) = self.record(operation) else {
             // An approved setup reserves the stealth account first.
             let reserving = self
@@ -270,6 +341,11 @@ impl PrivateSwapsView {
                 "This setup was stopped, so no order will be placed. Its stealth account stays in Stealth accounts."
                     .into(),
             )
+        } else if Self::prepared_draft(record).is_some() {
+            Some(
+                "This swap's stealth accounts are reserved for it, and no order is placed yet. Resume to continue, or cancel the preparation to release them."
+                    .into(),
+            )
         } else if record.is_hidden() && actions.dismiss {
             Some("Removed from the Private tab. Tracking continues in My orders.".into())
         } else if let Some(chain_id) = retry_destination {
@@ -286,7 +362,7 @@ impl PrivateSwapsView {
         };
         let latest = pending
             .is_none()
-            .then(|| record_swap_ranges(record).pop())
+            .then(|| record_swaps(record).pop())
             .flatten();
         let order = record
             .swap()
@@ -316,7 +392,7 @@ impl PrivateSwapsView {
                     .map(|((_, buy), minimum)| (buy, minimum))
             });
         let started = pending
-            .map(|pending| ("Started", pending.started_at))
+            .map(|pending| ("Started", pending.started(record)))
             .or_else(|| self.swap_started(record, latest.as_ref(), cx));
         let delivery = pending.map_or_else(|| swap_delivery(record), |pending| pending.delivery);
         let outcome =
@@ -342,7 +418,7 @@ impl PrivateSwapsView {
             .children(outcome)
             .children(
                 latest
-                    .and_then(|range| earlier_attempts_note(record, range))
+                    .and_then(|swap| earlier_attempts_note(record, swap.orders))
                     .map(|note| app_muted_text(note).whitespace_normal()),
             )
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
@@ -369,7 +445,7 @@ impl PrivateSwapsView {
     /// its own orders, and a footer that only closes. The account's latest swap owns every action.
     pub(super) fn render_past_detail(
         &self,
-        operation: ExecutorOperationId,
+        swap: SwapIdentity,
         first: usize,
         cx: &Context<'_, Self>,
     ) -> (gpui::Div, Option<gpui::Div>) {
@@ -385,7 +461,7 @@ impl PrivateSwapsView {
             .items_center()
             .child(div().flex_1())
             .child(close);
-        let Some((record, range, order)) = self.past_swap(operation, first) else {
+        let Some((record, past, order)) = self.past_swap(swap, first) else {
             return (
                 app_muted_text("This swap is no longer saved in this wallet."),
                 Some(footer),
@@ -401,14 +477,14 @@ impl PrivateSwapsView {
                 progress_group(
                     &step,
                     detail,
-                    format!("swap-step-{}-{first}-{index}", operation.opaque_id()),
+                    format!("swap-step-{}-{first}-{index}", swap.operation.opaque_id()),
                 )
             });
         // Recovery acts on the account, which its latest swap and Stealth accounts offer.
         let recovery = (stage.needs_recovery() || self.stage(record).needs_recovery()).then_some(
             "This stealth account needs recovery. Recover it from its latest swap or from Stealth accounts.",
         );
-        let started = self.swap_started(record, Some(&range), cx);
+        let started = self.swap_started(record, Some(&past), cx);
         let outcome = self.render_outcome(record, order, stage, started, cx);
         let not_filled = self.render_not_filled(record, order, stage, cx);
         let facts = match order.delivery() {
@@ -432,7 +508,7 @@ impl PrivateSwapsView {
             .children(facts)
             .children(outcome)
             .children(
-                earlier_attempts_note(record, range)
+                earlier_attempts_note(record, past.orders)
                     .map(|note| app_muted_text(note).whitespace_normal()),
             )
             .children(recovery.map(|note| app_muted_text(note).whitespace_normal()));
@@ -764,7 +840,8 @@ impl PrivateSwapsView {
                         "swap-held-account",
                         SwapStepAccount {
                             index: self
-                                .destination_account(record, delivery)
+                                .order_swap(record, order)
+                                .and_then(|swap| self.swap_destination_account(swap, delivery))
                                 .map(ExecutorRecord::index),
                             address: delivery.receiver,
                         },
@@ -1232,6 +1309,19 @@ impl PrivateSwapsView {
             .job
             .as_ref()
             .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup);
+        // A prepared swap is resumed or cancelled as a whole, including when its source is new.
+        let prepared = record.and_then(Self::prepared_draft);
+        let cancel_preparation = prepared.map(|_| {
+            app_button("swap-progress-cancel-preparation", "Cancel preparation…")
+                .debug_selector(|| "swap-progress-cancel-preparation".into())
+                .small()
+                .flex_none()
+                .disabled(busy && !setup_job)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.confirm_cancel_preparation(operation, window, cx);
+                }))
+        });
+        let setting_up = setting_up && prepared.is_none();
         let stop = setting_up.then(|| {
             app_button("swap-progress-stop", "Stop and remove…")
                 .debug_selector(|| "swap-progress-stop".into())
@@ -1369,10 +1459,22 @@ impl PrivateSwapsView {
                     this.request_cancel_quote(operation, window, cx);
                 }))
         });
-        let resume = actions.resume.map(|availability| {
+        // A prepared swap resumes in its form whatever its new destination account's setup
+        // does, so the action stays while that setup is on its way.
+        let resume = if prepared.is_some() {
+            Some(
+                record
+                    .and_then(|record| self.setup_retry_problem(record))
+                    .map_or(Ok(()), Err),
+            )
+        } else {
+            actions.resume
+        };
+        let resume = resume.map(|availability| {
             app_button(
                 "swap-progress-continue",
                 match stage {
+                    _ if prepared.is_some() => "Resume…",
                     SwapStage::SetupRetired => "New swap…",
                     SwapStage::Ready => "Review…",
                     SwapStage::Approved => "Place order…",
@@ -1472,7 +1574,7 @@ impl PrivateSwapsView {
             }))
         });
         // A removed swap stays in My orders, so its detail opens without this action.
-        let remove = (actions.dismiss && !hidden).then(|| {
+        let remove = (actions.dismiss && !hidden && prepared.is_none()).then(|| {
             app_button("swap-progress-remove", "Remove from Private tab")
                 .debug_selector(|| "swap-progress-remove".into())
                 .small()
@@ -1493,6 +1595,7 @@ impl PrivateSwapsView {
             .gap_2()
             .children(cancel)
             .children(stop)
+            .children(cancel_preparation)
             .children(remove)
             .child(div().flex_1())
             .child(
@@ -1567,6 +1670,11 @@ impl PrivateSwapsView {
     /// The detail stays open and shows the stopped setup, which remains in My orders. A
     /// private Bridge swap's destination stealth account is stopped with it when its network is
     /// loaded. Otherwise that network's next load stops it.
+    ///
+    /// A swap whose use claims its accounts is cancelled through that use instead, which
+    /// covers both accounts in one write and releases an existing destination account rather
+    /// than stopping it: see [`Self::cancel_preparation`]. Only a use from before approvals
+    /// bound their destination, which that cancellation can't locate, is stopped here.
     fn stop_setup(&mut self, operation: ExecutorOperationId, cx: &mut Context<'_, Self>) -> bool {
         if !self.session_is_current(cx)
             || self
@@ -1574,6 +1682,14 @@ impl PrivateSwapsView {
                 .is_none_or(|record| record.swap().is_some())
         {
             return false;
+        }
+        if self.record(operation).is_some_and(|record| {
+            prepared_swap_use(record).is_some_and(|swap_use| {
+                record.destination_operation().is_none()
+                    || swap_use_destination(record, swap_use.id()).is_some()
+            })
+        }) {
+            return self.cancel_preparation(operation, cx);
         }
         let destination = self.record(operation).and_then(|record| {
             let delivery = swap_private_delivery(record)?;
@@ -1592,6 +1708,279 @@ impl PrivateSwapsView {
         self.stop_setup_job(operation);
         self.form = None;
         self.reload_records();
+        cx.notify();
+        true
+    }
+
+    /// A claimed source use without an order, whether its source account is new or reused.
+    fn prepared_draft(record: &ExecutorRecord) -> Option<SwapUseId> {
+        prepared_swap_use(record)
+            .filter(|swap_use| swap_use.approval().is_some())
+            .map(SwapUseRecord::id)
+    }
+
+    /// What this session's cancellation of `operation`'s preparation left, while the swap's
+    /// detail still reports it. Another swap being prepared on the account takes the detail
+    /// back.
+    fn cancelled_preparation(
+        &self,
+        operation: ExecutorOperationId,
+    ) -> Option<&CancelledPreparation> {
+        self.cancelled
+            .as_ref()
+            .filter(|cancelled| cancelled.operation == operation)
+            .filter(|_| {
+                self.record(operation)
+                    .is_none_or(|record| self.pending_order(record).is_none())
+            })
+    }
+
+    /// Rebuild cancellation details from encrypted use history after closing the dialog or
+    /// restarting. A later swap on the same account must not replace this preparation's terms.
+    pub(super) fn cancelled_use(
+        &self,
+        swap: SwapIdentity,
+        cx: &App,
+    ) -> Option<CancelledPreparation> {
+        let record = self.record(swap.operation)?;
+        let claimed = super::model::cancelled_swap_uses(record)
+            .find(|claimed| claimed.id() == swap.swap_use)?;
+        let approval = claimed.approval()?;
+        let account = |role,
+                       chain_id,
+                       record: Option<&ExecutorRecord>,
+                       fresh,
+                       address: Option<alloy::primitives::Address>| {
+            let unresolved = record.is_some_and(|record| {
+                if fresh {
+                    return record.has_recorded_unresolved_issued_work();
+                }
+                let Some(SwapUseRole::Destination { shields, .. }) =
+                    record.swap_use(swap.swap_use).map(SwapUseRecord::role)
+                else {
+                    return false;
+                };
+                shields.iter().any(|hash| {
+                    !matches!(
+                        record.recorded_payload_status(*hash),
+                        Some(
+                            ExecutorPayloadStatus::Executed
+                                | ExecutorPayloadStatus::Invalidated { .. }
+                        )
+                    )
+                })
+            });
+            CancelledAccount {
+                role,
+                network: network_name(chain_id),
+                account: address.map(|address| SwapStepAccount {
+                    index: record.map(ExecutorRecord::index),
+                    address,
+                }),
+                fresh,
+                release: if unresolved {
+                    SwapUseRelease::IssuedWorkRemains
+                } else {
+                    SwapUseRelease::Released
+                },
+                unknown: record.is_none(),
+            }
+        };
+        let mut accounts = vec![account(
+            CancelledAccountRole::Source,
+            self.session.chain_id,
+            Some(record),
+            claimed.is_fresh(),
+            record.address(),
+        )];
+        if let Some((delivery, _)) = swap_use_destination(record, swap.swap_use) {
+            // The linked record exists before derivation resolves the approval's receiver.
+            let destination = super::destination_account_metadata(
+                self.destinations.get(&swap).and_then(Option::as_ref),
+                Some(swap.swap_use),
+                claimed.approval(),
+            );
+            let fresh = destination.fresh_from_claim_or_approval();
+            accounts.push(account(
+                CancelledAccountRole::Destination,
+                delivery.destination_chain,
+                destination.record,
+                fresh,
+                destination
+                    .record
+                    .and_then(ExecutorRecord::address)
+                    .or_else(|| (!delivery.receiver.is_zero()).then_some(delivery.receiver)),
+            ));
+        }
+        let title = approval.tokens.map_or_else(
+            || "Swap preparation".to_owned(),
+            |tokens| {
+                let bought = match approval.delivery {
+                    SwapDelivery::Bridge(delivery) => self.network_token_symbol(
+                        delivery.destination_chain,
+                        self.delivered_token(delivery, cx),
+                        cx,
+                    ),
+                    _ => self.token_symbol(tokens.buy, cx),
+                };
+                format!(
+                    "{} → {bought}",
+                    self.token_amount(tokens.sell, approval.bounds.spend_amount(), cx)
+                )
+            },
+        );
+        Some(CancelledPreparation {
+            operation: swap.operation,
+            title,
+            accounts,
+        })
+    }
+
+    pub(super) fn render_cancelled_use(
+        &self,
+        swap: SwapIdentity,
+        cx: &Context<'_, Self>,
+    ) -> (gpui::Div, Option<gpui::Div>) {
+        self.cancelled_use(swap, cx).map_or_else(
+            || (app_muted_text("Swap preparation unavailable."), None),
+            |cancelled| render_cancelled_preparation(&cancelled, cx),
+        )
+    }
+
+    fn confirm_cancel_preparation(
+        &self,
+        operation: ExecutorOperationId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self
+            .record(operation)
+            .is_none_or(|record| Self::prepared_draft(record).is_none())
+        {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title(app_strong_text("Cancel this swap's preparation?"))
+                .button_props(
+                    DialogButtonProps::default()
+                        .cancel_text("Keep preparation")
+                        .ok_text("Cancel preparation")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .confirm()
+                .child(app_text("No order will be placed. An existing stealth account is released for other swaps unless it already signed for this one. A setup already sent to a broadcaster may still confirm and charge its fee, and its new account stays in Stealth accounts for recovery.").whitespace_normal())
+                .on_ok(move |_, _, cx| {
+                    view.update(cx, |view, cx| view.cancel_preparation(operation, cx))
+                        .unwrap_or(false)
+                })
+        });
+    }
+
+    /// Cancel the preparation of `operation`'s swap, which has no order yet, through the
+    /// owners: the swap's use is stopped on both of its accounts in one write, and each
+    /// account is released or kept as the native cancellation reports. The detail stays open
+    /// and reports that outcome for each account. An existing account is never retired by
+    /// this. The destination network's owner hears of the change when its session is loaded.
+    fn cancel_preparation(
+        &mut self,
+        operation: ExecutorOperationId,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !self.session_is_current(cx) {
+            return false;
+        }
+        let Some(record) = self.record(operation) else {
+            return false;
+        };
+        let Some(swap_use) = prepared_swap_use(record) else {
+            return false;
+        };
+        let id = swap_use.id();
+        let title = self.progress_title(operation, cx);
+        // What the use holds of each account, read before the cancellation changes it.
+        let source = (
+            CancelledAccountRole::Source,
+            network_name(self.session.chain_id),
+            record.address().map(|address| SwapStepAccount {
+                index: Some(record.index()),
+                address,
+            }),
+            swap_use.is_fresh(),
+        );
+        let destination = swap_use_destination(record, id).map(|(delivery, _)| {
+            let account = super::destination_account_metadata(
+                self.swap_destination_account(
+                    SwapIdentity {
+                        operation,
+                        swap_use: id,
+                    },
+                    delivery,
+                ),
+                Some(id),
+                swap_use.approval(),
+            );
+            let fresh = account.fresh_from_claim_or_approval();
+            (
+                delivery.destination_chain,
+                (
+                    CancelledAccountRole::Destination,
+                    network_name(delivery.destination_chain),
+                    (!delivery.receiver.is_zero()).then(|| SwapStepAccount {
+                        index: account.record.map(ExecutorRecord::index),
+                        address: delivery.receiver,
+                    }),
+                    fresh,
+                ),
+            )
+        });
+        let destination_owner = destination
+            .as_ref()
+            .and_then(|(chain_id, _)| self.destination_owner(*chain_id, cx))
+            .map(|(_, owner)| owner);
+        // A setup still being handed off in this session stops with the preparation.
+        self.stop_setup_job(operation);
+        let cancellation =
+            match self
+                .owner
+                .cancel_swap_use(destination_owner.as_deref(), operation, id)
+            {
+                Ok(cancellation) => cancellation,
+                Err(error) => {
+                    self.fail(operation, format!("{error:#}"));
+                    cx.notify();
+                    return false;
+                }
+            };
+        let account = |(role, network, account, fresh), release| CancelledAccount {
+            role,
+            network,
+            account,
+            fresh,
+            release,
+            unknown: false,
+        };
+        let accounts = std::iter::once(account(source, cancellation.source))
+            .chain(
+                destination
+                    .zip(cancellation.destination)
+                    .map(|((_, destination), release)| account(destination, release)),
+            )
+            .collect();
+        let tracking = self.tracking.entry(operation).or_default();
+        tracking.pending_order = None;
+        tracking.error = None;
+        self.error = None;
+        self.form = None;
+        self.reload_records();
+        self.reload_destinations(cx);
+        self.cancelled = Some(CancelledPreparation {
+            operation,
+            title,
+            accounts,
+        });
         cx.notify();
         true
     }
@@ -2060,10 +2449,9 @@ impl PrivateSwapsView {
         let Some(record) = self.record(operation) else {
             return;
         };
-        let Some((sell, buy)) = swap_tokens(record) else {
+        let Some((token, (_, buy))) = self.recovery_token(record).zip(swap_tokens(record)) else {
             return;
         };
-        let token = swap_recovery_token(self.stage(record), swap_delivery(record), sell, buy);
         // Recovery offers what a balance check found, so this swap's own check goes with it.
         let checked = self
             .tracking
@@ -2082,6 +2470,18 @@ impl PrivateSwapsView {
                 cx,
             );
         });
+    }
+
+    /// The token recovery of `record`'s stealth account starts with. It follows the account's
+    /// latest order, which holds the funds, whatever a draft for another swap on it proposes.
+    pub(super) fn recovery_token(&self, record: &ExecutorRecord) -> Option<Address> {
+        let (sell, buy) = swap_tokens(record)?;
+        Some(swap_recovery_token(
+            self.stage(record),
+            swap_delivery(record),
+            sell,
+            buy,
+        ))
     }
 
     /// Held proceeds are recovered in Stealth accounts on the destination network. Switching
@@ -2398,6 +2798,71 @@ fn stealth_account(id: &'static str, account: SwapStepAccount) -> gpui::Div {
             .font_family(theme::APP_MONO_FONT_FAMILY),
         )
         .child(clipboard_with_toast(copy_id, address).tooltip("Copy stealth account address"))
+}
+
+/// The detail of a swap whose preparation was cancelled in this session: each stealth account
+/// with a control that copies its address, and what the cancellation left of it. The footer
+/// only closes.
+fn render_cancelled_preparation(
+    cancelled: &CancelledPreparation,
+    cx: &Context<'_, PrivateSwapsView>,
+) -> (gpui::Div, Option<gpui::Div>) {
+    let accounts = cancelled.accounts.iter().map(|account| {
+        let (role, selector) = match account.role {
+            CancelledAccountRole::Source => ("Source", "swap-cancelled-source"),
+            CancelledAccountRole::Destination => ("Destination", "swap-cancelled-destination"),
+        };
+        div()
+            .debug_selector(move || selector.into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(app_text(format!("{role} · {}", account.network)).flex_none())
+                    .children(
+                        account
+                            .account
+                            .map(|shown| stealth_account("swap-cancelled-account", shown)),
+                    ),
+            )
+            .child(app_muted_text(account.outcome()).whitespace_normal())
+    });
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_strong_text("Preparation cancelled"))
+                .child(app_muted_text("No order was placed for this swap.").whitespace_normal()),
+        )
+        .children(accounts);
+    let footer = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .child(div().flex_1())
+        .child(
+            app_button("swap-progress-close", "Close")
+                .small()
+                .flex_none()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_swap_dialog(window, cx);
+                })),
+        );
+    (body, Some(footer))
 }
 
 /// A swap step for the shared stepper, whose body hides a detail equal to its label.

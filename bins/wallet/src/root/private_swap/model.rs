@@ -9,9 +9,10 @@ use wallet_ops::{
     SwapOrderState, SwapSetupStatus, swap_order_state,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult,
-        ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
-        ExecutorRecoveryStepKind, SwapApprovedBounds, SwapDelivery, SwapOrderObservations,
-        SwapOrderRecord, SwapPreHookDeathCause, SwapSubmissionStatus, SwapTradeAmounts,
+        ExecutorOperationId, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
+        ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind, SwapApprovedBounds,
+        SwapDelivery, SwapOrderObservations, SwapOrderRecord, SwapPreHookDeathCause,
+        SwapSubmissionStatus, SwapTradeAmounts, SwapUseId, SwapUseRecord, SwapUseRole,
     },
 };
 
@@ -200,7 +201,10 @@ pub(in crate::root) fn swap_stage(
             recorded_setup_stage(&statuses, setup.is_some())
         }
     };
-    if stage == SwapStage::Ready && record.swap_approval().is_some() {
+    // An approval binds a first order while its swap use claims the account. A reused account
+    // that a cancelled preparation released keeps that approval only as history.
+    let approved = record.swap_approval().is_some() && record.active_swap_use().is_some();
+    if stage == SwapStage::Ready && approved {
         SwapStage::Approved
     } else {
         stage
@@ -331,11 +335,41 @@ pub(in crate::root) fn swap_order_ranges(
     ranges
 }
 
-/// The record's swaps as ranges of its orders, oldest first. A record without orders holds a
-/// single swap that has none yet, and yields no range.
-pub(in crate::root) fn record_swap_ranges(record: &ExecutorRecord) -> Vec<std::ops::Range<usize>> {
-    record.swap().map_or_else(Vec::new, |swap| {
-        swap_order_ranges(swap.orders().iter().map(|order| {
+/// One swap: the stealth account that places its orders, and the swap use on that account. The
+/// account is what derives the address and recovers funds; the use picks the swap among the
+/// account's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::root) struct SwapIdentity {
+    pub(in crate::root) operation: ExecutorOperationId,
+    pub(in crate::root) swap_use: SwapUseId,
+}
+
+/// One swap of a record that has orders: its swap use and its orders within the record's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) struct RecordSwap {
+    pub(in crate::root) swap_use: SwapUseId,
+    pub(in crate::root) orders: std::ops::Range<usize>,
+}
+
+/// The record's swaps that have orders, oldest first. Orders belong to the swap use they were
+/// signed for. Orders from before swap uses all belong to their account's first use, so
+/// within one use [`swap_order_ranges`] still tells a reused account's earlier swaps apart. A
+/// swap that has no order yet isn't listed.
+pub(in crate::root) fn record_swaps(record: &ExecutorRecord) -> Vec<RecordSwap> {
+    let Some(swap) = record.swap() else {
+        return Vec::new();
+    };
+    let mut swaps = Vec::new();
+    let mut start = 0;
+    for attempts in swap
+        .orders()
+        .chunk_by(|earlier, later| earlier.use_id() == later.use_id())
+    {
+        let swap_use = attempts
+            .first()
+            .and_then(SwapOrderRecord::use_id)
+            .unwrap_or_else(|| SwapUseId::first(record.operation()));
+        let ranges = swap_order_ranges(attempts.iter().map(|order| {
             let terms = swap.order_terms(order);
             (
                 terms.sell_token(),
@@ -343,7 +377,76 @@ pub(in crate::root) fn record_swap_ranges(record: &ExecutorRecord) -> Vec<std::o
                 order.delivery(),
                 order.observations().traded.is_some(),
             )
-        }))
+        }));
+        swaps.extend(ranges.into_iter().map(|range| RecordSwap {
+            swap_use,
+            orders: start + range.start..start + range.end,
+        }));
+        start += attempts.len();
+    }
+    swaps
+}
+
+/// The swap use the record's own progress is about: its latest order's, or before any order,
+/// the source use that claims the account for its first one.
+pub(in crate::root) fn record_latest_use(record: &ExecutorRecord) -> Option<SwapUseId> {
+    match record.swap().and_then(|swap| swap.orders().last()) {
+        Some(order) => order.use_id(),
+        None => record
+            .swap_uses()
+            .last()
+            .filter(|swap_use| matches!(swap_use.role(), SwapUseRole::Source { .. }))
+            .map(wallet_ops::vault::SwapUseRecord::id),
+    }
+}
+
+/// The latest order the record holds of `swap_use`.
+pub(in crate::root) fn swap_use_last_order(
+    record: &ExecutorRecord,
+    swap_use: SwapUseId,
+) -> Option<&SwapOrderRecord> {
+    record.swap_use_orders(swap_use).next_back()
+}
+
+/// The destination stealth account's operation the record's source use `swap_use` names, with
+/// that use's private Bridge delivery: its latest order's, or before it has an order, the one
+/// approved with the use.
+pub(in crate::root) fn swap_use_destination(
+    record: &ExecutorRecord,
+    swap_use: SwapUseId,
+) -> Option<(BridgeDelivery, ExecutorOperationId)> {
+    let SwapUseRole::Source {
+        approval,
+        destination_operation,
+    } = record.swap_use(swap_use)?.role()
+    else {
+        return None;
+    };
+    let delivery = swap_use_last_order(record, swap_use)
+        .map(SwapOrderRecord::delivery)
+        .or_else(|| approval.as_deref().map(|approval| approval.delivery))?;
+    Some((delivery.private_bridge()?, (*destination_operation)?))
+}
+
+/// The swap use that claims the record's account to place a swap's orders and has none yet:
+/// its accounts are reserved, and nothing but a setup can have been sent for it. A stopped use
+/// isn't one, and neither is a use whose order exists, which the order's own progress shows.
+pub(in crate::root) fn prepared_swap_use(record: &ExecutorRecord) -> Option<&SwapUseRecord> {
+    let swap_use = record.swap_use(record.active_swap_use()?)?;
+    (!swap_use.is_stopped()
+        && matches!(swap_use.role(), SwapUseRole::Source { .. })
+        && !record.has_swap_use_order(swap_use.id()))
+    .then_some(swap_use)
+}
+
+/// Stopped preparations have no order UID but retain their account and signed-work history.
+pub(in crate::root) fn cancelled_swap_uses(
+    record: &ExecutorRecord,
+) -> impl Iterator<Item = &SwapUseRecord> {
+    record.swap_uses().iter().filter(|swap_use| {
+        swap_use.is_stopped()
+            && swap_use.approval().is_some()
+            && !record.has_swap_use_order(swap_use.id())
     })
 }
 
@@ -550,6 +653,8 @@ pub(in crate::root) struct SwapSetupLabels {
     /// `None` until the account's address is derived.
     pub(in crate::root) account: Option<SwapStepAccount>,
     pub(in crate::root) progress: SwapSetupProgress,
+    /// The swap reuses the account, which was set up before it, so it sends no setup for it.
+    pub(in crate::root) reused: bool,
     /// The block the setup was included in, once recorded.
     pub(in crate::root) block: Option<u64>,
     /// What a setup on its way waits for, when this session knows it.
@@ -628,10 +733,7 @@ pub(in crate::root) fn swap_setup_block(record: &ExecutorRecord) -> Option<u64> 
 
 /// The record's delivery when it shields to the wallet on another network.
 pub(in crate::root) fn swap_private_delivery(record: &ExecutorRecord) -> Option<BridgeDelivery> {
-    match swap_delivery(record) {
-        SwapDelivery::Bridge(delivery) if delivery.is_private() => Some(delivery),
-        _ => None,
-    }
+    swap_delivery(record).private_bridge()
 }
 
 /// What a private Bridge delivery credits to the private balance: `amount`, which the
@@ -995,6 +1097,8 @@ pub(in crate::root) fn parent_step_status(children: &[SwapStep]) -> PublicAction
 }
 
 const TRADED: &str = "Traded";
+/// What a reused stealth account's sub-step shows in place of a setup's block.
+const REUSED_READY: &str = "Reused · ready";
 const BACK_IN_PRIVATE_BALANCE: &str = "Back in private balance";
 const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 
@@ -1281,9 +1385,12 @@ fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> 
         .collect()
 }
 
-/// A private Bridge swap's setup step: "Stealth accounts set up" with one sub-step per network,
-/// each naming its stealth account and the block of its setup or what it waits for. The step's
-/// own status follows its sub-steps, as [`parent_step_status`] derives it.
+/// A private Bridge swap's account step with one sub-step per network, each naming its stealth
+/// account. An account the swap sets up shows the block of its setup or what it waits for. An
+/// account the swap reuses shows that it is reused and ready, with no setup of its own, and
+/// never as pending. The step is "Stealth accounts set up", or "Stealth accounts ready" when the
+/// swap sets up neither. Its own status follows its sub-steps, as [`parent_step_status`]
+/// derives it.
 fn private_setup_step(
     stage: SwapStage,
     private: &SwapPrivateBridgeLabels,
@@ -1295,6 +1402,12 @@ fn private_setup_step(
         .iter()
         .map(|account| {
             let (status, detail) = match account.progress {
+                SwapSetupProgress::Done if account.reused => (Done, REUSED_READY.to_owned()),
+                // Its records are read once its network is loaded. Nothing is on its way.
+                SwapSetupProgress::NetworkLoading if account.reused => (
+                    NotStarted,
+                    format!("Reused · checked once {} loads", account.network),
+                ),
                 SwapSetupProgress::NotSent => (NotStarted, "Not sent yet".to_owned()),
                 SwapSetupProgress::NetworkLoading => {
                     (Pending, format!("Waiting for {} to load…", account.network))
@@ -1342,9 +1455,14 @@ fn private_setup_step(
             failed.join(" and ")
         ),
     };
+    let label = if private.setups.iter().all(|account| account.reused) {
+        "Stealth accounts ready"
+    } else {
+        "Stealth accounts set up"
+    };
     SwapStep {
         children,
-        ..SwapStep::new("Stealth accounts set up", detail, status)
+        ..SwapStep::new(label, detail, status)
     }
 }
 
@@ -2480,6 +2598,7 @@ mod tests {
                     address,
                 }),
                 progress,
+                reused: false,
                 block: (progress == Setup::Done).then_some(block),
                 detail: None,
             };
@@ -2579,6 +2698,63 @@ mod tests {
         assert_eq!(
             step(SwapStage::SetupFailed, Setup::Failed, Setup::Pending).status,
             Error
+        );
+
+        // An account the swap reuses is ready without a setup of its own. Only the new
+        // account's setup shows as pending, and the step waits for it.
+        let reuse = |mut labels: SwapLabels, origin: bool, arrival: bool| {
+            let bridge = labels.bridge.as_mut().unwrap();
+            let setups = &mut bridge.private.as_mut().unwrap().setups;
+            setups[0].reused = origin;
+            setups[1].reused = arrival;
+            labels
+        };
+        let mixed = swap_steps(
+            SwapStage::SetupPending,
+            &reuse(private(Setup::Done, Setup::Pending), true, false),
+        );
+        assert_eq!(
+            (mixed[0].label.as_str(), mixed[0].status),
+            ("Stealth accounts set up", Pending)
+        );
+        assert_eq!(
+            children(&mixed[0]),
+            [
+                child("Ethereum", Done, "Reused · ready"),
+                child("Arbitrum One", Pending, "Waiting for broadcaster…"),
+            ]
+        );
+        // With both reused nothing is set up: the step is done and the order is next.
+        let both = swap_steps(
+            SwapStage::Ready,
+            &reuse(private(Setup::Done, Setup::Done), true, true),
+        );
+        assert_eq!(
+            both.iter()
+                .take(2)
+                .map(|step| (step.label.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [("Stealth accounts ready", Done), ("Order open", NotStarted)]
+        );
+        assert_eq!(
+            children(&both[0]),
+            [
+                child("Ethereum", Done, "Reused · ready"),
+                child("Arbitrum One", Done, "Reused · ready"),
+            ]
+        );
+        // A reused account whose network isn't loaded shows no pending marker.
+        let unloaded = swap_steps(
+            SwapStage::Ready,
+            &reuse(private(Setup::Done, Setup::NetworkLoading), true, true),
+        );
+        assert_eq!(
+            children(&unloaded[0])[1],
+            child(
+                "Arbitrum One",
+                NotStarted,
+                "Reused · checked once Arbitrum One loads"
+            )
         );
 
         // With both set up, the last step is the shield on the destination network, or what
@@ -2721,6 +2897,7 @@ mod tests {
             destination_shield_fee_bps: None,
             delivery_allowance: None,
             destination_setup_fee: None,
+            source_setup_fee: None,
         };
         let settlement = B256::repeat_byte(0x51);
         let observed = SwapOrderObservations {

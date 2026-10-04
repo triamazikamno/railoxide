@@ -1,8 +1,9 @@
+use super::swap_order::delegate_setup;
 use super::*;
 use crate::{
     BroadcasterFeePolicyStatus, DesktopPrivateSpendAuthorization, ExecutorPrivateFeeLimitExceeded,
-    PrivateBridgeSetupPreparation, PublicBroadcasterCandidate, SwapSetupStatus,
-    is_swap_destination_record, prepare_private_bridge_setup, swap_setup_status,
+    PublicBroadcasterCandidate, SwapPairPreparation, SwapPairSide, SwapSetupStatus, SwapUseClaim,
+    is_swap_destination_record, prepare_swap_pair, submit_swap_pair_setups_with, swap_setup_status,
 };
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
 use alloy::primitives::address;
@@ -66,16 +67,18 @@ pub(super) fn setup_approval(sell: Address, buy: Address, delivery: SwapDelivery
             destination_shield_fee_bps: None,
             delivery_allowance: None,
             destination_setup_fee: None,
+            source_setup_fee: None,
         },
         price_verified: Some(false),
         price_acknowledged: true,
         delivery,
         tokens: Some(crate::vault::SwapApprovalTokens { sell, buy }),
+        accounts: None,
     }
 }
 
 /// Terms of a private Bridge swap to the destination chain, before its destination stealth
-/// account is derived.
+/// account is derived, with a setup fee limit for each chain.
 pub(super) fn private_bridge_approval() -> SwapApproval {
     let mut approval = setup_approval(
         WETH,
@@ -92,7 +95,24 @@ pub(super) fn private_bridge_approval() -> SwapApproval {
         }),
     );
     approval.bounds.destination_setup_fee = Some(U256::from(1_000));
+    approval.bounds.source_setup_fee = Some(U256::from(2_000));
     approval
+}
+
+/// A set-up account at `executor` on `store`'s chain with nothing unfinished: its setup won
+/// nonce 0 and it signed nothing else.
+pub(super) fn existing_account(
+    store: &ExecutorStore,
+    profile: crate::settings::ExecutorProfile,
+    executor: Address,
+) -> ExecutorOperationId {
+    let operation = ExecutorOperationId::random().unwrap();
+    store
+        .reserve(operation, profile.delegate(), Some("Private swap"), &[])
+        .unwrap();
+    store.bind_address(operation, executor).unwrap();
+    delegate_setup(store, operation, profile);
+    operation
 }
 
 /// The destination chain's configuration over the shared mock, which answers as chain 1. A
@@ -363,7 +383,7 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
 }
 
 #[tokio::test]
-async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stands_alone() {
+async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_alone() {
     let rpc = Rpc::start().await;
     let (root, db, vault) = desktop_store_with_vault();
     let view = Arc::new(import_wallet_with_metadata(
@@ -404,14 +424,15 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
     // One software authorization covers both chains.
     let authorization = password();
     let destination_authorization = authorization.for_destination().unwrap();
-    let preparation = |candidate, approval| PrivateBridgeSetupPreparation {
-        operation,
-        destination_operation,
-        candidate,
-        destination_candidate: destination_candidate.clone(),
+    let preparation = |candidate, approval| SwapPairPreparation {
+        use_id: SwapUseId::first(operation),
+        source: SwapAccountChoice::New(operation),
+        destination: Some(SwapAccountChoice::New(destination_operation)),
+        candidate: Some(candidate),
+        destination_candidate: Some(destination_candidate.clone()),
         approval,
         authorization: &authorization,
-        destination_authorization: &destination_authorization,
+        destination_authorization: Some(&destination_authorization),
     };
 
     // Nothing is reserved for terms that are not a private Bridge delivery with a destination
@@ -424,7 +445,7 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
     ] {
         let request = preparation(broadcaster(profile.delegate()), refused);
         assert!(
-            prepare_private_bridge_setup(&origin, &destination, request)
+            prepare_swap_pair(&origin, Some(&destination), request)
                 .await
                 .is_err()
         );
@@ -446,42 +467,121 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
     }
     assert!(origin.records().unwrap().is_empty() && destination.records().unwrap().is_empty());
 
-    // The destination account is reserved first, so a swap setup that fails leaves it reserved
-    // with no swap naming it.
+    // Both accounts are claimed for the swap's use before either is inspected, so a preparation
+    // paused in a chain read holds its whole pair, and a setup that fails leaves both claimed.
+    let swap_use = SwapUseId::first(operation);
+    // What an unrelated swap gets when it names either account of the pair.
+    let unrelated_claims = |origin: &ExecutorOwner, destination: &ExecutorOwner| {
+        [
+            origin.claim_swap_use(
+                None,
+                SwapUseClaim {
+                    id: SwapUseId::random().unwrap(),
+                    source: SwapAccountChoice::Existing(operation),
+                    approval: setup_approval(WETH, USDC, SwapDelivery::Reshield),
+                    destination: None,
+                },
+            ),
+            origin.claim_swap_use(
+                Some(destination),
+                SwapUseClaim {
+                    id: SwapUseId::random().unwrap(),
+                    source: SwapAccountChoice::New(ExecutorOperationId::random().unwrap()),
+                    approval: private_bridge_approval(),
+                    destination: Some(SwapAccountChoice::Existing(destination_operation)),
+                },
+            ),
+        ]
+        .map(|claim| {
+            matches!(
+                claim.unwrap_err().downcast_ref::<ExecutorStoreError>(),
+                Some(ExecutorStoreError::SwapUseActive)
+            )
+        })
+    };
+    // The pair as its records hold it.
+    let pair = |origin: &ExecutorOwner, destination: &ExecutorOwner| {
+        let (source, account) = (
+            record(origin, operation),
+            record(destination, destination_operation),
+        );
+        (
+            (source.active_swap_use(), account.active_swap_use()),
+            source.swap_approval().cloned(),
+            source.destination_operation(),
+            account.swap_destination(),
+            (source.is_retired(), account.is_retired()),
+        )
+    };
     let mut unavailable = broadcaster(profile.delegate());
     unavailable.available_wallets = 0;
     let request = preparation(unavailable, private_bridge_approval());
     rpc.hold.send_replace(Some(multicall()));
     {
-        let preparing = prepare_private_bridge_setup(&origin, &destination, request);
+        let preparing = prepare_swap_pair(&origin, Some(&destination), request);
         tokio::pin!(preparing);
         tokio::select! {
             result = &mut preparing => panic!("destination inspection should be blocked: {}", result.is_ok()),
             () = rpc.wait_for(|requests| requests.iter().any(|request| request["method"] == "eth_call")) => {},
         }
-        assert!(origin.records().unwrap().is_empty());
-        assert!(is_swap_destination_record(&record(
-            &destination,
-            destination_operation
-        )));
-        // Finishing an older swap sweeps this chain while the new destination is still
-        // being inspected. Its unlinked reservation must remain available to preparation.
+        let held = (
+            record(&origin, operation),
+            record(&destination, destination_operation),
+        );
+        assert_eq!(
+            (held.0.active_swap_use(), held.1.active_swap_use()),
+            (Some(swap_use), Some(swap_use))
+        );
+        assert_eq!(held.0.destination_operation(), Some(destination_operation));
+        assert!(is_swap_destination_record(&held.1));
+        // An unrelated swap takes neither account, and its own new account is not allocated.
+        assert_eq!(unrelated_claims(&origin, &destination), [true, true]);
+        // Finishing an older swap sweeps this chain while the pair is still being inspected,
+        // and so does a restart's load. Neither retires or releases an account of the pair.
         assert!(!destination.reconcile_swap_destinations().unwrap());
+        assert!(
+            !ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN)
+                .unwrap()
+                .reconcile_swap_destinations_on_load()
+                .unwrap()
+        );
+        assert_eq!(
+            (origin.records().unwrap(), destination.records().unwrap()),
+            (vec![held.0], vec![held.1])
+        );
         rpc.hold.send_replace(None);
         assert!(preparing.await.is_err());
     }
-    assert!(origin.records().unwrap().is_empty());
     let reserved = record(&destination, destination_operation);
     assert!(is_swap_destination_record(&reserved) && !crate::is_swap_record(&reserved));
+    assert!(crate::is_swap_record(&record(&origin, operation)));
 
-    // The retry resumes that account, and the approval saved with the swap names it.
+    // A restart before anything is signed restores the pair with its approval and its claim,
+    // and still gives neither account to another swap.
+    let claimed = pair(&origin, &destination);
+    assert_eq!(claimed.0, (Some(swap_use), Some(swap_use)));
+    origin.shutdown().await;
+    destination.shutdown().await;
+    drop((origin, destination));
+    let [origin, destination] = owners(1);
+    assert_eq!(pair(&origin, &destination), claimed);
+    assert_eq!(unrelated_claims(&origin, &destination), [true, true]);
+    assert!(record(&origin, operation).issued().is_empty() && reserved.issued().is_empty());
+
+    // The retry resumes both accounts, and the approval saved with the swap names the
+    // destination account.
     let request = preparation(broadcaster(profile.delegate()), private_bridge_approval());
-    let prepared = prepare_private_bridge_setup(&origin, &destination, request)
+    let prepared = prepare_swap_pair(&origin, Some(&destination), request)
         .await
         .unwrap();
-    let executor = prepared.destination.context().executor;
+    let (SwapPairSide::Setup(origin_setup), Some(SwapPairSide::Setup(destination_setup))) =
+        (&prepared.origin, &prepared.destination)
+    else {
+        panic!("both fresh accounts need setup");
+    };
+    let executor = destination_setup.context().executor;
     assert_eq!(reserved.address(), Some(executor));
-    assert_ne!(prepared.origin.context().executor, executor);
+    assert_ne!(origin_setup.context().executor, executor);
     let SwapDelivery::Bridge(delivery) = prepared.approval.delivery else {
         panic!("the approval keeps its Bridge delivery");
     };
@@ -499,6 +599,50 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
         record(&destination, destination_operation).swap_destination(),
         Some(serves)
     );
+
+    // A duplicate Public address rejects the handoff without stopping either fresh account.
+    let duplicate = {
+        let (_, signer) = vault
+            .executor_spend_signers_for_session(
+                &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
+                &view,
+                None,
+                1,
+                saved.index(),
+            )
+            .unwrap();
+        let private_key = Zeroizing::new(alloy::hex::encode(signer.to_bytes()));
+        vault
+            .import_public_account(TEST_PASSWORD, &view, &private_key, None, false)
+            .unwrap()
+    };
+    assert_eq!(duplicate.address, origin_setup.context().executor);
+    let before = (
+        origin.records().unwrap(),
+        destination.records().unwrap(),
+        vault.list_public_accounts_for_session(&view, true).unwrap(),
+    );
+    let error = origin
+        .register_public_account(operation, &authorization)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ExecutorStoreError>(),
+        Some(ExecutorStoreError::Vault(
+            VaultError::DuplicatePublicAccountAddress
+        ))
+    ));
+    assert_eq!(
+        (
+            origin.records().unwrap(),
+            destination.records().unwrap(),
+            vault.list_public_accounts_for_session(&view, true).unwrap(),
+        ),
+        before
+    );
+    vault
+        .delete_imported_public_account(&view, &duplicate.public_account_uuid)
+        .unwrap();
 
     // The destination setup's fee ceiling is the one approved with the swap, read from the
     // swap's record on its own chain.
@@ -618,7 +762,7 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
     origin.shutdown().await;
     destination.shutdown().await;
     drop((origin, destination));
-    let [origin, destination] = owners(1);
+    let [origin, destination] = owners(2);
     assert_eq!(
         record(&origin, operation).swap_approval(),
         Some(&prepared.approval)
@@ -627,43 +771,539 @@ async fn private_bridge_setup_reserves_the_destination_first_and_each_setup_stan
     assert!(!restored.is_retired());
     assert_eq!(restored.swap_destination(), Some(serves));
     let resumed = destination
-        .prepare_swap_destination_setup(
+        .resume_swap_setup(
             destination_operation,
             destination_candidate.clone(),
-            serves,
             &destination_authorization,
         )
         .await
         .unwrap();
     assert_eq!(resumed.context().executor, executor);
-    let another = SwapDestinationRecord {
-        destination_token: USDC,
-        ..serves
+    let before = (origin.records().unwrap(), destination.records().unwrap());
+    let mut another = prepared.approval.clone();
+    let SwapDelivery::Bridge(delivery) = &mut another.delivery else {
+        panic!("the approval keeps its Bridge delivery");
     };
-    assert!(
-        destination
-            .prepare_swap_destination_setup(
-                destination_operation,
-                destination_candidate.clone(),
-                another,
-                &destination_authorization,
-            )
-            .await
-            .is_err()
+    delivery.destination_token = USDC;
+    let error = prepare_swap_pair(
+        &origin,
+        Some(&destination),
+        preparation(broadcaster(profile.delegate()), another),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error.downcast_ref::<ExecutorStoreError>(),
+        Some(ExecutorStoreError::OperationMismatch)
+    ));
+    assert_eq!(
+        (origin.records().unwrap(), destination.records().unwrap()),
+        before
     );
     // A stopped destination account takes no further setup.
     destination.stop_swap_setup(destination_operation).unwrap();
     assert!(
         destination
-            .prepare_swap_destination_setup(
+            .resume_swap_setup(
                 destination_operation,
                 destination_candidate,
-                serves,
                 &destination_authorization,
             )
             .await
             .is_err()
     );
+    // Registering the swap's account in Public stops its use before the account is handed off.
+    let live = record(&origin, operation);
+    assert!(!live.swap_use(swap_use).unwrap().is_stopped());
+    origin
+        .register_public_account(operation, &authorization)
+        .await
+        .unwrap();
+    let registered = record(&origin, operation);
+    assert!(registered.swap_use(swap_use).unwrap().is_stopped());
+    assert_eq!(registered.issued(), live.issued());
+    origin.shutdown().await;
+    destination.shutdown().await;
+    drop((origin, destination));
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// Each side of a pair is a new account, which the swap sets up, or an existing one, which takes
+// no setup and no setup fee. Only new sides are prepared and submitted, each with its own
+// chain's broadcaster and approved fee limit, and two new sides are submitted at the same time.
+#[tokio::test]
+async fn swap_pair_sets_up_only_its_new_accounts() {
+    for (source_new, destination_new) in
+        [(true, true), (false, true), (true, false), (false, false)]
+    {
+        let rpc = Rpc::start().await;
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = Arc::new(import_wallet_with_metadata(
+            &vault,
+            TEST_WALLET_ID,
+            "Wallet",
+        ));
+        let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+        let profile = origin_chain.accepted_executor_profile().unwrap();
+        let destination_profile = destination_chain.accepted_executor_profile().unwrap();
+        let candidate = broadcaster(profile.delegate());
+        let mut destination_candidate = broadcaster(destination_profile.delegate());
+        destination_candidate.chain_id = DESTINATION_CHAIN;
+        let [origin, destination] = [origin_chain, destination_chain].map(|chain| {
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap()
+        });
+        let record = |owner: &ExecutorOwner, operation| {
+            owner
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap()
+        };
+        let existing = (Address::repeat_byte(0xa1), Address::repeat_byte(0xa2));
+        let source = if source_new {
+            SwapAccountChoice::New(ExecutorOperationId::random().unwrap())
+        } else {
+            let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+            SwapAccountChoice::Existing(existing_account(&store, profile, existing.0))
+        };
+        let destination_account = if destination_new {
+            SwapAccountChoice::New(ExecutorOperationId::random().unwrap())
+        } else {
+            let store = ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
+            SwapAccountChoice::Existing(existing_account(&store, destination_profile, existing.1))
+        };
+        let other_destination = if !source_new && !destination_new {
+            let store = ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
+            let address = Address::repeat_byte(0xa3);
+            existing_account(&store, destination_profile, address);
+            Some(address)
+        } else {
+            None
+        };
+        let before = (origin.records().unwrap(), destination.records().unwrap());
+        let use_id = SwapUseId::random().unwrap();
+        let authorization = password();
+        let destination_authorization = authorization.for_destination().unwrap();
+        // The approval binds a fee limit only for a chain whose account needs setup.
+        let mut approval = private_bridge_approval();
+        approval.bounds.source_setup_fee = source_new.then_some(U256::from(2_000));
+        approval.bounds.destination_setup_fee = destination_new.then_some(U256::from(1_000));
+        let preparation =
+            |source, approval, candidate, destination_candidate| SwapPairPreparation {
+                use_id,
+                source,
+                destination: Some(destination_account),
+                approval,
+                candidate,
+                destination_candidate,
+                authorization: &authorization,
+                destination_authorization: Some(&destination_authorization),
+            };
+        // The broadcaster of each side that needs setup.
+        let source_setup = source_new.then(|| candidate.clone());
+        let destination_setup = destination_new.then(|| destination_candidate.clone());
+
+        // A broadcaster on a side that isn't new, a new side without one, and a new side
+        // without its fee limit each reserve nothing.
+        let mut unbounded = approval.clone();
+        unbounded.bounds.source_setup_fee = None;
+        unbounded.bounds.destination_setup_fee = None;
+        let mut refused = vec![
+            (
+                approval.clone(),
+                (!source_new).then(|| candidate.clone()),
+                destination_setup.clone(),
+            ),
+            (
+                approval.clone(),
+                source_setup.clone(),
+                (!destination_new).then(|| destination_candidate.clone()),
+            ),
+        ];
+        if source_new || destination_new {
+            refused.push((unbounded, source_setup.clone(), destination_setup.clone()));
+        }
+        if let Some(other_destination) = other_destination {
+            // Software authorization cannot substitute the selected destination for the
+            // account explicitly approved, or change whether either side needs setup.
+            let mut bound = approval.clone();
+            bound.accounts = Some(SwapApprovedAccounts {
+                source: SwapApprovedAccount {
+                    address: Some(existing.0),
+                    setup: false,
+                },
+                destination: Some(SwapApprovedAccount {
+                    address: Some(other_destination),
+                    setup: false,
+                }),
+            });
+            refused.push((bound.clone(), None, None));
+            let accounts = bound.accounts.as_mut().unwrap();
+            accounts.destination.as_mut().unwrap().address = Some(existing.1);
+            accounts.source.setup = true;
+            refused.push((bound.clone(), None, None));
+            let accounts = bound.accounts.as_mut().unwrap();
+            accounts.source.setup = false;
+            accounts.destination = None;
+            refused.push((bound, None, None));
+        }
+        for (approval, candidate, destination_candidate) in refused {
+            let request = preparation(source, approval, candidate, destination_candidate);
+            assert!(
+                prepare_swap_pair(&origin, Some(&destination), request)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                (origin.records().unwrap(), destination.records().unwrap()),
+                before
+            );
+        }
+
+        let request = preparation(
+            source,
+            approval.clone(),
+            source_setup.clone(),
+            destination_setup.clone(),
+        );
+        let prepared = prepare_swap_pair(&origin, Some(&destination), request)
+            .await
+            .unwrap();
+        let prepared_destination = prepared.destination.as_ref().unwrap();
+        assert_eq!(
+            (
+                prepared.origin.requires_setup(),
+                prepared_destination.requires_setup()
+            ),
+            (source_new, destination_new)
+        );
+
+        // A new side is prepared for its own chain and its own broadcaster. An existing side
+        // keeps its address and what it issued, and its use is not a fresh one.
+        for (owner, side, chain_id, own, other, address) in [
+            (
+                &origin,
+                &prepared.origin,
+                1,
+                &candidate,
+                &destination_candidate,
+                existing.0,
+            ),
+            (
+                &destination,
+                prepared_destination,
+                DESTINATION_CHAIN,
+                &destination_candidate,
+                &candidate,
+                existing.1,
+            ),
+        ] {
+            let saved = record(owner, side.operation());
+            assert_eq!(saved.active_swap_use(), Some(use_id));
+            assert_eq!(saved.address(), Some(side.executor()));
+            match side {
+                SwapPairSide::Setup(setup) => {
+                    assert_eq!(setup.context().chain_id, chain_id);
+                    setup.require_broadcaster(own).unwrap();
+                    assert!(setup.require_broadcaster(other).is_err());
+                    assert!(saved.swap_use(use_id).unwrap().is_fresh());
+                    assert!(saved.issued().is_empty());
+                }
+                SwapPairSide::Existing { executor, .. } => {
+                    assert_eq!(*executor, address);
+                    assert!(!saved.swap_use(use_id).unwrap().is_fresh());
+                    assert_eq!(saved.issued().len(), 1, "only its earlier setup");
+                }
+            }
+        }
+
+        // The saved approval binds both addresses, each side's setup need and the destination
+        // account as receiver.
+        let bound = crate::vault::SwapApprovedAccounts {
+            source: crate::vault::SwapApprovedAccount {
+                address: Some(prepared.origin.executor()),
+                setup: source_new,
+            },
+            destination: Some(crate::vault::SwapApprovedAccount {
+                address: Some(prepared_destination.executor()),
+                setup: destination_new,
+            }),
+        };
+        assert_eq!(prepared.approval.accounts, Some(bound));
+        let SwapDelivery::Bridge(delivery) = prepared.approval.delivery else {
+            panic!("the approval keeps its Bridge delivery");
+        };
+        assert_eq!(delivery.receiver, prepared_destination.executor());
+        let saved = record(&origin, source.operation());
+        assert_eq!(saved.swap_approval(), Some(&prepared.approval));
+        if let Some(other_destination) = other_destination {
+            // An idempotent claim must still enforce the supplied account binding.
+            let before = (origin.records().unwrap(), destination.records().unwrap());
+            let mut replaced = prepared.approval.clone();
+            replaced
+                .accounts
+                .as_mut()
+                .unwrap()
+                .destination
+                .as_mut()
+                .unwrap()
+                .address = Some(other_destination);
+            let request = preparation(source, replaced, None, None);
+            assert!(
+                prepare_swap_pair(&origin, Some(&destination), request)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                (origin.records().unwrap(), destination.records().unwrap()),
+                before
+            );
+        }
+
+        // Each new side's fee limit is the one approved for its own chain.
+        let exceeds = |result: eyre::Result<()>| {
+            let error = result.unwrap_err();
+            let exceeded = error
+                .downcast_ref::<ExecutorPrivateFeeLimitExceeded>()
+                .unwrap();
+            (exceeded.maximum(), exceeded.required())
+        };
+        if source_new {
+            let (operation, token) = (source.operation(), candidate.token);
+            origin
+                .require_swap_source_setup_fee(operation, token, U256::from(2_000))
+                .unwrap();
+            assert_eq!(
+                exceeds(origin.require_swap_source_setup_fee(operation, token, U256::from(2_001))),
+                (U256::from(2_000), U256::from(2_001))
+            );
+        }
+        if destination_new {
+            let (operation, token) = (destination_account.operation(), destination_candidate.token);
+            destination
+                .require_swap_destination_setup_fee(operation, token, U256::from(1_000))
+                .unwrap();
+            assert_eq!(
+                exceeds(destination.require_swap_destination_setup_fee(
+                    operation,
+                    token,
+                    U256::from(1_001)
+                )),
+                (U256::from(1_000), U256::from(1_001))
+            );
+        }
+
+        // Only new sides are submitted. Each submission waits for the others, so two new sides
+        // finish only when both are in flight at once.
+        let new_sides = usize::from(source_new) + usize::from(destination_new);
+        let barrier = tokio::sync::Barrier::new(new_sides.max(1));
+        let submitted = Mutex::new(Vec::new());
+        let results = tokio::time::timeout(
+            Duration::from_secs(2),
+            submit_swap_pair_setups_with(
+                (&origin, &prepared.origin, Some(U256::from(2_000))),
+                Some((&destination, prepared_destination, Some(U256::from(1_000)))),
+                |_, setup, maximum_private_fee| {
+                    let (barrier, submitted) = (&barrier, &submitted);
+                    async move {
+                        barrier.wait().await;
+                        let sent = (setup.context().chain_id, setup.operation());
+                        submitted.lock().unwrap().push((sent, maximum_private_fee));
+                        Ok::<_, eyre::Report>(sent)
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("new sides are submitted at the same time");
+        let sent_origin = source_new.then(|| ((1, source.operation()), U256::from(2_000)));
+        let sent_destination = destination_new.then(|| {
+            (
+                (DESTINATION_CHAIN, destination_account.operation()),
+                U256::from(1_000),
+            )
+        });
+        assert_eq!(
+            (results.0.map(Result::unwrap), results.1.map(Result::unwrap)),
+            (
+                sent_origin.map(|(sent, _)| sent),
+                sent_destination.map(|(sent, _)| sent)
+            )
+        );
+        let mut submitted = submitted.into_inner().unwrap();
+        submitted.sort_by_key(|((chain_id, _), _)| *chain_id);
+        assert_eq!(
+            submitted,
+            sent_origin
+                .into_iter()
+                .chain(sent_destination)
+                .collect::<Vec<_>>()
+        );
+
+        // A retry prepares a new side alone, with the account it reserved. An existing side
+        // takes no setup, and its record stays as it is.
+        for (owner, side, candidate, authorization) in [
+            (&origin, &prepared.origin, &candidate, &authorization),
+            (
+                &destination,
+                prepared_destination,
+                &destination_candidate,
+                &destination_authorization,
+            ),
+        ] {
+            let saved = record(owner, side.operation());
+            let retried = owner
+                .resume_swap_setup(side.operation(), candidate.clone(), authorization)
+                .await;
+            if side.requires_setup() {
+                assert_eq!(retried.unwrap().context().executor, side.executor());
+            } else {
+                let error = retried.err().unwrap();
+                assert!(error.to_string().contains("takes no setup"), "{error:#}");
+                assert_eq!(record(owner, side.operation()), saved);
+            }
+        }
+
+        // The same request resumes the pair. One that flips the source's setup need for the
+        // same use is refused, and the saved approval stays.
+        let request = preparation(
+            source,
+            prepared.approval.clone(),
+            source_setup,
+            destination_setup.clone(),
+        );
+        let resumed = prepare_swap_pair(&origin, Some(&destination), request)
+            .await
+            .unwrap();
+        assert_eq!(resumed.approval, prepared.approval);
+        let flipped = if source_new {
+            SwapAccountChoice::Existing(source.operation())
+        } else {
+            SwapAccountChoice::New(source.operation())
+        };
+        let mut rebound = approval;
+        rebound.bounds.source_setup_fee = Some(U256::from(2_000));
+        let request = preparation(
+            flipped,
+            rebound,
+            (!source_new).then(|| candidate.clone()),
+            destination_setup,
+        );
+        let error = prepare_swap_pair(&origin, Some(&destination), request)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("differ"), "{error:#}");
+        assert_eq!(
+            record(&origin, source.operation()).swap_approval(),
+            Some(&prepared.approval)
+        );
+
+        origin.shutdown().await;
+        destination.shutdown().await;
+        drop((origin, destination));
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_swap_use_cancelled_during_inspection_refuses_its_late_preparation() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    let profile = origin_chain.accepted_executor_profile().unwrap();
+    let mut destination_candidate = broadcaster(
+        destination_chain
+            .accepted_executor_profile()
+            .unwrap()
+            .delegate(),
+    );
+    destination_candidate.chain_id = DESTINATION_CHAIN;
+    let [origin, destination] = [origin_chain, destination_chain].map(|chain| {
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            view.clone(),
+            chain,
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap()
+    });
+    let (operation, destination_operation) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    let authorization = password();
+    let destination_authorization = authorization.for_destination().unwrap();
+    let preparation = || SwapPairPreparation {
+        use_id: SwapUseId::first(operation),
+        source: SwapAccountChoice::New(operation),
+        destination: Some(SwapAccountChoice::New(destination_operation)),
+        candidate: Some(broadcaster(profile.delegate())),
+        destination_candidate: Some(destination_candidate.clone()),
+        approval: private_bridge_approval(),
+        authorization: &authorization,
+        destination_authorization: Some(&destination_authorization),
+    };
+
+    // The user cancels while the destination account is still being inspected. Neither fresh
+    // account issued anything, so both claims are released, and the inspection's result
+    // prepares nothing.
+    rpc.hold.send_replace(Some(multicall()));
+    {
+        let preparing = prepare_swap_pair(&origin, Some(&destination), preparation());
+        tokio::pin!(preparing);
+        tokio::select! {
+            result = &mut preparing => panic!("destination inspection should be blocked: {}", result.is_ok()),
+            () = rpc.wait_for(|requests| requests.iter().any(|request| request["method"] == "eth_call")) => {},
+        }
+        assert_eq!(
+            origin
+                .cancel_swap_use(Some(&destination), operation, SwapUseId::first(operation))
+                .unwrap(),
+            SwapUseCancellation {
+                source: SwapUseRelease::Released,
+                destination: Some(SwapUseRelease::Released),
+            }
+        );
+        rpc.hold.send_replace(None);
+        assert!(preparing.await.is_err());
+    }
+    // Starting the same swap again resumes its stopped claim, which prepares nothing either.
+    assert!(
+        prepare_swap_pair(&origin, Some(&destination), preparation())
+            .await
+            .is_err()
+    );
+    for (owner, operation) in [(&origin, operation), (&destination, destination_operation)] {
+        let records = owner.records().unwrap();
+        let [record] = records.as_slice() else {
+            panic!("the cancelled swap keeps its one account on each chain");
+        };
+        assert_eq!(record.operation(), operation);
+        assert!(record.is_swap_setup_stopped() && record.issued().is_empty());
+        assert!(record.swap_uses().iter().all(SwapUseRecord::is_stopped));
+    }
     origin.shutdown().await;
     destination.shutdown().await;
     drop((origin, destination));

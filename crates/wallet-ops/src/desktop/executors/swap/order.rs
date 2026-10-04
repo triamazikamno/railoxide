@@ -58,7 +58,10 @@ use super::bridge::{
 };
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::simulation::{PreHookSimulation, simulate_pre_hook};
-use super::{DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, trace_step};
+use super::{
+    DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, SwapShieldNotes, SwapUseClaim,
+    admission, is_live_swap_use, require_swap_account, trace_step,
+};
 use crate::cow::{
     CowApiError, CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters,
     CowSellQuoteRequest, GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit, OrderLimitError,
@@ -78,9 +81,11 @@ use crate::vault::{
     BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
     ExecutorInputIdentity, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
     ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStoreError,
-    IssuedExecutorPayload, SwapAnchorObservation, SwapApproval, SwapApprovalTokens,
+    IssuedExecutorPayload, SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse,
+    SwapAdmissionEvidence, SwapAnchorObservation, SwapApproval, SwapApprovalTokens,
     SwapApprovedBounds, SwapAttempt, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
-    SwapProof, SwapRecipient, SwapSubmission, SwapSubmissionStatus, SwapTerms,
+    SwapProof, SwapRecipient, SwapSubmission, SwapSubmissionStatus, SwapTerms, SwapUseId,
+    SwapUseRecord, SwapUseRole, swap_account_refusal,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
@@ -576,8 +581,9 @@ impl SwapReview {
                 destination_shield_fee_bps: private
                     .map(|private| private.destination_shield_fee_bps),
                 delivery_allowance: private.map(|private| private.delivery_allowance),
-                // Set by the caller once the destination setup is reserved.
+                // Set by the caller for each side that needs setup.
                 destination_setup_fee: None,
+                source_setup_fee: None,
             },
             price_verified: Some(self.price_verified()),
             price_acknowledged,
@@ -586,6 +592,8 @@ impl SwapReview {
                 sell: self.plan.sell_token,
                 buy: self.plan.buy_token,
             }),
+            // Bound by the pair's preparation, once both accounts are chosen.
+            accounts: None,
         })
     }
 
@@ -633,7 +641,7 @@ impl SwapReview {
         }
         // A private Bridge delivery shields on the destination chain, at that chain's fee.
         let private = self.bridge.and_then(|bridge| bridge.private);
-        if matches!(self.plan.delivery, SwapDelivery::Bridge(bridge) if bridge.is_private()) {
+        if self.plan.delivery.private_bridge().is_some() {
             let current = private.map(|private| private.destination_shield_fee_bps);
             if current.is_none() || current != approved.destination_shield_fee_bps {
                 return Err(SwapReviewChange::DestinationShieldFee {
@@ -832,6 +840,10 @@ pub struct SwapDestinationContext {
 /// Approval of a reviewed swap.
 pub struct SwapOrderRequest<'a> {
     pub review: &'a SwapReview,
+    /// The swap use the order is signed for. A swap's own order or retry names the use that
+    /// claims its account. An explicitly reused account that doesn't hold the use yet is
+    /// claimed for it first, so repeating the request with the same use resumes it.
+    pub swap_use: SwapUseId,
     /// `M`, the approved minimum received privately after the shield fee, or by an External
     /// receiver.
     pub private_minimum: U256,
@@ -919,6 +931,10 @@ pub enum SwapReviewChange {
         approved: U256,
         current: U256,
     },
+    /// The order's source account, its private delivery's destination account, or whether
+    /// either needs setup differs from the accounts the approval binds. An approved new
+    /// account that took its derived address is not a change. This always needs a full review.
+    Accounts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,6 +1221,8 @@ impl SwapOutputPoiSink for WalletSession {
 /// A reviewed swap's proved pre-hook and approval, ready to sign.
 pub(crate) struct SwapOrderSigning<'a> {
     pub(crate) review: &'a SwapReview,
+    /// The swap use that claims the plan's account: see [`SwapOrderRequest::swap_use`].
+    pub(crate) swap_use: SwapUseId,
     pub(crate) private_minimum: U256,
     pub(crate) price_acknowledged: bool,
     /// Proved Railgun transactions of the pre-hook, unsigned.
@@ -1234,6 +1252,10 @@ pub(crate) struct SwapDestinationSigning<'a> {
     pub(crate) owner: &'a ExecutorOwner,
     pub(crate) delegated: DelegatedSwapExecutor,
     pub(crate) authorization: &'a DesktopPrivateSpendAuthorization,
+    /// The wallet's local notes on the destination chain. A reused account's earlier shields
+    /// are judged from them again when its shield is issued; without them every such shield
+    /// is unknown, which refuses.
+    pub(crate) notes: Option<&'a dyn SwapShieldNotes>,
 }
 
 enum SwapRecheck {
@@ -1300,12 +1322,19 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if matches!(executor.setup, SwapExecutorSetup::Recorded) {
-            swap_attempt_refusal(&record, || record.has_recorded_unresolved_issued_work())
-                .map_or(Ok(()), |refusal| Err(eyre!(refusal)))?;
+        // Only a plan made for the confirmed delegation has reconciled evidence behind it.
+        let evidence = if executor.delegated().is_some() {
+            SwapAdmissionEvidence::Fresh
         } else {
-            require_swap_attempt_admitted(&record)?;
-        }
+            SwapAdmissionEvidence::Recorded
+        };
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            previewed_swap_use(&record, executor.is_reused()),
+            evidence,
+        )?;
         // Without reuse, the executor places the pair it was set up for: the setup approval's
         // before the first order, then the last order's.
         let pair = match record.swap() {
@@ -1548,6 +1577,7 @@ impl ExecutorOwner {
     ) -> Result<SwapOrderOutcome> {
         let SwapOrderRequest {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             session,
@@ -1563,38 +1593,30 @@ impl ExecutorOwner {
         self.require_swap_session(&session)?;
         review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
         bridge_route(&review.plan, bridge)?;
-        if private_bridge(review.plan.delivery).is_some() != destination.is_some() {
+        if review.plan.delivery.private_bridge().is_some() != destination.is_some() {
             return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH));
         }
+        // The use claims its account before the account is read or anything is proved.
+        self.admit_swap_use(review, swap_use, private_minimum, price_acknowledged)?;
         let confirmed = session
             .sync_tip_rx
             .borrow()
             .safe_head_block
             .ok_or_else(|| eyre!("waiting for the wallet to sync the chain head"))?;
-        let mut review = review.clone();
-        if let Some(change) = trace_step(
-            "order_account_refresh",
-            self.refresh_swap_executor(&mut review, confirmed),
-        )
-        .await?
-        {
-            return Ok(SwapOrderOutcome::ReviewRequired(change));
-        }
-        let review = &review;
-        let plan = &review.plan;
-        let delegated = require_delegated_plan(plan)?;
-        let record = self
-            .swap_account_record(delegated.operation())?
+        let operation = review
+            .plan
+            .operation()
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        // No proof is built for a retry the store would refuse.
-        require_swap_attempt_admitted(&record)?;
         // A private Bridge order is signed only once the destination chain's stealth account is
-        // confirmed as delegated too, through that chain's owner.
-        let destination = match (&destination, private_bridge(plan.delivery)) {
+        // confirmed as delegated too, through that chain's owner. The swap's record names it.
+        let destination_account = match (&destination, review.plan.delivery.private_bridge()) {
             (Some(context), Some(delivery)) => {
-                let operation = record.destination_operation().ok_or_else(|| {
-                    eyre!("this swap has no stealth account on the destination network")
-                })?;
+                let destination_operation = self
+                    .swap_account_record(operation)?
+                    .and_then(|record| record.destination_operation())
+                    .ok_or_else(|| {
+                        eyre!("this swap has no stealth account on the destination network")
+                    })?;
                 context.owner.require_swap_session(&context.session)?;
                 let confirmed = context
                     .session
@@ -1604,25 +1626,63 @@ impl ExecutorOwner {
                     .ok_or_else(|| {
                         eyre!("waiting for the wallet to sync the destination network")
                     })?;
-                let delegated = trace_step(
-                    "order_destination_refresh",
-                    context.owner.delegated_swap_destination(
-                        operation,
-                        confirmed,
-                        self.chain.chain_id,
-                        delegated.operation(),
-                        delivery.receiver,
-                    ),
-                )
-                .await?;
-                Some(SwapDestinationSigning {
-                    owner: context.owner.as_ref(),
-                    delegated,
-                    authorization: &context.authorization,
-                })
+                Some((context, destination_operation, confirmed, delivery.receiver))
             }
             _ => None,
         };
+        // Both selected accounts are refreshed at the same time, each through its own owner
+        // and session. Each result is bound to its record, which signing checks again.
+        let mut review = review.clone();
+        let (source, destination) = tokio::join!(
+            trace_step(
+                "order_account_refresh",
+                self.refresh_swap_executor(&mut review, confirmed, swap_use),
+            ),
+            async {
+                let Some((context, destination_operation, confirmed, receiver)) =
+                    destination_account
+                else {
+                    return Ok(None);
+                };
+                let delegated = trace_step(
+                    "order_destination_refresh",
+                    context.owner.delegated_swap_destination(
+                        destination_operation,
+                        confirmed,
+                        self.chain.chain_id,
+                        operation,
+                        swap_use,
+                        receiver,
+                        Some(&*context.session),
+                    ),
+                )
+                .await?;
+                Ok::<_, eyre::Report>(Some(SwapDestinationSigning {
+                    owner: context.owner.as_ref(),
+                    delegated,
+                    authorization: &context.authorization,
+                    notes: Some(&*context.session),
+                }))
+            },
+        );
+        if let Some(change) = source? {
+            return Ok(SwapOrderOutcome::ReviewRequired(change));
+        }
+        let destination = destination?;
+        let review = &review;
+        let plan = &review.plan;
+        let delegated = require_delegated_plan(plan)?;
+        let record = self
+            .swap_account_record(delegated.operation())?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        // No proof is built for a retry the store would refuse.
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            SwapAccountUse::Claimed(swap_use),
+            SwapAdmissionEvidence::Fresh,
+        )?;
         let utxos = self.swap_inputs(&session, &record)?;
         let (transactions, inputs, change_output_pois) = if let Some((transactions, inputs)) =
             reusable_swap_proof(&record, plan, &utxos)
@@ -1644,6 +1704,7 @@ impl ExecutorOwner {
         };
         Box::pin(self.issue_swap_order(SwapOrderSigning {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             transactions,
@@ -1659,6 +1720,38 @@ impl ExecutorOwner {
             destination,
         }))
         .await
+    }
+
+    /// Bind the order to its swap use before any preparation. An explicitly reused account
+    /// that doesn't hold `swap_use` yet is claimed for it, with the approval these terms make.
+    /// Any other account must already be claimed by that use.
+    fn admit_swap_use(
+        &self,
+        review: &SwapReview,
+        swap_use: SwapUseId,
+        private_minimum: U256,
+        price_acknowledged: bool,
+    ) -> Result<()> {
+        let operation = review
+            .plan
+            .operation()
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        if review.plan.executor.is_reused() && record.swap_use(swap_use).is_none() {
+            self.claim_swap_use(
+                None,
+                SwapUseClaim {
+                    id: swap_use,
+                    source: SwapAccountChoice::Existing(operation),
+                    approval: review.approval(private_minimum, price_acknowledged)?,
+                    destination: None,
+                },
+            )?;
+            return Ok(());
+        }
+        require_swap_use(&record, swap_use)
     }
 
     async fn prove_swap_pre_hook(
@@ -1779,6 +1872,7 @@ impl ExecutorOwner {
     ) -> Result<SwapOrderOutcome> {
         let SwapOrderSigning {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             transactions,
@@ -1801,7 +1895,7 @@ impl ExecutorOwner {
         // The attempt records the gas the signed minimum leaves room for.
         let gas_allowance = review.gas_allowance_for(private_minimum)?;
         let bridge = bridge_route(plan, bridge)?;
-        if private_bridge(plan.delivery).is_some() != destination.is_some() {
+        if plan.delivery.private_bridge().is_some() != destination.is_some() {
             return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH));
         }
         let profile = self.swap_order_profile()?;
@@ -1809,7 +1903,14 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        require_swap_attempt_admitted(&record)?;
+        require_swap_use(&record, swap_use)?;
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            SwapAccountUse::Claimed(swap_use),
+            SwapAdmissionEvidence::Fresh,
+        )?;
         // The hooks are issued against the latest reconciled observation, which the write
         // below requires to be unchanged; the plan's proof shape fixes the nonce.
         let observed = record
@@ -1821,7 +1922,7 @@ impl ExecutorOwner {
         }
         // A private delivery's receiver is the stealth account this swap's record links to on
         // the destination chain, confirmed there for the same wallet.
-        if let (Some(delivery), Some(destination)) = (private_bridge(plan.delivery), destination)
+        if let (Some(delivery), Some(destination)) = (plan.delivery.private_bridge(), destination)
             && (destination.owner.chain.chain_id != delivery.destination_chain
                 || !self.view.is_same_wallet_session(&destination.owner.view)
                 || destination.delegated.executor() != delivery.receiver
@@ -1830,6 +1931,36 @@ impl ExecutorOwner {
             return Err(eyre!(
                 "the stealth account on the destination network doesn't belong to this swap; plan the swap again"
             ));
+        }
+        // The first order of a use is signed for the accounts its approval binds: this account,
+        // a private delivery's receiver, and whether the use set each of them up.
+        let first_order = !record.has_swap_use_order(swap_use);
+        if first_order
+            && let Some(approval) = record.swap_use(swap_use).and_then(SwapUseRecord::approval)
+            && let Some(accounts) = approval.accounts
+        {
+            let source_setup = record
+                .swap_use(swap_use)
+                .is_none_or(SwapUseRecord::is_fresh);
+            let bound_destination = match (plan.delivery.private_bridge(), destination) {
+                (Some(delivery), Some(destination)) => {
+                    let setup = destination
+                        .owner
+                        .swap_account_record(destination.delegated.operation())?
+                        .and_then(|account| account.swap_use(swap_use).map(SwapUseRecord::is_fresh))
+                        .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+                    Some((delivery.receiver, setup))
+                }
+                _ => None,
+            };
+            if !accounts.admits((executor, source_setup), bound_destination) {
+                return Ok(SwapOrderOutcome::ReviewRequired(SwapReviewChange::Accounts));
+            }
+            // An account with earlier orders skips the check below, so its approved delivery
+            // is compared here.
+            if record.swap().is_some() && approval.delivery != plan.delivery {
+                return Ok(SwapOrderOutcome::ReviewRequired(SwapReviewChange::Delivery));
+            }
         }
         // The first order after setup places the approved pair and delivery. Later orders, with
         // their own reviews, aren't bound by it. A new delivery needs a new approval.
@@ -1895,7 +2026,7 @@ impl ExecutorOwner {
         // A private Bridge delivery shields on the destination chain at that chain's fee, the
         // shared protocol constant like this chain's. The reviewed rate must be the current
         // one, and for the first order after setup the one approved with it.
-        let private_quote = match private_bridge(plan.delivery) {
+        let private_quote = match plan.delivery.private_bridge() {
             Some(_) => {
                 let quote = review
                     .bridge
@@ -1955,9 +2086,11 @@ impl ExecutorOwner {
                             "order_destination_shield",
                             self.while_active(destination.owner.issue_swap_destination_shield(
                                 destination.delegated,
+                                swap_use,
                                 delivery.destination_token,
                                 destination_minimum,
                                 destination.authorization,
+                                destination.notes,
                             )),
                         )
                         .await?;
@@ -2188,6 +2321,7 @@ impl ExecutorOwner {
             self.store.record_swap_attempt(
                 operation,
                 SwapAttempt {
+                    use_id: swap_use,
                     terms: SwapTerms::new(
                         plan.sell_token,
                         plan.buy_token,
@@ -2224,9 +2358,11 @@ impl ExecutorOwner {
                         destination_shield_fee_bps: private_quote
                             .map(|private| private.destination_shield_fee_bps),
                         delivery_allowance: private_quote.map(|private| private.delivery_allowance),
-                        // The limit approved with the setup, when this swap's record has one.
+                        // The limits approved with the setup, when this swap's record has them.
                         destination_setup_fee: private_quote
                             .and_then(|_| record.swap_approval()?.bounds.destination_setup_fee),
+                        source_setup_fee: private_quote
+                            .and_then(|_| record.swap_approval()?.bounds.source_setup_fee),
                     },
                     invalidates: plan.invalidates,
                     pre_hook: IssuedExecutorPayload::new(
@@ -2287,13 +2423,21 @@ impl ExecutorOwner {
     /// full balance to the wallet. The guard makes a submission before the fill revert without
     /// consuming the nonce. The payload is in the account's record when its calldata is
     /// returned. A retry signs again at the same nonce for its own amount, and both stay
-    /// recorded.
+    /// recorded. The shield is signed for the swap use `swap_use`, which must claim the account
+    /// as its destination for `token`, also when the payload is written.
+    ///
+    /// An account the use reuses is judged again before each shield, the first and every
+    /// retry's: the shared admission rules on its reconciled record, a zero balance of `token`
+    /// read now, and, in the write's own critical section, the POI verdicts of its earlier
+    /// shields from `notes`. A verdict that changed since admission issues nothing.
     pub(crate) async fn issue_swap_destination_shield(
         &self,
         delegated: DelegatedSwapExecutor,
+        swap_use: SwapUseId,
         token: Address,
         amount: U256,
         authorization: &DesktopPrivateSpendAuthorization,
+        notes: Option<&dyn SwapShieldNotes>,
     ) -> Result<Bytes> {
         self.ensure_active()?;
         let (operation, executor) = (delegated.operation(), delegated.executor());
@@ -2309,16 +2453,34 @@ impl ExecutorOwner {
             .ok_or_else(|| {
                 eyre!("the destination stealth account's nonce changed; plan the swap again")
             })?;
+        let receives_token = record.swap_use(swap_use).is_some_and(|claimed| {
+            matches!(
+                claimed.role(),
+                SwapUseRole::Destination { destination_token, .. } if *destination_token == token
+            )
+        });
         if record.address() != Some(executor)
             || record.delegate() != delegated.delegate()
-            || record.swap().is_some()
-            || record
-                .swap_destination()
-                .is_none_or(|destination| destination.destination_token != token)
+            || !is_live_swap_use(&record, swap_use)
+            || !receives_token
         {
             return Err(eyre!(
                 "the destination stealth account changed; plan the swap again"
             ));
+        }
+        let reused = record
+            .swap_use(swap_use)
+            .is_some_and(|claimed| !claimed.is_fresh());
+        if reused {
+            require_swap_account(
+                &record,
+                self.chain.chain_id,
+                SwapAccountRole::Destination { token },
+                SwapAccountUse::Claimed(swap_use),
+                SwapAdmissionEvidence::Fresh,
+            )?;
+            self.require_empty_receiving_balance(executor, delegated.delegate(), token)
+                .await?;
         }
         let signer = self.authorized_executor_signer(
             authorization,
@@ -2345,8 +2507,12 @@ impl ExecutorOwner {
         drop(signer);
         let guard = self.lock_activity().await;
         self.require_record_unchanged(&record)?;
-        self.store.record_issued(
+        if reused {
+            admission::require_earlier_shields_resolved(&record, swap_use, notes)?;
+        }
+        self.store.record_swap_destination_shield(
             operation,
+            swap_use,
             IssuedExecutorPayload::new(
                 nonce,
                 delegated.delegate(),
@@ -2718,21 +2884,22 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
-        if reuse {
-            swap_account_candidate(&record, self.chain.chain_id)
-                .ok_or_else(|| eyre!("this account is unavailable for another swap"))?;
-        } else {
-            swap_attempt_refusal(&record, || record.has_recorded_unresolved_issued_work())
-                .map_or(Ok(()), |refusal| Err(eyre!(refusal)))?;
-            if !super::is_swap_record(&record)
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            previewed_swap_use(&record, reuse),
+            SwapAdmissionEvidence::Recorded,
+        )?;
+        if !reuse
+            && (!super::is_swap_record(&record)
                 || !record.issued().iter().any(|payload| {
                     payload.purpose() == ExecutorPayloadPurpose::Operation
                         && record.recorded_payload_status(payload.hash())
                             == Some(ExecutorPayloadStatus::Executed)
-                })
-            {
-                return Err(eyre!("this swap's setup is not confirmed"));
-            }
+                }))
+        {
+            return Err(eyre!("this swap's setup is not confirmed"));
         }
         self.swap_order_profile()?;
         ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
@@ -2759,6 +2926,7 @@ impl ExecutorOwner {
         &self,
         review: &mut SwapReview,
         confirmed: u64,
+        swap_use: SwapUseId,
     ) -> Result<Option<SwapReviewChange>> {
         let plan = &review.plan;
         if plan.executor.requires_setup() {
@@ -2769,7 +2937,14 @@ impl ExecutorOwner {
         let operation = plan
             .operation()
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        let mut executor = self.reuse_swap_account(operation, confirmed).await?;
+        let mut executor = self
+            .reuse_swap_account(
+                operation,
+                confirmed,
+                SwapAccountRole::Source,
+                SwapAccountUse::Claimed(swap_use),
+            )
+            .await?;
         if executor.executor() != plan.executor() || executor.delegate() != plan.context.delegate {
             return Err(eyre!("the swap executor changed; plan the swap again"));
         }
@@ -2791,20 +2966,42 @@ impl ExecutorOwner {
         Ok(None)
     }
 
-    /// Check the selected account and its prior orders before preparing execution.
-    /// This does not sign, reserve inputs, or restart a stopped setup.
+    /// Admit the selected account for `swap_use` in `role` before preparing execution, and
+    /// return it with its confirmed delegation. Source and destination accounts both come
+    /// through here. Recorded evidence first refuses what no observation changes. An account
+    /// whose earlier work is settled at `confirmed` then has only its delegation and nonce
+    /// refreshed, without historical block or receipt requests; any other is reconciled.
+    /// Either way the fresh record is judged under the activity lock, unchanged since it was
+    /// read. A destination's receiving-token balance and earlier shields are checked by its
+    /// caller. This does not sign, reserve inputs, or restart a stopped setup.
     pub async fn reuse_swap_account(
         &self,
         operation: ExecutorOperationId,
         confirmed: u64,
+        role: SwapAccountRole,
+        swap_use: SwapAccountUse,
     ) -> Result<SwapExecutor> {
+        let chain_id = self.chain.chain_id;
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
+        if let Some(refusal) = swap_account_refusal(
+            &record,
+            chain_id,
+            role,
+            swap_use,
+            SwapAdmissionEvidence::Recorded,
+        )
+        .filter(|refusal| !refusal.awaits_observation())
+        {
+            return Err(refusal.into());
+        }
         if record.settled_swaps_at(confirmed) {
-            require_swap_attempt_admitted(&record)?;
-            let mut executor =
-                trace_step("reuse_finalized", self.refresh_settled_swap(&record)).await?;
+            let mut executor = trace_step(
+                "reuse_finalized",
+                self.refresh_settled_swap(&record, role, swap_use),
+            )
+            .await?;
             executor.reused = true;
             return Ok(executor);
         }
@@ -2824,32 +3021,70 @@ impl ExecutorOwner {
         let record = report.record();
         let _guard = self.lock_activity().await;
         self.require_record_unchanged(record)?;
-        require_swap_attempt_admitted(record)?;
-        if record.swap().is_none() && record.has_unresolved_issued_work() {
-            return Err(eyre!(UNFINISHED_WORK));
-        }
+        require_swap_account(
+            record,
+            chain_id,
+            role,
+            swap_use,
+            SwapAdmissionEvidence::Fresh,
+        )?;
         let mut executor = SwapExecutor::from(delegated);
         executor.reused = true;
         Ok(executor)
     }
 
-    /// Set-up stealth accounts the swap form can offer for another swap, hidden ones included.
-    /// This reads local records only: a setup recorded as executed for an accepted delegate,
-    /// and the local rules of [`Self::reuse_swap_account`] judged from recorded outcomes.
-    /// Execution preparation observes and checks the chosen account with
+    /// Set-up stealth accounts the swap form can offer to place another swap, hidden ones
+    /// included, whichever role they had before. This reads local records only: the shared
+    /// admission rules judged from recorded outcomes, without a network request. Being listed
+    /// authorizes nothing: execution preparation observes and checks the chosen account with
     /// [`Self::reuse_swap_account`].
     pub fn swap_account_candidates(&self) -> Result<Vec<SwapAccountCandidate>> {
         self.swap_order_profile()?;
+        self.swap_role_candidates(SwapAccountRole::Source)
+    }
+
+    /// Set-up stealth accounts on this chain the swap form can offer as the destination of a
+    /// private Bridge swap that delivers `token`, hidden ones included. Like
+    /// [`Self::swap_account_candidates`] this reads local records only. The account's balance
+    /// of `token` and its earlier shields' POI verdicts are not judged here: preparation
+    /// checks them, and can still refuse a listed account.
+    pub fn swap_destination_candidates(&self, token: Address) -> Result<Vec<SwapAccountCandidate>> {
+        self.swap_destination_profile()?;
+        self.swap_role_candidates(SwapAccountRole::Destination { token })
+    }
+
+    fn swap_role_candidates(&self, role: SwapAccountRole) -> Result<Vec<SwapAccountCandidate>> {
         let chain_id = self.chain.chain_id;
         Ok(self
             .records()?
             .iter()
-            .filter_map(|record| swap_account_candidate(record, chain_id))
+            .filter_map(|record| swap_account_candidate(record, chain_id, role))
             .collect())
+    }
+
+    /// Why the account `operation` can't take another swap in `role`, from its recorded
+    /// outcomes and without a network request. `None` is provisional: it offers the account,
+    /// and preparation still checks its current state, and for a destination its
+    /// receiving-token balance and earlier shields.
+    pub fn swap_account_refusal(
+        &self,
+        operation: ExecutorOperationId,
+        role: SwapAccountRole,
+    ) -> Result<Option<SwapAccountRefusal>> {
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("stealth account is unavailable"))?;
+        Ok(swap_account_refusal(
+            &record,
+            self.chain.chain_id,
+            role,
+            SwapAccountUse::New,
+            SwapAdmissionEvidence::Recorded,
+        ))
     }
 }
 
-/// A stealth account whose setup is done and that may place another swap.
+/// A stealth account whose setup is done and that may take another swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwapAccountCandidate {
     operation: ExecutorOperationId,
@@ -2883,19 +3118,20 @@ impl SwapAccountCandidate {
     }
 }
 
-fn swap_account_candidate(record: &ExecutorRecord, chain_id: u64) -> Option<SwapAccountCandidate> {
+fn swap_account_candidate(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    role: SwapAccountRole,
+) -> Option<SwapAccountCandidate> {
     let address = record.address()?;
-    let set_up = ExecutorProfile::accepted(chain_id, record.delegate()).is_some()
-        && record.issued().iter().any(|payload| {
-            payload.purpose() == ExecutorPayloadPurpose::Operation
-                && record.recorded_payload_status(payload.hash())
-                    == Some(ExecutorPayloadStatus::Executed)
-        });
-    let unresolved = || record.has_recorded_unresolved_issued_work();
-    // An approved order still awaiting placement belongs to its own swap.
-    if !set_up
-        || swap_attempt_refusal(record, unresolved).is_some()
-        || record.swap().is_none() && (unresolved() || record.swap_approval().is_some())
+    if swap_account_refusal(
+        record,
+        chain_id,
+        role,
+        SwapAccountUse::New,
+        SwapAdmissionEvidence::Recorded,
+    )
+    .is_some()
     {
         return None;
     }
@@ -2910,14 +3146,6 @@ fn swap_account_candidate(record: &ExecutorRecord, chain_id: u64) -> Option<Swap
     })
 }
 
-/// The Bridge delivery of a swap that shields its proceeds on the destination chain.
-const fn private_bridge(delivery: SwapDelivery) -> Option<BridgeDelivery> {
-    match delivery {
-        SwapDelivery::Bridge(bridge) if bridge.is_private() => Some(bridge),
-        _ => None,
-    }
-}
-
 /// Hooks are signed only for a plan made for the confirmed delegation, at the nonce that
 /// delegation was observed with. A recorded preview must be refreshed before proving.
 fn require_delegated_plan(plan: &SwapInputPlan) -> Result<DelegatedSwapExecutor> {
@@ -2926,66 +3154,44 @@ fn require_delegated_plan(plan: &SwapInputPlan) -> Result<DelegatedSwapExecutor>
     })
 }
 
-/// A retry is refused while an earlier attempt's pre-hook can still run, including after it
-/// executed without a trade: that order can still fill until `validTo`.
-fn require_swap_attempt_admitted(record: &ExecutorRecord) -> Result<()> {
-    swap_attempt_refusal(record, || record.has_unresolved_issued_work())
-        .map_or(Ok(()), |refusal| Err(eyre!(refusal)))
-}
-
-const UNFINISHED_WORK: &str =
-    "this account still has unfinished work; resolve it before starting a swap";
-const PREVIOUS_ORDER_LIVE: &str =
-    "the previous order of this swap can still execute; retry once it has ended";
-
-/// Why `record` can't place a swap, from local state. `unresolved_work` reports signed work
-/// that isn't settled, which blocks an account that doesn't belong to a swap.
-fn swap_attempt_refusal(
-    record: &ExecutorRecord,
-    unresolved_work: impl FnOnce() -> bool,
-) -> Option<&'static str> {
-    if super::is_swap_destination_record(record) {
-        return Some(
-            "this account is reserved for a swap's destination and cannot place another swap",
-        );
-    }
-    if record.is_retired() && record.swap().is_none()
-        || record.is_swap_setup_stopped()
-        || record.public_account_uuid().is_some()
+/// An order is signed only for the swap use that claims its account and was not stopped. An
+/// account reserved without a use takes its first one with its first order.
+fn require_swap_use(record: &ExecutorRecord, swap_use: SwapUseId) -> Result<()> {
+    if is_live_swap_use(record, swap_use)
+        || record.swap_uses().is_empty() && swap_use == SwapUseId::first(record.operation())
     {
-        return Some("this account is retained for recovery or public use and cannot place a swap");
+        return Ok(());
     }
-    if !super::is_swap_record(record) && unresolved_work() {
-        return Some(UNFINISHED_WORK);
+    if record
+        .swap_use(swap_use)
+        .is_some_and(SwapUseRecord::is_stopped)
+    {
+        return Err(eyre!("this swap was stopped"));
     }
-    if let Some(swap) = record.swap().filter(|swap| !swap.admits_attempt()) {
-        return Some(
-            swap.orders()
-                .iter()
-                .find_map(bridge_refusal)
-                .unwrap_or(PREVIOUS_ORDER_LIVE),
-        );
-    }
-    None
+    Err(ExecutorStoreError::SwapUseActive.into())
 }
 
-/// Why a Bridge order keeps its account from placing a swap, when its bridge is the reason.
-fn bridge_refusal(order: &SwapOrderRecord) -> Option<&'static str> {
-    match super::observation::swap_order_state(order) {
-        super::observation::SwapOrderState::Bridging => {
-            Some("the previous swap's bridge hasn't delivered yet; retry once it has")
-        }
-        super::observation::SwapOrderState::Refunding => Some(
-            "the previous swap's bridge is refunding to this account; recover the funds instead",
-        ),
-        super::observation::SwapOrderState::NeedsAttention => {
-            Some("the previous swap's bridge needs attention; check its status first")
-        }
-        super::observation::SwapOrderState::HeldOnDestination => Some(
-            "the previous swap's proceeds are held on the destination network; recover them there",
-        ),
-        _ => None,
+/// The use a quote preview or plan judges `record`'s account for. Neither carries a use
+/// identity. A swap's own account is judged for the use that claims it. An account the user
+/// picked for reuse is judged for a new use, unless an explicit reuse already claimed it and
+/// has placed no order: resuming that draft previews the account it claimed. Signing names
+/// its use and refuses any other swap's claim.
+fn previewed_swap_use(record: &ExecutorRecord, reused: bool) -> SwapAccountUse {
+    let active = record.active_swap_use();
+    if !reused {
+        return SwapAccountUse::Claimed(
+            active.unwrap_or_else(|| SwapUseId::first(record.operation())),
+        );
     }
+    active
+        .filter(|id| {
+            record.swap_use(*id).is_some_and(|claimed| {
+                !claimed.is_fresh()
+                    && !claimed.is_stopped()
+                    && matches!(claimed.role(), SwapUseRole::Source { .. })
+            }) && !record.has_swap_use_order(*id)
+        })
+        .map_or(SwapAccountUse::New, SwapAccountUse::Claimed)
 }
 
 /// The earlier order of this executor that a retry's pre-hook invalidates in the same execution

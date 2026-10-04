@@ -34,7 +34,10 @@ fn swap_cost_confirmation_wraps_and_is_cleared_when_terms_change(cx: &mut TestAp
                 let warning = swaps.update(cx, |swaps, cx| {
                     PrivateSwapsView::render_cost_acknowledgement(
                         swaps.form.as_ref().unwrap(),
-                        Some("You allow paying up to $5.90 of gas, 59% of this swap.".to_owned()),
+                        Some(AuthorizedCostWarning {
+                            headline: "37% of this swap may go to costs.".to_owned(),
+                            details: "Up to $0.03 for source gas, a $0.10 bridge fee, and $0.85 for destination gas and shielding.".to_owned(),
+                        }),
                         true,
                         cx,
                     )
@@ -46,10 +49,19 @@ fn swap_cost_confirmation_wraps_and_is_cleared_when_terms_change(cx: &mut TestAp
         });
         let alert = cx.debug_bounds("swap-high-costs").unwrap();
         let message = cx.debug_bounds("swap-high-cost-message").unwrap();
+        let details = cx.debug_bounds("swap-high-cost-details").unwrap();
         let checkbox = cx.debug_bounds("swap-costs-acknowledged").unwrap();
         assert!(alert.size.width <= gpui::px(360.));
         assert!(
-            checkbox.top() >= message.bottom(),
+            details.top() >= message.bottom(),
+            "cost details follow the headline"
+        );
+        assert!(
+            details.left() >= alert.left() && details.right() <= alert.right(),
+            "cost details wrap inside the alert"
+        );
+        assert!(
+            checkbox.top() >= details.bottom(),
             "confirmation follows the full warning"
         );
         assert!(
@@ -567,12 +579,8 @@ fn pending_setup(
     executors: &ExecutorStore,
     operation: ExecutorOperationId,
 ) -> wallet_ops::vault::ExecutorRecord {
-    use alloy::eips::BlockNumHash;
-    use alloy::primitives::{B256, Bytes};
-    use wallet_ops::vault::{
-        ExecutorInputIdentity, ExecutorNonceObservation, ExecutorPayloadContext,
-        ExecutorPayloadPurpose, IssuedExecutorPayload,
-    };
+    use alloy::primitives::B256;
+    use wallet_ops::vault::ExecutorInputIdentity;
     let record = executors
         .records()
         .unwrap()
@@ -582,22 +590,44 @@ fn pending_setup(
     executors
         .bind_address(operation, Address::repeat_byte(3))
         .unwrap();
-    let observed =
-        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    executors.reconcile(operation, observed, &[]).unwrap();
     let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
         "tree": 4, "position": 16197, "commitment": "0x1"
     }))
     .unwrap();
+    record_setup(
+        executors,
+        operation,
+        record.delegate(),
+        B256::repeat_byte(4),
+        vec![input],
+    )
+}
+
+fn record_setup(
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    delegate: Address,
+    payload_hash: alloy::primitives::B256,
+    inputs: Vec<wallet_ops::vault::ExecutorInputIdentity>,
+) -> wallet_ops::vault::ExecutorRecord {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::{B256, Bytes};
+    use wallet_ops::vault::{
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload,
+    };
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    executors.reconcile(operation, observed, &[]).unwrap();
     executors
         .record_issued(
             operation,
             IssuedExecutorPayload::new(
                 U256::ZERO,
-                record.delegate(),
-                B256::repeat_byte(4),
+                delegate,
+                payload_hash,
                 ExecutorPayloadPurpose::Operation,
-                ExecutorPayloadContext::new(Bytes::from_static(b"setup"), observed, vec![input]),
+                ExecutorPayloadContext::new(Bytes::from_static(b"setup"), observed, inputs),
             ),
         )
         .unwrap()
@@ -757,7 +787,7 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
     with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let issued = pending_setup(executors, operation);
         executors
-            .record_swap_approval(operation, test_approval())
+            .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
             .unwrap();
         // Hiding an account is only presentation; it must not stop its pending swap.
         executors.set_hidden(operation, true).unwrap();
@@ -823,7 +853,7 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
             });
             window.draw(cx).clear(cx);
         });
-        let stop = cx.debug_bounds("swap-progress-stop").unwrap();
+        let stop = cx.debug_bounds("swap-progress-cancel-preparation").unwrap();
         cx.simulate_click(stop.center(), gpui::Modifiers::none());
         // Confirm the alert through its normal keyboard action.
         cx.simulate_keystrokes("enter");
@@ -857,7 +887,7 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
         );
         assert!(
             executors
-                .record_swap_approval(operation, test_approval())
+                .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
                 .is_err()
         );
         let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
@@ -919,7 +949,7 @@ fn handed_off_setup_waits_for_its_located_inclusion(cx: &mut TestAppContext) {
     with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let issued = pending_setup(executors, operation);
         executors
-            .record_swap_approval(operation, test_approval())
+            .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
             .unwrap();
         let observed = |swaps: &PrivateSwapsView, cx: &gpui::App| {
             swaps
@@ -1166,6 +1196,7 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
             .record_swap_attempt(
                 operation,
                 SwapAttempt {
+                    use_id: wallet_ops::vault::SwapUseId::first(operation),
                     terms: SwapTerms::new(
                         Address::repeat_byte(1),
                         Address::repeat_byte(2),
@@ -1383,11 +1414,13 @@ fn test_approval() -> SwapApproval {
             destination_shield_fee_bps: None,
             delivery_allowance: None,
             destination_setup_fee: None,
+            source_setup_fee: None,
         },
         price_verified: Some(false),
         price_acknowledged: true,
         delivery: wallet_ops::vault::SwapDelivery::Reshield,
         tokens: None,
+        accounts: None,
     }
 }
 
@@ -1631,7 +1664,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
         let setup = wallet_ops::swap_setup_status(&record, confirmed, &code, profile);
         let approval = test_approval();
         executors
-            .record_swap_approval(operation, approval.clone())
+            .record_swap_approval(operation, SwapUseId::first(operation), approval.clone())
             .unwrap();
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -1664,6 +1697,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                 swaps.job_revision += 1;
                 swaps.apply_approved_quote(
                     operation,
+                    SwapUseId::first(operation),
                     &approval,
                     QuoteResult {
                         orderbook: None,
@@ -1693,7 +1727,14 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                     SwapJobKind::Requote,
                     async move { Ok(receive.await.unwrap()) },
                     move |swaps, result, window, cx| {
-                        swaps.apply_approved_quote(operation, &approval, result, window, cx);
+                        swaps.apply_approved_quote(
+                            operation,
+                            SwapUseId::first(operation),
+                            &approval,
+                            result,
+                            window,
+                            cx,
+                        );
                     },
                     window,
                     cx,
@@ -1734,6 +1775,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
             swaps.update(cx, |swaps, cx| {
                 swaps.apply_approved_quote(
                     operation,
+                    SwapUseId::first(operation),
                     &approval,
                     QuoteResult {
                         orderbook: None,
@@ -1749,6 +1791,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
                 // A failed response still records its error and stops automatic retries.
                 swaps.apply_approved_quote(
                     operation,
+                    SwapUseId::first(operation),
                     &approval,
                     QuoteResult {
                         orderbook: None,
@@ -1774,6 +1817,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
             swaps.update(cx, |swaps, cx| {
                 swaps.apply_approved_quote(
                     operation,
+                    SwapUseId::first(operation),
                     &approval,
                     QuoteResult {
                         orderbook: None,
@@ -1914,6 +1958,117 @@ fn placed_swap(
     placed_swap_with(executors, operation, delivery, |_| {})
 }
 
+struct PlacedPrivateBridge {
+    operation: ExecutorOperationId,
+    destination_operation: ExecutorOperationId,
+    delivery: BridgeDelivery,
+    uid: broadcaster_core::contracts::cow::OrderUid,
+    origin_observed: wallet_ops::vault::ExecutorNonceObservation,
+    destination_observed: wallet_ops::vault::ExecutorNonceObservation,
+    setup_hash: alloy::primitives::B256,
+}
+
+/// Linked Ethereum and Polygon accounts with a private Bridge order and its destination
+/// shield signed. Neither the order's delivery nor the shield's execution is observed yet.
+fn placed_private_bridge(
+    origin: &ExecutorStore,
+    destination: &ExecutorStore,
+    origin_delegate: Address,
+    destination_delegate: Address,
+    destination_token: Address,
+) -> PlacedPrivateBridge {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::{B256, Bytes};
+    use wallet_ops::vault::{
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload, SwapDestinationRecord,
+    };
+
+    let operation = ExecutorOperationId::random().unwrap();
+    let destination_operation = ExecutorOperationId::random().unwrap();
+    let receiver = Address::repeat_byte(0x51);
+    origin
+        .reserve_with_swap_approval(
+            operation,
+            origin_delegate,
+            Some("Private swap"),
+            &[],
+            None,
+            Some(destination_operation),
+        )
+        .unwrap();
+    destination
+        .reserve_swap_destination(
+            destination_operation,
+            destination_delegate,
+            SwapDestinationRecord {
+                origin_chain: 1,
+                origin_operation: operation,
+                destination_token,
+                outcome: None,
+            },
+        )
+        .unwrap();
+    destination
+        .bind_address(destination_operation, receiver)
+        .unwrap();
+    // The destination account's setup won its first nonce, and its shield is signed
+    // at the next one.
+    let setup_hash = B256::repeat_byte(69);
+    record_setup(
+        destination,
+        destination_operation,
+        destination_delegate,
+        setup_hash,
+        Vec::new(),
+    );
+    let destination_observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
+    confirm_setup(
+        destination,
+        destination_operation,
+        setup_hash,
+        B256::repeat_byte(68),
+        destination_observed,
+    );
+    destination
+        .record_issued(
+            destination_operation,
+            IssuedExecutorPayload::new(
+                U256::ONE,
+                destination_delegate,
+                B256::repeat_byte(70),
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                ExecutorPayloadContext::new(
+                    Bytes::from_static(b"shield"),
+                    destination_observed,
+                    Vec::new(),
+                ),
+            ),
+        )
+        .unwrap();
+    let delivery = BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: 137,
+        receiver,
+        destination_token,
+        surplus: BridgeSurplus::Reshield,
+        private: Some(BridgePrivateDelivery {
+            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+        }),
+    };
+    let (uid, origin_observed) = placed_swap(origin, operation, SwapDelivery::Bridge(delivery));
+    PlacedPrivateBridge {
+        operation,
+        destination_operation,
+        delivery,
+        uid,
+        origin_observed,
+        destination_observed,
+        setup_hash,
+    }
+}
+
 /// [`placed_swap`] with `edit` applied to the order's approved bounds.
 fn placed_swap_with(
     executors: &ExecutorStore,
@@ -2014,6 +2169,7 @@ fn placed_swap_with(
         .record_swap_attempt(
             operation,
             SwapAttempt {
+                use_id: wallet_ops::vault::SwapUseId::first(operation),
                 terms: SwapTerms::new(
                     Address::repeat_byte(1),
                     Address::repeat_byte(2),
@@ -2041,14 +2197,47 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
     use alloy::primitives::{B256, Bytes};
     use wallet_ops::vault::{
         ExecutorInputIdentity, ExecutorNonceObservation, ExecutorPayloadContext,
-        ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAttempt, SwapDelivery, SwapObservation,
-        SwapOrderObservations, SwapProof, SwapTerms, SwapTradeAmounts,
+        ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAccountChoice, SwapApprovalTokens,
+        SwapAttempt, SwapDelivery, SwapObservation, SwapOrderObservations, SwapPairClaim,
+        SwapProof, SwapTerms, SwapTradeAmounts, SwapUseId,
     };
 
     with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         stranded_swap(executors, operation);
         let mut record = executors.records().unwrap().pop().unwrap();
         let previous = record.swap().unwrap().orders().last().unwrap().uid();
+        // The account's first swap, and the use a draft claims the account for next.
+        let original = SwapIdentity {
+            operation,
+            swap_use: SwapUseId::first(operation),
+        };
+        let second = SwapUseId::random().unwrap();
+        let pending = PendingSwapOrder {
+            previous_order: None,
+            sell: Address::repeat_byte(2),
+            buy: Address::repeat_byte(1),
+            delivery: SwapDelivery::Reshield,
+            amount: U256::from(50),
+            private_minimum: U256::from(45),
+            slippage_bps: 100,
+            gas_share_bps: wallet_ops::cow::GAS_SHARE_TIGHT_BPS,
+            valid_for: Duration::from_mins(30),
+            reuse_account: true,
+            swap_use: second,
+            started_at: 1,
+        };
+        // The original swap's unshielded funds wait in the account. A draft that sells
+        // another token doesn't change what its recovery starts with.
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                swaps.reload_records();
+                swaps.tracking.entry(operation).or_default().pending_order = Some(pending);
+                let record = swaps.record(operation).unwrap();
+                assert!(swaps.stage(record).needs_recovery());
+                assert_eq!(swaps.recovery_token(record), Some(Address::repeat_byte(1)));
+                swaps.tracking.entry(operation).or_default().pending_order = None;
+            });
+        });
         let seen = SwapObservation {
             block: record.nonce_observation().unwrap().block(),
             transaction_hash: Some(B256::repeat_byte(40)),
@@ -2081,23 +2270,13 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             )
             .unwrap();
         executors.set_hidden(operation, true).unwrap();
-        let pending = PendingSwapOrder {
-            previous_order: Some(previous),
-            sell: Address::repeat_byte(2),
-            buy: Address::repeat_byte(1),
-            delivery: SwapDelivery::Reshield,
-            amount: U256::from(50),
-            private_minimum: U256::from(45),
-            slippage_bps: 100,
-            gas_share_bps: wallet_ops::cow::GAS_SHARE_TIGHT_BPS,
-            valid_for: Duration::from_mins(30),
-            reuse_account: true,
-            started_at: now_unix(),
-        };
         let (send, receive) = tokio::sync::oneshot::channel::<()>();
-        cx.update(|window, cx| {
-            swaps.update(cx, |swaps, cx| {
+        let completed = cx.update(|window, cx| {
+            let completed = swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
+                let labels = swaps.labels(swaps.record(operation).unwrap(), cx);
+                let completed = (labels.pair, labels.received);
+                assert!(completed.1.is_some());
                 swaps.tracking.entry(operation).or_default().pending_order = Some(pending);
                 swaps.start_job(
                     operation,
@@ -2125,9 +2304,17 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                     swaps.has_shown_swaps(),
                     "a previously hidden account shows new work"
                 );
-                assert_eq!(swaps.past_swap(operation, 0).unwrap().2.uid(), previous);
+                // The completed swap keeps its own amounts under its own entry.
+                let (record, _, order) = swaps.past_swap(original, 0).unwrap();
+                assert_eq!(order.uid(), previous);
+                let past = swaps.past_labels(record, order, cx);
+                assert_eq!((past.pair, past.received), completed);
+                assert_ne!(swaps.labels(record, cx).pair, completed.0);
+                assert_eq!(pending.started(record), pending.started_at);
+                completed
             });
             window.draw(cx).clear(cx);
+            completed
         });
         assert!(cx.debug_bounds("swap-outcome").is_none());
 
@@ -2135,7 +2322,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
         // swap from Private must keep showing the new submission.
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
-                swaps.show_view(dialog::SwapDialogView::PastDetail(operation, 0), window, cx);
+                swaps.show_view(dialog::SwapDialogView::PastDetail(original, 0), window, cx);
             });
             window.draw(cx).clear(cx);
         });
@@ -2169,6 +2356,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                     (pending.gas_share_bps, pending.valid_for)
                 );
                 assert!(form.reuse_account);
+                assert_eq!(form.reuse_use, Some(second));
                 swaps.start_job(
                     operation,
                     SwapJobKind::Order,
@@ -2177,6 +2365,50 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                     window,
                     cx,
                 );
+            });
+        });
+
+        // The submission claims the account for the draft's use before it signs. The swap then
+        // starts when that use did, and still shows the draft's terms, not the earlier order's.
+        let mut bounds = test_approval().bounds;
+        bounds.sell_amount = pending.amount;
+        bounds.private_minimum = pending.private_minimum;
+        let claimed = executors
+            .claim_swap_pair(SwapPairClaim {
+                id: second,
+                source: SwapAccountChoice::Existing(operation),
+                delegate: record.delegate(),
+                purpose_summary: None,
+                assets: Vec::new(),
+                approval: SwapApproval {
+                    bounds: bounds.clone(),
+                    tokens: Some(SwapApprovalTokens {
+                        sell: pending.sell,
+                        buy: pending.buy,
+                    }),
+                    ..test_approval()
+                },
+                destination: None,
+            })
+            .unwrap()
+            .source;
+        let claimed_at = claimed.swap_use(second).unwrap().started_at().unwrap();
+        assert_ne!(claimed_at, pending.started_at);
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(swaps.pending_order(record).unwrap().swap_use, second);
+                assert_eq!(pending.started(record), claimed_at);
+                assert_eq!(
+                    swaps.progress_title(operation, cx),
+                    format!(
+                        "Swap {} for {}",
+                        swaps.token_amount(pending.sell, pending.amount, cx),
+                        swaps.token_symbol(pending.buy, cx)
+                    ),
+                );
+                assert_eq!(swaps.past_swap(original, 0).unwrap().2.uid(), previous);
             });
         });
 
@@ -2208,14 +2440,12 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             )
         };
         let uid = OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), u32::MAX);
-        let mut bounds = test_approval().bounds;
-        bounds.sell_amount = pending.amount;
-        bounds.private_minimum = pending.private_minimum;
         let terms = record.swap().unwrap().terms();
         executors
             .record_swap_attempt(
                 operation,
                 SwapAttempt {
+                    use_id: second,
                     terms: SwapTerms::new(
                         pending.sell,
                         pending.buy,
@@ -2240,14 +2470,25 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             )
             .unwrap();
         cx.update(|window, cx| {
-            swaps.update(cx, |swaps, _| {
+            swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
                 let record = swaps.record(operation).unwrap();
                 assert!(swaps.busy());
                 assert!(swaps.pending_order(record).is_none());
                 assert_eq!(swaps.progress_stage(record), SwapStage::SubmissionPending);
                 assert_eq!(record.swap().unwrap().orders().last().unwrap().uid(), uid);
-                assert_eq!(swaps.past_swap(operation, 0).unwrap().2.uid(), previous);
+                // The new order is the second use's alone. The first swap keeps its order,
+                // amounts and outcome, and the new swap keeps the start of its use.
+                let (record, _, order) = swaps.past_swap(original, 0).unwrap();
+                assert_eq!(order.uid(), previous);
+                let past = swaps.past_labels(record, order, cx);
+                assert_eq!((past.pair, past.received), completed);
+                let (_, latest) = swaps.record_history(record);
+                assert_eq!(latest.as_ref().map(|swap| swap.swap_use), Some(second));
+                assert_eq!(
+                    swaps.swap_started(record, latest.as_ref(), cx),
+                    Some(("Started", claimed_at))
+                );
             });
             window.draw(cx).clear(cx);
         });
@@ -2531,24 +2772,41 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
 fn reusable_account(executors: &ExecutorStore, operation: ExecutorOperationId) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::B256;
-    use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadInclusion,
-    };
+    use wallet_ops::vault::ExecutorNonceObservation;
     let setup = pending_setup(executors, operation);
+    confirm_setup(
+        executors,
+        operation,
+        setup.issued()[0].hash(),
+        B256::repeat_byte(5),
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE),
+    );
+}
+
+fn confirm_setup(
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    setup_hash: alloy::primitives::B256,
+    transaction_hash: alloy::primitives::B256,
+    observed: wallet_ops::vault::ExecutorNonceObservation,
+) -> wallet_ops::vault::ExecutorRecord {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::B256;
+    use wallet_ops::vault::{ExecutorExecutionResult, ExecutorPayloadInclusion};
     executors
         .reconcile(
             operation,
-            ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE),
+            observed,
             &[(
-                setup.issued()[0].hash(),
+                setup_hash,
                 ExecutorPayloadInclusion::new(
                     BlockNumHash::new(11, B256::repeat_byte(11)),
-                    B256::repeat_byte(5),
+                    transaction_hash,
                     ExecutorExecutionResult::Executed,
                 ),
             )],
         )
-        .unwrap();
+        .unwrap()
 }
 
 fn cold_wallet_entry(address: Address) -> wallet_ops::vault::PublicAddressBookEntry {
@@ -3790,7 +4048,9 @@ fn across_weth_to_arbitrum_is_listed_and_bridged_as_eth(cx: &mut TestAppContext)
 
 /// Private balance can deliver on another network only when it is enabled with RPC endpoints,
 /// has an accepted swap profile, is synced in this session, and holds private funds a setup
-/// broadcaster accepts. The first condition that fails is the reason the picker shows.
+/// broadcaster accepts or a set-up account to deliver to. The first condition that fails is
+/// the reason the picker shows. A network with such an account and no setup funds can be
+/// picked, and says that an existing account is needed.
 #[test]
 fn private_balance_needs_a_synced_and_funded_network() {
     let funded = PrivateNetworkFacts {
@@ -3798,6 +4058,7 @@ fn private_balance_needs_a_synced_and_funded_network() {
         swap_profile: true,
         sync: NetworkSync::Ready,
         funded: true,
+        reusable: false,
     };
     let unavailable = NetworkAvailability::Unavailable;
     for (facts, availability) in [
@@ -3808,6 +4069,24 @@ fn private_balance_needs_a_synced_and_funded_network() {
                 ..funded
             },
             unavailable(NetworkUnavailable::Unfunded),
+        ),
+        (
+            PrivateNetworkFacts {
+                funded: false,
+                reusable: true,
+                ..funded
+            },
+            NetworkAvailability::ReuseOnly,
+        ),
+        // A set-up account doesn't stand in for the sync, which reads it.
+        (
+            PrivateNetworkFacts {
+                sync: NetworkSync::Loading(None),
+                funded: false,
+                reusable: true,
+                ..funded
+            },
+            NetworkAvailability::Syncing(None),
         ),
         // Funds can't be read before the sync is ready, so a loading chain says so first.
         (
@@ -3843,6 +4122,9 @@ fn private_balance_needs_a_synced_and_funded_network() {
     ] {
         assert_eq!(private_network_availability(facts), availability);
     }
+    let reuse = NetworkAvailability::ReuseOnly;
+    assert!(reuse.is_available(), "its routes stay selectable");
+    assert!(!unavailable(NetworkUnavailable::Unfunded).is_available());
 }
 
 #[gpui::test]
@@ -4114,6 +4396,1708 @@ fn private_bridge_quote_survives_background_funding_checks(cx: &mut TestAppConte
                 );
                 assert!(swaps.form.as_ref().unwrap().delivery.is_err());
             });
+            runtime.block_on(session.stop()).unwrap();
+        },
+    );
+}
+
+/// A reusable set-up stealth account in the fixture wallet's records on Polygon, whose address
+/// is `Address::repeat_byte(3)`, with the store that holds it.
+fn reusable_polygon_account(
+    root: &Entity<WalletRoot>,
+    cx: &gpui::VisualTestContext,
+) -> (ExecutorStore, ExecutorOperationId) {
+    let (vault, view, delegate) = root.read_with(cx, |root, _| {
+        (
+            root.vault_store.clone().unwrap(),
+            root.view_session.clone().unwrap(),
+            root.effective_chain_configs
+                .get(137)
+                .unwrap()
+                .accepted_executor_profile()
+                .unwrap()
+                .delegate(),
+        )
+    });
+    let executors = ExecutorStore::new(vault.db(), view, 137).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    executors
+        .reserve(
+            operation,
+            delegate,
+            Some("Private swap"),
+            &[wallet_ops::ExecutorAsset::Erc20(STUB_POLYGON_USDT)],
+        )
+        .unwrap();
+    reusable_account(&executors, operation);
+    (executors, operation)
+}
+
+/// Choose `account` in a stealth account select, as a click on its row does.
+fn confirm_account(
+    select: &Entity<SelectState<SearchableVec<SwapAccountSelectItem>>>,
+    account: Option<ExecutorOperationId>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    select.update(cx, |select, cx| {
+        select.set_selected_value(&account, window, cx);
+        cx.emit(SelectEvent::<SearchableVec<SwapAccountSelectItem>>::Confirm(Some(account)));
+    });
+}
+
+/// Private balance on another network chooses a stealth account on each network by itself.
+/// Polygon holds no private funds and no broadcaster offers, only a set-up account: its routes
+/// stay selectable, a new account there leaves Review unavailable with the setup-funding
+/// reason, and nothing selects the existing one. Choosing it needs no setup there. A refused
+/// choice stays with its reason, a token change keeps the choice and checks it again, a
+/// network change returns the destination to a new account and keeps the source, and a new
+/// session's form has neither choice. Any other delivery has one selector.
+#[gpui::test]
+fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, store, cx| {
+            reusable_account(executors, operation);
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            let session = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (polygon, destination) = reusable_polygon_account(root, cx);
+            let chosen = |swaps: &PrivateSwapsView| {
+                let form = swaps.form.as_ref().unwrap();
+                (
+                    form.operation,
+                    form.destination_choice().map(|account| account.operation),
+                )
+            };
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                    swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                    assert_eq!(
+                        swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx),
+                        Some(NetworkAvailability::ReuseOnly)
+                    );
+                    assert_eq!(chosen(swaps), (None, None), "nothing selects the account");
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(
+                        matches!(
+                            &form.delivery,
+                            Err(DeliveryProblem::Network { syncing: false, .. })
+                        ),
+                        "a new account there needs setup funds: {:?}",
+                        form.delivery
+                    );
+                    assert!(form.quote_delivery().is_none(), "Review stays unavailable");
+                    // The picker keeps Polygon and its routes.
+                    swaps.open_buy_picker(window, cx);
+                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(form.picker.network, 137);
+                    let content = swaps.buy_picker_content(form, cx);
+                    assert!(matches!(
+                        &content.tokens,
+                        buy_picker::BuyPickerTokens::Listed(rows)
+                            if rows.iter().any(|row| row.item.asset.token == STUB_POLYGON_USDT)
+                    ));
+                    swaps.close_buy_picker(cx);
+                    window.close_dialog(cx);
+                });
+            });
+            // A funded destination still needs no setup when its existing account is used.
+            // Fail the estimator's RPC after sync, without changing its notes or offers.
+            session
+                .executor_owner()
+                .unwrap()
+                .plan_swaps_from_note_for_tests(STUB_POLYGON_USDT, U256::from(100_000_000));
+            let mut offer = crate::root::tests::fee_row(137, STUB_POLYGON_USDT, "reuse-offer");
+            offer.relay_adapt_7702 = root.read_with(cx, |root, _| {
+                root.effective_chain_configs
+                    .get(137)
+                    .unwrap()
+                    .accepted_executor_profile()
+                    .map(wallet_ops::settings::ExecutorProfile::delegate)
+            });
+            root.update(cx, |root, _| {
+                let ChainUtxoState::Ready { snapshot, .. } =
+                    root.chain_states.get_mut(&137).unwrap()
+                else {
+                    panic!("ready destination session")
+                };
+                *snapshot = Arc::new(wallet_ops::ListUtxosOutput {
+                    chain_id: 137,
+                    cache_key: "reuse-funding-test".into(),
+                    utxo_count: 1,
+                    unspent_count: 1,
+                    spent_count: 0,
+                    local_pending_spent_count: 0,
+                    utxos: vec![crate::root::tests::unshield_utxo_output(
+                        STUB_POLYGON_USDT,
+                        100_000_000,
+                        0,
+                        1,
+                    )],
+                    totals: vec![wallet_ops::TokenTotal {
+                        token: STUB_POLYGON_USDT.to_string(),
+                        total: "100000000".into(),
+                        poi_verified_total: "100000000".into(),
+                    }],
+                });
+                root.monitor_state.write().upsert_fee(offer);
+            });
+            stubs.set_failing(&["/rpc"]);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.refresh_destination_network(window, cx);
+                    assert_eq!(
+                        swaps.network_setup_availability(137, cx),
+                        NetworkAvailability::CheckingFee
+                    );
+                    swaps.open_buy_picker(window, cx);
+                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
+                    swaps.show_buy_picker_network(1, window, cx);
+                    swaps.show_buy_picker_network(137, window, cx);
+                    assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
+                    swaps.close_buy_picker(cx);
+                    window.close_dialog(cx);
+                    assert!(swaps.form.as_ref().unwrap().quote_delivery().is_none());
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| {
+                    swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .picker
+                        .funding_checked_for_tests(137)
+                })
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    assert_eq!(
+                        swaps.network_setup_availability(137, cx),
+                        NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee),
+                        "the actual estimator reports the RPC failure"
+                    );
+                    swaps.refresh_destination_network(window, cx);
+                    assert_eq!(chosen(swaps), (None, None));
+                    assert!(swaps.form.as_ref().unwrap().quote_delivery().is_none());
+                    swaps.open_buy_picker(window, cx);
+                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
+                    swaps.show_buy_picker_network(1, window, cx);
+                    swaps.show_buy_picker_network(137, window, cx);
+                    assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
+                    swaps.close_buy_picker(cx);
+                    window.close_dialog(cx);
+                    let select = swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .destination_select
+                        .clone()
+                        .unwrap();
+                    confirm_account(&select, Some(destination), window, cx);
+                });
+            });
+            // The Select event applies after the view's update releases its borrow.
+            swaps.read_with(cx, |swaps, _| {
+                assert_eq!(chosen(swaps), (None, Some(destination)));
+                assert!(swaps.form.as_ref().unwrap().quote_delivery().is_some());
+            });
+            // Later quote and signing checks still need a working RPC.
+            stubs.set_failing(&[]);
+            // The existing account is the delivery's receiver and takes no setup: no fee is
+            // estimated on Polygon and no broadcaster is chosen there.
+            let review = ready_review(swaps, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    assert_eq!(chosen(swaps), (None, Some(destination)));
+                    let form = swaps.form.as_mut().unwrap();
+                    assert!(matches!(
+                        &form.delivery,
+                        Ok(SwapDelivery::Bridge(delivery))
+                            if delivery.receiver == Address::repeat_byte(3)
+                    ));
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    assert_eq!(form.review_problem(&review), None);
+                    assert!(!form.destination_route.is_used());
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(swaps.setup_chain(form, SetupSide::Origin), Some(1));
+                    assert_eq!(swaps.setup_chain(form, SetupSide::Destination), None);
+
+                    // The swap's own account is chosen apart from the destination.
+                    swaps.select_form_account(Some(operation), window, cx);
+                    assert_eq!(chosen(swaps), (Some(operation), Some(destination)));
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(!swaps.reviews_setup(form), "neither account needs setup");
+                    swaps.select_form_account(None, window, cx);
+                    assert_eq!(chosen(swaps), (None, Some(destination)));
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("swap-account-source").is_some());
+            assert!(cx.debug_bounds("swap-account-destination").is_some());
+            assert!(
+                cx.debug_bounds("swap-account-select").is_none(),
+                "a private Bridge swap has two selectors"
+            );
+            assert!(cx.debug_bounds("swap-destination-reuse").is_some());
+            assert!(cx.debug_bounds("swap-source-reuse").is_none());
+
+            // Another token on Polygon keeps the choice, clears the acknowledgements and
+            // checks the delivery to the account again.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_buy_picker(window, cx);
+                    swaps.pick_buy_token(STUB_POLYGON_USDC, window, cx);
+                    assert_eq!(chosen(swaps), (None, Some(destination)));
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                    swaps.open_buy_picker(window, cx);
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                    assert_eq!(chosen(swaps), (None, Some(destination)));
+                    assert!(matches!(
+                        &swaps.form.as_ref().unwrap().delivery,
+                        Ok(SwapDelivery::Bridge(delivery))
+                            if delivery.receiver == Address::repeat_byte(3)
+                    ));
+                });
+            });
+            // Once its records refuse the account, the choice stays and says why.
+            polygon.retire(destination).unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.refresh_destination_network(window, cx);
+                    assert_eq!(chosen(swaps), (None, Some(destination)), "the choice stays");
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(
+                        matches!(&form.delivery, Err(DeliveryProblem::Account(_))),
+                        "{:?}",
+                        form.delivery
+                    );
+                    assert!(form.quote_delivery().is_none(), "Review stays unavailable");
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(
+                cx.debug_bounds("swap-destination-account-problem")
+                    .is_some()
+            );
+
+            // Another network returns the destination to a new account. The source stays.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.select_form_account(Some(operation), window, cx);
+                    swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(
+                cx.debug_bounds("swap-account-select").is_some()
+                    && cx.debug_bounds("swap-account-source").is_none()
+                    && cx.debug_bounds("swap-account-destination").is_none(),
+                "a Public address has one selector"
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                    assert_eq!(chosen(swaps), (Some(operation), Some(destination)));
+                    swaps.open_buy_picker(window, cx);
+                    swaps.show_buy_picker_network(1, window, cx);
+                    swaps.pick_buy_token(STUB_USDT, window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(form.network, None);
+                    assert_eq!(form.destination_account, None);
+                    assert_eq!(chosen(swaps), (Some(operation), None));
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(
+                cx.debug_bounds("swap-account-select").is_some()
+                    && cx.debug_bounds("swap-account-source").is_none()
+                    && cx.debug_bounds("swap-account-destination").is_none(),
+                "a same-chain swap has one selector"
+            );
+
+            // Another session's form starts with a new account on each side.
+            cx.update(|window, cx| {
+                window.close_all_dialogs(cx);
+                let fresh = root.update(cx, |root, cx| {
+                    root.clear_private_swaps(cx);
+                    root.ensure_private_swaps(window, cx);
+                    root.private_swaps_view().unwrap()
+                });
+                assert!(swaps.read(cx).form.is_none());
+                fresh.update(cx, |fresh, cx| {
+                    fresh.open_new_form(STUB_USDC, window, cx);
+                    let form = fresh.form.as_ref().unwrap();
+                    assert!(form.operation.is_none() && form.destination_account.is_none());
+                    assert!(form.reuse_use.is_none());
+                });
+            });
+            runtime.block_on(session.stop()).unwrap();
+        },
+    );
+}
+
+/// A setup broadcaster's offer for `fee` of `token` on `chain_id`.
+fn setup_offer(
+    root: &Entity<WalletRoot>,
+    chain_id: u64,
+    token: Address,
+    fee: U256,
+    cx: &gpui::VisualTestContext,
+) -> PublicBroadcasterCandidate {
+    let delegate = root.read_with(cx, |root, _| {
+        root.effective_chain_configs
+            .get(chain_id)
+            .unwrap()
+            .accepted_executor_profile()
+            .unwrap()
+            .delegate()
+    });
+    PublicBroadcasterCandidate {
+        chain_id,
+        railgun_address: "setup-offer".into(),
+        identifier: None,
+        token,
+        fee,
+        fees_id: "setup-offer".into(),
+        fee_expiration: std::time::SystemTime::now() + Duration::from_secs(60),
+        reliability: 0.9,
+        available_wallets: 1,
+        version: "8.2.3".into(),
+        relay_adapt: Address::ZERO,
+        relay_adapt_7702: Some(delegate),
+        required_poi_list_keys: Vec::new(),
+        viewing_public_key: [1; 32],
+        address_data: broadcaster_core::crypto::railgun::AddressData {
+            master_public_key: U256::ONE,
+            viewing_public_key: [1; 32],
+        },
+        fee_policy_status: wallet_ops::BroadcasterFeePolicyStatus::UnknownAnchor,
+    }
+}
+
+/// Each account of a private Bridge swap needs setup exactly while it is a new one. The
+/// review's setup fees, the fee limits and the accounts its approval binds follow the four
+/// combinations, and an existing account's stale estimate is never approved. A broadcaster
+/// offer that appears or expires on a reused side leaves the quote and its acknowledgements.
+/// Reuse keeps the delivery and shield costs, and the high-cost acknowledgement.
+#[gpui::test]
+fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    // The destination costs of `high_bridge_costs_require_swap_anyway`.
+    stubs.set_across_fee_bps(300);
+    stubs
+        .across_relayer_gas_bps
+        .store(200, std::sync::atomic::Ordering::Relaxed);
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, store, cx| {
+            reusable_account(executors, operation);
+            // A setup estimate on each network, as the form's routes would hold them.
+            let (session, owner) = swaps.read_with(cx, |swaps, _| {
+                (Arc::clone(&swaps.session), Arc::clone(&swaps.owner))
+            });
+            owner.plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10).pow(U256::from(20)));
+            let origin_offer =
+                setup_offer(root, 1, STUB_USDC, U256::from(10).pow(U256::from(18)), cx);
+            let origin_estimate = runtime
+                .block_on(Box::pin(owner.estimate_swap_setup_fee(
+                    &session,
+                    None,
+                    origin_offer.clone(),
+                )))
+                .unwrap();
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let polygon_owner = polygon.executor_owner().unwrap();
+            polygon_owner
+                .plan_swaps_from_note_for_tests(STUB_POLYGON_USDT, U256::from(100_000_000));
+            let destination_offer = setup_offer(root, 137, STUB_POLYGON_USDT, U256::from(10), cx);
+            let destination_estimate = runtime
+                .block_on(Box::pin(polygon_owner.estimate_swap_setup_fee(
+                    &polygon,
+                    None,
+                    destination_offer.clone(),
+                )))
+                .unwrap();
+            let (polygon_store, destination) = reusable_polygon_account(root, cx);
+            let account = Address::repeat_byte(3).to_checksum(None);
+            // Each reused account as its review names it: its number, then its address.
+            let numbered = |executors: &ExecutorStore, operation| {
+                let records = executors.records().unwrap();
+                let index = records
+                    .iter()
+                    .find(|record| record.operation() == operation)
+                    .unwrap()
+                    .index();
+                format!("#{index}")
+            };
+            let (own, reused) = (
+                numbered(executors, operation),
+                numbered(&polygon_store, destination),
+            );
+            let row = |summary: &SpendAuthorizationSummary, label: &str| {
+                summary
+                    .rows_for_test()
+                    .into_iter()
+                    .find(|(row, _)| row == label)
+                    .map(|(_, value)| value)
+            };
+            let reuse_warnings = |summary: &SpendAuthorizationSummary| {
+                summary
+                    .warnings_for_test()
+                    .into_iter()
+                    .filter(|warning| warning.starts_with("Reusing"))
+                    .collect::<Vec<_>>()
+            };
+
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                    swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                    swaps.select_form_destination(Some(destination), window, cx);
+                });
+            });
+            let review = ready_review(swaps, runtime, cx);
+            // The existing destination still costs its delivery and its shield fee.
+            assert!(!private_delivery_cost(&review).is_zero());
+            assert!(authorized_high_cost(&review).is_some());
+            // The review names both accounts: a new one on Ethereum, and the reused one on
+            // Polygon by its number and address, with its own warning and disclosure.
+            swaps.read_with(cx, |swaps, cx| {
+                let summary = swaps.swap_summary(&review, None, None, None, cx);
+                assert_eq!(
+                    row(&summary, "Source · Ethereum").as_deref(),
+                    Some("New account")
+                );
+                assert_eq!(
+                    row(&summary, "Destination · Polygon"),
+                    Some(format!("{reused} · {account}"))
+                );
+                let warnings = reuse_warnings(&summary);
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(
+                    warnings[0].starts_with(&format!("Reusing {reused} on Polygon links")),
+                    "{warnings:?}"
+                );
+                let (_, public, _) = summary.disclosure_for_test().unwrap();
+                assert!(
+                    public.contains(&format!(
+                        "This swap reuses stealth account {reused} on Polygon"
+                    )) && !public.contains("on Ethereum, so anyone"),
+                    "{public}"
+                );
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    assert_eq!(
+                        form.review_problem(&review)
+                            .map(|problem| problem.to_string()),
+                        Some("Confirm Swap anyway to accept the high swap costs.".to_owned())
+                    );
+                    form.high_costs_acknowledged = true;
+
+                    // Offers on Polygon come and go while its account is an existing one.
+                    let mut offer = crate::root::tests::fee_row(137, STUB_POLYGON_USDT, "churn");
+                    offer.relay_adapt_7702 = destination_offer.relay_adapt_7702;
+                    for expiration in [
+                        std::time::SystemTime::now() + Duration::from_secs(60),
+                        std::time::UNIX_EPOCH,
+                    ] {
+                        offer.fee_expiration = expiration;
+                        let _ = swaps.root.update(cx, |root, _| {
+                            root.monitor_state.write().upsert_fee(offer.clone());
+                        });
+                        swaps.update_setup_route(cx);
+                        swaps.refresh_destination_network(window, cx);
+                        let form = swaps.form.as_ref().unwrap();
+                        assert!(
+                            matches!(&form.quote, QuoteState::Ready(current)
+                                if Arc::ptr_eq(current, &review)),
+                            "an offer on a reused side keeps the quote"
+                        );
+                        assert!(form.price_acknowledged && form.high_costs_acknowledged);
+                        assert_eq!(form.review_problem(&review), None);
+                        assert!(!form.destination_route.is_used());
+                    }
+
+                    for (source_existing, destination_existing) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        swaps.select_form_account(source_existing.then_some(operation), window, cx);
+                        swaps.select_form_destination(
+                            destination_existing.then_some(destination),
+                            window,
+                            cx,
+                        );
+                        // Both routes hold an estimate, also one a side no longer needs.
+                        let form = swaps.form.as_mut().unwrap();
+                        form.price_acknowledged = true;
+                        form.route.estimate = Some(origin_estimate.clone());
+                        form.route.candidates = vec![origin_offer.clone()];
+                        form.destination_route.estimate = Some(destination_estimate.clone());
+                        form.destination_route.candidates = vec![destination_offer.clone()];
+                        let form = swaps.form.as_ref().unwrap();
+                        let combination = (source_existing, destination_existing);
+                        // The broadcaster controls are those of the accounts that need setup.
+                        assert_eq!(
+                            (
+                                swaps.setup_chain(form, SetupSide::Origin),
+                                swaps.setup_chain(form, SetupSide::Destination),
+                            ),
+                            (
+                                (!source_existing).then_some(1),
+                                (!destination_existing).then_some(137),
+                            ),
+                            "{combination:?}"
+                        );
+                        if source_existing && destination_existing {
+                            assert!(!swaps.reviews_setup(form), "no setup is reviewed");
+                            continue;
+                        }
+                        let parts = swaps.setup_parts(form, &review, false).unwrap();
+                        let fees = setup_fees(
+                            1,
+                            parts.origin.as_ref(),
+                            parts.destination.as_ref().and_then(DestinationPlan::setup),
+                        );
+                        assert_eq!(
+                            fees.iter().map(|fee| fee.chain_id).collect::<Vec<_>>(),
+                            [
+                                (!source_existing).then_some(1),
+                                (!destination_existing).then_some(137),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>(),
+                            "{combination:?}"
+                        );
+                        let limit = |estimate: &ExecutorRecoveryFeeEstimate| {
+                            default_public_broadcaster_fee_limit(estimate.fee_amount())
+                        };
+                        let bounds = &parts.approval.bounds;
+                        assert_eq!(
+                            (bounds.source_setup_fee, bounds.destination_setup_fee),
+                            (
+                                (!source_existing).then(|| limit(&origin_estimate)),
+                                (!destination_existing).then(|| limit(&destination_estimate)),
+                            ),
+                            "{combination:?}"
+                        );
+                        let accounts = parts.approval.accounts.unwrap();
+                        let account = Address::repeat_byte(3);
+                        assert_eq!(
+                            accounts.source,
+                            SwapApprovedAccount {
+                                address: source_existing.then_some(account),
+                                setup: !source_existing,
+                            },
+                            "{combination:?}"
+                        );
+                        assert_eq!(
+                            accounts.destination,
+                            Some(SwapApprovedAccount {
+                                address: destination_existing.then_some(account),
+                                setup: !destination_existing,
+                            }),
+                            "{combination:?}"
+                        );
+                        assert_eq!(
+                            parts.destination.as_ref().and_then(|plan| match plan {
+                                DestinationPlan::Existing(account) => Some(account.operation),
+                                DestinationPlan::Setup(_) => None,
+                            }),
+                            destination_existing.then_some(destination),
+                        );
+                    }
+                });
+            });
+
+            // With both accounts existing ones, the swap is quoted for the chosen account on
+            // the stub route again. Its review names each account and warns for each, and
+            // Review opens the order's review at once: no setup is reviewed or waited for.
+            let orderbook = stub_orderbook(&stubs, runtime);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                    form.orderbook = Some(orderbook);
+                    swaps.schedule_quote(window, cx);
+                });
+            });
+            let review = ready_review(swaps, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let summary = swaps.swap_summary(&review, None, None, None, cx);
+                    assert_eq!(
+                        row(&summary, "Source · Ethereum"),
+                        Some(format!("{own} · {account}"))
+                    );
+                    assert_eq!(
+                        row(&summary, "Destination · Polygon"),
+                        Some(format!("{reused} · {account}"))
+                    );
+                    let warnings = reuse_warnings(&summary);
+                    assert!(
+                        warnings.len() == 2
+                            && warnings[0].starts_with(&format!("Reusing {own} on Ethereum"))
+                            && warnings[1].starts_with(&format!("Reusing {reused} on Polygon")),
+                        "{warnings:?}"
+                    );
+                    let (_, public, _) = summary.disclosure_for_test().unwrap();
+                    for reuse in [
+                        format!("This swap reuses stealth account {own} on Ethereum"),
+                        format!("This swap reuses stealth account {reused} on Polygon"),
+                    ] {
+                        assert!(public.contains(&reuse), "{public}");
+                    }
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    let draft = form.reuse_use;
+                    swaps.form_primary(window, cx);
+                    let pending = swaps
+                        .pending_authorization
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{:?}", swaps.form.as_ref().unwrap().error));
+                    let SwapAction::Order(approval) = &pending.action else {
+                        panic!("both existing accounts go straight to the order's review");
+                    };
+                    assert!(approval.full_review);
+                    assert_eq!(approval.swap_use, draft);
+                    assert_eq!(
+                        approval.pair_destination.map(|account| account.operation),
+                        Some(destination)
+                    );
+                });
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+/// The destination select works from the keyboard like any other select: the arrow keys open
+/// it and move through its accounts, Enter chooses one, and focus is back on the select.
+#[gpui::test]
+fn private_bridge_destination_is_chosen_from_the_keyboard(cx: &mut TestAppContext) {
+    use gpui::Focusable as _;
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            let session = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (_, destination) = reusable_polygon_account(root, cx);
+            let select = cx.update(|window, cx| {
+                let select = swaps.update(cx, |swaps, cx| {
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                    swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(form.destination_choice(), None, "a new account by default");
+                    form.destination_select.clone().unwrap()
+                });
+                window.draw(cx).clear(cx);
+                // As Tab does from the source select.
+                select.update(cx, |select, cx| select.focus(window, cx));
+                window.draw(cx).clear(cx);
+                select
+            });
+            let focused = |cx: &mut gpui::VisualTestContext| {
+                cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    select.read(cx).focus_handle(cx).is_focused(window)
+                })
+            };
+            assert!(focused(cx));
+
+            // Down opens the list on the selected new account, and again moves to the
+            // existing one below it.
+            cx.simulate_keystrokes("down");
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes("down enter");
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    form.destination_choice().map(|account| account.operation),
+                    Some(destination)
+                );
+                assert_eq!(form.operation, None, "the source stays a new account");
+            });
+            assert!(focused(cx), "focus returns to the select it was chosen in");
+            runtime.block_on(session.stop()).unwrap();
+        },
+    );
+}
+
+/// A swap that reuses its own stealth account and sets up a new one on the destination network
+/// is approved once. Its progress shows the source as reused and ready and only the new
+/// account's setup as pending, and the approved new account resolving to its derived address
+/// changes nothing that was approved. Once that setup is confirmed the approved order is
+/// quoted again and placed through the confirm-only step, without another review.
+#[gpui::test]
+fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
+    cx: &mut TestAppContext,
+) {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::B256;
+    use gpui_kit::test::TestWindowExt;
+    use wallet_ops::vault::{ExecutorNonceObservation, SwapDestinationClaim, SwapPairClaim};
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, store, cx| {
+            reusable_account(executors, operation);
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (polygon_store, existing) = reusable_polygon_account(root, cx);
+            // The swap's terms as the form quotes them. Polygon is unfunded here, so the
+            // quote is one for a delivery to its existing account.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                    swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                    swaps.select_form_destination(Some(existing), window, cx);
+                });
+            });
+            let review = ready_review(swaps, runtime, cx);
+            let SwapDelivery::Bridge(delivery) = review.plan().delivery() else {
+                panic!("a Bridge delivery");
+            };
+            // The approval as the review saved it: the swap's own account is an existing
+            // one, and the destination a new one, which has no address before it is derived.
+            let (own, receiver) = (Address::repeat_byte(3), Address::repeat_byte(0x61));
+            let mut approval = review
+                .approval(review.suggested_private_minimum(), true)
+                .unwrap();
+            approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                receiver: Address::ZERO,
+                ..delivery
+            });
+            approval.bounds.destination_setup_fee = Some(U256::from(50_000));
+            let approved = SwapApprovedAccounts {
+                source: SwapApprovedAccount {
+                    address: Some(own),
+                    setup: false,
+                },
+                destination: Some(SwapApprovedAccount {
+                    address: None,
+                    setup: true,
+                }),
+            };
+            approval.accounts = Some(approved);
+            let (origin_delegate, polygon_delegate) = root.read_with(cx, |root, _| {
+                let delegate = |chain_id| {
+                    root.effective_chain_configs
+                        .get(chain_id)
+                        .unwrap()
+                        .accepted_executor_profile()
+                        .unwrap()
+                        .delegate()
+                };
+                (delegate(1), delegate(137))
+            });
+            let swap_use = SwapUseId::random().unwrap();
+            let draft = PendingSwapOrder {
+                previous_order: None,
+                sell: review.plan().sell_token(),
+                buy: review.plan().buy_token(),
+                delivery: approval.delivery,
+                amount: approval.bounds.spend_amount(),
+                private_minimum: approval.bounds.private_minimum,
+                slippage_bps: review.slippage_bps(),
+                gas_share_bps: review.gas_share_bps(),
+                valid_for: review.valid_for(),
+                reuse_account: true,
+                swap_use,
+                started_at: now_unix(),
+            };
+            let destination = ExecutorOperationId::random().unwrap();
+            executors
+                .claim_swap_pair(SwapPairClaim {
+                    id: swap_use,
+                    source: SwapAccountChoice::Existing(operation),
+                    delegate: origin_delegate,
+                    purpose_summary: None,
+                    assets: Vec::new(),
+                    approval: approval.clone(),
+                    destination: Some(SwapDestinationClaim {
+                        chain_id: 137,
+                        account: SwapAccountChoice::New(destination),
+                        delegate: polygon_delegate,
+                        destination_token: STUB_POLYGON_USDT,
+                    }),
+                })
+                .unwrap();
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.tracking.entry(operation).or_default().pending_order = Some(draft);
+                    let account = swaps
+                        .labels(swaps.record(operation).unwrap(), cx)
+                        .bridge
+                        .unwrap()
+                        .private
+                        .unwrap()
+                        .setups[1]
+                        .account;
+                    assert!(
+                        account.is_none(),
+                        "an underived account has no address to copy"
+                    );
+                });
+            });
+            // The new account is derived and its setup is sent.
+            polygon_store.bind_address(destination, receiver).unwrap();
+            approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                receiver,
+                ..delivery
+            });
+            executors
+                .record_swap_approval(operation, swap_use, approval)
+                .unwrap();
+            let setup_hash = B256::repeat_byte(0x44);
+            record_setup(
+                &polygon_store,
+                destination,
+                polygon_delegate,
+                setup_hash,
+                Vec::new(),
+            );
+
+            let orderbook = stub_orderbook(&stubs, runtime);
+            cx.update(gpui_component::WindowExt::close_all_dialogs);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.form = None;
+                    swaps.reload_records();
+                    swaps.reload_destinations(cx);
+                    // What the approved setup's submission leaves in this session.
+                    let tracking = swaps.tracking.entry(operation).or_default();
+                    tracking.pending_order = Some(draft);
+                    tracking.auto_place = true;
+                    tracking.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                    tracking.orderbook = Some(orderbook);
+                    let record = swaps.record(operation).unwrap();
+                    assert_eq!(swaps.progress_stage(record), SwapStage::SetupPending);
+                    let setups = swaps
+                        .labels(record, cx)
+                        .bridge
+                        .unwrap()
+                        .private
+                        .unwrap()
+                        .setups;
+                    assert_eq!(
+                        (setups[0].reused, setups[0].progress),
+                        (true, SwapSetupProgress::Done),
+                        "the source is reused and ready"
+                    );
+                    assert_eq!(
+                        (setups[1].reused, setups[1].progress),
+                        (false, SwapSetupProgress::Pending),
+                        "only the new destination's setup is pending"
+                    );
+                    assert_eq!(
+                        setups[1].account.map(|account| account.address),
+                        Some(receiver),
+                        "the pending draft shows the destination the preparation bound"
+                    );
+                    // The approved new account took its derived address: the accounts the
+                    // swap holds are the approved ones, and nothing asks for a review.
+                    let bound = swaps.bound_accounts(record, swap_use).unwrap();
+                    assert_eq!(
+                        bound.destination,
+                        Some(SwapApprovedAccount {
+                            address: Some(receiver),
+                            setup: true,
+                        })
+                    );
+                    assert!(approved.admits((own, false), Some((receiver, true))));
+                    assert!(swaps.reapproval.is_none());
+                    swaps.continue_approved_swaps(window, cx);
+                    assert!(
+                        swaps.job.is_none() && swaps.pending_authorization.is_none(),
+                        "the order waits for the destination setup"
+                    );
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.update(|window, cx| {
+                window.click(
+                    SharedString::from(format!(
+                        "swap-step-account-{}-copy",
+                        receiver.to_checksum(None)
+                    )),
+                    cx,
+                );
+            });
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text(),
+                Some(receiver.to_checksum(None))
+            );
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // A session draft from another use must not borrow this preparation's
+                    // destination account, even while it has no order of its own.
+                    swaps.tracking.entry(operation).or_default().pending_order =
+                        Some(PendingSwapOrder {
+                            swap_use: SwapUseId::random().unwrap(),
+                            ..draft
+                        });
+                    let account = swaps
+                        .labels(swaps.record(operation).unwrap(), cx)
+                        .bridge
+                        .unwrap()
+                        .private
+                        .unwrap()
+                        .setups[1]
+                        .account;
+                    assert!(
+                        account.is_none(),
+                        "another use does not resolve the placeholder"
+                    );
+                    swaps.tracking.entry(operation).or_default().pending_order = Some(draft);
+                });
+            });
+
+            // The setup is confirmed: the order follows by itself.
+            confirm_setup(
+                &polygon_store,
+                destination,
+                setup_hash,
+                B256::repeat_byte(5),
+                ExecutorNonceObservation::new(
+                    BlockNumHash::new(12, B256::repeat_byte(12)),
+                    U256::ONE,
+                ),
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_destinations(cx);
+                    swaps.continue_approved_swaps(window, cx);
+                    assert_eq!(
+                        swaps.job.as_ref().map(|job| job.kind),
+                        Some(SwapJobKind::Requote)
+                    );
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                let pending = swaps.pending_authorization.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "{:?} {:?}",
+                        swaps.reapproval, swaps.tracking[&operation].error
+                    )
+                });
+                let SwapAction::Order(placed) = &pending.action else {
+                    panic!("the approved order's confirm step");
+                };
+                assert!(!placed.full_review, "no second review");
+                assert_eq!(placed.swap_use, Some(swap_use));
+                assert!(swaps.reapproval.is_none() && swaps.form.is_none());
+                // The confirm step names both accounts by the addresses the approval binds.
+                let rows = swaps.place_summary(placed, cx).unwrap().rows_for_test();
+                for (label, address) in [
+                    ("Source · Ethereum", own),
+                    ("Destination · Polygon", receiver),
+                ] {
+                    let value = rows.iter().find(|(row, _)| row == label);
+                    assert!(
+                        value.is_some_and(|(_, value)| {
+                            value.starts_with('#') && value.ends_with(&address.to_checksum(None))
+                        }),
+                        "{rows:?}"
+                    );
+                }
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+/// After a restart only the records tell of a swap whose accounts are reserved and that has
+/// no order yet. It is listed in My orders and counted on the Private tab, and its detail
+/// offers Resume and Cancel preparation. Resume restores the reserved pair and the saved terms
+/// in the form, where Review opens the order's review. Cancel preparation releases both
+/// existing accounts, which can be chosen again and aren't retired. When the swap set up a
+/// new destination account whose setup was sent, the cancellation reports that account as
+/// unresolved and its guards stay.
+#[gpui::test]
+fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut TestAppContext) {
+    use alloy::primitives::B256;
+    use wallet_ops::vault::{
+        ExecutorInputIdentity, SwapApprovalTokens, SwapDestinationClaim, SwapPairClaim,
+        SwapUseRelease,
+    };
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, _, executors, operation, runtime, store, cx| {
+            reusable_account(executors, operation);
+            // Hidden, so that only a prepared swap shows the account on the Private tab.
+            executors.set_hidden(operation, true).unwrap();
+            cx.update(|_, cx| root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137)));
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let polygon_owner = polygon.executor_owner().unwrap();
+            let (polygon_store, existing) = reusable_polygon_account(root, cx);
+            let (origin_delegate, polygon_delegate) = root.read_with(cx, |root, _| {
+                let delegate = |chain_id| {
+                    root.effective_chain_configs
+                        .get(chain_id)
+                        .unwrap()
+                        .accepted_executor_profile()
+                        .unwrap()
+                        .delegate()
+                };
+                (delegate(1), delegate(137))
+            });
+            let own = Address::repeat_byte(3);
+            // The approval a preparation saves with its claim: 1 USDC for USDT on Polygon, to
+            // the account at `receiver` there, which the swap sets up when `new_destination`.
+            let prepared = |receiver: Address, new_destination: bool| {
+                let mut approval = test_approval();
+                approval.bounds.valid_for_secs = Some(600);
+                approval.bounds.gas_share_bps = Some(wallet_ops::cow::GAS_SHARE_BALANCED_BPS);
+                approval.bounds.destination_minimum = Some(BRIDGE_MINIMUM);
+                approval.bounds.destination_setup_fee =
+                    new_destination.then_some(U256::from(50_000));
+                approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                    provider: BridgeProvider::Across,
+                    destination_chain: 137,
+                    receiver,
+                    destination_token: STUB_POLYGON_USDT,
+                    surplus: BridgeSurplus::Reshield,
+                    private: Some(BridgePrivateDelivery {
+                        on_shield_failure: BridgeShieldFailure::default(),
+                    }),
+                });
+                approval.tokens = Some(SwapApprovalTokens {
+                    sell: STUB_USDC,
+                    buy: STUB_USDT,
+                });
+                approval.accounts = Some(SwapApprovedAccounts {
+                    source: SwapApprovedAccount {
+                        address: Some(own),
+                        setup: false,
+                    },
+                    destination: Some(SwapApprovedAccount {
+                        address: Some(receiver),
+                        setup: new_destination,
+                    }),
+                });
+                approval
+            };
+            let claim = |id, destination, approval| {
+                executors
+                    .claim_swap_pair(SwapPairClaim {
+                        id,
+                        source: SwapAccountChoice::Existing(operation),
+                        delegate: origin_delegate,
+                        purpose_summary: None,
+                        assets: Vec::new(),
+                        approval,
+                        destination: Some(SwapDestinationClaim {
+                            chain_id: 137,
+                            account: destination,
+                            delegate: polygon_delegate,
+                            destination_token: STUB_POLYGON_USDT,
+                        }),
+                    })
+                    .unwrap();
+            };
+            let record_of = |executors: &ExecutorStore, operation| {
+                let records = executors.records().unwrap();
+                records
+                    .into_iter()
+                    .find(|record| record.operation() == operation)
+                    .unwrap()
+            };
+            // Whether each account is offered to another swap, from local records.
+            let offered = |swaps: &Entity<PrivateSwapsView>, cx: &gpui::VisualTestContext| {
+                let source = swaps.read_with(cx, |swaps, _| {
+                    let candidates = swaps.owner.swap_account_candidates().unwrap();
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.operation() == operation)
+                });
+                let candidates = polygon_owner
+                    .swap_destination_candidates(STUB_POLYGON_USDT)
+                    .unwrap();
+                let destination = candidates
+                    .iter()
+                    .any(|candidate| candidate.operation() == existing);
+                (source, destination)
+            };
+            // Confirm the alert through its normal keyboard action.
+            let cancel_preparation = |cx: &mut gpui::VisualTestContext| {
+                let cancel = cx.debug_bounds("swap-progress-cancel-preparation").unwrap();
+                cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+                cx.simulate_keystrokes("enter");
+                cx.run_until_parked();
+            };
+
+            // Both accounts are existing ones, claimed before the restart.
+            let first = SwapUseId::random().unwrap();
+            claim(
+                first,
+                SwapAccountChoice::Existing(existing),
+                prepared(own, false),
+            );
+            let swaps = restarted_swaps(
+                root,
+                &stubs,
+                runtime,
+                operation,
+                wallet_ops::SwapSetupStatus::Pending,
+                cx,
+            );
+            assert_eq!(offered(&swaps, cx), (false, false), "both are reserved");
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_destinations(cx);
+                    let record = swaps.record(operation).unwrap();
+                    // Only the records tell of the swap: this session holds no draft of it.
+                    assert!(swaps.tracking[&operation].pending_order.is_none());
+                    assert_eq!(
+                        swaps.pending_order(record).map(|pending| pending.swap_use),
+                        Some(first)
+                    );
+                    assert!(swaps.has_shown_swaps(), "counted on the Private tab");
+                    assert_eq!(swaps.open_order_count(cx), 1);
+                    let rows = swaps.order_rows_for_test(cx);
+                    assert!(
+                        rows.len() == 1 && rows[0].0.contains("to private balance on Polygon"),
+                        "{rows:?}"
+                    );
+                    // Both accounts are reused and ready: nothing is set up or pending.
+                    assert_eq!(swaps.progress_stage(record), SwapStage::Ready);
+                    let setups = swaps
+                        .labels(record, cx)
+                        .bridge
+                        .unwrap()
+                        .private
+                        .unwrap()
+                        .setups;
+                    assert!(setups.iter().all(|account| {
+                        account.reused && account.progress == SwapSetupProgress::Done
+                    }));
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(
+                cx.debug_bounds("swap-progress-cancel-preparation")
+                    .is_some()
+            );
+            assert!(cx.debug_bounds("swap-progress-stop").is_none());
+            let resume = cx.debug_bounds("swap-progress-continue").unwrap();
+            cx.simulate_click(resume.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    assert_eq!(
+                        swaps.dialog.as_ref().map(|dialog| dialog.view),
+                        Some(dialog::SwapDialogView::Form)
+                    );
+                    let form = swaps
+                        .form
+                        .as_ref()
+                        .expect("Resume restores the swap's form");
+                    assert_eq!(form.operation, Some(operation));
+                    assert!(form.reuse_account);
+                    assert_eq!(form.reuse_use, Some(first));
+                    assert_eq!((form.sell, form.network), (STUB_USDC, Some(137)));
+                    assert_eq!(form.receive_to, ReceiveTo::PrivateBalance);
+                    // The pair the swap reserved comes back with its terms.
+                    assert_eq!(swaps.destination_operation(form), Some(existing));
+                    assert_eq!(
+                        swaps
+                            .reserved_delivery(form)
+                            .map(|delivery| delivery.receiver),
+                        Some(own)
+                    );
+                    // Neither account needs setup, so Review opens the order's review.
+                    assert_eq!(swaps.form_mode(form), FormMode::Order);
+                    assert!(!swaps.reviews_setup(form));
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+
+            cancel_preparation(cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let cancelled = swaps
+                        .cancelled
+                        .as_ref()
+                        .expect("the detail reports the cancellation");
+                    assert!(
+                        cancelled.accounts.len() == 2
+                            && cancelled.accounts.iter().all(|account| {
+                                !account.fresh
+                                    && account.release == SwapUseRelease::Released
+                                    && account.outcome().starts_with("Released.")
+                            })
+                    );
+                    assert!(
+                        swaps
+                            .pending_order(swaps.record(operation).unwrap())
+                            .is_none()
+                    );
+                    assert!(!swaps.has_shown_swaps());
+                    assert_eq!(swaps.open_order_count(cx), 0);
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("swap-cancelled-source").is_some());
+            assert!(cx.debug_bounds("swap-cancelled-destination").is_some());
+            assert!(
+                cx.debug_bounds("swap-progress-cancel-preparation")
+                    .is_none()
+            );
+            // Native cancellation released both accounts. Neither is retired or stopped, and
+            // each is offered again.
+            for (store, account) in [(executors, operation), (&polygon_store, existing)] {
+                let record = record_of(store, account);
+                assert_eq!(record.active_swap_use(), None);
+                assert!(record.swap_use(first).unwrap().is_stopped());
+                assert!(!record.is_retired() && !record.is_swap_setup_stopped());
+            }
+            assert_eq!(offered(&swaps, cx), (true, true));
+
+            // Another preparation sets up a new destination account, whose setup was sent.
+            let second = SwapUseId::random().unwrap();
+            let fresh = ExecutorOperationId::random().unwrap();
+            let receiver = Address::repeat_byte(0x61);
+            claim(
+                second,
+                SwapAccountChoice::New(fresh),
+                prepared(receiver, true),
+            );
+            polygon_store.bind_address(fresh, receiver).unwrap();
+            // The existing destination's setup used a different fee note.
+            let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
+                "tree": 4, "position": 16198, "commitment": "0x2"
+            }))
+            .unwrap();
+            let issued = record_setup(
+                &polygon_store,
+                fresh,
+                polygon_delegate,
+                B256::repeat_byte(0x44),
+                vec![input],
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.reload_destinations(cx);
+                    let record = swaps.record(operation).unwrap();
+                    assert_eq!(
+                        swaps.pending_order(record).map(|pending| pending.swap_use),
+                        Some(second)
+                    );
+                    assert_eq!(swaps.progress_stage(record), SwapStage::SetupPending);
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            cancel_preparation(cx);
+            swaps.read_with(cx, |swaps, _| {
+                let cancelled = swaps
+                    .cancelled
+                    .as_ref()
+                    .expect("the detail reports the cancellation");
+                let [source, destination] = cancelled.accounts.as_slice() else {
+                    panic!("both accounts are reported");
+                };
+                assert!(!source.fresh && source.release == SwapUseRelease::Released);
+                assert!(
+                    destination.fresh
+                        && destination.release == SwapUseRelease::IssuedWorkRemains
+                        && destination.outcome().starts_with("Unresolved."),
+                    "the sent setup is still unresolved"
+                );
+            });
+            // The sent setup keeps its payload and the fee notes it reserves. The existing
+            // source is released as before.
+            let kept = record_of(&polygon_store, fresh);
+            assert!(kept.is_swap_setup_stopped());
+            assert_eq!(kept.issued().len(), 1);
+            assert_eq!(kept.reserved_inputs(), issued.reserved_inputs());
+            let source = record_of(executors, operation);
+            assert_eq!(source.active_swap_use(), None);
+            assert!(!source.is_retired() && !source.is_swap_setup_stopped());
+
+            // Reopening from a new view must reconstruct cancellation from the records,
+            // including the destination's outstanding setup and its retained input guard.
+            let swaps = cx.update(|window, cx| {
+                root.update(cx, |root, cx| {
+                    root.clear_private_swaps(cx);
+                    root.ensure_private_swaps(window, cx);
+                    root.private_swaps_view().unwrap()
+                })
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_destinations(cx);
+                    assert!(swaps.cancelled.is_none());
+                    let rows = swaps.order_rows_for_test(cx);
+                    assert_eq!(rows.len(), 2, "both cancelled uses remain in history");
+                    assert_eq!(swaps.open_order_count(cx), 0);
+                    let identity = model::SwapIdentity {
+                        operation,
+                        swap_use: second,
+                    };
+                    let cancelled = swaps.cancelled_use(identity, cx).unwrap();
+                    assert!(cancelled.needs_attention());
+                    assert_eq!(
+                        cancelled.accounts[1].release,
+                        SwapUseRelease::IssuedWorkRemains
+                    );
+                    swaps.show_view(
+                        dialog::SwapDialogView::CancelledPreparation(identity),
+                        window,
+                        cx,
+                    );
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("swap-cancelled-destination").is_some());
+
+            // The same actions also belong to a prepared swap whose source is new.
+            let third = SwapUseId::random().unwrap();
+            let fresh_source = ExecutorOperationId::random().unwrap();
+            let mut approval = prepared(own, false);
+            approval.bounds.source_setup_fee = Some(U256::from(50_000));
+            approval.accounts.as_mut().unwrap().source = SwapApprovedAccount {
+                address: None,
+                setup: true,
+            };
+            executors
+                .claim_swap_pair(SwapPairClaim {
+                    id: third,
+                    source: SwapAccountChoice::New(fresh_source),
+                    delegate: origin_delegate,
+                    purpose_summary: Some("Private swap".into()),
+                    assets: Vec::new(),
+                    approval,
+                    destination: Some(SwapDestinationClaim {
+                        chain_id: 137,
+                        account: SwapAccountChoice::Existing(existing),
+                        delegate: polygon_delegate,
+                        destination_token: STUB_POLYGON_USDT,
+                    }),
+                })
+                .unwrap();
+            executors
+                .bind_address(fresh_source, Address::repeat_byte(0x73))
+                .unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.reload_destinations(cx);
+                    swaps.show_detail(fresh_source, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let resume = cx.debug_bounds("swap-progress-continue").unwrap();
+            cx.simulate_click(resume.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            let (session, owner) = swaps.read_with(cx, |swaps, _| {
+                (Arc::clone(&swaps.session), Arc::clone(&swaps.owner))
+            });
+            let offer = setup_offer(root, 1, STUB_USDC, U256::from(10), cx);
+            let estimate = runtime
+                .block_on(Box::pin(owner.estimate_swap_setup_fee(
+                    &session,
+                    Some(fresh_source),
+                    offer.clone(),
+                )))
+                .unwrap();
+            let orderbook = stub_orderbook(&stubs, runtime);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.orderbook = Some(orderbook.clone());
+                    form.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                    // Reopening queued its provider lookup before the fixture installed the
+                    // stub clients. Reload that lookup on the stub route before asking for a quote.
+                    form.bridge.routes_tasks.clear();
+                    form.bridge.routes.clear();
+                    swaps.load_bridge_routes(window, cx);
+                    swaps.schedule_quote(window, cx);
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| {
+                    swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .bridge
+                        .routes
+                        .contains_key(&(STUB_USDC, 137))
+                })
+            });
+            ready_review(&swaps, runtime, cx);
+            // This review never sends a setup. A disabled client supplies the reviewed action's
+            // transport handle without starting networking or duplicating proof fixtures.
+            let waku = root.read_with(cx, |root, _| {
+                let mut config = root.waku_config.clone();
+                config.network.mode = broadcaster_monitor_waku::RelayNetworkMode::Proxy;
+                config.build_client().unwrap()
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.route.estimate = Some(estimate);
+                    form.route.candidates = vec![offer];
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    let (approval, _) = swaps.setup_approval(true, Some(waku)).unwrap();
+                    // A reopened setup's review reaches the same guarded persistence boundary
+                    // as submission, before any setup payload is prepared or broadcast.
+                    swaps
+                        .owner
+                        .record_swap_approval(
+                            approval.operation,
+                            approval
+                                .swap_use
+                                .unwrap_or_else(|| SwapUseId::first(approval.operation)),
+                            approval.approval,
+                        )
+                        .expect("the reopened setup review still approves its claimed swap use");
+                    swaps.reload_records();
+                    swaps.show_detail(fresh_source, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            cancel_preparation(cx);
+            assert!(
+                record_of(executors, fresh_source)
+                    .swap_use(third)
+                    .unwrap()
+                    .is_stopped()
+            );
+            assert_eq!(record_of(&polygon_store, existing).active_swap_use(), None);
+
+            // Cancellation can precede derivation. The loaded destination record is still
+            // known by its operation even while the approved receiver is a placeholder.
+            let unbound = SwapUseId::random().unwrap();
+            let unbound_destination = ExecutorOperationId::random().unwrap();
+            claim(
+                unbound,
+                SwapAccountChoice::New(unbound_destination),
+                prepared(Address::ZERO, true),
+            );
+            executors.cancel_swap_use(operation, unbound).unwrap();
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.reload_destinations(cx);
+                    let cancelled = swaps
+                        .cancelled_use(
+                            model::SwapIdentity {
+                                operation,
+                                swap_use: unbound,
+                            },
+                            cx,
+                        )
+                        .unwrap();
+                    assert_eq!(cancelled.accounts.len(), 2);
+                    assert!(
+                        !cancelled.needs_attention(),
+                        "both loaded accounts stopped before signing anything"
+                    );
+                });
+            });
+
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+/// A private Bridge order's fill, verified as shielded, consumed its destination account's
+/// execution nonce, which only a read of that account records. Once the delivery is verified,
+/// the wallet has the destination network's own owner read the account at its confirmed
+/// block. With that nonce recorded, local records offer the account as a destination again.
+#[gpui::test]
+fn a_shielded_delivery_reads_its_destination_account_which_is_then_offered_again(
+    cx: &mut TestAppContext,
+) {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::B256;
+    use wallet_ops::vault::{ExecutorNonceObservation, SwapBridgeOutcome, SwapDestinationOutcome};
+    const POLYGON_RPC: &str = "/rpc-polygon";
+
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, origin, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 137);
+                    // Polygon's requests arrive on their own path, apart from Ethereum's.
+                    let mut polygon = root.effective_chain_configs.get(137).unwrap().clone();
+                    polygon.rpc_route = wallet_ops::RpcChainRoute::new(
+                        137,
+                        vec![stubs.url.join("rpc-polygon").unwrap()],
+                    );
+                    root.effective_chain_configs = root
+                        .effective_chain_configs
+                        .clone()
+                        .into_values()
+                        .filter(|chain| chain.chain_id != 137)
+                        .chain(std::iter::once(polygon))
+                        .collect();
+                });
+            });
+            let session = start_polygon_session(root, &stubs, runtime, store, cx);
+            let polygon_owner = session.executor_owner().unwrap();
+            let (db, view, delegate, origin_delegate) = root.read_with(cx, |root, _| {
+                let delegate = |chain_id| {
+                    root.effective_chain_configs
+                        .get(chain_id)
+                        .unwrap()
+                        .accepted_executor_profile()
+                        .unwrap()
+                        .delegate()
+                };
+                (
+                    root.vault_store.as_ref().unwrap().db(),
+                    root.view_session.clone().unwrap(),
+                    delegate(137),
+                    delegate(1),
+                )
+            });
+            let destination = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+            let PlacedPrivateBridge {
+                operation,
+                destination_operation,
+                uid,
+                origin_observed: observed,
+                destination_observed: signed,
+                setup_hash,
+                ..
+            } = placed_private_bridge(
+                origin,
+                &destination,
+                origin_delegate,
+                delegate,
+                STUB_POLYGON_USDC,
+            );
+            origin
+                .record_swap_observations(
+                    operation,
+                    uid,
+                    bridge_observations(observed, Some(U256::from(7)), None),
+                )
+                .unwrap();
+            // Polygon's confirmed block is known, as it is once its session has synced.
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    let Some(ChainUtxoState::Ready { sync_tip, .. }) =
+                        root.chain_states.get_mut(&137)
+                    else {
+                        panic!("ready fixture");
+                    };
+                    sync_tip.head_block = Some(1_000);
+                });
+            });
+            let account = || {
+                let records = destination.records().unwrap();
+                records
+                    .into_iter()
+                    .find(|record| record.operation() == destination_operation)
+                    .unwrap()
+            };
+            let offered = || {
+                let candidates = polygon_owner
+                    .swap_destination_candidates(STUB_POLYGON_USDC)
+                    .unwrap();
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.operation() == destination_operation)
+            };
+            assert!(!offered(), "its delivery isn't verified yet");
+            assert_eq!(account().nonce_observation(), Some(signed));
+
+            // A status check records the verified fill, which ran the shield.
+            let requests = stubs.rpc_requests_on(POLYGON_RPC);
+            let block = BlockNumHash::new(25, B256::repeat_byte(25));
+            let transaction_hash = B256::repeat_byte(26);
+            let writer = ExecutorStore::new(db, view, 1).unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.start_job(
+                        operation,
+                        SwapJobKind::Check,
+                        async move {
+                            writer.record_swap_bridge_outcome(
+                                operation,
+                                uid,
+                                SwapBridgeOutcome::DeliveredVerified {
+                                    block,
+                                    transaction_hash,
+                                    output_amount: BRIDGE_MINIMUM,
+                                    shielded: true,
+                                },
+                            )?;
+                            eyre::Ok(())
+                        },
+                        |_, (), _, _| {},
+                        window,
+                        cx,
+                    );
+                });
+            });
+            // The destination account's delivery is settled, and then Polygon's owner reads
+            // the account: the read starts from an invalidated observation and asks
+            // Polygon's own endpoint.
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+                    && account().nonce_observation().is_none()
+                    && stubs.rpc_requests_on(POLYGON_RPC) > requests
+            });
+            assert_eq!(
+                account().swap_destination().unwrap().outcome,
+                Some(SwapDestinationOutcome::Shielded {
+                    block,
+                    transaction_hash
+                })
+            );
+            // The stub endpoint serves no account state, so nothing is recorded yet.
+            assert!(!offered());
+            // What that read records once the endpoint answers: the nonce the shield consumed.
+            confirm_setup(
+                &destination,
+                destination_operation,
+                setup_hash,
+                B256::repeat_byte(68),
+                ExecutorNonceObservation::new(
+                    BlockNumHash::new(990, B256::repeat_byte(99)),
+                    U256::from(2),
+                ),
+            );
+            assert!(offered(), "local records offer the delivered account again");
             runtime.block_on(session.stop()).unwrap();
         },
     );
@@ -4544,6 +6528,8 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     bridge: None,
                     destination_minimum: Some(approved),
                     full_review: false,
+                    swap_use: None,
+                    pair_destination: None,
                 };
                 let place = swaps.place_summary(&approval, cx).unwrap();
                 assert_eq!(received(&place), exactly(approved), "the bound minimum");
@@ -4731,7 +6717,19 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                     );
                     assert_eq!(value("If the shield fails").as_deref(), Some(choice));
                     assert_eq!(value("Receiver"), None);
+                    // Before either account is derived, each is a new account on its network.
+                    for account in ["Source · Ethereum", "Destination · Polygon"] {
+                        assert_eq!(value(account).as_deref(), Some("New account"), "{account}");
+                    }
+                    assert!(
+                        summary
+                            .warnings_for_test()
+                            .iter()
+                            .all(|warning| !warning.starts_with("Reusing")),
+                        "new accounts link nothing"
+                    );
                     let (public, card, warns) = summary.disclosure_for_test().unwrap();
+                    assert!(!card.contains("reuses"), "{card}");
                     assert_eq!(public, "this swap, and that it shields on Polygon");
                     assert!(!warns, "the informational alert");
                     assert!(
@@ -4763,6 +6761,8 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                         bridge: None,
                         destination_minimum: Some(approved),
                         full_review: false,
+                        swap_use: None,
+                        pair_destination: None,
                     };
                     assert_eq!(
                         approval
@@ -4791,6 +6791,8 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                         [
                             ("Bridge".to_owned(), "Across".to_owned()),
                             ("If the shield fails".to_owned(), choice.to_owned()),
+                            ("Source · Ethereum".to_owned(), "New account".to_owned()),
+                            ("Destination · Polygon".to_owned(), "New account".to_owned()),
                         ]
                     );
                 });
@@ -4828,6 +6830,8 @@ fn private_bridge_approval_expires_when_the_destination_session_ends(cx: &mut Te
                         orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
                         bridge: None,
                         full_review: true,
+                        swap_use: None,
+                        pair_destination: None,
                     };
                     let summary = swaps.swap_summary(&review, None, None, None, cx);
                     swaps.request_authorization(
@@ -4960,6 +6964,8 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
                     bridge: None,
                     destination_minimum: Some(destination_minimum),
                     full_review: false,
+                    swap_use: None,
+                    pair_destination: None,
                 };
                 let (_, _, lines) = swaps
                     .place_summary(&approval, cx)
@@ -5040,8 +7046,9 @@ fn high_bridge_costs_require_swap_anyway(cx: &mut TestAppContext) {
                     authorized_high_cost(&review).expect("bridge costs take the total past 20%");
                 cx.update(|_, cx| {
                     swaps.update(cx, |swaps, cx| {
-                        let message = swaps.authorized_cost_message(&review, bps, cx);
-                        assert!(message.contains("bridge fee"), "{message}");
+                        let warning = swaps.authorized_cost_warning(&review, bps, cx);
+                        let message = warning.message();
+                        assert!(warning.details.contains("bridge fee"), "{message}");
                         assert!(
                             swaps
                                 .swap_summary(&review, None, None, None, cx)
@@ -5049,7 +7056,7 @@ fn high_bridge_costs_require_swap_anyway(cx: &mut TestAppContext) {
                                 .contains(&message)
                         );
                         if private {
-                            assert!(message.contains("destination"), "{message}");
+                            assert!(warning.details.contains("destination"), "{message}");
                             let cache = &root.read(cx).public_broadcaster_anchor_cache;
                             cache.store_rate(1, STUB_USDT, U256::from(1_000_000));
                             cache.store_native_usd_rate(1, U256::from(1_000_000), 18);
@@ -6357,14 +8364,18 @@ fn checking_an_across_refund_asks_across_before_the_balance(cx: &mut TestAppCont
 
 /// Check jobs can persist an outcome before a later RPC fails. With the destination still
 /// loaded, both that failure and a successful correction must update its outcome. Neither
-/// outcome revokes a shield signature at the unchanged nonce.
+/// outcome revokes a shield signature at the unchanged nonce. The checked swap reuses both
+/// accounts of an earlier, delivered swap, and each swap's delivery stays its own.
 #[gpui::test]
 fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
+    use wallet_ops::ExecutorAsset;
     use wallet_ops::vault::{
-        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
-        IssuedExecutorPayload, SwapBridgeOutcome, SwapDestinationOutcome, SwapDestinationRecord,
+        AcrossOrderTerms, BridgeOrderTerms, ExecutorInputIdentity, ExecutorNonceObservation,
+        ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAccountChoice,
+        SwapAttempt, SwapBridgeOutcome, SwapDestinationClaim, SwapDestinationOutcome,
+        SwapPairClaim, SwapProof, SwapTerms, SwapUseId,
     };
 
     let stubs = SwapStubs::start();
@@ -6374,82 +8385,267 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
         |root, swaps, origin, _, runtime, store, cx| {
             cx.update(|_, cx| root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137)));
             let session = start_polygon_session(root, &stubs, runtime, store, cx);
-            let (db, view, delegate) = root.read_with(cx, |root, _| {
-                (
-                    root.vault_store.as_ref().unwrap().db(),
-                    root.view_session.clone().unwrap(),
+            // Each account is delegated as its own network accepts, so both can be reused.
+            let (db, view, delegate, origin_delegate) = root.read_with(cx, |root, _| {
+                let delegate = |chain_id| {
                     root.effective_chain_configs
-                        .get(137)
+                        .get(chain_id)
                         .unwrap()
                         .accepted_executor_profile()
                         .unwrap()
-                        .delegate(),
+                        .delegate()
+                };
+                (
+                    root.vault_store.as_ref().unwrap().db(),
+                    root.view_session.clone().unwrap(),
+                    delegate(137),
+                    delegate(1),
                 )
             });
             let destination = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
-            let operation = ExecutorOperationId::random().unwrap();
-            let destination_operation = ExecutorOperationId::random().unwrap();
-            let receiver = Address::repeat_byte(0x51);
-            origin
-                .reserve_with_swap_approval(
-                    operation,
+            let PlacedPrivateBridge {
+                operation,
+                destination_operation,
+                delivery: initial_delivery,
+                uid: earlier_uid,
+                origin_observed,
+                setup_hash,
+                ..
+            } = placed_private_bridge(
+                origin,
+                &destination,
+                origin_delegate,
+                delegate,
+                STUB_POLYGON_USDT,
+            );
+            let shield_at = |nonce: u64, block: u64, hash: u8| {
+                let observed = ExecutorNonceObservation::new(
+                    BlockNumHash::new(block, B256::repeat_byte(30)),
+                    U256::from(nonce),
+                );
+                confirm_setup(
+                    &destination,
+                    destination_operation,
+                    setup_hash,
+                    B256::repeat_byte(68),
+                    observed,
+                );
+                IssuedExecutorPayload::new(
+                    U256::from(nonce),
                     delegate,
-                    Some("Private swap"),
-                    &[],
-                    None,
-                    Some(destination_operation),
+                    B256::repeat_byte(hash),
+                    ExecutorPayloadPurpose::SwapDestinationShield,
+                    ExecutorPayloadContext::new(
+                        Bytes::from_static(b"shield"),
+                        observed,
+                        Vec::new(),
+                    ),
+                )
+            };
+            // The earlier swap delivered USDT: its fill ran the first shield.
+            let earlier = SwapUseId::first(operation);
+            let earlier_delivery = SwapBridgeOutcome::DeliveredVerified {
+                block: BlockNumHash::new(25, B256::repeat_byte(25)),
+                transaction_hash: B256::repeat_byte(26),
+                output_amount: BRIDGE_MINIMUM,
+                shielded: true,
+            };
+            let earlier_outcome = Some(SwapDestinationOutcome::Shielded {
+                block: BlockNumHash::new(25, B256::repeat_byte(25)),
+                transaction_hash: B256::repeat_byte(26),
+            });
+            origin
+                .record_swap_observations(
+                    operation,
+                    earlier_uid,
+                    bridge_observations(origin_observed, Some(U256::from(7)), None),
                 )
                 .unwrap();
-            destination
-                .reserve_swap_destination(
-                    destination_operation,
-                    delegate,
-                    SwapDestinationRecord {
-                        origin_chain: 1,
-                        origin_operation: operation,
+            let placed = origin
+                .record_swap_bridge_outcome(operation, earlier_uid, earlier_delivery)
+                .unwrap();
+            assert!(destination.reconcile_swap_destinations().unwrap());
+
+            // Both settled accounts take a second swap, receiving USDC this time, which signs
+            // its own shield and order at the accounts' current nonces.
+            let delivery = SwapDelivery::Bridge(BridgeDelivery {
+                destination_token: STUB_POLYGON_USDC,
+                ..initial_delivery
+            });
+            let swap_use = SwapUseId::random().unwrap();
+            let origin_setup = &placed.issued()[0];
+            let origin_observed = ExecutorNonceObservation::new(
+                BlockNumHash::new(38, B256::repeat_byte(38)),
+                U256::from(3),
+            );
+            origin
+                .reconcile(
+                    operation,
+                    origin_observed,
+                    &[(origin_setup.hash(), origin_setup.inclusion().unwrap())],
+                )
+                .unwrap();
+            let shield = shield_at(2, 38, 71);
+            origin
+                .claim_swap_pair(SwapPairClaim {
+                    id: swap_use,
+                    source: SwapAccountChoice::Existing(operation),
+                    delegate: origin_delegate,
+                    purpose_summary: None,
+                    assets: Vec::new(),
+                    approval: SwapApproval {
+                        delivery,
+                        ..test_approval()
+                    },
+                    destination: Some(SwapDestinationClaim {
+                        chain_id: 137,
+                        account: SwapAccountChoice::Existing(destination_operation),
+                        delegate,
                         destination_token: STUB_POLYGON_USDC,
-                        outcome: None,
+                    }),
+                })
+                .unwrap();
+            destination
+                .record_swap_destination_shield(destination_operation, swap_use, shield.clone())
+                .unwrap();
+            let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
+                "tree": 4, "position": 16199, "commitment": "0x3"
+            }))
+            .unwrap();
+            let hook = |nonce: u64, hash, purpose, inputs| {
+                IssuedExecutorPayload::new(
+                    U256::from(nonce),
+                    origin_delegate,
+                    B256::repeat_byte(hash),
+                    purpose,
+                    ExecutorPayloadContext::new(
+                        Bytes::from_static(b"new hook"),
+                        origin_observed,
+                        inputs,
+                    ),
+                )
+            };
+            let uid = OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), u32::MAX);
+            let terms = placed.swap().unwrap().terms();
+            let mut bounds = test_approval().bounds;
+            bounds.destination_minimum = Some(BRIDGE_MINIMUM);
+            origin
+                .record_swap_attempt(
+                    operation,
+                    SwapAttempt {
+                        use_id: swap_use,
+                        terms: SwapTerms::new(
+                            terms.sell_token(),
+                            terms.buy_token(),
+                            terms.recipient(),
+                            origin_setup.hash(),
+                        ),
+                        proof: SwapProof::new(B256::repeat_byte(9), vec![input.clone()]),
+                        uid,
+                        submission: None,
+                        delivery,
+                        invalidates: None,
+                        pre_hook: hook(3, 9, ExecutorPayloadPurpose::SwapPreHook, vec![input]),
+                        post_hook: Some(hook(
+                            4,
+                            10,
+                            ExecutorPayloadPurpose::SwapPostHook,
+                            Vec::new(),
+                        )),
+                        bridge: Some(BridgeOrderTerms::Across(AcrossOrderTerms {
+                            spoke_pool: Address::repeat_byte(0x55),
+                            input_token: terms.buy_token(),
+                            output_token: STUB_POLYGON_USDC,
+                            input_amount: bounds.buy_amount,
+                            output_amount: BRIDGE_MINIMUM,
+                            quote_timestamp: 1_790_000_000,
+                            fill_deadline: 1_790_007_200,
+                            exclusive_relayer: Address::ZERO,
+                            exclusivity_parameter: 0,
+                            recipient: Some(Address::repeat_byte(0x56)),
+                            message_hash: Some(B256::repeat_byte(0x57)),
+                        })),
+                        bounds,
                     },
                 )
                 .unwrap();
-            destination
-                .bind_address(destination_operation, receiver)
-                .unwrap();
-            let observed = ExecutorNonceObservation::new(
-                BlockNumHash::new(30, B256::repeat_byte(30)),
-                U256::ONE,
-            );
-            destination
-                .reconcile(destination_operation, observed, &[])
-                .unwrap();
-            let shield = IssuedExecutorPayload::new(
-                U256::ONE,
-                delegate,
-                B256::repeat_byte(70),
-                ExecutorPayloadPurpose::SwapDestinationShield,
-                ExecutorPayloadContext::new(Bytes::from_static(b"shield"), observed, Vec::new()),
-            );
-            destination
-                .record_issued(destination_operation, shield.clone())
-                .unwrap();
-            let delivery = SwapDelivery::Bridge(BridgeDelivery {
-                provider: BridgeProvider::Across,
-                destination_chain: 137,
-                receiver,
-                destination_token: STUB_POLYGON_USDC,
-                surplus: BridgeSurplus::Reshield,
-                private: Some(BridgePrivateDelivery {
-                    on_shield_failure: BridgeShieldFailure::KeepOnDestination,
-                }),
-            });
-            let (uid, origin_observed) = placed_swap(origin, operation, delivery);
             origin
                 .record_swap_observations(
                     operation,
                     uid,
-                    bridge_observations(origin_observed, Some(U256::from(7)), None),
+                    bridge_observations(origin_observed, Some(U256::from(8)), None),
                 )
                 .unwrap();
+            // What each swap's use of the destination account records of its delivery.
+            let outcomes = || {
+                let record = destination.records().unwrap().remove(0);
+                assert_eq!(record.active_swap_use(), Some(swap_use));
+                (
+                    record.swap_destination_use(earlier).unwrap().outcome,
+                    record.swap_destination_use(swap_use).unwrap().outcome,
+                )
+            };
+
+            // A status check that reports the earlier swap's fill again settles only that
+            // swap. The second swap still waits for its own delivery, and My orders keeps the
+            // delivered swap apart from it.
+            let writer = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.start_job(
+                        operation,
+                        SwapJobKind::Check,
+                        async move {
+                            writer.record_swap_bridge_outcome(
+                                operation,
+                                earlier_uid,
+                                earlier_delivery,
+                            )?;
+                            eyre::Ok(())
+                        },
+                        |_, (), _, _| {},
+                        window,
+                        cx,
+                    );
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+            });
+            assert!(!destination.reconcile_swap_destinations().unwrap());
+            assert_eq!(outcomes(), (earlier_outcome, None));
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.reload_destinations(cx);
+                    let record = swaps.record(operation).unwrap();
+                    assert_ne!(
+                        swaps.progress_stage(record),
+                        SwapStage::Order(SwapOrderState::Done)
+                    );
+                    let past = SwapIdentity {
+                        operation,
+                        swap_use: earlier,
+                    };
+                    let (_, _, order) = swaps.past_swap(past, 0).unwrap();
+                    assert_eq!(order.uid(), earlier_uid);
+                    assert_eq!(
+                        model::swap_order_stage(record, order),
+                        SwapStage::Order(SwapOrderState::Done)
+                    );
+                    // Each swap resolves the destination account its own use names.
+                    let private = swap_private_delivery(record).unwrap();
+                    for swap in [past, swaps.shown_swap(record).unwrap()] {
+                        assert_eq!(
+                            swaps
+                                .swap_destination_account(swap, private)
+                                .map(ExecutorRecord::operation),
+                            Some(destination_operation)
+                        );
+                    }
+                });
+            });
             let block = BlockNumHash::new(40, B256::repeat_byte(40));
             let transaction_hash = B256::repeat_byte(41);
             for (outcome, expected, fail_after) in [
@@ -6502,16 +8698,50 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                             .outcome
                             == Some(expected)
                 });
+                // The earlier swap's delivery stays as it was recorded.
+                assert_eq!(outcomes(), (earlier_outcome, Some(expected)));
                 let record = destination.records().unwrap().remove(0);
                 assert_eq!(
                     (
-                        record.is_outstanding_at(&shield, U256::ONE),
+                        record.is_outstanding_at(&shield, U256::from(2)),
                         record.has_competing_payloads(),
                         record.has_unresolved_issued_work()
                     ),
                     (true, true, true)
                 );
             }
+            // Reload without an originating swap view supplying its receiving token. Direct
+            // account balance checks and recovery discover their assets from this record.
+            let reloaded = ExecutorStore::new(db, view, 137).unwrap();
+            let record = reloaded.records().unwrap().remove(0);
+            assert!(
+                record
+                    .assets()
+                    .contains(&ExecutorAsset::Erc20(STUB_POLYGON_USDT))
+            );
+            assert_eq!(
+                record
+                    .assets()
+                    .iter()
+                    .filter(|asset| **asset == ExecutorAsset::Erc20(STUB_POLYGON_USDC))
+                    .count(),
+                1,
+                "the later receiving token must be persisted for direct account recovery"
+            );
+            assert_eq!(
+                record
+                    .swap_destination_use(earlier)
+                    .unwrap()
+                    .destination_token,
+                STUB_POLYGON_USDT
+            );
+            assert_eq!(
+                record
+                    .swap_destination_use(swap_use)
+                    .unwrap()
+                    .destination_token,
+                STUB_POLYGON_USDC
+            );
             runtime.block_on(session.stop()).unwrap();
         },
     );
@@ -6864,6 +9094,8 @@ struct SwapStubs {
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
     order_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The path of each RPC request, which tells apart chains given their own path.
+    rpc_requests: Arc<std::sync::Mutex<Vec<String>>>,
     across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
     across_relayer_gas_bps: Arc<std::sync::atomic::AtomicU64>,
     across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -6896,6 +9128,7 @@ impl SwapStubs {
         let quotes = Arc::<std::sync::Mutex<Vec<serde_json::Value>>>::default();
         let bridge_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
         let order_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let rpc_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
         let across_fee_bps = Arc::new(std::sync::atomic::AtomicU64::new(10));
         let across_relayer_gas_bps = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let across_delay_ms = Arc::<std::sync::atomic::AtomicU64>::default();
@@ -6907,6 +9140,7 @@ impl SwapStubs {
         let recorded = Arc::clone(&quotes);
         let recorded_bridge = Arc::clone(&bridge_requests);
         let recorded_orders = Arc::clone(&order_requests);
+        let recorded_rpc = Arc::clone(&rpc_requests);
         let bridge = StubBridge {
             spoke_pool: wallet_ops::settings::build_effective_chain_configs(
                 &wallet_ops::settings::WalletSettings::default(),
@@ -6937,6 +9171,7 @@ impl SwapStubs {
                             Arc::clone(&recorded),
                             Arc::clone(&recorded_bridge),
                             Arc::clone(&recorded_orders),
+                            Arc::clone(&recorded_rpc),
                             bridge.clone(),
                             Arc::clone(&served_gas_price),
                             Arc::clone(&served_fee_amount),
@@ -6954,6 +9189,7 @@ impl SwapStubs {
             quotes,
             bridge_requests,
             order_requests,
+            rpc_requests,
             across_fee_bps,
             across_relayer_gas_bps,
             across_delay_ms,
@@ -7018,6 +9254,12 @@ impl SwapStubs {
     fn order_requests(&self) -> Vec<String> {
         self.order_requests.lock().unwrap().clone()
     }
+
+    /// How many RPC requests arrived on `path` so far.
+    fn rpc_requests_on(&self, path: &str) -> usize {
+        let requests = self.rpc_requests.lock().unwrap();
+        requests.iter().filter(|request| *request == path).count()
+    }
 }
 
 impl Drop for SwapStubs {
@@ -7037,6 +9279,7 @@ async fn stub_response(
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
     order_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    rpc_requests: Arc<std::sync::Mutex<Vec<String>>>,
     bridge: StubBridge,
     gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
     fee_amount: Arc<std::sync::atomic::AtomicU64>,
@@ -7066,6 +9309,9 @@ async fn stub_response(
     }
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let path = request_line.split(' ').nth(1).unwrap_or_default();
+    if path.starts_with("/rpc") {
+        rpc_requests.lock().unwrap().push(path.to_owned());
+    }
     let failing = bridge
         .failing
         .lock()
@@ -7591,7 +9837,9 @@ fn approved_swap(
             )],
         )
         .unwrap();
-    executors.record_swap_approval(operation, approval).unwrap();
+    executors
+        .record_swap_approval(operation, SwapUseId::first(operation), approval)
+        .unwrap();
     let code = [
         EIP7702_DELEGATION_DESIGNATOR.as_slice(),
         profile.delegate().as_slice(),

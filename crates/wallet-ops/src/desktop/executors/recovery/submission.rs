@@ -37,13 +37,9 @@ impl ExecutorOwner {
             .calls
             .get(step)
             .ok_or_else(|| eyre!("recovery step is unavailable"))?;
-        let mut chain = self.chain.clone();
-        chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
         let mut assets = vec![prepared.asset];
         if let (ExecutorAsset::Native, Some(shield)) = (prepared.asset, &prepared.shield) {
@@ -111,8 +107,9 @@ impl ExecutorOwner {
         let observed = inspection.block();
         let mut handoff = |hash, transaction: &TransactionRequest| {
             self.validate_recovery(prepared)?;
-            self.store.record_recovery_transaction(
+            self.store.record_recovery_transaction_for_use(
                 prepared.operation,
+                prepared.expected_active_use,
                 IssuedExecutorRecoveryTransaction::new(
                     prepared.recovery,
                     u32::try_from(step)?,

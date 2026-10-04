@@ -9,16 +9,23 @@ mod public_account;
 mod recovery;
 mod spare;
 mod swap;
+mod swap_admission;
+mod swap_use;
 pub use recovery::*;
 pub(crate) use spare::ExecutorSpare;
 pub use swap::*;
+pub use swap_admission::*;
+pub use swap_use::*;
 
 use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, RecordKind, VaultError,
     wallet_view_record_key,
 };
 
-const VERSION: u32 = 1;
+/// Records without swap-use metadata keep this version, which earlier builds read.
+const LEGACY_VERSION: u32 = 1;
+/// A record with swap-use metadata. Earlier builds refuse it rather than ignore its claim.
+const VERSION: u32 = 2;
 const ALLOCATION_VERSION: u32 = 2;
 const INDEX_LIMIT: u32 = 1 << 31;
 const POSITION_START: u32 = 1_000_000;
@@ -57,6 +64,8 @@ pub enum ExecutorStoreError {
     InputReserved,
     #[error("a previous swap attempt's pre-hook can still execute")]
     SwapAttemptOutstanding,
+    #[error("this account is reserved by another swap")]
+    SwapUseActive,
 }
 
 /// Stable native operation identity, retained across retries and presentation cleanup.
@@ -429,8 +438,14 @@ impl ExecutorUseCheck {
     }
 }
 
+/// Stored through `ExecutorRecordWire`, which keeps the field layout earlier builds wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    try_from = "swap_use::ExecutorRecordWire",
+    into = "swap_use::ExecutorRecordWire"
+)]
 pub struct ExecutorRecord {
+    /// The format this record is stored in, which follows from its swap-use metadata.
     version: u32,
     derivation: ExecutorDerivationScheme,
     origin: ExecutorRecordOrigin,
@@ -442,38 +457,23 @@ pub struct ExecutorRecord {
     created_at: Option<u64>,
     restored_at: Option<u64>,
     purpose_summary: Option<String>,
-    #[serde(default)]
     assets: Vec<ExecutorAsset>,
-    #[serde(default)]
     hidden: bool,
-    #[serde(default)]
     use_check: ExecutorUseCheck,
     issued: Vec<IssuedExecutorPayload>,
-    #[serde(default)]
     nonce_observation: Option<ExecutorNonceObservation>,
-    #[serde(default)]
     recovery_transactions: Vec<IssuedExecutorRecoveryTransaction>,
-    #[serde(default)]
     recovery_observation: Option<BlockNumHash>,
-    #[serde(default)]
     public_account_uuid: Option<String>,
-    #[serde(default)]
     swap: Option<SwapOperationRecord>,
-    #[serde(default)]
-    swap_approval: Option<SwapApproval>,
-    #[serde(default)]
     swap_setup_stopped: bool,
     /// Issued payloads the user released from input reservation. Their signatures
     /// remain valid; only the wallet's own spending of their inputs changes.
-    #[serde(default)]
     released_payloads: Vec<B256>,
-    /// Set on a private Bridge swap's destination stealth account.
-    #[serde(default)]
-    swap_destination: Option<SwapDestinationRecord>,
-    /// Set on a private Bridge swap's origin record: its destination stealth account's
-    /// operation on the destination chain.
-    #[serde(default)]
-    destination_operation: Option<ExecutorOperationId>,
+    /// The swaps this account took part in, in the order they started. A use is never removed.
+    swap_uses: Vec<SwapUseRecord>,
+    /// The one swap use that claims this account.
+    active_swap_use: Option<SwapUseId>,
 }
 
 impl ExecutorRecord {
@@ -523,15 +523,6 @@ impl ExecutorRecord {
     #[must_use]
     pub fn public_account_uuid(&self) -> Option<&str> {
         self.public_account_uuid.as_deref()
-    }
-
-    #[must_use]
-    pub const fn swap_destination(&self) -> Option<SwapDestinationRecord> {
-        self.swap_destination
-    }
-    #[must_use]
-    pub const fn destination_operation(&self) -> Option<ExecutorOperationId> {
-        self.destination_operation
     }
 
     #[must_use]
@@ -712,6 +703,22 @@ impl Default for Allocation {
     }
 }
 
+/// An exact expectation includes an account with no active use; unchecked issuance does not.
+#[derive(Clone, Copy)]
+enum SwapUseExpectation {
+    Unchecked,
+    Exact(Option<SwapUseId>),
+}
+
+impl SwapUseExpectation {
+    fn matches(&self, active: Option<SwapUseId>) -> bool {
+        match self {
+            Self::Unchecked => true,
+            Self::Exact(expected) => *expected == active,
+        }
+    }
+}
+
 /// Encrypted executor persistence for one canonical wallet-chain namespace.
 /// Native operation owners provide lifecycle, chain-state and signing admission.
 pub struct ExecutorStore {
@@ -747,7 +754,7 @@ impl ExecutorStore {
             .map(|stored| {
                 let record: ExecutorRecord =
                     self.open(RecordKind::ExecutorOperation, &stored.key, &stored.payload)?;
-                if record.version != VERSION
+                if !(LEGACY_VERSION..=VERSION).contains(&record.version)
                     || record.index >= INDEX_LIMIT
                     || stored.key != self.operation_key(record.operation)
                 {
@@ -884,14 +891,14 @@ impl ExecutorStore {
             // A destination record's outcome changes after its reservation.
             let existing_destination =
                 existing
-                    .swap_destination
+                    .swap_destination()
                     .map(|destination| SwapDestinationRecord {
                         outcome: None,
                         ..destination
                     });
             return if existing.delegate == delegate
                 && existing.origin == ExecutorRecordOrigin::Reserved
-                && existing.destination_operation == destination_operation
+                && existing.destination_operation() == destination_operation
                 && existing_destination == swap_destination
             {
                 Ok(existing)
@@ -899,14 +906,62 @@ impl ExecutorStore {
                 Err(ExecutorStoreError::OperationMismatch)
             };
         }
-        let mut allocation = self.allocation()?;
+        // A swap's reservation is its account's first use. Both accounts of a private Bridge
+        // swap take the origin's identity for it.
+        let first_use = if let Some(destination) = swap_destination {
+            Some((
+                SwapUseId::first(destination.origin_operation),
+                SwapUseRole::Destination {
+                    origin_chain: destination.origin_chain,
+                    origin_operation: destination.origin_operation,
+                    destination_token: destination.destination_token,
+                    shields: Vec::new(),
+                    outcome: None,
+                },
+            ))
+        } else if swap_approval.is_some() || destination_operation.is_some() {
+            Some((
+                SwapUseId::first(operation),
+                SwapUseRole::Source {
+                    approval: swap_approval.map(Box::new),
+                    destination_operation,
+                },
+            ))
+        } else {
+            None
+        };
         let mut updates = Vec::new();
+        let record = self.allocate_record(
+            operation,
+            delegate,
+            purpose_summary,
+            assets,
+            first_use,
+            &mut updates,
+        )?;
+        self.vault.db.put_desktop_wallet_vault_records(&updates)?;
+        Ok(record)
+    }
+
+    /// Allocate a fresh account for `operation`, which has no record yet, and append its
+    /// allocation row and record to `updates` without writing them. The caller holds the record
+    /// lock and commits `updates` in one write.
+    fn allocate_record(
+        &self,
+        operation: ExecutorOperationId,
+        delegate: Address,
+        purpose_summary: Option<&str>,
+        assets: &[ExecutorAsset],
+        first_use: Option<(SwapUseId, SwapUseRole)>,
+        updates: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        let mut allocation = self.allocation()?;
         if allocation
             .spare
             .as_ref()
             .is_some_and(|spare| spare.delegate != delegate)
         {
-            self.retain_spare(&mut allocation, &mut updates)?;
+            self.retain_spare(&mut allocation, updates)?;
         }
         let (index, address) = if let Some(spare) = allocation.spare.take() {
             (spare.index, spare.address)
@@ -915,8 +970,8 @@ impl ExecutorStore {
             allocation.next_index = index + 1;
             (index, None)
         };
-        let record = ExecutorRecord {
-            version: VERSION,
+        let mut record = ExecutorRecord {
+            version: LEGACY_VERSION,
             derivation: ExecutorDerivationScheme::Railgun7702V1,
             origin: ExecutorRecordOrigin::Reserved,
             operation,
@@ -936,12 +991,15 @@ impl ExecutorStore {
             recovery_observation: None,
             public_account_uuid: None,
             swap: None,
-            swap_approval,
             swap_setup_stopped: false,
             released_payloads: Vec::new(),
-            swap_destination,
-            destination_operation,
+            swap_uses: Vec::new(),
+            active_swap_use: None,
         };
+        if let Some((id, role)) = first_use {
+            record.begin_first_swap_use(id, role);
+        }
+        record.version = record.format_version();
         updates.extend([
             self.seal(
                 RecordKind::ExecutorAllocation,
@@ -954,7 +1012,6 @@ impl ExecutorStore {
                 &record,
             )?,
         ]);
-        self.vault.db.put_desktop_wallet_vault_records(&updates)?;
         Ok(record)
     }
 
@@ -1025,7 +1082,7 @@ impl ExecutorStore {
             self.retain_spare(&mut allocation, &mut updates)?;
         }
         let record = ExecutorRecord {
-            version: VERSION,
+            version: LEGACY_VERSION,
             derivation: ExecutorDerivationScheme::Railgun7702V1,
             origin: ExecutorRecordOrigin::Discovered,
             operation: ExecutorOperationId::random()?,
@@ -1045,11 +1102,10 @@ impl ExecutorStore {
             recovery_observation: None,
             public_account_uuid: None,
             swap: None,
-            swap_approval: None,
             swap_setup_stopped: false,
             released_payloads: Vec::new(),
-            swap_destination: None,
-            destination_operation: None,
+            swap_uses: Vec::new(),
+            active_swap_use: None,
         };
         updates.extend([
             self.seal(
@@ -1124,23 +1180,98 @@ impl ExecutorStore {
         operation: ExecutorOperationId,
         payload: IssuedExecutorPayload,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
-        let purpose = payload.purpose;
+        self.record_issued_for(operation, SwapUseExpectation::Unchecked, payload)
+    }
+
+    /// [`Self::record_issued`] for a destination stealth account's shield, which is signed for
+    /// the swap use `use_id`. It is refused unless that use still claims the account, checked in
+    /// the write that persists the payload.
+    pub fn record_swap_destination_shield(
+        &self,
+        operation: ExecutorOperationId,
+        use_id: SwapUseId,
+        payload: IssuedExecutorPayload,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        if payload.purpose != ExecutorPayloadPurpose::SwapDestinationShield {
+            return Err(ExecutorStoreError::OperationMismatch);
+        }
+        self.record_issued_for(operation, SwapUseExpectation::Exact(Some(use_id)), payload)
+    }
+
+    /// Persist a reviewed recovery only while its captured swap claim still matches.
+    pub(crate) fn record_recovery_issued(
+        &self,
+        operation: ExecutorOperationId,
+        expected_active_use: Option<SwapUseId>,
+        payload: IssuedExecutorPayload,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        if payload.purpose != ExecutorPayloadPurpose::Recovery {
+            return Err(ExecutorStoreError::OperationMismatch);
+        }
+        self.record_issued_for(
+            operation,
+            SwapUseExpectation::Exact(expected_active_use),
+            payload,
+        )
+    }
+
+    fn record_issued_for(
+        &self,
+        operation: ExecutorOperationId,
+        expected_active_use: SwapUseExpectation,
+        payload: IssuedExecutorPayload,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        let (purpose, hash) = (payload.purpose, payload.hash);
         self.update(operation, |record| {
+            if !expected_active_use.matches(record.active_swap_use) {
+                return Err(ExecutorStoreError::SwapUseActive);
+            }
             if record.address.is_none() || payload.delegate != record.delegate {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
+            // A destination shield belongs to the account's active destination use, whose
+            // origin swap on the other chain must name this account for the same use.
+            let shield_use = if purpose == ExecutorPayloadPurpose::SwapDestinationShield {
+                let Some(SwapUseRecord {
+                    id,
+                    stopped: false,
+                    role:
+                        SwapUseRole::Destination {
+                            origin_chain,
+                            origin_operation,
+                            ..
+                        },
+                    ..
+                }) = record.active_use()
+                else {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                };
+                if !self
+                    .for_chain(*origin_chain)
+                    .record(*origin_operation)?
+                    .is_some_and(|origin| origin.links_swap_destination(*id, operation))
+                {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
+                Some(*id)
+            } else {
+                None
+            };
+            // A setup belongs to the swap use that reserved its account fresh, until that use
+            // is stopped. An account a later use claims is already set up.
+            let setup_closed = record
+                .active_use()
+                .is_some_and(|swap_use| swap_use.is_stopped() || !swap_use.is_fresh());
             // Swap hooks are recorded only together with their order. A destination shield
             // belongs to a live destination account and spends no private inputs.
-            if (record.public_account_uuid.is_some() || record.swap_setup_stopped)
+            if (record.public_account_uuid.is_some() || record.swap_setup_stopped || setup_closed)
                 && payload.purpose == ExecutorPayloadPurpose::Operation
                 || matches!(
                     payload.purpose,
                     ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook
                 )
                 || payload.purpose == ExecutorPayloadPurpose::SwapDestinationShield
-                    && (record.swap_destination.is_none()
-                        || record.swap.is_some()
-                        || record.retired
+                    && (record.retired
                         || record.swap_setup_stopped
                         || !payload.context.inputs.is_empty())
             {
@@ -1199,12 +1330,22 @@ impl ExecutorStore {
                 }
                 record.issued.push(payload);
             }
-            // A newly signed order's fill can fund the shield again.
-            if purpose == ExecutorPayloadPurpose::SwapDestinationShield
-                && let Some(destination) = &mut record.swap_destination
-                && destination.outcome == Some(SwapDestinationOutcome::Unfilled)
+            if let Some(id) = shield_use
+                && let Some(SwapUseRecord {
+                    role:
+                        SwapUseRole::Destination {
+                            shields, outcome, ..
+                        },
+                    ..
+                }) = record.swap_use_mut(id)
             {
-                destination.outcome = None;
+                if !shields.contains(&hash) {
+                    shields.push(hash);
+                }
+                // A newly signed order's fill can fund the shield again.
+                if *outcome == Some(SwapDestinationOutcome::Unfilled) {
+                    *outcome = None;
+                }
             }
             Ok(())
         })
@@ -1213,8 +1354,11 @@ impl ExecutorStore {
     /// Bring this chain's destination stealth accounts in line with their origin swaps on
     /// other chains, in one write. Unlinked reservations may still be in preparation and are
     /// left alone. A destination whose swap setup was stopped before any outcome is stopped
-    /// and retired too. Otherwise the origin's bridge outcomes decide what became of the
-    /// shield payload. Returns whether any record changed.
+    /// and retired too, when that swap reserved it fresh; an account the swap reused only has
+    /// that use stopped. Otherwise the origin's bridge outcomes decide what became of the
+    /// shield payload, for each destination use from the orders of that use alone. A stopped,
+    /// orderless origin releases unsigned reused claims through cancellation. Returns whether
+    /// any record changed.
     pub fn reconcile_swap_destinations(&self) -> Result<bool, ExecutorStoreError> {
         self.reconcile_swap_destinations_inner(false)
     }
@@ -1234,29 +1378,75 @@ impl ExecutorStore {
             .map_err(|_| ExecutorStoreError::Unavailable)?;
         self.require_wallet()?;
         let mut updates = Vec::new();
+        let mut origins = std::collections::BTreeMap::new();
         for mut record in self.records()? {
-            let Some(destination) = record.swap_destination else {
-                continue;
-            };
             let previous = record.clone();
-            let origin = self
-                .for_chain(destination.origin_chain)
-                .record(destination.origin_operation)?
-                .filter(|origin| origin.destination_operation == Some(record.operation));
-            match origin {
-                None => record.retired |= retire_orphans && record.issued.is_empty(),
-                Some(origin) if origin.swap_setup_stopped && destination.outcome.is_none() => {
-                    record.swap_setup_stopped = true;
-                    record.retired = true;
+            // Every destination use is matched to its own origin use, so an earlier swap's fill
+            // is never read as a later swap's.
+            let uses: Vec<_> = record
+                .swap_uses()
+                .iter()
+                .filter_map(destination_link)
+                .collect();
+            for (id, origin_chain, origin_operation, known) in uses {
+                // Only the use that reserved an account fresh, while it still claims the
+                // account, can retire it or stop its setup.
+                let fresh = record.active_swap_use == Some(id)
+                    && record.swap_use(id).is_some_and(SwapUseRecord::is_fresh);
+                let key = (origin_chain, origin_operation);
+                if let std::collections::btree_map::Entry::Vacant(entry) = origins.entry(key) {
+                    entry.insert(self.for_chain(origin_chain).record(origin_operation)?);
                 }
-                Some(origin) => {
-                    let derived = record
-                        .address
-                        .and_then(|address| origin.swap_destination_outcome(address));
-                    record.swap_destination = Some(SwapDestinationRecord {
-                        outcome: next_destination_outcome(destination.outcome, derived),
-                        ..destination
-                    });
+                let origin = origins
+                    .get_mut(&key)
+                    .and_then(Option::as_mut)
+                    .filter(|origin| origin.links_swap_destination(id, record.operation));
+                let next = match origin {
+                    None => {
+                        record.retired |= retire_orphans && fresh && record.issued.is_empty();
+                        None
+                    }
+                    Some(origin) => {
+                        let setup_stopped = origin.swap_setup_stopped && known.is_none();
+                        let stopped = setup_stopped
+                            || origin.swap_use(id).is_some_and(SwapUseRecord::is_stopped);
+                        if stopped && !origin.has_swap_use_order(id) {
+                            // Both facts come from the exact linked source while the mutation
+                            // lock excludes any late order or signed-data handoff.
+                            origin.cancel_swap_use(id);
+                            record.cancel_swap_use(id);
+                        } else if setup_stopped && fresh {
+                            record.swap_setup_stopped = true;
+                            record.retired = true;
+                        }
+                        let derived = record
+                            .address
+                            .and_then(|address| origin.swap_destination_outcome(id, address));
+                        Some((stopped, next_destination_outcome(known, derived)))
+                    }
+                };
+                if let Some((stop, next)) = next
+                    && let Some(SwapUseRecord {
+                        stopped,
+                        role:
+                            SwapUseRole::Destination {
+                                shields, outcome, ..
+                            },
+                        ..
+                    }) = record.swap_use_mut(id)
+                {
+                    *stopped |= stop;
+                    // A fill can only have run, or left funds for, a shield this use signed.
+                    let filled = matches!(
+                        next,
+                        Some(
+                            SwapDestinationOutcome::Shielded { .. }
+                                | SwapDestinationOutcome::Held { .. }
+                        )
+                    );
+                    if !(filled && shields.is_empty()) {
+                        *outcome = next;
+                    }
                 }
             }
             if record != previous {
@@ -1264,6 +1454,19 @@ impl ExecutorStore {
                     RecordKind::ExecutorOperation,
                     self.operation_key(record.operation),
                     &record,
+                )?);
+            }
+        }
+        for ((chain_id, operation), origin) in origins {
+            let Some(origin) = origin else {
+                continue;
+            };
+            let store = self.for_chain(chain_id);
+            if store.record(operation)?.as_ref() != Some(&origin) {
+                updates.push(store.seal(
+                    RecordKind::ExecutorOperation,
+                    store.operation_key(operation),
+                    &origin,
                 )?);
             }
         }
@@ -1275,8 +1478,8 @@ impl ExecutorStore {
     }
 
     /// The swap record on its own chain that names this chain's destination stealth account
-    /// `operation` as its destination. `None` when `operation` is not a destination account or
-    /// no swap references it.
+    /// `operation` as the destination of the use that claims it. `None` when no destination use
+    /// claims `operation` or no swap references it.
     pub(crate) fn swap_destination_origin(
         &self,
         operation: ExecutorOperationId,
@@ -1285,16 +1488,16 @@ impl ExecutorStore {
             .lock()
             .map_err(|_| ExecutorStoreError::Unavailable)?;
         self.require_wallet()?;
-        let Some(destination) = self
+        let Some((id, origin_chain, origin_operation, _)) = self
             .record(operation)?
-            .and_then(|record| record.swap_destination)
+            .and_then(|record| record.active_use().and_then(destination_link))
         else {
             return Ok(None);
         };
         Ok(self
-            .for_chain(destination.origin_chain)
-            .record(destination.origin_operation)?
-            .filter(|origin| origin.destination_operation == Some(operation)))
+            .for_chain(origin_chain)
+            .record(origin_operation)?
+            .filter(|origin| origin.links_swap_destination(id, operation)))
     }
 
     /// The same wallet's store for another chain. It takes no lock: read through it with
@@ -1473,6 +1676,8 @@ impl ExecutorStore {
             .record(operation)?
             .ok_or(ExecutorStoreError::OperationMismatch)?;
         update(&mut record)?;
+        // A record that took its first swap use is stored, and compared, in the new format.
+        record.version = record.format_version();
         self.vault.db.put_desktop_wallet_vault_records(&[self.seal(
             RecordKind::ExecutorOperation,
             self.operation_key(operation),
@@ -1492,7 +1697,7 @@ impl ExecutorStore {
             .map(|payload| {
                 let record: ExecutorRecord =
                     self.open(RecordKind::ExecutorOperation, &key, &payload)?;
-                if record.version != VERSION
+                if !(LEGACY_VERSION..=VERSION).contains(&record.version)
                     || record.operation != operation
                     || record.index >= INDEX_LIMIT
                 {
@@ -1512,7 +1717,7 @@ impl ExecutorStore {
             .map(|payload| self.open(RecordKind::ExecutorAllocation, &key, &payload))
             .transpose()?
             .unwrap_or_default();
-        if !(VERSION..=ALLOCATION_VERSION).contains(&allocation.version)
+        if !(LEGACY_VERSION..=ALLOCATION_VERSION).contains(&allocation.version)
             || allocation.next_index > INDEX_LIMIT
             || allocation.spare.as_ref().is_some_and(|spare| {
                 spare.index >= allocation.next_index
@@ -1609,6 +1814,26 @@ struct ReservationLinks {
     swap_approval: Option<SwapApproval>,
     destination_operation: Option<ExecutorOperationId>,
     swap_destination: Option<SwapDestinationRecord>,
+}
+
+/// A destination use's identity, its origin swap's chain and operation, and its outcome.
+const fn destination_link(
+    swap_use: &SwapUseRecord,
+) -> Option<(
+    SwapUseId,
+    u64,
+    ExecutorOperationId,
+    Option<SwapDestinationOutcome>,
+)> {
+    match swap_use.role() {
+        SwapUseRole::Destination {
+            origin_chain,
+            origin_operation,
+            outcome,
+            ..
+        } => Some((swap_use.id(), *origin_chain, *origin_operation, *outcome)),
+        SwapUseRole::Source { .. } => None,
+    }
 }
 
 /// A fill's outcome is never replaced. `Unfilled` gives way to a fill, since Across can fill a

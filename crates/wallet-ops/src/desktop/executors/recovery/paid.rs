@@ -699,7 +699,7 @@ fn bounded_private_fee(
     bounded_public_broadcaster_fee(required, Some(maximum))
 }
 
-fn require_private_fee_limit(
+pub(in crate::desktop::executors) fn require_private_fee_limit(
     fee_token: Address,
     fee: U256,
     maximum: U256,

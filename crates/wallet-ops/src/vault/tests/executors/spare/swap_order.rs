@@ -4,10 +4,11 @@ use super::swap_setup::{
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote, GAS_SHARE_BALANCED_BPS};
 use crate::settings::{BridgeReceiverRejection, SwapReceiverRejection};
+use crate::vault::{SwapAccountRefusal, SwapAccountRole, SwapAccountUse};
 use crate::{
-    OperationHttpClient, OperationNetworkIsolation, PrivateBridgeSetupPreparation, SwapAmountPlan,
-    SwapAmountRequest, SwapOrderOutcome, SwapPrice, SwapReviewChange, SwapReviewRequest,
-    SwapSetupStatus, WalletNetworkMode, prepare_private_bridge_setup, swap_setup_status,
+    OperationHttpClient, OperationNetworkIsolation, SwapAmountPlan, SwapAmountRequest,
+    SwapOrderOutcome, SwapPairPreparation, SwapPrice, SwapReviewChange, SwapReviewRequest,
+    SwapSetupStatus, WalletNetworkMode, prepare_swap_pair, swap_setup_status,
 };
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
 use broadcaster_core::contracts::across::{MulticallHandler, SpokePool, private_delivery_message};
@@ -238,6 +239,19 @@ impl crate::SwapOutputPoiSink for StalledOutputPois {
 
 /// A freshly proved pre-hook's change output, as the wallet actor receives it: identified by
 /// its commitment, with no transaction or on-chain observation.
+/// The wallet's local notes on a destination chain, as a test sets them.
+#[derive(Default)]
+struct ShieldNotes(Mutex<Vec<crate::WalletUtxo>>);
+
+impl crate::SwapShieldNotes for ShieldNotes {
+    fn shield_notes(
+        &self,
+        shield: &crate::vault::SwapEarlierShield,
+    ) -> Option<Vec<crate::WalletUtxo>> {
+        Some(crate::notes_of_shield(&self.0.lock().unwrap(), shield))
+    }
+}
+
 fn change_output_poi(commitment: B256) -> local_db::PendingOutputPoiContextRecord {
     local_db::PendingOutputPoiContextRecord {
         chain_id: 1,
@@ -783,6 +797,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
                  change_output_pois: Vec<local_db::PendingOutputPoiContextRecord>| {
         owner.issue_swap_order(crate::SwapOrderSigning {
             review: &review,
+            swap_use: crate::vault::SwapUseId::first(review.plan().operation().unwrap()),
             private_minimum,
             price_acknowledged: true,
             transactions,
@@ -815,6 +830,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         .unwrap();
         let pending = preparing.issue_swap_order(crate::SwapOrderSigning {
             review: &review,
+            swap_use: crate::vault::SwapUseId::first(review.plan().operation().unwrap()),
             private_minimum,
             price_acknowledged: true,
             transactions: vec![pre_hook_transaction.clone()],
@@ -1202,6 +1218,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     let SwapOrderOutcome::Submitted { uid: new_uid } = owner
         .issue_swap_order(crate::SwapOrderSigning {
             review: &new_review,
+            swap_use: crate::vault::SwapUseId::first(new_review.plan().operation().unwrap()),
             private_minimum: new_review.suggested_private_minimum(),
             price_acknowledged: true,
             transactions: vec![pre_hook_transaction],
@@ -1391,7 +1408,11 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
         (amount, U256::from(997_500))
     );
     owner
-        .record_swap_approval(operation, approval.clone())
+        .record_swap_approval(
+            operation,
+            crate::vault::SwapUseId::first(operation),
+            approval.clone(),
+        )
         .unwrap();
     let restarted = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
     let record = restarted
@@ -1494,6 +1515,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
     let signed = owner
         .issue_swap_order(crate::SwapOrderSigning {
             review: &review,
+            swap_use: crate::vault::SwapUseId::first(review.plan().operation().unwrap()),
             private_minimum,
             price_acknowledged: true,
             transactions: vec![Transaction {
@@ -1787,6 +1809,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             owner
                 .issue_swap_order(crate::SwapOrderSigning {
                     review: $review,
+                    swap_use: crate::vault::SwapUseId::first($review.plan().operation().unwrap()),
                     private_minimum: $private_minimum,
                     price_acknowledged: true,
                     transactions: vec![transaction.clone()],
@@ -1931,6 +1954,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         owner
             .record_swap_approval(
                 operation,
+                crate::vault::SwapUseId::first(operation),
                 refused
                     .approval(refused.suggested_private_minimum(), true)
                     .unwrap(),
@@ -1954,6 +1978,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     owner
         .record_swap_approval(
             operation,
+            crate::vault::SwapUseId::first(operation),
             unaddressed
                 .approval(unaddressed.suggested_private_minimum(), true)
                 .unwrap(),
@@ -1966,7 +1991,11 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         Some(&SwapReceiverRejection::ZeroAddress)
     );
     owner
-        .record_swap_approval(operation, bridge_approval)
+        .record_swap_approval(
+            operation,
+            crate::vault::SwapUseId::first(operation),
+            bridge_approval,
+        )
         .unwrap();
     assert!(issue!(&bridge).is_err());
     assert!(record().swap().is_none());
@@ -1989,7 +2018,13 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         requote.approved_order_minimum(&approval),
         Ok(private_minimum)
     );
-    owner.record_swap_approval(operation, approval).unwrap();
+    owner
+        .record_swap_approval(
+            operation,
+            crate::vault::SwapUseId::first(operation),
+            approval,
+        )
+        .unwrap();
     assert!(
         issue!(&requote, None, private_minimum)
             .unwrap_err()
@@ -2091,7 +2126,7 @@ const POLYGON_WETH: Address =
 
 /// Record `operation`'s setup as the winner of nonce 0 and its account as delegated, observed
 /// at nonce 1.
-fn delegate_setup(
+pub(super) fn delegate_setup(
     store: &ExecutorStore,
     operation: ExecutorOperationId,
     profile: crate::settings::ExecutorProfile,
@@ -2135,6 +2170,28 @@ fn delegate_setup(
         panic!("the setup delegated the executor");
     };
     delegated
+}
+
+/// An account of `owner`'s wallet that an earlier action set up: derived for its index, with
+/// its setup the winner of nonce 0 and nothing else signed.
+async fn set_up_account(
+    owner: &ExecutorOwner,
+    store: &ExecutorStore,
+    profile: crate::settings::ExecutorProfile,
+    candidate: crate::PublicBroadcasterCandidate,
+) -> (ExecutorOperationId, crate::DelegatedSwapExecutor) {
+    let operation = ExecutorOperationId::random().unwrap();
+    owner
+        .prepare_operation(
+            operation,
+            ExecutorDelivery::PublicBroadcaster(Box::new(candidate)),
+            &password(),
+            &[],
+            Some("Private swap"),
+        )
+        .await
+        .unwrap();
+    (operation, delegate_setup(store, operation, profile))
 }
 
 /// An Across fee quote for `output` whose fill deadline is `fill_after` seconds from now.
@@ -2213,7 +2270,18 @@ impl BridgeOrderFixture {
         delivery: BridgeDelivery,
     ) -> Self {
         let delegated = delegate_setup(store, operation, profile);
+        Self::planned(view, swap_profile, delegated, executor, delivery)
+    }
 
+    /// The fixture for the account `delegated` confirms at `executor`, approved for `delivery`.
+    fn planned(
+        view: &DesktopViewSession,
+        swap_profile: &crate::settings::SwapProfile,
+        delegated: crate::DelegatedSwapExecutor,
+        executor: Address,
+        delivery: BridgeDelivery,
+    ) -> Self {
+        let operation = delegated.operation();
         let amount = U256::from(1_000_000);
         let input = Utxo::new(
             broadcaster_core::notes::Note::new_change(
@@ -2351,6 +2419,7 @@ impl BridgeOrderFixture {
         owner
             .issue_swap_order(crate::SwapOrderSigning {
                 review,
+                swap_use: crate::vault::SwapUseId::first(review.plan().operation().unwrap()),
                 private_minimum,
                 price_acknowledged: true,
                 transactions: vec![self.transaction.clone()],
@@ -2716,13 +2785,22 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
 // the handler message out of the wallet and before the swap's own account signs anything. The
 // post-hook's deposit then pays the handler with that message, whose fallback follows the
 // failure choice. The preview quote names no recipient, message or account.
+//
+// Each account is new, and set up by this swap, or existing. The first order is signed for the
+// accounts the approval binds, each at its current nonce, whichever of them needed setup.
+// Once the swap is delivered, both accounts can serve another swap. The destination account is
+// then judged again before it signs for that swap: its old shields' nonce must be consumed, its
+// earlier shield's note accepted or spent, and its balance of the receiving token zero.
 #[tokio::test]
 async fn private_across_order_records_the_destination_shield_before_its_deposit_is_signed() {
     use alloy::sol_types::SolValue as _;
 
-    for on_shield_failure in [
-        BridgeShieldFailure::RefundOnOrigin,
-        BridgeShieldFailure::KeepOnDestination,
+    for (source_new, destination_new, on_shield_failure) in [
+        (true, true, BridgeShieldFailure::RefundOnOrigin),
+        (true, true, BridgeShieldFailure::KeepOnDestination),
+        (false, true, BridgeShieldFailure::RefundOnOrigin),
+        (true, false, BridgeShieldFailure::KeepOnDestination),
+        (false, false, BridgeShieldFailure::RefundOnOrigin),
     ] {
         let rpc = Rpc::start().await;
         let (root, db, vault) = desktop_store_with_vault();
@@ -2754,12 +2832,39 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         let destination_store =
             ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
 
-        // Both accounts are reserved, and the approval saved with the swap names the destination
-        // account as receiver.
-        let (operation, destination_operation) = (
-            ExecutorOperationId::random().unwrap(),
-            ExecutorOperationId::random().unwrap(),
-        );
+        // Both accounts are claimed for the swap, each as a new account or as one an earlier
+        // action set up, and the approval saved with the swap names the destination account as
+        // receiver.
+        let authorization = password();
+        let destination_authorization = authorization.for_destination().unwrap();
+        let mut destination_candidate = broadcaster(destination_profile.delegate());
+        destination_candidate.chain_id = DESTINATION_CHAIN;
+        let (operation, existing_source) = if source_new {
+            (ExecutorOperationId::random().unwrap(), None)
+        } else {
+            let candidate = broadcaster(profile.delegate());
+            let (operation, delegated) = set_up_account(&owner, &store, profile, candidate).await;
+            (operation, Some(delegated))
+        };
+        let (destination_operation, existing_destination) = if destination_new {
+            (ExecutorOperationId::random().unwrap(), None)
+        } else {
+            let (operation, delegated) = set_up_account(
+                &destination_owner,
+                &destination_store,
+                destination_profile,
+                destination_candidate.clone(),
+            )
+            .await;
+            (operation, Some(delegated))
+        };
+        let choice = |new, operation| {
+            if new {
+                crate::vault::SwapAccountChoice::New(operation)
+            } else {
+                crate::vault::SwapAccountChoice::Existing(operation)
+            }
+        };
         let mut approval = setup_approval(
             USDC,
             WETH,
@@ -2772,23 +2877,23 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 private: Some(BridgePrivateDelivery { on_shield_failure }),
             }),
         );
-        approval.bounds.destination_setup_fee = Some(U256::from(1_000));
+        // Only a side that needs setup has a setup fee limit.
+        let setup_fee = |new: bool| new.then_some(U256::from(1_000));
+        approval.bounds.source_setup_fee = setup_fee(source_new);
+        approval.bounds.destination_setup_fee = setup_fee(destination_new);
         approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
-        let authorization = password();
-        let destination_authorization = authorization.for_destination().unwrap();
-        let mut destination_candidate = broadcaster(destination_profile.delegate());
-        destination_candidate.chain_id = DESTINATION_CHAIN;
-        let prepared = prepare_private_bridge_setup(
+        let prepared = prepare_swap_pair(
             &owner,
-            &destination_owner,
-            PrivateBridgeSetupPreparation {
-                operation,
-                destination_operation,
-                candidate: broadcaster(profile.delegate()),
-                destination_candidate,
+            Some(&destination_owner),
+            SwapPairPreparation {
+                use_id: crate::vault::SwapUseId::first(operation),
+                source: choice(source_new, operation),
+                destination: Some(choice(destination_new, destination_operation)),
                 approval,
+                candidate: source_new.then(|| broadcaster(profile.delegate())),
+                destination_candidate: destination_new.then_some(destination_candidate),
                 authorization: &authorization,
-                destination_authorization: &destination_authorization,
+                destination_authorization: Some(&destination_authorization),
             },
         )
         .await
@@ -2796,8 +2901,15 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         let SwapDelivery::Bridge(delivery) = prepared.approval.delivery else {
             panic!("the approval keeps its Bridge delivery");
         };
-        let destination_executor = prepared.destination.context().executor;
+        let destination_executor = prepared.destination.as_ref().unwrap().executor();
         assert_eq!(delivery.receiver, destination_executor);
+        assert_eq!(
+            (
+                prepared.origin.requires_setup(),
+                prepared.destination.as_ref().unwrap().requires_setup()
+            ),
+            (source_new, destination_new)
+        );
         let destination_record = || {
             destination_store
                 .records()
@@ -2807,38 +2919,54 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 .unwrap()
         };
 
-        // Before its setup is confirmed, the destination account can't back an order.
-        let error = destination_owner
-            .delegated_swap_destination(
-                destination_operation,
-                9,
-                1,
-                operation,
-                destination_executor,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("destination network"),
-            "{error:#}"
-        );
-        assert!(destination_record().issued().is_empty());
+        // Before its setup is confirmed, a new destination account can't back an order.
+        if destination_new {
+            let error = destination_owner
+                .delegated_swap_destination(
+                    destination_operation,
+                    9,
+                    1,
+                    operation,
+                    crate::vault::SwapUseId::first(operation),
+                    destination_executor,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("destination network"),
+                "{error:#}"
+            );
+            assert!(destination_record().issued().is_empty());
+        }
 
-        let fixture = BridgeOrderFixture::after_setup(
-            &store,
+        // A new account's setup is confirmed now. An existing account keeps the one it had.
+        let source_delegated =
+            existing_source.unwrap_or_else(|| delegate_setup(&store, operation, profile));
+        let fixture = BridgeOrderFixture::planned(
             &view,
-            profile,
             &swap_profile,
-            operation,
-            prepared.origin.context().executor,
+            source_delegated,
+            prepared.origin.executor(),
             delivery,
         );
         let executor = fixture.executor;
-        let delegated = delegate_setup(
-            &destination_store,
-            destination_operation,
-            destination_profile,
-        );
+        let delegated = existing_destination.unwrap_or_else(|| {
+            delegate_setup(
+                &destination_store,
+                destination_operation,
+                destination_profile,
+            )
+        });
+        // A reused destination's balance of the receiving token is read from the chain before
+        // each of its shields, so the chain holds its delegation and nonce.
+        if !destination_new {
+            rpc.set_delegated_account(
+                destination_executor,
+                destination_profile.delegate(),
+                delegated.observed().nonce(),
+            );
+        }
         // A completed destination setup still belongs to its origin swap, even before any
         // shield has been issued. It must not be offered or previewed for an unrelated swap.
         assert!(
@@ -2856,6 +2984,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             owner: &destination_owner,
             delegated,
             authorization: &destination_authorization,
+            notes: None,
         };
         let mut review = fixture.review.clone();
         review.set_bridge_for_tests(&crate::SwapBridgeQuote {
@@ -3042,6 +3171,49 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 Some(destination),
             )
         };
+        // The first order is signed for the accounts its approval binds. Another setup need or
+        // another account returns to review, and neither account signs. An approved new account
+        // that has no address yet takes its derived one, which is no change.
+        let bound = prepared.approval.accounts.unwrap();
+        let mut resetup = bound;
+        resetup.source.setup = !source_new;
+        let mut replaced = bound;
+        replaced.destination = Some(crate::vault::SwapApprovedAccount {
+            address: Some(Address::repeat_byte(0xee)),
+            setup: destination_new,
+        });
+        let mut unresolved = bound;
+        if source_new {
+            unresolved.source.address = None;
+        }
+        if destination_new {
+            unresolved.destination = Some(crate::vault::SwapApprovedAccount {
+                address: None,
+                setup: true,
+            });
+        }
+        for (accounts, changed) in [(resetup, true), (replaced, true), (unresolved, false)] {
+            let approval = SwapApproval {
+                accounts: Some(accounts),
+                ..prepared.approval.clone()
+            };
+            owner
+                .record_swap_approval(
+                    operation,
+                    crate::vault::SwapUseId::first(operation),
+                    approval,
+                )
+                .unwrap();
+            if changed {
+                assert_eq!(
+                    issue().await.unwrap(),
+                    SwapOrderOutcome::ReviewRequired(SwapReviewChange::Accounts)
+                );
+                fixture.assert_unsigned(&store, &submissions);
+                assert_eq!(destination_record().issued().len(), 1);
+            }
+        }
+
         *quoted.lock().unwrap() = (U256::from(999), false);
         assert_eq!(
             issue().await.unwrap(),
@@ -3180,6 +3352,46 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         assert_eq!(preimage.token.tokenAddress, POLYGON_WETH);
         assert!(preimage.value.is_zero());
 
+        // The swap's own account signed its hooks at its current nonce and the one after.
+        let source_nonce = source_delegated.observed().nonce();
+        let hooks = fixture.record(&store);
+        for (purpose, nonce) in [
+            (ExecutorPayloadPurpose::SwapPreHook, source_nonce),
+            (
+                ExecutorPayloadPurpose::SwapPostHook,
+                source_nonce + U256::ONE,
+            ),
+        ] {
+            assert!(
+                hooks
+                    .issued()
+                    .iter()
+                    .any(|payload| payload.purpose() == purpose && payload.nonce() == nonce)
+            );
+        }
+
+        // A retry of the same use signs its own shield at the same nonce, and the signature
+        // the order's deposit carries stays recorded.
+        let retried = destination_owner
+            .issue_swap_destination_shield(
+                delegated,
+                crate::vault::SwapUseId::first(operation),
+                POLYGON_WETH,
+                U256::from(1_001),
+                &destination_authorization,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(retried, shield_calldata);
+        let reissued = destination_record();
+        for calldata in [&shield_calldata, &retried] {
+            assert!(reissued.issued().iter().any(|payload| {
+                payload.context().calldata() == calldata
+                    && payload.nonce() == delegated.observed().nonce()
+            }));
+        }
+
         // The order keeps the signed recipient and message hash, and the private terms.
         let saved = fixture.record(&store).swap().unwrap().orders()[0].clone();
         assert_eq!(saved.uid(), uid);
@@ -3199,7 +3411,266 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             (
                 Some(crate::RAILGUN_PROTOCOL_FEE_BPS),
                 Some(U256::from(50)),
-                Some(U256::from(1_000)),
+                setup_fee(destination_new),
+            )
+        );
+
+        // The order trades and hands off, and its fill on the destination chain runs the
+        // shield. The destination account's record takes that outcome from its origin swap.
+        let (fill_block, fill) = (
+            BlockNumHash::new(15, B256::repeat_byte(15)),
+            B256::repeat_byte(0x61),
+        );
+        let traded = crate::vault::SwapObservation {
+            block: BlockNumHash::new(13, B256::repeat_byte(13)),
+            transaction_hash: Some(B256::repeat_byte(0x50)),
+        };
+        store
+            .record_swap_settlement(
+                operation,
+                uid,
+                traded,
+                crate::vault::SwapTradeAmounts {
+                    sell_amount: U256::from(997_500),
+                    buy_amount: U256::from(300_000_000_000_000_000_u64),
+                    fee_amount: U256::ZERO,
+                    settlement_gas_used: None,
+                    settlement_effective_gas_price: None,
+                    executed_fee: None,
+                    executed_fee_token: None,
+                },
+                None,
+                Some(crate::vault::SwapBridgeHandoff {
+                    observation: traded,
+                    deposit_id: Some(U256::from(77)),
+                }),
+            )
+            .unwrap();
+        store
+            .record_swap_bridge_outcome(
+                operation,
+                uid,
+                crate::vault::SwapBridgeOutcome::DeliveredVerified {
+                    block: fill_block,
+                    transaction_hash: fill,
+                    output_amount: U256::from(1_000),
+                    shielded: true,
+                },
+            )
+            .unwrap();
+        assert!(destination_store.reconcile_swap_destinations().unwrap());
+
+        // Another swap names both accounts. While the delivered swap's shields are still at
+        // the account's recorded nonce, the destination takes no other swap and signs nothing.
+        let second = crate::vault::SwapUseId::random().unwrap();
+        let mut second_approval = prepared.approval.clone();
+        let accounts = second_approval.accounts.as_mut().unwrap();
+        accounts.source.setup = false;
+        accounts.destination.as_mut().unwrap().setup = false;
+        let claim = || {
+            owner.claim_swap_use(
+                Some(&destination_owner),
+                crate::SwapUseClaim {
+                    id: second,
+                    source: crate::vault::SwapAccountChoice::Existing(operation),
+                    approval: second_approval.clone(),
+                    destination: Some(crate::vault::SwapAccountChoice::Existing(
+                        destination_operation,
+                    )),
+                },
+            )
+        };
+        let issued_count = || destination_record().issued().len();
+        let issued_before = issued_count();
+        assert!(claim().is_err());
+        assert_eq!(
+            destination_owner
+                .swap_account_refusal(
+                    destination_operation,
+                    SwapAccountRole::Destination {
+                        token: POLYGON_WETH
+                    },
+                )
+                .unwrap(),
+            Some(SwapAccountRefusal::UnfinishedWork)
+        );
+        let setup = destination_record().issued()[0].clone();
+        destination_store
+            .reconcile(
+                destination_operation,
+                ExecutorNonceObservation::new(
+                    BlockNumHash::new(20, B256::repeat_byte(20)),
+                    U256::from(2),
+                ),
+                &[(setup.hash(), setup.inclusion().unwrap())],
+            )
+            .unwrap();
+
+        // The account now has its delegation's code and execution nonce 2 on the chain.
+        rpc.state.head.store(40, Ordering::Relaxed);
+        rpc.set_delegated_account(
+            destination_executor,
+            destination_profile.delegate(),
+            U256::from(2),
+        );
+        let answer_call = |contract, word: Option<u64>| {
+            rpc.state
+                .calls
+                .lock()
+                .unwrap()
+                .insert(contract, word.map(U256::from));
+        };
+        // The settled former destination is offered in either role, and is admitted to place
+        // orders from its current state alone.
+        let offered = |candidates: Vec<crate::SwapAccountCandidate>| {
+            candidates
+                .iter()
+                .any(|candidate| candidate.operation() == destination_operation)
+        };
+        assert!(offered(
+            destination_owner.swap_account_candidates().unwrap()
+        ));
+        assert!(offered(
+            destination_owner
+                .swap_destination_candidates(POLYGON_WETH)
+                .unwrap()
+        ));
+        let sourced = destination_owner
+            .reuse_swap_account(
+                destination_operation,
+                39,
+                SwapAccountRole::Source,
+                SwapAccountUse::New,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sourced.expected_pre_hook_nonce(), U256::from(2));
+
+        // The second swap claims both accounts. Admission of its destination reads the
+        // earlier shield's note from the wallet's local notes: none, a blocked one and one
+        // without a verdict each refuse, despite the consumed nonce and an empty balance.
+        claim().unwrap();
+        let notes = ShieldNotes::default();
+        let shield_note = |status: Option<crate::PoiStatus>, spent: bool| {
+            let mut utxo = Utxo::new(
+                broadcaster_core::notes::Note::new_change(
+                    view.scan_keys().master_public_key,
+                    POLYGON_WETH,
+                    U256::from(1_000),
+                    [9; 16],
+                ),
+                0,
+                7,
+                UtxoSource {
+                    tx_hash: fill,
+                    block_number: fill_block.number,
+                    block_timestamp: 0,
+                },
+                UtxoCommitmentKind::Shield,
+            );
+            if let Some(status) = status {
+                for list in poi::poi::default_active_poi_list_keys() {
+                    utxo.poi.statuses.insert(list, status);
+                }
+            }
+            let mut note = crate::WalletUtxo::new(utxo);
+            if spent {
+                note.spent = Some(UtxoSource {
+                    tx_hash: B256::repeat_byte(0x62),
+                    block_number: fill_block.number + 1,
+                    block_timestamp: 0,
+                });
+            }
+            note
+        };
+        let hold = |note| *notes.0.lock().unwrap() = vec![note];
+        let admit = || {
+            destination_owner.delegated_swap_destination(
+                destination_operation,
+                39,
+                1,
+                operation,
+                second,
+                destination_executor,
+                Some(&notes),
+            )
+        };
+        let refusal = |error: eyre::Report| {
+            *error
+                .downcast_ref::<SwapAccountRefusal>()
+                .unwrap_or_else(|| panic!("{error:#}"))
+        };
+        let transaction_hash = fill;
+        assert_eq!(
+            refusal(admit().await.unwrap_err()),
+            SwapAccountRefusal::EarlierShieldUnknown { transaction_hash }
+        );
+        hold(shield_note(Some(crate::PoiStatus::ShieldBlocked), false));
+        assert_eq!(
+            refusal(admit().await.unwrap_err()),
+            SwapAccountRefusal::EarlierShieldBlocked { transaction_hash }
+        );
+        hold(shield_note(None, false));
+        assert_eq!(
+            refusal(admit().await.unwrap_err()),
+            SwapAccountRefusal::EarlierShieldPending { transaction_hash }
+        );
+        // A spent note needs no refund, whatever its verdict was, and an accepted one admits.
+        hold(shield_note(Some(crate::PoiStatus::ShieldBlocked), true));
+        admit().await.unwrap();
+        hold(shield_note(Some(crate::PoiStatus::Valid), false));
+        let reused = admit().await.unwrap();
+        assert_eq!(reused.observed().nonce(), U256::from(2));
+
+        // The shield is judged again when it is issued. A verdict that changed since
+        // admission, a balance of the receiving token and a balance that can't be read each
+        // issue nothing.
+        let issue_shield = || {
+            destination_owner.issue_swap_destination_shield(
+                reused,
+                second,
+                POLYGON_WETH,
+                U256::from(1_000),
+                &destination_authorization,
+                Some(&notes),
+            )
+        };
+        hold(shield_note(Some(crate::PoiStatus::ShieldBlocked), false));
+        assert_eq!(
+            refusal(issue_shield().await.unwrap_err()),
+            SwapAccountRefusal::EarlierShieldBlocked { transaction_hash }
+        );
+        hold(shield_note(Some(crate::PoiStatus::Valid), false));
+        answer_call(POLYGON_WETH, Some(5));
+        assert_eq!(
+            refusal(issue_shield().await.unwrap_err()),
+            SwapAccountRefusal::ReceivingBalance
+        );
+        answer_call(POLYGON_WETH, None);
+        assert_eq!(
+            refusal(issue_shield().await.unwrap_err()),
+            SwapAccountRefusal::ReceivingBalanceUnknown
+        );
+        assert_eq!(issued_count(), issued_before);
+
+        // Native currency in the account doesn't fail the balance rule. The shield is signed
+        // at the account's current nonce, and the first swap's shields stay recorded.
+        answer_call(POLYGON_WETH, Some(0));
+        rpc.state.native_balance.store(7, Ordering::Relaxed);
+        let reissued = issue_shield().await.unwrap();
+        let record = destination_record();
+        assert_eq!(record.issued().len(), issued_before + 1);
+        let payload = record.issued().last().unwrap();
+        assert_eq!(
+            (
+                payload.purpose(),
+                payload.nonce(),
+                payload.context().calldata()
+            ),
+            (
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                U256::from(2),
+                &reissued
             )
         );
 

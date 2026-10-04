@@ -67,6 +67,8 @@ impl ExecutorOwner {
             record.index(),
         )?;
         self.ensure_active()?;
+        // Registration hands the account to Public use, so its swap takes no further setup,
+        // order or shield on either chain. Payloads already issued keep their nonce guards.
         let account = self
             .store
             .register_public_account(operation, signer.address())?;
@@ -198,13 +200,9 @@ impl ExecutorOwner {
         if !record.issued().is_empty() || !record.recovery_transactions().is_empty() {
             // Never trust a previous session's completion or an observation that
             // may have been reorganized away. No local payload means no scan.
-            let mut chain = self.chain.clone();
-            chain
-                .railgun
-                .as_mut()
-                .ok_or_else(|| eyre!("chain does not support Railgun"))?
-                .deployment
-                .relay_adapt_7702_contract = record.delegate();
+            let mut chain = self
+                .chain_for_delegate(record.delegate())
+                .ok_or_else(|| eyre!("chain does not support Railgun"))?;
             chain.enabled = true;
             let (inspection, nonce) = self
                 .while_active(inspect_for_recovery_signing(

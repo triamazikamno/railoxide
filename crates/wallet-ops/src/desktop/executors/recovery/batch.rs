@@ -46,13 +46,9 @@ impl ExecutorOwner {
         };
         let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("historical executor profile is unavailable"))?;
-        let mut chain = self.chain.clone();
-        chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
         let (inspection, observed) = self
             .while_active(inspect_for_recovery_batch(
@@ -114,8 +110,9 @@ impl ExecutorOwner {
             signer.to_bytes().0,
         )?);
         self.ensure_active()?;
-        self.store.record_issued(
+        self.store.record_recovery_issued(
             prepared.operation,
+            prepared.expected_active_use,
             IssuedExecutorPayload::new(
                 nonce,
                 profile.delegate(),

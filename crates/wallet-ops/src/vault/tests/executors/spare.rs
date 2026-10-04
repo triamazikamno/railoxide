@@ -129,6 +129,11 @@ struct RpcState {
     native_balance: AtomicU64,
     changed: Notify,
     aggregate_response: Mutex<Option<Value>>,
+    /// Code of the accounts that have any. Every other account has none.
+    codes: Mutex<std::collections::BTreeMap<Address, Bytes>>,
+    /// The word an `eth_call` to a contract returns, or `None` for a call that fails. Calls to
+    /// any other contract return zero.
+    calls: Mutex<std::collections::BTreeMap<Address, Option<U256>>>,
 }
 
 struct Rpc {
@@ -166,6 +171,24 @@ impl Rpc {
             hold,
             task,
         }
+    }
+
+    fn set_delegated_account(&self, address: Address, delegate: Address, nonce: U256) {
+        use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
+        self.state.codes.lock().unwrap().insert(
+            address,
+            [
+                EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+                delegate.as_slice(),
+            ]
+            .concat()
+            .into(),
+        );
+        self.state
+            .calls
+            .lock()
+            .unwrap()
+            .insert(address, Some(nonce));
     }
 
     fn count_for(&self, address: Address) -> usize {
@@ -235,6 +258,9 @@ async fn serve(
         let _ = held.wait_for(|held| *held != address).await;
     }
     let used = address.is_some_and(|address| state.used.lock().unwrap().contains(&address));
+    let called = address
+        .filter(|_| request["method"] == "eth_call")
+        .and_then(|address| state.calls.lock().unwrap().get(&address).copied());
     let result = match request["method"].as_str().unwrap() {
         "eth_chainId" | "eth_gasPrice" => json!("0x1"),
         "eth_blockNumber" => json!(format!("0x{:x}", state.head.load(Ordering::Relaxed))),
@@ -253,9 +279,13 @@ async fn serve(
             "0x{:x}",
             state.native_balance.load(Ordering::Relaxed)
         )),
-        "eth_getCode" => json!("0x"),
+        "eth_getCode" => json!(
+            address
+                .and_then(|address| state.codes.lock().unwrap().get(&address).cloned())
+                .unwrap_or_default()
+        ),
         "eth_getStorageAt" => json!(B256::from(U256::from(u8::from(used)))),
-        "eth_call" => json!(B256::ZERO),
+        "eth_call" => json!(B256::from(called.flatten().unwrap_or_default())),
         "eth_maxPriorityFeePerGas" => json!("0x0"),
         "eth_feeHistory" => json!({
             "oldestBlock": "0x0", "baseFeePerGas": ["0x1", "0x1"],
@@ -265,7 +295,7 @@ async fn serve(
         "eth_estimateGas" => Value::Null,
         method => panic!("unexpected RPC method {method}"),
     };
-    let mut response = if request["method"] == "eth_estimateGas" {
+    let mut response = if request["method"] == "eth_estimateGas" || called == Some(None) {
         json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "test submission rejected"}})
     } else {
         json!({"jsonrpc": "2.0", "id": request["id"], "result": result})

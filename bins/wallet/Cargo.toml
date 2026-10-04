@@ -57,6 +57,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Wind
 [dev-dependencies]
 broadcaster-core = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
 wallet-ops = { path = "../../crates/wallet-ops", features = ["test-support"] }

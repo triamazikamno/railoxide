@@ -580,16 +580,16 @@ impl ExecutorOwner {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         let record = self.validate_preparation(prepared)?;
-        let mut chain = Box::new(self.chain.clone());
-        if prepared.recovery.is_some() {
-            chain
-                .railgun
-                .as_mut()
-                .ok_or_else(|| eyre!("chain does not support Railgun"))?
-                .deployment
-                .relay_adapt_7702_contract = record.delegate();
+        let chain = if prepared.recovery.is_some() {
+            let mut chain = self
+                .chain_for_delegate(record.delegate())
+                .ok_or_else(|| eyre!("chain does not support Railgun"))?;
             chain.enabled = true;
-        }
+            chain
+        } else {
+            self.chain.clone()
+        };
+        let chain = Box::new(chain);
         let profile = chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
@@ -804,20 +804,26 @@ impl ExecutorOwner {
                 .history_start(observed, self.chain.finality_depth);
             payload_context = payload_context.with_history_start(history_start);
         }
-        self.store.record_issued(
-            prepared.operation,
-            IssuedExecutorPayload::new(
-                observed.nonce(),
-                profile.delegate(),
-                hash,
-                if prepared.recovery.is_some() {
-                    ExecutorPayloadPurpose::Recovery
-                } else {
-                    ExecutorPayloadPurpose::Operation
-                },
-                payload_context,
-            ),
-        )?;
+        let payload = IssuedExecutorPayload::new(
+            observed.nonce(),
+            profile.delegate(),
+            hash,
+            if prepared.recovery.is_some() {
+                ExecutorPayloadPurpose::Recovery
+            } else {
+                ExecutorPayloadPurpose::Operation
+            },
+            payload_context,
+        );
+        if let Some(recovery) = &prepared.recovery {
+            self.store.record_recovery_issued(
+                prepared.operation,
+                recovery.expected_active_use,
+                payload,
+            )?;
+        } else {
+            self.store.record_issued(prepared.operation, payload)?;
+        }
         self.unused
             .lock()
             .map_err(|_| eyre!("executor preparation is unavailable"))?

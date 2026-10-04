@@ -237,6 +237,7 @@ mod tests {
         let prepared = PreparedExecutorRecovery {
             operation: approval.operation,
             recovery: ExecutorOperationId::random().unwrap(),
+            expected_active_use: None,
             generation: 0,
             owner: tokio::sync::watch::channel(false).0,
             source: approval.source,

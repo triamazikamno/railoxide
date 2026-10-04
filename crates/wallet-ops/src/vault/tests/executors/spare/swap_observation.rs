@@ -2,6 +2,7 @@
 //! reorgs that remove the evidence an observation or a reservation release rests on.
 
 use super::*;
+use crate::vault::{SwapAccountRefusal, SwapAccountRole, SwapAccountUse};
 use crate::{SwapOrderState, swap_order_state};
 use alloy::consensus::transaction::Recovered;
 use alloy::consensus::{
@@ -35,6 +36,32 @@ alloy::sol! {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Trade(address indexed owner, address sellToken, address buyToken, uint256 sellAmount, uint256 buyAmount, uint256 feeAmount, bytes orderUid);
     function filledAmount(bytes orderUid) external view returns (uint256);
+}
+
+fn swap_bounds() -> SwapApprovedBounds {
+    SwapApprovedBounds {
+        sell_amount: U256::from(SELL_AMOUNT),
+        unshield_amount: None,
+        unshield_fee_bps: U256::ZERO,
+        buy_amount: U256::from(BUY_AMOUNT),
+        private_minimum: U256::from(9_975),
+        shield_fee_bps: U256::from(25),
+        slippage_bps: 50,
+        pre_hook_gas_limit: 1,
+        post_hook_gas_limit: Some(1),
+        hook_cost: Some(U256::ZERO),
+        anchors: Vec::new(),
+        destination_minimum: None,
+        gas_share_bps: None,
+        gas_estimate: None,
+        gas_allowance: None,
+        gas_price_wei: None,
+        valid_for_secs: None,
+        destination_shield_fee_bps: None,
+        delivery_allowance: None,
+        destination_setup_fee: None,
+        source_setup_fee: None,
+    }
 }
 
 const fn timestamp(number: u64) -> u64 {
@@ -663,6 +690,51 @@ impl Fixture {
         bridge: Option<BridgeOrderTerms>,
     ) {
         let post_hook = delivery.has_post_hook();
+        let bounds = SwapApprovedBounds {
+            post_hook_gas_limit: post_hook.then_some(1),
+            destination_minimum: match &bridge {
+                Some(BridgeOrderTerms::Across(terms)) => Some(terms.output_amount),
+                Some(BridgeOrderTerms::NearIntents(terms)) => Some(terms.min_amount_out),
+                None => None,
+            },
+            ..swap_bounds()
+        };
+        // A private Bridge order is recorded only for a use that names the destination
+        // stealth account serving it.
+        if let SwapDelivery::Bridge(bridge) = delivery
+            && bridge.is_private()
+        {
+            let destination = ExecutorOperationId::random().unwrap();
+            let destination_store =
+                ExecutorStore::new(self.db.clone(), self.view.clone(), bridge.destination_chain)
+                    .unwrap();
+            self.store
+                .claim_swap_pair(crate::vault::SwapPairClaim {
+                    id: crate::vault::SwapUseId::first(self.operation),
+                    source: crate::vault::SwapAccountChoice::Existing(self.operation),
+                    delegate: self.delegate,
+                    purpose_summary: None,
+                    assets: Vec::new(),
+                    approval: SwapApproval {
+                        bounds: bounds.clone(),
+                        price_verified: None,
+                        price_acknowledged: false,
+                        delivery,
+                        tokens: Some(SwapApprovalTokens { sell: SELL, buy }),
+                        accounts: None,
+                    },
+                    destination: Some(crate::vault::SwapDestinationClaim {
+                        chain_id: bridge.destination_chain,
+                        account: crate::vault::SwapAccountChoice::New(destination),
+                        delegate: self.delegate,
+                        destination_token: bridge.destination_token,
+                    }),
+                })
+                .unwrap();
+            destination_store
+                .bind_address(destination, bridge.receiver)
+                .unwrap();
+        }
         let mut shield = post_hook_shield(attempt);
         shield.preimage.token = TokenData::erc20(buy);
         let observed = self.record().nonce_observation().unwrap();
@@ -672,6 +744,7 @@ impl Fixture {
             .record_swap_attempt(
                 self.operation,
                 SwapAttempt {
+                    use_id: crate::vault::SwapUseId::first(self.operation),
                     submission: None,
                     terms: SwapTerms::new(
                         SELL,
@@ -682,34 +755,7 @@ impl Fixture {
                     proof: SwapProof::new(B256::repeat_byte(0x20), inputs.clone()),
                     uid: uid(attempt, valid_to_block),
                     delivery,
-                    bounds: SwapApprovedBounds {
-                        sell_amount: U256::from(SELL_AMOUNT),
-                        unshield_amount: None,
-                        unshield_fee_bps: U256::ZERO,
-                        buy_amount: U256::from(BUY_AMOUNT),
-                        private_minimum: U256::from(9_975),
-                        shield_fee_bps: U256::from(25),
-                        slippage_bps: 50,
-                        pre_hook_gas_limit: 1,
-                        post_hook_gas_limit: post_hook.then_some(1),
-                        hook_cost: Some(U256::ZERO),
-                        anchors: Vec::new(),
-                        destination_minimum: match &bridge {
-                            Some(BridgeOrderTerms::Across(terms)) => Some(terms.output_amount),
-                            Some(BridgeOrderTerms::NearIntents(terms)) => {
-                                Some(terms.min_amount_out)
-                            }
-                            None => None,
-                        },
-                        gas_share_bps: None,
-                        gas_estimate: None,
-                        gas_allowance: None,
-                        gas_price_wei: None,
-                        valid_for_secs: None,
-                        destination_shield_fee_bps: None,
-                        delivery_allowance: None,
-                        destination_setup_fee: None,
-                    },
+                    bounds,
                     invalidates: None,
                     pre_hook: IssuedExecutorPayload::new(
                         U256::from(nonce),
@@ -919,7 +965,11 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
     assert_eq!(
         fixture
             .owner
-            .refresh_swap_executor(&mut review, 15)
+            .refresh_swap_executor(
+                &mut review,
+                15,
+                crate::vault::SwapUseId::first(fixture.operation),
+            )
             .await
             .unwrap(),
         None
@@ -963,7 +1013,11 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
     assert!(
         fixture
             .owner
-            .refresh_swap_executor(&mut review, 15)
+            .refresh_swap_executor(
+                &mut review,
+                15,
+                crate::vault::SwapUseId::first(fixture.operation),
+            )
             .await
             .is_err()
     );
@@ -981,7 +1035,12 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
     assert_eq!(listed_after_restart.address(), EXECUTOR);
     let selected = fixture
         .owner
-        .reuse_swap_account(fixture.operation, 13)
+        .reuse_swap_account(
+            fixture.operation,
+            13,
+            SwapAccountRole::Source,
+            SwapAccountUse::New,
+        )
         .await
         .unwrap();
     assert_eq!(selected.executor(), EXECUTOR);
@@ -991,6 +1050,19 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
         listed(&fixture.owner, fixture.operation).is_none(),
         "an order that can still execute keeps the account out of the list"
     );
+    // The same order keeps it from either role, with the reason the form shows.
+    for role in [
+        SwapAccountRole::Source,
+        SwapAccountRole::Destination { token: OTHER_BUY },
+    ] {
+        assert_eq!(
+            fixture
+                .owner
+                .swap_account_refusal(fixture.operation, role)
+                .unwrap(),
+            Some(SwapAccountRefusal::PreviousOrderLive)
+        );
+    }
     let expired = fixture.observe(31, 20).await;
     assert!(expired.swap().unwrap().admits_attempt());
     fixture.store.set_hidden(fixture.operation, true).unwrap();
@@ -1005,9 +1077,15 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
         .unwrap();
     assert!(preview.is_reused());
     assert!(fixture.chain.lock().unwrap().rpc_methods.is_empty());
+    // The ended order isn't settled history, so admission reconciles it before judging.
     let selected = fixture
         .owner
-        .reuse_swap_account(fixture.operation, 30)
+        .reuse_swap_account(
+            fixture.operation,
+            30,
+            SwapAccountRole::Source,
+            SwapAccountUse::New,
+        )
         .await
         .unwrap();
     assert_eq!(selected.executor(), EXECUTOR);
@@ -1025,12 +1103,20 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
         "checking setup and prior orders must share one history reconciliation"
     );
     fixture.record_pair_attempt(1, 100, OTHER_BUY);
-    assert!(
-        fixture
-            .owner
-            .reuse_swap_account(fixture.operation, 30)
-            .await
-            .is_err()
+    let refused = fixture
+        .owner
+        .reuse_swap_account(
+            fixture.operation,
+            30,
+            SwapAccountRole::Source,
+            SwapAccountUse::New,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.downcast_ref::<SwapAccountRefusal>(),
+        Some(&SwapAccountRefusal::PreviousOrderLive),
+        "{refused:#}"
     );
     {
         let mut chain = fixture.chain.lock().unwrap();
@@ -1075,8 +1161,50 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
 async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
     let fixture = Fixture::start().await;
     assert!(listed(&fixture.owner, fixture.operation).is_some());
+    let refusal = |operation| {
+        fixture
+            .owner
+            .swap_account_refusal(operation, SwapAccountRole::Source)
+            .unwrap()
+    };
+    assert_eq!(refusal(fixture.operation), None);
+    // Each restriction keeps an account out of the list for its own reason: a delegate this
+    // chain doesn't accept, an account kept for recovery, and one registered in Public.
+    let [foreign, public] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    for (operation, delegate, address) in [
+        (foreign, Address::repeat_byte(7), Address::repeat_byte(0x71)),
+        (public, fixture.delegate, Address::repeat_byte(0x72)),
+    ] {
+        fixture
+            .store
+            .reserve(operation, delegate, Some("Private swap"), &[])
+            .unwrap();
+        fixture.store.bind_address(operation, address).unwrap();
+    }
+    fixture
+        .store
+        .register_public_account(public, Address::repeat_byte(0x72))
+        .unwrap();
+    let recovered = fixture
+        .store
+        .restore_index(40, Address::repeat_byte(0x73), fixture.delegate, &[])
+        .unwrap()
+        .operation();
+    assert_eq!(
+        [foreign, public, recovered].map(refusal),
+        [
+            Some(SwapAccountRefusal::UnsupportedDelegate),
+            Some(SwapAccountRefusal::RegisteredInPublic),
+            Some(SwapAccountRefusal::RecoveryOnly),
+        ]
+    );
+    assert_eq!(fixture.owner.swap_account_candidates().unwrap().len(), 1);
     fixture.owner.stop_swap_setup(fixture.operation).unwrap();
     assert!(listed(&fixture.owner, fixture.operation).is_none());
+    assert_eq!(
+        refusal(fixture.operation),
+        Some(SwapAccountRefusal::RecoveryOnly)
+    );
     fixture.finish().await;
 
     // A setup whose approved order still awaits placement belongs to that swap.
@@ -1085,37 +1213,25 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
         .owner
         .record_swap_approval(
             fixture.operation,
+            SwapUseId::first(fixture.operation),
             SwapApproval {
-                bounds: SwapApprovedBounds {
-                    sell_amount: U256::from(SELL_AMOUNT),
-                    unshield_amount: None,
-                    unshield_fee_bps: U256::ZERO,
-                    buy_amount: U256::from(BUY_AMOUNT),
-                    private_minimum: U256::from(9_975),
-                    shield_fee_bps: U256::from(25),
-                    slippage_bps: 50,
-                    pre_hook_gas_limit: 1,
-                    post_hook_gas_limit: Some(1),
-                    hook_cost: Some(U256::ZERO),
-                    anchors: Vec::new(),
-                    destination_minimum: None,
-                    gas_share_bps: None,
-                    gas_estimate: None,
-                    gas_allowance: None,
-                    gas_price_wei: None,
-                    valid_for_secs: None,
-                    destination_shield_fee_bps: None,
-                    delivery_allowance: None,
-                    destination_setup_fee: None,
-                },
+                bounds: swap_bounds(),
                 price_verified: Some(false),
                 price_acknowledged: true,
                 delivery: SwapDelivery::Reshield,
                 tokens: None,
+                accounts: None,
             },
         )
         .unwrap();
     assert!(listed(&fixture.owner, fixture.operation).is_none());
+    assert_eq!(
+        fixture
+            .owner
+            .swap_account_refusal(fixture.operation, SwapAccountRole::Source)
+            .unwrap(),
+        Some(SwapAccountRefusal::ClaimedByAnotherSwap)
+    );
     fixture.finish().await;
 }
 
@@ -1999,9 +2115,9 @@ fn assert_block_only_requests(requests: &[Value], block: BlockNumHash) {
 
 #[tokio::test]
 async fn pending_observations_release_activity_and_reject_concurrent_changes() {
-    // Exercise both history reconciliation and receipt-only settlement: neither may
-    // hold activity over RPC, and neither may overwrite a changed local record.
-    for settlement in [false, true] {
+    // Exercise history reconciliation, receipt-only settlement and a settled account's reuse
+    // refresh: none may hold activity over RPC, and none may overwrite a changed local record.
+    for path in ["history", "settlement", "settled reuse"] {
         let fixture = Fixture::start().await;
         fixture.record_attempt(1, 20);
         let logs = settlement_logs(&fixture, 1, 20);
@@ -2009,6 +2125,15 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
             let mut chain = fixture.chain.lock().unwrap();
             chain.head = 16;
             chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
+        }
+        if path == "settled reuse" {
+            // The order is settled history and both of its hooks' nonces are consumed.
+            fixture
+                .owner
+                .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+                .await
+                .unwrap();
+            fixture.chain.lock().unwrap().nonces.push((15, 3));
         }
         let gate = crate::rpc_broker::tests::RpcMockGate {
             request_started: Arc::default(),
@@ -2034,12 +2159,17 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
         .unwrap();
         let operation = fixture.operation;
         let pending = async {
-            if settlement {
-                owner
-                    .observe_swap_settlement(operation, uid(1, 20), 15)
+            match path {
+                "settlement" => {
+                    owner
+                        .observe_swap_settlement(operation, uid(1, 20), 15)
+                        .await
+                }
+                "settled reuse" => owner
+                    .reuse_swap_account(operation, 15, SwapAccountRole::Source, SwapAccountUse::New)
                     .await
-            } else {
-                owner.reconcile_history(operation, 15..16).await.map(|_| ())
+                    .map(|_| ()),
+                _ => owner.reconcile_history(operation, 15..16).await.map(|_| ()),
             }
         };
         tokio::pin!(pending);
@@ -2184,19 +2314,14 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
         chain.head = 17;
         chain.nonces.push((15, 2));
     }
-    assert!(
-        restarted
-            .reuse_swap_account(fixture.operation, 16)
-            .await
-            .is_err()
-    );
+    let reuse =
+        |role| restarted.reuse_swap_account(fixture.operation, 16, role, SwapAccountUse::New);
+    // A stale nonce, still at the post-hook's, can't refresh the settled account.
+    assert!(reuse(SwapAccountRole::Source).await.is_err());
     assert_eq!(fixture.record().nonce_observation(), nonce_before);
     fixture.chain.lock().unwrap().nonces.push((15, 3));
     fixture.chain.lock().unwrap().rpc_requests.clear();
-    let reused = restarted
-        .reuse_swap_account(fixture.operation, 16)
-        .await
-        .unwrap();
+    let reused = reuse(SwapAccountRole::Source).await.unwrap();
     assert_eq!(reused.expected_pre_hook_nonce(), U256::from(3));
     let checked = fixture.record();
     assert!(
@@ -2213,8 +2338,26 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
             .is_none(),
         "current nonce admission must not fabricate a historical hook winner"
     );
+    // The settled account's former role doesn't bind it: it is listed and admitted as another
+    // swap's destination through the same refresh, with its order history kept.
+    assert!(
+        restarted
+            .swap_destination_candidates(OTHER_BUY)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.operation() == fixture.operation)
+    );
+    let received = reuse(SwapAccountRole::Destination { token: OTHER_BUY })
+        .await
+        .unwrap();
+    assert_eq!(
+        received.delegated().unwrap().observed().nonce(),
+        U256::from(3)
+    );
+    assert_eq!(fixture.record().swap(), checked.swap());
     {
         let chain = fixture.chain.lock().unwrap();
+        assert!(!chain.rpc_requests.is_empty());
         for request in &chain.rpc_requests {
             match request["method"].as_str().unwrap() {
                 "eth_chainId" | "eth_blockNumber" | "eth_getCode" => {}

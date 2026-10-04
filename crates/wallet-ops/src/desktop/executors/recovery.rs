@@ -19,7 +19,7 @@ use crate::desktop::executor_discovery::{
 };
 use crate::public_wallet::{PublicErc20, public_native_action_gas_units_with_buffer};
 use crate::settings::ExecutorProfile;
-use crate::vault::{ExecutorOperationId, ExecutorRecord};
+use crate::vault::{ExecutorOperationId, ExecutorRecord, SwapUseId};
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorInspection,
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicBroadcasterCandidate,
@@ -33,11 +33,11 @@ mod retry;
 mod submission;
 pub use approval::ExecutorRecoveryApproval;
 pub use output::{ExecutorRecoveryOutputId, ExecutorRecoveryOutputStatus};
-pub(super) use paid::PaidExecutionPurpose;
 pub use paid::{
     ExecutorPaidRecoveryOutcome, ExecutorPaidRecoveryRequest, ExecutorPrivateFeeLimitExceeded,
     ExecutorRecoveryFeeEstimate,
 };
+pub(super) use paid::{PaidExecutionPurpose, require_private_fee_limit};
 pub use retry::PreparedExecutorRecoveryRetry;
 
 /// Describe retained recovery calls for history display, without authorizing execution.
@@ -108,6 +108,7 @@ pub struct ExecutorRecoveryStepOutcome {
 pub struct PreparedExecutorRecovery {
     operation: ExecutorOperationId,
     recovery: ExecutorOperationId,
+    pub(super) expected_active_use: Option<SwapUseId>,
     generation: u64,
     owner: tokio::sync::watch::Sender<bool>,
     source: Address,
@@ -330,13 +331,9 @@ impl ExecutorOwner {
             ));
         }
         // Reading a recorded accepted profile also works while new allocation is disabled.
-        let mut chain = self.chain.clone();
-        chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
         let inspection = self
             .while_active(inspect_recovery_executor(
@@ -457,6 +454,16 @@ impl ExecutorOwner {
         let maximum_native_fee =
             recovery_funding_admission(&inspection, inspected, amount, &funding, &gas_limits)?;
         self.ensure_active()?;
+        // An admitted recovery of an asset stops the account's swap use: no further setup,
+        // order or shield is issued for it on either chain. An early cancellation recovers no
+        // asset and leaves its swap free to retry.
+        let record = if asset.is_some() {
+            let record = self.store.stop_swap_use(operation)?;
+            self.notify_change();
+            record
+        } else {
+            self.recovery_record(operation)?
+        };
         let recovery = ExecutorOperationId::random()?;
         if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
             hardware.bind_recovery(recovery)?;
@@ -464,6 +471,7 @@ impl ExecutorOwner {
         Ok(PreparedExecutorRecovery {
             operation,
             recovery,
+            expected_active_use: record.active_swap_use(),
             generation: self.generation,
             owner: self.closed.clone(),
             source,
@@ -490,6 +498,9 @@ impl ExecutorOwner {
             return Err(eyre!("recovery belongs to an inactive wallet session"));
         }
         let record = self.recovery_record(prepared.operation)?;
+        if record.active_swap_use() != prepared.expected_active_use {
+            return Err(eyre!("account swap claim changed; review recovery again"));
+        }
         if record.address() != Some(prepared.source)
             || record.delegate() != prepared.delegate
             || self.view.receive_address()? != prepared.recipient

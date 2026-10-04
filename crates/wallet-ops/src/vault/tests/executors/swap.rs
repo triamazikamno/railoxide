@@ -82,33 +82,16 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
         setup,
     );
     let bounds = SwapApprovedBounds {
-        sell_amount: U256::from(9_975),
-        unshield_amount: Some(U256::from(10_000)),
-        unshield_fee_bps: U256::from(25),
-        buy_amount: U256::from(9_999),
-        private_minimum: U256::from(9_975),
-        shield_fee_bps: U256::from(25),
-        slippage_bps: 50,
-        pre_hook_gas_limit: 900_000,
-        post_hook_gas_limit: Some(300_000),
-        hook_cost: Some(U256::ZERO),
         anchors: vec![SwapAnchorObservation {
             source: Address::repeat_byte(10),
             block: observed.block(),
             block_timestamp: 1_700_000_000,
             updated_at: Some(1_699_990_000),
         }],
-        destination_minimum: None,
-        gas_share_bps: None,
-        gas_estimate: None,
-        gas_allowance: None,
-        gas_price_wei: None,
-        valid_for_secs: None,
-        destination_shield_fee_bps: None,
-        delivery_allowance: None,
-        destination_setup_fee: None,
+        ..swap_bounds()
     };
     let attempt = |digest: u8, valid_to: u32, hooks: u8, post_nonce: u64| SwapAttempt {
+        use_id: SwapUseId::first(operation),
         submission: None,
         terms,
         proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
@@ -149,13 +132,14 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
     // issued and even if a caller bypasses the reusable-account list.
     let destination = ExecutorOperationId::random().unwrap();
     let destination_executor = Address::repeat_byte(90);
+    let destination_origin = ExecutorOperationId::random().unwrap();
     store
         .reserve_swap_destination(
             destination,
             delegate,
             SwapDestinationRecord {
                 origin_chain: 137,
-                origin_operation: ExecutorOperationId::random().unwrap(),
+                origin_operation: destination_origin,
                 destination_token: Address::repeat_byte(6),
                 outcome: None,
             },
@@ -164,6 +148,12 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
     set_up(&store, destination, delegate, destination_executor);
     let mut unrelated = first.clone();
     unrelated.uid = OrderUid::new(B256::repeat_byte(30), destination_executor, 1_000);
+    // An order for another use than the one that claims the account is refused as such.
+    assert!(matches!(
+        store.record_swap_attempt(destination, unrelated.clone()),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    unrelated.use_id = SwapUseId::first(destination_origin);
     assert!(matches!(
         store.record_swap_attempt(destination, unrelated),
         Err(ExecutorStoreError::OperationMismatch)
@@ -981,6 +971,7 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
     let receiver = Address::repeat_byte(9);
     let external = SwapDelivery::External { receiver };
     let attempt = |delivery: SwapDelivery, post_hook: Option<IssuedExecutorPayload>| SwapAttempt {
+        use_id: SwapUseId::first(operation),
         submission: None,
         // A native Buy asset, paid to the receiver directly.
         terms: SwapTerms::new(
@@ -993,26 +984,9 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
         uid: OrderUid::new(B256::repeat_byte(30), executor, 1_000),
         delivery,
         bounds: SwapApprovedBounds {
-            sell_amount: U256::from(9_975),
-            unshield_amount: Some(U256::from(10_000)),
-            unshield_fee_bps: U256::from(25),
             buy_amount: U256::from(9_975),
-            private_minimum: U256::from(9_975),
-            shield_fee_bps: U256::from(25),
-            slippage_bps: 50,
-            pre_hook_gas_limit: 900_000,
             post_hook_gas_limit: None,
-            hook_cost: Some(U256::ZERO),
-            anchors: Vec::new(),
-            destination_minimum: None,
-            gas_share_bps: None,
-            gas_estimate: None,
-            gas_allowance: None,
-            gas_price_wei: None,
-            valid_for_secs: None,
-            destination_shield_fee_bps: None,
-            delivery_allowance: None,
-            destination_setup_fee: None,
+            ..swap_bounds()
         },
         invalidates: None,
         pre_hook: hook(
@@ -1239,6 +1213,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
          post_hook: bool,
          (buy, uid, nonce, observed): (u8, u8, u64, ExecutorNonceObservation)| {
             SwapAttempt {
+                use_id: SwapUseId::first(operation),
                 terms: SwapTerms::new(
                     sell,
                     Address::repeat_byte(buy),
@@ -1250,26 +1225,11 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
                 submission: None,
                 delivery,
                 bounds: SwapApprovedBounds {
-                    sell_amount: U256::from(9_975),
-                    unshield_amount: Some(U256::from(10_000)),
-                    unshield_fee_bps: U256::from(25),
                     buy_amount: U256::from(9_975),
-                    private_minimum: U256::from(9_975),
                     shield_fee_bps: U256::ZERO,
-                    slippage_bps: 50,
-                    pre_hook_gas_limit: 900_000,
                     post_hook_gas_limit: post_hook.then_some(400_000),
-                    hook_cost: Some(U256::ZERO),
-                    anchors: Vec::new(),
                     destination_minimum: Some(U256::from(9_900)),
-                    gas_share_bps: None,
-                    gas_estimate: None,
-                    gas_allowance: None,
-                    gas_price_wei: None,
-                    valid_for_secs: None,
-                    destination_shield_fee_bps: None,
-                    delivery_allowance: None,
-                    destination_setup_fee: None,
+                    ..swap_bounds()
                 },
                 invalidates: None,
                 pre_hook: hook(
@@ -1882,6 +1842,148 @@ fn set_up(
     observed
 }
 
+/// The delegate of `chain_id`'s accepted executor profile. Only an account delegated to it
+/// takes another swap use.
+fn accepted_delegate(chain_id: u64) -> Address {
+    crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+        .unwrap()
+        .get(chain_id)
+        .unwrap()
+        .accepted_executor_profile()
+        .unwrap()
+        .delegate()
+}
+
+fn private_bridge_delivery(
+    receiver: Address,
+    token: Address,
+    failure: BridgeShieldFailure,
+) -> BridgeDelivery {
+    BridgeDelivery {
+        provider: BridgeProvider::Across,
+        destination_chain: 137,
+        receiver,
+        destination_token: token,
+        surplus: BridgeSurplus::KeepInAccount,
+        private: Some(BridgePrivateDelivery {
+            on_shield_failure: failure,
+        }),
+    }
+}
+
+/// A private Across order of the swap `origin`'s first use, signed by its account `executor`
+/// at `observed`, that delivers `token` on chain 137 to the destination account `receiver`.
+fn private_across_attempt(
+    origin: ExecutorOperationId,
+    executor: Address,
+    delegate: Address,
+    observed: ExecutorNonceObservation,
+    receiver: Address,
+    token: Address,
+) -> SwapAttempt {
+    let inputs = swap_inputs();
+    let buy = Address::repeat_byte(6);
+    SwapAttempt {
+        use_id: SwapUseId::first(origin),
+        terms: SwapTerms::new(
+            Address::repeat_byte(5),
+            buy,
+            SwapRecipient::new(U256::from(7), [8; 32]),
+            B256::repeat_byte(3),
+        ),
+        proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+        uid: OrderUid::new(B256::repeat_byte(30), executor, 1_000),
+        submission: None,
+        delivery: SwapDelivery::Bridge(private_bridge_delivery(
+            receiver,
+            token,
+            BridgeShieldFailure::RefundOnOrigin,
+        )),
+        bounds: SwapApprovedBounds {
+            destination_minimum: Some(U256::from(9_900)),
+            ..swap_bounds()
+        },
+        invalidates: None,
+        pre_hook: hook(
+            ExecutorPayloadPurpose::SwapPreHook,
+            1,
+            31,
+            delegate,
+            observed,
+            inputs,
+        ),
+        post_hook: Some(hook(
+            ExecutorPayloadPurpose::SwapPostHook,
+            2,
+            32,
+            delegate,
+            observed,
+            Vec::new(),
+        )),
+        bridge: Some(BridgeOrderTerms::Across(AcrossOrderTerms {
+            spoke_pool: Address::repeat_byte(11),
+            input_token: buy,
+            output_token: token,
+            input_amount: U256::from(9_975),
+            output_amount: U256::from(9_900),
+            quote_timestamp: 1_700_000_000,
+            fill_deadline: 1_700_021_600,
+            exclusive_relayer: Address::ZERO,
+            exclusivity_parameter: 0,
+            recipient: Some(Address::repeat_byte(12)),
+            message_hash: Some(B256::repeat_byte(13)),
+        })),
+    }
+}
+
+/// Record the order `uid`'s trade and Across hand-off, then its fill on the destination chain
+/// in `transaction_hash` at `block`, which ran the destination account's shield.
+fn deliver_shielded(
+    store: &ExecutorStore,
+    operation: ExecutorOperationId,
+    uid: OrderUid,
+    block: BlockNumHash,
+    transaction_hash: B256,
+) {
+    let traded = SwapObservation {
+        block: BlockNumHash::new(13, B256::repeat_byte(13)),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    store
+        .record_swap_settlement(
+            operation,
+            uid,
+            traded,
+            SwapTradeAmounts {
+                sell_amount: U256::from(9_975),
+                buy_amount: U256::from(10_000),
+                fee_amount: U256::ZERO,
+                settlement_gas_used: None,
+                settlement_effective_gas_price: None,
+                executed_fee: None,
+                executed_fee_token: None,
+            },
+            None,
+            Some(SwapBridgeHandoff {
+                observation: traded,
+                deposit_id: Some(U256::from(77)),
+            }),
+        )
+        .unwrap();
+    store
+        .record_swap_bridge_outcome(
+            operation,
+            uid,
+            SwapBridgeOutcome::DeliveredVerified {
+                block,
+                transaction_hash,
+                output_amount: U256::from(9_900),
+                shielded: true,
+            },
+        )
+        .unwrap();
+}
+
 #[test]
 fn swap_destination_records_link_to_their_origin_and_unreferenced_ones_retire() {
     let (root, db, vault) = desktop_store_with_vault();
@@ -1987,7 +2089,9 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
     ));
     let origin_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
     let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
-    let delegate = Address::repeat_byte(1);
+    // The destination's delegate is its chain's accepted one, so only its unresolved work keeps
+    // it from another swap.
+    let delegate = accepted_delegate(137);
     let (executor, destination_executor) = (Address::repeat_byte(2), Address::repeat_byte(9));
     let (sell, buy, token) = (
         Address::repeat_byte(5),
@@ -2039,6 +2143,33 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
         origin_store.record_issued(origin, shield(70)),
         Err(ExecutorStoreError::OperationMismatch)
     ));
+    // Nor does a destination whose origin swap names another account for this use.
+    let (stray, stray_executor) = (
+        ExecutorOperationId::random().unwrap(),
+        Address::repeat_byte(8),
+    );
+    store
+        .reserve_swap_destination(
+            stray,
+            delegate,
+            SwapDestinationRecord {
+                origin_chain: 1,
+                origin_operation: origin,
+                destination_token: token,
+                outcome: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(set_up(&store, stray, delegate, stray_executor), observed);
+    assert!(matches!(
+        store.record_issued(stray, shield(70)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    // A shield signed for another use than the one that claims the account is refused.
+    assert!(matches!(
+        store.record_swap_destination_shield(destination, SwapUseId::random().unwrap(), shield(70)),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
     let issued = store.record_issued(destination, shield(70)).unwrap();
     // Recovery admission asks the first two: whether a payload competes at the recovery's
     // nonce, and whether its review warns of one.
@@ -2055,96 +2186,58 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
     assert_eq!((issued.issued().len(), issued.is_retired()), (3, false));
 
     // The origin's private Across order names the destination account as its receiver.
-    let input = Utxo::new(
-        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
-        2,
-        3,
-        UtxoSource {
-            tx_hash: B256::repeat_byte(9),
-            block_number: 1,
-            block_timestamp: 1,
-        },
-        UtxoCommitmentKind::Transact,
+    let delivery = private_bridge_delivery(
+        destination_executor,
+        token,
+        BridgeShieldFailure::KeepOnDestination,
     );
-    let inputs = vec![ExecutorInputIdentity::from_utxo(&input)];
-    let uid = OrderUid::new(B256::repeat_byte(30), executor, 1_000);
-    origin_store
-        .record_swap_attempt(
+    let attempt = SwapAttempt {
+        delivery: SwapDelivery::Bridge(delivery),
+        bounds: SwapApprovedBounds {
+            buy_amount: U256::from(9_975),
+            shield_fee_bps: U256::ZERO,
+            post_hook_gas_limit: Some(400_000),
+            destination_minimum: Some(U256::from(9_900)),
+            destination_shield_fee_bps: Some(U256::from(25)),
+            delivery_allowance: Some(U256::from(120)),
+            destination_setup_fee: Some(U256::from(3)),
+            ..swap_bounds()
+        },
+        ..private_across_attempt(
             origin,
-            SwapAttempt {
-                terms: SwapTerms::new(
-                    sell,
-                    buy,
-                    SwapRecipient::new(U256::from(7), [8; 32]),
-                    B256::repeat_byte(3),
-                ),
-                proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
-                uid,
-                submission: None,
-                delivery: SwapDelivery::Bridge(BridgeDelivery {
-                    provider: BridgeProvider::Across,
-                    destination_chain: 137,
-                    receiver: destination_executor,
-                    destination_token: token,
-                    surplus: BridgeSurplus::KeepInAccount,
-                    private: Some(BridgePrivateDelivery {
-                        on_shield_failure: BridgeShieldFailure::KeepOnDestination,
-                    }),
-                }),
-                bounds: SwapApprovedBounds {
-                    sell_amount: U256::from(9_975),
-                    unshield_amount: Some(U256::from(10_000)),
-                    unshield_fee_bps: U256::from(25),
-                    buy_amount: U256::from(9_975),
-                    private_minimum: U256::from(9_975),
-                    shield_fee_bps: U256::ZERO,
-                    slippage_bps: 50,
-                    pre_hook_gas_limit: 900_000,
-                    post_hook_gas_limit: Some(400_000),
-                    hook_cost: Some(U256::ZERO),
-                    anchors: Vec::new(),
-                    destination_minimum: Some(U256::from(9_900)),
-                    gas_share_bps: None,
-                    gas_estimate: None,
-                    gas_allowance: None,
-                    gas_price_wei: None,
-                    valid_for_secs: None,
-                    destination_shield_fee_bps: Some(U256::from(25)),
-                    delivery_allowance: Some(U256::from(120)),
-                    destination_setup_fee: Some(U256::from(3)),
-                },
-                invalidates: None,
-                pre_hook: hook(
-                    ExecutorPayloadPurpose::SwapPreHook,
-                    1,
-                    31,
-                    delegate,
-                    observed,
-                    inputs,
-                ),
-                post_hook: Some(hook(
-                    ExecutorPayloadPurpose::SwapPostHook,
-                    2,
-                    32,
-                    delegate,
-                    observed,
-                    Vec::new(),
-                )),
-                bridge: Some(BridgeOrderTerms::Across(AcrossOrderTerms {
-                    spoke_pool: Address::repeat_byte(11),
-                    input_token: buy,
-                    output_token: token,
-                    input_amount: U256::from(9_975),
-                    output_amount: U256::from(9_900),
-                    quote_timestamp: 1_700_000_000,
-                    fill_deadline: 1_700_021_600,
-                    exclusive_relayer: Address::ZERO,
-                    exclusivity_parameter: 0,
-                    recipient: Some(Address::repeat_byte(12)),
-                    message_hash: Some(B256::repeat_byte(13)),
-                })),
-            },
+            executor,
+            delegate,
+            observed,
+            destination_executor,
+            token,
         )
+    };
+    let uid = attempt.uid;
+    // The order is refused unless the account this use names serves it: another account of
+    // the wallet, or another token than the destination was reserved for, is not the link.
+    for mislinked in [
+        BridgeDelivery {
+            receiver: stray_executor,
+            ..delivery
+        },
+        BridgeDelivery {
+            destination_token: buy,
+            ..delivery
+        },
+    ] {
+        assert!(matches!(
+            origin_store.record_swap_attempt(
+                origin,
+                SwapAttempt {
+                    delivery: SwapDelivery::Bridge(mislinked),
+                    ..attempt.clone()
+                },
+            ),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+    }
+    origin_store
+        .record_swap_attempt(origin, attempt.clone())
         .unwrap();
     let traded = SwapObservation {
         block: BlockNumHash::new(13, B256::repeat_byte(13)),
@@ -2185,6 +2278,27 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
     let unfilled = destination_record();
     assert_eq!(outcome(&unfilled), Some(SwapDestinationOutcome::Unfilled));
     assert_eq!(outstanding(&unfilled), (true, true, true));
+    // Nor does the report free the account for another swap while its shield can execute.
+    let unrelated = || {
+        origin_store.claim_swap_pair(SwapPairClaim {
+            id: SwapUseId::random().unwrap(),
+            source: SwapAccountChoice::New(ExecutorOperationId::random().unwrap()),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approval(5, 6),
+            destination: Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::Existing(destination),
+                delegate,
+                destination_token: token,
+            }),
+        })
+    };
+    assert!(matches!(
+        unrelated(),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
     // A retry's newly signed shield can be funded again.
     let reissued = store.record_issued(destination, shield(72)).unwrap();
     assert_eq!(outcome(&reissued), None);
@@ -2232,6 +2346,62 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
         })
     );
     assert_eq!(outstanding(&held), (true, true, true));
+
+    // Recovery and Public registration stop the swap on both chains before the account is
+    // handed off. A retry's order and another shield are then refused, while the published
+    // shields stay outstanding.
+    let retry = SwapAttempt {
+        uid: OrderUid::new(B256::repeat_byte(40), executor, 1_000),
+        pre_hook: hook(
+            ExecutorPayloadPurpose::SwapPreHook,
+            1,
+            33,
+            delegate,
+            observed,
+            attempt.proof.inputs().to_vec(),
+        ),
+        post_hook: Some(hook(
+            ExecutorPayloadPurpose::SwapPostHook,
+            2,
+            34,
+            delegate,
+            observed,
+            Vec::new(),
+        )),
+        ..attempt
+    };
+    assert!(matches!(
+        origin_store.record_swap_attempt(origin, retry.clone()),
+        Err(ExecutorStoreError::SwapAttemptOutstanding)
+    ));
+    let use_id = SwapUseId::first(origin);
+    let stopped = store.stop_swap_use(destination).unwrap();
+    assert!(stopped.swap_use(use_id).unwrap().is_stopped());
+    assert!(
+        origin_store.records().unwrap()[0]
+            .swap_use(use_id)
+            .unwrap()
+            .is_stopped()
+    );
+    assert!(matches!(
+        origin_store.record_swap_attempt(origin, retry),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    for refused in [
+        store.record_issued(destination, shield(73)),
+        store.record_swap_destination_shield(destination, use_id, shield(73)),
+    ] {
+        assert!(matches!(
+            refused,
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+    }
+    assert_eq!(stopped.issued(), held.issued());
+    assert_eq!(outstanding(&stopped), (true, true, true));
+    assert!(matches!(
+        unrelated(),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
     // Canonical nonce consumption, rather than a provider outcome, resolves the signature.
     let setup = &held.issued()[0];
     let consumed = store
@@ -2244,6 +2414,1720 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
     assert!(!consumed.is_outstanding_at(&consumed.issued()[1], U256::from(2)));
     assert!(!consumed.has_competing_payloads());
     assert!(!consumed.has_unresolved_issued_work());
+    // No signature of the account can execute any more. That doesn't resolve the delivery:
+    // the fill left the token in the account, so the account is neither settled nor free for
+    // another swap, whatever the nonce. A shielded delivery admits it: see
+    // `competing_swap_pair_claims_leave_one_complete_pair_and_nothing_of_the_other`.
+    assert!(!consumed.settled_swaps_at(block.number));
+    assert!(matches!(
+        store.refresh_settled_swap_nonce(
+            &consumed,
+            ExecutorNonceObservation::new(block, U256::from(3)),
+        ),
+        Err(ExecutorStoreError::OutstandingNonce)
+    ));
+    assert!(matches!(
+        unrelated(),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    assert_eq!(store.records().unwrap().remove(0), consumed);
+    drop(origin_store);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn swap_bounds() -> SwapApprovedBounds {
+    SwapApprovedBounds {
+        sell_amount: U256::from(9_975),
+        unshield_amount: Some(U256::from(10_000)),
+        unshield_fee_bps: U256::from(25),
+        buy_amount: U256::from(9_999),
+        private_minimum: U256::from(9_975),
+        shield_fee_bps: U256::from(25),
+        slippage_bps: 50,
+        pre_hook_gas_limit: 900_000,
+        post_hook_gas_limit: Some(300_000),
+        hook_cost: Some(U256::ZERO),
+        anchors: Vec::new(),
+        destination_minimum: None,
+        gas_share_bps: None,
+        gas_estimate: None,
+        gas_allowance: None,
+        gas_price_wei: None,
+        valid_for_secs: None,
+        destination_shield_fee_bps: None,
+        delivery_allowance: None,
+        destination_setup_fee: None,
+        source_setup_fee: None,
+    }
+}
+
+fn swap_inputs() -> Vec<ExecutorInputIdentity> {
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
+        2,
+        3,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    vec![ExecutorInputIdentity::from_utxo(&input)]
+}
+
+fn approval(sell: u8, buy: u8) -> SwapApproval {
+    SwapApproval {
+        bounds: swap_bounds(),
+        price_verified: Some(true),
+        price_acknowledged: false,
+        delivery: SwapDelivery::Reshield,
+        tokens: Some(SwapApprovalTokens {
+            sell: Address::repeat_byte(sell),
+            buy: Address::repeat_byte(buy),
+        }),
+        accounts: None,
+    }
+}
+
+/// An account with a completed source swap can still be a source after recovery retires it.
+fn settled_source_account(
+    store: &ExecutorStore,
+    operation: ExecutorOperationId,
+    delegate: Address,
+    executor: Address,
+) -> ExecutorNonceObservation {
+    store
+        .reserve_with_swap_approval(operation, delegate, None, &[], Some(approval(5, 6)), None)
+        .unwrap();
+    let observed = set_up(store, operation, delegate, executor);
+    // Each fixture account spends a different note. Executed pre-hooks keep their inputs
+    // reserved until private sync observes the spend, so another account cannot reuse them.
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(
+            U256::ONE,
+            Address::ZERO,
+            U256::from(9),
+            [executor.as_slice()[0]; 16],
+        ),
+        2,
+        u64::from(executor.as_slice()[0]),
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    let inputs = vec![ExecutorInputIdentity::from_utxo(&input)];
+    let uid = OrderUid::new(B256::repeat_byte(30), executor, 1_000);
+    let placed = store
+        .record_swap_attempt(
+            operation,
+            SwapAttempt {
+                use_id: SwapUseId::first(operation),
+                terms: SwapTerms::new(
+                    Address::repeat_byte(5),
+                    Address::repeat_byte(6),
+                    SwapRecipient::new(U256::from(7), [8; 32]),
+                    B256::repeat_byte(3),
+                ),
+                proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+                uid,
+                submission: None,
+                delivery: SwapDelivery::Reshield,
+                bounds: swap_bounds(),
+                invalidates: None,
+                pre_hook: hook(
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    1,
+                    31,
+                    delegate,
+                    observed,
+                    inputs,
+                ),
+                post_hook: Some(hook(
+                    ExecutorPayloadPurpose::SwapPostHook,
+                    2,
+                    32,
+                    delegate,
+                    observed,
+                    Vec::new(),
+                )),
+                bridge: None,
+            },
+        )
+        .unwrap();
+    let setup = &placed.issued()[0];
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(14, B256::repeat_byte(14)), U256::from(3));
+    store
+        .reconcile(
+            operation,
+            observed,
+            &[(setup.hash(), setup.inclusion().unwrap())],
+        )
+        .unwrap();
+    let delivered = SwapObservation {
+        block: observed.block(),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    store
+        .record_swap_observations(
+            operation,
+            uid,
+            SwapOrderObservations {
+                pre_hook_executed: Some(delivered),
+                traded: Some(delivered),
+                delivered: Some(delivered),
+                shielded: Some(SwapShieldObservation {
+                    observation: delivered,
+                    private_amount: U256::from(9_975),
+                    fee: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    observed
+}
+
+#[test]
+fn a_later_swap_use_leaves_the_earlier_use_and_its_order_unchanged() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let delegate = accepted_delegate(1);
+    let executor = Address::repeat_byte(2);
+    store
+        .reserve_with_swap_approval(
+            operation,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    let observed = set_up(&store, operation, delegate, executor);
+    let inputs = swap_inputs();
+    let attempt = |use_id, pair: (u8, u8), uid: u8, nonce: u64, observed| SwapAttempt {
+        use_id,
+        terms: SwapTerms::new(
+            Address::repeat_byte(pair.0),
+            Address::repeat_byte(pair.1),
+            SwapRecipient::new(U256::from(7), [8; 32]),
+            B256::repeat_byte(3),
+        ),
+        proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+        uid: OrderUid::new(B256::repeat_byte(uid), executor, 1_000),
+        submission: None,
+        delivery: SwapDelivery::Reshield,
+        bounds: swap_bounds(),
+        invalidates: None,
+        pre_hook: hook(
+            ExecutorPayloadPurpose::SwapPreHook,
+            nonce,
+            uid + 1,
+            delegate,
+            observed,
+            inputs.clone(),
+        ),
+        post_hook: Some(hook(
+            ExecutorPayloadPurpose::SwapPostHook,
+            nonce + 1,
+            uid + 2,
+            delegate,
+            observed,
+            Vec::new(),
+        )),
+        bridge: None,
+    };
+    let first = attempt(SwapUseId::first(operation), (5, 6), 30, 1, observed);
+    let (first_uid, first_terms) = (first.uid, first.terms);
+    let placed = store.record_swap_attempt(operation, first).unwrap();
+    // A use with an order ends through its order's own cancellation.
+    assert!(matches!(
+        store.cancel_swap_use(operation, SwapUseId::first(operation)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+
+    // The account stays with its swap while that swap's order can still trade.
+    let second = SwapUseId::random().unwrap();
+    let claim = SwapPairClaim {
+        id: second,
+        source: SwapAccountChoice::Existing(operation),
+        delegate,
+        purpose_summary: None,
+        assets: Vec::new(),
+        approval: approval(7, 8),
+        destination: None,
+    };
+    assert!(matches!(
+        store.claim_swap_pair(claim.clone()),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    let setup = &placed.issued()[0];
+    let after_fill =
+        ExecutorNonceObservation::new(BlockNumHash::new(14, B256::repeat_byte(14)), U256::from(3));
+    store
+        .reconcile(
+            operation,
+            after_fill,
+            &[(setup.hash(), setup.inclusion().unwrap())],
+        )
+        .unwrap();
+    let delivered = SwapObservation {
+        block: after_fill.block(),
+        transaction_hash: Some(B256::repeat_byte(50)),
+    };
+    let settled = store
+        .record_swap_observations(
+            operation,
+            first_uid,
+            SwapOrderObservations {
+                pre_hook_executed: Some(delivered),
+                traded: Some(delivered),
+                delivered: Some(delivered),
+                shielded: Some(SwapShieldObservation {
+                    observation: delivered,
+                    private_amount: U256::from(9_975),
+                    fee: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Another swap on the settled account is a new use with its own approval and orders. The
+    // account now signs for that use only.
+    store.claim_swap_pair(claim).unwrap();
+    let earlier_use = attempt(SwapUseId::first(operation), (7, 8), 40, 3, after_fill);
+    assert!(matches!(
+        store.record_swap_attempt(operation, earlier_use),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    let recorded = store
+        .record_swap_attempt(operation, attempt(second, (7, 8), 40, 3, after_fill))
+        .unwrap();
+    let swap = recorded.swap().unwrap();
+    let [first_order, second_order] = swap.orders() else {
+        panic!("one order per use");
+    };
+    assert_eq!(first_order, &settled.swap().unwrap().orders()[0]);
+    assert_eq!(swap.order_terms(first_order), &first_terms);
+    assert_eq!(&recorded.issued()[..3], settled.issued());
+    assert_eq!(
+        (first_order.use_id(), second_order.use_id()),
+        (Some(SwapUseId::first(operation)), Some(second))
+    );
+    assert_eq!(recorded.active_swap_use(), Some(second));
+    assert_eq!(recorded.swap_approval(), Some(&approval(7, 8)));
+    let [first_use, second_use] = recorded.swap_uses() else {
+        panic!("one use per swap");
+    };
+    assert!(matches!(
+        first_use.role(),
+        SwapUseRole::Source { approval: Some(known), .. } if **known == approval(5, 6)
+    ));
+    assert_eq!((first_use.is_fresh(), second_use.is_fresh()), (true, false));
+    assert_eq!(store.records().unwrap(), vec![recorded]);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn competing_swap_pair_claims_leave_one_complete_pair_and_nothing_of_the_other() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let other = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    let [earlier, existing, new, shared] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+
+    // The shared destination served an earlier swap, and its shield's nonce is consumed.
+    destination_store
+        .reserve_swap_destination(
+            shared,
+            destination_delegate,
+            SwapDestinationRecord {
+                origin_chain: 1,
+                origin_operation: earlier,
+                destination_token: token,
+                outcome: None,
+            },
+        )
+        .unwrap();
+    store
+        .reserve_with_swap_approval(
+            earlier,
+            delegate,
+            Some("Private swap"),
+            &[],
+            None,
+            Some(shared),
+        )
+        .unwrap();
+    let earlier_observed = set_up(&store, earlier, delegate, Address::repeat_byte(2));
+    store
+        .reserve(existing, delegate, Some("Private swap"), &[])
+        .unwrap();
+    set_up(&store, existing, delegate, Address::repeat_byte(7));
+    let observed = set_up(
+        &destination_store,
+        shared,
+        destination_delegate,
+        Address::repeat_byte(9),
+    );
+    let shielded = destination_store
+        .record_issued(
+            shared,
+            hook(
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                1,
+                70,
+                destination_delegate,
+                observed,
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+    let setup = &shielded.issued()[0];
+    destination_store
+        .reconcile(
+            shared,
+            ExecutorNonceObservation::new(
+                BlockNumHash::new(14, B256::repeat_byte(14)),
+                U256::from(2),
+            ),
+            &[(setup.hash(), setup.inclusion().unwrap())],
+        )
+        .unwrap();
+
+    // One preparation reuses a source account and the other allocates one. Both want the
+    // shared destination.
+    let claim = |source| SwapPairClaim {
+        id: SwapUseId::random().unwrap(),
+        source,
+        delegate,
+        purpose_summary: Some("Private swap".to_owned()),
+        assets: Vec::new(),
+        approval: approval(5, 6),
+        destination: Some(SwapDestinationClaim {
+            chain_id: 137,
+            account: SwapAccountChoice::Existing(shared),
+            delegate: destination_delegate,
+            destination_token: token,
+        }),
+    };
+    // The consumed nonce doesn't say which payload ran or whether the bridge delivered. Until
+    // the earlier swap's fill is verified as shielded, the destination is neither settled nor
+    // free, and a refused claim leaves nothing.
+    let order = private_across_attempt(
+        earlier,
+        Address::repeat_byte(2),
+        delegate,
+        earlier_observed,
+        Address::repeat_byte(9),
+        token,
+    );
+    let (uid, private_delivery) = (order.uid, order.delivery);
+    store.record_swap_attempt(earlier, order).unwrap();
+    assert!(!destination_store.records().unwrap()[0].settled_swaps_at(14));
+    assert!(matches!(
+        store.claim_swap_pair(claim(SwapAccountChoice::Existing(existing))),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    deliver_shielded(
+        &store,
+        earlier,
+        uid,
+        BlockNumHash::new(13, B256::repeat_byte(60)),
+        B256::repeat_byte(61),
+    );
+    assert!(destination_store.reconcile_swap_destinations().unwrap());
+    assert!(destination_store.records().unwrap()[0].settled_swaps_at(14));
+
+    // The same pair takes a second swap. The earlier swap's fill went to the same receiver from
+    // the same origin account, and reconciling it again leaves the new use as claimed: active,
+    // not stopped, and without an outcome. A fresh handle reads the same after a restart.
+    let again = SwapPairClaim {
+        source: SwapAccountChoice::Existing(earlier),
+        approval: SwapApproval {
+            delivery: private_delivery,
+            ..approval(5, 6)
+        },
+        ..claim(SwapAccountChoice::Existing(earlier))
+    };
+    let reclaimed = store
+        .claim_swap_pair(again.clone())
+        .unwrap()
+        .destination
+        .unwrap();
+    let delivered = Some(SwapDestinationOutcome::Shielded {
+        block: BlockNumHash::new(13, B256::repeat_byte(60)),
+        transaction_hash: B256::repeat_byte(61),
+    });
+    let restarted = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    assert!(!destination_store.reconcile_swap_destinations().unwrap());
+    assert!(!restarted.reconcile_swap_destinations_on_load().unwrap());
+    let record = restarted.records().unwrap().remove(0);
+    assert_eq!(record, reclaimed);
+    assert_eq!(record.active_swap_use(), Some(again.id));
+    assert!(!record.swap_use(again.id).unwrap().is_stopped());
+    assert_eq!(
+        (
+            record
+                .swap_destination_use(SwapUseId::first(earlier))
+                .unwrap()
+                .outcome,
+            record.swap_destination_use(again.id).unwrap().outcome,
+        ),
+        (delivered, None)
+    );
+    drop(restarted);
+    // Cancelled before it signed anything, the second swap frees both accounts.
+    assert_eq!(
+        store.cancel_swap_use(earlier, again.id).unwrap(),
+        SwapUseCancellation {
+            source: SwapUseRelease::Released,
+            destination: Some(SwapUseRelease::Released),
+        }
+    );
+    let reusing = claim(SwapAccountChoice::Existing(existing));
+    let allocating = claim(SwapAccountChoice::New(new));
+    let state = || {
+        (
+            store.records().unwrap(),
+            destination_store.records().unwrap(),
+            store.next_index().unwrap(),
+        )
+    };
+    let (sources_before, destinations_before, next_index_before) = state();
+    let barrier = std::sync::Barrier::new(2);
+    let (reused, allocated) = std::thread::scope(|scope| {
+        let reused = scope.spawn(|| {
+            barrier.wait();
+            store.claim_swap_pair(reusing.clone())
+        });
+        barrier.wait();
+        let allocated = other.claim_swap_pair(allocating.clone());
+        (reused.join().unwrap(), allocated)
+    });
+    let (won, winner) = match (reused, allocated) {
+        (Ok(pair), Err(ExecutorStoreError::SwapUseActive)) => (pair, reusing),
+        (Err(ExecutorStoreError::SwapUseActive), Ok(pair)) => (pair, allocating),
+        both => panic!("one claim wins and the other finds the destination taken: {both:?}"),
+    };
+
+    // The winner's accounts hold its use and name each other.
+    let destination = won.destination.clone().unwrap();
+    assert_eq!(
+        (won.source.active_swap_use(), destination.active_swap_use()),
+        (Some(winner.id), Some(winner.id))
+    );
+    assert_eq!(won.source.operation(), winner.source.operation());
+    assert_eq!(won.source.destination_operation(), Some(shared));
+    assert_eq!(
+        destination.swap_destination(),
+        Some(SwapDestinationRecord {
+            origin_chain: 1,
+            origin_operation: winner.source.operation(),
+            destination_token: token,
+            outcome: None,
+        })
+    );
+    // Nothing else changed: the loser's source keeps its record, or has none and took no index,
+    // and no account issued a payload.
+    let allocated = winner.source == SwapAccountChoice::New(new);
+    let mut sources = sources_before;
+    if allocated {
+        sources.push(won.source.clone());
+    } else {
+        *sources
+            .iter_mut()
+            .find(|record| record.operation() == existing)
+            .unwrap() = won.source.clone();
+    }
+    let after = (
+        sources,
+        vec![destination.clone()],
+        next_index_before + u32::from(allocated),
+    );
+    assert_eq!(state(), after);
+    assert_eq!(won.source.issued().len(), usize::from(!allocated));
+    assert_eq!(destination.issued(), destinations_before[0].issued());
+
+    // Repeating the winner's claim returns its pair and writes nothing.
+    assert_eq!(store.claim_swap_pair(winner).unwrap(), won);
+    assert_eq!(state(), after);
+    drop(other);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_prepared_swap_approval_preserves_its_use_and_linked_destination() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let [source, first_destination, next_destination] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    store.reserve(source, delegate, None, &[]).unwrap();
+    set_up(&store, source, delegate, Address::repeat_byte(2));
+    for (operation, address) in [
+        (first_destination, Address::repeat_byte(3)),
+        (next_destination, Address::repeat_byte(4)),
+    ] {
+        destination_store
+            .reserve(operation, destination_delegate, None, &[])
+            .unwrap();
+        set_up(&destination_store, operation, destination_delegate, address);
+    }
+    let claim = |destination, receiver| {
+        let mut approval = approval(5, 6);
+        approval.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+            receiver,
+            Address::repeat_byte(10),
+            BridgeShieldFailure::KeepOnDestination,
+        ));
+        SwapPairClaim {
+            id: SwapUseId::random().unwrap(),
+            source: SwapAccountChoice::Existing(source),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval,
+            destination: Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::Existing(destination),
+                delegate: destination_delegate,
+                destination_token: Address::repeat_byte(10),
+            }),
+        }
+    };
+    let first = claim(first_destination, Address::repeat_byte(3));
+    store.claim_swap_pair(first.clone()).unwrap();
+    assert_eq!(
+        store.cancel_swap_use(source, first.id).unwrap(),
+        SwapUseCancellation {
+            source: SwapUseRelease::Released,
+            destination: Some(SwapUseRelease::Released),
+        }
+    );
+    let next = claim(next_destination, Address::repeat_byte(4));
+    let claimed = store.claim_swap_pair(next.clone()).unwrap();
+
+    // The first preparation finishes after cancellation and a different pair claimed its
+    // source. Its approval must not change the new use's receiver or destination link.
+    assert!(matches!(
+        store.record_swap_approval(source, first.id, first.approval),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    let reopened = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let record = |store: &ExecutorStore, operation| {
+        store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+    };
+    assert_eq!(record(&reopened, source), Some(claimed.source.clone()));
+    assert_eq!(
+        record(&destination_store, next_destination),
+        claimed.destination
+    );
+    let SwapDelivery::Bridge(bridge) = next.approval.delivery else {
+        unreachable!()
+    };
+    for delivery in [
+        SwapDelivery::Reshield,
+        SwapDelivery::Bridge(BridgeDelivery {
+            private: None,
+            ..bridge
+        }),
+        SwapDelivery::Bridge(BridgeDelivery {
+            destination_chain: 10,
+            ..bridge
+        }),
+    ] {
+        let mut incompatible = next.approval.clone();
+        incompatible.delivery = delivery;
+        assert!(matches!(
+            reopened.record_swap_approval(source, next.id, incompatible),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+        let reopened_source = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+        let reopened_destination = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+        assert_eq!(
+            record(&reopened_source, source),
+            Some(claimed.source.clone())
+        );
+        assert_eq!(
+            record(&reopened_destination, next_destination),
+            claimed.destination
+        );
+    }
+    let mut refreshed = next.approval;
+    refreshed.bounds.slippage_bps += 1;
+    let saved = reopened
+        .record_swap_approval(source, next.id, refreshed.clone())
+        .unwrap();
+    assert_eq!(saved.swap_approval(), Some(&refreshed));
+    assert_eq!(saved.destination_operation(), Some(next_destination));
+    assert_eq!(
+        reopened.cancel_swap_use(source, next.id).unwrap(),
+        SwapUseCancellation {
+            source: SwapUseRelease::Released,
+            destination: Some(SwapUseRelease::Released),
+        }
+    );
+    drop((store, reopened, destination_store));
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cancelling_a_swap_use_releases_a_reused_source_and_keeps_an_issued_destination_setup() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let delegate = accepted_delegate(1);
+    let token = Address::repeat_byte(10);
+    let [existing, new] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+
+    // The source account is set up and idle. The swap reuses it and allocates its destination.
+    store
+        .reserve(existing, delegate, Some("Private swap"), &[])
+        .unwrap();
+    let source_observed = set_up(&store, existing, delegate, Address::repeat_byte(7));
+    let source_before = store.records().unwrap().remove(0);
+    let id = SwapUseId::random().unwrap();
+    let mut bridged = approval(5, 6);
+    bridged.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+        Address::ZERO,
+        token,
+        BridgeShieldFailure::RefundOnOrigin,
+    ));
+    store
+        .claim_swap_pair(SwapPairClaim {
+            id,
+            source: SwapAccountChoice::Existing(existing),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: bridged,
+            destination: Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::New(new),
+                delegate,
+                destination_token: token,
+            }),
+        })
+        .unwrap();
+    // A reused account is already set up, so its new use takes no setup payload.
+    let setup = |nonce, hash, observed, inputs| {
+        hook(
+            ExecutorPayloadPurpose::Operation,
+            nonce,
+            hash,
+            delegate,
+            observed,
+            inputs,
+        )
+    };
+    assert!(matches!(
+        store.record_issued(existing, setup(1, 4, source_observed, Vec::new())),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+
+    // The new destination's setup is handed off with its fee notes before the user cancels.
+    destination_store
+        .bind_address(new, Address::repeat_byte(9))
+        .unwrap();
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    destination_store.reconcile(new, observed, &[]).unwrap();
+    let issued = destination_store
+        .record_issued(new, setup(0, 3, observed, swap_inputs()))
+        .unwrap();
+    let cancelled = store.cancel_swap_use(existing, id).unwrap();
+    assert_eq!(
+        cancelled,
+        SwapUseCancellation {
+            source: SwapUseRelease::Released,
+            destination: Some(SwapUseRelease::IssuedWorkRemains),
+        }
+    );
+
+    // The reused source is free again with its history, and is neither retired nor stopped.
+    let source = store.records().unwrap().remove(0);
+    assert_eq!(
+        (
+            source.active_swap_use(),
+            source.is_retired(),
+            source.is_swap_setup_stopped()
+        ),
+        (None, false, false)
+    );
+    assert_eq!(source.issued(), source_before.issued());
+    assert!(source.swap_use(id).unwrap().is_stopped());
+
+    // The fresh destination is stopped and retired like any abandoned setup, and stays with
+    // the cancelled use. Its published setup keeps its inputs reserved.
+    let destination = destination_store.records().unwrap().remove(0);
+    assert!(destination.is_swap_setup_stopped() && destination.is_retired());
+    assert_eq!(destination.active_swap_use(), Some(id));
+    assert_eq!(destination.issued(), issued.issued());
+    assert_eq!(destination.reserved_inputs(), swap_inputs());
+
+    // Cancelling again changes nothing, and the source takes another swap.
+    assert_eq!(store.cancel_swap_use(existing, id).unwrap(), cancelled);
+    store
+        .claim_swap_pair(SwapPairClaim {
+            id: SwapUseId::random().unwrap(),
+            source: SwapAccountChoice::Existing(existing),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approval(5, 6),
+            destination: None,
+        })
+        .unwrap();
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stopping_an_unsigned_reused_pair_releases_both_accounts_after_reload() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let [source, destination] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    store.reserve(source, delegate, None, &[]).unwrap();
+    destination_store
+        .reserve(destination, destination_delegate, None, &[])
+        .unwrap();
+    let source_observed = set_up(&store, source, delegate, Address::repeat_byte(7));
+    let destination_observed = set_up(
+        &destination_store,
+        destination,
+        destination_delegate,
+        Address::repeat_byte(9),
+    );
+    let mut approved = approval(5, 6);
+    approved.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+        Address::repeat_byte(9),
+        Address::repeat_byte(10),
+        BridgeShieldFailure::KeepOnDestination,
+    ));
+    let claim = SwapPairClaim {
+        id: SwapUseId::random().unwrap(),
+        source: SwapAccountChoice::Existing(source),
+        delegate,
+        purpose_summary: None,
+        assets: Vec::new(),
+        approval: approved,
+        destination: Some(SwapDestinationClaim {
+            chain_id: 137,
+            account: SwapAccountChoice::Existing(destination),
+            delegate: destination_delegate,
+            destination_token: Address::repeat_byte(10),
+        }),
+    };
+    let pair = store.claim_swap_pair(claim.clone()).unwrap();
+    store.stop_swap_use(source).unwrap();
+    // A repeated stop and a restart cannot strand the unsigned counterpart.
+    destination_store.stop_swap_use(destination).unwrap();
+    let reloaded = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let reloaded_destination = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    for (record, before) in [
+        (reloaded.records().unwrap().remove(0), pair.source),
+        (
+            reloaded_destination.records().unwrap().remove(0),
+            pair.destination.unwrap(),
+        ),
+    ] {
+        assert_eq!(record.active_swap_use(), None);
+        assert!(!record.is_retired());
+        assert!(record.swap_use(claim.id).unwrap().is_stopped());
+        assert_eq!(record.issued(), before.issued());
+    }
+    // Late signed work cannot resume the stopped use, but a new use claims the same pair.
+    let mut late_order = private_across_attempt(
+        source,
+        Address::repeat_byte(7),
+        delegate,
+        source_observed,
+        Address::repeat_byte(9),
+        Address::repeat_byte(10),
+    );
+    late_order.use_id = claim.id;
+    assert!(matches!(
+        reloaded.record_swap_attempt(source, late_order),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    assert!(matches!(
+        reloaded_destination.record_swap_destination_shield(
+            destination,
+            claim.id,
+            hook(
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                1,
+                70,
+                destination_delegate,
+                destination_observed,
+                Vec::new(),
+            ),
+        ),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    let next = SwapUseId::random().unwrap();
+    let pair = reloaded
+        .claim_swap_pair(SwapPairClaim { id: next, ..claim })
+        .unwrap();
+    assert_eq!(pair.source.active_swap_use(), Some(next));
+    assert_eq!(pair.destination.unwrap().active_swap_use(), Some(next));
+    drop(reloaded);
+    drop(reloaded_destination);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_handoff_checks_the_current_use_and_blocks_a_later_swap_until_resolved() {
+    use alloy::rpc::types::TransactionRequest;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let delegate = accepted_delegate(1);
+    // Contract recovery and ordinary recovery have separate persisted signing paths.
+    for ordinary in [false, true] {
+        let operation = ExecutorOperationId::random().unwrap();
+        let executor = Address::repeat_byte(if ordinary { 8 } else { 7 });
+        let observed = settled_source_account(&store, operation, delegate, executor);
+        let claim = |id| SwapPairClaim {
+            id,
+            source: SwapAccountChoice::Existing(operation),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approval(5, 6),
+            destination: None,
+        };
+        let abandoned = SwapUseId::random().unwrap();
+        store.claim_swap_pair(claim(abandoned)).unwrap();
+        let prepared = store.stop_swap_use(operation).unwrap();
+        let expected_use = prepared.active_swap_use();
+        assert_eq!(expected_use, None);
+        // While the recovery review is open, another unsigned preparation claims the account.
+        let next = SwapUseId::random().unwrap();
+        let claimed = store.claim_swap_pair(claim(next)).unwrap().source;
+        let payload = hook(
+            ExecutorPayloadPurpose::Recovery,
+            3,
+            70,
+            delegate,
+            observed,
+            Vec::new(),
+        );
+        let mut request = TransactionRequest::default()
+            .to(Address::repeat_byte(10))
+            .input(Bytes::from_static(b"approved recovery fixture").into());
+        request.from = Some(executor);
+        request.chain_id = Some(1);
+        request.nonce = Some(7);
+        request.gas = Some(100_000);
+        request.max_fee_per_gas = Some(2);
+        request.max_priority_fee_per_gas = Some(1);
+        let transaction = IssuedExecutorRecoveryTransaction::new(
+            ExecutorOperationId::random().unwrap(),
+            0,
+            ExecutorRecoveryStepKind::Shield,
+            request,
+            B256::repeat_byte(71),
+            observed.block(),
+        );
+        let handoff = || {
+            if ordinary {
+                store.record_recovery_transaction_for_use(
+                    operation,
+                    expected_use,
+                    transaction.clone(),
+                )
+            } else {
+                store.record_recovery_issued(operation, expected_use, payload.clone())
+            }
+        };
+        assert!(matches!(handoff(), Err(ExecutorStoreError::SwapUseActive)));
+        assert_eq!(
+            store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap(),
+            claimed
+        );
+        // A new review after stopping that preparation can hand off, but its unresolved
+        // recovery cannot be bypassed just because this account has settled source history.
+        store.stop_swap_use(operation).unwrap();
+        let issued = handoff().unwrap();
+        for evidence in [
+            SwapAdmissionEvidence::Recorded,
+            SwapAdmissionEvidence::Fresh,
+        ] {
+            assert_eq!(
+                swap_account_refusal(
+                    &issued,
+                    1,
+                    SwapAccountRole::Source,
+                    SwapAccountUse::New,
+                    evidence,
+                ),
+                Some(SwapAccountRefusal::UnfinishedWork)
+            );
+        }
+        assert!(matches!(
+            store.claim_swap_pair(claim(SwapUseId::random().unwrap())),
+            Err(ExecutorStoreError::SwapUseActive)
+        ));
+    }
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_orphaned_destination_shield_needs_a_verified_replacement_before_source_reuse() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let origin_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (origin_delegate, delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    // A recorded order might still deliver. Only the preparation with no recorded order
+    // becomes reusable once a different canonical payload invalidates every signed shield.
+    for order_recorded in [false, true] {
+        let [origin, destination] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+        let executor = Address::repeat_byte(if order_recorded { 8 } else { 7 });
+        let receiver = Address::repeat_byte(if order_recorded { 18 } else { 17 });
+        origin_store
+            .reserve(origin, origin_delegate, None, &[])
+            .unwrap();
+        let origin_observed = set_up(&origin_store, origin, origin_delegate, executor);
+        let observed = settled_source_account(&store, destination, delegate, receiver);
+        let mut approved = approval(5, 6);
+        approved.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+            receiver,
+            token,
+            BridgeShieldFailure::RefundOnOrigin,
+        ));
+        let id = SwapUseId::random().unwrap();
+        origin_store
+            .claim_swap_pair(SwapPairClaim {
+                id,
+                source: SwapAccountChoice::Existing(origin),
+                delegate: origin_delegate,
+                purpose_summary: None,
+                assets: Vec::new(),
+                approval: approved,
+                destination: Some(SwapDestinationClaim {
+                    chain_id: 137,
+                    account: SwapAccountChoice::Existing(destination),
+                    delegate,
+                    destination_token: token,
+                }),
+            })
+            .unwrap();
+        for hash in [70, 71] {
+            store
+                .record_swap_destination_shield(
+                    destination,
+                    id,
+                    hook(
+                        ExecutorPayloadPurpose::SwapDestinationShield,
+                        3,
+                        hash,
+                        delegate,
+                        observed,
+                        Vec::new(),
+                    ),
+                )
+                .unwrap();
+        }
+        if order_recorded {
+            let mut attempt = private_across_attempt(
+                origin,
+                executor,
+                origin_delegate,
+                origin_observed,
+                receiver,
+                token,
+            );
+            attempt.use_id = id;
+            origin_store.record_swap_attempt(origin, attempt).unwrap();
+            origin_store.stop_swap_use(origin).unwrap();
+        } else {
+            let cancelled = origin_store.cancel_swap_use(origin, id).unwrap();
+            assert_eq!(cancelled.source, SwapUseRelease::Released);
+            assert_eq!(
+                cancelled.destination,
+                Some(SwapUseRelease::IssuedWorkRemains)
+            );
+        }
+        let before = store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == destination)
+            .unwrap();
+        let blocked = |record: &ExecutorRecord| {
+            for evidence in [
+                SwapAdmissionEvidence::Recorded,
+                SwapAdmissionEvidence::Fresh,
+            ] {
+                assert!(
+                    swap_account_refusal(
+                        record,
+                        137,
+                        SwapAccountRole::Source,
+                        SwapAccountUse::New,
+                        evidence,
+                    )
+                    .is_some()
+                );
+            }
+        };
+        blocked(&before);
+        let inclusions: Vec<_> = before
+            .issued()
+            .iter()
+            .filter_map(|payload| {
+                payload
+                    .inclusion()
+                    .map(|inclusion| (payload.hash(), inclusion))
+            })
+            .collect();
+        let block = BlockNumHash::new(20, B256::repeat_byte(20));
+        let consumed = ExecutorNonceObservation::new(block, U256::from(4));
+        // An advanced nonce without a known winner leaves the shield's execution uncertain.
+        let unknown = store.reconcile(destination, consumed, &inclusions).unwrap();
+        blocked(&unknown);
+        // Even a known winner is insufficient if one of the retained shields ran.
+        let mut shield_won = inclusions.clone();
+        shield_won.push((
+            B256::repeat_byte(70),
+            ExecutorPayloadInclusion::new(
+                block,
+                B256::repeat_byte(72),
+                ExecutorExecutionResult::Executed,
+            ),
+        ));
+        let executed = store.reconcile(destination, consumed, &shield_won).unwrap();
+        blocked(&executed);
+
+        // Recovery competes at the shield's nonce. Its verified execution makes both shield
+        // signatures unusable; the source's stopped orderless fact must also be retained.
+        store.reconcile(destination, observed, &inclusions).unwrap();
+        let issued = store
+            .record_recovery_issued(
+                destination,
+                Some(id),
+                hook(
+                    ExecutorPayloadPurpose::Recovery,
+                    3,
+                    73,
+                    delegate,
+                    observed,
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        let mut recovery_won = inclusions.clone();
+        recovery_won.push((
+            B256::repeat_byte(73),
+            ExecutorPayloadInclusion::new(
+                block,
+                B256::repeat_byte(74),
+                ExecutorExecutionResult::Executed,
+            ),
+        ));
+        store
+            .reconcile(destination, consumed, &recovery_won)
+            .unwrap();
+        let reloaded = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+        let resolved = reloaded
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == destination)
+            .unwrap();
+        assert_eq!(resolved.issued().len(), issued.issued().len());
+        assert!(resolved.swap_use(id).unwrap().is_stopped());
+        assert_eq!(resolved.swap_destination_use(id).unwrap().outcome, None);
+        for hash in [70, 71] {
+            assert_eq!(
+                resolved.payload_status(B256::repeat_byte(hash)),
+                Some(ExecutorPayloadStatus::Invalidated {
+                    winner: B256::repeat_byte(73)
+                })
+            );
+        }
+        let next = SwapUseId::random().unwrap();
+        let claim = SwapPairClaim {
+            id: next,
+            source: SwapAccountChoice::Existing(destination),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approval(5, 6),
+            destination: None,
+        };
+        if order_recorded {
+            blocked(&resolved);
+            assert!(matches!(
+                reloaded.claim_swap_pair(claim),
+                Err(ExecutorStoreError::SwapUseActive)
+            ));
+        } else {
+            assert_eq!(
+                reloaded
+                    .claim_swap_pair(claim)
+                    .unwrap()
+                    .source
+                    .active_swap_use(),
+                Some(next)
+            );
+            // A reorg removing the replacement restores the historical shield guard, even
+            // after a later use claimed the account. No destination outcome was invented.
+            let reorged = reloaded
+                .reconcile(destination, observed, &inclusions)
+                .unwrap();
+            assert_eq!(
+                swap_account_refusal(
+                    &reorged,
+                    137,
+                    SwapAccountRole::Source,
+                    SwapAccountUse::Claimed(next),
+                    SwapAdmissionEvidence::Fresh,
+                ),
+                Some(SwapAccountRefusal::EarlierDeliveryUnresolved)
+            );
+        }
+    }
+    drop(origin_store);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_1_swap_records_project_to_uses_and_are_rewritten_only_when_they_change() {
+    // The named MessagePack record of the build before swap uses: one swap's links on the
+    // record itself, and orders without a use.
+    #[derive(serde::Serialize)]
+    struct V1Hook {
+        nonce: U256,
+        payload: B256,
+    }
+    #[derive(serde::Serialize)]
+    struct V1Order {
+        terms: Option<SwapTerms>,
+        attempt: u32,
+        uid: FixedBytes<56>,
+        delivery: SwapDelivery,
+        bounds: SwapApprovedBounds,
+        pre_hook: V1Hook,
+        post_hook: Option<V1Hook>,
+        invalidates: Option<FixedBytes<56>>,
+        observations: SwapOrderObservations,
+        submission: Option<SwapSubmission>,
+        submission_status: SwapSubmissionStatus,
+        bridge: Option<BridgeOrderTerms>,
+    }
+    #[derive(serde::Serialize)]
+    struct V1Swap {
+        terms: SwapTerms,
+        proof: SwapProof,
+        orders: Vec<V1Order>,
+    }
+    #[derive(serde::Serialize)]
+    struct V1Record {
+        version: u32,
+        derivation: ExecutorDerivationScheme,
+        origin: ExecutorRecordOrigin,
+        operation: ExecutorOperationId,
+        index: u32,
+        address: Option<Address>,
+        delegate: Address,
+        retired: bool,
+        created_at: Option<u64>,
+        restored_at: Option<u64>,
+        purpose_summary: Option<String>,
+        assets: Vec<ExecutorAsset>,
+        hidden: bool,
+        issued: Vec<IssuedExecutorPayload>,
+        nonce_observation: Option<ExecutorNonceObservation>,
+        swap: Option<V1Swap>,
+        swap_approval: Option<SwapApproval>,
+        swap_setup_stopped: bool,
+        swap_destination: Option<SwapDestinationRecord>,
+        destination_operation: Option<ExecutorOperationId>,
+    }
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let origin_store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let delegate = accepted_delegate(1);
+    let token = Address::repeat_byte(10);
+    let [
+        pending,
+        pending_destination,
+        signed,
+        signed_destination,
+        fallback,
+        plain,
+    ] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let account = |index: u8| Address::repeat_byte(0x40 + index);
+    let v1 = |operation, index: u8| V1Record {
+        version: 1,
+        derivation: ExecutorDerivationScheme::Railgun7702V1,
+        origin: ExecutorRecordOrigin::Reserved,
+        operation,
+        index: u32::from(index),
+        address: Some(account(index)),
+        delegate,
+        retired: false,
+        created_at: Some(1_700_000_000),
+        restored_at: None,
+        purpose_summary: None,
+        assets: Vec::new(),
+        hidden: false,
+        issued: Vec::new(),
+        nonce_observation: None,
+        swap: None,
+        swap_approval: None,
+        swap_setup_stopped: false,
+        swap_destination: None,
+        destination_operation: None,
+    };
+    let serves = |origin_operation| SwapDestinationRecord {
+        origin_chain: 1,
+        origin_operation,
+        destination_token: token,
+        outcome: None,
+    };
+    let before_setup =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    let payload = |purpose, nonce, hash, observed, inputs| {
+        hook(purpose, nonce, hash, delegate, observed, inputs)
+    };
+    let setup = |inputs| {
+        payload(
+            ExecutorPayloadPurpose::Operation,
+            0,
+            3,
+            before_setup,
+            inputs,
+        )
+    };
+    let terms = SwapTerms::new(
+        Address::repeat_byte(5),
+        Address::repeat_byte(6),
+        SwapRecipient::new(U256::from(7), [8; 32]),
+        B256::repeat_byte(3),
+    );
+    let order = |terms, owner, delivery, observations, bridge| V1Order {
+        terms,
+        attempt: 0,
+        uid: OrderUid::new(B256::repeat_byte(30), owner, 1_000).0,
+        delivery,
+        bounds: swap_bounds(),
+        pre_hook: V1Hook {
+            nonce: U256::ONE,
+            payload: B256::repeat_byte(31),
+        },
+        post_hook: Some(V1Hook {
+            nonce: U256::from(2),
+            payload: B256::repeat_byte(32),
+        }),
+        invalidates: None,
+        observations,
+        submission: None,
+        submission_status: SwapSubmissionStatus::Accepted,
+        bridge,
+    };
+    let inputs = swap_inputs();
+    let approved = approval(7, 8);
+    for record in [
+        // A setup still pending: approved terms, the link to the destination, and the setup
+        // payload holding its inputs.
+        V1Record {
+            issued: vec![setup(inputs.clone())],
+            nonce_observation: Some(before_setup),
+            swap_approval: Some(approved.clone()),
+            destination_operation: Some(pending_destination),
+            ..v1(pending, 0)
+        },
+        // A signed private Bridge order with its hooks.
+        V1Record {
+            issued: vec![
+                setup(Vec::new()),
+                payload(
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    1,
+                    31,
+                    observed,
+                    Vec::new(),
+                ),
+                payload(
+                    ExecutorPayloadPurpose::SwapPostHook,
+                    2,
+                    32,
+                    observed,
+                    Vec::new(),
+                ),
+            ],
+            nonce_observation: Some(observed),
+            swap: Some(V1Swap {
+                terms,
+                proof: SwapProof::new(B256::repeat_byte(20), Vec::new()),
+                orders: vec![order(
+                    Some(terms),
+                    account(1),
+                    SwapDelivery::Bridge(BridgeDelivery {
+                        provider: BridgeProvider::Across,
+                        destination_chain: 137,
+                        receiver: account(1),
+                        destination_token: token,
+                        surplus: BridgeSurplus::KeepInAccount,
+                        private: Some(BridgePrivateDelivery {
+                            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+                        }),
+                    }),
+                    SwapOrderObservations::default(),
+                    Some(BridgeOrderTerms::Across(AcrossOrderTerms {
+                        spoke_pool: Address::repeat_byte(11),
+                        input_token: terms.buy_token(),
+                        output_token: token,
+                        input_amount: U256::from(9_975),
+                        output_amount: U256::from(9_900),
+                        quote_timestamp: 1_700_000_000,
+                        fill_deadline: 1_700_021_600,
+                        exclusive_relayer: Address::ZERO,
+                        exclusivity_parameter: 0,
+                        recipient: Some(Address::repeat_byte(12)),
+                        message_hash: Some(B256::repeat_byte(13)),
+                    })),
+                )],
+            }),
+            destination_operation: Some(signed_destination),
+            ..v1(signed, 1)
+        },
+        // An ended order from before orders kept their own terms.
+        V1Record {
+            swap: Some(V1Swap {
+                terms,
+                proof: SwapProof::new(B256::repeat_byte(20), Vec::new()),
+                orders: vec![order(
+                    None,
+                    account(2),
+                    SwapDelivery::Reshield,
+                    SwapOrderObservations {
+                        pre_hook_dead: Some(SwapPreHookDeath {
+                            cause: SwapPreHookDeathCause::Expired,
+                            observation: SwapObservation {
+                                block: observed.block(),
+                                transaction_hash: None,
+                            },
+                        }),
+                        ..SwapOrderObservations::default()
+                    },
+                    None,
+                )],
+            }),
+            ..v1(fallback, 2)
+        },
+        v1(plain, 3),
+    ] {
+        origin_store
+            .put_operation_fixture(record.operation, &record)
+            .unwrap();
+    }
+    for record in [
+        V1Record {
+            swap_destination: Some(serves(pending)),
+            ..v1(pending_destination, 0)
+        },
+        // The signed order's destination issued its shield.
+        V1Record {
+            issued: vec![
+                setup(Vec::new()),
+                payload(
+                    ExecutorPayloadPurpose::SwapDestinationShield,
+                    1,
+                    70,
+                    observed,
+                    Vec::new(),
+                ),
+            ],
+            nonce_observation: Some(observed),
+            swap_destination: Some(serves(signed)),
+            ..v1(signed_destination, 1)
+        },
+    ] {
+        store
+            .put_operation_fixture(record.operation, &record)
+            .unwrap();
+    }
+    let stored = |chain| {
+        db.list_desktop_wallet_vault_records(&crate::vault::executors::executor_operation_prefix(
+            view.wallet_id(),
+            chain,
+        ))
+        .unwrap()
+    };
+    let find = |records: &[ExecutorRecord], operation: ExecutorOperationId| {
+        records
+            .iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+            .clone()
+    };
+    let uses = |record: &ExecutorRecord| {
+        (
+            record
+                .swap_uses()
+                .iter()
+                .map(SwapUseRecord::id)
+                .collect::<Vec<_>>(),
+            record.active_swap_use(),
+        )
+    };
+    let first_use = |origin| {
+        (
+            vec![SwapUseId::first(origin)],
+            Some(SwapUseId::first(origin)),
+        )
+    };
+
+    // Loading projects the links in memory, the same way every time, and writes nothing.
+    // Startup reconciliation finds consistent links and writes nothing either.
+    let before = (stored(1), stored(137));
+    let origins = origin_store.records().unwrap();
+    let destinations = store.records().unwrap();
+    assert_eq!(origin_store.records_as_version_1_reader().unwrap(), origins);
+    assert!(!store.reconcile_swap_destinations_on_load().unwrap());
+    assert_eq!(store.records().unwrap(), destinations);
+    assert_eq!((stored(1), stored(137)), before);
+    assert_eq!(origin_store.next_index().unwrap(), 4);
+
+    // Both accounts of a swap project to the use named after its origin operation.
+    let pending_record = find(&origins, pending);
+    assert_eq!(
+        (
+            pending_record.index(),
+            pending_record.address(),
+            pending_record.swap_approval(),
+            pending_record.destination_operation()
+        ),
+        (
+            0,
+            Some(account(0)),
+            Some(&approved),
+            Some(pending_destination)
+        )
+    );
+    assert_eq!(pending_record.issued()[0].hash(), B256::repeat_byte(3));
+    assert_eq!(pending_record.reserved_inputs(), inputs);
+    assert_eq!(uses(&pending_record), first_use(pending));
+    let pending_destination = find(&destinations, pending_destination);
+    assert_eq!(
+        pending_destination.swap_destination(),
+        Some(serves(pending))
+    );
+    assert_eq!(uses(&pending_destination), first_use(pending));
+
+    let signed_record = find(&origins, signed);
+    let signed_order = &signed_record.swap().unwrap().orders()[0];
+    assert_eq!(
+        (
+            signed_order.use_id(),
+            signed_order.pre_hook().payload(),
+            signed_order.post_hook().map(|hook| hook.payload())
+        ),
+        (
+            Some(SwapUseId::first(signed)),
+            B256::repeat_byte(31),
+            Some(B256::repeat_byte(32))
+        )
+    );
+    assert_eq!(
+        signed_record
+            .issued()
+            .iter()
+            .map(IssuedExecutorPayload::hash)
+            .collect::<Vec<_>>(),
+        [3, 31, 32].map(B256::repeat_byte)
+    );
+    assert_eq!(
+        signed_record.destination_operation(),
+        Some(signed_destination)
+    );
+    assert_eq!(uses(&signed_record), first_use(signed));
+    let signed_destination = find(&destinations, signed_destination);
+    assert_eq!(uses(&signed_destination), first_use(signed));
+    assert!(matches!(
+        signed_destination.swap_uses()[0].role(),
+        SwapUseRole::Destination { shields, .. } if shields == &[B256::repeat_byte(70)]
+    ));
+    // An account without swap links has no use and keeps its version.
+    assert_eq!(uses(&find(&origins, plain)), (Vec::new(), None));
+
+    // A change stores that record with its uses and rewrites no other. A build from before
+    // uses then refuses the whole chain's list instead of overlooking the claim, while the
+    // allocation floor stays.
+    let hidden = origin_store.set_hidden(pending, true).unwrap();
+    assert!(hidden.is_hidden());
+    assert_eq!(
+        (
+            hidden.swap_uses(),
+            hidden.issued(),
+            hidden.reserved_inputs()
+        ),
+        (
+            pending_record.swap_uses(),
+            pending_record.issued(),
+            pending_record.reserved_inputs()
+        )
+    );
+    let reloaded = origin_store.records().unwrap();
+    assert_eq!(reloaded.len(), origins.len());
+    assert_eq!(find(&reloaded, pending), hidden);
+    assert_eq!(
+        before
+            .0
+            .iter()
+            .zip(stored(1))
+            .filter(|(old, new)| old != &new)
+            .count(),
+        1
+    );
+    assert!(matches!(
+        origin_store.records_as_version_1_reader(),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    assert_eq!(origin_store.next_index().unwrap(), 4);
+
+    // A later use on the account leaves the old order on the swap's original terms. The
+    // account takes one once its setup is recorded as executed.
+    origin_store.reconcile(fallback, before_setup, &[]).unwrap();
+    origin_store
+        .record_issued(fallback, setup(Vec::new()))
+        .unwrap();
+    origin_store
+        .reconcile(
+            fallback,
+            observed,
+            &[(
+                B256::repeat_byte(3),
+                ExecutorPayloadInclusion::new(
+                    BlockNumHash::new(11, B256::repeat_byte(11)),
+                    B256::repeat_byte(4),
+                    ExecutorExecutionResult::Executed,
+                ),
+            )],
+        )
+        .unwrap();
+    let later = SwapUseId::random().unwrap();
+    let reused = origin_store
+        .claim_swap_pair(SwapPairClaim {
+            id: later,
+            source: SwapAccountChoice::Existing(fallback),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approved.clone(),
+            destination: None,
+        })
+        .unwrap()
+        .source;
+    let swap = reused.swap().unwrap();
+    assert_eq!(swap.order_terms(&swap.orders()[0]), &terms);
+    assert_eq!(
+        (swap.orders()[0].use_id(), reused.active_swap_use()),
+        (Some(SwapUseId::first(fallback)), Some(later))
+    );
+    assert_eq!(reused.swap_approval(), Some(&approved));
     drop(origin_store);
     drop(store);
     drop(view);

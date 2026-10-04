@@ -10,7 +10,7 @@ use crate::vault::{
 
 impl ExecutorStore {
     /// The native owner holds activity admission and verifies the derived address
-    /// before atomically linking both encrypted records.
+    /// before atomically linking the encrypted records and stopping the account's swap use.
     pub(crate) fn register_public_account(
         &self,
         operation: ExecutorOperationId,
@@ -72,16 +72,19 @@ impl ExecutorStore {
             return Err(ExecutorStoreError::OperationMismatch);
         }
         account.status = PublicAccountStatus::Active;
+        let mut updates = vec![public_account_metadata_record_entry(
+            &self.view.view,
+            &account,
+        )?];
+        self.stop_swap_use_in_batch(&mut record, &mut updates)?;
         record.public_account_uuid = Some(account.public_account_uuid.clone());
         record.retired = true;
-        self.vault.db.put_desktop_wallet_vault_records(&[
-            public_account_metadata_record_entry(&self.view.view, &account)?,
-            self.seal(
-                RecordKind::ExecutorOperation,
-                self.operation_key(operation),
-                &record,
-            )?,
-        ])?;
+        updates.push(self.seal(
+            RecordKind::ExecutorOperation,
+            self.operation_key(operation),
+            &record,
+        )?);
+        self.vault.db.put_desktop_wallet_vault_records(&updates)?;
         Ok(account)
     }
 }

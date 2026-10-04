@@ -25,8 +25,9 @@ use wallet_ops::{
     settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
     swap_setup_recorded_executed,
     vault::{
-        BridgeDelivery, ExecutorOperationId, ExecutorRecord, IssuedExecutorPayload,
-        SwapApprovedBounds, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
+        BridgeDelivery, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadPurpose,
+        ExecutorRecord, IssuedExecutorPayload, SwapApproval, SwapApprovedBounds, SwapBridgeOutcome,
+        SwapDelivery, SwapOrderRecord, SwapUseId, SwapUseRecord,
     },
 };
 
@@ -40,8 +41,8 @@ mod progress;
 
 use form::SwapForm;
 use model::{
-    SwapBridgeLabels, SwapFillHint, SwapLabels, SwapPrivateBridgeLabels, SwapSetupLabels,
-    SwapSetupProgress, SwapStepAccount, bridge_sent_amount, swap_history_start,
+    SwapBridgeLabels, SwapFillHint, SwapIdentity, SwapLabels, SwapPrivateBridgeLabels,
+    SwapSetupLabels, SwapSetupProgress, SwapStepAccount, bridge_sent_amount, swap_history_start,
     swap_observation_range, swap_private_delivery,
 };
 pub(super) use model::{
@@ -58,6 +59,9 @@ const MAX_BRIDGE_POLL_INTERVAL: Duration = Duration::from_mins(5);
 const STALE_SETUP_BLOCKS: u64 = 150;
 /// Time between account reads of a deferred setup.
 const DEFERRED_SETUP_OBSERVATION_INTERVAL: Duration = Duration::from_mins(5);
+/// The order validity a prepared swap's draft restores from an approval saved without one. The
+/// form shows it, and the user can change it before the review.
+const DRAFT_VALIDITY: Duration = Duration::from_mins(30);
 const SWAP_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 const SWAP_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -176,21 +180,58 @@ struct PendingSwapOrder {
     gas_share_bps: u16,
     valid_for: Duration,
     reuse_account: bool,
+    /// The swap use the draft's order is signed for: the one that claims the account, or the
+    /// new one a reused account's draft claims it for. Restored with the draft.
+    swap_use: SwapUseId,
     started_at: u64,
 }
 
 impl PendingSwapOrder {
+    /// The draft of the swap a reused account is claimed for and has no order of yet, from the
+    /// approval saved with that claim. A restart keeps the claim and drops this session's
+    /// draft, so the records give it again: the swap stays listed, and reopens with its
+    /// accounts and terms. An account the use reserved fresh shows its own setup instead.
+    fn prepared(record: &ExecutorRecord) -> Option<Self> {
+        let swap_use = model::prepared_swap_use(record).filter(|swap_use| !swap_use.is_fresh())?;
+        let approval = swap_use.approval()?;
+        let tokens = approval.tokens?;
+        let bounds = &approval.bounds;
+        Some(Self {
+            previous_order: None,
+            sell: tokens.sell,
+            buy: tokens.buy,
+            delivery: approval.delivery,
+            amount: bounds.spend_amount(),
+            private_minimum: bounds.private_minimum,
+            slippage_bps: bounds.slippage_bps,
+            gas_share_bps: bounds
+                .gas_share_bps
+                .unwrap_or(wallet_ops::cow::GAS_SHARE_BALANCED_BPS),
+            valid_for: bounds
+                .valid_for_secs
+                .map_or(DRAFT_VALIDITY, |secs| Duration::from_secs(secs.into())),
+            reuse_account: true,
+            swap_use: swap_use.id(),
+            started_at: swap_use.started_at().unwrap_or_default(),
+        })
+    }
+
+    /// Whether the draft is another swap than the record's latest order belongs to.
     fn starts_new_swap(self, record: &ExecutorRecord) -> bool {
-        let Some(swap) = record.swap() else {
-            return false;
-        };
-        let Some(order) = swap.orders().last() else {
-            return false;
-        };
-        let terms = swap.order_terms(order);
-        order.observations().traded.is_some()
-            || (self.sell, self.buy, self.delivery)
-                != (terms.sell_token(), terms.buy_token(), order.delivery())
+        record
+            .swap()
+            .and_then(|swap| swap.orders().last())
+            .is_some_and(|order| order.use_id() != Some(self.swap_use))
+    }
+
+    /// When the draft's swap started. A reused account's new swap starts when its use claims
+    /// the account, which a retry of the draft keeps.
+    fn started(self, record: &ExecutorRecord) -> u64 {
+        record
+            .swap_use(self.swap_use)
+            .filter(|swap_use| !swap_use.is_fresh())
+            .and_then(SwapUseRecord::started_at)
+            .unwrap_or(self.started_at)
     }
 }
 
@@ -307,7 +348,7 @@ pub(super) struct PrivateSwapsView {
     /// Each private Bridge swap's destination stealth account record, by the swap's operation,
     /// as last read from the destination network's own executor records. An entry exists once
     /// that network's session is loaded, and holds `None` when no such record is there.
-    destinations: BTreeMap<ExecutorOperationId, Option<ExecutorRecord>>,
+    destinations: BTreeMap<SwapIdentity, Option<ExecutorRecord>>,
     /// My orders' open swaps, counted again whenever the view changes rather than on every
     /// frame.
     open_orders: usize,
@@ -323,6 +364,9 @@ pub(super) struct PrivateSwapsView {
     /// The order's terms changed before signing. Nothing was signed; the swap is quoted again
     /// and its review reopens with the change named.
     reapproval: Option<(ExecutorOperationId, SwapReviewChange)>,
+    /// What cancelling a swap's preparation in this session left of its claims, which the
+    /// swap's detail reports until the dialog shows something else.
+    cancelled: Option<progress::CancelledPreparation>,
     job: Option<SwapJob>,
     job_revision: u64,
     error: Option<String>,
@@ -386,6 +430,7 @@ impl WalletRoot {
                 view.cancel = None;
                 view.pending_authorization = None;
                 view.reapproval = None;
+                view.cancelled = None;
                 view.tracking.clear();
                 view.destinations.clear();
                 view.records.clear();
@@ -621,6 +666,7 @@ impl PrivateSwapsView {
             cancel: None,
             pending_authorization: None,
             reapproval: None,
+            cancelled: None,
             job: None,
             job_revision: 0,
             error: None,
@@ -648,6 +694,7 @@ impl PrivateSwapsView {
                     .into_iter()
                     .filter(|record| {
                         is_swap_record(record)
+                            || model::cancelled_swap_uses(record).next().is_some()
                             || Some(record.operation()) == selected
                             || self.pending_order(record).is_some()
                     })
@@ -796,26 +843,32 @@ impl PrivateSwapsView {
         let mut loaded = BTreeMap::new();
         let mut destinations = BTreeMap::new();
         for record in &self.records {
-            let (Some(delivery), Some(operation)) = (
-                swap_private_delivery(record),
-                record.destination_operation(),
-            ) else {
-                continue;
-            };
-            let records = loaded
-                .entry(delivery.destination_chain)
-                .or_insert_with_key(|chain_id| {
-                    let (_, owner) = self.destination_owner(*chain_id, cx)?;
-                    owner.records().ok()
-                });
-            if let Some(records) = records {
-                destinations.insert(
-                    record.operation(),
-                    records
-                        .iter()
-                        .find(|destination| destination.operation() == operation)
-                        .cloned(),
-                );
+            // Each swap of a reused account names its own destination account.
+            for swap_use in record.swap_uses() {
+                let Some((delivery, operation)) =
+                    model::swap_use_destination(record, swap_use.id())
+                else {
+                    continue;
+                };
+                let records =
+                    loaded
+                        .entry(delivery.destination_chain)
+                        .or_insert_with_key(|chain_id| {
+                            let (_, owner) = self.destination_owner(*chain_id, cx)?;
+                            owner.records().ok()
+                        });
+                if let Some(records) = records {
+                    destinations.insert(
+                        SwapIdentity {
+                            operation: record.operation(),
+                            swap_use: swap_use.id(),
+                        },
+                        records
+                            .iter()
+                            .find(|destination| destination.operation() == operation)
+                            .cloned(),
+                    );
+                }
             }
         }
         self.destinations = destinations;
@@ -833,6 +886,19 @@ impl PrivateSwapsView {
             })
             .filter_map(swap_private_delivery)
             .map(|delivery| delivery.destination_chain)
+            // A reused account's prepared swap waits for a new destination account's setup
+            // the same way.
+            .chain(self.records.iter().filter_map(|record| {
+                let swap_use = model::prepared_swap_use(record)?;
+                sets_up_destination(swap_use).then_some(())?;
+                Some(
+                    swap_use
+                        .approval()?
+                        .delivery
+                        .private_bridge()?
+                        .destination_chain,
+                )
+            }))
             .collect::<BTreeSet<_>>();
         for chain_id in chains {
             self.ensure_destination_load(chain_id, cx);
@@ -863,15 +929,54 @@ impl PrivateSwapsView {
         });
     }
 
-    /// A private Bridge swap's destination stealth account record, when its network's records
-    /// were read and hold the account `delivery` names.
+    /// The swap `record`'s own progress shows: the draft's while a new order is being
+    /// prepared, otherwise the latest order's, or before any order the one that claims the
+    /// account.
+    fn shown_swap(&self, record: &ExecutorRecord) -> Option<SwapIdentity> {
+        let swap_use = self.pending_order(record).map_or_else(
+            || model::record_latest_use(record),
+            |pending| Some(pending.swap_use),
+        )?;
+        Some(SwapIdentity {
+            operation: record.operation(),
+            swap_use,
+        })
+    }
+
+    /// The swap `order` of `record` belongs to; without an order, the swap the record shows.
+    fn order_swap(
+        &self,
+        record: &ExecutorRecord,
+        order: Option<&SwapOrderRecord>,
+    ) -> Option<SwapIdentity> {
+        order
+            .and_then(SwapOrderRecord::use_id)
+            .map(|swap_use| SwapIdentity {
+                operation: record.operation(),
+                swap_use,
+            })
+            .or_else(|| self.shown_swap(record))
+    }
+
+    /// The destination stealth account record of the private Bridge swap `record` shows, when
+    /// its network's records were read and hold the account `delivery` names.
     fn destination_account(
         &self,
         record: &ExecutorRecord,
         delivery: BridgeDelivery,
     ) -> Option<&ExecutorRecord> {
+        self.swap_destination_account(self.shown_swap(record)?, delivery)
+    }
+
+    /// [`Self::destination_account`] for one swap of a stealth account, which an earlier swap
+    /// of a reused account keeps apart from the account's later ones.
+    fn swap_destination_account(
+        &self,
+        swap: SwapIdentity,
+        delivery: BridgeDelivery,
+    ) -> Option<&ExecutorRecord> {
         self.destinations
-            .get(&record.operation())?
+            .get(&swap)?
             .as_ref()
             .filter(|destination| destination.address() == Some(delivery.receiver))
     }
@@ -891,8 +996,21 @@ impl PrivateSwapsView {
         record: &ExecutorRecord,
         delivery: BridgeDelivery,
     ) -> SwapSetupProgress {
-        let operation = record.operation();
-        match self.destinations.get(&operation) {
+        match self.shown_swap(record) {
+            Some(swap) => self.swap_destination_setup_progress(swap, delivery),
+            None => SwapSetupProgress::NetworkLoading,
+        }
+    }
+
+    /// [`Self::destination_setup_progress`] for one swap of a stealth account, which a draft
+    /// on a reused account asks about before its swap is the one the record shows.
+    fn swap_destination_setup_progress(
+        &self,
+        swap: SwapIdentity,
+        delivery: BridgeDelivery,
+    ) -> SwapSetupProgress {
+        let operation = swap.operation;
+        match self.destinations.get(&swap) {
             None => SwapSetupProgress::NetworkLoading,
             Some(None) => SwapSetupProgress::NotSent,
             Some(Some(destination)) => account_setup_progress(
@@ -910,16 +1028,47 @@ impl PrivateSwapsView {
     /// destination stealth account of the private Bridge swap `operation` from the swap's
     /// recorded bridge outcome. It runs on the runtime, and that owner's change is picked up
     /// with the next read of the destination accounts.
+    ///
+    /// A fill verified as shielded consumed the account's execution nonce, which only a read
+    /// of the account records. Until then its shield counts as outstanding and the account
+    /// can't be chosen for another swap. So the same owner reads the account once at its
+    /// network's confirmed block, through the wallet's network context. Nothing is asked
+    /// while that network isn't loaded or its confirmed block is unknown: the account then
+    /// stays unavailable until the network is loaded and the swap is checked.
     fn reconcile_destination(&self, operation: ExecutorOperationId, cx: &gpui::App) {
         let Some(delivery) = self.record(operation).and_then(swap_private_delivery) else {
             return;
         };
-        let Some((_, owner)) = self.destination_owner(delivery.destination_chain, cx) else {
+        let chain_id = delivery.destination_chain;
+        let Some((_, owner)) = self.destination_owner(chain_id, cx) else {
             return;
         };
-        drop(self.runtime.spawn_blocking(move || {
+        let confirmed = self
+            .root
+            .upgrade()
+            .and_then(|root| root.read(cx).confirmed_block(chain_id));
+        let origin = Arc::clone(&self.owner);
+        drop(self.runtime.spawn(async move {
+            let settling = Arc::clone(&owner);
             // A failed write is repeated by the owner's next reconciliation.
-            let _ = owner.reconcile_swap_destinations();
+            let _ =
+                tokio::task::spawn_blocking(move || settling.reconcile_swap_destinations()).await;
+            let Some(confirmed) = confirmed else {
+                return;
+            };
+            let reading = Arc::clone(&owner);
+            let delivered = tokio::task::spawn_blocking(move || {
+                delivered_destinations(&origin, &reading, operation, chain_id)
+            })
+            .await
+            .unwrap_or_default();
+            for account in delivered {
+                // A failed read leaves the account unavailable until the swap is checked again.
+                let _ = Box::pin(
+                    owner.reconcile_history(account, confirmed..confirmed.saturating_add(1)),
+                )
+                .await;
+            }
         }));
     }
 
@@ -937,27 +1086,115 @@ impl PrivateSwapsView {
             .is_some_and(|(block, destination)| model::held_proceeds_recovered(destination, block))
     }
 
-    /// A new submission must not borrow the previous order's outcome. Once its own order is
-    /// recorded, that record becomes the source of progress even if submission is still running.
+    /// A new submission must not borrow the previous order's outcome. Once its own swap use
+    /// records an order, that record becomes the source of progress even if submission is
+    /// still running.
+    ///
+    /// Without a draft of this session, a reused account's prepared swap gives one from its
+    /// saved approval: see [`PendingSwapOrder::prepared`].
     fn pending_order(&self, record: &ExecutorRecord) -> Option<PendingSwapOrder> {
         self.tracking
-            .get(&record.operation())?
-            .pending_order
+            .get(&record.operation())
+            .and_then(|tracking| tracking.pending_order)
             .filter(|pending| {
                 pending.previous_order
-                    == record
-                        .swap()
-                        .and_then(|swap| swap.orders().last())
+                    == model::swap_use_last_order(record, pending.swap_use)
                         .map(SwapOrderRecord::uid)
             })
+            .or_else(|| PendingSwapOrder::prepared(record))
+            .map(|mut pending| {
+                if let SwapDelivery::Bridge(delivery) = &mut pending.delivery
+                    && delivery.is_private()
+                    && delivery.receiver.is_zero()
+                    && let Some(SwapDelivery::Bridge(bound)) = model::prepared_swap_use(record)
+                        .filter(|swap_use| swap_use.id() == pending.swap_use)
+                        .and_then(SwapUseRecord::approval)
+                        .map(|approval| approval.delivery)
+                    && bound.is_private()
+                    && bound.destination_chain == delivery.destination_chain
+                    && !bound.receiver.is_zero()
+                {
+                    // Preparation binds the new account after this session saved its draft.
+                    // Keep the draft's terms, resolving only its placeholder receiver.
+                    delivery.receiver = bound.receiver;
+                }
+                pending
+            })
+    }
+
+    /// The swap use of `record` whose first order the approval saved with it still binds, once
+    /// every account the swap uses is ready for that order: an account the use set up is
+    /// confirmed, and an account it reuses is set up already. The approved order is then
+    /// placed without another review, whichever of its accounts needed setup. Signing still
+    /// checks each account afresh.
+    fn approved_use<'a>(
+        &self,
+        record: &'a ExecutorRecord,
+    ) -> Option<(SwapUseId, &'a SwapApproval)> {
+        if record.is_swap_setup_stopped() {
+            return None;
+        }
+        let swap_use = model::prepared_swap_use(record)?;
+        let approval = swap_use.approval()?;
+        let operation = record.operation();
+        let source_ready = if swap_use.is_fresh() {
+            self.stage(record) == SwapStage::Approved
+        } else {
+            account_setup_progress(
+                record,
+                self.session.chain_id,
+                self.tracking
+                    .get(&operation)
+                    .and_then(|tracking| tracking.setup),
+                false,
+            ) == SwapSetupProgress::Done
+        };
+        let destination_ready = match approval.delivery.private_bridge() {
+            Some(delivery) => {
+                let swap = SwapIdentity {
+                    operation,
+                    swap_use: swap_use.id(),
+                };
+                self.swap_destination_setup_progress(swap, delivery) == SwapSetupProgress::Done
+            }
+            None => true,
+        };
+        (source_ready && destination_ready).then_some((swap_use.id(), approval))
+    }
+
+    /// The private Bridge delivery `record`'s own progress is about: its draft's, or its
+    /// latest order's or approved one.
+    fn shown_private_delivery(&self, record: &ExecutorRecord) -> Option<BridgeDelivery> {
+        match self.pending_order(record) {
+            Some(pending) => pending.delivery.private_bridge(),
+            None => swap_private_delivery(record),
+        }
     }
 
     /// Presentation only; signing and observation still use the durable account stage. A
     /// private Bridge swap also shows its destination stealth account's setup, and a recovery
     /// of held proceeds on the destination network.
     fn progress_stage(&self, record: &ExecutorRecord) -> SwapStage {
-        if self.pending_order(record).is_some() {
-            return SwapStage::Ready;
+        if let Some(pending) = self.pending_order(record) {
+            // A draft's own account is set up. A destination account its swap use sets up
+            // shows that setup until it is confirmed; one it reuses has none to wait for.
+            let setup = record
+                .swap_use(pending.swap_use)
+                .filter(|swap_use| sets_up_destination(swap_use))
+                .and_then(|_| model::swap_use_destination(record, pending.swap_use));
+            return match setup {
+                Some((delivery, _)) => model::private_bridge_setup_stage(
+                    SwapStage::Ready,
+                    self.swap_destination_setup_progress(
+                        SwapIdentity {
+                            operation: record.operation(),
+                            swap_use: pending.swap_use,
+                        },
+                        delivery,
+                    ),
+                ),
+                None => SwapStage::Ready,
+            };
         }
         let stage = self.stage(record);
         let Some(delivery) = swap_private_delivery(record) else {
@@ -1252,8 +1489,9 @@ impl PrivateSwapsView {
         let token = self.delivered_token(bridge, cx);
         let destination_amount =
             |amount| self.network_token_amount(bridge.destination_chain, token, amount, cx);
+        let swap = self.order_swap(record, order);
         let private = bridge.is_private().then(|| SwapPrivateBridgeLabels {
-            setups: self.setup_labels(record, bridge, order.is_some(), cx),
+            setups: self.setup_labels(record, swap, bridge, order.is_some(), cx),
             held: order.and_then(|order| match order.observations().bridge_outcome {
                 Some(SwapBridgeOutcome::HeldOnDestination { amount, .. }) => {
                     Some(destination_amount(amount))
@@ -1298,12 +1536,13 @@ impl PrivateSwapsView {
         }
     }
 
-    /// The setup of each stealth account of a private Bridge swap, the swap's own network
-    /// first. `placed` tells that the order these labels describe exists, which needs both
-    /// accounts set up.
+    /// The setup of each stealth account of `record`'s private Bridge swap `swap`, the swap's
+    /// own network first. `placed` tells that the order these labels describe exists, which
+    /// needs both accounts set up.
     fn setup_labels(
         &self,
         record: &ExecutorRecord,
+        swap: Option<SwapIdentity>,
         delivery: BridgeDelivery,
         placed: bool,
         cx: &gpui::App,
@@ -1328,7 +1567,25 @@ impl PrivateSwapsView {
             SwapSetupProgress::Pending => self.setup_confirmation_detail(record, cx),
             _ => None,
         };
-        let destination = self.destination_account(record, delivery);
+        let destination = swap.and_then(|swap| self.swap_destination_account(swap, delivery));
+        // An account its swap use didn't reserve fresh is reused: the use sends no setup for
+        // it. A draft tells before its use claims the account, and the saved approval tells
+        // of a destination account whose network isn't loaded.
+        let swap_use = swap.and_then(|swap| record.swap_use(swap.swap_use));
+        let reuses = |account: &ExecutorRecord| {
+            swap.and_then(|swap| account.swap_use(swap.swap_use))
+                .is_some_and(|swap_use| !swap_use.is_fresh())
+        };
+        let source_reused = reuses(record)
+            || self.pending_order(record).is_some_and(|pending| {
+                pending.reuse_account && swap.is_some_and(|swap| swap.swap_use == pending.swap_use)
+            });
+        let destination = destination_account_metadata(
+            destination,
+            swap.map(|swap| swap.swap_use),
+            swap_use.and_then(SwapUseRecord::approval),
+        );
+        let destination_fresh = destination.fresh_from_record_or_approval();
         [
             SwapSetupLabels {
                 network: form::network_name(self.session.chain_id),
@@ -1337,13 +1594,14 @@ impl PrivateSwapsView {
                     address,
                 }),
                 progress: origin,
+                reused: source_reused,
                 block: model::swap_setup_block(record),
                 detail: waiting,
             },
             SwapSetupLabels {
                 network: form::network_name(delivery.destination_chain),
-                account: Some(SwapStepAccount {
-                    index: destination.map(ExecutorRecord::index),
+                account: (!delivery.receiver.is_zero()).then(|| SwapStepAccount {
+                    index: destination.record.map(ExecutorRecord::index),
                     address: delivery.receiver,
                 }),
                 progress: if placed {
@@ -1351,7 +1609,8 @@ impl PrivateSwapsView {
                 } else {
                     self.destination_setup_progress(record, delivery)
                 },
-                block: destination.and_then(model::swap_setup_block),
+                reused: !destination_fresh,
+                block: destination.record.and_then(model::swap_setup_block),
                 detail: None,
             },
         ]
@@ -1510,18 +1769,32 @@ impl PrivateSwapsView {
 
     /// The next observation of a private Bridge swap's destination stealth account, on its own
     /// network and through that network's owner, while its setup is unconfirmed and the swap
-    /// has no order. It is paced like the swap's own setup.
+    /// has no order. It is paced like the swap's own setup. A reused account's draft is such a
+    /// swap while its swap use has no order, whatever orders the account's earlier swaps have.
     fn destination_observation(
         &self,
         record: &ExecutorRecord,
         cx: &gpui::App,
     ) -> Option<ObservationPage> {
-        if record.swap().is_some() || record.is_retired() || record.is_swap_setup_stopped() {
+        if record.is_swap_setup_stopped() {
             return None;
         }
-        let delivery = swap_private_delivery(record)?;
+        let (delivery, destination) = match self.pending_order(record) {
+            Some(pending) if pending.reuse_account => {
+                let swap = SwapIdentity {
+                    operation: record.operation(),
+                    swap_use: pending.swap_use,
+                };
+                let (delivery, _) = model::swap_use_destination(record, pending.swap_use)?;
+                (delivery, self.swap_destination_account(swap, delivery)?)
+            }
+            _ if record.swap().is_some() || record.is_retired() => return None,
+            _ => {
+                let delivery = swap_private_delivery(record)?;
+                (delivery, self.destination_account(record, delivery)?)
+            }
+        };
         let chain_id = delivery.destination_chain;
-        let destination = self.destination_account(record, delivery)?;
         let tracking = self.tracking.get(&record.operation());
         let observed = tracking.and_then(|tracking| tracking.destination_setup);
         if account_stage(destination, chain_id, observed, false) != SwapStage::SetupPending {
@@ -1818,8 +2091,9 @@ impl PrivateSwapsView {
         catchup
     }
 
-    /// Place the order of a swap approved with its setup in this session once the setup is
-    /// confirmed. After a restart, or once the user declined, its detail offers the step.
+    /// Place the order of a swap approved with its setup in this session once every setup it
+    /// needs is confirmed: its own account's, a private Bridge swap's destination account's,
+    /// or both. After a restart, or once the user declined, its detail offers the step.
     /// Only this swap's detail may advance while a dialog is open.
     fn continue_approved_swaps(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.busy() || self.form.is_some() || !self.session_is_current(cx) {
@@ -1828,14 +2102,7 @@ impl PrivateSwapsView {
         let next = self
             .records
             .iter()
-            // A private Bridge swap's order also waits for its destination account's setup.
-            .filter(|record| {
-                !record.is_swap_setup_stopped()
-                    && self.stage(record) == SwapStage::Approved
-                    && swap_private_delivery(record).is_none_or(|delivery| {
-                        self.destination_setup_progress(record, delivery) == SwapSetupProgress::Done
-                    })
-            })
+            .filter(|record| self.approved_use(record).is_some())
             .map(ExecutorRecord::operation)
             .find(|operation| {
                 self.tracking
@@ -2005,7 +2272,14 @@ impl PrivateSwapsView {
             SwapAction::Setup(approval) => approval.destination_account(),
             SwapAction::Order(approval) => {
                 let delivery = approval.private_delivery()?;
-                let operation = self.record(approval.operation)?.destination_operation()?;
+                // An existing destination the order claims with its account before it signs.
+                if let Some(destination) = approval.pair_destination {
+                    return Some((destination.chain_id, destination.operation));
+                }
+                // The destination the order's own swap use names, not a later use's.
+                let record = self.record(approval.operation)?;
+                let swap_use = approval.swap_use.or_else(|| record.active_swap_use())?;
+                let (_, operation) = model::swap_use_destination(record, swap_use)?;
                 Some((delivery.destination_chain, operation))
             }
             // A setup sent again on the destination network is authorized there itself.
@@ -2130,11 +2404,123 @@ impl PrivateSwapsView {
     }
 }
 
+/// Whether a source use's saved approval has the swap set its destination account up. An
+/// approval from before accounts were bound has it do so, as every such swap did.
+fn sets_up_destination(swap_use: &SwapUseRecord) -> bool {
+    swap_use.approval().is_some_and(|approval| {
+        approval
+            .accounts
+            .and_then(|accounts| accounts.destination)
+            .is_none_or(|account| account.setup)
+    })
+}
+
+/// The destination stealth accounts on `chain_id` whose shield a verified fill of the swap
+/// account `operation` ran while their recorded execution nonce hasn't passed it. Read from
+/// both owners' records, without a network request.
+fn delivered_destinations(
+    origin: &ExecutorOwner,
+    destination: &ExecutorOwner,
+    operation: ExecutorOperationId,
+    chain_id: u64,
+) -> Vec<ExecutorOperationId> {
+    let record = origin.records().ok().and_then(|records| {
+        records
+            .into_iter()
+            .find(|record| record.operation() == operation)
+    });
+    let (Some(record), Ok(accounts)) = (record, destination.records()) else {
+        return Vec::new();
+    };
+    let orders = record
+        .swap()
+        .map_or(&[][..], wallet_ops::vault::SwapOperationRecord::orders);
+    orders
+        .iter()
+        .filter(|order| {
+            matches!(
+                order.observations().bridge_outcome,
+                Some(SwapBridgeOutcome::DeliveredVerified { shielded: true, .. })
+            ) && matches!(
+                order.delivery(),
+                SwapDelivery::Bridge(delivery) if delivery.destination_chain == chain_id
+            )
+        })
+        .filter_map(|order| {
+            let swap_use = order
+                .use_id()
+                .unwrap_or_else(|| SwapUseId::first(operation));
+            let (_, account) = model::swap_use_destination(&record, swap_use)?;
+            accounts
+                .iter()
+                .find(|candidate| candidate.operation() == account)
+                .filter(|candidate| has_unpassed_shield(candidate))
+                .map(ExecutorRecord::operation)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Whether a destination shield `record`'s account signed sits at or above its recorded
+/// execution nonce, or the record has none, so the records can't tell that the shield ran.
+fn has_unpassed_shield(record: &ExecutorRecord) -> bool {
+    let observed = record
+        .nonce_observation()
+        .map(ExecutorNonceObservation::nonce);
+    record.issued().iter().any(|payload| {
+        payload.purpose() == ExecutorPayloadPurpose::SwapDestinationShield
+            && observed.is_none_or(|nonce| nonce <= payload.nonce())
+    })
+}
+
 /// Whether `record`'s setup is recorded as executed for the accepted delegate of `chain_id`,
 /// the record's own network.
 fn setup_recorded_executed_on(chain_id: u64, record: &ExecutorRecord) -> bool {
     ExecutorProfile::accepted(chain_id, record.delegate())
         .is_some_and(|profile| swap_setup_recorded_executed(record, profile))
+}
+
+/// The destination record and the freshness reported by its matching claim and saved
+/// source approval. Callers choose which record is available and how missing claims fall back.
+struct DestinationAccountMetadata<'a> {
+    record: Option<&'a ExecutorRecord>,
+    claimed_fresh: Option<bool>,
+    approved_fresh: Option<bool>,
+}
+
+impl DestinationAccountMetadata<'_> {
+    /// A loaded record is authoritative for setup and review; without its claim, treat the
+    /// account as fresh. Only an unloaded record falls back to the saved approval.
+    fn fresh_from_record_or_approval(&self) -> bool {
+        if self.record.is_some() {
+            self.claimed_fresh.unwrap_or(true)
+        } else {
+            self.approved_fresh.unwrap_or(true)
+        }
+    }
+
+    /// Cancellation retains the approval's account choice when the loaded record has no
+    /// matching claim, so its explanation can still distinguish an existing account.
+    fn fresh_from_claim_or_approval(&self) -> bool {
+        self.claimed_fresh.or(self.approved_fresh).unwrap_or(true)
+    }
+}
+
+fn destination_account_metadata<'a>(
+    record: Option<&'a ExecutorRecord>,
+    swap_use: Option<SwapUseId>,
+    approval: Option<&SwapApproval>,
+) -> DestinationAccountMetadata<'a> {
+    DestinationAccountMetadata {
+        record,
+        claimed_fresh: swap_use
+            .and_then(|id| record?.swap_use(id))
+            .map(SwapUseRecord::is_fresh),
+        approved_fresh: approval
+            .and_then(|approval| approval.accounts?.destination)
+            .map(|account| account.setup),
+    }
 }
 
 /// The stage `record` gives on `chain_id`, its own network, with `setup` this session's last

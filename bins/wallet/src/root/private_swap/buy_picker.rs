@@ -89,6 +89,9 @@ pub(super) enum NetworkUnavailable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NetworkAvailability {
     Available,
+    /// Setup isn't available, but the network can be picked with an existing stealth account,
+    /// which the user selects in the form.
+    ReuseOnly,
     /// The wallet's private sync there isn't ready yet, with its progress in percent once
     /// known.
     Syncing(Option<u8>),
@@ -97,14 +100,30 @@ pub(super) enum NetworkAvailability {
 }
 
 impl NetworkAvailability {
+    /// The network can be picked: with a new stealth account there, or only with an existing
+    /// one.
     pub(super) const fn is_available(self) -> bool {
-        matches!(self, Self::Available)
+        matches!(self, Self::Available | Self::ReuseOnly)
     }
 
-    /// The line under `network` in the picker's list while it can't be picked.
+    /// Everything but the setup's funding holds, which is all a delivery to an existing
+    /// stealth account needs of the network.
+    pub(super) const fn admits_existing_account(self) -> bool {
+        matches!(
+            self,
+            Self::Available
+                | Self::ReuseOnly
+                | Self::CheckingFee
+                | Self::Unavailable(NetworkUnavailable::Unfunded | NetworkUnavailable::SetupFee)
+        )
+    }
+
+    /// The line under `network` in the picker's list while it can't be picked, or can be only
+    /// with an existing stealth account.
     fn list_reason(self, network: &str) -> Option<String> {
         match self {
             Self::Available => None,
+            Self::ReuseOnly => Some("Existing account only".to_owned()),
             Self::Syncing(None) => Some("Syncing…".to_owned()),
             Self::Syncing(Some(percent)) => Some(format!("Syncing… {percent}%")),
             Self::CheckingFee => Some("Checking setup fee…".to_owned()),
@@ -132,6 +151,9 @@ impl NetworkAvailability {
         let elsewhere = "Pick a token on another network or use Public address.";
         Some(match self {
             Self::Available => return None,
+            Self::ReuseOnly => format!(
+                "New stealth account setup is unavailable on {network}. Select an existing stealth account there, or use Public address."
+            ),
             Self::CheckingFee => {
                 format!("Checking whether your private funds on {network} cover the setup fee.")
             }
@@ -179,6 +201,8 @@ pub(super) struct PrivateNetworkFacts {
     pub(super) sync: NetworkSync,
     /// A spendable private balance there is in a token a compatible broadcaster accepts.
     pub(super) funded: bool,
+    /// A set-up stealth account there is locally eligible as a destination.
+    pub(super) reusable: bool,
 }
 
 /// Whether Private balance can deliver on a network with these `facts`. The first condition
@@ -195,6 +219,7 @@ pub(super) const fn private_network_availability(
     match facts.sync {
         NetworkSync::Loading(percent) => NetworkAvailability::Syncing(percent),
         NetworkSync::Failed => NetworkAvailability::Unavailable(NetworkUnavailable::SyncFailed),
+        NetworkSync::Ready if !facts.funded && facts.reusable => NetworkAvailability::ReuseOnly,
         NetworkSync::Ready if !facts.funded => {
             NetworkAvailability::Unavailable(NetworkUnavailable::Unfunded)
         }
@@ -574,8 +599,10 @@ impl PrivateSwapsView {
     /// kind. A shown network the kind can't take gives way to the swap's own, which only
     /// changes what the picker lists. For Private balance, the networks that aren't loaded
     /// start loading.
-    pub(super) fn settle_buy_picker(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn settle_buy_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let own = self.session.chain_id;
+        // A network without setup funds can be picked for an existing account there.
+        self.refresh_destination_accounts(window, cx);
         let Some(form) = self.form.as_ref().filter(|form| form.picker.open) else {
             return;
         };
@@ -649,7 +676,8 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         }
-        if form.network != network {
+        let network_changed = form.network != network;
+        if network_changed {
             form.network = network;
             // The provider follows the new network's token, unless the user picks one again.
             form.bridge.chosen = None;
@@ -657,6 +685,10 @@ impl PrivateSwapsView {
         form.buy = Some(token);
         form.native_output = false;
         form.error = None;
+        if network_changed {
+            // An account chosen on the old network doesn't follow to the new one.
+            form.clear_destination();
+        }
         self.load_bridge_routes(window, cx);
         self.bridge_choices_changed(window, cx);
     }

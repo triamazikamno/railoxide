@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use alloy::eips::BlockNumHash;
-use alloy::primitives::{B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes};
 use eyre::{Result, eyre};
 use sync_service::WalletHandle;
 use tokio::sync::{Mutex, MutexGuard, watch};
@@ -42,23 +42,26 @@ pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;
 pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
 pub(crate) use swap::Transfer;
+pub use swap::is_swap_destination_record;
+#[cfg(test)]
+pub(crate) use swap::submit_swap_pair_setups_with;
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
     SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
     SwapPrivateBridgeQuote, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
-    SwapSetupStatus, is_swap_record, swap_order_state, swap_setup_recorded_executed,
+    SwapSetupStatus, SwapUseClaim, is_swap_record, swap_order_state, swap_setup_recorded_executed,
     swap_setup_status, swap_submission_outcome,
 };
 pub use swap::{
-    PreparedPrivateBridgeSetup, PrivateBridgeSetupPreparation, is_swap_destination_record,
-    prepare_private_bridge_setup, submit_private_bridge_setups,
+    PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
+    submit_swap_pair_setups,
 };
 #[cfg(test)]
 pub(crate) use swap::{
-    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs,
-    price_swap_review, reusable_swap_proof, swap_cancellation_admitted, swap_invalidation,
-    swap_recovery_calls,
+    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, SwapShieldNotes, notes_of_shield,
+    plan_swap_inputs, price_swap_review, reusable_swap_proof, swap_cancellation_admitted,
+    swap_invalidation, swap_recovery_calls,
 };
 
 pub struct ExecutorReconciliationReport {
@@ -162,6 +165,13 @@ impl ExecutorOwner {
 
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Configure reads of a recorded account for its delegate's nonce layout.
+    fn chain_for_delegate(&self, delegate: Address) -> Option<EffectiveChainConfig> {
+        let mut chain = self.chain.clone();
+        chain.railgun.as_mut()?.deployment.relay_adapt_7702_contract = delegate;
+        Some(chain)
     }
 
     /// Also releases the observation endpoints, so their background admission stops.
@@ -426,13 +436,9 @@ impl ExecutorOwner {
         previous: &ExecutorRecord,
         range: Range<u64>,
     ) -> Result<super::executor_observation::ExecutorHistoryObservation> {
-        let mut historical_chain = self.chain.clone();
-        historical_chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = previous.delegate();
+        let mut historical_chain = self
+            .chain_for_delegate(previous.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         historical_chain.enabled = true;
         self.while_active(super::executor_observation::observe_executor_history(
             &self.endpoints,
@@ -521,13 +527,9 @@ impl ExecutorOwner {
         let address = record.address().ok_or_else(|| {
             eyre!("executor address is unavailable; authorize its derivation first")
         })?;
-        let mut historical_chain = self.chain.clone();
-        historical_chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut historical_chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         historical_chain.enabled = true;
         self.while_active(inspect_executor(
             &historical_chain,

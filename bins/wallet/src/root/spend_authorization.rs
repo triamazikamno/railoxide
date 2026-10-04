@@ -682,11 +682,12 @@ impl SpendAuthorizationSummary {
         self
     }
 
+    /// Each row's label and value. A copyable account's value follows its prefix, in full.
     #[cfg(test)]
     pub(in crate::root) fn rows_for_test(&self) -> Vec<(String, String)> {
         self.rows
             .iter()
-            .map(|row| (row.label.to_string(), row.value.to_string()))
+            .map(SpendAuthorizationSummaryRow::values_for_test)
             .collect()
     }
 
@@ -1055,6 +1056,9 @@ pub(super) struct SpendAuthorizationSummaryRow {
     value: Arc<str>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
+    /// What a shortened, copyable value follows and what its copy control calls it, such as an
+    /// account's number and "stealth account address".
+    copyable_account: Option<(Arc<str>, Arc<str>)>,
     delta: Option<SpendAuthorizationAmountDelta>,
     hint: Option<SpendAuthorizationHint>,
 }
@@ -1095,6 +1099,7 @@ impl SpendAuthorizationSummaryRow {
             value: value.into(),
             icon_path: None,
             shortened_copyable: false,
+            copyable_account: None,
             delta: None,
             hint: None,
         }
@@ -1116,6 +1121,35 @@ impl SpendAuthorizationSummaryRow {
         self
     }
 
+    /// The value is an account's address: shortened after `prefix`, such as "#35 · ", with a
+    /// control that copies it in full and is named `name`.
+    pub(super) fn with_copyable_account(
+        mut self,
+        prefix: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
+    ) -> Self {
+        self.shortened_copyable = true;
+        self.copyable_account = Some((prefix.into(), name.into()));
+        self
+    }
+
+    /// What a shortened, copyable row shows: its value, shortened, after its prefix.
+    fn shortened_value(&self) -> String {
+        let short = spend_authorization_recipient_display(self.value.as_ref());
+        match &self.copyable_account {
+            Some((prefix, _)) => format!("{prefix}{short}"),
+            None => short,
+        }
+    }
+
+    /// The tooltip of a shortened, copyable row's copy control.
+    fn copy_tooltip(&self) -> String {
+        match &self.copyable_account {
+            Some((_, name)) => format!("Copy {name}"),
+            None => format!("Copy {}", self.label.to_ascii_lowercase()),
+        }
+    }
+
     pub(super) fn with_amount_change(
         mut self,
         previous: Option<U256>,
@@ -1134,7 +1168,11 @@ impl SpendAuthorizationSummaryRow {
 
     #[cfg(test)]
     pub(in crate::root) fn values_for_test(&self) -> (String, String) {
-        (self.label.to_string(), self.value.to_string())
+        let prefix = self
+            .copyable_account
+            .as_ref()
+            .map_or("", |(prefix, _)| prefix.as_ref());
+        (self.label.to_string(), format!("{prefix}{}", self.value))
     }
 }
 
@@ -2061,7 +2099,7 @@ fn render_spend_authorization_compact_row(
     cx: &App,
 ) -> gpui::Div {
     let value = if row.shortened_copyable {
-        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
+        let copy_tooltip = row.copy_tooltip();
         div()
             .flex_auto()
             .min_w_0()
@@ -2070,7 +2108,7 @@ fn render_spend_authorization_compact_row(
             .justify_end()
             .gap_1()
             .child(
-                app_text(spend_authorization_recipient_display(row.value.as_ref()))
+                app_text(row.shortened_value())
                     .min_w_0()
                     .text_color(rgb(theme::TEXT))
                     .font_family(APP_MONO_FONT_FAMILY),
@@ -2614,8 +2652,8 @@ fn spend_authorization_summary_value(
     }
 
     if row.shortened_copyable {
-        let display_value = spend_authorization_recipient_display(row.value.as_ref());
-        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
+        let display_value = row.shortened_value();
+        let copy_tooltip = row.copy_tooltip();
         return div()
             .w_full()
             .flex()

@@ -246,7 +246,7 @@ pub enum OrderLimitError {
     InvalidPriceTolerance,
     #[error("the gas share must be at most 10000 basis points")]
     InvalidGasShare,
-    #[error("the quote's native price can't be used")]
+    #[error("Couldn't calculate network fees from this quote.")]
     InvalidQuotePrice,
     #[error("the quote's gas amount can't be used")]
     InvalidQuoteGas,

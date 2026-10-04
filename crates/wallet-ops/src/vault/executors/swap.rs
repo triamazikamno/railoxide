@@ -3,7 +3,8 @@ use broadcaster_core::contracts::cow::OrderUid;
 use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorInputIdentity, ExecutorOperationId,
     ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStore,
-    ExecutorStoreError, FixedBytes, IssuedExecutorPayload, Serialize, SwapDestinationOutcome, U256,
+    ExecutorStoreError, FixedBytes, IssuedExecutorPayload, Serialize, SwapDestinationOutcome,
+    SwapUseId, SwapUseRecord, SwapUseRole, U256,
 };
 
 /// Public components of the Railgun address that every post-hook of one swap
@@ -143,6 +144,17 @@ impl SwapOperationRecord {
                     && order.destination_delivered()
         })
     }
+
+    pub(super) fn has_use_ids(&self) -> bool {
+        self.orders.iter().any(|order| order.use_id.is_some())
+    }
+
+    /// Orders from before swap uses all belong to their account's first use.
+    pub(super) fn assign_use(&mut self, id: SwapUseId) {
+        for order in &mut self.orders {
+            order.use_id = Some(id);
+        }
+    }
 }
 
 /// Serialized with serde's external tag, so later kinds such as keeping the
@@ -160,6 +172,15 @@ pub enum SwapDelivery {
 }
 
 impl SwapDelivery {
+    /// The Bridge delivery of a swap that shields its proceeds on the destination chain.
+    #[must_use]
+    pub const fn private_bridge(self) -> Option<BridgeDelivery> {
+        match self {
+            Self::Bridge(bridge) if bridge.is_private() => Some(bridge),
+            _ => None,
+        }
+    }
+
     /// Whether the order carries a post-hook at the pre-hook's nonce plus one: Reshield's
     /// shield, or Across's deposit.
     #[must_use]
@@ -419,6 +440,10 @@ pub struct SwapApprovedBounds {
     /// `None` for other deliveries.
     #[serde(default)]
     pub destination_setup_fee: Option<U256>,
+    /// The approved maximum private setup fee on the swap's own chain, in its fee token. `None`
+    /// when the source account needs no setup, and in records from before it was bound.
+    #[serde(default)]
+    pub source_setup_fee: Option<U256>,
 }
 
 impl SwapApprovedBounds {
@@ -448,6 +473,52 @@ pub struct SwapApproval {
     /// [`ExecutorRecord::swap_approval_tokens`].
     #[serde(default)]
     pub tokens: Option<SwapApprovalTokens>,
+    /// The stealth accounts the approval binds and whether each needs setup. `None` in
+    /// approvals from before accounts were bound, which bind neither.
+    #[serde(default)]
+    pub accounts: Option<SwapApprovedAccounts>,
+}
+
+/// The stealth accounts an approval binds: the swap's own, and for a private Bridge delivery
+/// the destination chain's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapApprovedAccounts {
+    pub source: SwapApprovedAccount,
+    #[serde(default)]
+    pub destination: Option<SwapApprovedAccount>,
+}
+
+/// One approved stealth account and whether the swap sets it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapApprovedAccount {
+    /// `None` for an approved new account until its derivation binds the address.
+    #[serde(default)]
+    pub address: Option<Address>,
+    /// The approved swap sets the account up. False for an existing account.
+    pub setup: bool,
+}
+
+impl SwapApprovedAccount {
+    /// Whether the account at `address`, with the setup need `setup`, is the approved one. An
+    /// approved new account without an address takes the one its derivation binds.
+    #[must_use]
+    pub fn admits(&self, address: Address, setup: bool) -> bool {
+        self.setup == setup && self.address.is_none_or(|approved| approved == address)
+    }
+}
+
+impl SwapApprovedAccounts {
+    /// Whether `source` and `destination`, each an account's address and setup need, are the
+    /// approved accounts.
+    #[must_use]
+    pub fn admits(&self, source: (Address, bool), destination: Option<(Address, bool)>) -> bool {
+        self.source.admits(source.0, source.1)
+            && match (self.destination, destination) {
+                (None, None) => true,
+                (Some(approved), Some((address, setup))) => approved.admits(address, setup),
+                _ => false,
+            }
+    }
 }
 
 /// The approved sell and buy tokens. A native Buy asset is `Address::ZERO`.
@@ -734,9 +805,17 @@ pub struct SwapOrderRecord {
     /// Required for Bridge delivery, with the delivery's provider, and absent otherwise.
     #[serde(default)]
     bridge: Option<BridgeOrderTerms>,
+    /// The swap use this order is an attempt of. Stored only with the record's uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    use_id: Option<SwapUseId>,
 }
 
 impl SwapOrderRecord {
+    #[must_use]
+    pub const fn use_id(&self) -> Option<SwapUseId> {
+        self.use_id
+    }
+
     fn settled_at(&self, cutoff: u64) -> bool {
         self.observations
             .traded
@@ -822,6 +901,8 @@ impl SwapOrderRecord {
 /// attempt index and derives hook identities from the payloads.
 #[derive(Debug, Clone)]
 pub struct SwapAttempt {
+    /// The swap use the order was signed for, which must still claim the account.
+    pub use_id: SwapUseId,
     pub terms: SwapTerms,
     pub proof: SwapProof,
     pub uid: OrderUid,
@@ -837,20 +918,41 @@ pub struct SwapAttempt {
 }
 
 impl ExecutorRecord {
-    /// Completed swaps are durable at the accepted safety cutoff. Reuse still needs a
-    /// fresh nonce and delegation, but no historical RPC evidence for these outcomes.
+    /// Completed swaps are durable at the accepted safety cutoff, whichever role the account
+    /// had in them: every order traded and delivered, and every destination use that signed a
+    /// shield had its fill run one, all at or below the cutoff. Reuse still needs a fresh nonce
+    /// and delegation, but no historical RPC evidence for these outcomes. A consumed nonce is
+    /// not such an outcome: a signed shield without a shielded delivery leaves the account
+    /// unsettled, as does any recovery.
     pub(crate) fn settled_swaps_at(&self, cutoff: u64) -> bool {
-        let Some(swap) = &self.swap else {
-            return false;
-        };
+        let orders = self
+            .swap
+            .as_ref()
+            .map_or(&[][..], |swap| swap.orders.as_slice());
+        let mut delivered_shields = Vec::new();
+        for swap_use in &self.swap_uses {
+            let SwapUseRole::Destination {
+                shields, outcome, ..
+            } = &swap_use.role
+            else {
+                continue;
+            };
+            match outcome {
+                Some(SwapDestinationOutcome::Shielded { block, .. }) if block.number <= cutoff => {
+                    delivered_shields.extend_from_slice(shields);
+                }
+                _ if shields.is_empty() => {}
+                _ => return false,
+            }
+        }
         self.nonce_observation
             .is_some_and(|observed| observed.block.number <= cutoff)
-            && !swap.orders.is_empty()
+            && !(orders.is_empty() && delivered_shields.is_empty())
             && self.recovery_transactions.is_empty()
-            && swap.orders.iter().all(|order| order.settled_at(cutoff))
+            && orders.iter().all(|order| order.settled_at(cutoff))
             && self.issued.iter().all(|payload| match payload.purpose {
                 ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook => {
-                    swap.orders.iter().any(|order| {
+                    orders.iter().any(|order| {
                         order.pre_hook.payload == payload.hash
                             || order
                                 .post_hook
@@ -861,8 +963,10 @@ impl ExecutorRecord {
                     inclusion.block.number <= cutoff
                         && inclusion.result == super::ExecutorExecutionResult::Executed
                 }),
-                ExecutorPayloadPurpose::Recovery
-                | ExecutorPayloadPurpose::SwapDestinationShield => false,
+                ExecutorPayloadPurpose::SwapDestinationShield => {
+                    delivered_shields.contains(&payload.hash)
+                }
+                ExecutorPayloadPurpose::Recovery => false,
             })
     }
 
@@ -884,21 +988,17 @@ impl ExecutorRecord {
             })
     }
 
-    /// The terms approved before setup, while no order records its own.
+    /// The terms the latest use approved before setup, while no order records its own.
     #[must_use]
-    pub const fn swap_approval(&self) -> Option<&SwapApproval> {
-        self.swap_approval.as_ref()
+    pub fn swap_approval(&self) -> Option<&SwapApproval> {
+        self.swap_uses.last().and_then(SwapUseRecord::approval)
     }
 
     /// The sell and buy tokens approved with the setup. Approvals that predate the recorded
     /// pair, and records without an approval, use the setup's assets in sell-then-buy order.
     #[must_use]
     pub fn swap_approval_tokens(&self) -> Option<(Address, Address)> {
-        if let Some(tokens) = self
-            .swap_approval
-            .as_ref()
-            .and_then(|approval| approval.tokens)
-        {
+        if let Some(tokens) = self.swap_approval().and_then(|approval| approval.tokens) {
             return Some((tokens.sell, tokens.buy));
         }
         let mut tokens = self.assets.iter().filter_map(|asset| match asset {
@@ -955,11 +1055,12 @@ impl ExecutorRecord {
     }
 
     /// What became of the shield payload of the destination stealth account `receiver`, from
-    /// this origin record's private Bridge orders to it. A shield in any order's fill wins,
-    /// then a fill that left the token in the account. Otherwise only the latest order counts,
-    /// since a retry can still be filled.
+    /// the private Bridge orders to it of this origin record's use `id`. A shield in any of
+    /// those orders' fills wins, then a fill that left the token in the account. Otherwise only
+    /// the use's latest order counts, since a retry can still be filled.
     pub(super) fn swap_destination_outcome(
         &self,
+        id: SwapUseId,
         receiver: Address,
     ) -> Option<SwapDestinationOutcome> {
         let orders = || {
@@ -967,11 +1068,12 @@ impl ExecutorRecord {
                 .iter()
                 .flat_map(|swap| &swap.orders)
                 .filter(move |order| {
-                    matches!(
-                        order.delivery,
-                        SwapDelivery::Bridge(bridge)
-                            if bridge.is_private() && bridge.receiver == receiver
-                    )
+                    order.use_id == Some(id)
+                        && matches!(
+                            order.delivery,
+                            SwapDelivery::Bridge(bridge)
+                                if bridge.is_private() && bridge.receiver == receiver
+                        )
                 })
         };
         orders()
@@ -1168,9 +1270,11 @@ fn bridge_terms_fit(delivery: SwapDelivery, bridge: Option<&BridgeOrderTerms>) -
 }
 
 impl ExecutorStore {
-    /// Refresh only mutable account state, retaining finalized swap and setup evidence.
-    /// A receipt credit does not identify a hook winner: require every old hook nonce to
-    /// be behind the freshly read nonce without inventing historical execution evidence.
+    /// Refresh only mutable account state, retaining finalized swap and setup evidence, for
+    /// an account settled in either role. A receipt credit does not identify a hook winner:
+    /// require every old hook and shield nonce to be behind the freshly read nonce without
+    /// inventing historical execution evidence. The nonce alone settles nothing: the record
+    /// must already be settled at the observed block.
     pub(crate) fn refresh_settled_swap_nonce(
         &self,
         previous: &ExecutorRecord,
@@ -1199,13 +1303,15 @@ impl ExecutorStore {
     /// Reshield or Across Bridge order's post-hook holds `k + 1`; External and NEAR
     /// Intents Bridge orders have none. No other payload may use a future nonce. A
     /// Bridge order carries its provider's terms. A retry is admitted only after every
-    /// earlier attempt ended or completed delivery.
+    /// earlier attempt ended or completed delivery. The order belongs to the attempt's swap
+    /// use, and is refused once another use claims the account.
     pub fn record_swap_attempt(
         &self,
         operation: ExecutorOperationId,
         attempt: SwapAttempt,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         let SwapAttempt {
+            use_id,
             terms,
             proof,
             uid,
@@ -1218,12 +1324,71 @@ impl ExecutorStore {
             bridge,
         } = attempt;
         self.update(operation, |record| {
+            // An account reserved without swap links takes its first use with its first order.
+            if record.swap_uses.is_empty() && use_id == SwapUseId::first(operation) {
+                record.begin_first_swap_use(
+                    use_id,
+                    SwapUseRole::Source {
+                        approval: None,
+                        destination_operation: None,
+                    },
+                );
+            }
+            if record.active_swap_use != Some(use_id) {
+                return Err(ExecutorStoreError::SwapUseActive);
+            }
+            // The order is an attempt of the account's active use, which the latest use is.
+            let Some(SwapUseRecord {
+                stopped: false,
+                role:
+                    SwapUseRole::Source {
+                        destination_operation,
+                        ..
+                    },
+                ..
+            }) = record
+                .swap_uses
+                .last()
+                .filter(|swap_use| swap_use.id == use_id)
+            else {
+                return Err(ExecutorStoreError::OperationMismatch);
+            };
+            let destination_operation = *destination_operation;
+            // A private Bridge order pays the destination account this use names, which must
+            // serve this use for the delivery's token. Read under the held record lock.
+            if let SwapDelivery::Bridge(bridge) = delivery
+                && bridge.is_private()
+            {
+                let destination = match destination_operation {
+                    Some(destination) => self
+                        .for_chain(bridge.destination_chain)
+                        .record(destination)?,
+                    None => None,
+                };
+                if !destination.is_some_and(|destination| {
+                    destination.address == Some(bridge.receiver)
+                        && destination.swap_use(use_id).is_some_and(|swap_use| {
+                            matches!(
+                                swap_use.role,
+                                SwapUseRole::Destination {
+                                    origin_chain,
+                                    origin_operation,
+                                    destination_token,
+                                    ..
+                                } if origin_chain == self.chain_id
+                                    && origin_operation == operation
+                                    && destination_token == bridge.destination_token
+                            )
+                        })
+                }) {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
+            }
             let orders = record
                 .swap
                 .as_ref()
                 .map_or(&[][..], |swap| swap.orders.as_slice());
             if record.retired && record.swap.is_none()
-                || record.swap_destination.is_some()
                 || record.swap_setup_stopped
                 || record.address != Some(uid.owner())
                 || record.public_account_uuid.is_some()
@@ -1282,6 +1447,8 @@ impl ExecutorStore {
             // The setup must have won its nonce. Earlier pre-hooks have ended or executed.
             // Post-hooks below the current nonce need execution evidence or finalized
             // delivery; the current nonce makes their old signatures unusable either way.
+            // The same holds for a shield this account signed as an earlier swap's
+            // destination, which needs that swap's shielded delivery.
             if record.nonce_observation != Some(observed)
                 || observed.nonce != nonce
                 || pre_hook.context.calldata.is_empty()
@@ -1305,6 +1472,8 @@ impl ExecutorStore {
                                         .is_some_and(|hook| hook.payload == issued.hash)
                                         && order.settled_at(observed.block.number)
                                 })))
+                        && !(issued.purpose == ExecutorPayloadPurpose::SwapDestinationShield
+                            && record.swap_shield_delivered(issued.hash))
                         && !orders
                             .iter()
                             .any(|order| order.pre_hook.payload == issued.hash)
@@ -1325,6 +1494,7 @@ impl ExecutorStore {
                 submission,
                 submission_status: SwapSubmissionStatus::Pending,
                 bridge,
+                use_id: Some(use_id),
             };
             if let Some(swap) = &mut record.swap {
                 swap.proof = proof;
@@ -1392,18 +1562,63 @@ impl ExecutorStore {
         })
     }
 
-    /// Persist the terms approved with a swap's setup, replacing an earlier approval. Only a
-    /// reserved swap without orders takes one; an order records its own bounds.
+    /// Persist the terms approved with a swap's setup, replacing an earlier approval. Only the
+    /// expected latest use takes one, as an active source use without orders that was not
+    /// stopped; an order records its own bounds. A reserved account without a use takes its
+    /// first one here.
     pub fn record_swap_approval(
         &self,
         operation: ExecutorOperationId,
+        expected_use: SwapUseId,
         approval: SwapApproval,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         self.update(operation, |record| {
-            if record.address.is_none() || record.swap.is_some() || record.swap_setup_stopped {
+            if record.address.is_none() || record.swap_setup_stopped {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
-            record.swap_approval = Some(approval);
+            if !record.swap_uses.is_empty() && record.active_swap_use != Some(expected_use) {
+                return Err(ExecutorStoreError::OperationMismatch);
+            }
+            let has_orders = record
+                .swap_uses
+                .last()
+                .is_some_and(|swap_use| record.has_swap_use_order(swap_use.id));
+            match record.swap_uses.last_mut() {
+                Some(SwapUseRecord {
+                    id,
+                    stopped: false,
+                    role:
+                        SwapUseRole::Source {
+                            approval: known,
+                            destination_operation,
+                        },
+                    ..
+                }) if *id == expected_use && !has_orders => {
+                    // Cancellation resolves the linked destination through this delivery's chain.
+                    if destination_operation.is_some()
+                        && !matches!(
+                            (known.as_deref().map(|known| known.delivery), approval.delivery),
+                            (Some(SwapDelivery::Bridge(previous)), SwapDelivery::Bridge(replacement))
+                                if previous.is_private()
+                                    && replacement.is_private()
+                                    && previous.destination_chain == replacement.destination_chain
+                        )
+                    {
+                        return Err(ExecutorStoreError::OperationMismatch);
+                    }
+                    *known = Some(Box::new(approval));
+                }
+                None if record.swap.is_none() && expected_use == SwapUseId::first(operation) => {
+                    record.begin_first_swap_use(
+                        expected_use,
+                        SwapUseRole::Source {
+                            approval: Some(Box::new(approval)),
+                            destination_operation: None,
+                        },
+                    );
+                }
+                _ => return Err(ExecutorStoreError::OperationMismatch),
+            }
             Ok(())
         })
     }
@@ -1419,6 +1634,9 @@ impl ExecutorStore {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
             record.swap_setup_stopped = true;
+            if let Some(swap_use) = record.swap_uses.last_mut() {
+                swap_use.stopped = true;
+            }
             Ok(())
         })
     }
