@@ -59,8 +59,8 @@ use wallet_ops::{
     },
     default_public_broadcaster_fee_limit, prepare_swap_pair,
     settings::{
-        BridgeProfile, BridgeReceiverRejection, EffectiveChainConfig, EffectiveTokenRegistry,
-        SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
+        BridgeDestinationProfile, BridgeProfile, BridgeReceiverRejection, EffectiveChainConfig,
+        EffectiveTokenRegistry, SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
         resolve_effective_chain_rpc_route, swap_destination_tokens,
     },
     submit_swap_pair_setups,
@@ -770,10 +770,15 @@ struct BridgeRoutes {
     /// Tokens that are the sell token's own asset. The Buy list offers them, so the form can
     /// say why that pair isn't bridged.
     same_asset: Vec<BridgeDestination>,
-    /// The wrapped native token Across delivers on this network as the native asset.
+    /// The network's configured wrapped native token, which Across delivers there as the
+    /// native asset. `None` on a network without that setting.
     across_native: Option<Address>,
     /// The provider that couldn't be asked, and why. Its list is empty, and Retry asks again.
     unavailable: Option<(BridgeProvider, eyre::Report)>,
+    /// Whether a provider serves this network from the swap's: Across has a route to it, for
+    /// any token, or the wallet ships its 1Click name. A provider that couldn't be asked
+    /// counts as serving it.
+    served: bool,
 }
 
 impl BridgeRoutes {
@@ -1541,21 +1546,30 @@ async fn quote_swap_terms(
 
 /// What each provider delivers on `destination`'s chain for `sell`, asked on `clients`' route.
 /// One provider failing leaves its list empty and is named in the routes; both failing is the
-/// error.
+/// error. NEAR Intents isn't offered on a chain without a 1Click name and isn't asked: its
+/// list is empty, and an Across failure is then the error.
 async fn fetch_bridge_routes(
     clients: &SwapBridgeClients,
     origin: BridgeProfile,
-    destination: BridgeProfile,
+    destination: BridgeDestinationProfile,
     sell: Address,
     tokens: &EffectiveTokenRegistry,
     across_native: Option<Address>,
 ) -> eyre::Result<BridgeRoutes> {
     let chain = destination.chain_id();
+    let near_offered = destination.one_click_blockchain().is_some();
     let (routes, listed, unavailable) = match tokio::join!(
         clients.across.available_routes(origin.chain_id(), chain),
-        clients.near.tokens(),
+        async {
+            if near_offered {
+                clients.near.tokens().await
+            } else {
+                Ok(Vec::new())
+            }
+        },
     ) {
         (Ok(routes), Ok(listed)) => (routes, listed, None),
+        (Err(error), Ok(_)) if !near_offered => return Err(error.into()),
         (Ok(routes), Err(error)) => (
             routes,
             Vec::new(),
@@ -1578,6 +1592,8 @@ async fn fetch_bridge_routes(
             );
         }
     };
+    // Across failing here means NEAR Intents is offered, so the network isn't unserved.
+    let served = near_offered || !routes.is_empty();
     let across = across_destination_tokens(&routes, sell, tokens, chain);
     let near = near_destination_tokens(&listed, &origin, &destination, sell, tokens);
     // Without a sell token to leave out, the lists also hold the sell token's own asset.
@@ -1606,6 +1622,7 @@ async fn fetch_bridge_routes(
         same_asset,
         across_native,
         unavailable,
+        served,
     })
 }
 
@@ -1621,7 +1638,7 @@ async fn approved_bridge_destination(
     };
     let destination = bridge
         .destination_chain
-        .bridge_profile()
+        .bridge_destination()
         .ok_or_else(|| eyre::eyre!("Bridging to this network isn't supported."))?;
     let routes = fetch_bridge_routes(
         clients,
@@ -1669,7 +1686,7 @@ async fn request_bridge_routes(
     orderbook: Option<CowOrderbookClient>,
     bridge_clients: Option<SwapBridgeClients>,
     origin: BridgeProfile,
-    destination: BridgeProfile,
+    destination: BridgeDestinationProfile,
     sell: Address,
     tokens: EffectiveTokenRegistry,
     across_native: Option<Address>,
@@ -2306,20 +2323,6 @@ impl PrivateSwapsView {
                 },
             ),
             cx.subscribe_in(
-                &picker.search,
-                window,
-                |this, input, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Change)
-                        && this
-                            .form
-                            .as_ref()
-                            .is_some_and(|form| form.picker.search == *input)
-                    {
-                        this.buy_picker_searched(cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
                 &provider_select,
                 window,
                 |this, _, event: &SelectEvent<SearchableVec<ProviderSelectItem>>, window, cx| {
@@ -2508,7 +2511,12 @@ impl PrivateSwapsView {
         else {
             return Vec::new();
         };
-        root.private_action_asset_options(DeliveryFormKind::Unshield, self.session.chain_id)
+        let wrapped = root
+            .effective_chain_configs
+            .get(self.session.chain_id)
+            .and_then(|chain| chain.wrapped_native_token);
+        let mut assets = root
+            .private_action_asset_options(DeliveryFormKind::Unshield, self.session.chain_id)
             .into_iter()
             .filter(|asset| {
                 profile.token_eligibility(asset.token, SwapTokenRole::Sell)
@@ -2521,7 +2529,10 @@ impl PrivateSwapsView {
                     .unwrap_or_default();
                 asset
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // The wrapped native token leads; the rest keep their order.
+        assets.sort_by_key(|asset| native_rank(asset.token, wrapped));
+        assets
     }
 
     /// Read the form's [`FormAssets`] again.
@@ -2560,8 +2571,8 @@ impl PrivateSwapsView {
         }
     }
 
-    /// The destination list: configured tokens the swap profile accepts. Native output is a
-    /// switch on the wrapped native token, not an entry.
+    /// The destination list: configured tokens the swap profile accepts, the wrapped native
+    /// token first. Native output is a switch on that token, not an entry.
     fn buy_items(&self, sell: Address, cx: &App) -> Vec<PrivateActionAssetSelectItem> {
         let Some(root) = self.root.upgrade() else {
             return Vec::new();
@@ -2574,6 +2585,10 @@ impl PrivateSwapsView {
         else {
             return Vec::new();
         };
+        let wrapped = root
+            .effective_chain_configs
+            .get(self.session.chain_id)
+            .and_then(|chain| chain.wrapped_native_token);
         let mut items = swap_destination_tokens(&root.effective_token_registry, &profile)
             .into_iter()
             .filter_map(|info| {
@@ -2585,11 +2600,15 @@ impl PrivateSwapsView {
                 })
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.label.cmp(&right.label));
+        items.sort_by(|left, right| {
+            (native_rank(left.token, wrapped), &left.label)
+                .cmp(&(native_rank(right.token, wrapped), &right.label))
+        });
         items
     }
 
-    /// A Bridge swap's destination list: what either provider delivers, native first. Tokens
+    /// A Bridge swap's destination list: what either provider delivers, the native asset first
+    /// and `network`'s wrapped native token next. Tokens
     /// only NEAR Intents delivers carry its tag. The wrapped native token Across unwraps is
     /// listed as the native asset. The sell token's own asset stays listed, so picking it
     /// explains why the pair isn't bridged. A `private` delivery lists only what Across
@@ -2640,9 +2659,15 @@ impl PrivateSwapsView {
                 near_only,
             });
         }
+        let wrapped = self.root.upgrade().and_then(|root| {
+            root.read(cx)
+                .effective_chain_configs
+                .get(network)?
+                .wrapped_native_token
+        });
         items.sort_by(|left, right| {
-            (left.asset.token != Address::ZERO, &left.asset.label)
-                .cmp(&(right.asset.token != Address::ZERO, &right.asset.label))
+            (native_rank(left.asset.token, wrapped), &left.asset.label)
+                .cmp(&(native_rank(right.asset.token, wrapped), &right.asset.label))
         });
         items
     }
@@ -2664,9 +2689,10 @@ impl PrivateSwapsView {
         }
     }
 
-    /// The networks `receive_to` can deliver on: this one first, then the other built-in
-    /// chains a bridge reaches. One that fails a condition of the delivery kind is listed with
-    /// the reason and can't be picked.
+    /// The networks `receive_to` can deliver on: this one first, then the other swap chains and
+    /// every other chain enabled with RPC endpoints. One that fails a condition of the delivery
+    /// kind is listed with the reason and can't be picked. Under Private balance, the chains that
+    /// take Public address delivery only come last.
     fn network_items(&self, receive_to: ReceiveTo, cx: &App) -> Vec<BuyNetwork> {
         let own = self.session.chain_id;
         let mut items = vec![BuyNetwork {
@@ -2690,7 +2716,11 @@ impl PrivateSwapsView {
         items.extend(
             root.effective_chain_configs
                 .values()
-                .filter(|chain| chain.chain_id != own && chain.bridge_profile().is_some())
+                .filter(|chain| {
+                    chain.chain_id != own
+                        && (chain.bridge_profile().is_some()
+                            || chain.bridge_destination().is_some())
+                })
                 .map(|chain| BuyNetwork {
                     chain_id: chain.chain_id,
                     label: network_name(chain.chain_id).into(),
@@ -2699,11 +2729,19 @@ impl PrivateSwapsView {
                         .checked_destination_availability(root, receive_to, chain, cx),
                 }),
         );
+        // Private balance lists the chains that could take it before the Public-address-only
+        // ones, each group in its own order.
+        if receive_to == ReceiveTo::PrivateBalance {
+            items[1..].sort_by_key(|network| {
+                network.availability
+                    == NetworkAvailability::Unavailable(NetworkUnavailable::PublicOnly)
+            });
+        }
         items
     }
 
-    /// Whether `receive_to` can deliver on `network`, another chain. `None` when no bridge
-    /// reaches it from the swap's chain.
+    /// Whether `receive_to` can deliver on `network`, another chain. `None` when the picker
+    /// doesn't list it from the swap's chain.
     fn network_availability(
         &self,
         receive_to: ReceiveTo,
@@ -2716,7 +2754,9 @@ impl PrivateSwapsView {
             .get(self.session.chain_id)?
             .bridge_profile()?;
         let chain = root.effective_chain_configs.get(network)?;
-        chain.bridge_profile()?;
+        if chain.bridge_profile().is_none() && chain.bridge_destination().is_none() {
+            return None;
+        }
         Some(self.checked_destination_availability(root, receive_to, chain, cx))
     }
 
@@ -2739,8 +2779,24 @@ impl PrivateSwapsView {
                     availability => availability,
                 }
             }
+            // Routes are fetched for a network once the picker shows it, so only then is it
+            // known that no provider serves it.
+            NetworkAvailability::Available if self.unserved(chain.chain_id) => {
+                NetworkAvailability::Unavailable(NetworkUnavailable::NoBridge)
+            }
             availability => availability,
         }
+    }
+
+    /// Whether the routes fetched for `network` and the form's sell token show that no provider
+    /// serves it. Routes that aren't fetched yet, or couldn't be, don't.
+    fn unserved(&self, network: u64) -> bool {
+        self.form.as_ref().is_some_and(|form| {
+            matches!(
+                form.bridge.routes.get(&(form.sell, network)),
+                Some(Ok(routes)) if !routes.served
+            )
+        })
     }
 
     /// Start loading the wallet's session of the chains Private balance could deliver on that
@@ -2841,14 +2897,13 @@ impl PrivateSwapsView {
         };
         let (origin, destination, tokens, across_native) = {
             let root = root.read(cx);
-            let profile = |chain_id| {
-                root.effective_chain_configs
-                    .get(chain_id)
-                    .and_then(EffectiveChainConfig::bridge_profile)
-            };
             (
-                profile(self.session.chain_id),
-                profile(network),
+                root.effective_chain_configs
+                    .get(self.session.chain_id)
+                    .and_then(EffectiveChainConfig::bridge_profile),
+                root.effective_chain_configs
+                    .get(network)
+                    .and_then(EffectiveChainConfig::bridge_destination),
                 root.effective_token_registry.clone(),
                 root.effective_chain_configs
                     .get(network)
@@ -3613,9 +3668,9 @@ impl PrivateSwapsView {
         let railgun = chain
             .railgun
             .as_ref()
-            .map_or(Address::ZERO, |railgun| railgun.deployment.contract);
+            .map(|railgun| railgun.deployment.contract);
         chain
-            .bridge_profile()
+            .bridge_destination()
             .ok_or_else(unavailable)?
             .check_receiver(railgun, receiver)
             .map_err(|rejection| {
@@ -9337,8 +9392,8 @@ impl PrivateSwapsView {
         })
     }
 
-    /// Whether Across pays `token` on the form's network as ETH: WETH on Ethereum or Arbitrum
-    /// One reaches a receiver without code unwrapped.
+    /// Whether Across pays `token` on the form's network as its native asset: the network's
+    /// configured wrapped native token reaches a receiver without code unwrapped.
     fn across_delivers_native(&self, form: &SwapForm, token: Address, cx: &App) -> bool {
         self.destination_chain(form, cx)
             .and_then(|chain| across_unwrapped_token(&chain))
@@ -9505,10 +9560,16 @@ impl PrivateSwapsView {
                 NEAR_INTENTS_DISCLAIMER.into()
             }
             BridgeProvider::Across => {
-                // The SpokePool unwraps WETH only for receivers without code.
+                // The SpokePool unwraps the wrapped native token only for receivers without code.
                 if self.across_delivers_native(form, destination.destination_token, cx) {
+                    let network = form.network.unwrap_or(self.session.chain_id);
                     notes.push(
-                        "Across delivers ETH to wallets. Contract receivers get WETH.".into(),
+                        format!(
+                            "Across delivers {} to wallets. Contract receivers get {}.",
+                            self.network_token_symbol(network, Address::ZERO, cx),
+                            destination.symbol
+                        )
+                        .into(),
                     );
                 }
                 notes.push(self.surplus_note(form, destination.intermediate, cx).into());
@@ -10758,17 +10819,28 @@ fn same_chain_buy_items(items: Vec<PrivateActionAssetSelectItem>) -> Vec<SwapBuy
         .collect()
 }
 
+/// Where `token` sorts in an asset list: the native asset, then the chain's `wrapped` native
+/// token, then every other token.
+fn native_rank(token: Address, wrapped: Option<Address>) -> u8 {
+    if token == Address::ZERO {
+        0
+    } else if Some(token) == wrapped {
+        1
+    } else {
+        2
+    }
+}
+
 fn destination_for(list: &[BridgeDestination], token: Address) -> Option<&BridgeDestination> {
     list.iter()
         .find(|destination| destination.destination_token == token)
 }
 
 /// The wrapped native token Across delivers on `chain` as the native asset: the `SpokePool`
-/// unwraps WETH on Ethereum and Arbitrum One for a receiver without code.
-fn across_unwrapped_token(chain: &EffectiveChainConfig) -> Option<Address> {
-    chain
-        .wrapped_native_token
-        .filter(|_| matches!(chain.chain_id, 1 | 42161))
+/// unwraps the chain's configured wrapped native token for a receiver without code. A chain
+/// without that setting has none, and its tokens are shown as themselves.
+const fn across_unwrapped_token(chain: &EffectiveChainConfig) -> Option<Address> {
+    chain.wrapped_native_token
 }
 
 /// The surplus choice a provider takes: Across's `chosen` one; NEAR Intents converts it all.
@@ -10783,8 +10855,8 @@ pub(super) fn network_name(chain_id: u64) -> String {
     railgun_ui::chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned)
 }
 
-/// Whether `receive_to` can deliver on `chain`, another built-in chain a bridge reaches. A
-/// Public address needs only its RPC endpoints. Private balance also needs an accepted swap
+/// Whether `receive_to` can deliver on `chain`, another chain the picker lists. A Public
+/// address needs only its RPC endpoints. Private balance also needs an accepted swap
 /// profile, the wallet's private sync ready in this session, and either private funds for the
 /// destination stealth account's setup or, with `reusable`, a set-up account there to select.
 fn destination_availability(
@@ -11177,7 +11249,7 @@ fn source_return_hint(review: &SwapReview, deposit: &str, chain: &str) -> String
 
 /// A new swap's steps, as its reviews' stepper names them. A private Bridge swap sets up
 /// `two_accounts`.
-const fn swap_steps(two_accounts: bool) -> [&'static str; 2] {
+pub(super) const fn swap_steps(two_accounts: bool) -> [&'static str; 2] {
     if two_accounts {
         PRIVATE_BRIDGE_SWAP_STEPS
     } else {
@@ -11186,7 +11258,7 @@ const fn swap_steps(two_accounts: bool) -> [&'static str; 2] {
 }
 
 /// The stepper's explanation of a new swap's two steps.
-fn swap_steps_hint(two_accounts: bool) -> SpendAuthorizationHint {
+pub(super) fn swap_steps_hint(two_accounts: bool) -> SpendAuthorizationHint {
     let setup = if two_accounts {
         "1. Set up stealth accounts. A broadcaster on each network creates a one-time account for this swap, and you pay both setup fees."
     } else {

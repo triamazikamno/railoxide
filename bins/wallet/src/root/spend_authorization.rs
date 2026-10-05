@@ -618,11 +618,7 @@ impl SpendAuthorizationSummary {
         labels: impl IntoIterator<Item = L>,
         hint: SpendAuthorizationHint,
     ) -> Self {
-        self.steps = Some(SpendAuthorizationSteps {
-            current,
-            labels: labels.into_iter().map(Into::into).collect(),
-            hint,
-        });
+        self.steps = Some(SpendAuthorizationSteps::new(current, labels, hint));
         self
     }
 
@@ -860,11 +856,26 @@ impl SpendAuthorizationHint {
     }
 }
 
+/// A stepper's steps: see [`SpendAuthorizationSummary::with_steps`].
 #[derive(Clone)]
-struct SpendAuthorizationSteps {
+pub(super) struct SpendAuthorizationSteps {
     current: usize,
     labels: Vec<Arc<str>>,
     hint: SpendAuthorizationHint,
+}
+
+impl SpendAuthorizationSteps {
+    pub(super) fn new<L: Into<Arc<str>>>(
+        current: usize,
+        labels: impl IntoIterator<Item = L>,
+        hint: SpendAuthorizationHint,
+    ) -> Self {
+        Self {
+            current,
+            labels: labels.into_iter().map(Into::into).collect(),
+            hint,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1642,7 +1653,12 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .children(render_spend_authorization_steps(&self.summary))
+            .children(
+                self.summary
+                    .steps
+                    .as_ref()
+                    .map(render_spend_authorization_steps),
+            )
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
@@ -1780,7 +1796,12 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .children(render_spend_authorization_steps(&self.summary))
+            .children(
+                self.summary
+                    .steps
+                    .as_ref()
+                    .map(render_spend_authorization_steps),
+            )
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
@@ -2347,13 +2368,12 @@ fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
         )
 }
 
-/// The summary's stepper, when it has steps: numbered badges and their labels joined by a
-/// connector, with an info button at the end. A completed step shows a check in the success
-/// colour, the current one a filled badge, and a later one an outlined badge and a muted label.
+/// A stepper: numbered badges and their labels joined by a connector, with an info button at
+/// the end. A completed step shows a check in the success colour, the current one a filled
+/// badge, and a later one an outlined badge and a muted label.
 /// A step that doesn't fit beside the one before it wraps to the next line, and a label wider
 /// than the strip truncates.
-fn render_spend_authorization_steps(summary: &SpendAuthorizationSummary) -> Option<gpui::Div> {
-    let steps = summary.steps.as_ref()?;
+pub(super) fn render_spend_authorization_steps(steps: &SpendAuthorizationSteps) -> gpui::Div {
     let mut strip = div()
         .w_full()
         .min_w_0()
@@ -2438,11 +2458,11 @@ fn render_spend_authorization_steps(summary: &SpendAuthorizationSummary) -> Opti
                 ),
         );
     }
-    Some(strip.child(spend_authorization_hint(
+    strip.child(spend_authorization_hint(
         "wallet-spend-auth-steps-hint",
         &steps.hint,
         None,
-    )))
+    ))
 }
 
 /// The details disclosure as one more compact row: its title, its summary at the right, and a
@@ -3018,7 +3038,7 @@ impl WalletRoot {
                     .flex_col()
                     .gap_3()
                     .child(spend_authorization_title(&summary.title, summary.title_chip.as_deref()))
-                    .children(render_spend_authorization_steps(&summary))
+                    .children(summary.steps.as_ref().map(render_spend_authorization_steps))
                     .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
                     .child(render_spend_authorization_summary(
                         &summary,

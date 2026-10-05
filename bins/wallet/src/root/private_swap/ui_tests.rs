@@ -216,32 +216,38 @@ fn buy_asset_picker_searches_and_keeps_selection_in_sync(cx: &mut TestAppContext
         cx.simulate_input("DAI");
         cx.run_until_parked();
         swaps.read_with(cx, |swaps, cx| {
-            let form = swaps.form.as_ref().unwrap();
-            assert_eq!(&*form.picker.search.read(cx).value(), "DAI");
-            let content = swaps.buy_picker_content(form, cx);
-            assert_eq!(content.highlighted_token, Some(dai), "the first match");
+            let tokens = swaps.form.as_ref().unwrap().picker.tokens.read(cx);
+            assert_eq!(tokens.delegate().listed().next(), Some(dai));
+            assert_eq!(
+                tokens.selected_index(),
+                Some(gpui_component::IndexPath::default()),
+                "the first match"
+            );
         });
-        // Enter in the search picks the highlighted token and closes the picker.
+        // Enter in the search picks the selected token and closes the picker.
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("swap-buy-picker").is_none());
         assert!(cx.update(|window, _| previous_focus.is_focused(window)));
-        // Escape from either search or a list closes only the picker, leaving the swap
-        // form and its selected asset intact. The dialog restores the previous focus.
-        for from_list in [false, true] {
+        // Escape from either search closes only the picker, leaving the swap form and its
+        // selected asset intact. The dialog restores the previous focus.
+        for from_networks in [false, true] {
             let trigger = cx.debug_bounds("swap-buy-selector").unwrap();
             cx.simulate_click(trigger.center(), gpui::Modifiers::none());
             cx.run_until_parked();
             cx.update(|window, cx| {
                 window.draw(cx).clear(cx);
                 let picker = &swaps.read(cx).form.as_ref().unwrap().picker;
-                assert!(picker.search.read(cx).value().is_empty());
-                if from_list {
-                    let focus = picker.networks_focus.clone();
+                assert!(
+                    picker.tokens.read(cx).delegate().listed().count() > 1,
+                    "the search starts empty"
+                );
+                if from_networks {
+                    let focus = picker.networks.read(cx).focus_handle(cx);
                     focus.focus(window, cx);
                 } else {
-                    assert!(picker.search.read(cx).focus_handle(cx).is_focused(window));
+                    assert!(picker.tokens.read(cx).focus_handle(cx).is_focused(window));
                 }
             });
             cx.simulate_keystrokes("escape");
@@ -3093,6 +3099,15 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
                 );
                 swaps.form.as_mut().unwrap().orderbook = Some(orderbook);
                 assert!(!offers_native(swaps, cx));
+                // The wrapped native token leads the Buy list; the rest follow by symbol.
+                let items = swaps.buy_picker_items(swaps.form.as_ref().unwrap(), cx);
+                assert!(items.len() > 2);
+                assert_eq!(items[0].asset.token, weth);
+                assert!(
+                    items[1..]
+                        .windows(2)
+                        .all(|pair| pair[0].asset.label <= pair[1].asset.label)
+                );
             });
             weth
         });
@@ -4046,6 +4061,59 @@ fn across_weth_to_arbitrum_is_listed_and_bridged_as_eth(cx: &mut TestAppContext)
     });
 }
 
+/// Across's route to a chain's configured wrapped native token is listed as the native asset
+/// on any chain, here Base. On a chain without that setting the token is listed as itself.
+#[gpui::test]
+fn across_lists_the_configured_wrapped_native_token_as_the_native_asset(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        // List Base's tokens once its routes are fetched for `wrapped` as its setting.
+        let base_items = |wrapped: Option<Address>, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    let mut base = root.effective_chain_configs.get(8453).unwrap().clone();
+                    base.wrapped_native_token = wrapped;
+                    put_chain(root, base);
+                });
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.bridge.routes.remove(&(STUB_USDC, 8453));
+                    swaps.show_buy_picker_network(8453, window, cx);
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| {
+                    let form = swaps.form.as_ref().unwrap();
+                    form.bridge.routes.contains_key(&(STUB_USDC, 8453))
+                })
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                swaps
+                    .buy_picker_items(swaps.form.as_ref().unwrap(), cx)
+                    .into_iter()
+                    .map(|item| (item.asset.token, item.asset.label.to_string()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                enable_stub_chain(root, &stubs, 8453);
+            });
+        });
+        assert_eq!(
+            base_items(Some(STUB_BASE_WETH), cx),
+            [(Address::ZERO, "ETH".to_owned())],
+            "outside Ethereum and Arbitrum One, the setting decides too"
+        );
+        assert_eq!(
+            base_items(None, cx),
+            [(STUB_BASE_WETH, "WETH".to_owned())],
+            "without the setting, the form doesn't promise the native asset"
+        );
+    });
+}
+
 /// Private balance can deliver on another network only when it is enabled with RPC endpoints,
 /// has an accepted swap profile, is synced in this session, and holds private funds a setup
 /// broadcaster accepts or a set-up account to deliver to. The first condition that fails is
@@ -4125,6 +4193,172 @@ fn private_balance_needs_a_synced_and_funded_network() {
     let reuse = NetworkAvailability::ReuseOnly;
     assert!(reuse.is_available(), "its routes stay selectable");
     assert!(!unavailable(NetworkUnavailable::Unfunded).is_available());
+}
+
+/// The picker lists every other chain enabled with RPC endpoints, built in or added by the
+/// user, also without Railgun. Private balance can't deliver on such a chain, and opening the
+/// picker starts no session there. A Public address can pick it until its fetched routes show
+/// that no provider serves it, which a provider that couldn't be asked doesn't show.
+#[gpui::test]
+fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestAppContext) {
+    const ADDED: u64 = 777_777;
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        let orderbook = stub_orderbook(&stubs, runtime);
+        let listed = |swaps: &PrivateSwapsView, receive_to, cx: &App| {
+            swaps
+                .network_items(receive_to, cx)
+                .into_iter()
+                .filter(|network| !network.this_network)
+                .map(|network| (network.chain_id, network.availability))
+                .collect::<Vec<_>>()
+        };
+        let unavailable = NetworkAvailability::Unavailable;
+        let fetched = |cx: &mut gpui::VisualTestContext| {
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| {
+                    let form = swaps.form.as_ref().unwrap();
+                    form.bridge.routes.contains_key(&(STUB_USDC, ADDED))
+                })
+            });
+        };
+        cx.update(|window, cx| {
+            root.update(cx, |root, _| {
+                enable_stub_chain(root, &stubs, 8453);
+                // A Railgun chain with a higher id than Base, which Private balance lists first.
+                enable_stub_chain(root, &stubs, 42161);
+                // A chain the user added has no Railgun deployment and no 1Click name, and the
+                // stub Across has no route to it.
+                let mut added = root.effective_chain_configs.get(8453).unwrap().clone();
+                added.chain_id = ADDED;
+                added.built_in = false;
+                added.rpc_route = wallet_ops::RpcChainRoute::new(ADDED, vec![stubs.rpc()]);
+                put_chain(root, added);
+                let mut disabled = built_in_chain(10);
+                disabled.enabled = false;
+                put_chain(root, disabled);
+            });
+            swaps.update(cx, |swaps, cx| {
+                swaps
+                    .owner
+                    .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
+                swaps.open_form(
+                    None,
+                    STUB_USDC,
+                    None,
+                    Some(U256::from(1_000_000)),
+                    None,
+                    SwapDelivery::Reshield,
+                    window,
+                    cx,
+                );
+                let form = swaps.form.as_mut().unwrap();
+                form.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
+                form.orderbook = Some(orderbook);
+                swaps.open_buy_picker(window, cx);
+                let public_only = unavailable(NetworkUnavailable::PublicOnly);
+                assert_eq!(
+                    listed(swaps, ReceiveTo::PrivateBalance, cx)
+                        .into_iter()
+                        .map(|(chain_id, availability)| (chain_id, availability == public_only))
+                        .collect::<Vec<_>>(),
+                    [(42161, false), (8453, true), (ADDED, true)],
+                    "Arbitrum One comes before the Public-address-only chains, and disabled \
+                     Optimism isn't listed"
+                );
+            });
+            let states = &root.read(cx).chain_states;
+            assert!(
+                !states.contains_key(&8453) && !states.contains_key(&ADDED),
+                "no session starts on a chain without Railgun"
+            );
+            swaps.update(cx, |swaps, cx| {
+                swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+                set_receiver_text(swaps, &Address::repeat_byte(4).to_string(), window, cx);
+                assert_eq!(
+                    listed(swaps, ReceiveTo::PublicAddress, cx),
+                    [
+                        (8453, NetworkAvailability::Available),
+                        (42161, NetworkAvailability::Available),
+                        (ADDED, NetworkAvailability::Available),
+                    ],
+                    "a chain can be picked before its routes are fetched"
+                );
+
+                // The network search filters what the picker lists, by name or by the start
+                // of the chain id, and leaves the form's own list alone.
+                let networks = swaps.form.as_ref().unwrap().picker.networks.clone();
+                let mut matches = |query: &'static str, cx: &mut Context<'_, PrivateSwapsView>| {
+                    networks.update(cx, |list, cx| {
+                        list.set_query(query, window, cx);
+                        list.delegate().listed().collect::<Vec<_>>()
+                    })
+                };
+                assert_eq!(matches(" ARBITRUM ", cx), [42161]);
+                assert_eq!(matches("7777", cx), [ADDED]);
+                assert_eq!(listed(swaps, ReceiveTo::PublicAddress, cx).len(), 3);
+                assert_eq!(matches("", cx), [1, 8453, 42161, ADDED]);
+            });
+        });
+
+        // Across couldn't be asked, which doesn't show that it has no route there.
+        stubs.set_failing(&["/across/available-routes"]);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.show_buy_picker_network(ADDED, window, cx);
+            });
+        });
+        fetched(cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert!(matches!(
+                form.bridge.routes.get(&(STUB_USDC, ADDED)),
+                Some(Err(_))
+            ));
+            assert_eq!(
+                listed(swaps, ReceiveTo::PublicAddress, cx)[2],
+                (ADDED, NetworkAvailability::Available)
+            );
+        });
+
+        // Asked again, Across has no route there, and the chain has no 1Click name.
+        stubs.set_failing(&[]);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let form = swaps.form.as_mut().unwrap();
+                form.bridge.routes.remove(&(STUB_USDC, ADDED));
+                swaps.load_bridge_routes(window, cx);
+            });
+        });
+        fetched(cx);
+        swaps.read_with(cx, |swaps, cx| {
+            assert_eq!(
+                listed(swaps, ReceiveTo::PublicAddress, cx),
+                [
+                    (8453, NetworkAvailability::Available),
+                    (42161, NetworkAvailability::Available),
+                    (ADDED, unavailable(NetworkUnavailable::NoBridge)),
+                ]
+            );
+        });
+
+        // A form left on that network has no provider for any token, so nothing is quoted.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let form = swaps.form.as_mut().unwrap();
+                form.network = Some(ADDED);
+                form.buy = Some(Address::repeat_byte(9));
+                swaps.bridge_choices_changed(window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(matches!(form.delivery, Err(DeliveryProblem::Bridge)));
+                assert!(form.quote_delivery().is_none());
+                assert!(
+                    matches!(form.quote, QuoteState::Idle) && form.quote_task.is_none(),
+                    "nothing is quoted, so Review stays unavailable"
+                );
+            });
+        });
+    });
 }
 
 #[gpui::test]
@@ -5432,8 +5666,9 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
 
 /// After a restart only the records tell of a swap whose accounts are reserved and that has
 /// no order yet. It is listed in My orders and counted on the Private tab, and its detail
-/// offers Resume and Cancel preparation. Resume restores the reserved pair and the saved terms
-/// in the form, where Review opens the order's review. Cancel preparation releases both
+/// offers Place order and Cancel preparation. With both accounts ready, Place order checks the
+/// approved terms again instead of opening the form. The form still restores the reserved pair
+/// and the saved terms, where Review opens the order's review. Cancel preparation releases both
 /// existing accounts, which can be chosen again and aren't retired. When the swap set up a
 /// new destination account whose setup was sent, the cancellation reports that account as
 /// unresolved and its guards stay.
@@ -5606,11 +5841,20 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     .is_some()
             );
             assert!(cx.debug_bounds("swap-progress-stop").is_none());
-            let resume = cx.debug_bounds("swap-progress-continue").unwrap();
-            cx.simulate_click(resume.center(), gpui::Modifiers::none());
-            cx.run_until_parked();
+            let place = cx.debug_bounds("swap-progress-continue").unwrap();
+            cx.simulate_click(place.center(), gpui::Modifiers::none());
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
+                    // Both accounts are ready, so the approved order is quoted again.
+                    let job = swaps
+                        .job
+                        .take()
+                        .expect("a ready prepared swap places its approved order");
+                    assert_eq!(job.kind, SwapJobKind::Requote);
+                    assert!(swaps.form.is_none());
+                    job.abort.abort();
+                    swaps.job_revision += 1;
+                    swaps.open_existing_form(operation, window, cx);
                     assert_eq!(
                         swaps.dialog.as_ref().map(|dialog| dialog.view),
                         Some(dialog::SwapDialogView::Form)
@@ -5618,7 +5862,7 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     let form = swaps
                         .form
                         .as_ref()
-                        .expect("Resume restores the swap's form");
+                        .expect("the form restores the prepared swap");
                     assert_eq!(form.operation, Some(operation));
                     assert!(form.reuse_account);
                     assert_eq!(form.reuse_use, Some(first));
@@ -6263,57 +6507,68 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
     });
 }
 
-/// The picker's lists take the keyboard: Right, Left and Tab move between them, Up and Down
-/// move within one, and Enter shows a network's tokens or picks a token.
+/// Each list picks through its selection. Enter in the network search shows the selected
+/// network's tokens, and typing there doesn't change the shown network. A network the search
+/// hides can't be picked. Enter in the token search picks the selected token.
 #[gpui::test]
-fn buy_picker_keys_move_between_its_lists_and_pick(cx: &mut TestAppContext) {
+fn buy_picker_lists_pick_their_selection(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
     with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
         open_bridge_form(root, swaps, &stubs, runtime, cx);
-        let focused = |cx: &mut gpui::VisualTestContext| {
-            cx.update(|window, cx| {
-                window.draw(cx).clear(cx);
-                let picker = &swaps.read(cx).form.as_ref().unwrap().picker;
-                (
-                    picker.tokens_focus.is_focused(window),
-                    picker.networks_focus.is_focused(window),
-                )
-            })
+        let (tokens, networks) = swaps.read_with(cx, |swaps, _| {
+            let picker = &swaps.form.as_ref().unwrap().picker;
+            (picker.tokens.clone(), picker.networks.clone())
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
         };
         let shown = |cx: &mut gpui::VisualTestContext| {
             swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().picker.network)
         };
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            let tokens = swaps
-                .read(cx)
-                .form
-                .as_ref()
-                .unwrap()
-                .picker
-                .tokens_focus
-                .clone();
-            tokens.focus(window, cx);
-        });
-        assert_eq!(focused(cx), (true, false));
-
-        cx.simulate_keystrokes("right");
-        assert_eq!(focused(cx), (false, true));
-        // Ethereum, the swap's own network, is listed above Polygon.
-        cx.simulate_keystrokes("up enter");
+        let listed = |cx: &mut gpui::VisualTestContext| {
+            draw(cx);
+            networks.read_with(cx, |list, _| list.delegate().listed().collect::<Vec<_>>())
+        };
+        draw(cx);
+        cx.update(|window, cx| networks.read(cx).focus_handle(cx).focus(window, cx));
+        draw(cx);
+        assert_eq!(shown(cx), 137);
+        cx.simulate_input("ETH");
+        assert_eq!(listed(cx), [1]);
+        assert_eq!(shown(cx), 137, "typing doesn't change the shown network");
+        cx.simulate_keystrokes("enter");
         assert_eq!(shown(cx), 1);
-        cx.simulate_keystrokes("down enter");
+
+        // Nothing matches: no rows, and Enter does nothing.
+        cx.update(|window, cx| {
+            networks.update(cx, |list, cx| list.set_query("POLYGONE", window, cx));
+        });
+        assert_eq!(listed(cx), Vec::<u64>::new());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(shown(cx), 1);
+
+        // Polygon is listed again, under Ethereum, the swap's own network.
+        cx.update(|window, cx| {
+            networks.update(cx, |list, cx| {
+                list.set_query("", window, cx);
+                list.set_selected_index(Some(gpui_component::IndexPath::new(1)), window, cx);
+            });
+        });
+        assert_eq!(listed(cx), [1, 137]);
+        cx.simulate_keystrokes("enter");
         assert_eq!(shown(cx), 137);
 
-        cx.simulate_keystrokes("left");
-        assert_eq!(focused(cx), (true, false));
-        cx.simulate_keystrokes("tab");
-        assert_eq!(focused(cx), (false, true));
-        cx.simulate_keystrokes("left");
-        assert_eq!(focused(cx), (true, false));
-
         // POL, USDC, then USDT.
-        cx.simulate_keystrokes("down down enter");
+        draw(cx);
+        cx.update(|window, cx| {
+            tokens.update(cx, |list, cx| {
+                list.set_selected_index(Some(gpui_component::IndexPath::new(2)), window, cx);
+            });
+            tokens.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter");
         swaps.read_with(cx, |swaps, _| {
             let form = swaps.form.as_ref().unwrap();
             assert_eq!(
@@ -8066,6 +8321,16 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
                 ("Delivered on Polygon", Pending),
                 "Sent to the bridge",
             ),
+            // A delivery only Across reported is final too, and isn't labelled verified.
+            (
+                handed_off(Some(SwapBridgeOutcome::DeliveredReported {
+                    amount_out: None,
+                    transaction_hash: None,
+                })),
+                SwapOrderState::Done,
+                ("Delivered on Polygon · reported by Across", Done),
+                "Delivered · reported by Across",
+            ),
             (
                 handed_off(Some(verified)),
                 SwapOrderState::Done,
@@ -9401,13 +9666,15 @@ const STUB_POLYGON_USDC: Address =
 const STUB_POLYGON_USDT: Address =
     alloy::primitives::address!("c2132d05d31c914a87c6611c10748aeb04b58e8f");
 
-/// WETH on Ethereum and on Arbitrum One, where it is the wrapped native token.
+/// WETH on Ethereum, and on Arbitrum One and Base, where it is the wrapped native token.
 const STUB_WETH: Address = alloy::primitives::address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
 const STUB_ARBITRUM_WETH: Address =
     alloy::primitives::address!("82af49447d8a07e3bd95bd0d56f35241523fbab1");
+const STUB_BASE_WETH: Address =
+    alloy::primitives::address!("4200000000000000000000000000000000000006");
 
 /// The stub providers' lists from Ethereum. Across bridges USDC and USDT to Polygon, and WETH
-/// to Arbitrum One. 1Click lists both stablecoins on Ethereum and Polygon, native POL on
+/// to Arbitrum One and Base. 1Click lists both stablecoins on Ethereum and Polygon, native POL on
 /// Polygon, and native ETH on Arbitrum One.
 fn stub_bridge_list(path: &str) -> serde_json::Value {
     let route = |chain: u64, origin: Address, destination: Address, symbol: &str| {
@@ -9428,6 +9695,7 @@ fn stub_bridge_list(path: &str) -> serde_json::Value {
             route(137, STUB_USDC, STUB_POLYGON_USDC, "USDC"),
             route(137, STUB_USDT, STUB_POLYGON_USDT, "USDT"),
             route(42161, STUB_WETH, STUB_ARBITRUM_WETH, "WETH"),
+            route(8453, STUB_WETH, STUB_BASE_WETH, "WETH"),
         ])
     } else if path.starts_with("/near/v0/tokens") {
         serde_json::json!([
@@ -9644,24 +9912,35 @@ fn start_polygon_session(
     session
 }
 
-/// Enable the built-in `chain_id` with the stub's RPC.
-fn enable_stub_chain(root: &mut WalletRoot, stubs: &SwapStubs, chain_id: u64) {
-    let mut enabled = wallet_ops::settings::build_effective_chain_configs(
+/// The built-in `chain_id` as the default settings configure it.
+fn built_in_chain(chain_id: u64) -> EffectiveChainConfig {
+    wallet_ops::settings::build_effective_chain_configs(
         &wallet_ops::settings::WalletSettings::default(),
     )
     .unwrap()
     .get(chain_id)
     .unwrap()
-    .clone();
-    enabled.enabled = true;
-    enabled.rpc_route = wallet_ops::RpcChainRoute::new(chain_id, vec![stubs.rpc()]);
+    .clone()
+}
+
+/// Put `chain` among the wallet's chains, in place of one with its id.
+fn put_chain(root: &mut WalletRoot, chain: EffectiveChainConfig) {
+    let chain_id = chain.chain_id;
     root.effective_chain_configs = root
         .effective_chain_configs
         .clone()
         .into_values()
-        .filter(|chain| chain.chain_id != chain_id)
-        .chain(std::iter::once(enabled))
+        .filter(|known| known.chain_id != chain_id)
+        .chain(std::iter::once(chain))
         .collect();
+}
+
+/// Enable the built-in `chain_id` with the stub's RPC.
+fn enable_stub_chain(root: &mut WalletRoot, stubs: &SwapStubs, chain_id: u64) {
+    let mut enabled = built_in_chain(chain_id);
+    enabled.enabled = true;
+    enabled.rpc_route = wallet_ops::RpcChainRoute::new(chain_id, vec![stubs.rpc()]);
+    put_chain(root, enabled);
 }
 
 /// An orderbook client for the stub orderbook, on a direct route.

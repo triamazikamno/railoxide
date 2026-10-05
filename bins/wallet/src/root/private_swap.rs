@@ -1523,6 +1523,12 @@ impl PrivateSwapsView {
                     })
                 }),
             private,
+            reported: order.is_some_and(|order| {
+                matches!(
+                    order.observations().bridge_outcome,
+                    Some(SwapBridgeOutcome::DeliveredReported { .. })
+                )
+            }),
         })
     }
 

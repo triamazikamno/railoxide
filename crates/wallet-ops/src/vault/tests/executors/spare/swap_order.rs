@@ -2626,6 +2626,60 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
         })
     );
     fixture.assert_unsigned(&store, &submissions);
+
+    // Base has neither a Railgun deployment nor a pinned pool, and still takes a public
+    // delivery: its receiver passes the check, so Across is asked for the quote. The zero
+    // address is refused there too.
+    let swap_use = crate::vault::SwapUseId::first(fixture.operation);
+    let approved = fixture.record(&store).swap_approval().unwrap().clone();
+    let delegated = fixture.review.plan().swap_executor().delegated().unwrap();
+    let base_route = crate::SwapBridgeRoute {
+        destination_chain: chains.get(8453).unwrap(),
+        ..route
+    };
+    let to_base = |receiver| {
+        let base = BridgeOrderFixture::planned(
+            &view,
+            &swap_profile,
+            delegated,
+            executor,
+            BridgeDelivery {
+                destination_chain: 8453,
+                receiver,
+                ..delivery
+            },
+        );
+        let approval = base
+            .review
+            .approval(base.review.suggested_private_minimum(), true)
+            .unwrap();
+        owner
+            .record_swap_approval(fixture.operation, swap_use, approval)
+            .unwrap();
+        base
+    };
+    assert_eq!(
+        to_base(receiver)
+            .issue(&owner, &orderbook, base_route)
+            .await
+            .unwrap(),
+        SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+            approved: U256::from(1_000),
+            current: U256::from(999),
+        })
+    );
+    assert_eq!(
+        to_base(Address::ZERO)
+            .issue(&owner, &orderbook, base_route)
+            .await
+            .unwrap_err()
+            .downcast_ref::<BridgeReceiverRejection>(),
+        Some(&BridgeReceiverRejection::ZeroAddress)
+    );
+    owner
+        .record_swap_approval(fixture.operation, swap_use, approved)
+        .unwrap();
+    fixture.assert_unsigned(&store, &submissions);
     // A deadline that leaves relayers too little time after the order expires.
     *quoted.lock().unwrap() = (U256::from(1_005), 60);
     let error = fixture.issue(&owner, &orderbook, route).await.unwrap_err();

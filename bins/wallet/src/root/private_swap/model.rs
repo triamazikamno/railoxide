@@ -622,6 +622,8 @@ pub(in crate::root) struct SwapBridgeLabels {
     /// Set when the swap delivers to the wallet's private balance on the destination network.
     /// `receiver` is then the destination stealth account, which no copy names as a receiver.
     pub(in crate::root) private: Option<SwapPrivateBridgeLabels>,
+    /// The recorded delivery is the provider's report, which the wallet didn't verify.
+    pub(in crate::root) reported: bool,
 }
 
 impl SwapBridgeLabels {
@@ -918,12 +920,18 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
             format!("Swapped {pair}"),
             match (bridge, &labels.receiver, &labels.received) {
                 (Some(bridge), _, received) => format!(
-                    "Delivered {}to {} on {} via {}",
+                    "Delivered {}to {} on {} {} {}",
                     received
                         .as_ref()
                         .map_or_else(String::new, |amount| format!("{amount} ")),
                     bridge.destination(),
                     bridge.network,
+                    // An Across delivery the wallet couldn't verify is named as Across's word.
+                    if bridge.reported && bridge.provider == BridgeProvider::Across {
+                        "· reported by"
+                    } else {
+                        "via"
+                    },
                     provider_name(bridge.provider)
                 ),
                 (None, Some(receiver), Some(received)) => {
@@ -1467,11 +1475,11 @@ fn private_setup_step(
 }
 
 /// A Bridge swap's steps: set up, order open, sent to the bridge once the hand-off is proven,
-/// then delivered on the destination network, labelled verified for Across or reported by NEAR
-/// Intents. Refunding and Needs attention replace the delivered step. An Across post-hook that
-/// didn't run replaces both with the bought token held on the swap's network. A private Bridge
-/// swap's last step is its shield into the private balance there, and proceeds its destination
-/// stealth account holds replace that step.
+/// then delivered on the destination network, labelled by the recorded outcome: verified, or
+/// reported by the provider. Refunding and Needs attention replace the delivered step. An Across
+/// post-hook that didn't run replaces both with the bought token held on the swap's network. A
+/// private Bridge swap's last step is its shield into the private balance there, and proceeds
+/// its destination stealth account holds replace that step.
 fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
     let step = |label: String, detail: String, status| SwapStep::new(label, detail, status);
@@ -1535,9 +1543,10 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
         SwapStage::Order(SwapOrderState::Done) => vec![
             handed_off(),
             step(
-                match bridge.provider {
-                    BridgeProvider::Across => format!("{delivered} · verified"),
-                    BridgeProvider::NearIntents => format!("{delivered} · reported by {provider}"),
+                if bridge.reported {
+                    format!("{delivered} · reported by {provider}")
+                } else {
+                    format!("{delivered} · verified")
                 },
                 match (&labels.received, private) {
                     (Some(received), Some(_)) => {
@@ -1934,6 +1943,14 @@ pub(in crate::root) fn swap_order_status(
         SwapStage::SubmissionRejected => "Rejected".into(),
         SwapStage::Order(SwapOrderState::Traded) => "Traded".into(),
         SwapStage::Order(SwapOrderState::Bridging) => "Sent to the bridge".into(),
+        // An Across delivery the wallet couldn't verify is named as Across's word.
+        SwapStage::Order(SwapOrderState::Done)
+            if labels.bridge.as_ref().is_some_and(|bridge| {
+                bridge.reported && bridge.provider == BridgeProvider::Across
+            }) =>
+        {
+            "Delivered · reported by Across".into()
+        }
         // Filled means back in the private balance; a Public address or Bridge swap was
         // delivered.
         SwapStage::Order(SwapOrderState::Done)
@@ -2455,7 +2472,7 @@ mod tests {
     #[test]
     fn bridge_steps_follow_the_hand_off_then_the_destination_outcome() {
         use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
-        let bridged = |provider| SwapLabels {
+        let bridged = |provider, reported| SwapLabels {
             received: Some("248.71 USDC".into()),
             bridge: Some(SwapBridgeLabels {
                 provider,
@@ -2466,12 +2483,14 @@ mod tests {
                 sent: Some("248.82 USDC".into()),
                 minimum: Some("248.70 USDC".into()),
                 private: None,
+                reported,
             }),
             ..labels()
         };
-        let (across, near) = (
-            bridged(BridgeProvider::Across),
-            bridged(BridgeProvider::NearIntents),
+        let (across, across_reported, near) = (
+            bridged(BridgeProvider::Across, false),
+            bridged(BridgeProvider::Across, true),
+            bridged(BridgeProvider::NearIntents, true),
         );
         let order = SwapStage::Order;
         for (stage, labels, steps) in [
@@ -2569,6 +2588,10 @@ mod tests {
             swap_card_line(order(SwapOrderState::Done), &across).detail,
             "Delivered 248.71 USDC to Treasury on Polygon via Across"
         );
+        assert_eq!(
+            swap_card_line(order(SwapOrderState::Done), &across_reported).detail,
+            "Delivered 248.71 USDC to Treasury on Polygon · reported by Across"
+        );
         // A refund returns to the stealth account on the swap's own network.
         assert!(
             swap_card_line(order(SwapOrderState::Refunding), &across)
@@ -2625,6 +2648,7 @@ mod tests {
                         ],
                         held: Some("992.74 USDC".into()),
                     }),
+                    reported: false,
                 }),
                 ..labels()
             }

@@ -2,13 +2,13 @@
 //! chain to hand to the provider.
 //!
 //! Both lists are limited to the destination chain's configured tokens, plus the native asset
-//! where NEAR Intents delivers it. A destination that is the same asset as the sell token is
-//! left out: same-token bridging isn't supported.
+//! where NEAR Intents delivers it. A provider's route never adds a token. A destination that is
+//! the same asset as the sell token is left out: same-token bridging isn't supported.
 
 use alloy::primitives::Address;
 
 use super::{AcrossRoute, OneClickToken};
-use crate::settings::{BridgeProfile, EffectiveTokenRegistry};
+use crate::settings::{BridgeDestinationProfile, BridgeProfile, EffectiveTokenRegistry};
 
 /// A token the provider can deliver on the destination chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,15 +89,18 @@ const NEAR_INTERMEDIATES: [&str; 2] = ["USDC", "USDT"];
 /// asset. Each takes as intermediate the first token 1Click lists on `origin`'s chain with a
 /// configured ERC-20 contract other than `sell_token`, preferring a token with the
 /// destination's symbol, then USDC and USDT. Destinations without an intermediate are left
-/// out.
+/// out. A `destination` without a 1Click name has none: NEAR Intents isn't offered there.
 #[must_use]
 pub fn near_destination_tokens(
     tokens: &[OneClickToken],
     origin: &BridgeProfile,
-    destination: &BridgeProfile,
+    destination: &BridgeDestinationProfile,
     sell_token: Address,
     registry: &EffectiveTokenRegistry,
 ) -> Vec<BridgeDestination> {
+    let Some(destination_blockchain) = destination.one_click_blockchain() else {
+        return Vec::new();
+    };
     let on_origin = |token: &&OneClickToken| token.blockchain == origin.one_click_blockchain();
     let sell_symbol = tokens
         .iter()
@@ -118,7 +121,7 @@ pub fn near_destination_tokens(
     let mut destinations: Vec<BridgeDestination> = Vec::new();
     for token in tokens
         .iter()
-        .filter(|token| token.blockchain == destination.one_click_blockchain())
+        .filter(|token| token.blockchain == destination_blockchain)
     {
         let (destination_token, symbol) = match token.contract_address {
             None => (Address::ZERO, token.symbol.clone()),
@@ -239,6 +242,8 @@ mod tests {
             route(ARB_WETH, "WETH", POL_WETH, "WETH"),
             // Not in Polygon's configured list.
             route(ARB_WETH, "WETH", Address::repeat_byte(7), "XYZ"),
+            // Nor is this address, whatever symbol the provider gives it.
+            route(ARB_USDT, "USDT", Address::repeat_byte(8), "USDT"),
         ];
 
         // WETH to WETH would bridge the sell token itself.
@@ -271,7 +276,7 @@ mod tests {
         let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
         let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
         let arbitrum = chains.get(42161).unwrap().bridge_profile().unwrap();
-        let bnb = chains.get(56).unwrap().bridge_profile().unwrap();
+        let bnb = chains.get(56).unwrap().bridge_destination().unwrap();
         let tokens = [
             one_click("arb", "ETH", None),
             one_click("arb", "WETH", Some(ARB_WETH)),
@@ -282,6 +287,8 @@ mod tests {
             one_click("bsc", "ETH", Some(BSC_ETH)),
             // Not in BNB Chain's configured list.
             one_click("bsc", "XYZ", Some(Address::repeat_byte(7))),
+            // Nor is this address, whatever symbol the provider gives it.
+            one_click("bsc", "USDT", Some(Address::repeat_byte(8))),
         ];
 
         // Selling USDC: USDC on BNB Chain is the same asset. BNB has no asset match on
@@ -325,6 +332,23 @@ mod tests {
             across_destination_tokens(&across, ARB_WETH, &registry, 56)
                 .iter()
                 .all(|destination| destination.destination_token != Address::ZERO)
+        );
+    }
+
+    #[test]
+    fn near_offers_nothing_for_a_destination_without_a_one_click_name() {
+        let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let arbitrum = chains.get(42161).unwrap().bridge_profile().unwrap();
+        // The wallet ships no 1Click name for Linea, so NEAR Intents offers nothing there, even
+        // if the token list holds tokens under a name for it.
+        let linea = chains.get(59144).unwrap().bridge_destination().unwrap();
+        let tokens = [
+            one_click("arb", "USDC", Some(ARB_USDC)),
+            one_click("linea", "ETH", None),
+        ];
+        assert!(
+            near_destination_tokens(&tokens, &arbitrum, &linea, ARB_WETH, &registry).is_empty()
         );
     }
 }

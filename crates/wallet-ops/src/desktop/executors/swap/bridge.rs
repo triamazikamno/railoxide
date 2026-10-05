@@ -32,7 +32,9 @@ use crate::desktop::{
     effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
     query_rpc_pool_with_http_client,
 };
-use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, SwapProfile};
+use crate::settings::{
+    BridgeReceiverRejection, EffectiveChainConfig, EffectiveTokenRegistry, SwapProfile,
+};
 use crate::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeProvider, NearIntentsOrderTerms,
     SwapDelivery,
@@ -556,9 +558,10 @@ pub(super) fn across_bridge_quote(
 /// after the order expires, and its timestamp and fill deadline must pass the `SpokePool`'s
 /// buffers for any settlement before `valid_to`: a deposit's block can't precede its quote. No
 /// delivery allowance applies: the approved minimum already allows for it. A private delivery's
-/// terms carry `handler_message`, the handler the deposit pays and its message's hash.
+/// terms carry `handler_message`, the handler the deposit pays and its message's hash. A public
+/// delivery's receiver must not be the destination `SpokePool` the quote names.
 #[allow(clippy::too_many_arguments)]
-fn across_order_terms(
+pub(super) fn across_order_terms(
     fees: &AcrossFeeQuote,
     spoke_pool: Address,
     input_token: Address,
@@ -569,6 +572,11 @@ fn across_order_terms(
     handler_message: Option<(Address, B256)>,
 ) -> Result<BridgeSigning> {
     let quote = across_bridge_quote(fees, spoke_pool, None)?;
+    // The only use of the destination pool the provider names: it can only refuse a swap. A
+    // private delivery's receiver is the wallet's own account, and its deposit pays the handler.
+    if !delivery.is_private() && delivery.receiver == fees.destination_spoke_pool {
+        return Err(BridgeReceiverRejection::SpokePool.into());
+    }
     if quote.destination_minimum < destination_minimum {
         return Ok(BridgeSigning::Changed(
             SwapReviewChange::DestinationMinimum {

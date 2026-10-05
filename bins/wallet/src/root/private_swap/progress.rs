@@ -33,7 +33,10 @@ use wallet_ops::{
 };
 
 use super::dialog::{SwapDialogView, settled_by_cow};
-use super::form::{broadcaster_result_problem, format_gwei, gas_share_name, network_name};
+use super::form::{
+    broadcaster_result_problem, format_gwei, gas_share_name, network_name,
+    swap_steps as review_steps, swap_steps_hint,
+};
 use super::model::{
     SwapActions, SwapIdentity, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep,
     SwapStepAccount, bridge_sent_amount, needs_executed_fee, prepared_swap_use,
@@ -43,14 +46,17 @@ use super::model::{
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-    SwapAction, SwapJobKind, local_date_time_label, local_time_label, now_unix, short_receiver,
-    swap_delivery, swap_recovery_token, swap_tokens,
+    SwapAction, SwapJobKind, local_date_time_label, local_time_label, now_unix,
+    sets_up_destination, short_receiver, swap_delivery, swap_recovery_token, swap_tokens,
 };
 use crate::assets::WalletIconSource;
 use crate::root::broadcaster_picker::broadcaster_candidate_label;
 use crate::root::dialog_max_height;
 use crate::root::public_action::PublicActionStepStatus;
-use crate::root::spend_authorization::{SpendAuthorizationSummary, SpendAuthorizationSummaryRow};
+use crate::root::spend_authorization::{
+    SpendAuthorizationSteps, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    render_spend_authorization_steps,
+};
 use crate::root::stealth_accounts::StealthAccountTarget;
 use crate::root::submission_progress::{
     SubmissionProgressGroup, SubmissionProgressStep, SubmissionProgressSubstep,
@@ -336,15 +342,43 @@ impl PrivateSwapsView {
         let error = tracking
             .and_then(|tracking| tracking.error.clone())
             .or_else(|| self.error.clone());
+        // A swap with no order yet shows the two steps its reviews named, when it sets an
+        // account up: the setup, then the order once every account it uses is ready.
+        let prepared = !stopped && Self::prepared_draft(record).is_some();
+        let placeable = prepared && self.approved_use(record).is_some();
+        let review_stepper = prepared_swap_use(record)
+            .filter(|_| prepared)
+            .map(|swap_use| {
+                let destination = swap_use
+                    .approval()
+                    .is_some_and(|approval| approval.delivery.private_bridge().is_some())
+                    && sets_up_destination(swap_use);
+                usize::from(swap_use.is_fresh()) + usize::from(destination)
+            })
+            .filter(|setups| *setups > 0)
+            .map(|setups| {
+                render_spend_authorization_steps(&SpendAuthorizationSteps::new(
+                    if placeable { 2 } else { 1 },
+                    review_steps(setups > 1),
+                    swap_steps_hint(setups > 1),
+                ))
+            });
         let note: Option<SharedString> = if stopped {
             Some(
                 "This setup was stopped, so no order will be placed. Its stealth account stays in Stealth accounts."
                     .into(),
             )
-        } else if Self::prepared_draft(record).is_some() {
+        } else if placeable {
+            progress_note(SwapStage::Approved).map(Into::into)
+        } else if prepared && matches!(stage, SwapStage::SetupSubmitting | SwapStage::SetupPending)
+        {
             Some(
-                "This swap's stealth accounts are reserved for it, and no order is placed yet. Resume to continue, or cancel the preparation to release them."
-                    .into(),
+                if tracking.is_some_and(|tracking| tracking.auto_place) {
+                    "You can close this. Once the setup confirms, the wallet checks the quote again and asks you to place the order."
+                } else {
+                    "The order isn't placed yet. Once the setup confirms, place it from here."
+                }
+                .into(),
             )
         } else if record.is_hidden() && actions.dismiss {
             Some("Removed from the Private tab. Tracking continues in My orders.".into())
@@ -409,6 +443,7 @@ impl PrivateSwapsView {
             .flex()
             .flex_col()
             .gap_3()
+            .children(review_stepper)
             .children(
                 shows_steps(stage, outcome.is_some())
                     .then(|| render_submission_progress_groups(steps)),
@@ -784,9 +819,14 @@ impl PrivateSwapsView {
                         }));
                         rows.push(provider_row);
                         rows.extend(deposit);
-                        note = Some(format!(
-                            "{provider} reports this delivery. The wallet doesn't check it on {network}, because looking the transaction up would tell the RPC provider which swap is yours."
-                        ));
+                        note = Some(match delivery.provider {
+                            BridgeProvider::Across => format!(
+                                "{provider} reports this delivery. The wallet couldn't verify it on {network}."
+                            ),
+                            BridgeProvider::NearIntents => format!(
+                                "{provider} reports this delivery. The wallet doesn't check it on {network}, because looking the transaction up would tell the RPC provider which swap is yours."
+                            ),
+                        });
                     }
                     _ => rows.push(provider_row),
                 }
@@ -1309,7 +1349,7 @@ impl PrivateSwapsView {
             .job
             .as_ref()
             .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup);
-        // A prepared swap is resumed or cancelled as a whole, including when its source is new.
+        // A prepared swap is cancelled as a whole, including when its source is new.
         let prepared = record.and_then(Self::prepared_draft);
         let cancel_preparation = prepared.map(|_| {
             app_button("swap-progress-cancel-preparation", "Cancel preparation…")
@@ -1359,21 +1399,24 @@ impl PrivateSwapsView {
                         this.resubmit_order(operation, window, cx);
                     }))
             });
-        // A Bridge swap's check asks its provider again about a deposit that needs attention or
-        // that Across refunds, and reads the stealth account for a refund or a deposit that
-        // wasn't sent.
+        // A Bridge swap's check asks its provider again about a deposit that needs attention,
+        // that Across refunds or whose delivery Across only reported, and reads the stealth
+        // account for a refund or a deposit that wasn't sent.
         let across_refund = stage == SwapStage::Order(SwapOrderState::Refunding)
             && record.is_some_and(refunds_across_deposit);
+        let across_reported = stage == SwapStage::Order(SwapOrderState::Done)
+            && record.is_some_and(reported_by_across);
         let bridge_check = record.is_some_and(|record| {
             matches!(swap_delivery(record), SwapDelivery::Bridge(_))
-                && matches!(
-                    stage,
-                    SwapStage::Order(
-                        SwapOrderState::NeedsAttention
-                            | SwapOrderState::Refunding
-                            | SwapOrderState::NotDelivered
-                    )
-                )
+                && (across_reported
+                    || matches!(
+                        stage,
+                        SwapStage::Order(
+                            SwapOrderState::NeedsAttention
+                                | SwapOrderState::Refunding
+                                | SwapOrderState::NotDelivered
+                        )
+                    ))
         });
         // Held proceeds are looked for in the destination stealth account, on its network.
         let held = stage.is_held_on_destination();
@@ -1409,6 +1452,9 @@ impl PrivateSwapsView {
                         }
                         _ if across_refund => {
                             "Asks Across about the deposit and confirms its refund, then checks this stealth account's balance"
+                        }
+                        _ if across_reported => {
+                            "Asks Across about the deposit again and checks its delivery on the destination network"
                         }
                         _ => "Checks this stealth account's balance with the RPC provider",
                     })
@@ -1459,34 +1505,30 @@ impl PrivateSwapsView {
                     this.request_cancel_quote(operation, window, cx);
                 }))
         });
-        // A prepared swap resumes in its form whatever its new destination account's setup
-        // does, so the action stays while that setup is on its way.
-        let resume = if prepared.is_some() {
-            Some(
-                record
-                    .and_then(|record| self.setup_retry_problem(record))
-                    .map_or(Ok(()), Err),
-            )
-        } else {
-            actions.resume
-        };
-        let resume = resume.map(|availability| {
+        // An approved order whose accounts are all ready is placed from here, as the wallet
+        // does by itself after a setup approved in this session.
+        let place = stage == SwapStage::Approved
+            || record.is_some_and(|record| self.approved_use(record).is_some());
+        let resume = actions.resume.map(|availability| {
             app_button(
                 "swap-progress-continue",
                 match stage {
-                    _ if prepared.is_some() => "Resume…",
+                    _ if place => "Place order…",
                     SwapStage::SetupRetired => "New swap…",
                     SwapStage::Ready => "Review…",
-                    SwapStage::Approved => "Place order…",
                     SwapStage::SetupPending => "Retry setup…",
                     _ => "Continue…",
                 },
             )
-            .primary()
+            // Sending a setup again while it still waits isn't the next step.
+            .when(
+                place || stage != SwapStage::SetupPending,
+                ButtonVariants::primary,
+            )
             .small()
             .flex_none()
             .debug_selector(|| "swap-progress-continue".into())
-            .loading(stage == SwapStage::Approved && job.is_some())
+            .loading(place && job.is_some())
             .disabled((busy && !setup_job) || availability.is_err())
             .when_some(availability.err(), gpui_component::button::Button::tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1496,7 +1538,7 @@ impl PrivateSwapsView {
                 {
                     return;
                 }
-                if stage == SwapStage::Approved {
+                if place {
                     this.place_approved_order(operation, window, cx);
                 } else {
                     this.stop_setup_job(operation);
@@ -2073,9 +2115,10 @@ impl PrivateSwapsView {
         );
     }
 
-    /// A Bridge swap's explicit check. A deposit that needs attention is asked about again on
-    /// the swap's own route, with the destination network's settings; a refund, then or
-    /// already recorded, and a deposit that wasn't sent are looked for in the stealth account.
+    /// A Bridge swap's explicit check. A deposit that needs attention, or whose delivery Across
+    /// only reported, is asked about again on the swap's own route, with the destination
+    /// network's settings; a refund, then or already recorded, and a deposit that wasn't sent
+    /// are looked for in the stealth account.
     fn check_bridge_status(
         &mut self,
         operation: ExecutorOperationId,
@@ -2094,6 +2137,8 @@ impl PrivateSwapsView {
         let stage = self.stage(record);
         let across_refund =
             stage == SwapStage::Order(SwapOrderState::Refunding) && refunds_across_deposit(record);
+        let across_reported =
+            stage == SwapStage::Order(SwapOrderState::Done) && reported_by_across(record);
         let uid = order.uid();
         let buy = record
             .swap()
@@ -2116,6 +2161,7 @@ impl PrivateSwapsView {
             async move {
                 let asked = if stage == SwapStage::Order(SwapOrderState::NeedsAttention)
                     || across_refund
+                    || across_reported
                 {
                     let destination = destination.ok_or_else(|| {
                         eyre::eyre!("Turn on {network} in Settings to check this swap's delivery.")
@@ -2607,6 +2653,21 @@ fn refunds_across_deposit(record: &ExecutorRecord) -> bool {
         .swap()
         .and_then(|swap| swap.orders().last())
         .is_some_and(|order| matches!(order.bridge(), Some(BridgeOrderTerms::Across(_))))
+}
+
+/// Whether the record's latest order is an Across Bridge order whose delivery only Across
+/// reported, which an explicit check asks Across about again.
+fn reported_by_across(record: &ExecutorRecord) -> bool {
+    refunds_across_deposit(record)
+        && record
+            .swap()
+            .and_then(|swap| swap.orders().last())
+            .is_some_and(|order| {
+                matches!(
+                    order.observations().bridge_outcome,
+                    Some(SwapBridgeOutcome::DeliveredReported { .. })
+                )
+            })
 }
 
 /// A hash, shortened, with a control that copies it in full.

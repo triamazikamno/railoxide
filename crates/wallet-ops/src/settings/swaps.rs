@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, address};
 
-use super::{EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry};
+use super::{
+    EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry,
+    resolve_effective_chain_rpc_route,
+};
 use crate::FreshAnchorParams;
 use crate::vault::SwapDelivery;
 
@@ -182,20 +185,80 @@ impl BridgeProfile {
     pub const fn one_click_quote_key(&self) -> &'static str {
         self.one_click_quote_key
     }
+}
 
-    /// Check a Bridge delivery receiver on this profile's chain, the destination chain,
-    /// against that chain's Railgun proxy `railgun` and this profile's `SpokePool`. Any other
-    /// address is accepted.
+/// What a public Bridge delivery needs of its destination chain, any enabled chain with RPC
+/// endpoints: 1Click's name for the chain and Across's pinned `SpokePool` there, where the
+/// wallet ships them. Not user-editable and not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeDestinationProfile {
+    chain_id: u64,
+    one_click_blockchain: Option<&'static str>,
+    spoke_pool: Option<Address>,
+}
+
+/// Across's `SpokePool` pinned for a destination chain: the one its bridge profile deposits
+/// into.
+const fn destination_spoke_pool(chain_id: u64) -> Option<Address> {
+    match chain_id {
+        1 => Some(MAINNET_BRIDGE_PROFILE.spoke_pool),
+        56 => Some(BNB_BRIDGE_PROFILE.spoke_pool),
+        137 => Some(POLYGON_BRIDGE_PROFILE.spoke_pool),
+        42161 => Some(ARBITRUM_BRIDGE_PROFILE.spoke_pool),
+        _ => None,
+    }
+}
+
+/// 1Click's `blockchain` identifier for a destination chain in its token list. The names
+/// beyond the bridge profiles' own were checked against 1Click's token list on 2026-10-04.
+const fn destination_one_click_blockchain(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        1 => Some(MAINNET_BRIDGE_PROFILE.one_click_blockchain),
+        10 => Some("op"),
+        56 => Some(BNB_BRIDGE_PROFILE.one_click_blockchain),
+        100 => Some("gnosis"),
+        137 => Some(POLYGON_BRIDGE_PROFILE.one_click_blockchain),
+        143 => Some("monad"),
+        4663 => Some("hood"),
+        8453 => Some("base"),
+        9745 => Some("plasma"),
+        42161 => Some(ARBITRUM_BRIDGE_PROFILE.one_click_blockchain),
+        43114 => Some("avax"),
+        80094 => Some("bera"),
+        _ => None,
+    }
+}
+
+impl BridgeDestinationProfile {
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+    /// 1Click's `blockchain` identifier for this chain in its token list. `None` where NEAR
+    /// Intents isn't offered.
+    #[must_use]
+    pub const fn one_click_blockchain(&self) -> Option<&'static str> {
+        self.one_click_blockchain
+    }
+    /// Across's `SpokePool` on this chain, where the wallet pins one.
+    #[must_use]
+    pub const fn spoke_pool(&self) -> Option<Address> {
+        self.spoke_pool
+    }
+
+    /// Check a Bridge delivery receiver on this profile's chain against that chain's Railgun
+    /// proxy `railgun`, when it has one, and this profile's `SpokePool`, when one is pinned.
+    /// Any other address is accepted.
     pub fn check_receiver(
         &self,
-        railgun: Address,
+        railgun: Option<Address>,
         receiver: Address,
     ) -> Result<(), BridgeReceiverRejection> {
         let rejection = if receiver == Address::ZERO {
             BridgeReceiverRejection::ZeroAddress
-        } else if receiver == railgun {
+        } else if Some(receiver) == railgun {
             BridgeReceiverRejection::Railgun
-        } else if receiver == self.spoke_pool {
+        } else if Some(receiver) == self.spoke_pool {
             BridgeReceiverRejection::SpokePool
         } else {
             return Ok(());
@@ -383,6 +446,19 @@ impl EffectiveChainConfig {
             _ => None,
         }
     }
+
+    /// What a public Bridge delivery needs of this chain as its destination: an enabled chain
+    /// with RPC endpoints, built in or added by the user, with or without Railgun. The 1Click
+    /// name and the pinned `SpokePool` follow the chain id alone.
+    #[must_use]
+    pub fn bridge_destination(&self) -> Option<BridgeDestinationProfile> {
+        resolve_effective_chain_rpc_route(self.chain_id, self).ok()?;
+        Some(BridgeDestinationProfile {
+            chain_id: self.chain_id,
+            one_click_blockchain: destination_one_click_blockchain(self.chain_id),
+            spoke_pool: destination_spoke_pool(self.chain_id),
+        })
+    }
 }
 
 /// v1 destination-token source: configured tokens on the profile's chain filtered by eligibility.
@@ -494,6 +570,14 @@ mod tests {
                     address!("924a9f036260DdD5808007E1AA95f08eD08aA569")
                 };
                 assert_eq!(bridge.multicall_handler(), handler);
+                // The public destination role names the same pool and 1Click chain.
+                let destination = chain.bridge_destination().expect("every swap chain");
+                assert_eq!(destination.chain_id(), chain.chain_id);
+                assert_eq!(destination.spoke_pool(), Some(bridge.spoke_pool()));
+                assert_eq!(
+                    destination.one_click_blockchain(),
+                    Some(bridge.one_click_blockchain())
+                );
             } else if chain.built_in && ![1, 56, 137, 42161].contains(&chain.chain_id) {
                 assert!(bridge.is_none(), "chain {}", chain.chain_id);
                 unsupported_built_in += 1;
@@ -508,6 +592,57 @@ mod tests {
         assert!(chain.bridge_profile().is_some());
         chain.built_in = false;
         assert!(chain.bridge_profile().is_none());
+    }
+
+    #[test]
+    fn bridge_destinations_cover_every_enabled_chain_with_rpc() {
+        const CUSTOM: u64 = 31337;
+        let mut settings = WalletSettings::default();
+        settings
+            .chains
+            .custom
+            .insert(CUSTOM, crate::settings::tests::custom_evm_chain());
+        let mut chains = build_effective_chain_configs(&settings).unwrap();
+        // Built-in chains without Railgun, and a chain the user added: Base has a 1Click name,
+        // and none of them a pinned pool.
+        for (chain_id, one_click) in [(8453, Some("base")), (59144, None), (CUSTOM, None)] {
+            let chain = chains.get(chain_id).unwrap();
+            assert!(chain.railgun.is_none(), "chain {chain_id}");
+            assert!(chain.bridge_profile().is_none(), "chain {chain_id}");
+            let destination = chain.bridge_destination().expect("enabled chain with RPC");
+            assert_eq!(destination.chain_id(), chain_id);
+            assert_eq!(destination.one_click_blockchain(), one_click);
+            assert_eq!(destination.spoke_pool(), None);
+        }
+
+        let chain = chains.get_mut(8453).unwrap();
+        chain.enabled = false;
+        assert!(chain.bridge_destination().is_none());
+    }
+
+    /// Across names a chain's wrapped native token as the destination of its native delivery,
+    /// and only listed tokens are offered, so a chain whose native asset is ETH lists its WETH.
+    #[test]
+    fn eth_native_chains_list_their_wrapped_native_token() {
+        let settings = WalletSettings::default();
+        let chains = build_effective_chain_configs(&settings).unwrap();
+        let registry = build_effective_token_registry(&settings).unwrap();
+        let mut checked = 0;
+        for chain in chains.values() {
+            let Some(wrapped) = chain
+                .wrapped_native_token
+                .filter(|_| chain.built_in && chain.native_currency.symbol == "ETH")
+            else {
+                continue;
+            };
+            assert!(
+                registry.get(chain.chain_id, &wrapped).is_some(),
+                "chain {}",
+                chain.chain_id
+            );
+            checked += 1;
+        }
+        assert!(checked > 2);
     }
 
     #[test]
@@ -607,18 +742,33 @@ mod tests {
     fn bridge_receivers_exclude_the_destination_chains_protocol_contracts() {
         let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
         let destination = chains.get(137).unwrap();
-        let bridge = destination.bridge_profile().unwrap();
+        let bridge = destination.bridge_destination().unwrap();
         let railgun = destination.require_railgun().unwrap().deployment.contract;
+        let spoke_pool = bridge.spoke_pool().unwrap();
         for (receiver, rejection) in [
             (Address::ZERO, BridgeReceiverRejection::ZeroAddress),
             (railgun, BridgeReceiverRejection::Railgun),
-            (bridge.spoke_pool(), BridgeReceiverRejection::SpokePool),
+            (spoke_pool, BridgeReceiverRejection::SpokePool),
         ] {
-            assert_eq!(bridge.check_receiver(railgun, receiver), Err(rejection));
+            assert_eq!(
+                bridge.check_receiver(Some(railgun), receiver),
+                Err(rejection)
+            );
         }
         assert_eq!(
-            bridge.check_receiver(railgun, Address::repeat_byte(3)),
+            bridge.check_receiver(Some(railgun), Address::repeat_byte(3)),
             Ok(())
         );
+
+        // A chain without Railgun and without a pinned pool rejects only the zero address:
+        // contracts that are protocol contracts on Polygon are ordinary addresses there.
+        let base = chains.get(8453).unwrap().bridge_destination().unwrap();
+        assert_eq!(
+            base.check_receiver(None, Address::ZERO),
+            Err(BridgeReceiverRejection::ZeroAddress)
+        );
+        for receiver in [railgun, spoke_pool, Address::repeat_byte(3)] {
+            assert_eq!(base.check_receiver(None, receiver), Ok(()));
+        }
     }
 }

@@ -59,7 +59,7 @@ const POLYGON_REWARD_TOKENS: &[GovernanceRewardToken] = &[
         token: address!("0x92A9C92C215092720C731c96D4Ff508c831a714f"),
     },
     GovernanceRewardToken {
-        symbol: "WMATIC",
+        symbol: "WPOL",
         token: address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"),
     },
 ];
@@ -242,7 +242,7 @@ mod tests {
                     address!("0x92A9C92C215092720C731c96D4Ff508c831a714f"),
                 ),
                 (
-                    "WMATIC",
+                    "WPOL",
                     address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"),
                 ),
             ],

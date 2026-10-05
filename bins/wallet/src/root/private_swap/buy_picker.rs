@@ -1,8 +1,8 @@
 //! The Buy picker behind the swap form's Buy token button: a switch for the delivery kind, the
-//! tokens of one network with a search, and the networks. Picking a token closes it and sets
-//! the delivery kind, network and token together.
+//! tokens of one network with a search, and the networks with theirs. Picking a token closes
+//! it and sets the delivery kind, network and token together.
 //!
-//! The form owns the picker's state. The modal dialog reads its live lists into
+//! The form owns the picker's state. The modal dialog gives its two lists their rows from
 //! [`BuyPickerContent`] whenever it renders.
 
 use std::collections::HashMap;
@@ -11,25 +11,20 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
-    IntoElement as _, KeyBinding, KeyDownEvent, NoAction, ParentElement as _, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
-    prelude::FluentBuilder as _, relative, rems, rgb,
+    App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+    KeyBinding, NoAction, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, WeakEntity, Window, div, prelude::FluentBuilder as _, relative, rems, rgb,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, WindowExt as _,
     button::ButtonGroup,
-    input::{Enter as InputEnter, Escape as InputEscape, InputState},
-    list::ListItem,
+    list::{List, ListDelegate, ListItem, ListState},
     select::SelectItem as _,
     spinner::Spinner,
     tag::Tag,
+    tooltip::Tooltip,
 };
-use gpui_kit::base::actions::{Confirm, SelectDown, SelectLeft, SelectRight, SelectUp};
-use ui::controls::{app_input, app_muted_text, app_segment_button, app_strong_text, app_text};
-use ui::recipient_picker::{
-    RecipientSuggestionDirection as Direction, suggestion_index_after_move,
-};
+use ui::controls::{app_muted_text, app_segment_button, app_strong_text, app_text};
 use ui::theme;
 use wallet_ops::{PublicBroadcasterCandidate, WalletSession};
 
@@ -40,30 +35,25 @@ use super::{
 use crate::assets::WalletIconSource;
 use crate::root::{PRIVATE_ASSET_LIST_WIDTH, dialog_max_height};
 
-/// The key contexts of the picker's two lists, for their arrow keys.
-const TOKENS_KEY_CONTEXT: &str = "SwapBuyPickerTokens";
-const NETWORKS_KEY_CONTEXT: &str = "SwapBuyPickerNetworks";
 /// Let Enter and Space activate the focused picker button instead of the dialog's `Confirm`.
 const BUTTONS_KEY_CONTEXT: &str = "SwapBuyPickerButtons";
+
+/// A list lays its rows out at one height, in rems. A token row is one line, a network row
+/// its name over a reason.
+const TOKEN_ROW_HEIGHT: f32 = 2.;
+const NETWORK_ROW_HEIGHT: f32 = 3.;
 
 /// Marks that the picker's key bindings are installed in this app.
 struct BuyPickerBindings;
 
 impl gpui::Global for BuyPickerBindings {}
 
-/// Bind the picker's keys once per app. Enter and Space reach a focused list as the dialog's
-/// `Confirm`.
+/// Bind the picker's keys once per app.
 pub(super) fn ensure_buy_picker_bindings(cx: &mut App) {
     if cx.has_global::<BuyPickerBindings>() {
         return;
     }
     cx.bind_keys([
-        KeyBinding::new("up", SelectUp, Some(TOKENS_KEY_CONTEXT)),
-        KeyBinding::new("down", SelectDown, Some(TOKENS_KEY_CONTEXT)),
-        KeyBinding::new("right", SelectRight, Some(TOKENS_KEY_CONTEXT)),
-        KeyBinding::new("up", SelectUp, Some(NETWORKS_KEY_CONTEXT)),
-        KeyBinding::new("down", SelectDown, Some(NETWORKS_KEY_CONTEXT)),
-        KeyBinding::new("left", SelectLeft, Some(NETWORKS_KEY_CONTEXT)),
         KeyBinding::new("enter", NoAction, Some(BUTTONS_KEY_CONTEXT)),
         KeyBinding::new("space", NoAction, Some(BUTTONS_KEY_CONTEXT)),
     ]);
@@ -83,6 +73,8 @@ pub(super) enum NetworkUnavailable {
     Unfunded,
     /// The setup fee could not be checked through the destination session.
     SetupFee,
+    /// Neither provider serves the chain from the swap's, as its fetched routes show.
+    NoBridge,
 }
 
 /// Whether a network can be picked for the selected delivery kind.
@@ -142,6 +134,9 @@ impl NetworkAvailability {
             Self::Unavailable(NetworkUnavailable::SetupFee) => {
                 Some("Couldn't check the setup fee. Retrying…".to_owned())
             }
+            Self::Unavailable(NetworkUnavailable::NoBridge) => {
+                Some("No bridge serves it from this network".to_owned())
+            }
         }
     }
 
@@ -177,6 +172,9 @@ impl NetworkAvailability {
             ),
             Self::Unavailable(NetworkUnavailable::SetupFee) => format!(
                 "Couldn't check the setup fee on {network}. Retrying, or use Public address."
+            ),
+            Self::Unavailable(NetworkUnavailable::NoBridge) => format!(
+                "No bridge serves {network} from this network. Pick a token on another network."
             ),
         })
     }
@@ -227,7 +225,8 @@ pub(super) const fn private_network_availability(
     }
 }
 
-/// Whether a Public address can receive on a network: it needs only RPC endpoints.
+/// Whether a Public address can receive on a network: it needs only RPC endpoints. A network
+/// whose fetched routes show that no provider serves it is marked by the form afterwards.
 pub(super) const fn public_network_availability(rpc: bool) -> NetworkAvailability {
     if rpc {
         NetworkAvailability::Available
@@ -236,8 +235,8 @@ pub(super) const fn public_network_availability(rpc: bool) -> NetworkAvailabilit
     }
 }
 
-/// A network in the picker's list: the swap's own first, then the other built-in chains a
-/// bridge reaches. One that can't take the delivery kind is listed with the reason.
+/// A network in the picker's list: the swap's own first, then the other chains a bridge could
+/// deliver on. One that can't take the delivery kind is listed with the reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BuyNetwork {
     pub(super) chain_id: u64,
@@ -251,16 +250,56 @@ pub(super) struct BuyPicker {
     pub(super) open: bool,
     /// The network whose tokens are listed. Picking a token makes it the form's.
     pub(super) network: u64,
-    pub(super) search: Entity<InputState>,
-    /// The highlighted token, which Enter picks. `None` highlights the first row.
-    pub(super) token: Option<Address>,
-    /// The highlighted network, which Enter shows the tokens of.
-    pub(super) highlighted_network: u64,
-    /// The lists' focus, which takes their arrow keys.
-    pub(super) tokens_focus: FocusHandle,
-    pub(super) networks_focus: FocusHandle,
-    pub(super) tokens_scroll: ScrollHandle,
+    /// The shown network's tokens under their search. Enter or a click picks the selected one.
+    pub(super) tokens: Entity<ListState<BuyTokensDelegate>>,
+    /// The networks under their search, which doesn't change the shown one. Enter or a click
+    /// shows the selected one's tokens.
+    pub(super) networks: Entity<ListState<BuyNetworksDelegate>>,
     funding: HashMap<u64, NetworkFunding>,
+}
+
+/// The picker's two lists, with empty searches and nothing selected.
+fn buy_picker_lists(
+    network: u64,
+    window: &mut Window,
+    cx: &mut Context<'_, PrivateSwapsView>,
+) -> (
+    Entity<ListState<BuyTokensDelegate>>,
+    Entity<ListState<BuyNetworksDelegate>>,
+) {
+    let view = cx.weak_entity();
+    let tokens = cx.new(|cx| {
+        ListState::new(
+            BuyTokensDelegate {
+                view: view.clone(),
+                network,
+                tokens: BuyPickerTokens::Listed(Vec::new()),
+                rows: Vec::new(),
+                query: String::new(),
+                busy: false,
+                selected: None,
+            },
+            window,
+            cx,
+        )
+        .searchable(true)
+    });
+    let networks = cx.new(|cx| {
+        ListState::new(
+            BuyNetworksDelegate {
+                view,
+                shown: network,
+                networks: Vec::new(),
+                rows: Vec::new(),
+                query: String::new(),
+                selected: None,
+            },
+            window,
+            cx,
+        )
+        .searchable(true)
+    });
+    (tokens, networks)
 }
 
 impl BuyPicker {
@@ -283,16 +322,12 @@ impl BuyPicker {
         window: &mut Window,
         cx: &mut Context<'_, PrivateSwapsView>,
     ) -> Self {
+        let (tokens, networks) = buy_picker_lists(network, window, cx);
         Self {
             open: false,
             network,
-            search: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Search name or paste address")),
-            token: None,
-            highlighted_network: network,
-            tokens_focus: cx.focus_handle().tab_stop(true),
-            networks_focus: cx.focus_handle().tab_stop(true),
-            tokens_scroll: ScrollHandle::new(),
+            tokens,
+            networks,
             funding: HashMap::new(),
         }
     }
@@ -498,40 +533,421 @@ pub(super) struct BuyPickerContent {
     pub(super) receive_to: ReceiveTo,
     /// Receive to can't change, as in the form's row.
     pub(super) receive_to_locked: bool,
-    pub(super) search: Entity<InputState>,
-    pub(super) searched: bool,
+    pub(super) token_list: Entity<ListState<BuyTokensDelegate>>,
+    pub(super) network_list: Entity<ListState<BuyNetworksDelegate>>,
     pub(super) network: u64,
+    /// The shown network is the swap's own.
+    pub(super) own_network: bool,
+    /// Every token of the shown network. The token list's search filters them.
     pub(super) tokens: BuyPickerTokens,
-    pub(super) highlighted_token: Option<Address>,
+    /// Every network. The network list's search filters them.
     pub(super) networks: Vec<BuyNetwork>,
-    pub(super) highlighted_network: u64,
-    pub(super) tokens_focus: FocusHandle,
-    pub(super) networks_focus: FocusHandle,
-    pub(super) tokens_scroll: ScrollHandle,
     pub(super) busy: bool,
 }
 
-/// The highlighted token: the picker's while the list holds it, otherwise the first row.
-fn highlighted_token(picker: &BuyPicker, items: &[SwapBuyItem]) -> Option<Address> {
-    picker
-        .token
-        .filter(|token| items.iter().any(|item| item.asset.token == *token))
-        .or_else(|| items.first().map(|item| item.asset.token))
+impl BuyPickerContent {
+    /// Give the two lists their rows.
+    fn sync_lists(self, cx: &mut App) {
+        let Self {
+            token_list,
+            network_list,
+            network,
+            tokens,
+            networks,
+            busy,
+            ..
+        } = self;
+        token_list.update(cx, |list, _| {
+            list.delegate_mut().set_content(network, tokens, busy);
+        });
+        network_list.update(cx, |list, _| {
+            list.delegate_mut().set_content(network, networks);
+        });
+    }
 }
 
-/// The highlighted network: the picker's while it can be picked, otherwise the shown one.
-fn highlighted_network(picker: &BuyPicker, networks: &[BuyNetwork]) -> u64 {
-    if networks.iter().any(|network| {
-        network.chain_id == picker.highlighted_network && network.availability.is_available()
-    }) {
-        picker.highlighted_network
-    } else {
-        picker.network
+/// Select `row` of `list` and scroll to it.
+fn select_row<D: ListDelegate>(
+    list: &Entity<ListState<D>>,
+    row: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    list.update(cx, |list, cx| {
+        list.set_selected_index(Some(IndexPath::new(row)), window, cx);
+        list.scroll_to_selected_item(window, cx);
+    });
+}
+
+/// The token list's rows: the shown network's tokens the search matches. While there are
+/// none, the list shows where the network's routes stand.
+pub(super) struct BuyTokensDelegate {
+    view: WeakEntity<PrivateSwapsView>,
+    network: u64,
+    tokens: BuyPickerTokens,
+    /// The listed tokens the search matches, as indexes into them.
+    rows: Vec<usize>,
+    query: String,
+    busy: bool,
+    selected: Option<IndexPath>,
+}
+
+impl BuyTokensDelegate {
+    fn set_content(&mut self, network: u64, tokens: BuyPickerTokens, busy: bool) {
+        self.network = network;
+        self.tokens = tokens;
+        self.busy = busy;
+        self.filter();
+    }
+
+    fn filter(&mut self) {
+        self.rows = match &self.tokens {
+            BuyPickerTokens::Listed(tokens) => tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, token)| token.item.asset.matches(&self.query))
+                .map(|(index, _)| index)
+                .collect(),
+            BuyPickerTokens::Loading | BuyPickerTokens::Failed(_) => Vec::new(),
+        };
+    }
+
+    fn row(&self, row: usize) -> Option<&BuyPickerToken> {
+        let BuyPickerTokens::Listed(tokens) = &self.tokens else {
+            return None;
+        };
+        tokens.get(*self.rows.get(row)?)
+    }
+
+    /// The tokens the search matches, in the list's order.
+    pub(super) fn listed(&self) -> impl Iterator<Item = Address> {
+        (0..self.rows.len())
+            .filter_map(|row| self.row(row))
+            .map(|row| row.item.asset.token)
+    }
+}
+
+impl ListDelegate for BuyTokensDelegate {
+    type Item = ListItem;
+
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) -> Task<()> {
+        query.trim().clone_into(&mut self.query);
+        self.filter();
+        Task::ready(())
+    }
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.rows.len()
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let row = self.row(ix.row)?;
+        Some(
+            ListItem::new(SharedString::from(format!(
+                "swap-buy-picker-token-{:#x}",
+                row.item.asset.token
+            )))
+            .h(rems(TOKEN_ROW_HEIGHT))
+            .px_2()
+            .py_0()
+            .rounded(cx.theme().radius)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(network_token_icon(
+                        row.item.asset.icon_path.clone(),
+                        self.network,
+                    ))
+                    .child(
+                        app_text(row.item.asset.label.to_string())
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                    )
+                    .children(
+                        row.balance
+                            .clone()
+                            .map(|balance| app_muted_text(balance).text_xs().flex_none()),
+                    )
+                    .when(row.item.near_only, |row| row.child(near_tag())),
+            ),
+        )
+    }
+
+    /// Where the list stands while it has no rows. Its Retry is a button like the header's.
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) -> impl IntoElement {
+        let network = network_name(self.network);
+        let status = match &self.tokens {
+            BuyPickerTokens::Loading => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new().small())
+                .child(
+                    app_muted_text(format!("Getting the tokens {network} can receive…"))
+                        .min_w_0()
+                        .whitespace_normal(),
+                ),
+            BuyPickerTokens::Failed(error) => div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_2()
+                .child(
+                    app_text(error.clone())
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal(),
+                )
+                .children(
+                    self.view
+                        .upgrade()
+                        .map(|view| bridge_routes_retry_button(view, self.busy)),
+                ),
+            BuyPickerTokens::Listed(_) => app_muted_text(if self.query.is_empty() {
+                format!("No tokens to buy on {network}")
+            } else {
+                "No matching tokens".to_owned()
+            })
+            .whitespace_normal(),
+        };
+        div()
+            .key_context(BUTTONS_KEY_CONTEXT)
+            .px_2()
+            .py_1()
+            .child(status)
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) {
+        self.selected = ix;
+    }
+
+    /// Enter or a click picks the token.
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) {
+        let Some(token) = self
+            .selected
+            .and_then(|ix| self.row(ix.row))
+            .map(|row| row.item.asset.token)
+        else {
+            return;
+        };
+        let _ = self.view.update(cx, |view, cx| {
+            view.pick_buy_token(token, window, cx);
+        });
+    }
+}
+
+/// The network list's rows: the networks the search matches, by name or by the start of the
+/// chain id. One the delivery kind can't deliver on is disabled with the reason.
+pub(super) struct BuyNetworksDelegate {
+    view: WeakEntity<PrivateSwapsView>,
+    /// The network whose tokens the picker shows, which its row marks.
+    shown: u64,
+    networks: Vec<BuyNetwork>,
+    /// The networks the search matches, as indexes into them.
+    rows: Vec<usize>,
+    query: String,
+    selected: Option<IndexPath>,
+}
+
+impl BuyNetworksDelegate {
+    fn set_content(&mut self, shown: u64, networks: Vec<BuyNetwork>) {
+        self.shown = shown;
+        self.networks = networks;
+        self.filter();
+    }
+
+    fn filter(&mut self) {
+        self.rows = self
+            .networks
+            .iter()
+            .enumerate()
+            .filter(|(_, network)| {
+                network.label.to_lowercase().contains(&self.query)
+                    || (!self.query.is_empty()
+                        && network.chain_id.to_string().starts_with(&self.query))
+            })
+            .map(|(index, _)| index)
+            .collect();
+    }
+
+    fn row(&self, row: usize) -> Option<&BuyNetwork> {
+        self.networks.get(*self.rows.get(row)?)
+    }
+
+    /// The networks the search matches, in the list's order.
+    pub(super) fn listed(&self) -> impl Iterator<Item = u64> {
+        (0..self.rows.len())
+            .filter_map(|row| self.row(row))
+            .map(|row| row.chain_id)
+    }
+}
+
+impl ListDelegate for BuyNetworksDelegate {
+    type Item = ListItem;
+
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) -> Task<()> {
+        self.query = query.trim().to_lowercase();
+        self.filter();
+        Task::ready(())
+    }
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.rows.len()
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let network = self.row(ix.row)?;
+        let chain_id = network.chain_id;
+        let available = network.availability.is_available();
+        let shown = self.shown == chain_id;
+        let note = if network.this_network {
+            Some("Current network".to_owned())
+        } else {
+            network.availability.list_reason(&network.label)
+        };
+        // The reason is cut to the row's one line, so the pointer shows it whole.
+        let tooltip = note.clone().filter(|_| !network.this_network);
+        Some(
+            ListItem::new(SharedString::from(format!(
+                "swap-buy-picker-network-{chain_id}"
+            )))
+            .debug_selector(move || format!("swap-buy-picker-network-{chain_id}"))
+            .h(rems(NETWORK_ROW_HEIGHT))
+            .px_2()
+            .py_0()
+            .rounded(cx.theme().radius)
+            .disabled(!available)
+            // The shown network keeps the selected segment's fill and color, and no hover.
+            .confirmed(shown)
+            .when(shown, |row| row.bg(rgb(theme::SURFACE_HOVER)))
+            .when_some(tooltip, |row, tooltip| {
+                row.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size_4()
+                                    .flex_none()
+                                    .when(!available, |icon| icon.opacity(0.45))
+                                    .children(
+                                        railgun_ui::chain_icon_asset_path(chain_id)
+                                            .map(|path| gpui::img(path).size_full()),
+                                    ),
+                            )
+                            .child(
+                                app_text(network.label.clone())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .when(shown, |label| label.text_color(rgb(theme::PRIMARY))),
+                            )
+                            .when(shown, |row| {
+                                row.child(
+                                    Icon::new(IconName::Check)
+                                        .small()
+                                        .flex_none()
+                                        .text_color(rgb(theme::PRIMARY)),
+                                )
+                            }),
+                    )
+                    // Under the label, past the icon and the row's gap.
+                    .children(note.map(|note| app_muted_text(note).text_xs().pl_6().truncate())),
+            ),
+        )
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .child(app_muted_text("No matching networks").whitespace_normal())
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) {
+        self.selected = ix;
+    }
+
+    /// Enter or a click shows the network's tokens, when the delivery kind can deliver there.
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, ListState<Self>>,
+    ) {
+        let Some(chain_id) = self
+            .selected
+            .and_then(|ix| self.row(ix.row))
+            .map(|row| row.chain_id)
+        else {
+            return;
+        };
+        let _ = self.view.update(cx, |view, cx| {
+            view.show_buy_picker_network(chain_id, window, cx);
+        });
     }
 }
 
 impl PrivateSwapsView {
-    /// Open the picker on the form's network and Buy asset, with an empty search.
+    /// Open the picker on the form's network and Buy asset, with empty searches.
     pub(super) fn open_buy_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let own = self.session.chain_id;
         let busy = self.busy();
@@ -541,13 +957,24 @@ impl PrivateSwapsView {
         if busy || form.picker.open || (form.operation.is_some() && !form.reuse_account) {
             return;
         }
+        let buy = form.buy;
         let picker = &mut form.picker;
         picker.open = true;
         picker.network = form.network.unwrap_or(own);
-        picker.token = form.buy;
-        let search = picker.search.clone();
-        search.update(cx, |search, cx| search.set_value("", window, cx));
+        (picker.tokens, picker.networks) = buy_picker_lists(picker.network, window, cx);
+        let tokens = picker.tokens.clone();
         self.settle_buy_picker(window, cx);
+        // The form's Buy asset is the selected token.
+        let row = buy.and_then(|buy| {
+            tokens
+                .read(cx)
+                .delegate()
+                .listed()
+                .position(|token| token == buy)
+        });
+        if let Some(row) = row {
+            select_row(&tokens, row, window, cx);
+        }
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, window, cx| {
             let close_view = view.clone();
@@ -558,7 +985,7 @@ impl PrivateSwapsView {
                     .as_ref()
                     .filter(|form| form.picker.open)
                     .map(|form| view.read(cx).buy_picker_content(form, cx))?;
-                Some(render_buy_picker(&view, &content, window, cx))
+                Some(render_buy_picker(&view, content, window, cx))
             });
             dialog
                 .title(app_strong_text("Choose buy asset"))
@@ -572,7 +999,7 @@ impl PrivateSwapsView {
         });
         cx.defer_in(window, move |view, window, cx| {
             if view.form.as_ref().is_some_and(|form| form.picker.open) {
-                search.read(cx).focus_handle(cx).focus(window, cx);
+                tokens.read(cx).focus_handle(cx).focus(window, cx);
             }
         });
     }
@@ -586,19 +1013,10 @@ impl PrivateSwapsView {
         }
     }
 
-    /// The search changed: the first match is highlighted.
-    pub(super) fn buy_picker_searched(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some(form) = self.form.as_mut() {
-            form.picker.token = None;
-            form.picker.tokens_scroll.scroll_to_item(0);
-            cx.notify();
-        }
-    }
-
     /// The picker opened, or Receive to changed while it is open: its lists follow the delivery
-    /// kind. A shown network the kind can't take gives way to the swap's own, which only
-    /// changes what the picker lists. For Private balance, the networks that aren't loaded
-    /// start loading.
+    /// kind, with the shown network and the first token selected. A shown network the kind
+    /// can't take gives way to the swap's own, which only changes what the picker lists. For
+    /// Private balance, the networks that aren't loaded start loading.
     pub(super) fn settle_buy_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let own = self.session.chain_id;
         // A network without setup funds can be picked for an existing account there.
@@ -615,16 +1033,29 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let picker = &mut form.picker;
         if !selectable {
-            picker.network = own;
+            form.picker.network = own;
         }
-        picker.highlighted_network = picker.network;
-        picker.tokens_scroll.scroll_to_item(0);
         if receive_to == ReceiveTo::PrivateBalance {
             self.load_private_networks(None, cx);
         }
         self.load_bridge_routes(window, cx);
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let content = self.buy_picker_content(form, cx);
+        let (tokens, networks) = (content.token_list.clone(), content.network_list.clone());
+        let shown = content.network;
+        content.sync_lists(cx);
+        select_row(&tokens, 0, window, cx);
+        let row = networks
+            .read(cx)
+            .delegate()
+            .listed()
+            .position(|chain_id| chain_id == shown);
+        if let Some(row) = row {
+            select_row(&networks, row, window, cx);
+        }
         cx.notify();
     }
 
@@ -632,7 +1063,7 @@ impl PrivateSwapsView {
     pub(super) fn show_buy_picker_network(
         &mut self,
         chain_id: u64,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(form) = self.form.as_ref().filter(|form| form.picker.open) else {
@@ -648,11 +1079,9 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let picker = &mut form.picker;
-        picker.network = chain_id;
-        picker.highlighted_network = chain_id;
-        picker.token = None;
-        picker.tokens_scroll.scroll_to_item(0);
+        form.picker.network = chain_id;
+        let tokens = form.picker.tokens.clone();
+        select_row(&tokens, 0, window, cx);
         self.load_bridge_routes(window, cx);
         cx.notify();
     }
@@ -699,98 +1128,6 @@ impl PrivateSwapsView {
         self.buy_items_on(form, (shown != self.session.chain_id).then_some(shown), cx)
     }
 
-    /// [`Self::buy_picker_items`] the search matches.
-    fn buy_picker_matches(&self, form: &SwapForm, cx: &App) -> Vec<SwapBuyItem> {
-        let query = form.picker.search.read(cx).value();
-        self.buy_picker_items(form, cx)
-            .into_iter()
-            .filter(|item| item.asset.matches(&query))
-            .collect()
-    }
-
-    fn move_buy_picker_token(&mut self, direction: Direction, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let items = self.buy_picker_matches(form, cx);
-        let current = highlighted_token(&form.picker, &items)
-            .and_then(|token| items.iter().position(|item| item.asset.token == token));
-        let Some(index) = suggestion_index_after_move(current, items.len(), direction) else {
-            return;
-        };
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        form.picker.token = Some(items[index].asset.token);
-        form.picker.tokens_scroll.scroll_to_item(index);
-        cx.notify();
-    }
-
-    /// Pick the highlighted token, as Enter does in the search and in the token list.
-    fn confirm_buy_picker_token(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let items = self.buy_picker_matches(form, cx);
-        if let Some(token) = highlighted_token(&form.picker, &items) {
-            self.pick_buy_token(token, window, cx);
-        }
-    }
-
-    /// Move the highlight among the networks that can be picked.
-    fn move_buy_picker_network(&mut self, direction: Direction, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let networks = self.network_items(form.receive_to, cx);
-        let highlighted = highlighted_network(&form.picker, &networks);
-        let selectable = networks
-            .iter()
-            .filter(|network| network.availability.is_available())
-            .map(|network| network.chain_id)
-            .collect::<Vec<_>>();
-        let current = selectable
-            .iter()
-            .position(|chain_id| *chain_id == highlighted);
-        let Some(index) = suggestion_index_after_move(current, selectable.len(), direction) else {
-            return;
-        };
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        form.picker.highlighted_network = selectable[index];
-        cx.notify();
-    }
-
-    /// Show the highlighted network's tokens, as Enter does in the network list.
-    fn confirm_buy_picker_network(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let networks = self.network_items(form.receive_to, cx);
-        let highlighted = highlighted_network(&form.picker, &networks);
-        self.show_buy_picker_network(highlighted, window, cx);
-    }
-
-    /// Move the keyboard to the token list, or to the search while the list has no rows.
-    fn focus_buy_picker_tokens(&self, window: &mut Window, cx: &mut App) {
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let focus = if self.buy_picker_matches(form, cx).is_empty() {
-            form.picker.search.read(cx).focus_handle(cx)
-        } else {
-            form.picker.tokens_focus.clone()
-        };
-        focus.focus(window, cx);
-    }
-
-    fn focus_buy_picker_networks(&self, window: &mut Window, cx: &mut App) {
-        if let Some(form) = self.form.as_ref() {
-            form.picker.networks_focus.focus(window, cx);
-        }
-    }
-
     /// What the open picker shows for `form`.
     pub(super) fn buy_picker_content(&self, form: &SwapForm, cx: &App) -> BuyPickerContent {
         let own = self.session.chain_id;
@@ -798,8 +1135,6 @@ impl PrivateSwapsView {
         let shown = picker.network;
         let private = form.receive_to == ReceiveTo::PrivateBalance;
         let routes = (shown != own).then(|| form.bridge.routes.get(&(form.sell, shown)));
-        let items = self.buy_picker_matches(form, cx);
-        let highlighted = highlighted_token(picker, &items);
         let tokens = match routes {
             Some(None) => BuyPickerTokens::Loading,
             Some(Some(Err(error))) => BuyPickerTokens::Failed(self.quote_error_message(error, cx)),
@@ -811,7 +1146,7 @@ impl PrivateSwapsView {
             _ => {
                 let totals = private.then(|| self.private_totals(form, shown, cx));
                 BuyPickerTokens::Listed(
-                    items
+                    self.buy_picker_items(form, cx)
                         .into_iter()
                         .map(|item| {
                             let token = item.asset.token;
@@ -828,32 +1163,18 @@ impl PrivateSwapsView {
                 )
             }
         };
-        let networks = self.network_items(form.receive_to, cx);
         BuyPickerContent {
             receive_to: form.receive_to,
             receive_to_locked: self.receive_to_locked(form),
-            search: picker.search.clone(),
-            searched: !picker.search.read(cx).value().trim().is_empty(),
+            token_list: picker.tokens.clone(),
+            network_list: picker.networks.clone(),
             network: shown,
+            own_network: shown == own,
             tokens,
-            highlighted_token: highlighted,
-            highlighted_network: highlighted_network(picker, &networks),
-            networks,
-            tokens_focus: picker.tokens_focus.clone(),
-            networks_focus: picker.networks_focus.clone(),
-            tokens_scroll: picker.tokens_scroll.clone(),
+            networks: self.network_items(form.receive_to, cx),
             busy: self.busy(),
         }
     }
-}
-
-/// A listener that runs `handler` on `view`, whatever its event.
-fn on_view<E: 'static>(
-    view: &Entity<PrivateSwapsView>,
-    handler: fn(&mut PrivateSwapsView, &mut Window, &mut Context<'_, PrivateSwapsView>),
-) -> impl Fn(&E, &mut Window, &mut App) + 'static {
-    let view = view.clone();
-    move |_, window, cx| view.update(cx, |view, cx| handler(view, window, cx))
 }
 
 /// A token's icon with its network's icon as a badge at its corner.
@@ -891,12 +1212,13 @@ fn near_tag() -> Tag {
         .child("NEAR")
 }
 
-/// The open picker: the Receive to switch over the token pane and the network pane.
+/// The open picker: the Receive to switch over the token pane and the network pane, whose
+/// lists take their rows from `content`.
 fn render_buy_picker(
     view: &Entity<PrivateSwapsView>,
-    content: &BuyPickerContent,
+    content: BuyPickerContent,
     window: &Window,
-    cx: &App,
+    cx: &mut App,
 ) -> gpui::Div {
     let switch = |id: &'static str, label: &'static str, receive_to: ReceiveTo| {
         let view = view.clone();
@@ -912,6 +1234,42 @@ fn render_buy_picker(
             view.update(cx, |view, cx| view.set_receive_to(receive_to, window, cx));
         })
     };
+    let header = div()
+        .key_context(BUTTONS_KEY_CONTEXT)
+        .flex()
+        .flex_none()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .child(app_muted_text("Receive to").text_xs())
+        .child(
+            ButtonGroup::new("swap-buy-picker-receive-to")
+                .outline()
+                .compact()
+                .disabled(content.receive_to_locked)
+                .child(switch(
+                    "swap-buy-picker-private",
+                    "Private balance",
+                    ReceiveTo::PrivateBalance,
+                ))
+                .child(switch(
+                    "swap-buy-picker-public",
+                    "Public address",
+                    ReceiveTo::PublicAddress,
+                )),
+        );
+    let panes = div()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .items_stretch()
+        .child(token_pane(&content))
+        .child(network_pane(&content));
+    content.sync_lists(cx);
     div()
         .debug_selector(|| "swap-buy-picker".into())
         .w_full()
@@ -920,135 +1278,19 @@ fn render_buy_picker(
         .overflow_hidden()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .key_context(BUTTONS_KEY_CONTEXT)
-                .flex()
-                .flex_none()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(theme::BORDER_SUBTLE))
-                .child(app_muted_text("Receive to").text_xs())
-                .child(
-                    ButtonGroup::new("swap-buy-picker-receive-to")
-                        .outline()
-                        .compact()
-                        .disabled(content.receive_to_locked)
-                        .child(switch(
-                            "swap-buy-picker-private",
-                            "Private balance",
-                            ReceiveTo::PrivateBalance,
-                        ))
-                        .child(switch(
-                            "swap-buy-picker-public",
-                            "Public address",
-                            ReceiveTo::PublicAddress,
-                        )),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .items_stretch()
-                .child(token_pane(view, content, cx))
-                .child(network_pane(view, content, cx)),
-        )
+        .child(header)
+        .child(panes)
 }
 
-/// The search and the shown network's tokens. Down and Up in the search move the highlight,
-/// and Enter picks it.
-fn token_pane(view: &Entity<PrivateSwapsView>, content: &BuyPickerContent, cx: &App) -> gpui::Div {
+/// The shown network's tokens under their search. Down and Up move the selection, and Enter
+/// picks it.
+fn token_pane(content: &BuyPickerContent) -> gpui::Div {
     let network = network_name(content.network);
-    let own = content
-        .networks
-        .first()
-        .is_some_and(|own| own.chain_id == content.network);
     // Only Across shields on delivery, so it alone lists another network's tokens.
-    let heading = if content.receive_to == ReceiveTo::PrivateBalance && !own {
+    let heading = if content.receive_to == ReceiveTo::PrivateBalance && !content.own_network {
         format!("Tokens Across delivers on {network}")
     } else {
         format!("Tokens on {network}")
-    };
-    let move_view = view.clone();
-    let ring = cx.theme().ring;
-    // Where the list stands while it has no rows. Its Retry is a button like the header's.
-    let status = |status: gpui::Div| {
-        div()
-            .key_context(BUTTONS_KEY_CONTEXT)
-            .px_2()
-            .py_1()
-            .child(status)
-            .into_any_element()
-    };
-    let list = match &content.tokens {
-        BuyPickerTokens::Loading => status(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(Spinner::new().small())
-                .child(
-                    app_muted_text(format!("Getting the tokens {network} can receive…"))
-                        .min_w_0()
-                        .whitespace_normal(),
-                ),
-        ),
-        BuyPickerTokens::Failed(error) => status(
-            div()
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap_2()
-                .child(
-                    app_text(error.clone())
-                        .text_color(cx.theme().danger)
-                        .whitespace_normal(),
-                )
-                .child(bridge_routes_retry_button(view.clone(), content.busy)),
-        ),
-        BuyPickerTokens::Listed(rows) if rows.is_empty() => status(
-            app_muted_text(if content.searched {
-                "No matching tokens".to_owned()
-            } else {
-                format!("No tokens to buy on {network}")
-            })
-            .whitespace_normal(),
-        ),
-        BuyPickerTokens::Listed(rows) => div()
-            .id("swap-buy-picker-tokens")
-            .debug_selector(|| "swap-buy-picker-tokens".into())
-            .track_focus(&content.tokens_focus)
-            .key_context(TOKENS_KEY_CONTEXT)
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&content.tokens_scroll)
-            .flex()
-            .flex_col()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .focus_visible(move |style| style.border_color(ring))
-            .on_action(on_view::<SelectUp>(view, |view, _, cx| {
-                view.move_buy_picker_token(Direction::Previous, cx);
-            }))
-            .on_action(on_view::<SelectDown>(view, |view, _, cx| {
-                view.move_buy_picker_token(Direction::Next, cx);
-            }))
-            .on_action(on_view::<SelectRight>(view, |view, window, cx| {
-                view.focus_buy_picker_networks(window, cx);
-            }))
-            .on_action(on_view::<Confirm>(view, |view, window, cx| {
-                view.confirm_buy_picker_token(window, cx);
-            }))
-            .children(rows.iter().map(|row| token_row(view, content, row, cx)))
-            .into_any_element(),
     };
     div()
         .flex_1()
@@ -1058,85 +1300,23 @@ fn token_pane(view: &Entity<PrivateSwapsView>, content: &BuyPickerContent, cx: &
         .flex_col()
         .gap_1()
         .p_2()
+        .child(app_muted_text(heading).text_xs().px_2())
         .child(
             div()
-                .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                    let direction = match event.keystroke.key.as_str() {
-                        "down" => Direction::Next,
-                        "up" => Direction::Previous,
-                        _ => return,
-                    };
-                    move_view.update(cx, |view, cx| view.move_buy_picker_token(direction, cx));
-                    cx.stop_propagation();
-                })
-                .on_action(on_view::<InputEnter>(view, |view, window, cx| {
-                    view.confirm_buy_picker_token(window, cx);
-                }))
-                .on_action(on_view::<InputEscape>(view, |view, window, cx| {
-                    view.close_buy_picker(cx);
-                    window.close_dialog(cx);
-                }))
+                .debug_selector(|| "swap-buy-picker-tokens".into())
+                .flex_1()
+                .min_h_0()
                 .child(
-                    app_input(&content.search)
+                    List::new(&content.token_list)
                         .small()
-                        .aria_label("Search tokens"),
+                        .search_placeholder("Search name or paste address"),
                 ),
         )
-        .child(app_muted_text(heading).text_xs().px_2())
-        .child(list)
 }
 
-fn token_row(
-    view: &Entity<PrivateSwapsView>,
-    content: &BuyPickerContent,
-    row: &BuyPickerToken,
-    cx: &App,
-) -> ListItem {
-    let token = row.item.asset.token;
-    let id = format!("swap-buy-picker-token-{token:#x}");
-    let selector = id.clone();
-    let view = view.clone();
-    ListItem::new(SharedString::from(id))
-        .debug_selector(move || selector)
-        .px_2()
-        .rounded(cx.theme().radius)
-        .selected(content.highlighted_token == Some(token))
-        .on_click(move |_, window, cx| {
-            view.update(cx, |view, cx| view.pick_buy_token(token, window, cx));
-        })
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(network_token_icon(
-                    row.item.asset.icon_path.clone(),
-                    content.network,
-                ))
-                .child(
-                    app_text(row.item.asset.label.to_string())
-                        .flex_1()
-                        .min_w_0()
-                        .truncate(),
-                )
-                .children(
-                    row.balance
-                        .clone()
-                        .map(|balance| app_muted_text(balance).text_xs().flex_none()),
-                )
-                .when(row.item.near_only, |row| row.child(near_tag())),
-        )
-}
-
-/// The networks. One the delivery kind can't deliver on is disabled with the reason.
-fn network_pane(
-    view: &Entity<PrivateSwapsView>,
-    content: &BuyPickerContent,
-    cx: &App,
-) -> gpui::Div {
-    let ring = cx.theme().ring;
+/// The networks under their search. Down and Up move the selection, and Enter shows its
+/// tokens.
+fn network_pane(content: &BuyPickerContent) -> gpui::Div {
     div()
         .w(rems(11.))
         .flex_none()
@@ -1147,97 +1327,16 @@ fn network_pane(
         .p_2()
         .border_l_1()
         .border_color(rgb(theme::BORDER_SUBTLE))
-        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
         .child(app_muted_text("Network").text_xs().px_2())
         .child(
             div()
-                .id("swap-buy-picker-networks")
                 .debug_selector(|| "swap-buy-picker-networks".into())
-                .track_focus(&content.networks_focus)
-                .key_context(NETWORKS_KEY_CONTEXT)
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(gpui::transparent_black())
-                .focus_visible(move |style| style.border_color(ring))
-                .on_action(on_view::<SelectUp>(view, |view, _, cx| {
-                    view.move_buy_picker_network(Direction::Previous, cx);
-                }))
-                .on_action(on_view::<SelectDown>(view, |view, _, cx| {
-                    view.move_buy_picker_network(Direction::Next, cx);
-                }))
-                .on_action(on_view::<SelectLeft>(view, |view, window, cx| {
-                    view.focus_buy_picker_tokens(window, cx);
-                }))
-                .on_action(on_view::<Confirm>(view, |view, window, cx| {
-                    view.confirm_buy_picker_network(window, cx);
-                }))
-                .children(
-                    content
-                        .networks
-                        .iter()
-                        .map(|network| network_row(view, content, network, cx)),
+                .child(
+                    List::new(&content.network_list)
+                        .small()
+                        .search_placeholder("Search networks"),
                 ),
         )
-}
-
-fn network_row(
-    view: &Entity<PrivateSwapsView>,
-    content: &BuyPickerContent,
-    network: &BuyNetwork,
-    cx: &App,
-) -> ListItem {
-    let chain_id = network.chain_id;
-    let available = network.availability.is_available();
-    let note = if network.this_network {
-        Some("This network".to_owned())
-    } else {
-        network.availability.list_reason(&network.label)
-    };
-    let view = view.clone();
-    ListItem::new(SharedString::from(format!(
-        "swap-buy-picker-network-{chain_id}"
-    )))
-    .debug_selector(move || format!("swap-buy-picker-network-{chain_id}"))
-    .px_2()
-    .rounded(cx.theme().radius)
-    .disabled(!available)
-    .selected(available && content.highlighted_network == chain_id)
-    .confirmed(content.network == chain_id)
-    .check_icon(IconName::Check)
-    .on_click(move |_, window, cx| {
-        view.update(cx, |view, cx| {
-            view.show_buy_picker_network(chain_id, window, cx);
-        });
-    })
-    .child(
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .size_4()
-                            .flex_none()
-                            .when(!available, |icon| icon.opacity(0.45))
-                            .children(
-                                railgun_ui::chain_icon_asset_path(chain_id)
-                                    .map(|path| gpui::img(path).size_full()),
-                            ),
-                    )
-                    .child(app_text(network.label.clone()).min_w_0().truncate()),
-            )
-            // Under the label, past the icon and the row's gap.
-            .children(note.map(|note| app_muted_text(note).text_xs().pl_6().whitespace_normal())),
-    )
 }

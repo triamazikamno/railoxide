@@ -205,7 +205,7 @@ pub(super) const fn native_wrapped_output_labels(
     match chain_id {
         1 | 42161 => Some(("ETH", "WETH")),
         56 => Some(("BNB", "WBNB")),
-        137 => Some(("MATIC", "WMATIC")),
+        137 => Some(("POL", "WPOL")),
         _ => None,
     }
 }

@@ -697,7 +697,9 @@ pub struct SwapBridgeHandoff {
 /// `DeliveredVerified`, `DeliveredReported`, `Refunding` and `HeldOnDestination` are final.
 /// `NeedsAttention` stops automatic polling, but an explicit status check may replace it. An
 /// explicit check may also replace an Across `Refunding` with `DeliveredVerified` or
-/// `HeldOnDestination` once it verifies the matching fill.
+/// `HeldOnDestination` once it verifies the matching fill, and an Across `DeliveredReported`
+/// with `DeliveredVerified` once it verifies the fill or with `Refunding` when Across then
+/// reports the deposit expired or refunded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapBridgeOutcome {
     /// Across's fill, checked in the destination chain's finalized receipts. `output_amount` is
@@ -711,7 +713,9 @@ pub enum SwapBridgeOutcome {
         #[serde(default)]
         shielded: bool,
     },
-    /// Success as reported by 1Click, not checked on the destination chain.
+    /// Success as reported by the provider, not checked on the destination chain: 1Click's
+    /// report, or Across's when the final fill block holds no fill the wallet can verify or the
+    /// destination chain's endpoints serve no whole-block receipts.
     DeliveredReported {
         amount_out: Option<U256>,
         transaction_hash: Option<B256>,
@@ -1799,8 +1803,9 @@ impl ExecutorStore {
 
     /// Persist a Bridge order's destination outcome after its hand-off. A final outcome is
     /// never replaced, though recording it again is accepted; `NeedsAttention` may be
-    /// replaced by any outcome. The one exception is an Across `Refunding` without a verified
-    /// refund, which a verified fill replaces. A verified delivery must meet the approved
+    /// replaced by any outcome. The exceptions are an Across `Refunding` without a verified
+    /// refund, which a verified fill replaces, and an Across `DeliveredReported`, which a
+    /// verified fill or a refund replaces. A verified delivery must meet the approved
     /// destination minimum. A private delivery's fill is recorded as a shielded delivery or as
     /// held on the destination chain, and no other delivery takes either.
     pub fn record_swap_bridge_outcome(
@@ -1843,13 +1848,21 @@ impl ExecutorStore {
                 )
                 && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
                 && order.observations.bridge_refund.is_none();
+            // Nothing on the destination chain backs a delivery Across only reported, so a
+            // verified fill or a refund replaces it.
+            let corrects_report = matches!(
+                order.observations.bridge_outcome,
+                Some(SwapBridgeOutcome::DeliveredReported { .. })
+            ) && matches!(
+                outcome,
+                SwapBridgeOutcome::DeliveredVerified { .. } | SwapBridgeOutcome::Refunding
+            ) && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)));
             if order.observations.bridge_handoff.is_none()
                 || !private_fits
                 || below_minimum
-                || order
-                    .observations
-                    .bridge_outcome
-                    .is_some_and(|known| known.is_final() && known != outcome && !corrects_refund)
+                || order.observations.bridge_outcome.is_some_and(|known| {
+                    known.is_final() && known != outcome && !corrects_refund && !corrects_report
+                })
             {
                 return Err(ExecutorStoreError::InvalidRecord);
             }

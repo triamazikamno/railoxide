@@ -1855,11 +1855,11 @@ impl ExecutorOwner {
     /// the post-hook at `k + 1`, and the order, after checking cached anchors. The first order
     /// after setup must match the pair and delivery approved with the setup, an External
     /// receiver must pass [`SwapProfile::check_receiver`], and a public Bridge receiver the
-    /// destination chain's [`crate::settings::BridgeProfile::check_receiver`]. A Bridge order's
-    /// provider is quoted again before anything is signed: Across for the deposit's terms, NEAR
-    /// Intents for a verified deposit address that the order pays. Persist them with the input
-    /// reservation and the provider's terms, then submit. Nothing signed leaves the wallet
-    /// before the write succeeds.
+    /// destination chain's [`crate::settings::BridgeDestinationProfile::check_receiver`]. A
+    /// Bridge order's provider is quoted again before anything is signed: Across for the
+    /// deposit's terms, NEAR Intents for a verified deposit address that the order pays. Persist
+    /// them with the input reservation and the provider's terms, then submit. Nothing signed
+    /// leaves the wallet before the write succeeds.
     ///
     /// A private Bridge delivery's receiver is the wallet's own destination stealth account.
     /// Before the provider's quote and before this chain's account signs anything, that account
@@ -1989,10 +1989,13 @@ impl ExecutorOwner {
         {
             let destination = route.destination_chain;
             destination
-                .bridge_profile()
+                .bridge_destination()
                 .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
                 .check_receiver(
-                    destination.require_railgun()?.deployment.contract,
+                    destination
+                        .railgun
+                        .as_ref()
+                        .map(|railgun| railgun.deployment.contract),
                     delivery.receiver,
                 )?;
         }

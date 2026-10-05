@@ -16,7 +16,7 @@ use alloy::transports::{RpcError, TransportError};
 use broadcaster_core::contracts::railgun::{
     Call, Nullified, RelayAdapt7702, Shield, ShieldRequest, Transact, Transaction, shieldCall,
 };
-use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool, RpcAdmission};
 use eyre::{Result, eyre};
 use tracing::Instrument as _;
 
@@ -32,6 +32,13 @@ use crate::vault::{
 const MAX_OBSERVATION_BLOCKS: u64 = 64;
 /// How long an endpoint whose request failed sits out executor observations.
 const ENDPOINT_COOLDOWN: Duration = Duration::from_mins(3);
+/// How long in all one observation waits in [`ObservationEndpoints::later_providers`]: just
+/// above the RPC identity check's timeout, by which every endpoint's first check finished.
+/// Tests wait less.
+pub(super) const LATE_ADMISSION_WAIT: Duration =
+    Duration::from_secs(if cfg!(test) { 2 } else { 11 });
+/// How often a wait for a later admission looks at the pool.
+const LATE_ADMISSION_POLL: Duration = Duration::from_millis(100);
 
 mod recovery;
 
@@ -197,6 +204,43 @@ impl ObservationEndpoints {
             providers[..=position].rotate_right(1);
         }
         providers
+    }
+
+    /// Endpoints admitted since an earlier [`Self::providers`] call: the available ones whose
+    /// pool index isn't in `tried`, as soon as there is one, waiting until `deadline` while an
+    /// untried endpoint's admission is pending. Empty at the deadline, once no such admission
+    /// is pending, and once released.
+    pub(super) async fn later_providers(
+        &self,
+        tried: &BTreeSet<usize>,
+        deadline: tokio::time::Instant,
+    ) -> Vec<ProviderHandle> {
+        loop {
+            // The pool is looked up on every pass and not held while waiting, so a release
+            // still drops it.
+            let pending = {
+                let Some(pool) = self.current_pool() else {
+                    return Vec::new();
+                };
+                // Read before the providers: an endpoint admitted between the two reads then
+                // still counts as pending, and the next pass finds it.
+                let pending = (0..pool.len()).any(|index| {
+                    !tried.contains(&index)
+                        && pool.provider_admission(index) == Some(RpcAdmission::Pending)
+                });
+                let mut providers = pool.available_providers();
+                providers.retain(|provider| !tried.contains(&provider.index));
+                if !providers.is_empty() {
+                    return providers;
+                }
+                pending
+            };
+            let now = tokio::time::Instant::now();
+            if !pending || now >= deadline {
+                return Vec::new();
+            }
+            tokio::time::sleep_until(deadline.min(now + LATE_ADMISSION_POLL)).await;
+        }
     }
 
     pub(super) fn succeeded(&self, provider: &ProviderHandle) {

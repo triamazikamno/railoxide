@@ -5,13 +5,15 @@ use railgun_wallet::tx::GasEstimateMode;
 use railgun_wallet::{Note, UtxoCommitmentKind, UtxoSource};
 
 use super::super::bridge::{
-    SwapPrivateBridgeQuote, across_bridge_quote, delivery_allowance_rate, near_bridge_quote,
+    BridgeSigning, SwapPrivateBridgeQuote, across_bridge_quote, across_order_terms,
+    delivery_allowance_rate, near_bridge_quote,
 };
 use super::*;
 use crate::bridge::{AcrossFeeQuote, BridgeDestination, NearAssets, OneClickDryQuote};
 use crate::cow::{
     DeliveryAllowanceRate, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
 };
+use crate::settings::BridgeReceiverRejection;
 use crate::vault::{BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation};
 
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
@@ -502,6 +504,58 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
         ..fees
     };
     assert!(delivery_allowance_rate(delivery, Some(WETH), None, &unusable).is_err());
+}
+
+// The destination SpokePool a quote names is never trusted as a pool. While signing, it only
+// refuses a public receiver equal to it, whose proceeds would be stranded there.
+#[test]
+fn across_terms_refuse_a_public_receiver_that_is_the_quoted_destination_pool() {
+    let spoke_pool = Address::repeat_byte(0x5b);
+    let destination_spoke_pool = Address::repeat_byte(0x5c);
+    let fees = AcrossFeeQuote {
+        output_amount: U256::from(850_000_000),
+        total_relay_fee_total: U256::from(150_000_000),
+        total_relay_fee_pct: U256::ZERO,
+        relayer_gas_fee_total: U256::ZERO,
+        relayer_gas_fee_pct: U256::ZERO,
+        lp_fee_total: U256::ZERO,
+        timestamp: 1_000,
+        fill_deadline: 4_000,
+        exclusive_relayer: Address::ZERO,
+        exclusivity_deadline: 0,
+        spoke_pool,
+        destination_spoke_pool,
+        is_amount_too_low: false,
+        min_deposit: U256::ONE,
+        max_deposit: U256::MAX,
+        estimated_fill_time_sec: 12,
+    };
+    let terms = |receiver| {
+        across_order_terms(
+            &fees,
+            spoke_pool,
+            USDC,
+            BridgeDelivery {
+                provider: BridgeProvider::Across,
+                receiver,
+                ..near_delivery()
+            },
+            U256::from(1_000_000_000),
+            fees.output_amount,
+            2_000,
+            None,
+        )
+    };
+    assert!(matches!(
+        terms(Address::repeat_byte(0x99)),
+        Ok(BridgeSigning::Terms(_))
+    ));
+    assert_eq!(
+        terms(destination_spoke_pool)
+            .err()
+            .and_then(|error| error.downcast_ref::<BridgeReceiverRejection>().copied()),
+        Some(BridgeReceiverRejection::SpokePool)
+    );
 }
 
 // The plan sizes a private delivery's post-hook with placeholders. It must encode to the length
