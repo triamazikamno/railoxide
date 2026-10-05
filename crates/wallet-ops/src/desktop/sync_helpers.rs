@@ -789,6 +789,278 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
+    /// Run with the four verified `<CID>.car` files in `PPOI_ARTIFACT_CARS`:
+    /// `PPOI_ARTIFACT_CARS=/tmp/ppoi-desktop-cars cargo test --locked -p wallet-ops --lib desktop::sync_helpers::tests::desktop_ppoi_artifact_upgrade_preserves_existing_db -- --ignored --exact --nocapture`
+    #[tokio::test]
+    #[ignore = "requires provisioned PPOI artifact CARs"]
+    async fn desktop_ppoi_artifact_upgrade_preserves_existing_db() {
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const BUNDLE: &str = "QmZ2MyM6TKxffkv6stuo2hFwmUfs3q4xgMYN164Sje8new";
+        const CIDS: [&str; 4] = [
+            "QmYG6a72rcLiddX1DyHmDvRaDpkPAf3VdHNNPxVBqndhEy",
+            "QmaNNJxu5DqzmB3W6BSR49bsPM1MNhwWH9o4Dqd8cSpeyL",
+            "QmTY2yzKjMhjdcgC52Q3aiHE5wNRUsWgdDtzFtqSFfuzXm",
+            "QmUtQFFYcmooihjn5wfYdVNPbtkEv4SKqegwcdcd1L3K5X",
+        ];
+        const HASHES: [(usize, &str, &str); 2] = [
+            (
+                3,
+                "a128e273f8a7b9fa9e04e17da079b89a57e416db845864d0d5c88570564a2066",
+                "b82a6d545d94cb774592b652b3d6b3d73f032eac946119b5de631d0609da7cbe",
+            ),
+            (
+                13,
+                "1ec7c1230a3985f752c5cbeafedcb152902d0d293d9b69477032a0d7d736ef53",
+                "49a0c7b654d8d70157164a16702d9de15e9d2176803a999c631fa6e27a6a5a81",
+            ),
+        ];
+
+        struct AbortServerOnDrop(tokio::task::JoinHandle<()>);
+
+        impl Drop for AbortServerOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let car_dir =
+            PathBuf::from(std::env::var_os("PPOI_ARTIFACT_CARS").expect("set PPOI_ARTIFACT_CARS"));
+        let cars = CIDS
+            .into_iter()
+            .map(|cid| {
+                (
+                    cid.to_string(),
+                    fs::read(car_dir.join(format!("{cid}.car"))).expect("read provisioned CAR"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local artifact gateway");
+        let gateway = format!(
+            "http://{}",
+            listener.local_addr().expect("local gateway address")
+        );
+        let requests = Arc::new(AtomicU64::new(0));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let server_requests = Arc::clone(&requests);
+        let server_unavailable = Arc::clone(&unavailable);
+        let mut server = AbortServerOnDrop(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept artifact request");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192, "artifact request header too large");
+                        request.push(socket.read_u8().await.expect("read artifact request"));
+                    }
+                    let request = String::from_utf8(request).expect("HTTP request text");
+                    let target = request
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("artifact request target");
+                    assert!(target.contains("format=car"), "request must use a CAR");
+                    let cid = target
+                        .strip_prefix("/ipfs/")
+                        .expect("IPFS artifact path")
+                        .split('?')
+                        .next()
+                        .expect("artifact CID");
+                    let car = cars.get(cid).expect("request must use a current artifact CID");
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = if server_unavailable.load(Ordering::SeqCst) {
+                        ("503 Service Unavailable", &[][..])
+                    } else {
+                        ("200 OK", car.as_slice())
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/vnd.ipld.car\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(header.as_bytes()).await.expect("write CAR header");
+                    socket.write_all(body).await.expect("write CAR body");
+                })
+                .await
+                .expect("artifact server request deadline");
+            }
+        }));
+
+        for upgraded in [false, true] {
+            let root_dir = temp_db_root();
+            let db = DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open test db");
+            let mut saved_settings = settings::WalletSettings::default();
+            saved_settings.poi.artifact.gateway_urls = vec![gateway.clone()];
+            settings::save_wallet_settings(&db, &saved_settings).expect("save artifact gateway");
+            let cache_key = WalletCacheKey::from_opaque_id([0x42; 16]);
+            let checkpoint = vault::WalletChainMetadataBundle {
+                wallet_chain_uuid: cache_key.to_string(),
+                wallet_uuid: "synthetic-artifact-upgrade".to_string(),
+                chain_type: 0,
+                chain_id: 1,
+                contract: "0x1111111111111111111111111111111111111111".to_string(),
+                start_block: 100,
+                last_scanned_block: 149,
+                last_scanned_block_hash: Some([0x33; 32]),
+                poi_read_source: None,
+            };
+            initialize_atomic_wallet_cache_metadata(&db, &cache_key, &checkpoint)
+                .expect("save checkpoint sentinel");
+            let artifact_dir = db.blob_dir().join("artifacts");
+            let mut sentinels = Vec::new();
+            if upgraded {
+                for variant in [
+                    "01x01",
+                    "artifacts-v2.1/poi-nov-2-23/POI_3x3",
+                    "artifacts-v2.1/poi-nov-2-23/POI_13x13",
+                ] {
+                    for file in ["zkey", "wasm"] {
+                        let path = artifact_dir.join(variant).join(file);
+                        fs::create_dir_all(path.parent().expect("sentinel directory"))
+                            .expect("create old artifact directory");
+                        let bytes = format!("retained {variant}/{file}").into_bytes();
+                        fs::write(&path, &bytes).expect("seed artifact sentinel");
+                        sentinels.push((path, bytes));
+                    }
+                }
+            }
+            let http = build_wallet_network_context(WalletNetworkConfig {
+                network_mode: Some(WalletNetworkMode::Direct),
+                proxy: None,
+                data_dir: &root_dir,
+            })
+            .await
+            .expect("shared direct HTTP context");
+            let before = requests.load(Ordering::SeqCst);
+            let source = artifact_source(&http, &db).expect("desktop artifact source");
+            for (size, zkey_hash, wasm_hash) in HASHES {
+                let paths = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    source.ensure_poi_artifacts(size, size),
+                )
+                .await
+                .expect("artifact acquisition deadline")
+                .expect("acquire current artifacts through desktop factory");
+                let expected_dir =
+                    artifact_dir.join(format!("artifacts-v2.1/{BUNDLE}/POI_{size}x{size}"));
+                assert_eq!(paths.zkey, expected_dir.join("zkey"));
+                assert_eq!(paths.wasm, expected_dir.join("wasm"));
+                for (path, expected_hash) in [(paths.zkey, zkey_hash), (paths.wasm, wasm_hash)] {
+                    assert_eq!(
+                        hex::encode(Sha256::digest(
+                            fs::read(path).expect("read current artifact")
+                        )),
+                        expected_hash
+                    );
+                }
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), before + 4);
+            drop(source);
+            drop(db);
+
+            let db = DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("reopen test db");
+            let source = artifact_source(&http, &db).expect("recreate desktop artifact source");
+            for (size, _, _) in HASHES {
+                source
+                    .ensure_poi_artifacts(size, size)
+                    .await
+                    .expect("reuse current artifacts after restart");
+            }
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                before + 4,
+                "restart must reuse downloaded artifacts"
+            );
+            assert_eq!(
+                settings::load_wallet_settings(&db).expect("load saved settings"),
+                saved_settings
+            );
+            let stored = db
+                .get_wallet_meta(&cache_key)
+                .expect("load checkpoint")
+                .expect("checkpoint retained");
+            assert_eq!(stored.last_scanned_block, checkpoint.last_scanned_block);
+            assert_eq!(
+                stored.last_scanned_block_hash,
+                checkpoint.last_scanned_block_hash
+            );
+            for (path, bytes) in sentinels {
+                assert_eq!(fs::read(path).expect("retained artifact sentinel"), bytes);
+            }
+            drop(source);
+            drop(db);
+            drop(http);
+            fs::remove_dir_all(root_dir).expect("remove test db");
+        }
+
+        unavailable.store(true, Ordering::SeqCst);
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open legacy-only db");
+        let mut saved_settings = settings::WalletSettings::default();
+        saved_settings.poi.artifact.gateway_urls = vec![gateway];
+        settings::save_wallet_settings(&db, &saved_settings).expect("save unavailable gateway");
+        let legacy = db
+            .blob_dir()
+            .join("artifacts/artifacts-v2.1/poi-nov-2-23/POI_3x3");
+        fs::create_dir_all(&legacy).expect("create legacy-only directory");
+        fs::write(legacy.join("zkey"), b"legacy zkey").expect("seed legacy zkey");
+        fs::write(legacy.join("wasm"), b"legacy wasm").expect("seed legacy wasm");
+        let http = build_wallet_network_context(WalletNetworkConfig {
+            network_mode: Some(WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &root_dir,
+        })
+        .await
+        .expect("shared HTTP context for legacy-only db");
+        let source = artifact_source(&http, &db).expect("legacy-only desktop artifact source");
+        let error =
+            tokio::time::timeout(Duration::from_secs(10), source.ensure_poi_artifacts(3, 3))
+                .await
+                .expect("unavailable acquisition deadline")
+                .expect_err("legacy artifacts must not satisfy a current artifact request");
+        assert!(matches!(
+            &error,
+            railgun_wallet::artifacts::ArtifactError::Trustless(_)
+        ));
+        assert!(
+            error.to_string().contains("503"),
+            "acquisition error must identify the HTTP failure: {error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 9);
+        let current = source.artifact_paths("POI_3x3");
+        assert!(!current.zkey.exists());
+        assert!(!current.wasm.exists());
+        assert_eq!(
+            fs::read(legacy.join("zkey")).expect("retained legacy zkey"),
+            b"legacy zkey"
+        );
+        assert_eq!(
+            fs::read(legacy.join("wasm")).expect("retained legacy wasm"),
+            b"legacy wasm"
+        );
+        drop(source);
+        drop(db);
+        drop(http);
+        fs::remove_dir_all(root_dir).expect("remove legacy-only db");
+        server.0.abort();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), &mut server.0)
+            .await
+            .expect("artifact server shutdown deadline")
+            .expect_err("artifact server should stop on abort");
+        assert!(stopped.is_cancelled());
+    }
+
     #[test]
     fn alpha_wallet_cache_metadata_initializes_once_from_chain_metadata() {
         let root_dir = temp_db_root();
@@ -858,6 +1130,7 @@ mod tests {
                             chain_id: chain_key.chain_id,
                             contract: chain_key.contract,
                             relay_adapt_contract: Address::ZERO,
+                            relay_adapt_history: &[],
                             relay_adapt_7702_contract: Address::ZERO,
                             deployment_block: 0,
                             v2_start_block: 0,
