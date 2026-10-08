@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::Cell, rc::Weak, sync::Arc};
 
 use gpui::{Context, Window};
 use wallet_ops::vault::{
@@ -477,6 +477,7 @@ impl WalletRoot {
         &mut self,
         target_base_profile_uuid: Arc<str>,
         vault_password: Zeroizing<String>,
+        lease: Weak<Cell<bool>>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -552,7 +553,8 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
-                if !root.is_active_wallet_generation(
+                if !lease.upgrade().is_some_and(|open| open.get())
+                    || !root.is_active_wallet_generation(
                     active_wallet_id.as_ref(),
                     active_wallet_generation,
                 )

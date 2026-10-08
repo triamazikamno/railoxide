@@ -109,6 +109,7 @@ pub(in crate::root) enum HardwareProfileApprovalPrompt {
 
 #[cfg(feature = "hardware")]
 pub(in crate::root) struct HardwareProfileUnlockState {
+    pub(in crate::root) dialog_lease: std::rc::Weak<std::cell::Cell<bool>>,
     pub(in crate::root) target_wallet_id: Option<Arc<str>>,
     pub(in crate::root) purpose: HardwareProfileUnlockPurpose,
     pub(in crate::root) device_kind: Option<HardwareDeviceKind>,
@@ -134,6 +135,7 @@ pub(in crate::root) struct HardwareProfileUnlockState {
 impl Default for HardwareProfileUnlockState {
     fn default() -> Self {
         Self {
+            dialog_lease: std::rc::Weak::new(),
             target_wallet_id: None,
             purpose: HardwareProfileUnlockPurpose::Open,
             device_kind: None,

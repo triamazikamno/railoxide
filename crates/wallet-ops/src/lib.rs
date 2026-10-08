@@ -100,6 +100,7 @@ pub mod bridge;
 pub mod cow;
 pub mod dapp_request;
 mod desktop;
+pub mod device_auth;
 pub mod gateway;
 mod governance;
 mod governance_actions;

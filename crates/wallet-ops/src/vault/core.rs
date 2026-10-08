@@ -75,6 +75,12 @@ pub enum VaultError {
     VaultNotFound,
     #[error("unlock failed")]
     UnlockFailed,
+    #[error(transparent)]
+    DeviceAuth(#[from] crate::device_auth::DeviceAuthError),
+    #[error("Device authentication is not enabled")]
+    DeviceAuthDisabled,
+    #[error("Device authentication data is corrupt")]
+    DeviceAuthCorrupt,
     #[error("spend grant is invalid")]
     InvalidSpendGrant,
     #[error("invalid gateway permission")]

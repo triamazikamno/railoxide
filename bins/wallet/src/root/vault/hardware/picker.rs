@@ -350,8 +350,7 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        let Some(vault_view_unlock) =
-            self.hardware_profile_vault_view_unlock(store.as_ref(), window, cx)
+        let Some(vault_view_unlock) = self.hardware_profile_vault_view_unlock(&store, window, cx)
         else {
             return;
         };

@@ -361,6 +361,7 @@ impl Render for WalletRoot {
         self.ensure_private_swaps(window, cx);
         if should_apply_background_focus(window.has_active_dialog(cx)) {
             self.focus_vault_input_if_requested(window, cx);
+            self.prompt_device_auth_on_unlock_screen_if_requested(window, cx);
             self.focus_utxo_table_if_requested(window, cx);
             self.focus_public_account_search_if_requested(window, cx);
         }

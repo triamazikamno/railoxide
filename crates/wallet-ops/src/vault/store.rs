@@ -11,23 +11,23 @@ use super::{
     MAX_HARDWARE_RECOVERY_RANGE_COUNT, PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX,
     PUBLIC_ADDRESS_BOOK_PREFIX, PathBuf, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
     PublicAccountMetadata, PublicAccountScope, PublicAccountSecret, PublicAccountSource,
-    PublicAccountStatus, PublicAddressBookEntry, RecordKind, Serialize, SoftwareContextChainInput,
-    SoftwareContextSyncIntent, SoftwareRailgunSpendSigner, SoftwareSeedSessionBinding, SpendGrant,
-    SpendUnlock, StoredHardwareWalletRecord, StoredWalletContextRecord, StoredWalletRecord, U256,
-    VAULT_METADATA_KEY, VaultError, VaultMetadata, VaultRecordEntries, VaultSessionId, ViewUnlock,
-    ViewingKeyData, WALLET_CHAIN_INDEX_COMPLETE_VERSION, WALLET_CHAIN_INDEX_PREFIX,
-    WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
-    WALLETCONNECT_SESSION_PREFIX, WalletCacheKey, WalletChainMetadataBundle,
-    WalletConnectRelayIdentity, WalletConnectSessionAccountResolution,
-    WalletConnectSessionLifecycleState, WalletConnectSessionRecord, WalletKeys, WalletMeta,
-    WalletMetadataBundle, WalletPrivateNamespaceId, WalletSoftwareContext,
-    WalletSoftwareContextKind, WalletSource, WalletSpendBundle, WalletSpendSource, WalletStatus,
-    WalletViewBundle, Zeroizing, assign_missing_display_orders, bip39_entropy_from_mnemonic,
-    bip39_mnemonic_from_entropy, bip39_seed_from_mnemonic_zeroizing,
-    broadcaster_banned_record_entry, broadcaster_banned_record_key,
-    broadcaster_favorite_record_entry, broadcaster_favorite_record_key,
-    broadcaster_preference_entry_identity, create_spend_grant, create_with_params,
-    current_vault_version, default_wallet_label_for_metadata,
+    PublicAccountStatus, PublicAddressBookEntry, RecordKind, SALT_LEN, Serialize,
+    SoftwareContextChainInput, SoftwareContextSyncIntent, SoftwareRailgunSpendSigner,
+    SoftwareSeedSessionBinding, SpendGrant, SpendUnlock, StoredHardwareWalletRecord,
+    StoredWalletContextRecord, StoredWalletRecord, U256, VAULT_METADATA_KEY, VaultError,
+    VaultMetadata, VaultRecordEntries, VaultSessionId, ViewUnlock, ViewingKeyData,
+    WALLET_CHAIN_INDEX_COMPLETE_VERSION, WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX,
+    WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX, WALLETCONNECT_SESSION_PREFIX,
+    WalletCacheKey, WalletChainMetadataBundle, WalletConnectRelayIdentity,
+    WalletConnectSessionAccountResolution, WalletConnectSessionLifecycleState,
+    WalletConnectSessionRecord, WalletKeys, WalletMeta, WalletMetadataBundle,
+    WalletPrivateNamespaceId, WalletSoftwareContext, WalletSoftwareContextKind, WalletSource,
+    WalletSpendBundle, WalletSpendSource, WalletStatus, WalletViewBundle, Zeroizing,
+    assign_missing_display_orders, bip39_entropy_from_mnemonic, bip39_mnemonic_from_entropy,
+    bip39_seed_from_mnemonic_zeroizing, broadcaster_banned_record_entry,
+    broadcaster_banned_record_key, broadcaster_favorite_record_entry,
+    broadcaster_favorite_record_key, broadcaster_preference_entry_identity, create_spend_grant,
+    create_with_params, current_vault_version, default_wallet_label_for_metadata,
     derive_public_evm_address_from_entropy, derive_public_evm_address_from_seed,
     derive_public_evm_private_key_from_entropy, derive_public_evm_private_key_from_seed,
     deserialize_wallet_utxo, ensure_private_address_book_address_available,
@@ -63,6 +63,7 @@ mod address_book;
 mod base;
 mod broadcaster_preferences;
 mod chain_cache;
+mod device_auth;
 mod gateway;
 mod hardware;
 mod key_export;
@@ -73,5 +74,6 @@ mod wallet_metadata;
 mod walletconnect;
 mod wallets;
 
+pub use device_auth::DeviceAuthStatus;
 pub use gateway::GatewayPermission;
 pub use software_context::SoftwareContextMatch;

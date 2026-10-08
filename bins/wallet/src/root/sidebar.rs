@@ -172,6 +172,7 @@ impl WalletRoot {
                                 settings_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
                                     root.invalidate_governance_context();
+                                    root.refresh_device_auth_status();
                                     root.active_activity = Activity::Settings;
                                     cx.notify();
                                 });

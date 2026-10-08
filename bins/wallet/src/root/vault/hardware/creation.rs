@@ -177,7 +177,7 @@ impl WalletRoot {
 
     #[cfg(feature = "hardware")]
     fn finish_hardware_wallet_setup_error(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
         clear_password: bool,
@@ -187,8 +187,7 @@ impl WalletRoot {
             return;
         }
         if clear_password {
-            self.add_wallet_password_input
-                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.clear_add_wallet_password(window, cx);
         }
         cx.defer_in(window, move |root, window, cx| {
             if matches!(root.vault_state, VaultState::ViewUnlocked)

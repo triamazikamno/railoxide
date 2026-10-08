@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use alloy::primitives::Address;
 #[cfg(feature = "hardware")]
@@ -12,6 +16,7 @@ use gpui_component::{
     alert::Alert,
     button::ButtonVariants,
     checkbox::Checkbox,
+    input::InputGroupButton,
     menu::{DropdownMenu, PopupMenuItem},
 };
 use railgun_ui::{chain_name, short_address};
@@ -31,6 +36,8 @@ use zeroize::Zeroizing;
 mod assets;
 mod commands;
 mod components;
+#[cfg(test)]
+mod device_auth_tests;
 mod hardware;
 mod identicon;
 pub(super) mod list;
@@ -62,6 +69,10 @@ pub(super) use ui::public_address::{
     PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, public_address_qr_module_range,
 };
 
+use super::device_auth::{
+    DEVICE_AUTH_REASON_PUBLIC_ACCOUNT, DeviceAuthMethod, DeviceAuthPassword, device_auth_buttons,
+    masked_input_with_device_auth,
+};
 use super::dialogs::PublicAccountDialogKind;
 use super::participant::{remove_global_participant, remove_scoped_participant};
 use super::public_action::{PublicActionMode, PublicSendKind};
@@ -122,7 +133,7 @@ impl WalletRoot {
         kind: PublicAccountDialogKind,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> Weak<Cell<bool>> {
         window.close_all_dialogs(cx);
         self.public_form.error = None;
         self.clear_public_account_dialog_inputs(kind, window, cx);
@@ -130,7 +141,12 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
+        let lease = Rc::new(Cell::new(true));
+        let identity = Rc::downgrade(&lease);
         window.open_dialog(cx, move |dialog, _window, cx| {
+            // Only the active builder owns the lease. Programmatic closure skips on_close.
+            let identity = Rc::downgrade(&lease);
+            let close_identity = identity.clone();
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -139,6 +155,9 @@ impl WalletRoot {
                 .max_h(dialog_max_height)
                 .title(app_strong_text(kind.title()))
                 .on_close(move |_event, window, cx| {
+                    if let Some(lease) = close_identity.upgrade() {
+                        lease.set(false);
+                    }
                     close_root.update(cx, |root, cx| {
                         root.public_form.error = None;
                         root.clear_public_account_dialog_inputs(kind, window, cx);
@@ -148,11 +167,13 @@ impl WalletRoot {
                     content_root.clone(),
                     kind,
                     content_width,
+                    identity,
                 ))
         });
         cx.defer_in(window, move |root, window, cx| {
             root.focus_public_account_dialog_input(kind, window, cx);
         });
+        identity
     }
 
     pub(super) fn open_public_account_edit_dialog(
@@ -191,6 +212,7 @@ impl WalletRoot {
                     content_root.clone(),
                     PublicAccountDialogKind::EditLabel,
                     content_width,
+                    Weak::new(),
                 ))
         });
         cx.defer_in(window, |root, window, cx| {
@@ -645,6 +667,18 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.device_auth_in_progress {
+            return;
+        }
+        self.add_public_derived_account(None, window, cx);
+    }
+
+    fn add_public_derived_account(
+        &mut self,
+        device_auth_password: Option<Zeroizing<String>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.public_form.adding_account
             || self.public_form.hardware_derivation_status
                 == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation
@@ -692,7 +726,10 @@ impl WalletRoot {
             );
             return;
         }
-        let password = Self::read_and_clear_input(&self.public_form.add_password_input, window, cx);
+        let password = match device_auth_password {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.public_form.add_password_input, window, cx),
+        };
         if password.trim().is_empty() {
             self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
             cx.notify();
@@ -870,6 +907,18 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.device_auth_in_progress {
+            return;
+        }
+        self.import_public_account(None, window, cx);
+    }
+
+    fn import_public_account(
+        &mut self,
+        device_auth_password: Option<Zeroizing<String>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.public_form.importing_account {
             return;
         }
@@ -897,8 +946,10 @@ impl WalletRoot {
         }
         let private_key =
             Self::read_and_clear_input(&self.public_form.import_private_key_input, window, cx);
-        let password =
-            Self::read_and_clear_input(&self.public_form.import_password_input, window, cx);
+        let password = match device_auth_password {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.public_form.import_password_input, window, cx),
+        };
         if private_key.trim().is_empty() || password.trim().is_empty() {
             self.public_form.error = Some(Arc::from(
                 "Enter a private key and vault password to import an account",
@@ -1198,11 +1249,136 @@ impl WalletRoot {
             })
     }
 
+    /// Runs the add or import form with the vault password from device authentication.
+    fn submit_public_account_with_device_auth(
+        &mut self,
+        method: DeviceAuthMethod,
+        kind: PublicAccountDialogKind,
+        lease: Weak<Cell<bool>>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.device_auth_in_progress
+            || self.public_form.adding_account
+            || self.public_form.importing_account
+            || !lease.upgrade().is_some_and(|open| open.get())
+        {
+            return;
+        }
+        let (label_input, missing_input_error) = match kind {
+            PublicAccountDialogKind::Derive => (&self.public_form.add_label_input, None),
+            PublicAccountDialogKind::Import => (
+                &self.public_form.import_label_input,
+                self.public_form
+                    .import_private_key_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .is_empty()
+                    .then_some("Enter a private key to import an account"),
+            ),
+            PublicAccountDialogKind::EditLabel => return,
+        };
+        // Check the other fields before asking for device approval on a form that
+        // cannot be submitted.
+        let error = if label_input.read(cx).value().trim().is_empty() {
+            Some("Enter an account label")
+        } else {
+            missing_input_error
+        };
+        if let Some(error) = error {
+            self.public_form.error = Some(Arc::from(error));
+            cx.notify();
+            return;
+        }
+        let Some(prompt) = self.device_auth_prompt() else {
+            cx.notify();
+            return;
+        };
+        self.device_auth_in_progress = true;
+        self.public_form.error = None;
+        let generation = self.active_wallet_generation;
+        cx.notify();
+        prompt.run(
+            method,
+            DEVICE_AUTH_REASON_PUBLIC_ACCOUNT,
+            window,
+            cx,
+            move |root, outcome, window, cx| {
+                root.finish_public_account_device_auth(
+                    kind, &lease, generation, outcome, window, cx,
+                );
+            },
+        );
+    }
+
+    fn finish_public_account_device_auth(
+        &mut self,
+        kind: PublicAccountDialogKind,
+        lease: &Weak<Cell<bool>>,
+        generation: u64,
+        outcome: DeviceAuthPassword,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.device_auth_in_progress = false;
+        cx.notify();
+        if !lease.upgrade().is_some_and(|open| open.get())
+            || self.active_wallet_generation != generation
+        {
+            return;
+        }
+        match outcome {
+            DeviceAuthPassword::Password(password) => match kind {
+                PublicAccountDialogKind::Derive => {
+                    self.add_public_derived_account(Some(password), window, cx);
+                }
+                PublicAccountDialogKind::Import => {
+                    self.import_public_account(Some(password), window, cx);
+                }
+                PublicAccountDialogKind::EditLabel => {}
+            },
+            DeviceAuthPassword::Cancelled => {}
+            DeviceAuthPassword::Failed(message) => {
+                self.refresh_device_auth_status();
+                self.public_form.error = Some(message);
+            }
+        }
+    }
+
+    fn public_account_device_auth_buttons(
+        &self,
+        root: Entity<Self>,
+        kind: PublicAccountDialogKind,
+        id: &'static str,
+        busy: bool,
+        lease: Weak<Cell<bool>>,
+    ) -> Vec<InputGroupButton> {
+        device_auth_buttons(
+            self.device_auth_prompt_cached().as_ref(),
+            id,
+            self.device_auth_in_progress,
+            busy,
+            move |method, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.submit_public_account_with_device_auth(
+                        method,
+                        kind,
+                        lease.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            },
+        )
+    }
+
     pub(super) fn render_public_account_dialog_content(
         &self,
         root: Entity<Self>,
         kind: PublicAccountDialogKind,
         content_width: Pixels,
+        device_auth_lease: Weak<Cell<bool>>,
     ) -> gpui::Div {
         match kind {
             PublicAccountDialogKind::Derive => {
@@ -1367,10 +1543,20 @@ impl WalletRoot {
                         "Derive a Public EVM account from the selected Private wallet mnemonic.",
                     ))
                     .child(app_muted_text(next_index))
-                    .child(app_input(&self.public_form.add_label_input))
-                    .child(app_masked_input(
+                    .child(
+                        app_input(&self.public_form.add_label_input)
+                            .disabled(self.device_auth_in_progress),
+                    )
+                    .child(masked_input_with_device_auth(
                         &self.public_form.add_password_input,
-                        false,
+                        self.device_auth_in_progress,
+                        self.public_account_device_auth_buttons(
+                            add_root.clone(),
+                            PublicAccountDialogKind::Derive,
+                            "wallet-public-add-derived-touch-id",
+                            self.public_form.adding_account,
+                            device_auth_lease,
+                        ),
                     ))
                     .children(self.public_form.error.as_ref().map(|message| {
                         Alert::error("wallet-public-add-derived-error", message.to_string()).small()
@@ -1387,7 +1573,7 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.adding_account)
-                        .disabled(self.public_form.adding_account)
+                        .disabled(self.public_form.adding_account || self.device_auth_in_progress)
                         .on_click(move |_event, window, cx| {
                             add_root.update(cx, |root, cx| {
                                 root.add_public_derived_account_from_input(window, cx);
@@ -1406,20 +1592,31 @@ impl WalletRoot {
                     .child(app_muted_text(
                         "Import an EVM private key as a vaulted Public account.",
                     ))
-                    .child(app_input(&self.public_form.import_label_input))
+                    .child(
+                        app_input(&self.public_form.import_label_input)
+                            .disabled(self.device_auth_in_progress),
+                    )
                     .child(app_masked_input(
                         &self.public_form.import_private_key_input,
-                        false,
+                        self.device_auth_in_progress,
                     ))
-                    .child(app_masked_input(
+                    .child(masked_input_with_device_auth(
                         &self.public_form.import_password_input,
-                        false,
+                        self.device_auth_in_progress,
+                        self.public_account_device_auth_buttons(
+                            import_root.clone(),
+                            PublicAccountDialogKind::Import,
+                            "wallet-public-import-touch-id",
+                            self.public_form.importing_account,
+                            device_auth_lease,
+                        ),
                     ))
                     .child(
                         Checkbox::new("wallet-public-import-global")
                             .label("Global account")
                             .checked(self.public_form.import_global)
                             .small()
+                            .disabled(self.device_auth_in_progress)
                             .on_click(move |checked, _window, cx| {
                                 let checked = *checked;
                                 global_root.update(cx, |root, cx| {
@@ -1443,7 +1640,9 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.importing_account)
-                        .disabled(self.public_form.importing_account)
+                        .disabled(
+                            self.public_form.importing_account || self.device_auth_in_progress,
+                        )
                         .on_click(move |_event, window, cx| {
                             import_root.update(cx, |root, cx| {
                                 root.import_public_account_from_input(window, cx);

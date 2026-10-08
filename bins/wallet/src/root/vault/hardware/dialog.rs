@@ -1,4 +1,7 @@
 #[cfg(feature = "hardware")]
+use std::{cell::Cell, rc::Rc};
+
+#[cfg(feature = "hardware")]
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
 #[cfg(feature = "hardware")]
@@ -30,7 +33,7 @@ impl WalletRoot {
     #[cfg(feature = "hardware")]
     pub(in crate::root::vault) fn hardware_profile_vault_view_unlock(
         &mut self,
-        store: &DesktopVaultStore,
+        store: &Arc<DesktopVaultStore>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Option<Arc<ViewUnlock>> {
@@ -64,8 +67,10 @@ impl WalletRoot {
             }
         }
 
-        let password =
-            Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx);
+        let password = match self.hardware_profile_device_auth_password.take() {
+            Some(password) => password,
+            None => Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx),
+        };
         if password.trim().is_empty() {
             self.hardware_profile_unlock.error =
                 Some(Arc::from("Enter the vault password to continue"));
@@ -78,6 +83,20 @@ impl WalletRoot {
                 self.install_vault_view_unlock(Arc::clone(&vault_view_unlock));
                 self.hardware_profile_unlock.vault_view_unlock =
                     Some(Arc::clone(&vault_view_unlock));
+                let store = Arc::clone(store);
+                let join = self
+                    .runtime
+                    .spawn_blocking(move || Self::renew_device_auth(&store, password.as_str()));
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = join.await {
+                        tracing::warn!(%error, "device authentication renewal task failed");
+                    }
+                    let _ = this.update(cx, |root, cx| {
+                        root.refresh_device_auth_status();
+                        cx.notify();
+                    });
+                })
+                .detach();
                 Some(vault_view_unlock)
             }
             Err(error) => {
@@ -618,6 +637,8 @@ impl WalletRoot {
         self.next_hardware_profile_action_generation();
         self.hardware_profile_unlock
             .reset_for_device(device_kind, wallet_id, purpose);
+        let lease = Rc::new(Cell::new(true));
+        self.hardware_profile_unlock.dialog_lease = Rc::downgrade(&lease);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
         self.hardware_profile_label_input.update(cx, |input, cx| {
             input.set_value(default_hardware_profile_label(device_kind), window, cx);
@@ -637,6 +658,7 @@ impl WalletRoot {
         let content_focus = cx.focus_handle();
         let dialog_content_focus = content_focus.clone();
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let identity = Rc::downgrade(&lease);
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -645,6 +667,9 @@ impl WalletRoot {
                 .max_h(dialog_max_height)
                 .title(app_strong_text(format!("{device_label} wallet")))
                 .on_close(move |_event, window, cx| {
+                    if let Some(open) = identity.upgrade() {
+                        open.set(false);
+                    }
                     close_root.update(cx, |root, cx| {
                         root.dismiss_hardware_profile_unlock_dialog(gateway_unlock, window, cx);
                     });
@@ -786,5 +811,92 @@ impl WalletRoot {
         }
 
         self.unlock_hardware_profile_from_dialog(window, cx);
+    }
+}
+
+#[cfg(all(test, feature = "hardware"))]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, IntoElement, Render, TestAppContext, div};
+    use wallet_ops::vault::DeviceAuthStatus;
+
+    struct TestWindow;
+
+    impl Render for TestWindow {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn hardware_password_unlock_refreshes_device_auth_after_dialog_closes(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            root = Some(crate::root::tests::public_accounts::fixture_root(
+                directory.path(),
+                &runtime,
+                window,
+                cx,
+            ));
+            let view = cx.new(|_| TestWindow);
+            gpui_component::Root::new(view, window, cx)
+        });
+        let root = root.unwrap();
+        cx.executor().allow_parking();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.lock_vault(window, cx);
+                root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+                let store = root.vault_store.clone().unwrap();
+                // Completion must replace this stale cache with the fixture's actual status.
+                root.touch_id_status = DeviceAuthStatus::NeedsReenrollment;
+                root.hardware_profile_password_input
+                    .update(cx, |input, cx| {
+                        input.set_value("public list test password", window, cx);
+                    });
+                assert!(
+                    root.hardware_profile_vault_view_unlock(&store, window, cx)
+                        .is_some()
+                );
+                window.close_all_dialogs(cx);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while root.read_with(cx, |root, _| root.touch_id_status)
+            == DeviceAuthStatus::NeedsReenrollment
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Touch ID status stayed stale"
+            );
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            cx.run_until_parked();
+        }
+        root.read_with(cx, |root, _| {
+            assert_eq!(
+                root.touch_id_status,
+                root.vault_store
+                    .as_ref()
+                    .unwrap()
+                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
+                    .unwrap()
+            );
+            assert!(root.vault_view_unlock.is_some());
+        });
+        cx.update(|window, _| window.remove_window());
     }
 }

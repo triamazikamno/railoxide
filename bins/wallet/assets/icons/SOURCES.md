@@ -3,6 +3,8 @@
 - `square.svg`: Lucide `square`, ISC License, https://lucide.dev/icons/square
 - `square-asterisk.svg`: Lucide `square-asterisk`, ISC License, https://lucide.dev/icons/square-asterisk
 - `key-round.svg`: Lucide `key-round`, ISC License, https://lucide.dev/icons/key-round
+- `watch.svg`: Lucide `watch`, unchanged from [Lucide 0.468.0](https://github.com/lucide-icons/lucide/blob/0.468.0/icons/watch.svg), ISC License.
+- `fingerprint.svg`: Lucide `fingerprint`, unchanged from [Lucide 0.468.0](https://github.com/lucide-icons/lucide/blob/0.468.0/icons/fingerprint.svg), ISC License.
 - `hat-glasses.svg`: Lucide `hat-glasses`, ISC License, https://lucide.dev/icons/hat-glasses
 - `list-sort-descending.svg`: Lucide `list-sort-descending`, ISC License, https://lucide.dev/icons/list-sort-descending
 - `wrench.svg`: Lucide `wrench`, ISC License, https://lucide.dev/icons/wrench

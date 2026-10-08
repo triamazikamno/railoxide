@@ -20,6 +20,9 @@ impl WalletSettingsEditor {
             cx.notify();
         })
         .detach();
+        if let Some(root) = active_root.as_ref().and_then(WeakEntity::upgrade) {
+            cx.observe(&root, |_editor, _root, cx| cx.notify()).detach();
+        }
         let snapshot =
             wallet_ops::settings::chain_editor_snapshot(&settings, None).unwrap_or_default();
         let chain_editor = cx.new(|cx| ui::chain_editor::ChainEditor::new(snapshot, cx));

@@ -51,7 +51,7 @@ pub use crypto::*;
 pub use executors::*;
 pub use models::*;
 pub use records::*;
-pub use store::{GatewayPermission, SoftwareContextMatch};
+pub use store::{DeviceAuthStatus, GatewayPermission, SoftwareContextMatch};
 pub use unlock::*;
 
 #[cfg(test)]

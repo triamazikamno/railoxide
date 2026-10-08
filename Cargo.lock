@@ -15833,7 +15833,7 @@ dependencies = [
 
 [[package]]
 name = "wallet"
-version = "0.2.0-beta.6"
+version = "0.2.0-beta.8"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -15884,6 +15884,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bip39",
+ "block2 0.6.2",
  "broadcaster-core",
  "broadcaster-monitor",
  "bs58",
@@ -15892,6 +15893,7 @@ dependencies = [
  "cid",
  "coins-bip32 0.13.1",
  "coins-ledger",
+ "core-foundation 0.10.0",
  "dapp-gateway-protocol",
  "ed25519-dalek 3.0.0",
  "ens-normalize-rs",
@@ -15906,6 +15908,8 @@ dependencies = [
  "libp2p",
  "local-db",
  "merkletree",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
  "poi",
  "protobuf",
  "public-broadcaster-protocol",
@@ -15916,6 +15920,8 @@ dependencies = [
  "reqwest",
  "reqwest-websocket",
  "rmp-serde",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.11.0",

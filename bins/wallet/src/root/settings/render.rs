@@ -1,4 +1,5 @@
 use super::*;
+use wallet_ops::device_auth::DeviceAuthMethod;
 
 /// Position of the Chains page in the `ComponentSettings` page list below.
 const CHAINS_PAGE_INDEX: usize = 2;
@@ -400,12 +401,16 @@ impl Render for WalletSettingsEditor {
         let discard_editor = editor.clone();
         let reset_editor = editor.clone();
         let apply_editor = editor.clone();
-        let security_page = SettingPage::new("Security").group(
-            settings_group().item(
-                SettingItem::new("Auto-lock vault", auto_lock_timeout)
-                    .description("Lock the vault after this long without wallet activity."),
-            ),
+        let mut security_group = settings_group().item(
+            SettingItem::new("Auto-lock vault", auto_lock_timeout)
+                .description("Lock the vault after this long without wallet activity."),
         );
+        for method in DeviceAuthMethod::ALL {
+            if let Some(setting) = self.device_auth_setting(method, cx) {
+                security_group = security_group.item(setting);
+            }
+        }
+        let security_page = SettingPage::new("Security").group(security_group);
         let mut privacy_group = settings_group()
             .item(SettingItem::new("Network mode", network_mode))
             .item(
@@ -706,5 +711,58 @@ impl Render for WalletSettingsEditor {
                             }),
                     ),
             )
+    }
+}
+
+impl WalletSettingsEditor {
+    fn device_auth_setting(&self, method: DeviceAuthMethod, cx: &App) -> Option<SettingItem> {
+        let root = self.active_root.as_ref()?.upgrade()?;
+        let checked = root.read(cx).device_auth_setting_state(method)?;
+        let available = root.read(cx).device_auth_available(method);
+        let description = if !available {
+            match method {
+                DeviceAuthMethod::TouchId => "Touch ID is unavailable right now. Check Touch ID in macOS System Settings.",
+                DeviceAuthMethod::AppleWatch => "Apple Watch is unavailable right now. Make sure your watch is unlocked, on your wrist, and nearby.",
+            }.to_owned()
+        } else if root.read(cx).device_auth_status(method)
+            == wallet_ops::vault::DeviceAuthStatus::NeedsReenrollment
+        {
+            format!(
+                "Enter your vault password when prompted to restore {}. Changes apply immediately.",
+                method.label()
+            )
+        } else {
+            match method {
+                DeviceAuthMethod::TouchId => "Use Touch ID instead of your vault password on this Mac. Changes apply immediately.",
+                DeviceAuthMethod::AppleWatch => "Double-press your watch's side button for each approval. Never unlocks automatically. Changes apply immediately.",
+            }.to_owned()
+        };
+        Some(
+            SettingItem::new(
+                format!("Use {}", method.label()),
+                SettingField::<SharedString>::render(move |options, _window, _cx| {
+                    let root = root.clone();
+                    Switch::new(match method {
+                        DeviceAuthMethod::TouchId => "wallet-settings-touch-id",
+                        DeviceAuthMethod::AppleWatch => "wallet-settings-apple-watch",
+                    })
+                    .accessibility_label(format!("Use {}", method.label()))
+                    .checked(checked)
+                    // Revocation must remain available even while the device is not.
+                    .disabled(!checked && !available)
+                    .with_size(options.size())
+                    .on_change(move |enabled, window, cx| {
+                        root.update(cx, |root, cx| {
+                            if *enabled {
+                                root.open_enable_device_auth_dialog(method, window, cx);
+                            } else {
+                                root.disable_device_auth(method, window, cx);
+                            }
+                        });
+                    })
+                }),
+            )
+            .description(description),
+        )
     }
 }

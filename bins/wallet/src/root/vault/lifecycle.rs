@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::rc::Rc;
 use std::time::Duration;
 
 use super::super::chain_load::{
@@ -197,13 +199,22 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
+        let lease = Rc::new(Cell::new(true));
+        self.add_wallet_dialog_lease = Rc::downgrade(&lease);
         window.open_dialog(cx, move |dialog, _window, cx| {
+            // Builder ownership also invalidates programmatically closed dialogs.
+            let identity = Rc::downgrade(&lease);
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Add wallet"))
+                .on_close(move |_, _, _| {
+                    if let Some(lease) = identity.upgrade() {
+                        lease.set(false);
+                    }
+                })
                 .child(
                     content_root
                         .read(cx)
@@ -212,8 +223,7 @@ impl WalletRoot {
         });
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);
-            root.add_wallet_password_input
-                .update(cx, |input, cx| input.set_value("", window, cx));
+            root.clear_add_wallet_password(window, cx);
         });
     }
 
@@ -851,8 +861,7 @@ impl WalletRoot {
             self.hardware_wallet_creation_generation.wrapping_add(1);
         self.hardware_wallet_creation_intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
-        self.add_wallet_password_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.clear_add_wallet_password(window, cx);
         self.import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
@@ -1270,6 +1279,7 @@ impl WalletRoot {
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
+        self.add_wallet_device_auth_password = None;
         self.vault_view_unlock = None;
         self.auto_lock.disarm();
         self.generated_seed = None;
@@ -1290,6 +1300,7 @@ impl WalletRoot {
         self.publish_gateway_desktop_state();
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = true;
+        self.refresh_device_auth_status();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }

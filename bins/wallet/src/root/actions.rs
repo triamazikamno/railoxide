@@ -9,6 +9,7 @@ pub(super) const PRIVATE_ACTION_FORM_KEY_CONTEXT: &str = "PrivateActionForm";
 
 pub(super) const PUBLIC_ACCOUNT_LIST_KEY_CONTEXT: &str = "PublicAccountList";
 pub(super) const PUBLIC_ACCOUNT_SEARCH_KEY_CONTEXT: &str = "PublicAccountSearch";
+pub(super) const DEVICE_AUTH_BUTTON_KEY_CONTEXT: &str = "DeviceAuthButton";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -113,6 +114,17 @@ pub(super) const PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT: &str = "PublicAccountSectio
 
 pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     app.bind_keys([
+        // Let the focused icon activate natively instead of a parent dialog or form command.
+        KeyBinding::new(
+            "enter",
+            gpui::NoAction,
+            Some(DEVICE_AUTH_BUTTON_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "space",
+            gpui::NoAction,
+            Some(DEVICE_AUTH_BUTTON_KEY_CONTEXT),
+        ),
         KeyBinding::new(
             "enter",
             gpui_kit::base::actions::Confirm { secondary: false },

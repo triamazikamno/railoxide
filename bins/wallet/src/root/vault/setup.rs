@@ -202,6 +202,7 @@ impl WalletRoot {
 
         match store.create_vault(password.as_str()) {
             Ok(created) => {
+                self.enable_touch_id_after_vault_creation(&password, cx);
                 Self::defer_wallet_name_input(PRIMARY_WALLET_LABEL.to_owned(), window, cx);
                 self.install_vault_view_unlock(Arc::new(created.view));
                 self.setup_password = Some(password);
@@ -264,6 +265,7 @@ impl WalletRoot {
 
         let join = self.runtime.spawn_blocking(move || {
             let view = store.unlock_view(password.as_str())?;
+            Self::renew_device_auth(&store, password.as_str());
             let metadata = store.list_wallet_metadata_with_view_unlock(&view, true)?;
             let remembered_wallet_id = remembered_wallet_id_for_restore(
                 &metadata,
@@ -315,6 +317,7 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.unlock_in_progress = false;
+                root.refresh_device_auth_status();
                 if remote.as_ref().is_some_and(|guard| !guard.is_current())
                     || root.active_wallet_generation != active_wallet_generation
                 {
@@ -510,6 +513,9 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<Zeroizing<String>> {
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            if let Some(password) = self.add_wallet_device_auth_password.take() {
+                return Some(password);
+            }
             let password = Self::read_and_clear_input(&self.add_wallet_password_input, window, cx);
             if password.trim().is_empty() {
                 self.set_vault_error("Enter the vault password to add a wallet", cx);
@@ -530,6 +536,10 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<Zeroizing<String>> {
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            // Kept like the typed field so a retry after a device error works.
+            if let Some(password) = self.add_wallet_device_auth_password.clone() {
+                return Some(password);
+            }
             let password =
                 Zeroizing::new(self.add_wallet_password_input.read(cx).value().to_string());
             if password.trim().is_empty() {

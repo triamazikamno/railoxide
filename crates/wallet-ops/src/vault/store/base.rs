@@ -88,7 +88,9 @@ impl DesktopVaultStore {
     ) -> Result<(), VaultError> {
         let metadata = self.metadata()?;
         let metadata = reencrypt_metadata(&metadata, current_password, new_password)?;
-        self.put_metadata(&metadata)
+        self.put_metadata(&metadata)?;
+        self.reseal_device_auth_after_password_change(new_password);
+        Ok(())
     }
 
     fn upgrade_vault_metadata_version_if_legacy(
