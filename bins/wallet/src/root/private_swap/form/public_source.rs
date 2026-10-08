@@ -4538,11 +4538,21 @@ async fn advance_public_execution(
         loop {
             let range = super::super::model::swap_observation_range(cursor, confirmed);
             let end = range.end;
-            match command
+            let observed = match command
                 .owner
                 .observe_swap_setup(command.operation, range)
-                .await?
+                .await
             {
+                // A background read updated the account under this one, most often private
+                // sync recording the setup's block. Nothing failed, so the page stays due
+                // for the next pass, as in the private swap's observation.
+                Err(error) if error.is::<wallet_ops::ExecutorRecordChanged>() => {
+                    execution.setup_cursor = Some(cursor);
+                    return Ok(PublicExecutionResult::Waiting(execution));
+                }
+                observed => observed?,
+            };
+            match observed {
                 SwapSetupStatus::Pending if end > confirmed => {
                     execution.setup_cursor = Some(end);
                     return Ok(PublicExecutionResult::Waiting(execution));
