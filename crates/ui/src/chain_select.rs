@@ -59,19 +59,25 @@ impl SelectItem for ChainSelectItem {
     }
 }
 
+/// Where the network selector lists a chain: the Railgun chains first, then the public-only
+/// ones, each group in preset order and then by chain id.
+#[must_use]
+pub fn chain_select_order(chain_id: u64) -> (bool, usize, u64) {
+    (
+        !railgun_ui::DEFAULT_CHAINS.contains(&chain_id),
+        railgun_ui::built_in_chain_ids()
+            .position(|id| id == chain_id)
+            .unwrap_or(usize::MAX),
+        chain_id,
+    )
+}
+
 pub struct ChainSelectItems(SearchableVec<SearchableGroup<ChainSelectItem>>);
 
 impl ChainSelectItems {
     #[must_use]
     pub fn new(mut items: Vec<ChainSelectItem>) -> Self {
-        items.sort_by_key(|item| {
-            (
-                railgun_ui::built_in_chain_ids()
-                    .position(|id| id == item.chain_id)
-                    .unwrap_or(usize::MAX),
-                item.chain_id,
-            )
-        });
+        items.sort_by_key(|item| chain_select_order(item.chain_id));
         // The divider separates Railgun chains from public-only ones, preset or custom.
         let groups: (Vec<_>, Vec<_>) = items
             .into_iter()

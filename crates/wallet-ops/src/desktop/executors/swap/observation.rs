@@ -40,7 +40,8 @@ use crate::vault::{
     SwapShieldObservation, SwapTradeAmounts,
 };
 
-const MAX_OBSERVATION_BLOCKS: u64 = 64;
+/// The most blocks one observation page, and so one of its log queries, spans.
+pub(super) const MAX_OBSERVATION_BLOCKS: u64 = 64;
 
 // The pinned shared bindings have no settlement event or reads, and no getter for
 // Railgun's public nullifier map. These match the deployed contracts.
@@ -804,7 +805,7 @@ async fn any_order_filled(
     Ok(false)
 }
 
-async fn filled_amount(
+pub(super) async fn filled_amount(
     provider: &DynProvider,
     settlement: Address,
     uid: OrderUid,

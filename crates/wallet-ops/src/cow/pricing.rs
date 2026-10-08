@@ -160,6 +160,25 @@ pub const fn private_delivery_gas(model: &RailgunGasModel, mode: GasEstimateMode
     ACROSS_HANDLER_GAS.saturating_add(post_hook_gas(model, mode))
 }
 
+/// Estimated gas of the post-hook of an order paid from a Public account:
+/// `COWShedFactory.executeHooks` running the account's cow-shed proxy, whose batch checks the
+/// proxy's balance and deposits it into Across with a private-delivery message. The first batch
+/// of an account also deploys its proxy, so `proxy_deployed` is false until then.
+///
+/// Fork measurements on Ethereum on 2026-10-06, taken on the `executeHooks` call frame with a
+/// USDC deposit and a private-delivery message, used 409,967 gas when the hook deploys the
+/// proxy and 203,316 on a deployed proxy. The upper bound leaves room for tokens with costlier
+/// transfers and approvals.
+#[must_use]
+pub const fn public_deposit_hook_gas(proxy_deployed: bool, mode: GasEstimateMode) -> u64 {
+    match (proxy_deployed, mode) {
+        (false, GasEstimateMode::UpperBound) => 470_000,
+        (true, GasEstimateMode::UpperBound) => 260_000,
+        (false, GasEstimateMode::Expected) => 410_000,
+        (true, GasEstimateMode::Expected) => 205_000,
+    }
+}
+
 /// Gas limit to declare for a hook in the app data: the estimate plus 10%. The margin covers
 /// the 1/64 of gas a call keeps back from the calls it makes, and variation the measurements
 /// didn't cover.

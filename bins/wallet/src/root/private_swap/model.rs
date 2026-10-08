@@ -344,6 +344,485 @@ pub(in crate::root) struct SwapIdentity {
     pub(in crate::root) swap_use: SwapUseId,
 }
 
+/// Presentation of a Public-paid swap, derived from its destination use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PublicSwapStage {
+    Preparing(SwapStage),
+    Approving,
+    ApprovalFailed,
+    OrderOpen,
+    SubmissionPending,
+    SubmissionRejected,
+    Depositing,
+    DepositFailed,
+    Bridging,
+    DeliveredVerified,
+    DeliveredReported,
+    Refunding,
+    Refunded,
+    HeldByProxy,
+    Withdrawing,
+    WithdrawnPendingCheck,
+    SwappedNotBridged,
+    HeldOnDestination,
+    Recovered,
+    Cancelled,
+    Expired,
+    PreparationCancelled,
+    NeedsAttention,
+}
+
+impl PublicSwapStage {
+    pub(super) const fn group(self) -> SwapOrderGroup {
+        match self {
+            Self::HeldByProxy | Self::HeldOnDestination => SwapOrderGroup::NeedsRecovery,
+            Self::ApprovalFailed
+            | Self::DepositFailed
+            | Self::NeedsAttention
+            | Self::Preparing(SwapStage::SetupFailed) => SwapOrderGroup::NeedsAttention,
+            Self::DeliveredVerified
+            | Self::DeliveredReported
+            | Self::Refunded
+            | Self::SwappedNotBridged
+            | Self::Recovered
+            | Self::PreparationCancelled
+            | Self::Cancelled
+            | Self::Expired => SwapOrderGroup::Ended,
+            _ => SwapOrderGroup::Open,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Preparing(SwapStage::SetupFailed) => "Destination setup failed",
+            // An existing account, or one whose setup confirmed: nothing is being prepared.
+            Self::Preparing(SwapStage::Ready | SwapStage::Approved) => "Account ready",
+            Self::Preparing(_) => "Preparing destination account",
+            Self::Approving => "Approving token",
+            Self::ApprovalFailed => "Approval failed",
+            Self::OrderOpen => "Order open",
+            Self::SubmissionPending => "Order submission pending",
+            Self::SubmissionRejected => "Order submission rejected",
+            Self::Depositing => "Bridge deposit pending",
+            Self::DepositFailed => "Bridge deposit failed",
+            Self::Bridging => "Sent to the bridge",
+            Self::DeliveredVerified => "Delivered · verified",
+            Self::DeliveredReported => "Delivered · reported",
+            Self::Refunding => "Refunding to Public account",
+            Self::Refunded => "Refunded to Public account",
+            Self::HeldByProxy => "Held by CoW proxy",
+            Self::Withdrawing => "Withdrawing to Public account",
+            Self::WithdrawnPendingCheck => "Withdrawn · checking deposit",
+            Self::SwappedNotBridged => "Swapped without bridging",
+            Self::HeldOnDestination => "Held on destination",
+            Self::Recovered => "Recovered",
+            Self::Cancelled => "Order cancelled",
+            Self::Expired => "Order expired",
+            Self::PreparationCancelled => "Preparation cancelled",
+            Self::NeedsAttention => "Needs attention",
+        }
+    }
+}
+
+pub(super) fn public_swap_stage(
+    record: &ExecutorRecord,
+    claimed: &SwapUseRecord,
+    setup: Option<SwapSetupStatus>,
+    now: u64,
+    railgun: Option<Address>,
+) -> Option<PublicSwapStage> {
+    use wallet_ops::vault::{PublicSwapTransactionKind as Kind, SwapBridgeOutcome};
+    let swap = claimed.public_swap()?;
+    let observed = swap.observations();
+    if observed.bridge_handoff.is_some() {
+        return Some(match observed.bridge_outcome {
+            Some(SwapBridgeOutcome::DeliveredVerified { .. }) => PublicSwapStage::DeliveredVerified,
+            Some(SwapBridgeOutcome::DeliveredReported { .. }) => PublicSwapStage::DeliveredReported,
+            Some(SwapBridgeOutcome::Refunding) if observed.bridge_refund.is_some() => {
+                PublicSwapStage::Refunded
+            }
+            Some(SwapBridgeOutcome::Refunding) => PublicSwapStage::Refunding,
+            Some(SwapBridgeOutcome::HeldOnDestination { .. }) => {
+                if public_held_remaining(record, claimed, railgun)
+                    .is_some_and(|amount| amount.is_zero())
+                {
+                    PublicSwapStage::Recovered
+                } else {
+                    PublicSwapStage::HeldOnDestination
+                }
+            }
+            Some(SwapBridgeOutcome::NeedsAttention) => PublicSwapStage::NeedsAttention,
+            None => PublicSwapStage::Bridging,
+        });
+    }
+    if observed.withdrawn.is_some() {
+        // A later batch deposit can still have happened, even after a withdrawal. Its bounded
+        // deadline query must rule that out before this swap leaves the status card.
+        return Some(
+            if observed.deposit_ruled_out.is_some() && !swap.batch_can_run(now) {
+                PublicSwapStage::SwappedNotBridged
+            } else {
+                PublicSwapStage::WithdrawnPendingCheck
+            },
+        );
+    }
+    if observed.held_by_proxy.is_some() {
+        let withdrawing = swap
+            .transactions()
+            .iter()
+            .rev()
+            .find(|tx| tx.kind == Kind::Withdrawal)
+            .is_some_and(|tx| tx.inclusion.is_none());
+        return Some(if withdrawing {
+            PublicSwapStage::Withdrawing
+        } else {
+            PublicSwapStage::HeldByProxy
+        });
+    }
+    if observed.traded.is_none() {
+        if observed.cancelled.is_some() {
+            return Some(PublicSwapStage::Cancelled);
+        }
+        if observed.expired.is_some() {
+            return Some(PublicSwapStage::Expired);
+        }
+    }
+    if let Some(order) = swap.order() {
+        return Some(match order.submission_status() {
+            SwapSubmissionStatus::Accepted => PublicSwapStage::OrderOpen,
+            SwapSubmissionStatus::Pending => PublicSwapStage::SubmissionPending,
+            SwapSubmissionStatus::Rejected => PublicSwapStage::SubmissionRejected,
+        });
+    }
+    let mut deposits = swap
+        .transactions()
+        .iter()
+        .filter(|tx| tx.kind == Kind::Deposit)
+        .peekable();
+    if deposits.peek().is_some() {
+        return Some(
+            if deposits.all(|deposit| {
+                deposit
+                    .inclusion
+                    .is_some_and(|included| included.finalized && !included.succeeded)
+            }) {
+                PublicSwapStage::DepositFailed
+            } else {
+                PublicSwapStage::Depositing
+            },
+        );
+    }
+    if claimed.is_stopped() {
+        return Some(PublicSwapStage::PreparationCancelled);
+    }
+    if let Some(approval) = swap
+        .transactions()
+        .iter()
+        .rev()
+        .find(|tx| matches!(tx.kind, Kind::ApprovalReset | Kind::Approval))
+    {
+        if approval.inclusion.is_none() {
+            return Some(PublicSwapStage::Approving);
+        }
+        if approval
+            .inclusion
+            .is_some_and(|included| !included.succeeded)
+        {
+            return Some(PublicSwapStage::ApprovalFailed);
+        }
+    }
+    Some(PublicSwapStage::Preparing(if claimed.is_fresh() {
+        swap_stage(record, setup, false)
+    } else {
+        SwapStage::Ready
+    }))
+}
+
+/// The exact ERC20 amount still held after verified recovery shields.
+pub(super) fn public_held_remaining(
+    record: &ExecutorRecord,
+    claimed: &SwapUseRecord,
+    railgun: Option<Address>,
+) -> Option<U256> {
+    let SwapUseRole::PublicSourceDestination {
+        destination_token,
+        swap,
+        ..
+    } = claimed.role()
+    else {
+        return None;
+    };
+    let wallet_ops::vault::SwapBridgeOutcome::HeldOnDestination { amount, block, .. } =
+        swap.observations().bridge_outcome?
+    else {
+        return None;
+    };
+    Some(railgun.map_or(amount, |railgun| {
+        wallet_ops::executor_recovery_remaining_amount(
+            record,
+            *destination_token,
+            amount,
+            block.number,
+            railgun,
+        )
+    }))
+}
+
+/// Values on the origin and destination networks, formatted independently.
+pub(super) struct PublicSwapLabels {
+    pub(super) source: String,
+    pub(super) origin: String,
+    pub(super) destination: String,
+    pub(super) sell: String,
+    pub(super) sell_symbol: String,
+    pub(super) buy_symbol: String,
+    /// The token the bridge takes on the origin network, which a refund and the proxy hold.
+    pub(super) bridged_symbol: String,
+    pub(super) traded: Option<String>,
+    pub(super) deposited: Option<String>,
+    pub(super) received: Option<String>,
+    pub(super) held: Option<String>,
+    /// The wallet knows the held token, so `held` is a formatted amount a card title can show.
+    pub(super) held_named: bool,
+    pub(super) minimum: String,
+    /// "#57 · 0x9a3D…41e0", with " · reused" for an account the swap didn't set up.
+    pub(super) account: String,
+    /// The block of the destination account's setup. `None` for a reused account.
+    pub(super) setup_block: Option<u64>,
+}
+
+pub(super) fn public_swap_steps(
+    claimed: &SwapUseRecord,
+    stage: PublicSwapStage,
+    labels: &PublicSwapLabels,
+) -> Vec<SwapStep> {
+    use PublicActionStepStatus::{Done, Error, NotStarted, Pending, Stopped, Warning};
+    use wallet_ops::vault::{
+        PublicSwapTransactionKind as Kind, SwapBridgeOutcome, SwapObservation,
+    };
+    let Some(swap) = claimed.public_swap() else {
+        return Vec::new();
+    };
+    let observed = swap.observations();
+    let block = |observation: Option<SwapObservation>| {
+        observation.map(|observation| observation.block.number)
+    };
+    let setup_status = match stage {
+        PublicSwapStage::Preparing(SwapStage::SetupFailed) => Error,
+        PublicSwapStage::Preparing(SwapStage::SetupNotSent) => NotStarted,
+        PublicSwapStage::Preparing(SwapStage::SetupPending | SwapStage::SetupSubmitting) => Pending,
+        PublicSwapStage::PreparationCancelled => Stopped,
+        _ => Done,
+    };
+    // The step claims a setup only once it confirmed. A reused account has none.
+    let destination = &labels.destination;
+    let setup_title = match setup_status {
+        _ if !claimed.is_fresh() => format!("Account on {destination} ready"),
+        Error => format!("Account setup on {destination} failed"),
+        NotStarted => format!("Set up account on {destination}"),
+        Pending => format!("Setting up account on {destination}"),
+        Stopped if labels.setup_block.is_none() => {
+            format!("Account setup on {destination} stopped")
+        }
+        _ => format!("Account on {destination} set up"),
+    };
+    let mut steps = vec![
+        SwapStep::new(setup_title, labels.account.clone(), setup_status)
+            .in_block(labels.setup_block.filter(|_| setup_status == Done)),
+    ];
+    // Existing allowance and native deposits have no approval transaction to display.
+    for tx in swap
+        .transactions()
+        .iter()
+        .filter(|tx| matches!(tx.kind, Kind::ApprovalReset | Kind::Approval))
+    {
+        let (detail, status) = match tx.inclusion {
+            None => ("Waiting for confirmation…", Pending),
+            Some(inclusion) if inclusion.succeeded => ("", Done),
+            Some(_) => ("The approval reverted.", Error),
+        };
+        steps.push(
+            SwapStep::new(
+                if tx.kind == Kind::ApprovalReset {
+                    format!(
+                        "Reset {} approval from {}",
+                        labels.sell_symbol, labels.source
+                    )
+                } else {
+                    format!("{} approved from {}", labels.sell_symbol, labels.source)
+                },
+                detail,
+                status,
+            )
+            .in_block(block(tx.inclusion.map(|inclusion| inclusion.observation))),
+        );
+    }
+    if swap.intent().order {
+        let (title, status) = if observed.traded.is_some() {
+            ("Order filled", Done)
+        } else {
+            match stage {
+                PublicSwapStage::Cancelled => ("Order cancelled", Stopped),
+                PublicSwapStage::Expired => ("Order expired", Stopped),
+                PublicSwapStage::SubmissionRejected => ("Order submission rejected", Error),
+                PublicSwapStage::OrderOpen | PublicSwapStage::SubmissionPending => {
+                    (stage.label(), Pending)
+                }
+                _ => ("Place order", NotStarted),
+            }
+        };
+        let valid_to = || {
+            swap.order()
+                .map(|order| super::local_time_label(u64::from(order.valid_to())))
+        };
+        let detail = if observed.traded.is_some() {
+            labels.traded.clone().unwrap_or_default()
+        } else {
+            match stage {
+                PublicSwapStage::Cancelled => None,
+                PublicSwapStage::Expired => valid_to().map(|at| format!("expired {at}")),
+                _ => valid_to().map(|at| format!("expires {at}")),
+            }
+            .unwrap_or_default()
+        };
+        steps.push(SwapStep::new(title, detail, status).in_block(block(observed.traded)));
+    }
+    let proxy = matches!(
+        stage,
+        PublicSwapStage::HeldByProxy
+            | PublicSwapStage::Withdrawing
+            | PublicSwapStage::WithdrawnPendingCheck
+            | PublicSwapStage::SwappedNotBridged
+    );
+    if proxy {
+        let step = match stage {
+            // The settlement that paid the proxy is the block the proceeds are held since.
+            PublicSwapStage::HeldByProxy => SwapStep::new(
+                "Held by your CoW proxy",
+                format!(
+                    "The swap went through, but the bridge deposit didn't run. {} is in {}'s CoW proxy on {}.",
+                    labels.held.as_deref().unwrap_or(&labels.bridged_symbol),
+                    labels.source,
+                    labels.origin
+                ),
+                Warning,
+            )
+            .in_block(block(observed.held_by_proxy.map(|held| held.observation))),
+            PublicSwapStage::Withdrawing => SwapStep::new(
+                format!("Withdrawing to {}", labels.source),
+                "Waiting for confirmation…",
+                Pending,
+            ),
+            PublicSwapStage::WithdrawnPendingCheck => SwapStep::new(
+                format!("Withdrawn to {}", labels.source),
+                "The wallet checks for a bridge deposit once the bridge instructions for your CoW proxy expire…",
+                Pending,
+            )
+            .in_block(block(observed.withdrawn)),
+            _ => SwapStep::new(
+                format!("Withdrawn to {}", labels.source),
+                "Swapped without bridging",
+                Done,
+            )
+            .in_block(block(observed.withdrawn)),
+        };
+        steps.push(step);
+        return steps;
+    }
+    steps.push(
+        SwapStep::new(
+            BRIDGE_DEPOSIT,
+            labels.deposited.as_ref().map_or_else(
+                || {
+                    if stage == PublicSwapStage::DepositFailed {
+                        "Deposit reverted. Nothing was bridged.".into()
+                    } else {
+                        String::new()
+                    }
+                },
+                |amount| format!("{amount} to Across"),
+            ),
+            if observed.bridge_handoff.is_some() {
+                Done
+            } else if stage == PublicSwapStage::DepositFailed {
+                Error
+            } else if stage == PublicSwapStage::Depositing {
+                Pending
+            } else {
+                NotStarted
+            },
+        )
+        .in_block(block(
+            observed.bridge_handoff.map(|handoff| handoff.observation),
+        )),
+    );
+    let private = format!("Private on {}", labels.destination);
+    let step = match stage {
+        PublicSwapStage::DeliveredVerified => SwapStep::new(
+            format!("{private} · verified"),
+            labels.received.as_ref().map_or_else(String::new, |amount| {
+                format!("{amount} shielded to your private balance")
+            }),
+            Done,
+        )
+        .in_block(match observed.bridge_outcome {
+            Some(SwapBridgeOutcome::DeliveredVerified { block, .. }) => Some(block.number),
+            _ => None,
+        }),
+        PublicSwapStage::DeliveredReported => SwapStep::new(
+            format!("Delivered on {} · reported", labels.destination),
+            "Across reports delivery. The wallet could not verify the shield in finalized receipts.",
+            Warning,
+        ),
+        PublicSwapStage::Refunding => SwapStep::new(
+            format!("Refunding to {}", labels.source),
+            format!(
+                "No relayer delivered the deposit before it expired. Across returns {} to {} on {}, usually within a few hours.",
+                labels
+                    .deposited
+                    .as_deref()
+                    .unwrap_or(&labels.bridged_symbol),
+                labels.source,
+                labels.origin
+            ),
+            Warning,
+        ),
+        PublicSwapStage::Refunded => {
+            SwapStep::new(format!("Refunded to {}", labels.source), "", Done)
+                .in_block(block(observed.bridge_refund))
+        }
+        PublicSwapStage::HeldOnDestination => SwapStep::new(
+            format!("Held on {}", labels.destination),
+            format!(
+                "{} is in the destination stealth account. Recover it on this network.",
+                labels.held.as_deref().unwrap_or(&labels.buy_symbol)
+            ),
+            Warning,
+        )
+        .in_block(match observed.bridge_outcome {
+            Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) => Some(block.number),
+            _ => None,
+        }),
+        PublicSwapStage::Recovered => {
+            SwapStep::new("Recovered", "Destination funds were recovered.", Done)
+        }
+        PublicSwapStage::NeedsAttention => SwapStep::new(
+            "Bridge needs attention",
+            "Check the deposit status.",
+            Warning,
+        ),
+        PublicSwapStage::Bridging => SwapStep::new(private, "Waiting for a relayer…", Pending),
+        PublicSwapStage::Cancelled
+        | PublicSwapStage::Expired
+        | PublicSwapStage::PreparationCancelled => {
+            SwapStep::new(private, "Nothing traded", Stopped)
+        }
+        _ => SwapStep::new(private, "", NotStarted),
+    };
+    steps.push(step);
+    steps
+}
+
 /// One swap of a record that has orders: its swap use and its orders within the record's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::root) struct RecordSwap {
@@ -1062,6 +1541,57 @@ pub(in crate::root) fn swaps_card_line(swaps: &[(SwapStage, SwapLabels)]) -> Opt
     }
 }
 
+/// What the Private tab card shows of the swaps paid from Public accounts: one swap's own title
+/// and subtitle, or how many are incoming.
+pub(super) struct PublicCardLine {
+    pub(super) title: String,
+    pub(super) detail: String,
+    /// How many swaps the line stands for.
+    pub(super) count: usize,
+    /// How many of them ask the user to act.
+    pub(super) attention: usize,
+}
+
+/// The single Private tab card for the wallet's private swaps and the swaps paid from Public
+/// accounts. Either kind alone shows its own card. Together they read as several private swaps
+/// do: how many there are and how many need attention, then each private swap's pair and the
+/// title of the Public-paid ones.
+pub(super) fn card_line(
+    swaps: &[(SwapStage, SwapLabels)],
+    public: Option<PublicCardLine>,
+) -> Option<SwapCardLine> {
+    let Some(public) = public else {
+        return swaps_card_line(swaps);
+    };
+    if swaps.is_empty() {
+        return Some(SwapCardLine {
+            title: public.title,
+            detail: public.detail,
+            attention: public.attention > 0,
+        });
+    }
+    let count = swaps.len() + public.count;
+    let attention = swaps
+        .iter()
+        .filter(|(stage, _)| stage.needs_attention())
+        .count()
+        + public.attention;
+    Some(SwapCardLine {
+        title: if attention == 0 {
+            format!("{count} swaps in progress")
+        } else {
+            format!("{count} swaps · {attention} needs attention")
+        },
+        detail: swaps
+            .iter()
+            .map(|(_, labels)| labels.pair.as_str())
+            .chain([public.title.as_str()])
+            .collect::<Vec<_>>()
+            .join(" · "),
+        attention: attention > 0,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::root) struct SwapStep {
     pub(in crate::root) label: String,
@@ -1072,6 +1602,9 @@ pub(in crate::root) struct SwapStep {
     pub(in crate::root) children: Vec<Self>,
     /// A sub-step's stealth account. `None` for every other step.
     pub(in crate::root) account: Option<SwapStepAccount>,
+    /// The block the step completed in, shown at its trailing edge. Only a Public-paid swap's
+    /// steps carry one.
+    pub(in crate::root) block: Option<u64>,
 }
 
 impl SwapStep {
@@ -1086,7 +1619,13 @@ impl SwapStep {
             status,
             children: Vec::new(),
             account: None,
+            block: None,
         }
+    }
+
+    const fn in_block(mut self, block: Option<u64>) -> Self {
+        self.block = block;
+        self
     }
 }
 
@@ -2065,7 +2604,7 @@ pub(in crate::root) fn format_bps_percent(bps: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn labels() -> SwapLabels {
@@ -2243,6 +2782,38 @@ mod tests {
             ])
             .unwrap()
             .attention
+        );
+        // Private swaps alone show their own card whether or not Public-paid swaps exist
+        // elsewhere. With one, the card keeps each private swap's pair and its attention count.
+        let private = [
+            (SwapStage::Order(SwapOrderState::Open), labels()),
+            (SwapStage::Order(SwapOrderState::NotDelivered), labels()),
+        ];
+        for swaps in [&private[..1], &private[..]] {
+            assert_eq!(card_line(swaps, None), swaps_card_line(swaps));
+        }
+        let incoming = || PublicCardLine {
+            title: "Receiving USDC from Main on Ethereum".into(),
+            detail: "Order open".into(),
+            count: 1,
+            attention: 0,
+        };
+        let pair = labels().pair;
+        assert_eq!(
+            card_line(&private[..1], Some(incoming())),
+            Some(SwapCardLine {
+                title: "2 swaps in progress".into(),
+                detail: format!("{pair} · Receiving USDC from Main on Ethereum"),
+                attention: false,
+            })
+        );
+        assert_eq!(
+            card_line(&private, Some(incoming())),
+            Some(SwapCardLine {
+                title: "3 swaps · 1 needs attention".into(),
+                detail: format!("{pair} · {pair} · Receiving USDC from Main on Ethereum"),
+                attention: true,
+            })
         );
     }
 
@@ -3173,5 +3744,742 @@ mod tests {
         assert_eq!(format_bps_percent(40), "0.4%");
         assert_eq!(format_bps_percent(125), "1.25%");
         assert_eq!(format_bps_percent(300), "3%");
+    }
+
+    pub(in crate::root::private_swap) fn public_presentation_record(
+        order: bool,
+        observations: &wallet_ops::vault::PublicSwapObservations,
+    ) -> ExecutorRecord {
+        use wallet_ops::vault::{PublicSwapApproval, PublicSwapIntent, PublicSwapRecord};
+        let bounds: SwapApprovedBounds = serde_json::from_value(serde_json::json!({
+            "sell_amount": "0x3e8", "buy_amount": "0x3e1", "private_minimum": "0x3dc",
+            "shield_fee_bps": "0x0", "slippage_bps": 50, "pre_hook_gas_limit": 0, "anchors": []
+        }))
+        .unwrap();
+        let swap = PublicSwapRecord::new(
+            PublicSwapApproval {
+                bounds,
+                price_verified: Some(true),
+                price_acknowledged: false,
+                sell_token: Address::repeat_byte(1),
+                on_shield_failure: wallet_ops::vault::BridgeShieldFailure::RefundOnOrigin,
+                destination: wallet_ops::vault::SwapApprovedAccount {
+                    address: Some(Address::repeat_byte(3)),
+                    setup: false,
+                },
+                max_gas_cost: U256::ZERO,
+            },
+            PublicSwapIntent {
+                bridged_token: Address::repeat_byte(2),
+                order,
+            },
+        );
+        let mut swap = serde_json::to_value(swap).unwrap();
+        swap["observations"] = serde_json::to_value(observations).unwrap();
+        if order {
+            swap["path"] = serde_json::json!({ "Order": {
+                "uid": alloy::hex::encode_prefixed([0u8; 56]),
+                "buy_token": Address::repeat_byte(2), "proxy": Address::repeat_byte(4),
+                "batch": { "calldata": "0x", "nonce": B256::ZERO, "deadline": 100 },
+                "submission": { "signature": alloy::hex::encode_prefixed([0u8; 65]), "quote_id": null },
+                "submission_status": "Accepted"
+            }});
+        }
+        serde_json::from_value(serde_json::json!({
+            "version": 2, "derivation": "Railgun7702V1", "origin": "Reserved",
+            "operation": "0x11111111111111111111111111111111", "index": 57,
+            "address": Address::repeat_byte(3), "delegate": Address::repeat_byte(5),
+            "retired": false, "issued": [],
+            "swap_uses": [{ "id": "0x11111111111111111111111111111111", "started_at": 10,
+                "role": { "PublicSourceDestination": { "origin_chain": 1,
+                    "source": Address::repeat_byte(6), "destination_token": Address::repeat_byte(7),
+                    "swap": swap
+                }}
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn public_labels() -> PublicSwapLabels {
+        PublicSwapLabels {
+            source: "Main".into(),
+            origin: "Ethereum".into(),
+            destination: "Arbitrum One".into(),
+            sell: "1,000 DAI".into(),
+            sell_symbol: "DAI".into(),
+            buy_symbol: "USDC".into(),
+            bridged_symbol: "USDC".into(),
+            traded: Some("1,000 DAI for 994.47 USDC".into()),
+            deposited: Some("994.47 USDC".into()),
+            received: Some("991.54 USDC".into()),
+            held: Some("994.47 USDC".into()),
+            held_named: true,
+            minimum: "990.12 USDC".into(),
+            account: "#57 · 0x0303…0303".into(),
+            setup_block: Some(402_118_977),
+        }
+    }
+
+    /// Every state of the order detail: its steps with their sub-lines and blocks, the facts
+    /// under them, and the footer's actions.
+    #[test]
+    fn public_swap_detail_shows_each_state_as_the_mockup_draws_it() {
+        use super::super::public_progress::{
+            PublicSwapAction as Action, PublicSwapFact as Fact, public_card_text,
+            public_swap_actions, public_swap_facts, public_swap_note,
+        };
+        use alloy::eips::BlockNumHash;
+        use wallet_ops::vault::{
+            PublicSwapDeposited, PublicSwapObservations, PublicSwapProxyHolding, SwapBridgeHandoff,
+            SwapBridgeOutcome, SwapObservation,
+        };
+        type Case<'a> = (
+            PublicSwapStage,
+            ExecutorRecord,
+            &'a PublicSwapLabels,
+            u64,
+            Vec<(&'a str, &'a str, Option<u64>)>,
+            Vec<Fact>,
+            Vec<Action>,
+        );
+        const VALID_TO: u32 = 1_000;
+        const ACCOUNT: (&str, &str, Option<u64>) = (
+            "Account on Arbitrum One set up",
+            "#57 · 0x0303…0303",
+            Some(402_118_977),
+        );
+        const APPROVED: (&str, &str, Option<u64>) = ("DAI approved from Main", "", Some(30));
+        const FILLED: (&str, &str, Option<u64>) =
+            ("Order filled", "1,000 DAI for 994.47 USDC", Some(51));
+        const DEPOSITED: (&str, &str, Option<u64>) =
+            ("Bridge deposit", "994.47 USDC to Across", Some(51));
+        const UNDER_WAY: [Fact; 3] = [
+            Fact::PaidFrom { copy: true },
+            Fact::Destination,
+            Fact::Started,
+        ];
+        const REFUND: [Fact; 3] = [Fact::Provider, Fact::DepositId, Fact::DepositExpired];
+        const PROXY: [Fact; 3] = [Fact::CowProxy, Fact::ControlledBy, Fact::Settlement];
+        let at = |number| SwapObservation {
+            block: BlockNumHash::new(number, B256::ZERO),
+            transaction_hash: Some(B256::ZERO),
+        };
+        let transaction = |kind: &str, block: u8| {
+            serde_json::json!({
+                "kind": kind, "transaction": {}, "hash": B256::repeat_byte(block),
+                "inclusion": {
+                    "observation": at(u64::from(block)), "finalized": true, "succeeded": true
+                }
+            })
+        };
+        // A new destination account, an approval from the Public account and an accepted order.
+        let order = |observed: PublicSwapObservations| {
+            let mut value =
+                serde_json::to_value(public_presentation_record(true, &observed)).unwrap();
+            let claimed = &mut value["swap_uses"][0];
+            claimed["fresh"] = serde_json::json!(true);
+            let swap = &mut claimed["role"]["PublicSourceDestination"]["swap"];
+            swap["transactions"] = serde_json::json!([transaction("Approval", 30)]);
+            let mut uid = [0u8; 56];
+            uid[52..].copy_from_slice(&VALID_TO.to_be_bytes());
+            swap["path"]["Order"]["uid"] = serde_json::json!(alloy::hex::encode_prefixed(uid));
+            serde_json::from_value::<ExecutorRecord>(value).unwrap()
+        };
+        // A reused destination account, an approval and the deposit the account sent itself.
+        let deposit = |observed: PublicSwapObservations| {
+            let mut value =
+                serde_json::to_value(public_presentation_record(false, &observed)).unwrap();
+            let swap = &mut value["swap_uses"][0]["role"]["PublicSourceDestination"]["swap"];
+            swap["path"] = serde_json::json!("Deposit");
+            swap["transactions"] =
+                serde_json::json!([transaction("Approval", 30), transaction("Deposit", 34)]);
+            serde_json::from_value::<ExecutorRecord>(value).unwrap()
+        };
+        let handed_off = |block, outcome| PublicSwapObservations {
+            bridge_handoff: Some(SwapBridgeHandoff {
+                observation: at(block),
+                deposit_id: Some(U256::from(1_279_830)),
+            }),
+            deposited: Some(PublicSwapDeposited {
+                input_amount: U256::from(995),
+                output_amount: U256::from(990),
+            }),
+            bridge_outcome: outcome,
+            ..Default::default()
+        };
+        let bridged = |outcome| PublicSwapObservations {
+            traded: Some(at(51)),
+            ..handed_off(51, outcome)
+        };
+        let held = PublicSwapObservations {
+            traded: Some(at(51)),
+            held_by_proxy: Some(PublicSwapProxyHolding {
+                observation: at(51),
+                amount: U256::from(995),
+            }),
+            ..Default::default()
+        };
+        let open = PublicSwapLabels {
+            traded: None,
+            deposited: None,
+            received: None,
+            held: None,
+            ..public_labels()
+        };
+        let direct = PublicSwapLabels {
+            sell: "1,000 USDC".into(),
+            sell_symbol: "USDC".into(),
+            deposited: Some("1,000 USDC".into()),
+            account: "#57 · 0x0303…0303 · reused".into(),
+            setup_block: None,
+            ..public_labels()
+        };
+        let full = public_labels();
+        let valid_to = super::super::local_time_label(u64::from(VALID_TO));
+        let expires = format!("expires {valid_to}");
+        let expired = format!("expired {valid_to}");
+        let cancelled = PublicSwapObservations {
+            cancelled: Some(SwapObservation {
+                transaction_hash: None,
+                ..at(40)
+            }),
+            ..Default::default()
+        };
+        let cases: Vec<Case<'_>> = vec![
+            (
+                PublicSwapStage::OrderOpen,
+                order(PublicSwapObservations::default()),
+                &open,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    ("Order open", expires.as_str(), None),
+                    ("Bridge deposit", "", None),
+                    ("Private on Arbitrum One", "", None),
+                ],
+                UNDER_WAY.to_vec(),
+                vec![Action::CancelOrder],
+            ),
+            (
+                PublicSwapStage::Bridging,
+                deposit(handed_off(34, None)),
+                &direct,
+                101,
+                vec![
+                    (
+                        "Account on Arbitrum One ready",
+                        "#57 · 0x0303…0303 · reused",
+                        None,
+                    ),
+                    ("USDC approved from Main", "", Some(30)),
+                    ("Bridge deposit", "1,000 USDC to Across", Some(34)),
+                    ("Private on Arbitrum One", "Waiting for a relayer…", None),
+                ],
+                vec![
+                    Fact::PaidFrom { copy: true },
+                    Fact::Destination,
+                    Fact::Deposit,
+                ],
+                vec![Action::CheckStatus],
+            ),
+            (
+                PublicSwapStage::DeliveredVerified,
+                order(bridged(Some(SwapBridgeOutcome::DeliveredVerified {
+                    block: BlockNumHash::new(644, B256::ZERO),
+                    transaction_hash: B256::ZERO,
+                    output_amount: U256::from(995),
+                    shielded: true,
+                }))),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    DEPOSITED,
+                    (
+                        "Private on Arbitrum One · verified",
+                        "991.54 USDC shielded to your private balance",
+                        Some(644),
+                    ),
+                ],
+                vec![
+                    Fact::Received,
+                    Fact::PaidFrom { copy: false },
+                    Fact::Destination,
+                    Fact::Provider,
+                    Fact::Fill,
+                    Fact::Settlement,
+                ],
+                vec![],
+            ),
+            (
+                PublicSwapStage::Refunding,
+                order(bridged(Some(SwapBridgeOutcome::Refunding))),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    DEPOSITED,
+                    (
+                        "Refunding to Main",
+                        "No relayer delivered the deposit before it expired. Across returns 994.47 USDC to Main on Ethereum, usually within a few hours.",
+                        None,
+                    ),
+                ],
+                REFUND.to_vec(),
+                vec![Action::CheckStatus],
+            ),
+            (
+                PublicSwapStage::Refunded,
+                order(PublicSwapObservations {
+                    bridge_refund: Some(at(77)),
+                    ..bridged(Some(SwapBridgeOutcome::Refunding))
+                }),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    DEPOSITED,
+                    ("Refunded to Main", "", Some(77)),
+                ],
+                REFUND.to_vec(),
+                vec![],
+            ),
+            (
+                PublicSwapStage::HeldByProxy,
+                order(held),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    (
+                        "Held by your CoW proxy",
+                        "The swap went through, but the bridge deposit didn't run. 994.47 USDC is in Main's CoW proxy on Ethereum.",
+                        Some(51),
+                    ),
+                ],
+                PROXY.to_vec(),
+                vec![Action::CheckStatus, Action::Withdraw],
+            ),
+            (
+                PublicSwapStage::SwappedNotBridged,
+                order(PublicSwapObservations {
+                    withdrawn: Some(at(60)),
+                    deposit_ruled_out: Some(at(61)),
+                    ..held
+                }),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    ("Withdrawn to Main", "Swapped without bridging", Some(60)),
+                ],
+                PROXY.to_vec(),
+                vec![],
+            ),
+            // The cancelled order's validity window is still open, so no retry yet.
+            (
+                PublicSwapStage::Cancelled,
+                order(cancelled),
+                &open,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    ("Order cancelled", "", None),
+                    ("Bridge deposit", "", None),
+                    ("Private on Arbitrum One", "Nothing traded", None),
+                ],
+                UNDER_WAY.to_vec(),
+                vec![Action::CheckStatus],
+            ),
+            (
+                PublicSwapStage::Expired,
+                order(PublicSwapObservations {
+                    expired: Some(at(90)),
+                    ..Default::default()
+                }),
+                &open,
+                1_001,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    ("Order expired", expired.as_str(), None),
+                    ("Bridge deposit", "", None),
+                    ("Private on Arbitrum One", "Nothing traded", None),
+                ],
+                UNDER_WAY.to_vec(),
+                vec![Action::CheckStatus, Action::Retry],
+            ),
+            (
+                PublicSwapStage::HeldOnDestination,
+                order(bridged(Some(SwapBridgeOutcome::HeldOnDestination {
+                    block: BlockNumHash::new(644, B256::ZERO),
+                    transaction_hash: B256::ZERO,
+                    amount: U256::from(995),
+                }))),
+                &full,
+                101,
+                vec![
+                    ACCOUNT,
+                    APPROVED,
+                    FILLED,
+                    DEPOSITED,
+                    (
+                        "Held on Arbitrum One",
+                        "994.47 USDC is in the destination stealth account. Recover it on this network.",
+                        Some(644),
+                    ),
+                ],
+                vec![
+                    Fact::PaidFrom { copy: false },
+                    Fact::Destination,
+                    Fact::Provider,
+                    Fact::Fill,
+                    Fact::Settlement,
+                ],
+                vec![Action::CheckStatus, Action::RecoverDestination],
+            ),
+        ];
+        for (expected, record, labels, now, steps, facts, actions) in cases {
+            let claimed = &record.swap_uses()[0];
+            let swap = claimed.public_swap().unwrap();
+            let stage = public_swap_stage(&record, claimed, None, now, None).unwrap();
+            assert_eq!(stage, expected);
+            let shown = public_swap_steps(claimed, stage, labels);
+            assert_eq!(
+                shown
+                    .iter()
+                    .map(|step| (step.label.as_str(), step.detail.as_str(), step.block))
+                    .collect::<Vec<_>>(),
+                steps,
+                "{stage:?}"
+            );
+            assert_eq!(public_swap_facts(stage), facts, "{stage:?}");
+            let offered = public_swap_actions(swap, claimed, stage, now);
+            assert_eq!(offered, actions, "{stage:?}");
+            // Only an open order says it shields when it fills, and only it can be cancelled.
+            let is_open = stage == PublicSwapStage::OrderOpen;
+            let (_, subtitle) = public_card_text(stage, swap.intent().order, labels);
+            assert_eq!(subtitle.ends_with("when it fills"), is_open, "{subtitle}");
+            let note = public_swap_note(swap, stage, &offered, labels, now).unwrap_or_default();
+            assert_eq!(note.contains("Cancelling now"), is_open, "{note}");
+            assert_eq!(
+                note.contains("You can retry after"),
+                stage == PublicSwapStage::Cancelled,
+                "{note}"
+            );
+        }
+        // A reused account waits on no setup before signing: neither its stage nor its step
+        // says it is being prepared.
+        let reused = public_presentation_record(false, &PublicSwapObservations::default());
+        let claimed = &reused.swap_uses()[0];
+        let stage = public_swap_stage(&reused, claimed, None, 101, None).unwrap();
+        assert_eq!(stage, PublicSwapStage::Preparing(SwapStage::Ready));
+        assert_eq!(stage.label(), "Account ready");
+        assert_eq!(
+            public_swap_steps(claimed, stage, &direct)[0].label,
+            "Account on Arbitrum One ready"
+        );
+        // A new account's step claims a setup only once it confirmed.
+        let fresh = order(PublicSwapObservations::default());
+        for (setup, title) in [
+            (
+                SwapStage::SetupPending,
+                "Setting up account on Arbitrum One",
+            ),
+            (
+                SwapStage::SetupFailed,
+                "Account setup on Arbitrum One failed",
+            ),
+        ] {
+            let steps = public_swap_steps(
+                &fresh.swap_uses()[0],
+                PublicSwapStage::Preparing(setup),
+                &open,
+            );
+            assert_eq!((steps[0].label.as_str(), steps[0].block), (title, None));
+        }
+    }
+
+    #[test]
+    fn public_swap_steps_distinguish_delivery_refund_proxy_and_direct_deposit() {
+        use super::super::public_progress::{PublicSwapAction, public_swap_actions};
+        use alloy::eips::BlockNumHash;
+        use wallet_ops::vault::{
+            PublicSwapObservations, SwapBridgeHandoff, SwapBridgeOutcome, SwapObservation,
+        };
+        let observation = SwapObservation {
+            block: BlockNumHash::new(20, B256::ZERO),
+            transaction_hash: Some(B256::ZERO),
+        };
+        let outcome = |outcome| PublicSwapObservations {
+            traded: Some(observation),
+            bridge_handoff: Some(SwapBridgeHandoff {
+                observation,
+                deposit_id: Some(U256::from(1)),
+            }),
+            bridge_outcome: Some(outcome),
+            ..Default::default()
+        };
+        for (observed, expected, status) in [
+            (
+                outcome(SwapBridgeOutcome::DeliveredVerified {
+                    block: observation.block,
+                    transaction_hash: B256::ZERO,
+                    output_amount: U256::from(995),
+                    shielded: true,
+                }),
+                PublicSwapStage::DeliveredVerified,
+                PublicActionStepStatus::Done,
+            ),
+            (
+                outcome(SwapBridgeOutcome::DeliveredReported {
+                    amount_out: None,
+                    transaction_hash: None,
+                }),
+                PublicSwapStage::DeliveredReported,
+                PublicActionStepStatus::Warning,
+            ),
+            (
+                outcome(SwapBridgeOutcome::Refunding),
+                PublicSwapStage::Refunding,
+                PublicActionStepStatus::Warning,
+            ),
+            (
+                PublicSwapObservations {
+                    bridge_refund: Some(observation),
+                    ..outcome(SwapBridgeOutcome::Refunding)
+                },
+                PublicSwapStage::Refunded,
+                PublicActionStepStatus::Done,
+            ),
+            (
+                outcome(SwapBridgeOutcome::HeldOnDestination {
+                    block: observation.block,
+                    transaction_hash: B256::ZERO,
+                    amount: U256::from(995),
+                }),
+                PublicSwapStage::HeldOnDestination,
+                PublicActionStepStatus::Warning,
+            ),
+            (
+                PublicSwapObservations {
+                    cancelled: Some(SwapObservation {
+                        transaction_hash: None,
+                        ..observation
+                    }),
+                    ..Default::default()
+                },
+                PublicSwapStage::Cancelled,
+                PublicActionStepStatus::Stopped,
+            ),
+            (
+                PublicSwapObservations {
+                    expired: Some(observation),
+                    ..Default::default()
+                },
+                PublicSwapStage::Expired,
+                PublicActionStepStatus::Stopped,
+            ),
+        ] {
+            let record = public_presentation_record(true, &observed);
+            let claimed = &record.swap_uses()[0];
+            let stage = public_swap_stage(&record, claimed, None, 101, None).unwrap();
+            assert_eq!(stage, expected);
+            let actions = super::super::public_progress::public_swap_actions(
+                claimed.public_swap().unwrap(),
+                claimed,
+                stage,
+                101,
+            );
+            assert_eq!(
+                actions
+                    .contains(&super::super::public_progress::PublicSwapAction::RecoverDestination),
+                stage == PublicSwapStage::HeldOnDestination
+            );
+            assert!(!actions.contains(&super::super::public_progress::PublicSwapAction::Withdraw));
+            let steps = public_swap_steps(claimed, stage, &public_labels());
+            assert_eq!(steps.last().unwrap().status, status);
+            assert!(steps.iter().all(|step| step.children.is_empty()));
+            if observed.bridge_handoff.is_some() {
+                assert!(
+                    steps
+                        .iter()
+                        .any(|step| step.detail.starts_with("994.47 USDC to Across"))
+                );
+            }
+        }
+        let direct = public_presentation_record(false, &PublicSwapObservations::default());
+        let steps = public_swap_steps(
+            &direct.swap_uses()[0],
+            PublicSwapStage::Depositing,
+            &public_labels(),
+        );
+        assert_eq!(steps.len(), 3, "no order or approval without a transaction");
+        assert_eq!(steps[1].status, PublicActionStepStatus::Pending);
+        // A provisional revert can be reorganized, and every legacy attempt must resolve.
+        for (inclusions, expected) in [
+            (vec![(false, false)], PublicSwapStage::Depositing),
+            (vec![(true, false)], PublicSwapStage::DepositFailed),
+            (
+                vec![(true, false), (false, false)],
+                PublicSwapStage::Depositing,
+            ),
+            (
+                vec![(true, false), (true, true)],
+                PublicSwapStage::Depositing,
+            ),
+        ] {
+            let mut value = serde_json::to_value(&direct).unwrap();
+            value["swap_uses"][0]["role"]["PublicSourceDestination"]["swap"]["path"] =
+                serde_json::json!("Deposit");
+            value["swap_uses"][0]["role"]["PublicSourceDestination"]["swap"]["transactions"] = serde_json::json!(inclusions.into_iter().enumerate().map(|(index, (finalized, succeeded))| serde_json::json!({
+                "kind": "Deposit", "transaction": {}, "hash": B256::repeat_byte(u8::try_from(index).unwrap()),
+                "inclusion": { "observation": observation, "finalized": finalized, "succeeded": succeeded }
+            })).collect::<Vec<_>>());
+            let record: ExecutorRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                public_swap_stage(&record, &record.swap_uses()[0], None, 101, None),
+                Some(expected)
+            );
+        }
+        // Cancellation ends the order immediately, but its validity and hook deadlines still
+        // gate a new review. Each deadline is inclusive.
+        for (valid_to, batch_deadline) in [(100_u32, 200_u32), (200, 100)] {
+            let record = public_presentation_record(
+                true,
+                &PublicSwapObservations {
+                    cancelled: Some(SwapObservation {
+                        transaction_hash: None,
+                        ..observation
+                    }),
+                    ..Default::default()
+                },
+            );
+            let mut value = serde_json::to_value(record).unwrap();
+            let order = &mut value["swap_uses"][0]["role"]["PublicSourceDestination"]["swap"]["path"]
+                ["Order"];
+            let mut uid = [0u8; 56];
+            uid[52..].copy_from_slice(&valid_to.to_be_bytes());
+            order["uid"] = serde_json::json!(alloy::hex::encode_prefixed(uid));
+            order["batch"]["deadline"] = serde_json::json!(batch_deadline);
+            let record: ExecutorRecord = serde_json::from_value(value).unwrap();
+            let claimed = &record.swap_uses()[0];
+            let swap = claimed.public_swap().unwrap();
+            assert!(
+                !public_swap_actions(swap, claimed, PublicSwapStage::Cancelled, 200)
+                    .contains(&PublicSwapAction::Retry)
+            );
+            assert!(
+                public_swap_actions(swap, claimed, PublicSwapStage::Cancelled, 201)
+                    .contains(&PublicSwapAction::Retry)
+            );
+        }
+    }
+
+    #[test]
+    fn public_withdrawal_waits_for_the_deposit_query_and_late_handoff_wins() {
+        use alloy::eips::BlockNumHash;
+        use wallet_ops::vault::{
+            PublicSwapObservations, PublicSwapProxyHolding, SwapBridgeHandoff, SwapObservation,
+        };
+        let observation = SwapObservation {
+            block: BlockNumHash::new(20, B256::ZERO),
+            transaction_hash: None,
+        };
+        let held = PublicSwapObservations {
+            traded: Some(observation),
+            held_by_proxy: Some(PublicSwapProxyHolding {
+                observation,
+                amount: U256::from(995),
+            }),
+            ..Default::default()
+        };
+        for (observed, expected, group) in [
+            (
+                held,
+                PublicSwapStage::HeldByProxy,
+                SwapOrderGroup::NeedsRecovery,
+            ),
+            (
+                PublicSwapObservations {
+                    withdrawn: Some(observation),
+                    ..held
+                },
+                PublicSwapStage::WithdrawnPendingCheck,
+                SwapOrderGroup::Open,
+            ),
+            (
+                PublicSwapObservations {
+                    withdrawn: Some(observation),
+                    deposit_ruled_out: Some(observation),
+                    ..held
+                },
+                PublicSwapStage::SwappedNotBridged,
+                SwapOrderGroup::Ended,
+            ),
+            (
+                PublicSwapObservations {
+                    withdrawn: Some(observation),
+                    bridge_handoff: Some(SwapBridgeHandoff {
+                        observation,
+                        deposit_id: Some(U256::from(1)),
+                    }),
+                    ..held
+                },
+                PublicSwapStage::Bridging,
+                SwapOrderGroup::Open,
+            ),
+        ] {
+            let record = public_presentation_record(true, &observed);
+            let claimed = &record.swap_uses()[0];
+            let stage = public_swap_stage(&record, claimed, None, 101, None).unwrap();
+            assert_eq!(stage, expected);
+            assert_eq!(stage.group(), group);
+            let actions = super::super::public_progress::public_swap_actions(
+                claimed.public_swap().unwrap(),
+                claimed,
+                stage,
+                101,
+            );
+            assert_eq!(
+                actions.contains(&super::super::public_progress::PublicSwapAction::Withdraw),
+                stage == PublicSwapStage::HeldByProxy
+            );
+            assert!(
+                !actions
+                    .contains(&super::super::public_progress::PublicSwapAction::RecoverDestination)
+            );
+            let steps = public_swap_steps(claimed, stage, &public_labels());
+            assert_eq!(
+                steps.len(),
+                if stage == PublicSwapStage::Bridging {
+                    4
+                } else {
+                    3
+                }
+            );
+            assert_eq!(
+                steps.last().unwrap().status,
+                if stage == PublicSwapStage::HeldByProxy {
+                    PublicActionStepStatus::Warning
+                } else if stage == PublicSwapStage::SwappedNotBridged {
+                    PublicActionStepStatus::Done
+                } else {
+                    PublicActionStepStatus::Pending
+                }
+            );
+        }
     }
 }

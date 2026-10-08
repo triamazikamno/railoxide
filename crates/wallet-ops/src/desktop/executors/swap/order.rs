@@ -114,6 +114,26 @@ const APPROVAL_CUSHION_DIVISOR: u64 = 5;
 /// points of the deposit, for the provider's quote of the larger amount.
 const BRIDGE_DEPOSIT_MARGIN_BPS: u64 = 5;
 
+/// The cushion of an approval whose allowed gas is `approved_allowance`, in buy-token base
+/// units: its share by [`APPROVAL_CUSHION_DIVISOR`].
+pub(super) fn approval_cushion(approved_allowance: U256) -> U256 {
+    approved_allowance / U256::from(APPROVAL_CUSHION_DIVISOR)
+}
+
+/// The Bridge deposit that delivers `approved` on the destination chain when a deposit of
+/// `deposit` is quoted `quoted` there: `ceil(deposit * approved / quoted)` plus the margin.
+/// `None` when `quoted` is zero or the arithmetic overflows.
+pub(super) fn scaled_bridge_deposit(deposit: U256, approved: U256, quoted: U256) -> Option<U256> {
+    if quoted.is_zero() {
+        return None;
+    }
+    let scaled = deposit.checked_mul(approved)?.div_ceil(quoted);
+    let margin = scaled
+        .checked_mul(U256::from(BRIDGE_DEPOSIT_MARGIN_BPS))?
+        .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
+    scaled.checked_add(margin)
+}
+
 const DESTINATION_ACCOUNT_MISMATCH: &str = "a private Bridge delivery needs its destination stealth account, and no other delivery takes one";
 
 /// An amount to plan for a swap, before or after its executor's setup.
@@ -341,10 +361,10 @@ pub struct SwapReview {
 
 /// Quote-time inputs of the gas estimate, kept so that another gas share reprices without I/O.
 #[derive(Debug, Clone, Copy)]
-struct SwapGasPricing {
+pub(super) struct SwapGasPricing {
     quote_gas_units: u64,
     /// The RPC gas price in wei, without the cushion.
-    gas_price_wei: u128,
+    pub(super) gas_price_wei: u128,
     /// `gas_price_wei` with the 25% cushion, which prices the gas estimate.
     limit_gas_price_wei: u128,
     hook_data_cost_wei: U256,
@@ -403,7 +423,8 @@ impl SwapReview {
     /// quoted for the old order amount, so it is cleared and must be quoted again.
     pub fn with_gas_share(&self, gas_share_bps: u16) -> Result<Self> {
         let limit = swap_order_limit(
-            &self.plan,
+            self.plan.hook_gas_estimate(),
+            self.plan.buy_token,
             &self.quote,
             self.gas,
             self.slippage_bps,
@@ -741,17 +762,10 @@ impl SwapReview {
             let quoted_destination = self.bridge?.destination_minimum;
             if quoted_destination >= approved_destination {
                 approved.private_minimum
-            } else if quoted_destination.is_zero() {
-                return None;
             } else {
                 // Bridge orders carry no shield, so the deposit is the private minimum.
-                let scaled = quoted_buy_amount
-                    .checked_mul(approved_destination)?
-                    .div_ceil(quoted_destination);
-                let margin = scaled
-                    .checked_mul(U256::from(BRIDGE_DEPOSIT_MARGIN_BPS))?
-                    .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
-                scaled.checked_add(margin)?.max(approved.private_minimum)
+                scaled_bridge_deposit(quoted_buy_amount, approved_destination, quoted_destination)?
+                    .max(approved.private_minimum)
             }
         } else {
             approved.private_minimum
@@ -760,7 +774,7 @@ impl SwapReview {
             .buy_amount_for(minimum)
             .ok()?
             .saturating_sub(quoted_buy_amount);
-        let cushion = approved_allowance / U256::from(APPROVAL_CUSHION_DIVISOR);
+        let cushion = approval_cushion(approved_allowance);
         (shortfall <= cushion && shortfall <= self.gas_allowance()).then_some(minimum)
     }
 
@@ -975,6 +989,27 @@ pub fn swap_submission_outcome(
     }
 }
 
+/// What the orderbook's answer to the order `uid` says of its submission. A duplicate-order
+/// answer is an acceptance whose response was lost. An interrupted request, or an answer that
+/// isn't about the order, leaves it pending.
+pub(super) fn swap_submission_status(
+    result: &Result<OrderUid, CowApiError>,
+    uid: OrderUid,
+) -> SwapSubmissionStatus {
+    match result {
+        Ok(assigned) if *assigned == uid => SwapSubmissionStatus::Accepted,
+        Err(CowApiError::DuplicatedOrder) => SwapSubmissionStatus::Accepted,
+        Err(
+            CowApiError::AppDataTooLarge
+            | CowApiError::SellAmountDoesNotCoverFee
+            | CowApiError::NoLiquidity
+            | CowApiError::UnsupportedToken
+            | CowApiError::Rejected { .. },
+        ) => SwapSubmissionStatus::Rejected,
+        _ => SwapSubmissionStatus::Pending,
+    }
+}
+
 /// The next plan's budget after app data of `rejected_len` bytes didn't fit.
 const fn swap_replan_budget(byte_budget: usize, rejected_len: usize) -> usize {
     let below = rejected_len.saturating_sub(1);
@@ -1095,22 +1130,7 @@ pub(crate) fn price_swap_review(
         SwapDelivery::Reshield => shield_fee_bps,
         SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => U256::ZERO,
     };
-    let native_rate = match &price {
-        SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
-        SwapPrice::Unverified => NativeBuyRate::Quote,
-    };
-    // The gas estimate, and thus the minimum and an Across deposit, allows a 25% gas-price
-    // increase, rounded upward to whole wei. Neither changes the hooks' execution gas limits
-    // or applies the broadcaster's separate gas-price buffer.
-    let gas = SwapGasPricing {
-        quote_gas_units: quote_gas_units(&quote.quote)?,
-        gas_price_wei,
-        limit_gas_price_wei: gas_price_wei
-            .checked_add(gas_price_wei.div_ceil(4))
-            .ok_or(OrderLimitError::Overflow)?,
-        hook_data_cost_wei,
-        native_rate,
-    };
+    let gas = swap_gas_pricing(&quote.quote, &price, gas_price_wei, hook_data_cost_wei)?;
     tracing::debug!(
         target: "swap_quote",
         step = "gas_price_comparison",
@@ -1121,30 +1141,15 @@ pub(crate) fn price_swap_review(
         gas_share_bps,
         "priced swap and hook gas from RPC gas"
     );
-    let limit = swap_order_limit(
-        &plan,
+    let (limit, gas_share_bps) = order_limit_or_tight(
+        plan.hook_gas_estimate(),
+        plan.buy_token,
         &quote.quote,
         gas,
         slippage_bps,
         gas_share_bps,
         shield_fee_bps,
-    );
-    let (limit, gas_share_bps) = match limit {
-        Err(OrderLimitError::HookCostExceedsOutput { .. })
-            if gas_share_bps > GAS_SHARE_TIGHT_BPS =>
-        {
-            let limit = swap_order_limit(
-                &plan,
-                &quote.quote,
-                gas,
-                slippage_bps,
-                GAS_SHARE_TIGHT_BPS,
-                shield_fee_bps,
-            )?;
-            (limit, GAS_SHARE_TIGHT_BPS)
-        }
-        limit => (limit?, gas_share_bps),
-    };
+    )?;
     Ok(SwapReview {
         cow_fee: quote_protocol_fee(&quote),
         plan,
@@ -1165,10 +1170,78 @@ pub(crate) fn price_swap_review(
     })
 }
 
-/// The order limit of `quote` at `gas_share_bps`. A nonpositive minimum names the wallet's buy
-/// token, not `CoW`'s native buy address.
-fn swap_order_limit(
-    plan: &SwapInputPlan,
+/// The quote-time gas inputs of an order's limit: `quote`'s swap gas, the RPC gas price with
+/// its cushion, the hooks' rollup data cost, and the rate that converts gas into the buy token,
+/// the anchor's for a verified `price` and otherwise the quote's own.
+pub(super) fn swap_gas_pricing(
+    quote: &CowQuoteParameters,
+    price: &SwapPrice,
+    gas_price_wei: u128,
+    hook_data_cost_wei: U256,
+) -> Result<SwapGasPricing, OrderLimitError> {
+    let native_rate = match price {
+        SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
+        SwapPrice::Unverified => NativeBuyRate::Quote,
+    };
+    // The gas estimate, and thus the minimum and an Across deposit, allows a 25% gas-price
+    // increase, rounded upward to whole wei. Neither changes the hooks' execution gas limits
+    // or applies the broadcaster's separate gas-price buffer.
+    Ok(SwapGasPricing {
+        quote_gas_units: quote_gas_units(quote)?,
+        gas_price_wei,
+        limit_gas_price_wei: gas_price_wei
+            .checked_add(gas_price_wei.div_ceil(4))
+            .ok_or(OrderLimitError::Overflow)?,
+        hook_data_cost_wei,
+        native_rate,
+    })
+}
+
+/// The order limit of `quote` at `gas_share_bps`, with the share it was priced at. When that
+/// share leaves no positive minimum and is above the Tight preset, the limit is priced at Tight
+/// instead. If Tight fails too, the error is returned.
+pub(super) fn order_limit_or_tight(
+    hook_gas: u64,
+    buy_token: Address,
+    quote: &CowQuoteParameters,
+    gas: SwapGasPricing,
+    price_tolerance_bps: u32,
+    gas_share_bps: u16,
+    shield_fee_bps: U256,
+) -> Result<(OrderLimit, u16), OrderLimitError> {
+    let limit = swap_order_limit(
+        hook_gas,
+        buy_token,
+        quote,
+        gas,
+        price_tolerance_bps,
+        gas_share_bps,
+        shield_fee_bps,
+    );
+    match limit {
+        Err(OrderLimitError::HookCostExceedsOutput { .. })
+            if gas_share_bps > GAS_SHARE_TIGHT_BPS =>
+        {
+            let limit = swap_order_limit(
+                hook_gas,
+                buy_token,
+                quote,
+                gas,
+                price_tolerance_bps,
+                GAS_SHARE_TIGHT_BPS,
+                shield_fee_bps,
+            )?;
+            Ok((limit, GAS_SHARE_TIGHT_BPS))
+        }
+        limit => Ok((limit?, gas_share_bps)),
+    }
+}
+
+/// The order limit of `quote` at `gas_share_bps`, for hooks estimated at `hook_gas`. A
+/// nonpositive minimum names the wallet's `buy_token`, not `CoW`'s native buy address.
+pub(super) fn swap_order_limit(
+    hook_gas: u64,
+    buy_token: Address,
     quote: &CowQuoteParameters,
     gas: SwapGasPricing,
     price_tolerance_bps: u32,
@@ -1178,7 +1251,7 @@ fn swap_order_limit(
     price_order_limit(&OrderLimitParams {
         quote,
         quote_gas_units: gas.quote_gas_units,
-        hook_gas: plan.hook_gas_estimate(),
+        hook_gas,
         gas_price_wei: gas.limit_gas_price_wei,
         hook_data_cost_wei: gas.hook_data_cost_wei,
         native_rate: gas.native_rate,
@@ -1192,7 +1265,7 @@ fn swap_order_limit(
             best_case,
             ..
         } => OrderLimitError::HookCostExceedsOutput {
-            buy_token: plan.buy_token,
+            buy_token,
             gas_estimate,
             best_case,
         },
@@ -2459,7 +2532,9 @@ impl ExecutorOwner {
         let receives_token = record.swap_use(swap_use).is_some_and(|claimed| {
             matches!(
                 claimed.role(),
-                SwapUseRole::Destination { destination_token, .. } if *destination_token == token
+                SwapUseRole::Destination { destination_token, .. }
+                    | SwapUseRole::PublicSourceDestination { destination_token, .. }
+                    if *destination_token == token
             )
         });
         if record.address() != Some(executor)
@@ -2729,18 +2804,7 @@ impl ExecutorOwner {
         uid: OrderUid,
         result: &Result<OrderUid, CowApiError>,
     ) -> Result<()> {
-        let status = match result {
-            Ok(assigned) if *assigned == uid => SwapSubmissionStatus::Accepted,
-            Err(CowApiError::DuplicatedOrder) => SwapSubmissionStatus::Accepted,
-            Err(
-                CowApiError::AppDataTooLarge
-                | CowApiError::SellAmountDoesNotCoverFee
-                | CowApiError::NoLiquidity
-                | CowApiError::UnsupportedToken
-                | CowApiError::Rejected { .. },
-            ) => SwapSubmissionStatus::Rejected,
-            _ => SwapSubmissionStatus::Pending,
-        };
+        let status = swap_submission_status(result, uid);
         self.ensure_active()?;
         self.store.record_swap_submission(operation, uid, status)?;
         self.notify_change();
@@ -3478,7 +3542,7 @@ fn placeholder_across_deposit(
 /// `RelayAdapt7702.multicall` calldata of the signed calldata's length for the guarded shield a
 /// private `bridge` delivery's destination stealth account runs in the fill: the amount and
 /// the nonce are static ABI words, and the signature is 65 bytes.
-fn placeholder_destination_shield_multicall(bridge: BridgeDelivery) -> Result<Bytes> {
+pub(super) fn placeholder_destination_shield_multicall(bridge: BridgeDelivery) -> Result<Bytes> {
     Ok(RelayAdapt7702::multicallCall {
         _requireSuccess: true,
         _calls: guarded_shield_calls(
@@ -3552,7 +3616,7 @@ fn swap_app_data(
 
 /// A fill-or-kill sell order owned by the executor that pays `receiver`, from
 /// [`order_receiver`]. A native `buy_token`, `Address::ZERO`, becomes `GPv2`'s native buy address.
-fn swap_order(
+pub(super) fn swap_order(
     sell_token: Address,
     buy_token: Address,
     receiver: Address,
@@ -3641,7 +3705,7 @@ fn swap_quote_request(
     }
 }
 
-fn valid_to_after(now: SystemTime, window: Duration) -> Result<u32> {
+pub(super) fn valid_to_after(now: SystemTime, window: Duration) -> Result<u32> {
     now.checked_add(window)
         .and_then(|valid_to| valid_to.duration_since(UNIX_EPOCH).ok())
         .and_then(|valid_to| u32::try_from(valid_to.as_secs()).ok())

@@ -12,13 +12,19 @@ mod runtime;
 pub use recipient::resolve_public_ens_recipient;
 mod signer;
 mod submission;
+mod swap_source;
+pub(crate) use swap_source::{
+    PublicSwapStepOutcome, sign_public_swap_typed_data, submit_public_swap_step,
+};
 #[cfg(test)]
 mod tests;
 mod transaction_tracker;
 mod types;
 mod walletconnect;
 
-pub(crate) use actions::submit_public_action_step_with_signer;
+pub(crate) use actions::{
+    query_erc20_allowance, query_erc20_balance, submit_public_action_step_with_signer,
+};
 pub use actions::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,

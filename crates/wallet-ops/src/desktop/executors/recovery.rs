@@ -32,7 +32,9 @@ mod paid;
 mod retry;
 mod submission;
 pub use approval::ExecutorRecoveryApproval;
-pub use output::{ExecutorRecoveryOutputId, ExecutorRecoveryOutputStatus};
+pub use output::{
+    ExecutorRecoveryOutputId, ExecutorRecoveryOutputStatus, executor_recovery_remaining_amount,
+};
 pub use paid::{
     ExecutorPaidRecoveryOutcome, ExecutorPaidRecoveryRequest, ExecutorPrivateFeeLimitExceeded,
     ExecutorRecoveryFeeEstimate,

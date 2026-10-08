@@ -9,41 +9,61 @@
 //! private Bridge delivery, and replay the Across fill there. They read its RPC from
 //! `DESTINATION_FORK_RPC_URL`.
 //!
+//! The `swap_fork_public` scenarios pay from a Public account on Ethereum. Those that deliver
+//! to Polygon fork it from `DESTINATION_FORK_RPC_URL` too, and the one that delivers to BNB
+//! Chain forks that chain from `BNB_FORK_RPC_URL`. Mainnet has no `SwapMath` yet, so a scenario
+//! with an order deploys it on the Ethereum fork first, as its release will.
+//!
 //! Settlements are sent by an impersonated allow-listed solver. The harness adds
 //! `0xdEaD` to the `GPv2` solver allow list through the authenticator's manager,
 //! because Railgun accepts a synthetic proof only when `tx.origin` is that
 //! `VERIFICATION_BYPASS` address, and a settlement can run the swap's pre-hook.
 
-use super::swap_order::{OutputPois, spawn_bridge_stub, spawn_orderbook, submitted_order};
+use super::swap_order::{
+    OutputPois, read_json_body, spawn_bridge_stub, spawn_orderbook, submitted_order,
+};
 use super::swap_setup::{
     DESTINATION_CHAIN, DESTINATION_TOKEN, USDC, WETH, broadcaster, password, setup_approval,
 };
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
+use crate::public_wallet::VaultedPublicSigner;
+use crate::signer::SoftwareEvmSigner;
 use crate::tests::cow_fork::{
-    ForkChain, MULTICALL3, RAILGUN, RailgunTree, VERIFICATION_BYPASS, synthetic_transaction,
-    unshield_to,
+    BNB_FORK_RPC_URL_ENV, DESTINATION_FORK_RPC_URL_ENV, ForkChain, MULTICALL3, RAILGUN,
+    RailgunTree, VERIFICATION_BYPASS, synthetic_transaction, unshield_to,
 };
 use crate::vault::{
+    PublicAccountScope, PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent,
+    PublicSwapObservations, PublicSwapProxyHolding, PublicSwapRecord, PublicSwapTransactionKind,
     SwapAccountChoice, SwapAccountRole, SwapAccountUse, SwapApprovedAccount, SwapApprovedAccounts,
-    SwapUseId, SwapUseRecord, SwapUseRole,
+    SwapBridgeHandoff, SwapObservation, SwapUseId, SwapUseRecord, SwapUseRole,
 };
 use crate::{
     DelegatedSwapExecutor, ExecutorRecoveryExecution, ExecutorRecoveryFunding,
     IssuedExecutorTransaction, OperationHttpClient, OperationNetworkIsolation,
-    PreparedExecutorOperation, PreparedExecutorRecovery, SwapAmountPlan, SwapAmountRequest,
-    SwapInputPlan, SwapOrderOutcome, SwapOrderState, SwapPairPreparation, SwapPairSide, SwapPrice,
-    SwapSetupStatus, WalletNetworkMode, prepare_swap_pair, swap_order_state,
+    PreparedExecutorOperation, PreparedExecutorRecovery, PublicActionGasFeeSelection,
+    PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapGasPlan, PublicSwapOrderOutcome,
+    PublicSwapOrderState, PublicSwapTransactionOutcome, PublicSwapUseClaim, SwapAmountPlan,
+    SwapAmountRequest, SwapInputPlan, SwapOrderOutcome, SwapOrderState, SwapPairPreparation,
+    SwapPairSide, SwapPrice, SwapSetupStatus, WalletNetworkMode, new_public_swap_batch_nonce,
+    prepare_swap_pair, public_swap_order_state, swap_order_state,
 };
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use broadcaster_core::contracts::across::{
     MulticallHandler, SpokePool, address_to_bytes32, private_delivery_message,
 };
 use broadcaster_core::contracts::cow::{
-    AppData, AppDataHooks, BUY_NATIVE_TOKEN, GPv2Settlement, Order, OrderUid,
+    AppData, AppDataHook, AppDataHooks, BUY_NATIVE_TOKEN, GPv2Settlement, Order, OrderUid,
+    order_uid,
 };
-use broadcaster_core::contracts::executor::EXECUTION_NONCE_STORAGE_SLOT;
+use broadcaster_core::contracts::cow_shed::proxy_address;
+use broadcaster_core::contracts::executor::{AcrossPrivateDelivery, EXECUTION_NONCE_STORAGE_SLOT};
 use broadcaster_core::contracts::railgun::{Call, Shield, approveCall};
+use broadcaster_core::contracts::swap_math::{
+    DETERMINISTIC_DEPLOYER, SWAP_MATH_ADDRESS, SWAP_MATH_RUNTIME_CODE_HASH,
+    swap_math_deployment_calldata,
+};
 
 alloy::sol! {
     interface ForkSwapSettlement {
@@ -216,16 +236,21 @@ impl Wallet {
     }
 
     /// Also open the wallet's owner on the destination chain, over `fork`.
-    fn with_destination(mut self, fork: &ForkChain) -> Self {
+    fn with_destination(self, fork: &ForkChain) -> Self {
+        self.with_destination_on(fork, DESTINATION_CHAIN)
+    }
+
+    /// Also open the wallet's owner on the destination chain `chain_id`, over `fork`.
+    fn with_destination_on(mut self, fork: &ForkChain, chain_id: u64) -> Self {
         let mut chain = crate::settings::build_effective_chain_configs(
             &crate::settings::WalletSettings::default(),
         )
         .unwrap()
-        .get(DESTINATION_CHAIN)
+        .get(chain_id)
         .cloned()
         .unwrap();
-        chain.rpc_route = crate::RpcChainRoute::new(DESTINATION_CHAIN, vec![fork.url()])
-            .with_multicall(MULTICALL3);
+        chain.rpc_route =
+            crate::RpcChainRoute::new(chain_id, vec![fork.url()]).with_multicall(MULTICALL3);
         let owner = ExecutorOwner::new(
             0,
             self.db.clone(),
@@ -741,6 +766,7 @@ impl Wallet {
                     quoted_output: U256::from(DESTINATION_MINIMUM + DELIVERY_ALLOWANCE),
                     delivery_allowance: U256::from(DELIVERY_ALLOWANCE),
                     destination_shield_fee_bps: crate::RAILGUN_PROTOCOL_FEE_BPS,
+                    deposit_floor: None,
                 }),
             });
         }
@@ -885,22 +911,12 @@ impl Wallet {
         };
         let destination_spoke_pool = destination.bridge_profile().unwrap().spoke_pool();
         let (url, _, task) = spawn_bridge_stub(move |_| {
-            json!({
-                "outputAmount": DESTINATION_MINIMUM.to_string(),
-                "totalRelayFee": {"pct": "0", "total": "10000"},
-                "relayerGasFee": {"pct": "0", "total": "0"},
-                "lpFee": {"pct": "0", "total": "0"},
-                "timestamp": quoted.to_string(),
-                "fillDeadline": (quoted + 3 * 60 * 60).to_string(),
-                "exclusiveRelayer": Address::ZERO,
-                "exclusivityDeadline": 0,
-                "spokePoolAddress": spoke_pool,
-                "destinationSpokePoolAddress": destination_spoke_pool,
-                "isAmountTooLow": false,
-                "limits": {"minDeposit": "1", "maxDeposit": "1000000000000"},
-                "estimatedFillTimeSec": 2
-            })
-            .to_string()
+            across_quote_at(
+                spoke_pool,
+                destination_spoke_pool,
+                U256::from(DESTINATION_MINIMUM),
+                quoted,
+            )
         })
         .await;
         let mut clients = self.owner.swap_bridge_clients(orderbook).unwrap();
@@ -1151,6 +1167,32 @@ impl Wallet {
         drop(self.db);
         std::fs::remove_dir_all(self.root).unwrap();
     }
+}
+
+/// Across's fee quote of `output` for a deposit into `spoke_pool`, dated `quoted` with a fill
+/// deadline three hours later.
+fn across_quote_at(
+    spoke_pool: Address,
+    destination_spoke_pool: Address,
+    output: U256,
+    quoted: u64,
+) -> String {
+    json!({
+        "outputAmount": output.to_string(),
+        "totalRelayFee": {"pct": "0", "total": "10000"},
+        "relayerGasFee": {"pct": "0", "total": "0"},
+        "lpFee": {"pct": "0", "total": "0"},
+        "timestamp": quoted.to_string(),
+        "fillDeadline": (quoted + 3 * 60 * 60).to_string(),
+        "exclusiveRelayer": Address::ZERO,
+        "exclusivityDeadline": 0,
+        "spokePoolAddress": spoke_pool,
+        "destinationSpokePoolAddress": destination_spoke_pool,
+        "isAmountTooLow": false,
+        "limits": {"minDeposit": "1", "maxDeposit": "1000000000000"},
+        "estimatedFillTimeSec": 2
+    })
+    .to_string()
 }
 
 fn first_order(record: &ExecutorRecord) -> &SwapOrderRecord {
@@ -2490,18 +2532,24 @@ fn relay_of(deposit: &SpokePool::FundsDeposited) -> ForkSpokePool::V3RelayData {
 
 /// Give the relayer destination-chain USDC for several fills, which `spoke_pool` may pull.
 async fn fund_relayer(fork: &ForkChain, spoke_pool: Address) {
-    fork.impersonate(RELAYER).await;
-    fork.add_erc20(
+    fund_relayer_with(
+        fork,
+        spoke_pool,
         DESTINATION_TOKEN,
-        RELAYER,
         U256::from(10 * DESTINATION_MINIMUM),
     )
     .await;
+}
+
+/// Give the relayer `amount` of `token` on `fork`'s chain, which `spoke_pool` may pull.
+async fn fund_relayer_with(fork: &ForkChain, spoke_pool: Address, token: Address, amount: U256) {
+    fork.impersonate(RELAYER).await;
+    fork.add_erc20(token, RELAYER, amount).await;
     let receipt = fork
         .send(
             TransactionRequest::default()
                 .from(RELAYER)
-                .to(DESTINATION_TOKEN)
+                .to(token)
                 .input(
                     approveCall {
                         spender: spoke_pool,
@@ -2523,13 +2571,23 @@ async fn fill(
     spoke_pool: Address,
     relay: ForkSpokePool::V3RelayData,
 ) -> (TransactionReceipt, Option<String>) {
+    fill_on(fork, spoke_pool, relay, DESTINATION_CHAIN).await
+}
+
+/// [`fill`] on the fork of the chain `chain_id`, where the relayer is also repaid.
+async fn fill_on(
+    fork: &ForkChain,
+    spoke_pool: Address,
+    relay: ForkSpokePool::V3RelayData,
+    chain_id: u64,
+) -> (TransactionReceipt, Option<String>) {
     let request = TransactionRequest::default()
         .from(RELAYER)
         .to(spoke_pool)
         .input(
             ForkSpokePool::fillRelayCall {
                 relayData: relay,
-                repaymentChainId: U256::from(DESTINATION_CHAIN),
+                repaymentChainId: U256::from(chain_id),
                 repaymentAddress: address_to_bytes32(RELAYER),
             }
             .abi_encode()
@@ -3162,4 +3220,1855 @@ async fn swap_fork_private_across_post_hook_deposits_within_its_gas_limit() {
         );
     }
     wallet.finish().await;
+}
+
+// Ethereum's USDT refuses a change from one nonzero allowance to another. A Public account
+// that already allows the `SpokePool` 100 and sells 200 resets the allowance first, and both
+// approvals cost no more gas than the plan the review showed.
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_usdt_approval_resets_a_short_allowance_first() {
+    use alloy::primitives::{address, keccak256};
+    use broadcaster_core::contracts::shield::build_approve_calldata;
+
+    const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    const MAX_FEE_PER_GAS: u128 = 200_000_000_000;
+    const MAX_PRIORITY_FEE_PER_GAS: u128 = 2_000_000_000;
+
+    let fork = ForkChain::start().await;
+    // The swap's record is on the destination chain's owner, which reads nothing of its own
+    // chain here. Every read and transaction goes to the origin fork.
+    let wallet = Wallet::open(&fork).with_destination(&fork);
+    let origin = &wallet.chain;
+    let owner = &wallet.destination.as_ref().unwrap().owner;
+    let spoke_pool = origin.bridge_origin_profile().unwrap().spoke_pool();
+    let key = keccak256(format!(
+        "{:?} {}",
+        std::time::SystemTime::now(),
+        std::process::id()
+    ));
+    let signer = VaultedPublicSigner::Software(SoftwareEvmSigner::from_private_key(key.0).unwrap());
+    let source = signer.address();
+    let (sell_amount, allowed) = (U256::from(200), U256::from(100));
+    let allowance = || ForkAllowance::allowanceCall {
+        owner: source,
+        spender: spoke_pool,
+    };
+
+    // The account holds USDT and gas money, and already allows the pool less than it sells.
+    fork.impersonate(source).await;
+    fork.add_erc20(USDT, source, U256::from(1_000)).await;
+    let receipt = fork
+        .send(
+            TransactionRequest::default()
+                .from(source)
+                .to(USDT)
+                .input(Bytes::from(build_approve_calldata(spoke_pool, allowed)).into())
+                .gas_limit(100_000),
+        )
+        .await;
+    assert!(receipt.status());
+    assert_eq!(fork.call(USDT, allowance()).await, allowed);
+
+    let plan = owner
+        .plan_public_swap_gas(
+            origin,
+            source,
+            USDT,
+            spoke_pool,
+            sell_amount,
+            true,
+            MAX_FEE_PER_GAS,
+            MAX_PRIORITY_FEE_PER_GAS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.approval_gas_limits.len(), 2);
+
+    // The smallest claim of a direct USDT deposit from this account, approved for the plan.
+    let (operation, id) = (
+        ExecutorOperationId::random().unwrap(),
+        SwapUseId::random().unwrap(),
+    );
+    let mut bounds = setup_approval(USDT, WETH, SwapDelivery::Reshield).bounds;
+    bounds.sell_amount = sell_amount;
+    bounds.destination_minimum = Some(U256::from(100));
+    bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
+    bounds.destination_setup_fee = Some(U256::from(1_000));
+    owner
+        .claim_public_swap(PublicSwapUseClaim {
+            id,
+            origin_chain: 1,
+            source,
+            source_scope: PublicAccountScope::PrivateWallet {
+                wallet_uuid: TEST_WALLET_ID.to_owned(),
+            },
+            account: SwapAccountChoice::New(operation),
+            destination_token: DESTINATION_TOKEN,
+            intent: PublicSwapIntent {
+                bridged_token: USDT,
+                order: false,
+            },
+            approval: PublicSwapApproval {
+                bounds,
+                price_verified: Some(true),
+                price_acknowledged: false,
+                sell_token: USDT,
+                on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+                destination: SwapApprovedAccount {
+                    address: None,
+                    setup: true,
+                },
+                max_gas_cost: plan.max_gas_cost,
+            },
+        })
+        .unwrap();
+
+    let funded = fork.native_balance(source).await;
+    owner
+        .submit_public_swap_approvals_with_signer(
+            operation,
+            id,
+            origin,
+            &signer,
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: MAX_FEE_PER_GAS,
+                max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(fork.call(USDT, allowance()).await, sell_amount);
+
+    // approve(0), then approve(200), both included and successful.
+    let store =
+        ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), DESTINATION_CHAIN).unwrap();
+    let record = store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap();
+    let (_, swap) = record.public_swap_use(id).unwrap();
+    let [reset, approval] = swap.transactions() else {
+        panic!("a reset and an approval were sent");
+    };
+    for (transaction, kind, value) in [
+        (reset, PublicSwapTransactionKind::ApprovalReset, U256::ZERO),
+        (approval, PublicSwapTransactionKind::Approval, sell_amount),
+    ] {
+        assert_eq!(transaction.kind, kind);
+        assert_eq!(
+            transaction.transaction.input.input().unwrap()[..],
+            build_approve_calldata(spoke_pool, value)[..]
+        );
+        assert!(transaction.inclusion.unwrap().succeeded);
+    }
+
+    // The approvals carry no value, so what the account lost is the gas both receipts paid.
+    let paid = funded - fork.native_balance(source).await;
+    assert!(!paid.is_zero());
+    assert!(
+        paid <= plan.max_gas_cost,
+        "the approvals paid {paid} wei of the planned {} wei",
+        plan.max_gas_cost
+    );
+    println!(
+        "MEASURE public_usdt_approvals_gas paid={paid} planned={}",
+        plan.max_gas_cost
+    );
+    drop(store);
+    wallet.finish().await;
+}
+
+/// The fee every Public account's transaction here is reviewed and sent at.
+const PUBLIC_MAX_FEE_PER_GAS: u128 = 200_000_000_000;
+const PUBLIC_MAX_PRIORITY_FEE_PER_GAS: u128 = 2_000_000_000;
+const PUBLIC_GAS_FEE: PublicActionGasFeeSelection = PublicActionGasFeeSelection::Custom {
+    max_fee_per_gas: PUBLIC_MAX_FEE_PER_GAS,
+    max_priority_fee_per_gas: PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+};
+/// What a Public account's direct deposit sells here, in USDC base units.
+const PUBLIC_DEPOSIT: u64 = 20_000_000;
+/// The approved minimum on Polygon of that deposit, in USDC base units.
+const PUBLIC_DEPOSIT_MINIMUM: u64 = 19_900_000;
+/// The buy amount of every Public account's order here, in USDC base units.
+const PUBLIC_ORDER_BUY_AMOUNT: u64 = 15_000_000;
+/// How long a Public account's order and its hook batch stay valid, and how long a direct
+/// deposit's quote is taken for, in seconds. It is within the ten minutes the wallet signs for.
+const PUBLIC_VALID_SECS: u64 = 9 * 60;
+/// How far ahead of the swap chain's clock the quote of a deposit that must fail is dated, in
+/// seconds. The `SpokePool` refuses a deposit whose block precedes its quote.
+const QUOTE_AHEAD_SECS: u64 = 3 * 60;
+/// Gas limit of a hook batch sent to the factory on its own, above a batch that deploys its
+/// proxy and deposits.
+const BATCH_GAS: u64 = 1_500_000;
+/// The gas limit an order's invalidation is reviewed with.
+const INVALIDATION_GAS_LIMIT: u64 = 100_000;
+/// Polygon's WETH, which Across pays out for WETH deposited on Ethereum.
+const POLYGON_WETH: Address =
+    alloy::primitives::address!("7ceb23fd6bc0add59e62ac25578270cff1b9f619");
+const BNB_CHAIN: u64 = 56;
+/// BNB Chain's USDC, which has 18 decimals.
+const BNB_USDC: Address = alloy::primitives::address!("8ac76a51cc950d9822d68b83fe1ad97b32cd580d");
+
+/// What a swap paid from a Public account on Ethereum sells, deposits and must deliver.
+#[derive(Clone, Copy)]
+struct PublicTerms {
+    /// `Address::ZERO` for ETH.
+    sell_token: Address,
+    sell_amount: U256,
+    /// The token deposited into Across: the sold token, WETH for ETH, or an order's buy token.
+    bridged_token: Address,
+    /// The amount the deposit is quoted for: the sold amount, or an order's buy amount.
+    bridged_amount: U256,
+    destination_token: Address,
+    destination_minimum: U256,
+    /// The hook gas limit an order was reviewed with. `None` for a direct deposit.
+    hook_gas_limit: Option<u64>,
+}
+
+/// A claimed swap paid from a Public account, whose new destination stealth account is set up
+/// and confirmed on the destination fork.
+struct PublicSwap {
+    operation: ExecutorOperationId,
+    id: SwapUseId,
+    /// The Public account.
+    source: Address,
+    terms: PublicTerms,
+    /// The account's own transactions as planned for the approval.
+    plan: PublicSwapGasPlan,
+    /// The destination stealth account.
+    account: DelegatedSwapExecutor,
+}
+
+/// A swap's signed delivery: the destination account's shield, the handler message that runs
+/// it, and the deposit terms Across quoted for that message.
+struct SignedDelivery {
+    delivery: AcrossPrivateDelivery,
+    message: Bytes,
+    terms: AcrossOrderTerms,
+}
+
+/// An orderbook stub for one Public account's order. It records each order request's body, and
+/// answers a read of the order's trades with the block last set, or with no trade.
+struct PublicOrderbook {
+    client: CowOrderbookClient,
+    orders: Arc<Mutex<Vec<Value>>>,
+    trade_block: Arc<Mutex<Option<u64>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PublicOrderbook {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A Public account's order placed through the wallet, as the orderbook stub received it.
+struct PlacedOrder {
+    swap: PublicSwap,
+    signed: SignedDelivery,
+    orderbook: PublicOrderbook,
+    order: Order,
+    uid: OrderUid,
+    signature: Bytes,
+    /// The order's one post-hook: the signed `executeHooks` call on the cow-shed factory.
+    hook: AppDataHook,
+    /// The Public account's cow-shed proxy, the order's receiver.
+    proxy: Address,
+    /// The order's `validTo`, also its hook batch's deadline.
+    valid_to: u32,
+}
+
+/// Where a Public account's order from Ethereum delivers, and how much of the scenario runs.
+#[derive(Clone, Copy)]
+struct OrderDestination {
+    chain_id: u64,
+    /// The environment variable that names the RPC the chain is forked from.
+    rpc_env: &'static str,
+    /// The chain's USDC.
+    token: Address,
+    /// The approved minimum of `token` for the order's buy amount, in `token`'s base units.
+    minimum: u128,
+    /// Whether the failed hook, the late batch run and the cancellation run after the delivery.
+    every_outcome: bool,
+}
+
+/// A new software key of a Public account. `label` tells one test's accounts apart.
+fn public_signer(label: &str) -> VaultedPublicSigner {
+    let key = alloy::primitives::keccak256(format!(
+        "{label} {:?} {}",
+        std::time::SystemTime::now(),
+        std::process::id()
+    ));
+    VaultedPublicSigner::Software(SoftwareEvmSigner::from_private_key(key.0).unwrap())
+}
+
+/// Unix seconds `secs` from now, for an order's `validTo` or a deposit's deadline.
+fn valid_until(secs: u64) -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    u32::try_from(now + secs).unwrap()
+}
+
+/// An Across client over the local stub at `url`.
+fn across_client(url: url::Url) -> crate::bridge::AcrossClient {
+    crate::bridge::AcrossClient::new(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        ),
+        url,
+    )
+    .unwrap()
+}
+
+/// Across's record of a deposit that pays `recipient` at least `output` on `destination_chain`:
+/// its `status`, the fill it locates and the refund transaction it names.
+fn across_deposit_record(
+    status: &str,
+    fill: Option<&TransactionReceipt>,
+    refund: Option<B256>,
+    recipient: Address,
+    destination_chain: u64,
+    output: U256,
+) -> String {
+    json!({"deposit": {
+        "status": status,
+        "fillBlockNumber": fill.map(|fill| fill.block_number.unwrap()),
+        "fillTx": fill.map(|fill| fill.transaction_hash),
+        "depositRefundTxHash": refund,
+        "outputAmount": output.to_string(),
+        "recipient": recipient,
+        "destinationChainId": destination_chain.to_string()
+    }})
+    .to_string()
+}
+
+/// An Across client whose deposit lookups a local stub answers with what the returned reply
+/// holds, at first `reply`.
+async fn across_deposit_stub(
+    reply: String,
+) -> (
+    crate::bridge::AcrossClient,
+    Arc<Mutex<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let reply = Arc::new(Mutex::new(reply));
+    let served = reply.clone();
+    let (url, _, task) = spawn_bridge_stub(move |_| served.lock().unwrap().clone()).await;
+    (across_client(url), reply, task)
+}
+
+/// An orderbook stub on Ethereum for a Public account's order at `settlement`.
+async fn spawn_public_orderbook(settlement: Address) -> PublicOrderbook {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mainnet", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let orders = Arc::new(Mutex::new(Vec::new()));
+    let trade_block = Arc::new(Mutex::new(None));
+    let (recorded, reported) = (orders.clone(), trade_block.clone());
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut stream = BufReader::new(stream);
+            let mut request_line = String::new();
+            if stream.read_line(&mut request_line).await.unwrap() == 0 {
+                continue;
+            }
+            let Some(body) = read_json_body(&mut stream).await else {
+                continue;
+            };
+            // The only read is of the order's trades, by its UID.
+            let (status, reply) = if request_line.starts_with("GET") {
+                let block: Option<u64> = *reported.lock().unwrap();
+                let trades =
+                    block.map_or_else(|| json!([]), |block| json!([{"blockNumber": block}]));
+                ("200 OK", trades.to_string())
+            } else {
+                let owner = body["from"].as_str().unwrap().parse().unwrap();
+                let uid = order_uid(&submitted_order(&body), 1, settlement, owner);
+                recorded.lock().unwrap().push(body);
+                ("201 Created", json!(uid.0).to_string())
+            };
+            stream
+                .get_mut()
+                .write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let client = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        ),
+        url,
+        1,
+    )
+    .unwrap();
+    PublicOrderbook {
+        client,
+        orders,
+        trade_block,
+        task,
+    }
+}
+
+/// The claim of a swap with `terms` paid from the Public account `source` on Ethereum, for the
+/// new destination account `operation`. A failed shield reverts the fill, so that Across
+/// refunds the deposit.
+fn public_claim(
+    id: SwapUseId,
+    operation: ExecutorOperationId,
+    source: Address,
+    terms: PublicTerms,
+    max_gas_cost: U256,
+) -> PublicSwapUseClaim {
+    let mut bounds = setup_approval(
+        terms.sell_token,
+        terms.bridged_token,
+        SwapDelivery::Reshield,
+    )
+    .bounds;
+    bounds.sell_amount = terms.sell_amount;
+    bounds.buy_amount = terms.bridged_amount;
+    bounds.post_hook_gas_limit = terms.hook_gas_limit;
+    bounds.destination_minimum = Some(terms.destination_minimum);
+    bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
+    bounds.destination_setup_fee = Some(U256::from(1_000));
+    PublicSwapUseClaim {
+        id,
+        origin_chain: 1,
+        source,
+        source_scope: PublicAccountScope::PrivateWallet {
+            wallet_uuid: TEST_WALLET_ID.to_owned(),
+        },
+        account: SwapAccountChoice::New(operation),
+        destination_token: terms.destination_token,
+        intent: PublicSwapIntent {
+            bridged_token: terms.bridged_token,
+            order: terms.hook_gas_limit.is_some(),
+        },
+        approval: PublicSwapApproval {
+            bounds,
+            price_verified: Some(true),
+            price_acknowledged: false,
+            sell_token: terms.sell_token,
+            on_shield_failure: BridgeShieldFailure::RefundOnOrigin,
+            destination: SwapApprovedAccount {
+                address: None,
+                setup: true,
+            },
+            max_gas_cost,
+        },
+    }
+}
+
+impl Wallet {
+    /// Plan the gas of the Public account `signer`'s own transactions for a swap with `terms`,
+    /// claim the swap for a new destination stealth account, deliver that account's
+    /// delegation-only setup on `destination_fork`, and confirm it delegated there.
+    async fn public_swap(
+        &self,
+        destination_fork: &ForkChain,
+        signer: &VaultedPublicSigner,
+        terms: PublicTerms,
+    ) -> PublicSwap {
+        let destination = self.destination.as_ref().unwrap();
+        let (origin, owner) = (&self.chain, &destination.owner);
+        let source = signer.address();
+        let order = terms.hook_gas_limit.is_some();
+        // An order's Sell token is pulled by `CoW`'s vault relayer, a deposit's by the pool.
+        let spender = if order {
+            origin.public_swap_profile().unwrap().vault_relayer()
+        } else {
+            origin.bridge_origin_profile().unwrap().spoke_pool()
+        };
+        let plan = owner
+            .plan_public_swap_gas(
+                origin,
+                source,
+                terms.sell_token,
+                spender,
+                terms.sell_amount,
+                !order,
+                PUBLIC_MAX_FEE_PER_GAS,
+                PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+            )
+            .await
+            .unwrap();
+        let (operation, id) = (
+            ExecutorOperationId::random().unwrap(),
+            SwapUseId::random().unwrap(),
+        );
+        owner
+            .claim_public_swap(public_claim(
+                id,
+                operation,
+                source,
+                terms,
+                plan.max_gas_cost,
+            ))
+            .unwrap();
+
+        let authorization = password();
+        let delegate = destination
+            .chain
+            .accepted_executor_profile()
+            .unwrap()
+            .delegate();
+        let mut candidate = broadcaster(delegate);
+        candidate.chain_id = destination.chain.chain_id;
+        let SwapPairSide::Setup(prepared) = owner
+            .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+            .await
+            .unwrap()
+        else {
+            panic!("a new destination account needs setup");
+        };
+        let installed = self
+            .install(
+                destination_fork,
+                owner,
+                &destination.chain,
+                &prepared,
+                &authorization,
+            )
+            .await;
+        let confirmed = destination_fork.block_number().await - destination.chain.finality_depth;
+        let account = owner
+            .delegated_public_swap_destination(operation, confirmed, id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (account.executor(), account.observed().nonce()),
+            (installed.executor(), installed.observed().nonce())
+        );
+        PublicSwap {
+            operation,
+            id,
+            source,
+            terms,
+            plan,
+            account,
+        }
+    }
+
+    /// Sign `swap`'s delivery for a deposit that can be made until `valid_to`. The destination
+    /// account signs its shield, and a local Across stub quotes the approved destination
+    /// minimum for the handler message that runs it, dated `quoted` on the swap chain's clock.
+    async fn sign_public_delivery(
+        &self,
+        swap: &PublicSwap,
+        quoted: u64,
+        valid_to: u32,
+    ) -> SignedDelivery {
+        let destination = self.destination.as_ref().unwrap();
+        let spoke_pool = self.chain.bridge_origin_profile().unwrap().spoke_pool();
+        let destination_spoke_pool = destination.chain.bridge_profile().unwrap().spoke_pool();
+        let output = swap.terms.destination_minimum;
+        let (url, _, stub) = spawn_bridge_stub(move |_| {
+            across_quote_at(spoke_pool, destination_spoke_pool, output, quoted)
+        })
+        .await;
+        let signed = destination
+            .owner
+            .sign_public_swap_delivery(PublicSwapDeliverySigning {
+                operation: swap.operation,
+                swap_use: swap.id,
+                delegated: swap.account,
+                origin: &self.chain,
+                across: &across_client(url),
+                input_amount: swap.terms.bridged_amount,
+                valid_to,
+                authorization: &password(),
+                notes: None,
+            })
+            .await
+            .unwrap();
+        stub.abort();
+        let PublicSwapDelivery::Signed {
+            delivery,
+            message,
+            terms,
+        } = signed
+        else {
+            panic!("Across's quote covers the approved destination minimum");
+        };
+        SignedDelivery {
+            delivery,
+            message,
+            terms,
+        }
+    }
+}
+
+/// The swap of `swap`'s use as its destination account's record holds it, and what became of
+/// that account's shield.
+fn public_swap_record(
+    wallet: &Wallet,
+    swap: &PublicSwap,
+) -> (PublicSwapRecord, Option<SwapDestinationOutcome>) {
+    let record = wallet.destination_record(swap.operation);
+    let Some(SwapUseRole::PublicSourceDestination {
+        swap: saved,
+        outcome,
+        ..
+    }) = record.swap_use(swap.id).map(SwapUseRecord::role)
+    else {
+        panic!("the use delivers a swap paid from a Public account");
+    };
+    ((**saved).clone(), *outcome)
+}
+
+/// The state of `swap`'s order, from its record.
+fn public_order_state(wallet: &Wallet, swap: &PublicSwap) -> Option<PublicSwapOrderState> {
+    public_swap_order_state(&public_swap_record(wallet, swap).0)
+}
+
+/// Mine `fork` until its clock is past `time`, Unix seconds.
+async fn mine_past(fork: &ForkChain, time: u64) {
+    loop {
+        let now = fork.timestamp().await;
+        if now > time {
+            return;
+        }
+        fork.increase_time(time + 1 - now).await;
+        fork.mine(1).await;
+    }
+}
+
+/// Send `swap`'s deposit from its Public account through the wallet. The pinned `SpokePool`
+/// must take one deposit of the signed amounts that names the Public account as depositor and
+/// the destination chain's handler as recipient, with the signed message, for no more gas than
+/// the plan the swap was approved with. Returns the deposit's receipt and event.
+async fn deposit_from_public_account(
+    wallet: &Wallet,
+    fork: &ForkChain,
+    signer: &VaultedPublicSigner,
+    swap: &PublicSwap,
+    signed: &SignedDelivery,
+) -> (TransactionReceipt, SpokePool::FundsDeposited) {
+    let destination = wallet.destination.as_ref().unwrap();
+    let origin = &wallet.chain;
+    let outcome = destination
+        .owner
+        .submit_public_swap_deposit_with_signer(
+            swap.operation,
+            swap.id,
+            origin,
+            signer,
+            PUBLIC_GAS_FEE,
+            &signed.delivery,
+            &signed.terms,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    let PublicSwapTransactionOutcome::Included {
+        transaction_hash, ..
+    } = outcome
+    else {
+        panic!("the deposit succeeds: {outcome:?}");
+    };
+    let receipt = fork.receipt(transaction_hash).await;
+    let deposits = deposits(
+        &receipt,
+        origin.bridge_origin_profile().unwrap().spoke_pool(),
+    );
+    let [deposit] = deposits.as_slice() else {
+        panic!("the Public account deposits once");
+    };
+    let handler = destination
+        .chain
+        .bridge_profile()
+        .unwrap()
+        .multicall_handler();
+    assert_eq!(
+        (deposit.depositor, deposit.recipient),
+        (address_to_bytes32(swap.source), address_to_bytes32(handler))
+    );
+    assert_eq!(deposit.message, signed.message);
+    assert_eq!(
+        (
+            deposit.inputToken,
+            deposit.outputToken,
+            deposit.destinationChainId
+        ),
+        (
+            address_to_bytes32(swap.terms.bridged_token),
+            address_to_bytes32(swap.terms.destination_token),
+            U256::from(destination.chain.chain_id)
+        )
+    );
+    assert_eq!(
+        (deposit.inputAmount, deposit.outputAmount),
+        (swap.terms.sell_amount, swap.terms.destination_minimum)
+    );
+    assert_eq!(
+        (signed.terms.input_amount, signed.terms.output_amount),
+        (deposit.inputAmount, deposit.outputAmount)
+    );
+    assert_eq!(
+        (deposit.quoteTimestamp, deposit.fillDeadline),
+        (signed.terms.quote_timestamp, signed.terms.fill_deadline)
+    );
+    let limit = swap.plan.deposit_gas_limit.unwrap();
+    assert!(
+        receipt.gas_used <= limit,
+        "the deposit used {} gas of the planned {limit}",
+        receipt.gas_used
+    );
+    println!(
+        "MEASURE public_deposit_gas sell_token={} used={} limit={limit}",
+        swap.terms.sell_token, receipt.gas_used
+    );
+    let deposit = deposit.clone();
+    (receipt, deposit)
+}
+
+/// Read `swap`'s hand-off through the wallet once the block of `receipt`, its deposit's, is
+/// final on the swap's chain. The wallet must record that transaction as the hand-off of
+/// `deposit`, with the amounts its event carries.
+async fn observe_public_handoff(
+    wallet: &Wallet,
+    fork: &ForkChain,
+    swap: &PublicSwap,
+    receipt: &TransactionReceipt,
+    deposit: &SpokePool::FundsDeposited,
+) {
+    let origin = &wallet.chain;
+    let owner = &wallet.destination.as_ref().unwrap().owner;
+    let observe = || owner.observe_public_swap_handoff(swap.operation, swap.id, origin);
+    assert_eq!(
+        observe().await.unwrap(),
+        None,
+        "the deposit's block isn't final yet"
+    );
+    fork.mine(origin.finality_depth).await;
+    let handoff = observe()
+        .await
+        .unwrap()
+        .expect("the final deposit is the swap's hand-off");
+    assert_eq!(
+        handoff,
+        SwapBridgeHandoff {
+            observation: SwapObservation {
+                block: BlockNumHash::new(
+                    receipt.block_number.unwrap(),
+                    receipt.block_hash.unwrap()
+                ),
+                transaction_hash: Some(receipt.transaction_hash),
+            },
+            deposit_id: Some(deposit.depositId),
+        }
+    );
+    let observed = public_swap_record(wallet, swap).0.observations();
+    assert_eq!(observed.bridge_handoff, Some(handoff));
+    assert_eq!(
+        observed.deposited,
+        Some(PublicSwapDeposited {
+            input_amount: deposit.inputAmount,
+            output_amount: deposit.outputAmount,
+        })
+    );
+}
+
+/// Fill `deposit` on the destination fork as the relayer. The handler must pass the deposit's
+/// whole output of `token` to the destination stealth account `account`, whose shield must put
+/// all of it into Railgun, less the shield fee, at the account's next nonce. Returns the fill.
+async fn fill_and_shield(
+    destination_fork: &ForkChain,
+    destination: &Destination,
+    token: Address,
+    deposit: &SpokePool::FundsDeposited,
+    account: DelegatedSwapExecutor,
+) -> TransactionReceipt {
+    let spoke_pool = destination.chain.bridge_profile().unwrap().spoke_pool();
+    let railgun = destination
+        .chain
+        .require_railgun()
+        .unwrap()
+        .deployment
+        .contract;
+    let executor = account.executor();
+    let nonce = execution_nonce(destination_fork, executor).await;
+    assert_eq!(nonce, account.observed().nonce());
+    assert!(
+        destination_fork.timestamp().await < u64::from(deposit.fillDeadline),
+        "the destination fork's clock is before the fill deadline"
+    );
+    let (filled, reverts) = fill_on(
+        destination_fork,
+        spoke_pool,
+        relay_of(deposit),
+        destination.chain.chain_id,
+    )
+    .await;
+    assert!(
+        filled.status(),
+        "the fill runs the handler's instructions and the shield: {reverts:?}"
+    );
+    let shields = shields_of(&filled, railgun, token);
+    let [(credited, fee)] = shields.as_slice() else {
+        panic!("the fill shields once");
+    };
+    assert!(!fee.is_zero());
+    assert_eq!(*credited + *fee, deposit.outputAmount);
+    assert_eq!(
+        destination_fork.erc20_balance(token, executor).await,
+        U256::ZERO
+    );
+    assert_eq!(
+        execution_nonce(destination_fork, executor).await,
+        nonce + U256::ONE
+    );
+    filled
+}
+
+/// The wallet's explicit status check of `swap`'s deposit once `filled`'s block is final on the
+/// destination fork: one lookup at an Across stub whose record names that fill, then the read
+/// of its block's receipts. It must record the delivery of `output`, the deposit's whole
+/// output, as verified and shielded, and the destination account's shield as run.
+async fn verify_public_delivery(
+    wallet: &Wallet,
+    destination_fork: &ForkChain,
+    swap: &PublicSwap,
+    output: U256,
+    filled: &TransactionReceipt,
+) {
+    let destination = wallet.destination.as_ref().unwrap();
+    destination_fork
+        .mine(destination.chain.finality_depth)
+        .await;
+    let handler = destination
+        .chain
+        .bridge_profile()
+        .unwrap()
+        .multicall_handler();
+    let located = across_deposit_record(
+        "filled",
+        Some(filled),
+        None,
+        handler,
+        destination.chain.chain_id,
+        output,
+    );
+    let (across, _, stub) = across_deposit_stub(located).await;
+    let outcome = destination
+        .owner
+        .check_public_swap_bridge(swap.operation, swap.id, &across)
+        .await
+        .unwrap();
+    stub.abort();
+    let block = BlockNumHash::new(filled.block_number.unwrap(), filled.block_hash.unwrap());
+    let transaction_hash = filled.transaction_hash;
+    assert_eq!(
+        outcome,
+        Some(SwapBridgeOutcome::DeliveredVerified {
+            block,
+            transaction_hash,
+            output_amount: output,
+            shielded: true,
+        })
+    );
+    let (saved, shield) = public_swap_record(wallet, swap);
+    assert_eq!(saved.observations().bridge_outcome, outcome);
+    assert_eq!(
+        shield,
+        Some(SwapDestinationOutcome::Shielded {
+            block,
+            transaction_hash,
+        })
+    );
+}
+
+// A Public account on Ethereum deposits USDC into Across itself, for the handler on Polygon and
+// the message that runs its new destination stealth account's shield. The relayer's fill
+// shields the whole output to the wallet there, and the wallet verifies it from the fill's
+// block.
+//
+// The record of a delivered swap takes no refund, so the withheld fill is a second deposit of
+// the same account: Across reports it expired, refunds it on Ethereum, and the wallet verifies
+// the refund to the Public account. Nothing is recovered: the tokens are back in the account.
+//
+// The account then sells ETH. That deposit takes no approval and pays its amount as the
+// transaction's value, which the pool wraps.
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_deposit_is_filled_and_shielded_on_the_destination_chain() {
+    let fork = ForkChain::start().await;
+    let destination_fork = ForkChain::start_destination(DESTINATION_CHAIN).await;
+    let wallet = Wallet::open(&fork).with_destination(&destination_fork);
+    let origin = &wallet.chain;
+    let destination = wallet.destination.as_ref().unwrap();
+    let owner = &destination.owner;
+    let spoke_pool = origin.bridge_origin_profile().unwrap().spoke_pool();
+    let profile = destination.chain.bridge_profile().unwrap();
+    let (destination_spoke_pool, handler) = (profile.spoke_pool(), profile.multicall_handler());
+    let signer = public_signer("deposit");
+    let source = signer.address();
+    let (sold, minimum) = (
+        U256::from(PUBLIC_DEPOSIT),
+        U256::from(PUBLIC_DEPOSIT_MINIMUM),
+    );
+    let terms = PublicTerms {
+        sell_token: USDC,
+        sell_amount: sold,
+        bridged_token: USDC,
+        bridged_amount: sold,
+        destination_token: DESTINATION_TOKEN,
+        destination_minimum: minimum,
+        hook_gas_limit: None,
+    };
+    let allowance = || ForkAllowance::allowanceCall {
+        owner: source,
+        spender: spoke_pool,
+    };
+    let approve = async |swap: &PublicSwap| {
+        owner
+            .submit_public_swap_approvals_with_signer(
+                swap.operation,
+                swap.id,
+                origin,
+                &signer,
+                PUBLIC_GAS_FEE,
+                &mut |_| {},
+            )
+            .await
+    };
+
+    // The account holds gas money and the USDC of two deposits.
+    fork.impersonate(source).await;
+    fork.add_erc20(USDC, source, sold * U256::from(2)).await;
+    fund_relayer(&destination_fork, destination_spoke_pool).await;
+
+    // The first deposit: one approval of the pool, the delivery signed against a quote dated
+    // on the fork's clock, then the deposit itself.
+    let swap = wallet.public_swap(&destination_fork, &signer, terms).await;
+    assert_eq!(swap.plan.approval_gas_limits.len(), 1);
+    approve(&swap).await.unwrap();
+    assert_eq!(fork.call(USDC, allowance()).await, sold);
+    let signed = wallet
+        .sign_public_delivery(
+            &swap,
+            fork.timestamp().await,
+            valid_until(PUBLIC_VALID_SECS),
+        )
+        .await;
+    let held = fork.erc20_balance(USDC, source).await;
+    let (receipt, deposit) =
+        deposit_from_public_account(&wallet, &fork, &signer, &swap, &signed).await;
+    assert_eq!(fork.erc20_balance(USDC, source).await, held - sold);
+    observe_public_handoff(&wallet, &fork, &swap, &receipt, &deposit).await;
+
+    // The fill pays the handler, which passes the output to the destination account, and that
+    // account's shield puts all of it into Railgun.
+    let filled = fill_and_shield(
+        &destination_fork,
+        destination,
+        DESTINATION_TOKEN,
+        &deposit,
+        swap.account,
+    )
+    .await;
+    verify_public_delivery(
+        &wallet,
+        &destination_fork,
+        &swap,
+        deposit.outputAmount,
+        &filled,
+    )
+    .await;
+
+    // The second deposit's fill is withheld, and Across reports it expired.
+    let withheld = wallet.public_swap(&destination_fork, &signer, terms).await;
+    approve(&withheld).await.unwrap();
+    let signed = wallet
+        .sign_public_delivery(
+            &withheld,
+            fork.timestamp().await,
+            valid_until(PUBLIC_VALID_SECS),
+        )
+        .await;
+    let held = fork.erc20_balance(USDC, source).await;
+    let (receipt, deposit) =
+        deposit_from_public_account(&wallet, &fork, &signer, &withheld, &signed).await;
+    assert_eq!(fork.erc20_balance(USDC, source).await, held - sold);
+    observe_public_handoff(&wallet, &fork, &withheld, &receipt, &deposit).await;
+    let expired = |refund| {
+        across_deposit_record(
+            "expired",
+            None,
+            refund,
+            handler,
+            DESTINATION_CHAIN,
+            deposit.outputAmount,
+        )
+    };
+    let (across, reply, stub) = across_deposit_stub(expired(None)).await;
+    assert_eq!(
+        owner
+            .check_public_swap_bridge(withheld.operation, withheld.id, &across)
+            .await
+            .unwrap(),
+        Some(SwapBridgeOutcome::Refunding)
+    );
+    let (refunding, shield) = public_swap_record(&wallet, &withheld);
+    assert_eq!(shield, Some(SwapDestinationOutcome::Unfilled));
+    assert_eq!(refunding.observations().bridge_refund, None);
+    let refund =
+        || owner.observe_public_swap_refund(withheld.operation, withheld.id, origin, &across);
+    // Across names no refund transaction yet.
+    assert_eq!(refund().await.unwrap(), None);
+
+    // The SpokePool refunds the deposit's input to the depositor, the Public account.
+    fork.impersonate(spoke_pool).await;
+    let refunded = fork
+        .send(
+            TransactionRequest::default()
+                .from(spoke_pool)
+                .to(USDC)
+                .input(
+                    ForkTransfer::transferCall {
+                        to: source,
+                        amount: deposit.inputAmount,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .gas_limit(200_000),
+        )
+        .await;
+    assert!(refunded.status(), "the SpokePool refunds the deposit");
+    *reply.lock().unwrap() = expired(Some(refunded.transaction_hash));
+    assert_eq!(
+        refund().await.unwrap(),
+        None,
+        "the refund's block isn't final yet"
+    );
+    fork.mine(origin.finality_depth).await;
+    let verified = Some(SwapObservation {
+        block: BlockNumHash::new(refunded.block_number.unwrap(), refunded.block_hash.unwrap()),
+        transaction_hash: Some(refunded.transaction_hash),
+    });
+    assert_eq!(refund().await.unwrap(), verified);
+    let (saved, shield) = public_swap_record(&wallet, &withheld);
+    assert_eq!(saved.observations().bridge_refund, verified);
+    assert_eq!(
+        saved.observations().bridge_outcome,
+        Some(SwapBridgeOutcome::Refunding)
+    );
+    assert_eq!(shield, Some(SwapDestinationOutcome::Unfilled));
+    stub.abort();
+    // The tokens are back in the Public account. The destination account received nothing,
+    // and its shield never ran.
+    assert_eq!(fork.erc20_balance(USDC, source).await, held);
+    let account = withheld.account.executor();
+    assert_eq!(
+        (
+            destination_fork
+                .erc20_balance(DESTINATION_TOKEN, account)
+                .await,
+            execution_nonce(&destination_fork, account).await
+        ),
+        (U256::ZERO, withheld.account.observed().nonce())
+    );
+
+    // ETH is deposited as WETH: no approval, and the amount as the transaction's value.
+    let amount = U256::from(SELL_AMOUNT);
+    let native = wallet
+        .public_swap(
+            &destination_fork,
+            &signer,
+            PublicTerms {
+                sell_token: Address::ZERO,
+                sell_amount: amount,
+                bridged_token: WETH,
+                bridged_amount: amount,
+                destination_token: POLYGON_WETH,
+                destination_minimum: amount - amount / U256::from(100),
+                hook_gas_limit: None,
+            },
+        )
+        .await;
+    assert!(native.plan.approval_gas_limits.is_empty());
+    approve(&native).await.unwrap();
+    assert!(
+        public_swap_record(&wallet, &native)
+            .0
+            .transactions()
+            .is_empty()
+    );
+    let signed = wallet
+        .sign_public_delivery(
+            &native,
+            fork.timestamp().await,
+            valid_until(PUBLIC_VALID_SECS),
+        )
+        .await;
+    let (ether, wrapped) = (
+        fork.native_balance(source).await,
+        fork.erc20_balance(WETH, source).await,
+    );
+    let (receipt, deposit) =
+        deposit_from_public_account(&wallet, &fork, &signer, &native, &signed).await;
+    let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
+    assert_eq!(
+        (
+            fork.native_balance(source).await,
+            fork.erc20_balance(WETH, source).await
+        ),
+        (ether - amount - gas, wrapped)
+    );
+    let sent = public_swap_record(&wallet, &native).0;
+    assert!(matches!(
+        sent.transactions(),
+        [transaction] if transaction.kind == PublicSwapTransactionKind::Deposit
+            && transaction.hash == receipt.transaction_hash
+            && transaction.transaction.value == Some(amount)
+    ));
+    observe_public_handoff(&wallet, &fork, &native, &receipt, &deposit).await;
+    wallet.finish().await;
+}
+
+/// Deploy `SwapMath` on `fork` through the deterministic deployer, as its release does, unless
+/// the forked chain already has it.
+async fn deploy_swap_math(fork: &ForkChain) {
+    if fork.code(SWAP_MATH_ADDRESS).await.is_empty() {
+        let receipt = fork
+            .send_as_bypass(
+                DETERMINISTIC_DEPLOYER,
+                swap_math_deployment_calldata(),
+                1_000_000,
+            )
+            .await;
+        assert!(
+            receipt.status(),
+            "the deterministic deployer deploys the math contract"
+        );
+    }
+    assert_eq!(
+        alloy::primitives::keccak256(fork.code(SWAP_MATH_ADDRESS).await),
+        SWAP_MATH_RUNTIME_CODE_HASH
+    );
+}
+
+/// Place an order of the Public account `signer` through the wallet: it sells WETH for USDC
+/// paid to the account's cow-shed proxy, whose hook batch deposits the proxy's whole balance
+/// for a new destination stealth account on `route`'s chain. The account approves the vault
+/// relayer, the delivery is signed for the order's buy amount and `validTo` against a quote
+/// dated `quote_ahead` seconds ahead of the swap chain's clock, and the order is taken from
+/// what the orderbook stub received.
+async fn place_public_order(
+    wallet: &Wallet,
+    fork: &ForkChain,
+    destination_fork: &ForkChain,
+    signer: &VaultedPublicSigner,
+    route: OrderDestination,
+    quote_ahead: u64,
+) -> PlacedOrder {
+    let origin = &wallet.chain;
+    let owner = &wallet.destination.as_ref().unwrap().owner;
+    let profile = origin.public_swap_profile().unwrap();
+    let source = signer.address();
+    let proxy = proxy_address(
+        profile.cow_shed_factory(),
+        profile.cow_shed_implementation(),
+        source,
+    );
+    let sell_amount = U256::from(SELL_AMOUNT);
+    // The account holds gas money and the WETH it sells.
+    fork.impersonate(source).await;
+    fork.add_erc20(WETH, source, sell_amount).await;
+    // The limit a review declares for the hook: an account's first batch deploys its proxy.
+    let proxy_deployed = !fork.code(proxy).await.is_empty();
+    let hook_gas_limit = crate::cow::hook_gas_limit(crate::cow::public_deposit_hook_gas(
+        proxy_deployed,
+        railgun_wallet::tx::GasEstimateMode::UpperBound,
+    ));
+    let swap = wallet
+        .public_swap(
+            destination_fork,
+            signer,
+            PublicTerms {
+                sell_token: WETH,
+                sell_amount,
+                bridged_token: USDC,
+                bridged_amount: U256::from(PUBLIC_ORDER_BUY_AMOUNT),
+                destination_token: route.token,
+                destination_minimum: U256::from(route.minimum),
+                hook_gas_limit: Some(hook_gas_limit),
+            },
+        )
+        .await;
+    owner
+        .submit_public_swap_approvals_with_signer(
+            swap.operation,
+            swap.id,
+            origin,
+            signer,
+            PUBLIC_GAS_FEE,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fork.call(
+            WETH,
+            ForkAllowance::allowanceCall {
+                owner: source,
+                spender: profile.vault_relayer(),
+            },
+        )
+        .await,
+        sell_amount
+    );
+
+    // A new block puts the fork's clock at the present before the quote is dated.
+    fork.mine(1).await;
+    let quoted = fork.timestamp().await + quote_ahead;
+    let valid_to = valid_until(PUBLIC_VALID_SECS);
+    let signed = wallet.sign_public_delivery(&swap, quoted, valid_to).await;
+    let orderbook = spawn_public_orderbook(profile.settlement()).await;
+    let outcome = owner
+        .submit_public_swap_order_with_signer(
+            swap.operation,
+            swap.id,
+            origin,
+            signer,
+            &orderbook.client,
+            &signed.delivery,
+            &signed.terms,
+            valid_to,
+            new_public_swap_batch_nonce().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let PublicSwapOrderOutcome::Submitted { uid } = outcome else {
+        panic!("the order is submitted: {outcome:?}");
+    };
+    let body = orderbook.orders.lock().unwrap().last().cloned().unwrap();
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    assert!(hooks.pre.is_empty());
+    let [hook] = hooks.post.as_slice() else {
+        panic!("the order has one post-hook");
+    };
+    assert_eq!(
+        (hook.target, hook.gas_limit),
+        (profile.cow_shed_factory(), hook_gas_limit)
+    );
+    let order = submitted_order(&body);
+    assert_eq!(
+        (order.sellToken, order.buyToken, order.receiver),
+        (WETH, USDC, proxy)
+    );
+    assert_eq!(
+        (order.sellAmount, order.buyAmount, order.validTo),
+        (sell_amount, U256::from(PUBLIC_ORDER_BUY_AMOUNT), valid_to)
+    );
+    PlacedOrder {
+        hook: hook.clone(),
+        signature: body["signature"].as_str().unwrap().parse().unwrap(),
+        swap,
+        signed,
+        orderbook,
+        order,
+        uid,
+        proxy,
+        valid_to,
+    }
+}
+
+/// Read what became of `placed`'s order through the wallet once the block of `settlement` is
+/// final, with the orderbook stub reporting the order's trade there. The wallet must record
+/// the trade in that transaction, for `payout`. Returns what its record then holds of the swap.
+async fn observe_public_settlement(
+    wallet: &Wallet,
+    fork: &ForkChain,
+    placed: &PlacedOrder,
+    settlement: &TransactionReceipt,
+    payout: U256,
+) -> PublicSwapObservations {
+    let origin = &wallet.chain;
+    let owner = &wallet.destination.as_ref().unwrap().owner;
+    *placed.orderbook.trade_block.lock().unwrap() = settlement.block_number;
+    fork.mine(origin.finality_depth).await;
+    let record = owner
+        .observe_public_swap_order(
+            placed.swap.operation,
+            placed.swap.id,
+            origin,
+            &placed.orderbook.client,
+        )
+        .await
+        .unwrap();
+    let (_, saved) = record.public_swap_use(placed.swap.id).unwrap();
+    let observed = saved.observations();
+    let traded = observed
+        .traded
+        .expect("the final settlement holds the order's trade");
+    assert_eq!(
+        (traded.block.number, traded.transaction_hash),
+        (
+            settlement.block_number.unwrap(),
+            Some(settlement.transaction_hash)
+        )
+    );
+    assert_eq!(
+        observed
+            .trade_amounts
+            .map(|amounts| (amounts.sell_amount, amounts.buy_amount)),
+        Some((placed.order.sellAmount, payout))
+    );
+    observed
+}
+
+/// Place an order of the Public account `signer` whose hook must fail at its settlement, and
+/// settle it above its buy amount. The deposit's quote is dated ahead of the fork's clock, so
+/// the `SpokePool` refuses it until that time comes. The settlement must succeed and leave its
+/// payout at the address of the account's proxy, which the failed hook didn't deploy, and the
+/// wallet must record the proxy as holding it while the batch can still run. Returns the order
+/// and the payout.
+async fn held_public_order(
+    wallet: &Wallet,
+    fork: &ForkChain,
+    destination_fork: &ForkChain,
+    signer: &VaultedPublicSigner,
+    route: OrderDestination,
+) -> (PlacedOrder, U256) {
+    let spoke_pool = wallet.chain.bridge_origin_profile().unwrap().spoke_pool();
+    let placed = place_public_order(
+        wallet,
+        fork,
+        destination_fork,
+        signer,
+        route,
+        QUOTE_AHEAD_SECS,
+    )
+    .await;
+    let payout = placed.order.buyAmount + U256::from(SURPLUS);
+    let receipt = fork
+        .settle_with_surplus(
+            &placed.order,
+            placed.signature.clone(),
+            &[],
+            std::slice::from_ref(&placed.hook),
+            U256::from(SURPLUS),
+        )
+        .await;
+    assert!(receipt.status(), "the settlement survives its failed hook");
+    assert!(
+        fork.timestamp().await < u64::from(placed.signed.terms.quote_timestamp),
+        "the settlement's block precedes the deposit's quote"
+    );
+    assert!(deposits(&receipt, spoke_pool).is_empty());
+    assert_eq!(fork.erc20_balance(USDC, placed.proxy).await, payout);
+    assert!(fork.code(placed.proxy).await.is_empty());
+
+    let observed = observe_public_settlement(wallet, fork, &placed, &receipt, payout).await;
+    assert_eq!(
+        observed.held_by_proxy,
+        Some(PublicSwapProxyHolding {
+            observation: observed.traded.unwrap(),
+            amount: payout,
+        })
+    );
+    assert_eq!((observed.bridge_handoff, observed.deposited), (None, None));
+    assert_eq!(
+        public_order_state(wallet, &placed.swap),
+        Some(PublicSwapOrderState::HeldByProxy {
+            amount: payout,
+            batch_live: true,
+        })
+    );
+    (placed, payout)
+}
+
+/// A Public account on Ethereum places an order that pays its cow-shed proxy, whose hook batch
+/// deposits the proxy's whole balance into Across for `route`'s chain. A settlement above the
+/// buy amount deposits all of its payout at the signed scale, and the fill shields the whole
+/// output to the wallet on that chain.
+///
+/// With `route.every_outcome`, the account's next order then runs its batch on the deployed
+/// proxy. Other accounts follow: one whose hook fails at the settlement and that withdraws the
+/// proceeds its proxy holds, one whose order is invalidated on chain, and one whose failed
+/// batch someone runs again before its deadline.
+async fn public_order_scenario(route: OrderDestination) {
+    let fork = ForkChain::start().await;
+    let destination_fork = ForkChain::start_destination_from(route.rpc_env, route.chain_id).await;
+    let wallet = Wallet::open(&fork).with_destination_on(&destination_fork, route.chain_id);
+    let origin = &wallet.chain;
+    let destination = wallet.destination.as_ref().unwrap();
+    let owner = &destination.owner;
+    let profile = origin.public_swap_profile().unwrap();
+    let (factory, settlement) = (profile.cow_shed_factory(), profile.settlement());
+    let spoke_pool = origin.bridge_origin_profile().unwrap().spoke_pool();
+    let bridge = destination.chain.bridge_profile().unwrap();
+    let handler = bridge.multicall_handler();
+    let (buy_amount, minimum) = (
+        U256::from(PUBLIC_ORDER_BUY_AMOUNT),
+        U256::from(route.minimum),
+    );
+    let payout = buy_amount + U256::from(SURPLUS);
+    // The batch scales the deposit's output from the proxy's balance, rounding down.
+    let scaled = payout * minimum / buy_amount;
+    assert!(scaled > minimum);
+    // What the wallet's record holds of `placed`'s order after one more read of its chain.
+    let observe = async |placed: &PlacedOrder| {
+        owner
+            .observe_public_swap_order(
+                placed.swap.operation,
+                placed.swap.id,
+                origin,
+                &placed.orderbook.client,
+            )
+            .await
+    };
+
+    deploy_swap_math(&fork).await;
+    fund_relayer_with(
+        &destination_fork,
+        bridge.spoke_pool(),
+        route.token,
+        minimum * U256::from(10),
+    )
+    .await;
+
+    let signer = public_signer("order");
+    let source = signer.address();
+    let placed = place_public_order(&wallet, &fork, &destination_fork, &signer, route, 0).await;
+    let proxy = placed.proxy;
+
+    // Anyone can run the published batch before the settlement. Its guard reverts while the
+    // proxy holds less than the buy amount, and the factory deploys nothing.
+    assert!(fork.code(proxy).await.is_empty());
+    let early = fork
+        .send_as_bypass(factory, placed.hook.call_data.clone(), BATCH_GAS)
+        .await;
+    assert!(!early.status(), "an early run of the batch reverts");
+    assert!(fork.code(proxy).await.is_empty());
+
+    // The solver pays more than the buy amount, and the hook deposits all of it.
+    let receipt = fork
+        .settle_with_surplus(
+            &placed.order,
+            placed.signature.clone(),
+            &[],
+            std::slice::from_ref(&placed.hook),
+            U256::from(SURPLUS),
+        )
+        .await;
+    assert!(
+        receipt.status(),
+        "the solver settles with the batch as its post-hook"
+    );
+    let settled_deposits = deposits(&receipt, spoke_pool);
+    let [deposit] = settled_deposits.as_slice() else {
+        panic!("the hook deposits once within its gas limit");
+    };
+    assert_eq!(
+        (deposit.inputAmount, deposit.outputAmount),
+        (payout, scaled)
+    );
+    assert_eq!(
+        (deposit.depositor, deposit.recipient),
+        (address_to_bytes32(source), address_to_bytes32(handler))
+    );
+    assert_eq!(deposit.message, placed.signed.message);
+    assert_eq!(
+        (
+            deposit.inputToken,
+            deposit.outputToken,
+            deposit.destinationChainId
+        ),
+        (
+            address_to_bytes32(USDC),
+            address_to_bytes32(route.token),
+            U256::from(route.chain_id)
+        )
+    );
+    assert_eq!(fork.erc20_balance(USDC, proxy).await, U256::ZERO);
+    assert!(!fork.code(proxy).await.is_empty());
+    let deploying_gas = fork
+        .call_gas(receipt.transaction_hash, factory, &placed.hook.call_data)
+        .await
+        .expect("the settlement's trace holds the hook's call");
+    assert!(
+        deploying_gas <= placed.hook.gas_limit,
+        "the hook used {deploying_gas} gas of its limit of {}",
+        placed.hook.gas_limit
+    );
+    println!(
+        "MEASURE public_order_hook_gas chain={} proxy=deployed_by_hook used={deploying_gas} limit={}",
+        route.chain_id, placed.hook.gas_limit
+    );
+
+    // The wallet reads the trade and the hand-off from the settlement once it is final, with
+    // the amounts the deposit's event carries.
+    let observed = observe_public_settlement(&wallet, &fork, &placed, &receipt, payout).await;
+    assert_eq!(
+        observed.bridge_handoff,
+        Some(SwapBridgeHandoff {
+            observation: observed.traded.unwrap(),
+            deposit_id: Some(deposit.depositId),
+        })
+    );
+    assert_eq!(
+        observed.deposited,
+        Some(PublicSwapDeposited {
+            input_amount: payout,
+            output_amount: scaled,
+        })
+    );
+    assert_eq!(observed.held_by_proxy, None);
+    assert_eq!(
+        public_order_state(&wallet, &placed.swap),
+        Some(PublicSwapOrderState::Bridged)
+    );
+
+    // The destination account shields the whole deposited output, not only the minimum.
+    let filled = fill_and_shield(
+        &destination_fork,
+        destination,
+        route.token,
+        deposit,
+        placed.swap.account,
+    )
+    .await;
+    verify_public_delivery(&wallet, &destination_fork, &placed.swap, scaled, &filled).await;
+    if !route.every_outcome {
+        drop(placed);
+        wallet.finish().await;
+        return;
+    }
+
+    // The account's next order runs its batch on the deployed proxy, for a lower reviewed gas
+    // limit. Settled at exactly its buy amount, it deposits the signed minimums.
+    let next = place_public_order(&wallet, &fork, &destination_fork, &signer, route, 0).await;
+    assert!(next.hook.gas_limit < placed.hook.gas_limit);
+    let receipt = fork
+        .settle(
+            &next.order,
+            next.signature.clone(),
+            &[],
+            std::slice::from_ref(&next.hook),
+        )
+        .await;
+    assert!(receipt.status(), "the solver settles the next order");
+    let exact = deposits(&receipt, spoke_pool);
+    let [exact] = exact.as_slice() else {
+        panic!("the next hook deposits once within its gas limit");
+    };
+    assert_eq!(
+        (exact.inputAmount, exact.outputAmount),
+        (buy_amount, minimum)
+    );
+    let deployed_gas = fork
+        .call_gas(receipt.transaction_hash, factory, &next.hook.call_data)
+        .await
+        .expect("the settlement's trace holds the hook's call");
+    assert!(
+        deployed_gas <= next.hook.gas_limit,
+        "the hook used {deployed_gas} gas of its limit of {}",
+        next.hook.gas_limit
+    );
+    println!(
+        "MEASURE public_order_hook_gas chain={} proxy=deployed_before used={deployed_gas} limit={}",
+        route.chain_id, next.hook.gas_limit
+    );
+    let observed = observe_public_settlement(&wallet, &fork, &next, &receipt, buy_amount).await;
+    assert_eq!(
+        observed.deposited,
+        Some(PublicSwapDeposited {
+            input_amount: buy_amount,
+            output_amount: minimum,
+        })
+    );
+    assert_eq!(
+        public_order_state(&wallet, &next.swap),
+        Some(PublicSwapOrderState::Bridged)
+    );
+    drop((placed, next));
+
+    // Another account's hook fails at the settlement, and its proxy was never deployed. The
+    // account withdraws the proceeds in one transaction through the factory, which deploys
+    // the proxy and runs the transfer.
+    let signer = public_signer("withdrawal");
+    let source = signer.address();
+    let (held, payout) = held_public_order(&wallet, &fork, &destination_fork, &signer, route).await;
+    let (operation, id) = (held.swap.operation, held.swap.id);
+    let review = owner
+        .review_public_swap_withdrawal(
+            operation,
+            id,
+            origin,
+            PUBLIC_MAX_FEE_PER_GAS,
+            PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (review.proxy, review.token, review.amount),
+        (held.proxy, USDC, payout)
+    );
+    assert!(!review.proxy_deployed);
+    let before = fork.erc20_balance(USDC, source).await;
+    let outcome = owner
+        .submit_public_swap_withdrawal_with_signer(
+            operation,
+            id,
+            origin,
+            &signer,
+            PUBLIC_GAS_FEE,
+            &review,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    let PublicSwapTransactionOutcome::Included {
+        transaction_hash, ..
+    } = outcome
+    else {
+        panic!("the withdrawal succeeds: {outcome:?}");
+    };
+    let withdrawal = fork.receipt(transaction_hash).await;
+    assert_eq!(withdrawal.to, Some(factory));
+    assert_eq!(
+        (
+            fork.erc20_balance(USDC, source).await,
+            fork.erc20_balance(USDC, held.proxy).await
+        ),
+        (before + payout, U256::ZERO)
+    );
+    assert!(!fork.code(held.proxy).await.is_empty());
+    assert!(
+        withdrawal.gas_used <= review.gas_limit,
+        "the withdrawal used {} gas of the reviewed {}",
+        withdrawal.gas_used,
+        review.gas_limit
+    );
+    println!(
+        "MEASURE public_order_withdrawal_gas proxy=deployed_by_withdrawal used={} limit={}",
+        withdrawal.gas_used, review.gas_limit
+    );
+    // The account sent its approval and this one withdrawal.
+    let sent = public_swap_record(&wallet, &held.swap).0;
+    assert!(matches!(
+        sent.transactions(),
+        [approval, withdrawal] if approval.kind == PublicSwapTransactionKind::Approval
+            && withdrawal.kind == PublicSwapTransactionKind::Withdrawal
+            && withdrawal.hash == transaction_hash
+    ));
+    // The withdrawal counts once its block is final.
+    fork.mine(origin.finality_depth).await;
+    observe(&held).await.unwrap();
+    let withdrawn = public_swap_record(&wallet, &held.swap).0;
+    assert_eq!(
+        withdrawn
+            .observations()
+            .withdrawn
+            .and_then(|observation| observation.transaction_hash),
+        Some(transaction_hash)
+    );
+    assert_eq!(
+        public_swap_order_state(&withdrawn),
+        Some(PublicSwapOrderState::SwappedNotBridged)
+    );
+    drop(held);
+
+    // Another account invalidates its open order on chain. Its hook batch stays signed, so a
+    // second swap of the account that buys the same token is refused until the batch's
+    // deadline has passed: a later payout to the proxy can't be taken by the cancelled order's
+    // batch.
+    let signer = public_signer("cancellation");
+    let open = place_public_order(&wallet, &fork, &destination_fork, &signer, route, 0).await;
+    let outcome = owner
+        .submit_public_swap_invalidation_with_signer(
+            open.swap.operation,
+            open.swap.id,
+            origin,
+            &signer,
+            PUBLIC_GAS_FEE,
+            &open.orderbook.client,
+            INVALIDATION_GAS_LIMIT,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, PublicSwapTransactionOutcome::Included { .. }),
+        "the invalidation succeeds: {outcome:?}"
+    );
+    let deadline = u64::from(open.valid_to);
+    // The sending step saw the invalidation's first inclusion. The settlement state in that
+    // block is not final yet, so it cannot conclude cancellation or release admission.
+    assert_eq!(
+        public_order_state(&wallet, &open.swap),
+        Some(PublicSwapOrderState::Open)
+    );
+    assert_eq!(
+        fork.call(
+            settlement,
+            ForkSwapSettlement::filledAmountCall {
+                orderUid: open.uid.0.to_vec().into(),
+            },
+        )
+        .await,
+        U256::MAX
+    );
+    fork.mine(origin.finality_depth).await;
+    observe(&open).await.unwrap();
+    let cancelled = public_swap_record(&wallet, &open.swap).0;
+    assert_eq!(
+        public_swap_order_state(&cancelled),
+        Some(PublicSwapOrderState::Cancelled {
+            retry_at: deadline + 1
+        })
+    );
+    assert_eq!(
+        cancelled.observations().cancelled.unwrap().transaction_hash,
+        None
+    );
+    let refused = owner
+        .claim_public_swap(public_claim(
+            SwapUseId::random().unwrap(),
+            ExecutorOperationId::random().unwrap(),
+            signer.address(),
+            open.swap.terms,
+            open.swap.plan.max_gas_cost,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<ExecutorStoreError>(),
+            Some(ExecutorStoreError::PublicSwapBuysSameToken {
+                swap,
+                chain_id,
+                available_at: Some(available_at),
+            }) if *swap == open.swap.id
+                && *chain_id == route.chain_id
+                && *available_at == deadline + 1
+        ),
+        "the second swap is refused until the batch's deadline: {refused}"
+    );
+    drop(open);
+
+    // Another account's hook fails at the settlement because its deposit's quote is dated
+    // ahead of the fork's clock. Once that time has come, someone runs the same batch again
+    // before its deadline, and it deposits what the proxy held.
+    let signer = public_signer("late batch");
+    let source = signer.address();
+    let (late, payout) = held_public_order(&wallet, &fork, &destination_fork, &signer, route).await;
+    mine_past(&fork, u64::from(late.signed.terms.quote_timestamp)).await;
+    let run = fork
+        .send_as_bypass(factory, late.hook.call_data.clone(), BATCH_GAS)
+        .await;
+    assert!(
+        run.status(),
+        "the same batch deposits once the pool accepts its quote"
+    );
+    let deadline = u64::from(late.valid_to);
+    assert!(
+        fork.timestamp().await <= deadline,
+        "the batch ran before its deadline"
+    );
+    let deposits = deposits(&run, spoke_pool);
+    let [deposit] = deposits.as_slice() else {
+        panic!("the late run deposits once");
+    };
+    assert_eq!(
+        (deposit.depositor, deposit.inputAmount, deposit.outputAmount),
+        (address_to_bytes32(source), payout, scaled)
+    );
+    assert_eq!(fork.erc20_balance(USDC, late.proxy).await, U256::ZERO);
+    assert!(!fork.code(late.proxy).await.is_empty());
+
+    // The batch can run until its deadline, so the wallet looks for no deposit before the
+    // first block past it is final. Then it finds this one among the Public account's
+    // deposits, and the swap is bridged.
+    fork.mine(origin.finality_depth).await;
+    observe(&late).await.unwrap();
+    assert_eq!(
+        public_order_state(&wallet, &late.swap),
+        Some(PublicSwapOrderState::HeldByProxy {
+            amount: payout,
+            batch_live: true,
+        })
+    );
+    mine_past(&fork, deadline).await;
+    fork.mine(origin.finality_depth).await;
+    observe(&late).await.unwrap();
+    let observed = public_swap_record(&wallet, &late.swap).0.observations();
+    assert_eq!(
+        observed.bridge_handoff,
+        Some(SwapBridgeHandoff {
+            observation: SwapObservation {
+                block: BlockNumHash::new(run.block_number.unwrap(), run.block_hash.unwrap()),
+                transaction_hash: Some(run.transaction_hash),
+            },
+            deposit_id: Some(deposit.depositId),
+        })
+    );
+    assert_eq!(
+        observed.deposited,
+        Some(PublicSwapDeposited {
+            input_amount: payout,
+            output_amount: scaled,
+        })
+    );
+    assert_eq!(
+        public_order_state(&wallet, &late.swap),
+        Some(PublicSwapOrderState::Bridged)
+    );
+    let filled = fill_and_shield(
+        &destination_fork,
+        destination,
+        route.token,
+        deposit,
+        late.swap.account,
+    )
+    .await;
+    verify_public_delivery(&wallet, &destination_fork, &late.swap, scaled, &filled).await;
+    drop(late);
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_order_deposits_its_whole_payout_and_is_shielded() {
+    Box::pin(public_order_scenario(OrderDestination {
+        chain_id: DESTINATION_CHAIN,
+        rpc_env: DESTINATION_FORK_RPC_URL_ENV,
+        token: DESTINATION_TOKEN,
+        minimum: 14_900_000,
+        every_outcome: true,
+    }))
+    .await;
+}
+
+// BNB Chain's USDC has 18 decimals, so the approved minimum and the output the batch scales
+// from the payout are in units a trillion times smaller than the 6-decimal USDC the order buys.
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL, BNB_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_order_scales_its_output_to_an_18_decimal_token() {
+    Box::pin(public_order_scenario(OrderDestination {
+        chain_id: BNB_CHAIN,
+        rpc_env: BNB_FORK_RPC_URL_ENV,
+        token: BNB_USDC,
+        minimum: 14_900_000_000_000_000_000,
+        every_outcome: false,
+    }))
+    .await;
 }

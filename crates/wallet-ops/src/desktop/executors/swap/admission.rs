@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// The wallet's local notes on a destination chain, read for the verdicts of earlier shields.
-pub(crate) trait SwapShieldNotes: Sync {
+pub trait SwapShieldNotes: Sync {
     /// The local notes `shield` created, spent ones included. `None` while the wallet has no
     /// snapshot of its notes.
     fn shield_notes(&self, shield: &SwapEarlierShield) -> Option<Vec<WalletUtxo>>;

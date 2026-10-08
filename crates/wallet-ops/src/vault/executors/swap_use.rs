@@ -2,7 +2,7 @@ use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorAsset, ExecutorDerivationScheme,
     ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord,
     ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck, FixedBytes,
-    IssuedExecutorPayload, IssuedExecutorRecoveryTransaction, LEGACY_VERSION,
+    IssuedExecutorPayload, IssuedExecutorRecoveryTransaction, LEGACY_VERSION, PublicSwapRecord,
     SWAP_DESTINATION_PURPOSE_SUMMARY, Serialize, SwapAccountRole, SwapAccountUse,
     SwapAdmissionEvidence, SwapApproval, SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome,
     SwapDestinationRecord, SwapOperationRecord, SwapOrderRecord, VERSION, local_timestamp,
@@ -72,12 +72,21 @@ impl SwapUseRecord {
     pub const fn role(&self) -> &SwapUseRole {
         &self.role
     }
-    /// The approval saved with this source use. Destination uses have no approval.
+    /// The approval saved with this source use. Destination uses have no approval, and a swap
+    /// paid from a Public account keeps its own kind in [`Self::public_swap`].
     #[must_use]
     pub fn approval(&self) -> Option<&SwapApproval> {
         match &self.role {
             SwapUseRole::Source { approval, .. } => approval.as_deref(),
-            SwapUseRole::Destination { .. } => None,
+            SwapUseRole::Destination { .. } | SwapUseRole::PublicSourceDestination { .. } => None,
+        }
+    }
+    /// The swap this use delivers, when a Public account pays for it.
+    #[must_use]
+    pub const fn public_swap(&self) -> Option<&PublicSwapRecord> {
+        match &self.role {
+            SwapUseRole::PublicSourceDestination { swap, .. } => Some(&**swap),
+            SwapUseRole::Source { .. } | SwapUseRole::Destination { .. } => None,
         }
     }
 }
@@ -105,6 +114,20 @@ pub enum SwapUseRole {
         /// What became of the shield payload, from the origin swap's bridge outcome.
         #[serde(default)]
         outcome: Option<SwapDestinationOutcome>,
+    },
+    /// The account receives the delivery of a swap paid from a Public account on another chain.
+    /// There is no source stealth account: the swap's whole record is `swap`.
+    PublicSourceDestination {
+        origin_chain: u64,
+        /// The Public account that pays.
+        source: Address,
+        destination_token: Address,
+        /// Hashes of the `SwapDestinationShield` payloads issued for this use.
+        #[serde(default)]
+        shields: Vec<B256>,
+        #[serde(default)]
+        outcome: Option<SwapDestinationOutcome>,
+        swap: Box<PublicSwapRecord>,
     },
 }
 
@@ -194,6 +217,12 @@ impl ExecutorRecord {
     pub fn swap_use(&self, id: SwapUseId) -> Option<&SwapUseRecord> {
         self.swap_uses.iter().find(|swap_use| swap_use.id == id)
     }
+    /// The use `id` and the swap it delivers, when a Public account pays for it.
+    #[must_use]
+    pub fn public_swap_use(&self, id: SwapUseId) -> Option<(&SwapUseRecord, &PublicSwapRecord)> {
+        let swap_use = self.swap_use(id)?;
+        Some((swap_use, swap_use.public_swap()?))
+    }
 
     /// What the latest use serves, when it is a destination use.
     #[must_use]
@@ -256,6 +285,10 @@ impl ExecutorRecord {
             matches!(
                 &swap_use.role,
                 SwapUseRole::Destination {
+                    shields,
+                    outcome: Some(SwapDestinationOutcome::Shielded { .. }),
+                    ..
+                } | SwapUseRole::PublicSourceDestination {
                     shields,
                     outcome: Some(SwapDestinationOutcome::Shielded { .. }),
                     ..
@@ -340,7 +373,8 @@ impl ExecutorRecord {
         swap_use.stopped_before_order = true;
         let fresh = swap_use.fresh;
         let (destination, shielded) = match &swap_use.role {
-            SwapUseRole::Destination { shields, .. } => (true, !shields.is_empty()),
+            SwapUseRole::Destination { shields, .. }
+            | SwapUseRole::PublicSourceDestination { shields, .. } => (true, !shields.is_empty()),
             SwapUseRole::Source { .. } => (false, false),
         };
         if fresh && self.active_swap_use == Some(id) {
@@ -379,6 +413,9 @@ impl ExecutorRecord {
     /// the use is not fresh. The caller checks `admits_swap_use` first.
     fn begin_later_swap_use(&mut self, id: SwapUseId, role: SwapUseRole) {
         if let SwapUseRole::Destination {
+            destination_token, ..
+        }
+        | SwapUseRole::PublicSourceDestination {
             destination_token, ..
         } = &role
         {
@@ -429,7 +466,7 @@ const fn destination_view(swap_use: &SwapUseRecord) -> Option<SwapDestinationRec
             destination_token: *destination_token,
             outcome: *outcome,
         }),
-        SwapUseRole::Source { .. } => None,
+        SwapUseRole::Source { .. } | SwapUseRole::PublicSourceDestination { .. } => None,
     }
 }
 
@@ -689,7 +726,7 @@ fn admits_swap_use(
 
 /// Whether one side of a claim can take the use `id` in `role`: a new account's operation
 /// identity is unused, and an existing account on `chain_id` is there and admits another use.
-fn admit_swap_account(
+pub(super) fn admit_swap_account(
     choice: SwapAccountChoice,
     record: Option<&ExecutorRecord>,
     chain_id: u64,
@@ -991,6 +1028,12 @@ impl ExecutorStore {
         };
         let id = active.id;
         let source = matches!(active.role, SwapUseRole::Source { .. });
+        // A swap paid from a Public account has no linked record. It has no order while that
+        // account has signed nothing.
+        let unsigned_public = matches!(
+            &active.role,
+            SwapUseRole::PublicSourceDestination { swap, .. } if swap.path().is_none()
+        );
         let counterpart = match &active.role {
             SwapUseRole::Source { .. } => record.swap_use_destination(id),
             SwapUseRole::Destination {
@@ -998,6 +1041,7 @@ impl ExecutorStore {
                 origin_operation,
                 ..
             } => Some((*origin_chain, *origin_operation)),
+            SwapUseRole::PublicSourceDestination { .. } => None,
         };
         let mut other = counterpart
             .map(|(chain_id, operation)| {
@@ -1015,11 +1059,12 @@ impl ExecutorStore {
         let orderless = if source {
             !record.has_swap_use_order(id)
         } else {
-            other.as_ref().is_some_and(|(_, other)| {
-                other
-                    .as_ref()
-                    .is_some_and(|origin| !origin.has_swap_use_order(id))
-            })
+            unsigned_public
+                || other.as_ref().is_some_and(|(_, other)| {
+                    other
+                        .as_ref()
+                        .is_some_and(|origin| !origin.has_swap_use_order(id))
+                })
         };
         if orderless {
             record.cancel_swap_use(id);
@@ -1044,7 +1089,7 @@ impl ExecutorStore {
     /// Give one admitted side of a claim its use and append the result to `updates` without
     /// writing: the existing `record` with the use added, or a fresh account allocated for
     /// `operation` on this chain with the delegate, purpose summary and assets in `fresh`.
-    fn claim_swap_account(
+    pub(super) fn claim_swap_account(
         &self,
         operation: ExecutorOperationId,
         record: Option<ExecutorRecord>,

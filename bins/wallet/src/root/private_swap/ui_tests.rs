@@ -1,6 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::root::chain_load::{ChainUtxoState, WalletSyncLifecycle};
+use broadcaster_core::contracts::swap_math::{SWAP_MATH_ADDRESS, SWAP_MATH_CREATION_CODE};
 use gpui::{IntoElement, ParentElement, Render, Styled, TestAppContext, div};
 use gpui_component::{Root, WindowExt};
 use std::cell::Cell;
@@ -277,6 +278,55 @@ fn buy_asset_picker_searches_and_keeps_selection_in_sync(cx: &mut TestAppContext
                 swaps.set_form_sell(usdc, window, cx);
                 let form = swaps.form.as_ref().unwrap();
                 assert!(form.buy.is_none());
+
+                // The picker lists what the wallet holds first, by value, then the rest by
+                // symbol. WETH has a price, which a zero balance doesn't show.
+                let cache = &root.read(cx).public_broadcaster_anchor_cache;
+                cache.store_native_usd_rate(1, U256::from(3_000_000_000_u64), 18);
+                cache.store_rate(1, dai, U256::from(3_000_000_000_000_000_000_000_u128));
+                swaps.form.as_mut().unwrap().assets.totals = vec![
+                    (STUB_USDT, U256::from(5_000_000)),
+                    (dai, U256::from(1_000_000_000_000_000_000_000_u128)),
+                ];
+                let form = swaps.form.as_ref().unwrap();
+                let buy_picker::BuyPickerTokens::Listed(rows) =
+                    swaps.buy_picker_content(form, cx).tokens
+                else {
+                    panic!("the swap's own network lists its tokens");
+                };
+                assert_eq!(
+                    rows.iter()
+                        .take(2)
+                        .map(|row| (row.item.asset.token, row.usd.is_some()))
+                        .collect::<Vec<_>>(),
+                    [(dai, true), (STUB_USDT, false)],
+                    "a priced balance, then a balance without a price"
+                );
+                // Of the tokens the wallet doesn't hold, the network's own asset and its
+                // wrapped token lead, and the rest follow by symbol.
+                let wrapped = root
+                    .read(cx)
+                    .effective_chain_configs
+                    .get(1)
+                    .and_then(|chain| chain.wrapped_native_token);
+                let rest = rows[2..]
+                    .iter()
+                    .map(|row| {
+                        let rank = match row.item.asset.token {
+                            Address::ZERO => 0_u8,
+                            token if Some(token) == wrapped => 1,
+                            _ => 2,
+                        };
+                        (rank, row.item.asset.label.to_lowercase())
+                    })
+                    .collect::<Vec<_>>();
+                assert!(rest.is_sorted(), "{rest:?}");
+                assert!(rest.first().is_some_and(|(rank, _)| *rank < 2), "{rest:?}");
+                assert!(
+                    rows[2..]
+                        .iter()
+                        .any(|row| row.item.asset.token == STUB_WETH && row.usd.is_none())
+                );
             });
             window.draw(cx).clear(cx);
         });
@@ -346,7 +396,7 @@ fn swap_quote_error_wraps_within_its_column(cx: &mut TestAppContext) {
 #[gpui::test]
 fn quote_retry_discards_the_old_route_and_ignores_its_late_response(cx: &mut TestAppContext) {
     with_swap_view(cx, |_, swaps, _, operation, runtime, cx| {
-        let owner = swaps.read_with(cx, |swaps, _| Arc::clone(&swaps.owner));
+        let owner = swaps.read_with(cx, |swaps, _| Arc::clone(swaps.private_owner().unwrap()));
         let old_client = runtime.block_on(owner.swap_orderbook_client()).unwrap();
         for operation in [None, Some(operation)] {
             let mut old_revision = 0;
@@ -498,7 +548,7 @@ fn selected_account_swap_allows_changing_both_tokens_without_starting_setup(
             .unwrap();
         cx.update(|window, cx| {
             let target = crate::root::stealth_accounts::StealthAccountTarget::new(
-                &swaps.read(cx).session,
+                swaps.read(cx).private_session().unwrap(),
                 operation,
             );
             root.update(cx, |root, cx| {
@@ -843,7 +893,11 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
                 assert_eq!(form.operation, Some(operation));
                 assert_eq!(swaps.form_mode(form), FormMode::Setup { resume: true });
                 assert!(!swaps.tracking.get(&operation).unwrap().auto_place);
-                let preview = swaps.owner.swap_setup_preview(operation).unwrap();
+                let preview = swaps
+                    .private_owner()
+                    .unwrap()
+                    .swap_setup_preview(operation)
+                    .unwrap();
                 assert_eq!(preview.executor(), issued.address().unwrap());
                 assert!(preview.delegated().is_none());
                 swaps.form = None;
@@ -3085,7 +3139,8 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
             });
             swaps.update(cx, |swaps, cx| {
                 swaps
-                    .owner
+                    .private_owner()
+                    .unwrap()
                     .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
                 swaps.open_form(
                     None,
@@ -3251,7 +3306,8 @@ fn public_address_quote_is_ready_before_its_receiver_and_takes_it_locally(cx: &m
             });
             swaps.update(cx, |swaps, cx| {
                 swaps
-                    .owner
+                    .private_owner()
+                    .unwrap()
                     .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
                 swaps.open_form(
                     None,
@@ -3322,7 +3378,8 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps
-                    .owner
+                    .private_owner()
+                    .unwrap()
                     .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
                 swaps.open_form(
                     None,
@@ -4196,9 +4253,10 @@ fn private_balance_needs_a_synced_and_funded_network() {
 }
 
 /// The picker lists every other chain enabled with RPC endpoints, built in or added by the
-/// user, also without Railgun. Private balance can't deliver on such a chain, and opening the
-/// picker starts no session there. A Public address can pick it until its fetched routes show
-/// that no provider serves it, which a provider that couldn't be asked doesn't show.
+/// user, also without Railgun, in the network selector's order. Private balance can't deliver
+/// on such a chain, so it leaves those out and counts them, and opening the picker starts no
+/// session there. A Public address can pick one until its fetched routes show that no provider
+/// serves it, which a provider that couldn't be asked doesn't show.
 #[gpui::test]
 fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestAppContext) {
     const ADDED: u64 = 777_777;
@@ -4225,7 +4283,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
         cx.update(|window, cx| {
             root.update(cx, |root, _| {
                 enable_stub_chain(root, &stubs, 8453);
-                // A Railgun chain with a higher id than Base, which Private balance lists first.
+                // A Railgun chain with a higher id than Base, which the selector lists first.
                 enable_stub_chain(root, &stubs, 42161);
                 // A chain the user added has no Railgun deployment and no 1Click name, and the
                 // stub Across has no route to it.
@@ -4240,7 +4298,8 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
             });
             swaps.update(cx, |swaps, cx| {
                 swaps
-                    .owner
+                    .private_owner()
+                    .unwrap()
                     .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
                 swaps.open_form(
                     None,
@@ -4256,15 +4315,29 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 form.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
                 form.orderbook = Some(orderbook);
                 swaps.open_buy_picker(window, cx);
-                let public_only = unavailable(NetworkUnavailable::PublicOnly);
-                assert_eq!(
-                    listed(swaps, ReceiveTo::PrivateBalance, cx)
+                let chains = |swaps: &PrivateSwapsView, receive_to, cx: &App| {
+                    swaps
+                        .network_items(receive_to, cx)
                         .into_iter()
-                        .map(|(chain_id, availability)| (chain_id, availability == public_only))
-                        .collect::<Vec<_>>(),
-                    [(42161, false), (8453, true), (ADDED, true)],
-                    "Arbitrum One comes before the Public-address-only chains, and disabled \
-                     Optimism isn't listed"
+                        .map(|network| network.chain_id)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    chains(swaps, ReceiveTo::PrivateBalance, cx),
+                    [1, 42161],
+                    "only the chains with a private balance, and disabled Optimism isn't listed"
+                );
+                assert_eq!(
+                    chains(swaps, ReceiveTo::PublicAddress, cx),
+                    [1, 42161, 8453, ADDED],
+                    "the same order, with the Public-address-only chains after"
+                );
+                let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
+                assert_eq!(content.receive_to, ReceiveTo::PrivateBalance);
+                assert_eq!(
+                    content.network_counts,
+                    (2, 4),
+                    "Base and the added chain take a Public address only"
                 );
             });
             let states = &root.read(cx).chain_states;
@@ -4278,11 +4351,17 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 assert_eq!(
                     listed(swaps, ReceiveTo::PublicAddress, cx),
                     [
-                        (8453, NetworkAvailability::Available),
                         (42161, NetworkAvailability::Available),
+                        (8453, NetworkAvailability::Available),
                         (ADDED, NetworkAvailability::Available),
                     ],
                     "a chain can be picked before its routes are fetched"
+                );
+                let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
+                assert_eq!(
+                    content.network_counts,
+                    (2, 4),
+                    "the counts don't depend on the delivery kind"
                 );
 
                 // The network search filters what the picker lists, by name or by the start
@@ -4297,7 +4376,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 assert_eq!(matches(" ARBITRUM ", cx), [42161]);
                 assert_eq!(matches("7777", cx), [ADDED]);
                 assert_eq!(listed(swaps, ReceiveTo::PublicAddress, cx).len(), 3);
-                assert_eq!(matches("", cx), [1, 8453, 42161, ADDED]);
+                assert_eq!(matches("", cx), [1, 42161, 8453, ADDED]);
             });
         });
 
@@ -4335,8 +4414,8 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
             assert_eq!(
                 listed(swaps, ReceiveTo::PublicAddress, cx),
                 [
-                    (8453, NetworkAvailability::Available),
                     (42161, NetworkAvailability::Available),
+                    (8453, NetworkAvailability::Available),
                     (ADDED, unavailable(NetworkUnavailable::NoBridge)),
                 ]
             );
@@ -4366,7 +4445,10 @@ fn private_network_funding_checks_the_setup_fee_against_spendable_notes(cx: &mut
     let stubs = SwapStubs::start();
     with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
         let (session, owner) = swaps.read_with(cx, |swaps, _| {
-            (Arc::clone(&swaps.session), Arc::clone(&swaps.owner))
+            (
+                Arc::clone(swaps.private_session().unwrap()),
+                Arc::clone(swaps.private_owner().unwrap()),
+            )
         });
         let delegate = root.read_with(cx, |root, _| {
             root.effective_chain_configs
@@ -5036,7 +5118,10 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
             reusable_account(executors, operation);
             // A setup estimate on each network, as the form's routes would hold them.
             let (session, owner) = swaps.read_with(cx, |swaps, _| {
-                (Arc::clone(&swaps.session), Arc::clone(&swaps.owner))
+                (
+                    Arc::clone(swaps.private_session().unwrap()),
+                    Arc::clone(swaps.private_owner().unwrap()),
+                )
             });
             owner.plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10).pow(U256::from(20)));
             let origin_offer =
@@ -5766,7 +5851,11 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
             // Whether each account is offered to another swap, from local records.
             let offered = |swaps: &Entity<PrivateSwapsView>, cx: &gpui::VisualTestContext| {
                 let source = swaps.read_with(cx, |swaps, _| {
-                    let candidates = swaps.owner.swap_account_candidates().unwrap();
+                    let candidates = swaps
+                        .private_owner()
+                        .unwrap()
+                        .swap_account_candidates()
+                        .unwrap();
                     candidates
                         .iter()
                         .any(|candidate| candidate.operation() == operation)
@@ -5879,8 +5968,14 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     // Neither account needs setup, so Review opens the order's review.
                     assert_eq!(swaps.form_mode(form), FormMode::Order);
                     assert!(!swaps.reviews_setup(form));
-                    swaps.show_detail(operation, window, cx);
                 });
+            });
+            assert!(
+                !pay_from_menu_opens(cx),
+                "a swap that keeps its stealth account keeps its payer"
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| swaps.show_detail(operation, window, cx));
                 window.draw(cx).clear(cx);
             });
 
@@ -6064,7 +6159,10 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
             cx.simulate_click(resume.center(), gpui::Modifiers::none());
             cx.run_until_parked();
             let (session, owner) = swaps.read_with(cx, |swaps, _| {
-                (Arc::clone(&swaps.session), Arc::clone(&swaps.owner))
+                (
+                    Arc::clone(swaps.private_session().unwrap()),
+                    Arc::clone(swaps.private_owner().unwrap()),
+                )
             });
             let offer = setup_offer(root, 1, STUB_USDC, U256::from(10), cx);
             let estimate = runtime
@@ -6118,7 +6216,8 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     // A reopened setup's review reaches the same guarded persistence boundary
                     // as submission, before any setup payload is prepared or broadcast.
                     swaps
-                        .owner
+                        .private_owner()
+                        .unwrap()
                         .record_swap_approval(
                             approval.operation,
                             approval
@@ -6379,7 +6478,8 @@ fn open_form_beside_syncing_polygon(
         });
         swaps.update(cx, |swaps, cx| {
             swaps
-                .owner
+                .private_owner()
+                .unwrap()
                 .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
             swaps.open_form(
                 None,
@@ -6684,6 +6784,16 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     "Across delivers exactly its output"
                 );
                 assert_eq!(
+                    summary.send_card_for_test().map(|(label, _)| label),
+                    Some(format!("Sell on {}", network_name(swaps.origin_chain_id))),
+                    "a swap to another network names its own"
+                );
+                assert_eq!(
+                    summary.card_networks_for_test(),
+                    Some([Some(swaps.origin_chain_id), Some(137)]),
+                    "each card's icon carries its own network"
+                );
+                assert_eq!(
                     summary.receiver_for_test().map(|(address, _)| address),
                     Some(receiver.clone())
                 );
@@ -6950,6 +7060,20 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                             limit(&fees[0]),
                             limit(&fees[1])
                         ))
+                    );
+                    // The cost rows sit under one collapsed line, which names what isn't
+                    // refunded.
+                    let (title, collapsed, costs) = summary.row_group_for_test().unwrap();
+                    assert_eq!(title, "Costs");
+                    assert_eq!(costs, ["Pay now", "Gas", "Returned", "Bridge"]);
+                    assert_eq!(
+                        collapsed,
+                        format!(
+                            "{} · up to {} + {} now, not refunded",
+                            swaps.costs_label(&review, "", cx),
+                            limit(&fees[0]),
+                            limit(&fees[1])
+                        )
                     );
                     let setup = summary.row_hint_for_test("Pay now").unwrap();
                     assert!(
@@ -8166,11 +8290,20 @@ fn private_review_leads_with_the_minimum_and_states_the_gas(cx: &mut TestAppCont
                 )
             );
             assert_eq!(
+                summary.send_card_for_test().map(|(label, _)| label),
+                Some("Sell".to_owned()),
+                "a swap on one network doesn't name it"
+            );
+            assert_eq!(
                 lines.last().map(String::as_str),
                 Some("to your private balance")
             );
             assert_eq!(summary.receiver_for_test(), None);
             assert_eq!(summary.rows_for_test()[0], gas_row(swaps, &review, cx));
+            assert!(
+                summary.row_group_for_test().is_none(),
+                "a single cost row isn't grouped"
+            );
             let gas = summary.row_hint_for_test("Gas").unwrap();
             assert!(
                 gas.contains(
@@ -9366,6 +9499,8 @@ struct SwapStubs {
     across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
     gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
+    public_review_rpc: Arc<std::sync::atomic::AtomicBool>,
+    math_deployed: Arc<std::sync::atomic::AtomicBool>,
     fee_amount: Arc<std::sync::atomic::AtomicU64>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -9381,6 +9516,9 @@ struct StubBridge {
     across_relayer_gas_bps: Arc<std::sync::atomic::AtomicU64>,
     across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    public_review_rpc: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the math contract an order's post-hook calls has its code on the stub chain.
+    math_deployed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SwapStubs {
@@ -9399,6 +9537,8 @@ impl SwapStubs {
         let across_delay_ms = Arc::<std::sync::atomic::AtomicU64>::default();
         let failing = Arc::<std::sync::Mutex<Vec<&'static str>>>::default();
         let gas_price_wei = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let public_review_rpc = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let math_deployed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let served_gas_price = Arc::clone(&gas_price_wei);
         let fee_amount = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let served_fee_amount = Arc::clone(&fee_amount);
@@ -9420,6 +9560,8 @@ impl SwapStubs {
             across_relayer_gas_bps: Arc::clone(&across_relayer_gas_bps),
             across_delay_ms: Arc::clone(&across_delay_ms),
             failing: Arc::clone(&failing),
+            public_review_rpc: Arc::clone(&public_review_rpc),
+            math_deployed: Arc::clone(&math_deployed),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
@@ -9460,6 +9602,8 @@ impl SwapStubs {
             across_delay_ms,
             failing,
             gas_price_wei,
+            public_review_rpc,
+            math_deployed,
             fee_amount,
             stop: Some(stop),
             thread: Some(thread),
@@ -9499,6 +9643,20 @@ impl SwapStubs {
 
     fn rpc(&self) -> reqwest::Url {
         self.url.join("rpc").unwrap()
+    }
+
+    /// Public previews read an existing allowance, whether the `CoW` proxy is deployed, and
+    /// the math contract's code.
+    fn enable_public_reviews(&self) {
+        self.public_review_rpc
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Have the chain answer a read of the math contract's code with its runtime code, as it
+    /// does at first, or with none, from now on.
+    fn set_math_deployed(&self, deployed: bool) {
+        self.math_deployed
+            .store(deployed, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn orderbook(&self) -> reqwest::Url {
@@ -9637,6 +9795,33 @@ async fn stub_response(
             "executedFee": STUB_EXECUTED_FEE.to_string(),
             "executedFeeToken": Address::repeat_byte(2),
         })
+    } else if bridge
+        .public_review_rpc
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && body["method"] == "eth_call"
+    {
+        serde_json::json!({"jsonrpc": "2.0", "id": body["id"],
+            "result": format!("0x{}", alloy::hex::encode(U256::ZERO.to_be_bytes::<32>()))})
+    } else if bridge
+        .public_review_rpc
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && body["method"] == "eth_getCode"
+    {
+        // Only the math contract has code: the account's `CoW` proxy isn't deployed.
+        let math = body["params"][0]
+            .as_str()
+            .and_then(|address| address.parse::<Address>().ok())
+            == Some(SWAP_MATH_ADDRESS)
+            && bridge
+                .math_deployed
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let code = if math {
+            &SWAP_MATH_CREATION_CODE[30..]
+        } else {
+            &[]
+        };
+        serde_json::json!({"jsonrpc": "2.0", "id": body["id"],
+            "result": alloy::hex::encode_prefixed(code)})
     } else if body["method"] == "eth_gasPrice" {
         let price = gas_price_wei.load(std::sync::atomic::Ordering::Relaxed);
         serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": format!("{price:#x}")})
@@ -9825,7 +10010,8 @@ fn open_bridge_form(
         });
         swaps.update(cx, |swaps, cx| {
             swaps
-                .owner
+                .private_owner()
+                .unwrap()
                 .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
             swaps.open_form(
                 None,
@@ -10150,7 +10336,8 @@ fn restarted_swaps(
         });
         swaps.update(cx, |swaps, _| {
             swaps
-                .owner
+                .private_owner()
+                .unwrap()
                 .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
             let tracking = swaps.tracking.entry(operation).or_default();
             tracking.setup = Some(setup);
@@ -10183,7 +10370,8 @@ fn open_private_form(
         });
         swaps.update(cx, |swaps, cx| {
             swaps
-                .owner
+                .private_owner()
+                .unwrap()
                 .plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10_000_000));
             swaps.open_form(
                 None,
@@ -10276,4 +10464,2027 @@ fn gas_row(swaps: &PrivateSwapsView, review: &SwapReview, cx: &App) -> (String, 
             swaps.gas_money(buy, review.gas_estimate(), cx)
         ),
     )
+}
+
+fn configure_public_review_assets(root: &mut WalletRoot) {
+    for account in &mut Arc::make_mut(root.public_balance_snapshot.as_mut().unwrap()).accounts {
+        for balance in &mut account.balances {
+            let token = match balance.asset.id {
+                wallet_ops::PublicAssetId::Erc20(token) if token == Address::repeat_byte(42) => {
+                    Some((STUB_USDC, "USDC"))
+                }
+                wallet_ops::PublicAssetId::Erc20(token) if token == Address::repeat_byte(43) => {
+                    Some((STUB_USDT, "USDT"))
+                }
+                _ => None,
+            };
+            if let Some((token, symbol)) = token {
+                balance.asset.id = wallet_ops::PublicAssetId::Erc20(token);
+                balance.asset.symbol = symbol.into();
+                balance.asset.decimals = 6;
+                balance.amount = wallet_ops::PublicBalanceAmount::Available(U256::from(10_000_000));
+            }
+        }
+    }
+}
+
+/// Build the backend's actual deposit or order review; only the network responses are stubbed.
+#[allow(clippy::too_many_arguments)]
+fn public_review_fixture(
+    root: &Entity<WalletRoot>,
+    session: &Arc<WalletSession>,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    sell: Address,
+    sell_amount: U256,
+    order: bool,
+    cx: &gpui::VisualTestContext,
+) -> (
+    wallet_ops::PublicSwapReview,
+    wallet_ops::bridge::AcrossClient,
+    CowOrderbookClient,
+    wallet_ops::bridge::PublicBridgeDestination,
+) {
+    use wallet_ops::bridge::{
+        AcrossClient, AcrossRoute, PublicSellAsset, public_across_destination_tokens,
+    };
+    let orderbook = stub_orderbook(stubs, runtime);
+    let across =
+        AcrossClient::new(orderbook.http().clone(), stubs.url.join("across").unwrap()).unwrap();
+    let (origin, registry, source) = root.read_with(cx, |root, _| {
+        (
+            root.effective_chain_configs.get(1).unwrap().clone(),
+            root.effective_token_registry.clone(),
+            root.public_accounts[1].address,
+        )
+    });
+    let route = public_across_destination_tokens(
+        &[AcrossRoute {
+            origin_token: if order { STUB_USDC } else { sell },
+            destination_token: STUB_POLYGON_USDC,
+            origin_symbol: "USDC".into(),
+            destination_symbol: "USDC".into(),
+        }],
+        PublicSellAsset::Erc20(sell),
+        true,
+        &registry,
+        137,
+    )
+    .remove(0);
+    let review = runtime
+        .block_on(session.executor_owner().unwrap().review_public_swap(
+            wallet_ops::PublicSwapReviewRequest {
+                origin: &origin,
+                source,
+                sell: PublicSellAsset::Erc20(sell),
+                sell_amount,
+                destination: &route,
+                slippage_bps: DEFAULT_SLIPPAGE_BPS,
+                gas_share_bps: GAS_SHARE_BALANCED_BPS,
+                on_shield_failure: BridgeShieldFailure::default(),
+                orderbook: Some(&orderbook),
+                across: &across,
+                anchor_cache: None,
+                token_registry: &registry,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+            },
+        ))
+        .unwrap();
+    (review, across, orderbook, route)
+}
+
+/// Select through the production menu so disabled rows and owner subscriptions are exercised.
+fn choose_swap_source(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    if cx.debug_bounds(selector).is_none() {
+        let trigger = cx
+            .debug_bounds("swap-pay-from")
+            .unwrap_or_else(|| panic!("Pay from control before {selector}"));
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let row = cx.debug_bounds(selector).expect("source menu row");
+    cx.simulate_click(row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+}
+
+/// Click the rendered Pay from control and report whether its menu opened.
+fn pay_from_menu_opens(cx: &mut gpui::VisualTestContext) -> bool {
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let trigger = cx.debug_bounds("swap-pay-from").expect("Pay from control");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.debug_bounds("swap-source-private").is_some()
+}
+
+/// A chosen stealth account spends the private balance, so Pay from is off until the form is
+/// back on a new account, and a choice the control committed anyway is put back.
+#[gpui::test]
+fn pay_from_is_fixed_while_an_existing_stealth_account_is_chosen(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, _, _, cx| {
+            reusable_account(executors, operation);
+            cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_new_form(STUB_USDC, window, cx);
+                    swaps.select_form_account(Some(operation), window, cx);
+                });
+            });
+            let swap_use = swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(form.operation, Some(operation));
+                assert!(form.reuse_use.is_some());
+                form.reuse_use
+            });
+
+            assert!(
+                !pay_from_menu_opens(cx),
+                "the payer can't change while an existing account is chosen"
+            );
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                assert!(form.public.is_none());
+                assert_eq!(form.pay_from_select.read(cx).selected_value(), Some(&None));
+            });
+
+            // The control commits its choice before it reports it to the form.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let select = swaps.form.as_ref().unwrap().pay_from_select.clone();
+                    let public = Some("account-1".to_owned());
+                    select.update(cx, |select, cx| {
+                        select.set_selected_value(&public, window, cx);
+                    });
+                    assert_eq!(select.read(cx).selected_value(), Some(&public));
+                    swaps.select_form_source(public.as_deref(), window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(form.public.is_none());
+                    assert_eq!(
+                        form.pay_from_select.read(cx).selected_value(),
+                        Some(&None),
+                        "a rejected payer doesn't stay shown"
+                    );
+                    assert_eq!(
+                        (form.operation, form.reuse_use),
+                        (Some(operation), swap_use)
+                    );
+
+                    swaps.select_form_account(None, window, cx);
+                });
+            });
+            choose_swap_source(cx, "swap-source-public-account-1");
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    form.public
+                        .as_ref()
+                        .map(|public| public.account.public_account_uuid.as_str()),
+                    Some("account-1"),
+                    "a new account lets a Public account pay"
+                );
+            });
+        },
+    );
+}
+
+#[gpui::test]
+fn pay_from_changes_clear_acknowledgements_and_global_imports_cannot_be_chosen(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            let sell = STUB_USDC;
+            cx.update(|window, cx| {
+                root.update(cx, |root, _| {
+                    root.public_accounts.truncate(4);
+                    root.public_accounts[3].source =
+                        wallet_ops::vault::PublicAccountSource::Imported;
+                    root.public_accounts[3].scope = wallet_ops::vault::PublicAccountScope::Global;
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_new_form(sell, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    form.destination_route.fee_token = Some(sell);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, destination_operation) = reusable_polygon_account(root, cx);
+            let destination_record = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == destination_operation)
+                .unwrap();
+            let (review, across, orderbook, route) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                sell,
+                U256::from(7_000_000),
+                false,
+                cx,
+            );
+            choose_swap_source(cx, "swap-source-public-account-1");
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    form.public.as_ref().unwrap().account.public_account_uuid,
+                    "account-1"
+                );
+                assert_eq!(
+                    form.sell, sell,
+                    "the account holds the previously selected Sell token"
+                );
+                assert_eq!(form.amount_input.read(cx).value().as_ref(), "7");
+                assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                assert!(
+                    form.account_select.is_none(),
+                    "a Public source creates no source stealth account"
+                );
+                assert!(form.destination_select.is_some());
+                assert!(
+                    !form.destination_route.is_used(),
+                    "another payer must review setup terms again"
+                );
+                assert_eq!(form.assets.locked, U256::ZERO);
+                assert!(
+                    form.assets
+                        .sell_assets
+                        .iter()
+                        .any(|asset| asset.token == Address::ZERO)
+                );
+                assert!(swaps.receive_to_locked(form));
+            });
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation: destination_operation,
+                        index: destination_record.index(),
+                        address: destination_record.address().unwrap(),
+                    });
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((sell, 137), vec![route]);
+                    swaps.install_public_review_for_tests(
+                        review.clone(),
+                        across.clone(),
+                        Some(orderbook.clone()),
+                        cx,
+                    );
+                    assert!(
+                        swaps
+                            .form
+                            .as_ref()
+                            .unwrap()
+                            .public
+                            .as_ref()
+                            .unwrap()
+                            .review
+                            .is_some()
+                    );
+                });
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_form_sell(STUB_USDT, window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(
+                        (form.network, form.buy),
+                        (Some(137), Some(STUB_POLYGON_USDC))
+                    );
+                    assert!(
+                        form.public.as_ref().unwrap().review.is_none(),
+                        "an unserved Sell pair cannot retain the previous token's received minimum"
+                    );
+                    assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                    swaps.request_public_review(window, cx);
+                    assert!(
+                        swaps.public_authorization.is_none(),
+                        "Review waits for the new pair's route"
+                    );
+                    swaps.set_form_sell(sell, window, cx);
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                });
+            });
+            choose_swap_source(cx, "swap-source-public-account-2");
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                let public = form.public.as_ref().unwrap();
+                assert_eq!(public.account.public_account_uuid, "account-2");
+                assert!(public.review.is_none() && public.routes.is_empty());
+                assert_eq!(
+                    (form.network, form.buy),
+                    (Some(137), Some(STUB_POLYGON_USDC)),
+                    "a payer change preserves the chosen destination without its old quote"
+                );
+                assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| swaps.request_public_review(window, cx));
+            });
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.public_authorization.is_none(),
+                    "the new payer has no route and cannot approve the previous payer's minimum"
+                );
+            });
+            choose_swap_source(cx, "swap-source-public-account-3");
+            swaps.read_with(cx, |swaps, _| {
+                assert_eq!(
+                    swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .public
+                        .as_ref()
+                        .unwrap()
+                        .account
+                        .public_account_uuid,
+                    "account-2",
+                    "a globally visible import cannot admit a Public swap"
+                );
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                let groups = swaps.swap_source_items(sell, cx);
+                // Private balance, the heading of the Public accounts, then the accounts.
+                assert_eq!(groups.len(), 1);
+                assert!(groups[0].items[0].account.is_none());
+                assert!(groups[0].items[1].heading && groups[0].items[1].unavailable);
+                let (shared, scoped): (Vec<_>, Vec<_>) = groups[0].items[2..]
+                    .iter()
+                    .partition(|item| item.account.as_deref() == Some("account-3"));
+                assert!(shared[0].unavailable);
+                assert_eq!(
+                    shared[0].reason.as_deref(),
+                    Some(SHARED_ACCOUNT_REASON),
+                    "Pay from says why an account shared between Private wallets can't pay"
+                );
+                assert!(
+                    scoped
+                        .iter()
+                        .all(|item| !item.unavailable && item.reason.is_none())
+                );
+                // An account whose balances are read holds none of a token they don't list.
+                let unheld = Address::repeat_byte(0x77);
+                let zero = format!("0 {}", swaps.token_symbol(unheld, cx));
+                let read = root
+                    .read(cx)
+                    .public_balance_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .accounts
+                    .iter()
+                    .map(|account| account.account.public_account_uuid.clone())
+                    .collect::<Vec<_>>();
+                let groups = swaps.swap_source_items(unheld, cx);
+                let rows = groups[0]
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.account
+                            .as_ref()
+                            .is_some_and(|uuid| read.contains(uuid))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !rows.is_empty() && rows.iter().all(|item| item.balance == zero),
+                    "a read account without the Sell token shows a zero balance"
+                );
+            });
+            choose_swap_source(cx, "swap-source-private");
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert!(form.public.is_none());
+                assert!(
+                    form.account_select.is_some(),
+                    "Private balance retains the existing account flow"
+                );
+                assert_eq!(form.receive_to, ReceiveTo::PrivateBalance);
+                assert!(!swaps.receive_to_locked(form));
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+#[gpui::test]
+fn public_bridge_opens_before_a_destination_or_origin_private_session_exists(
+    cx: &mut TestAppContext,
+) {
+    with_swap_view(cx, |root, _, _, _, _, cx| {
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.clear_private_swaps(cx);
+                root.chain_states.remove(&1);
+                root.open_public_swap_form("account-1", Some(Address::repeat_byte(42)), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let swaps = root.read_with(cx, |root, _| root.private_swaps_view().unwrap());
+        swaps.read_with(cx, |swaps, _| {
+            assert!(swaps.session.is_none() && swaps.owner.is_none());
+            assert_eq!(swaps.origin_chain_id, 1);
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(
+                form.public.as_ref().unwrap().account.public_account_uuid,
+                "account-1"
+            );
+            assert!(
+                form.network.is_none(),
+                "opening does not bind an arbitrary destination owner"
+            );
+            assert!(form.account_select.is_none());
+            assert!(form.destination_select.is_some());
+        });
+        choose_swap_source(cx, "swap-source-private");
+        swaps.read_with(cx, |swaps, _| {
+            assert!(
+                swaps.form.as_ref().unwrap().public.is_some(),
+                "Private balance cannot be selected without a source private session"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    });
+}
+
+#[gpui::test]
+fn closing_public_preparation_aborts_continuation_and_continue_keeps_the_durable_use(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, destination_operation) = reusable_polygon_account(root, cx);
+            let destination_record = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == destination_operation)
+                .unwrap();
+            let issued_setup = destination_record.issued()[0].hash();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let sell = STUB_USDC;
+            let (review, across, orderbook, route) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                sell,
+                U256::from(7_000_000),
+                false,
+                cx,
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source, sell, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation: destination_operation,
+                        index: destination_record.index(),
+                        address: destination_record.address().unwrap(),
+                    });
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((sell, 137), vec![route]);
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                });
+            });
+            let command =
+                swaps.read_with(cx, |swaps, _| swaps.public_authorization.clone().unwrap());
+            cx.update(WindowExt::close_dialog);
+            let (release, gate) = tokio::sync::oneshot::channel();
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let identity = cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps
+                        .hold_public_preparation_for_tests(
+                            command,
+                            gate,
+                            completed.clone(),
+                            window,
+                            cx,
+                        )
+                        .unwrap()
+                })
+            });
+            cx.run_until_parked();
+            runtime.block_on(tokio::task::yield_now());
+            assert!(
+                !release.is_closed(),
+                "the preparation is suspended before its continuation"
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.navigate(SwapDialogView::Orders, window, cx);
+                });
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                completed.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a dismissed preparation must not reach its signing/submission continuation"
+            );
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.public_job.is_none()
+                        && swaps.public_authorization.is_none()
+                        && swaps.public_execution.is_none()
+                );
+                assert!(
+                    swaps
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.view == SwapDialogView::Orders),
+                    "My orders dismisses the form's preparation without changing its claim"
+                );
+            });
+            let claimed = polygon
+                .executor_owner()
+                .unwrap()
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == identity.operation)
+                .unwrap();
+            assert!(
+                claimed.public_swap_use(identity.swap_use).is_some(),
+                "closing keeps the encrypted claim for recovery"
+            );
+            assert_eq!(
+                (claimed.issued().len(), claimed.issued()[0].hash()),
+                (1, issued_setup)
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.refresh_public_swap_records(cx);
+                    swaps.perform_public_swap_action(
+                        identity,
+                        super::super::public_progress::PublicSwapAction::Continue,
+                        window,
+                        cx,
+                    );
+                    let public = swaps.form.as_ref().unwrap().public.as_ref().unwrap();
+                    assert_eq!(
+                        (public.operation, public.swap_use),
+                        (Some(identity.operation), Some(identity.swap_use))
+                    );
+                    assert!(
+                        public.review.is_none() && swaps.public_authorization.is_none(),
+                        "Continue requires a fresh review"
+                    );
+                });
+            });
+            let (review, across, orderbook, _) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                sell,
+                U256::from(7_000_000),
+                false,
+                cx,
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                });
+            });
+            let resumed_command =
+                swaps.read_with(cx, |swaps, _| swaps.public_authorization.clone().unwrap());
+            cx.update(WindowExt::close_dialog);
+            let (next_release, next_gate) = tokio::sync::oneshot::channel();
+            let next_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let resumed_identity = swaps
+                        .hold_public_preparation_for_tests(
+                            resumed_command,
+                            next_gate,
+                            next_completed.clone(),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        resumed_identity, identity,
+                        "a new review continues the original use"
+                    );
+                });
+            });
+            cx.run_until_parked();
+            runtime.block_on(tokio::task::yield_now());
+            let _ = release.send(());
+            runtime.block_on(tokio::task::yield_now());
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.public_job.is_some(),
+                    "an abandoned task cannot clear a newer preparation"
+                );
+                assert!(
+                    swaps.public_authorization.is_none() && swaps.public_execution.is_none(),
+                    "an abandoned result cannot restore authority into the continued form"
+                );
+            });
+            assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(next_completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.refresh_public_swap_records(cx);
+                    swaps.navigate(SwapDialogView::PublicDetail(identity), window, cx);
+                });
+            });
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.public_job.is_some() && swaps.form.is_none(),
+                    "the claimed swap's detail takes its preparation over from the form"
+                );
+            });
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| swaps.close_swap_dialog(window, cx));
+            });
+            cx.run_until_parked();
+            let _ = next_release.send(());
+            runtime.block_on(tokio::task::yield_now());
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.public_job.is_none()
+                        && swaps.public_authorization.is_none()
+                        && swaps.public_execution.is_none()
+                );
+                assert!(
+                    swaps.form.is_none() && swaps.dialog.is_none(),
+                    "closing cannot repopulate a preparation"
+                );
+            });
+            assert_eq!(
+                next_completed.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "closing the detail at work stops its signing/submission continuation"
+            );
+            let resumed = polygon
+                .executor_owner()
+                .unwrap()
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == identity.operation)
+                .unwrap();
+            assert_eq!(
+                resumed.swap_uses().len(),
+                claimed.swap_uses().len(),
+                "Continue does not create another use"
+            );
+            assert_eq!(
+                (resumed.issued().len(), resumed.issued()[0].hash()),
+                (1, issued_setup),
+                "Continue retains the confirmed setup without issuing another payload"
+            );
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+#[gpui::test]
+fn public_amounts_use_selected_balance_metadata_through_review_max_and_restore(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt;
+    use wallet_ops::vault::{PublicSwapClaim, SwapAccountChoice, SwapApprovedAccount};
+
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    let sell = Address::repeat_byte(42);
+    let entered = U256::from(7_000_000_000_000_000_000_u64);
+    let available = U256::from(10_000_000_000_000_000_123_u64);
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    assert!(root.effective_token_registry.get(1, &sell).is_none());
+                    configure_public_review_assets(root);
+                    for account in
+                        &mut Arc::make_mut(root.public_balance_snapshot.as_mut().unwrap()).accounts
+                    {
+                        for balance in &mut account.balances {
+                            if balance.asset.id == wallet_ops::PublicAssetId::Erc20(STUB_USDC) {
+                                balance.asset.id = wallet_ops::PublicAssetId::Erc20(sell);
+                                balance.asset.symbol = "SNAP".into();
+                                balance.asset.decimals = 18;
+                                balance.amount =
+                                    wallet_ops::PublicBalanceAmount::Available(available);
+                            }
+                        }
+                    }
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, operation) = reusable_polygon_account(root, cx);
+            let destination = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            let account = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(account, sell, window, cx);
+                    swaps
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .amount_input
+                        .update(cx, |input, cx| {
+                            input.set_value("7", window, cx);
+                        });
+                });
+            });
+            choose_swap_source(cx, "swap-source-public-account-2");
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(form.sell, sell);
+                assert_eq!(form.amount_input.read(cx).value().as_ref(), "7");
+                assert_eq!(swaps.form_amount(form, cx).unwrap(), entered);
+                assert_eq!(swaps.form_sell_amount(form, entered, cx), "7 SNAP");
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let max = cx.debug_bounds("swap-amount-max").unwrap();
+            cx.simulate_click(max.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(swaps.form_amount(form, cx).unwrap(), available);
+                assert_eq!(
+                    form.amount_input.read(cx).value().as_ref(),
+                    "10.000000000000000123"
+                );
+            });
+            choose_swap_source(cx, "swap-source-public-account-1");
+            let (review, across, orderbook, route) =
+                public_review_fixture(root, &polygon, &stubs, runtime, sell, entered, false, cx);
+            assert_eq!(review.sell_amount(), entered);
+            assert!(across_fee_amounts(&stubs).contains(&entered));
+            let approval = review
+                .approval(
+                    SwapApprovedAccount {
+                        address: destination.address(),
+                        setup: false,
+                    },
+                    None,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(approval.bounds.sell_amount, entered);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.use_amount(entered, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation,
+                        index: destination.index(),
+                        address: destination.address().unwrap(),
+                    });
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((sell, 137), vec![route]);
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                });
+            });
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, _| {
+                assert_eq!(
+                    swaps
+                        .public_authorization
+                        .as_ref()
+                        .unwrap()
+                        .public_authorization_summary()
+                        .send_card_for_test(),
+                    Some((format!("Send on {}", network_name(1)), "7 SNAP".into()))
+                );
+            });
+            cx.update(|window, cx| {
+                window.click(SharedString::from("wallet-spend-auth-cancel"), cx);
+            });
+            cx.run_until_parked();
+            let account = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let id = SwapUseId::random().unwrap();
+            destination_store
+                .claim_public_swap(PublicSwapClaim {
+                    id,
+                    origin_chain: 1,
+                    source: account.address,
+                    source_scope: account.scope,
+                    account: SwapAccountChoice::Existing(operation),
+                    delegate: destination.delegate(),
+                    destination_token: STUB_POLYGON_USDC,
+                    bridged_token: sell,
+                    order: false,
+                    approval,
+                    now: now_unix(),
+                })
+                .unwrap();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    assert!(swaps.public_authorization.is_none());
+                    swaps.refresh_public_swap_records(cx);
+                    swaps.perform_public_swap_action(
+                        model::SwapIdentity {
+                            operation,
+                            swap_use: id,
+                        },
+                        super::super::public_progress::PublicSwapAction::Continue,
+                        window,
+                        cx,
+                    );
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(form.amount_input.read(cx).value().as_ref(), "7");
+                    assert_eq!(swaps.form_amount(form, cx).unwrap(), entered);
+                    assert_eq!(swaps.form_sell_amount(form, entered, cx), "7 SNAP");
+                    swaps.close_swap_dialog(window, cx);
+                });
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+/// The form and the review of a swap paid from a Public account, for a same-token deposit and
+/// for an order, both to an existing destination account. The form's Buy card and details
+/// follow the path. The review is the compact one: the network chip, the account on the Sell
+/// or Send card, a Pay now row with the account's gas and what it sends, and the reused
+/// account, its address shortened. An order's terms name the proxy it goes through. Only the
+/// deposit, which waits on nothing, has no stepper.
+#[gpui::test]
+fn public_form_and_review_follow_the_path_and_name_the_paying_account(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, destination_operation) = reusable_polygon_account(root, cx);
+            let destination_record = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == destination_operation)
+                .unwrap();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let label = public_source_label(&source);
+            let (origin, destination) = (network_name(1), network_name(137));
+            let reused = format!(
+                "Reuses #{} · {}",
+                destination_record.index(),
+                spend_authorization_recipient_display(
+                    &destination_record.address().unwrap().to_checksum(None)
+                )
+            );
+            // A form started on the native asset suggests wrapping before a token is picked, and
+            // the suggestion alone doesn't keep Review unavailable.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source.clone(), Address::ZERO, window, cx);
+                    swaps.stub_public_orders_for_tests(true, cx);
+                    let reason = swaps
+                        .public_form_reason(swaps.form.as_ref().unwrap(), cx)
+                        .expect("a native Sell asset suggests wrapping");
+                    assert!(!reason.blocks_review);
+                    assert!(
+                        reason
+                            .text
+                            .contains(" can't be swapped from a Public account. Wrap it first"),
+                        "{}",
+                        reason.text
+                    );
+                    swaps.close_swap_dialog(window, cx);
+                });
+            });
+            cx.run_until_parked();
+            for order in [false, true] {
+                let sell = if order { STUB_USDT } else { STUB_USDC };
+                let (review, across, orderbook, route) = public_review_fixture(
+                    root,
+                    &polygon,
+                    &stubs,
+                    runtime,
+                    sell,
+                    U256::from(7_000_000),
+                    order,
+                    cx,
+                );
+                assert_eq!(review.intent().order, order);
+                assert!(
+                    !review.gas_plan().max_gas_cost.is_zero(),
+                    "the review accounts for gas paid by the Public account"
+                );
+                let proxy = review.proxy();
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        swaps.open_public_form(source.clone(), sell, window, cx);
+                        swaps.stub_public_orders_for_tests(true, cx);
+                        let fresh = swaps.form.as_ref().unwrap();
+                        assert!(
+                            receive_to_problem(fresh, cx).is_none()
+                                && swaps.public_form_reason(fresh, cx).is_none(),
+                            "an untouched form prompts for a network without an error"
+                        );
+                        let form = swaps.form.as_mut().unwrap();
+                        assert_eq!(
+                            form.sell, sell,
+                            "each scenario opens a fresh source-token draft"
+                        );
+                        form.network = Some(137);
+                        form.buy = Some(STUB_POLYGON_USDC);
+                        form.amount_input
+                            .update(cx, |input, cx| input.set_value("7", window, cx));
+                        form.destination_account = Some(DestinationAccount {
+                            chain_id: 137,
+                            operation: destination_operation,
+                            index: destination_record.index(),
+                            address: destination_record.address().unwrap(),
+                        });
+                        form.public
+                            .as_mut()
+                            .unwrap()
+                            .routes
+                            .insert((sell, 137), vec![route]);
+                        swaps.install_public_review_for_tests(
+                            review.clone(),
+                            across,
+                            Some(orderbook),
+                            cx,
+                        );
+                        let form = swaps.form.as_ref().unwrap();
+                        assert_eq!(
+                            PrivateSwapsView::public_buy_label(form, true),
+                            if order {
+                                format!("Buy on {destination}, at least")
+                            } else {
+                                format!("Receive on {destination}")
+                            }
+                        );
+                        let details = swaps
+                            .public_details(form, &review, cx)
+                            .into_iter()
+                            .map(|row| row.label)
+                            .collect::<Vec<_>>();
+                        let bridge_costs = [
+                            "Across fee".to_owned(),
+                            format!("Delivery on {destination}"),
+                            format!("Railgun shield on {destination}"),
+                        ];
+                        if order {
+                            // The stubbed pair has no anchors, so there is no price check row.
+                            assert!(
+                                details[0].starts_with("Gas at ") && details[0].ends_with(" gwei")
+                            );
+                            assert_eq!(details[1], "Gas you pay");
+                            assert_eq!(details[2..5], bridge_costs);
+                            assert_eq!(
+                                details[5..],
+                                [
+                                    format!("Approval from {label}"),
+                                    "Price tolerance".to_owned()
+                                ]
+                            );
+                        } else {
+                            assert_eq!(details[..3], bridge_costs);
+                            assert_eq!(
+                                details[3..],
+                                [format!("Approval and deposit from {label}")],
+                                "a deposit has no order, so no gas share, price or tolerance rows"
+                            );
+                        }
+                        swaps.form.as_mut().unwrap().price_acknowledged = true;
+                        swaps.request_public_review(window, cx);
+                        assert!(
+                            swaps.public_authorization.is_some(),
+                            "{:?}",
+                            swaps.form.as_ref().unwrap().error
+                        );
+                    });
+                });
+                cx.run_until_parked();
+                let summary = swaps.read_with(cx, |swaps, _| {
+                    swaps
+                        .public_authorization
+                        .as_ref()
+                        .unwrap()
+                        .public_authorization_summary()
+                });
+                assert!(summary.compact_rows_for_test());
+                assert_eq!(
+                    summary.title_for_test(),
+                    (
+                        if order {
+                            "Swap to private balance".to_owned()
+                        } else {
+                            format!("Shield on {destination}")
+                        },
+                        None
+                    ),
+                    "an existing account's review claims no setup"
+                );
+                assert_eq!(
+                    summary.send_card_for_test().unwrap().0,
+                    format!("{} on {origin}", if order { "Sell" } else { "Send" })
+                );
+                assert_eq!(
+                    summary.card_networks_for_test(),
+                    Some([Some(1), Some(137)]),
+                    "each card's icon carries its own network"
+                );
+                assert_eq!(
+                    summary.send_account_for_test(),
+                    Some((label.clone(), source.address.to_checksum(None)))
+                );
+                let (receive, _, lines) = summary.receive_card_for_test().unwrap();
+                assert_eq!(
+                    receive,
+                    if order {
+                        format!("Receive on {destination}, at least")
+                    } else {
+                        format!("Receive on {destination}")
+                    }
+                );
+                // An order's card shows its best case too, in the destination token.
+                let best = swaps.read_with(cx, |swaps, cx| {
+                    review.best_case().map(|best| {
+                        format!(
+                            "up to {} if solvers pay all gas",
+                            swaps.network_bare_amount(137, STUB_POLYGON_USDC, best, cx)
+                        )
+                    })
+                });
+                assert_eq!(best.is_some(), order, "only an order has a best case");
+                assert_eq!(
+                    lines,
+                    best.into_iter()
+                        .chain(["to your private balance".to_owned()])
+                        .collect::<Vec<_>>()
+                );
+                let rows = summary.shown_rows_for_test();
+                let labels = rows
+                    .iter()
+                    .map(|(label, _)| label.as_str())
+                    .collect::<Vec<_>>();
+                let account = format!("Account on {destination}");
+                // The account's gas and what it sends, with the account named behind the info
+                // button.
+                let max_gas = swaps.read_with(cx, |swaps, cx| {
+                    swaps.token_amount(Address::ZERO, review.gas_plan().max_gas_cost, cx)
+                });
+                let sends = rows[0]
+                    .1
+                    .strip_prefix(&format!("up to {max_gas} · "))
+                    .unwrap_or_else(|| panic!("{}", rows[0].1));
+                assert!(
+                    if order {
+                        matches!(sends, "one approval" | "two approvals")
+                    } else {
+                        sends.ends_with("deposit")
+                    },
+                    "{sends}"
+                );
+                let pays = summary.row_hint_for_test("Pay now").unwrap();
+                assert!(pays.starts_with(&format!("{label} sends ")), "{pays}");
+                // The cost rows sit under one collapsed line, which says the account's gas
+                // isn't refunded.
+                let (title, collapsed, costs) = summary.row_group_for_test().unwrap();
+                assert_eq!(title, "Costs");
+                assert!(
+                    collapsed.ends_with(&format!("up to {max_gas} now, not refunded")),
+                    "{collapsed}"
+                );
+                if order {
+                    assert_eq!(costs, ["Pay now", "Gas", "Bridge"]);
+                    assert_eq!(
+                        labels,
+                        [
+                            "Pay now",
+                            "Gas",
+                            "Bridge",
+                            account.as_str(),
+                            "If the shield fails"
+                        ]
+                    );
+                    assert!(
+                        summary.details_for_test().contains(&(
+                            "Your CoW proxy".to_owned(),
+                            proxy.unwrap().to_checksum(None)
+                        )),
+                        "the order's terms show the proxy's address in full"
+                    );
+                    assert!(summary.details_note_for_test().is_some_and(|note| {
+                        note.contains(&format!("only {label} controls"))
+                            && note.contains("stays in the proxy")
+                    }));
+                    assert_eq!(
+                        summary.steps_for_test(),
+                        Some((
+                            2,
+                            vec![
+                                format!("Account on {destination} ready"),
+                                "Approve and place order".to_owned()
+                            ]
+                        ))
+                    );
+                } else {
+                    assert_eq!(costs, ["Pay now", "Bridge"]);
+                    assert_eq!(
+                        labels,
+                        ["Pay now", "Bridge", account.as_str(), "If the shield fails"]
+                    );
+                    assert!(
+                        summary.details_for_test().is_empty(),
+                        "a deposit has no order terms and no proxy"
+                    );
+                    assert!(
+                        summary.steps_for_test().is_none(),
+                        "a direct deposit into an existing account uses a single review"
+                    );
+                }
+                assert_eq!(rows[labels.len() - 2].1, reused);
+                assert_eq!(rows[labels.len() - 1].1, format!("Refund to {label}"));
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                assert_eq!(
+                    cx.debug_bounds("wallet-spend-auth-steps-hint").is_some(),
+                    order,
+                    "request_spend_authorization renders the review's step choice"
+                );
+                cx.update(|window, cx| {
+                    window.click(SharedString::from("wallet-spend-auth-cancel"), cx);
+                });
+                cx.run_until_parked();
+                swaps.read_with(cx, |swaps, _| {
+                    assert!(
+                        swaps.public_authorization.is_none(),
+                        "Cancel releases the reviewed authority before another scenario"
+                    );
+                });
+                if order {
+                    public_order_setup_review_and_signatures(
+                        swaps,
+                        &source,
+                        destination_operation,
+                        &review,
+                        cx,
+                    );
+                    // Last, as it empties the account: one that can't pay its own gas has the
+                    // form say how much it needs in the Sell card, and Review is unavailable.
+                    cx.update(|window, cx| {
+                        root.update(cx, |root, _| {
+                            let snapshot =
+                                Arc::make_mut(root.public_balance_snapshot.as_mut().unwrap());
+                            for balance in snapshot
+                                .accounts
+                                .iter_mut()
+                                .flat_map(|account| &mut account.balances)
+                            {
+                                if balance.asset.id == wallet_ops::PublicAssetId::Native {
+                                    balance.amount =
+                                        wallet_ops::PublicBalanceAmount::Available(U256::ZERO);
+                                }
+                            }
+                        });
+                        swaps.update(cx, |swaps, cx| {
+                            let reason = swaps
+                                .public_form_reason(swaps.form.as_ref().unwrap(), cx)
+                                .expect("a gas shortfall is a reason");
+                            assert!(reason.blocks_review);
+                            assert!(
+                                reason.text.starts_with(&format!("{label} needs "))
+                                    && reason
+                                        .text
+                                        .contains(&format!(" on {origin} for gas and has ")),
+                                "{}",
+                                reason.text
+                            );
+                            swaps.request_public_review(window, cx);
+                            assert!(swaps.public_authorization.is_none());
+                            cx.notify();
+                        });
+                        window.draw(cx).clear(cx);
+                    });
+                    let pay_from = cx.debug_bounds("swap-pay-from").unwrap();
+                    let reason = cx.debug_bounds("swap-public-reason").unwrap();
+                    let buy = cx.debug_bounds("swap-buy-panel").unwrap();
+                    assert!(
+                        reason.top() > pay_from.bottom() && reason.bottom() <= buy.top(),
+                        "the reason sits in the Sell card, above the Buy card"
+                    );
+                    assert!(
+                        cx.debug_bounds("swap-price-status").is_some(),
+                        "the Buy card shows the order's best case under its minimum"
+                    );
+
+                    // A preset prices the reviewed quote at its share and previews the bridge
+                    // leg again: the review stays, and CoW isn't asked for another quote.
+                    let quotes = stubs.quotes().len();
+                    cx.update(|window, cx| {
+                        swaps.update(cx, |swaps, cx| {
+                            let reviewed = |swaps: &PrivateSwapsView| {
+                                let form = swaps.form.as_ref().unwrap();
+                                form.public.as_ref().unwrap().review.clone().unwrap()
+                            };
+                            let before = reviewed(swaps);
+                            swaps.set_gas_preset(GasPreset::Tight, window, cx);
+                            assert!(Arc::ptr_eq(&reviewed(swaps), &before));
+                            assert_eq!(
+                                public_strip(swaps.form.as_ref().unwrap())
+                                    .unwrap()
+                                    .share_bps,
+                                GAS_SHARE_TIGHT_BPS
+                            );
+                        });
+                    });
+                    assert_eq!(stubs.quotes().len(), quotes);
+
+                    // Another open swap of the account that buys the same token is named
+                    // under the Sell card before Review is clicked, and keeps it unavailable.
+                    polygon
+                        .executor_owner()
+                        .unwrap()
+                        .claim_public_swap(wallet_ops::PublicSwapUseClaim {
+                            id: SwapUseId::random().unwrap(),
+                            origin_chain: 1,
+                            source: source.address,
+                            source_scope: source.scope.clone(),
+                            account: SwapAccountChoice::New(ExecutorOperationId::random().unwrap()),
+                            destination_token: STUB_POLYGON_USDC,
+                            intent: review.intent(),
+                            approval: review
+                                .approval(
+                                    SwapApprovedAccount {
+                                        address: None,
+                                        setup: true,
+                                    },
+                                    Some(U256::from(50_000)),
+                                    true,
+                                )
+                                .unwrap(),
+                        })
+                        .unwrap();
+                    cx.update(|window, cx| {
+                        swaps.update(cx, |swaps, cx| {
+                            swaps.refresh_public_swap_records(cx);
+                            let reason = swaps
+                                .public_form_reason(swaps.form.as_ref().unwrap(), cx)
+                                .expect("an open swap is a reason");
+                            assert!(reason.blocks_review);
+                            assert!(
+                                reason.text.starts_with(&format!(
+                                    "{label} already has an open swap that buys "
+                                )),
+                                "{}",
+                                reason.text
+                            );
+                            swaps.request_public_review(window, cx);
+                            assert!(swaps.public_authorization.is_none());
+                            cx.notify();
+                        });
+                        window.draw(cx).clear(cx);
+                    });
+                    assert!(
+                        cx.debug_bounds("swap-public-open-swap").is_some(),
+                        "the reason offers to open the swap it names"
+                    );
+
+                    // A token the routes don't deliver, and a network whose private balance
+                    // isn't synced, each say why and keep Review unavailable.
+                    cx.update(|_, cx| {
+                        swaps.update(cx, |swaps, cx| {
+                            for (network, expected) in [
+                                (137, "Across doesn't deliver "),
+                                (42_161, "Private balance needs "),
+                            ] {
+                                let form = swaps.form.as_mut().unwrap();
+                                form.network = Some(network);
+                                form.buy = Some(Address::repeat_byte(0x55));
+                                let reason = swaps
+                                    .public_form_reason(swaps.form.as_ref().unwrap(), cx)
+                                    .expect("a pair that can't be quoted has a reason");
+                                assert!(reason.blocks_review, "{}", reason.text);
+                                assert!(
+                                    reason.text.starts_with(expected)
+                                        && reason.text.contains(&network_name(network)),
+                                    "{}",
+                                    reason.text
+                                );
+                            }
+                        });
+                    });
+                }
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| swaps.close_swap_dialog(window, cx));
+                });
+                cx.run_until_parked();
+            }
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+/// An order to a new destination account, on the open form of an order: its review has the
+/// mockup's two steps, and one Pay now row for the setup fee and the account's gas, whose hint
+/// names the network the fee is paid on and what the account sends. A hardware account
+/// then sees what its device will sign as two groups of decoded, formatted terms.
+fn public_order_setup_review_and_signatures(
+    swaps: &Entity<PrivateSwapsView>,
+    source: &wallet_ops::vault::PublicAccountMetadata,
+    destination: ExecutorOperationId,
+    review: &wallet_ops::PublicSwapReview,
+    cx: &gpui::VisualTestContext,
+) {
+    let network = network_name(137);
+    let label = public_source_label(source);
+    let proxy = review.proxy().unwrap();
+    let bought = review.buy_amount().unwrap();
+    swaps.read_with(cx, |swaps, cx| {
+        let form = swaps.form.as_ref().unwrap();
+        let approval = review
+            .approval(
+                SwapApprovedAccount {
+                    address: None,
+                    setup: true,
+                },
+                Some(U256::from(50_000)),
+                true,
+            )
+            .unwrap();
+        let fee = SetupFee {
+            chain_id: 137,
+            token: STUB_POLYGON_USDC,
+            maximum: U256::from(50_000),
+            broadcaster: "0zk1…test".to_owned(),
+        };
+        let summary = swaps.public_review_summary(form, review, &approval, Some(&fee), cx);
+        assert_eq!(summary.title_for_test().0, "Set up account and swap");
+        assert_eq!(
+            summary.steps_for_test(),
+            Some((
+                1,
+                vec![
+                    format!("Set up account on {network}"),
+                    "Approve and place order".to_owned()
+                ]
+            ))
+        );
+        let (pay_now, value) = summary.rows_for_test().remove(0);
+        assert_eq!(pay_now, "Pay now");
+        let fees = value
+            .strip_prefix("up to ")
+            .and_then(|value| value.strip_suffix(" · not refunded"))
+            .and_then(|fees| fees.split_once(" + "))
+            .unwrap_or_else(|| panic!("{value}"));
+        assert!(!fees.0.is_empty(), "{value}");
+        assert_eq!(
+            fees.1,
+            swaps.token_amount(Address::ZERO, approval.max_gas_cost, cx)
+        );
+        // The collapsed Costs line names the same amounts as not refunded.
+        let (title, collapsed, costs) = summary.row_group_for_test().unwrap();
+        assert_eq!(title, "Costs");
+        assert_eq!(costs.first().map(String::as_str), Some("Pay now"));
+        assert!(
+            collapsed.ends_with(&format!("up to {} + {} now, not refunded", fees.0, fees.1)),
+            "{collapsed}"
+        );
+        let pays = summary.row_hint_for_test("Pay now").unwrap();
+        assert!(
+            pays.contains(&format!(
+                "Paid to broadcaster 0zk1…test from your private balance on {network}"
+            )) && pays.contains(&format!("{label} sends ")),
+            "{pays}"
+        );
+        assert!(
+            !summary
+                .rows_for_test()
+                .iter()
+                .any(|(label, _)| label.starts_with("Account on ")),
+            "a new account has no address to name yet"
+        );
+
+        let batch = wallet_ops::PublicSwapBatchTerms {
+            proxy,
+            guard_token: STUB_USDC,
+            guard_amount: bought,
+            depositor: source.address,
+            recipient: Address::repeat_byte(9),
+            input_token: STUB_USDC,
+            output_token: STUB_POLYGON_USDC,
+            destination_chain: 137,
+            scale_numerator: review.bridge().destination_minimum,
+            scale_denominator: bought,
+            deadline: 1_700_000_000,
+            nonce: alloy::primitives::B256::ZERO,
+        };
+        let [(instructions, batch_rows), (order, order_rows)] = swaps.public_signature_groups(
+            source,
+            destination,
+            review,
+            STUB_USDT,
+            &batch,
+            1_700_000_000,
+            cx,
+        );
+        assert_eq!(instructions, "1 · Bridge instructions for your CoW proxy");
+        assert_eq!(order, "2 · CoW order");
+        assert_eq!(
+            batch_rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Runs only if the proxy holds",
+                "Deposits into Across",
+                "Refunds go to",
+                format!("Delivered on {network}").as_str(),
+                "Recipient",
+                "Valid until"
+            ]
+        );
+        assert_eq!(
+            batch_rows[0].value,
+            format!("at least {}", swaps.token_amount(STUB_USDC, bought, cx))
+        );
+        assert_eq!(
+            (batch_rows[2].value.clone(), batch_rows[2].address.clone()),
+            (label, Some(railgun_ui::short_address(&source.address)))
+        );
+        assert_eq!(
+            order_rows
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.clone()))
+                .collect::<Vec<_>>()[..3],
+            [
+                (
+                    "Sell",
+                    swaps.form_sell_amount(form, review.sell_amount(), cx)
+                ),
+                ("Buy at least", swaps.token_amount(STUB_USDC, bought, cx)),
+                ("Receiver", "Your CoW proxy".to_owned()),
+            ]
+        );
+        assert_eq!(
+            order_rows[2].address,
+            Some(railgun_ui::short_address(&proxy))
+        );
+        for row in batch_rows.iter().chain(&order_rows) {
+            assert!(
+                !row.value.contains("1700000000")
+                    && !row.value.contains(&bought.to_string())
+                    && !row.value.contains("0x"),
+                "{} shows raw data: {}",
+                row.label,
+                row.value
+            );
+        }
+        assert_eq!(
+            public_source::public_sign_label("Ledger"),
+            "Sign on Ledger…"
+        );
+    });
+}
+
+#[gpui::test]
+fn public_buy_picker_keeps_same_asset_routes_and_refuses_own_chain_and_unfunded_destination(
+    cx: &mut TestAppContext,
+) {
+    use alloy::primitives::address;
+    use wallet_ops::bridge::{
+        AcrossRoute, PublicBridgePath, PublicSellAsset, public_across_destination_tokens,
+    };
+    let sell = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+    let received = address!("3c499c542cef5e3811e1192ce70d8cc03d5c3359");
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            let account = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    enable_stub_chain(root, &stubs, 137);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(account, sell, window, cx);
+                    let root = swaps.root.upgrade().unwrap();
+                    let routes = public_across_destination_tokens(
+                        &[AcrossRoute {
+                            origin_token: sell,
+                            destination_token: received,
+                            origin_symbol: "USDC".into(),
+                            destination_symbol: "USDC".into(),
+                        }],
+                        PublicSellAsset::Erc20(sell),
+                        false,
+                        &root.read(cx).effective_token_registry,
+                        137,
+                    );
+                    assert_eq!(routes[0].path, PublicBridgePath::Deposit);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((sell, 137), routes);
+                    form.picker.network = 137;
+                    form.picker.open = true;
+                    let form = swaps.form.as_ref().unwrap();
+                    let items = swaps.buy_picker_items(form, cx);
+                    assert!(
+                        items.iter().any(|item| item.asset.token == received),
+                        "a direct route remains selectable when there is no CoW route"
+                    );
+                    assert_eq!(
+                        swaps.network_availability(ReceiveTo::PrivateBalance, 1, cx),
+                        Some(NetworkAvailability::Unavailable(NetworkUnavailable::Shield))
+                    );
+                    assert_eq!(
+                        swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx),
+                        Some(NetworkAvailability::Unavailable(
+                            NetworkUnavailable::Unfunded
+                        ))
+                    );
+                    swaps.show_buy_picker_network(1, window, cx);
+                    assert_eq!(
+                        swaps.form.as_ref().unwrap().picker.network,
+                        137,
+                        "the own-chain Shield pointer cannot become a bridge destination"
+                    );
+                    let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
+                    assert!(
+                        content.receive_to == ReceiveTo::PrivateBalance
+                            && content.receive_to_locked,
+                        "the switch shows Private selected and can't change"
+                    );
+                    swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+                    assert_eq!(
+                        swaps.form.as_ref().unwrap().receive_to,
+                        ReceiveTo::PrivateBalance
+                    );
+                    swaps.form.as_mut().unwrap().picker.open = false;
+                });
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+// A chain with a Public swap profile takes no orders until its math contract is deployed. Its
+// form then lists what a deposit serves and says so without blocking Review, as on a chain
+// that has no profile. A form opened once the contract is there lists the other tokens too.
+#[gpui::test]
+fn public_form_lists_only_direct_routes_until_its_chain_takes_orders(cx: &mut TestAppContext) {
+    use wallet_ops::bridge::PublicBridgePath;
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let key = (STUB_USDT, 137);
+            for available in [false, true] {
+                stubs.set_math_deployed(available);
+                // Each form reads its chain again.
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        swaps.open_public_form(source.clone(), STUB_USDT, window, cx);
+                        swaps.form.as_mut().unwrap().network = Some(137);
+                        swaps.load_bridge_routes(window, cx);
+                    });
+                });
+                drive_until(cx, runtime, |cx| {
+                    swaps.read_with(cx, |swaps, _| {
+                        let public = swaps.form.as_ref().unwrap().public.as_ref().unwrap();
+                        public.orders_available.is_some() && public.routes.contains_key(&key)
+                    })
+                });
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        let form = swaps.form.as_mut().unwrap();
+                        let public = form.public.as_ref().unwrap();
+                        assert_eq!(public.orders_available, Some(available));
+                        let listed = public.routes[&key]
+                            .iter()
+                            .map(|route| (route.destination.destination_token, route.path))
+                            .collect::<Vec<_>>();
+                        let direct = (STUB_POLYGON_USDT, PublicBridgePath::Deposit);
+                        if available {
+                            // Every other token Across delivers there is listed as an order.
+                            assert!(listed.contains(&direct));
+                            assert!(listed.contains(&(STUB_POLYGON_USDC, PublicBridgePath::Order)));
+                            assert!(listed.iter().all(|route| *route == direct
+                                || route.1 == PublicBridgePath::Order));
+                        } else {
+                            assert_eq!(listed, [direct]);
+                        }
+                        // The token that bridges directly can be picked either way.
+                        form.buy = Some(STUB_POLYGON_USDT);
+                        let reason = swaps.public_form_reason(swaps.form.as_ref().unwrap(), cx);
+                        if available {
+                            assert!(reason.is_none());
+                        } else {
+                            let reason = reason.expect("a chain without orders says so");
+                            assert!(!reason.blocks_review);
+                            assert_eq!(
+                                reason.text,
+                                format!(
+                                    "From {}, a token can only be bridged as itself, such as USDC to USDC. Swapping to a different token isn't supported on this network.",
+                                    network_name(1)
+                                )
+                            );
+                        }
+                        swaps.close_swap_dialog(window, cx);
+                    });
+                });
+                cx.run_until_parked();
+            }
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+#[gpui::test]
+fn partial_public_destination_recovery_keeps_the_remaining_amount_and_action(
+    cx: &mut TestAppContext,
+) {
+    use alloy::{eips::BlockNumHash, sol_types::SolCall};
+    use broadcaster_core::contracts::railgun::{
+        CommitmentPreimage, ShieldCiphertext, ShieldRequest, TokenData, shieldCall,
+    };
+    use wallet_ops::vault::{
+        ExecutorExecutionResult, ExecutorPayloadInclusion, PublicSwapObservations,
+        SwapBridgeHandoff, SwapBridgeOutcome, SwapObservation,
+    };
+    with_swap_view(cx, |root, swaps, _, _, _, cx| {
+        let railgun = root.read_with(cx, |root, _| {
+            root.effective_chain_configs
+                .get(1)
+                .unwrap()
+                .railgun
+                .as_ref()
+                .unwrap()
+                .deployment
+                .contract
+        });
+        let observed = SwapObservation {
+            block: BlockNumHash::new(20, B256::ZERO),
+            transaction_hash: Some(B256::ZERO),
+        };
+        let held = PublicSwapObservations {
+            bridge_handoff: Some(SwapBridgeHandoff {
+                observation: observed,
+                deposit_id: Some(U256::ONE),
+            }),
+            bridge_outcome: Some(SwapBridgeOutcome::HeldOnDestination {
+                block: observed.block,
+                transaction_hash: B256::ZERO,
+                amount: U256::from(995),
+            }),
+            ..Default::default()
+        };
+        let record = model::tests::public_presentation_record(true, &held);
+        let hash = B256::repeat_byte(0x91);
+        let request = ShieldRequest {
+            preimage: CommitmentPreimage {
+                npk: B256::ZERO,
+                token: TokenData::erc20(Address::repeat_byte(7)),
+                value: alloy::primitives::Uint::from(400_u64),
+            },
+            ciphertext: ShieldCiphertext {
+                encryptedBundle: [B256::ZERO; 3],
+                shieldKey: B256::ZERO,
+            },
+        };
+        let transaction = alloy::rpc::types::TransactionRequest::default()
+            .from(record.address().unwrap())
+            .to(railgun)
+            .input(
+                shieldCall {
+                    _shieldRequests: vec![request],
+                }
+                .abi_encode()
+                .into(),
+            );
+        let mut value = serde_json::to_value(record).unwrap();
+        value["recovery_transactions"] = serde_json::json!([{ "recovery": ExecutorOperationId::random().unwrap(), "step": 0, "kind": "Shield",
+            "transaction": transaction, "hash": hash, "observed": observed.block,
+            "inclusion": ExecutorPayloadInclusion::new(BlockNumHash::new(21, B256::ZERO), hash, ExecutorExecutionResult::Executed) }]);
+        let record: ExecutorRecord = serde_json::from_value(value).unwrap();
+        let identity = model::SwapIdentity {
+            operation: record.operation(),
+            swap_use: record.swap_uses()[0].id(),
+        };
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.public_records = vec![(1, record)];
+                swaps.show_view(SwapDialogView::PublicDetail(identity), window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, cx| {
+            let (record, claimed, swap) = swaps.public_swap_record(identity).unwrap();
+            let stage = model::public_swap_stage(
+                record,
+                claimed,
+                None,
+                now_unix(),
+                swaps.public_destination_railgun(record),
+            )
+            .unwrap();
+            assert_eq!(stage, model::PublicSwapStage::HeldOnDestination);
+            // The wallet has no metadata for the held token: the detail keeps the remaining
+            // amount as a private swap words it, and the card's title names only the token.
+            let held = swaps.public_labels(record, claimed, cx).unwrap().held;
+            assert!(held.as_deref().is_some_and(|held| held.starts_with("595 ")));
+            let title = swaps.public_card_line(cx).unwrap().title;
+            let held_on = format!(" held on {}", network_name(1));
+            assert!(
+                !title.starts_with("595") && title.ends_with(&held_on),
+                "{title}"
+            );
+            assert!(
+                swaps
+                    .shown_public_swaps()
+                    .any(|(shown, _)| shown == identity)
+            );
+            assert!(
+                public_progress::public_swap_actions(swap, claimed, stage, now_unix())
+                    .contains(&public_progress::PublicSwapAction::RecoverDestination)
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, _| {
+            use gpui_kit::test::TestWindowExt;
+            assert!(
+                window
+                    .find("public-swap-action-RecoverDestination")
+                    .visible()
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn retrying_an_expired_public_order_starts_a_fresh_review_and_preserves_its_history(
+    cx: &mut TestAppContext,
+) {
+    use alloy::eips::BlockNumHash;
+    use wallet_ops::vault::{
+        AcrossOrderTerms, PublicSwapClaim, PublicSwapObservations, SwapAccountChoice,
+        SwapObservation,
+    };
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, operation) = reusable_polygon_account(root, cx);
+            let destination = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            let account = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let template =
+                model::tests::public_presentation_record(true, &PublicSwapObservations::default());
+            let saved = template.swap_uses()[0].public_swap().unwrap();
+            let mut approval = saved.approval().clone();
+            approval.sell_token = Address::repeat_byte(42);
+            approval.bounds.sell_amount = U256::from(7_000_000_000_000_000_000_u64);
+            approval.bounds.slippage_bps = 125;
+            approval.bounds.gas_share_bps = Some(3_000);
+            approval.destination.address = destination.address();
+            let id = SwapUseId::random().unwrap();
+            destination_store
+                .claim_public_swap(PublicSwapClaim {
+                    id,
+                    origin_chain: 1,
+                    source: account.address,
+                    source_scope: account.scope,
+                    account: SwapAccountChoice::Existing(operation),
+                    delegate: destination.delegate(),
+                    destination_token: STUB_POLYGON_USDC,
+                    bridged_token: saved.intent().bridged_token,
+                    order: true,
+                    approval: approval.clone(),
+                    now: now_unix(),
+                })
+                .unwrap();
+            destination_store
+                .record_public_swap_path(
+                    operation,
+                    id,
+                    saved.path().unwrap().clone(),
+                    AcrossOrderTerms {
+                        spoke_pool: Address::repeat_byte(8),
+                        input_token: saved.intent().bridged_token,
+                        output_token: STUB_POLYGON_USDC,
+                        input_amount: U256::from(995),
+                        output_amount: U256::from(990),
+                        quote_timestamp: 0,
+                        fill_deadline: 100,
+                        exclusive_relayer: Address::ZERO,
+                        exclusivity_parameter: 0,
+                        recipient: destination.address(),
+                        message_hash: Some(B256::ZERO),
+                    },
+                )
+                .unwrap();
+            let old = destination_store
+                .record_public_swap_observations(
+                    operation,
+                    id,
+                    PublicSwapObservations {
+                        expired: Some(SwapObservation {
+                            block: BlockNumHash::new(20, B256::ZERO),
+                            transaction_hash: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let identity = model::SwapIdentity {
+                operation,
+                swap_use: id,
+            };
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.public_records = vec![(137, old.clone())];
+                    swaps.show_view(SwapDialogView::PublicDetail(identity), window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                use gpui_kit::test::TestWindowExt;
+                window.click("public-swap-action-Retry", cx);
+            });
+            cx.run_until_parked();
+            swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            let public = form.public.as_ref().unwrap();
+            assert_eq!(public.account.public_account_uuid, account.public_account_uuid);
+            assert!(public.operation.is_none() && public.swap_use.is_none(), "the signed use is immutable and cannot own the new review");
+            assert!(public.review.is_none(), "the old signature and quote cannot authorize another attempt");
+            assert_eq!((form.sell, form.network, form.buy), (approval.sell_token, Some(137), Some(STUB_POLYGON_USDC)));
+            assert_eq!(form.amount_input.read(cx).value().as_ref(), "7");
+            assert_eq!((form.slippage_bps, form.gas_share_bps), (125, 3_000));
+            assert!(form.destination_account.is_none(), "the previously claimed account is checked afresh instead of selected automatically");
+            assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+        });
+            assert_eq!(
+                destination_store
+                    .records()
+                    .unwrap()
+                    .into_iter()
+                    .find(|record| record.operation() == operation)
+                    .unwrap(),
+                old
+            );
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
 }

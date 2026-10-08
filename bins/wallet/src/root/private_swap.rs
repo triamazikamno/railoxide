@@ -38,6 +38,30 @@ mod dialog;
 mod form;
 mod model;
 mod progress;
+mod public_progress;
+#[cfg(debug_assertions)]
+mod ui_fixture;
+/// The debug UI fixture's queries in a release build, which has no fixture.
+#[cfg(not(debug_assertions))]
+mod ui_fixture {
+    pub(super) const fn active() -> bool {
+        false
+    }
+
+    pub(super) const fn holds_records() -> bool {
+        false
+    }
+
+    pub(super) const fn setup_fee(_decimals: u8) -> Option<alloy::primitives::U256> {
+        None
+    }
+
+    pub(super) const fn setup_done() -> bool {
+        false
+    }
+}
+pub(super) use form::SHARED_ACCOUNT_REASON;
+pub(super) use form::public_source::PublicSwapAuthorization;
 
 use form::SwapForm;
 use model::{
@@ -66,7 +90,8 @@ const SWAP_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 const SWAP_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct PrivateSwapsPanel {
-    session: Arc<WalletSession>,
+    origin_chain_id: u64,
+    session: Option<Arc<WalletSession>>,
     view: Entity<PrivateSwapsView>,
 }
 
@@ -333,8 +358,27 @@ struct SwapOrderHint {
 
 pub(super) struct PrivateSwapsView {
     root: WeakEntity<WalletRoot>,
-    session: Arc<WalletSession>,
-    owner: Arc<ExecutorOwner>,
+    origin_chain_id: u64,
+    session: Option<Arc<WalletSession>>,
+    owner: Option<Arc<ExecutorOwner>>,
+    public_records: Vec<(u64, ExecutorRecord)>,
+    public_tracking: BTreeSet<(u64, ExecutorOperationId, SwapUseId)>,
+    /// The Railgun contract of each chain in `public_records`, read with them. The Private
+    /// tab asks for the shown swaps while the root renders, when the root can't be read.
+    public_railgun: BTreeMap<u64, Address>,
+    /// The networks whose private sync has been ready in this session. Such a network syncs
+    /// again from time to time, which doesn't put a quote for a delivery there on hold.
+    public_synced: BTreeSet<u64>,
+    /// Background status checks of a Public account swap that failed in a row.
+    public_tracking_failures: BTreeMap<(ExecutorOperationId, SwapUseId), u32>,
+    public_authorization: Option<Arc<PublicSwapAuthorization>>,
+    public_execution: Option<form::public_source::PublicSwapExecution>,
+    public_job: Option<Task<()>>,
+    /// The swap `public_job` works on, which its detail shows at work. `None` for any other
+    /// job, such as a withdrawal's.
+    public_running: Option<SwapIdentity>,
+    /// What a Public account swap is doing between its review and its order or deposit.
+    public_status: Option<gpui::SharedString>,
     runtime: tokio::runtime::Handle,
     active: bool,
     /// Swap executor records only, newest first.
@@ -370,7 +414,7 @@ pub(super) struct PrivateSwapsView {
     job: Option<SwapJob>,
     job_revision: u64,
     error: Option<String>,
-    _changes: Task<()>,
+    origin_changes: Task<()>,
     _polling: Task<()>,
     _hint_polling: Task<()>,
 }
@@ -385,36 +429,83 @@ impl Drop for PrivateSwapsView {
 
 impl WalletRoot {
     pub(super) fn ensure_private_swaps(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        // Swaps exist only on chains with a swap profile, for wallets that run executors there.
-        let Some(session) = self
-            .stealth_session()
-            .filter(|_| self.view_session.is_some())
-            .filter(|session| {
-                self.effective_chain_configs
-                    .get(session.chain_id)
-                    .and_then(wallet_ops::settings::EffectiveChainConfig::swap_profile)
-                    .is_some()
-            })
-        else {
+        let origin_chain_id = self.selected_chain;
+        let Some(chain) = self.effective_chain_configs.get(origin_chain_id) else {
             self.clear_private_swaps(cx);
             return;
         };
-        if self
-            .private_swaps
-            .as_ref()
-            .is_some_and(|panel| Arc::ptr_eq(&panel.session, &session))
+        if self.view_session.is_none()
+            || (chain.swap_profile().is_none() && chain.bridge_origin_profile().is_none())
         {
+            self.clear_private_swaps(cx);
+            return;
+        }
+        let session = self.stealth_session().filter(|session| {
+            session.chain_id == origin_chain_id && chain.swap_profile().is_some()
+        });
+        // Public drafts and destination execution do not depend on the origin's private
+        // session. Attach one when it arrives without replacing their view or capabilities.
+        if let Some(panel) = self
+            .private_swaps
+            .as_mut()
+            .filter(|panel| panel.origin_chain_id == origin_chain_id && panel.session.is_none())
+            && let Some(session) = session.as_ref()
+        {
+            let owner = session.executor_owner();
+            panel.session = Some(session.clone());
+            panel.view.update(cx, |view, cx| {
+                view.session = Some(session.clone());
+                view.owner = owner;
+                view.origin_changes = PrivateSwapsView::watch_origin_changes(
+                    view.session.as_ref(),
+                    view.owner.as_ref(),
+                    cx,
+                );
+                view.reload_records();
+                cx.notify();
+            });
+            return;
+        }
+        if self.private_swaps.as_ref().is_some_and(|panel| {
+            panel.origin_chain_id == origin_chain_id
+                && match (&panel.session, &session) {
+                    (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }) {
             return;
         }
         self.clear_private_swaps(cx);
-        let owner = session.executor_owner().expect("checked executor session");
+        let owner = session
+            .as_ref()
+            .and_then(|session| session.executor_owner());
         let root = cx.entity().downgrade();
         let runtime = self.runtime.clone();
         let view = cx.new(|cx| {
-            PrivateSwapsView::new(root, Arc::clone(&session), owner, runtime, window, cx)
+            PrivateSwapsView::new_for_origin(
+                root,
+                origin_chain_id,
+                session.clone(),
+                owner,
+                runtime,
+                window,
+                cx,
+            )
         });
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
-        self.private_swaps = Some(PrivateSwapsPanel { session, view });
+        let refresh = view.downgrade();
+        cx.defer(move |cx| {
+            let _ = refresh.update(cx, |view, cx| {
+                view.refresh_public_swap_records(cx);
+                cx.notify();
+            });
+        });
+        self.private_swaps = Some(PrivateSwapsPanel {
+            origin_chain_id,
+            session,
+            view,
+        });
     }
 
     pub(super) fn clear_private_swaps(&mut self, cx: &mut Context<'_, Self>) {
@@ -434,6 +525,13 @@ impl WalletRoot {
                 view.tracking.clear();
                 view.destinations.clear();
                 view.records.clear();
+                view.public_records.clear();
+                view.public_tracking.clear();
+                view.public_tracking_failures.clear();
+                view.public_authorization = None;
+                view.public_execution = None;
+                view.public_job = None;
+                view.public_running = None;
                 cx.notify();
             });
         }
@@ -443,7 +541,14 @@ impl WalletRoot {
     pub(super) fn private_swaps_view(&self) -> Option<Entity<PrivateSwapsView>> {
         self.private_swaps
             .as_ref()
-            .filter(|panel| self.stealth_session_is_current(&panel.session))
+            .filter(|panel| {
+                panel.origin_chain_id == self.selected_chain
+                    && self.view_session.is_some()
+                    && panel
+                        .session
+                        .as_ref()
+                        .is_none_or(|session| self.stealth_session_is_current(session))
+            })
             .map(|panel| panel.view.clone())
     }
 
@@ -454,7 +559,7 @@ impl WalletRoot {
         if self
             .private_swaps
             .as_ref()
-            .is_none_or(|panel| panel.session.chain_id != chain_id)
+            .is_none_or(|panel| panel.origin_chain_id != chain_id)
         {
             return;
         }
@@ -478,6 +583,40 @@ impl WalletRoot {
         self.effective_chain_configs
             .get(self.selected_chain)?
             .swap_profile()
+    }
+
+    pub(super) fn open_public_swap_form(
+        &mut self,
+        public_account_uuid: &str,
+        sell: Option<Address>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(account) = self
+            .public_accounts
+            .iter()
+            .find(|account| {
+                account.public_account_uuid == public_account_uuid
+                    && account.status == wallet_ops::vault::PublicAccountStatus::Active
+                    && account.scope != wallet_ops::vault::PublicAccountScope::Global
+                    && !matches!(
+                        account.source,
+                        wallet_ops::vault::PublicAccountSource::ExecutorDerived(_)
+                    )
+            })
+            .cloned()
+        else {
+            return;
+        };
+        self.ensure_private_swaps(window, cx);
+        let Some(view) = self.private_swaps_view() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_public_form(account, sell.unwrap_or(Address::ZERO), window, cx);
+            });
+        });
     }
 
     pub(super) fn open_private_swap_form(
@@ -524,18 +663,22 @@ pub(super) fn swap_entry_availability(
 }
 
 impl PrivateSwapsView {
-    fn new(
-        root: WeakEntity<WalletRoot>,
-        session: Arc<WalletSession>,
-        owner: Arc<ExecutorOwner>,
-        runtime: tokio::runtime::Handle,
-        window: &Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
-        let mut changes = owner.subscribe();
-        let mut private_changes = session.observation_rx.clone();
-        let mut tip_changes = session.sync_tip_rx.clone();
-        let changes_task = cx.spawn(async move |this, cx| {
+    fn watch_origin_changes(
+        session: Option<&Arc<WalletSession>>,
+        owner: Option<&Arc<ExecutorOwner>>,
+        cx: &Context<'_, Self>,
+    ) -> Task<()> {
+        let watches = owner.zip(session).map(|(owner, session)| {
+            (
+                owner.subscribe(),
+                session.observation_rx.clone(),
+                session.sync_tip_rx.clone(),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let Some((mut changes, mut private_changes, mut tip_changes)) = watches else {
+                return;
+            };
             loop {
                 let reload = tokio::select! {
                     changed = changes.changed() => changed.map(|()| true),
@@ -550,6 +693,7 @@ impl PrivateSwapsView {
                         if this.session_is_current(cx) {
                             if reload {
                                 this.reload_records();
+                                this.refresh_public_swap_records(cx);
                                 this.reload_destinations(cx);
                                 this.refresh_form_assets(cx);
                             }
@@ -561,7 +705,19 @@ impl PrivateSwapsView {
                     break;
                 }
             }
-        });
+        })
+    }
+
+    fn new_for_origin(
+        root: WeakEntity<WalletRoot>,
+        origin_chain_id: u64,
+        session: Option<Arc<WalletSession>>,
+        owner: Option<Arc<ExecutorOwner>>,
+        runtime: tokio::runtime::Handle,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let changes_task = Self::watch_origin_changes(session.as_ref(), owner.as_ref(), cx);
         // Every change to the records, tracking or jobs notifies, so the open count follows
         // notifications. It reads the root, which is busy creating this view, so the first
         // count waits for the first notification; opening the dialog sends one.
@@ -594,6 +750,9 @@ impl PrivateSwapsView {
                     if woken {
                         this.continue_form_after_observation(window, cx);
                     }
+                    this.refresh_public_swap_records(cx);
+                    this.track_public_swaps(window, cx);
+                    this.continue_public_swap_after_setup(window, cx);
                     this.refresh_destinations(cx);
                     this.continue_approved_swaps(window, cx);
                     let (runtime, owner, mut pages) = this.next_observations(cx)?;
@@ -649,8 +808,19 @@ impl PrivateSwapsView {
         });
         let mut view = Self {
             root,
+            origin_chain_id,
             session,
             owner,
+            public_records: Vec::new(),
+            public_tracking: BTreeSet::new(),
+            public_railgun: BTreeMap::new(),
+            public_synced: BTreeSet::new(),
+            public_tracking_failures: BTreeMap::new(),
+            public_authorization: None,
+            public_execution: None,
+            public_job: None,
+            public_running: None,
+            public_status: None,
             runtime,
             active: true,
             records: Vec::new(),
@@ -670,7 +840,7 @@ impl PrivateSwapsView {
             job: None,
             job_revision: 0,
             error: None,
-            _changes: changes_task,
+            origin_changes: changes_task,
             _polling: polling,
             _hint_polling: hint_polling,
         };
@@ -678,16 +848,41 @@ impl PrivateSwapsView {
         view
     }
 
+    /// The origin network's private session, which every private swap spends from. `None` in
+    /// a view that only tracks swaps paid from Public accounts, which need none there.
+    const fn private_session(&self) -> Option<&Arc<WalletSession>> {
+        self.session.as_ref()
+    }
+
+    /// The origin network's executor owner, as [`Self::private_session`] is available.
+    const fn private_owner(&self) -> Option<&Arc<ExecutorOwner>> {
+        self.owner.as_ref()
+    }
+
+    fn public_record_chain(&self, record: &ExecutorRecord) -> Option<u64> {
+        self.public_records.iter().find_map(|(chain, candidate)| {
+            (candidate.operation() == record.operation()).then_some(*chain)
+        })
+    }
+
     fn session_is_current(&self, cx: &gpui::App) -> bool {
         self.active
-            && self
-                .root
-                .upgrade()
-                .is_some_and(|root| root.read(cx).stealth_session_is_current(&self.session))
+            && self.root.upgrade().is_some_and(|root| {
+                let root = root.read(cx);
+                root.selected_chain == self.origin_chain_id
+                    && root.view_session.is_some()
+                    && self
+                        .session
+                        .as_ref()
+                        .is_none_or(|session| root.stealth_session_is_current(session))
+            })
     }
 
     fn reload_records(&mut self) {
-        match self.owner.records() {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        match owner.records() {
             Ok(records) => {
                 let selected = self.form.as_ref().and_then(SwapForm::operation);
                 let mut records = records
@@ -773,12 +968,12 @@ impl PrivateSwapsView {
             .tracking
             .get(&operation)
             .and_then(|tracking| tracking.setup);
-        account_stage(record, self.session.chain_id, setup, submitting)
+        account_stage(record, self.origin_chain_id, setup, submitting)
     }
 
     /// Whether the record's setup is recorded as executed for this chain's accepted delegate.
     fn setup_recorded_executed(&self, record: &ExecutorRecord) -> bool {
-        setup_recorded_executed_on(self.session.chain_id, record)
+        setup_recorded_executed_on(self.origin_chain_id, record)
     }
 
     /// The wallet session and executor owner of `chain_id`, a private Bridge swap's destination
@@ -1047,7 +1242,9 @@ impl PrivateSwapsView {
             .root
             .upgrade()
             .and_then(|root| root.read(cx).confirmed_block(chain_id));
-        let origin = Arc::clone(&self.owner);
+        let Some(origin) = self.private_owner().cloned() else {
+            return;
+        };
         drop(self.runtime.spawn(async move {
             let settling = Arc::clone(&owner);
             // A failed write is repeated by the owner's next reconciliation.
@@ -1142,7 +1339,7 @@ impl PrivateSwapsView {
         } else {
             account_setup_progress(
                 record,
-                self.session.chain_id,
+                self.origin_chain_id,
                 self.tracking
                     .get(&operation)
                     .and_then(|tracking| tracking.setup),
@@ -1215,7 +1412,10 @@ impl PrivateSwapsView {
     }
 
     const fn busy(&self) -> bool {
-        self.job.is_some() || self.pending_authorization.is_some()
+        self.job.is_some()
+            || self.pending_authorization.is_some()
+            || self.public_authorization.is_some()
+            || self.public_job.is_some()
     }
 
     /// The confirmed block of the session's last synced head.
@@ -1223,7 +1423,7 @@ impl PrivateSwapsView {
         self.root
             .upgrade()?
             .read(cx)
-            .confirmed_block(self.session.chain_id)
+            .confirmed_block(self.origin_chain_id)
     }
 
     /// A token's symbol, decimals and icon. The native asset, which a Public address swap can
@@ -1233,7 +1433,7 @@ impl PrivateSwapsView {
         token: Address,
         cx: &gpui::App,
     ) -> Option<super::tokens::TokenDisplayMetadata> {
-        self.chain_token_metadata(self.session.chain_id, token, cx)
+        self.chain_token_metadata(self.origin_chain_id, token, cx)
     }
 
     /// [`Self::token_metadata`] on `chain_id`, such as a Bridge swap's destination network.
@@ -1276,7 +1476,7 @@ impl PrivateSwapsView {
             || amount.to_string(),
             |root| {
                 super::format_token_amount_for_display(
-                    self.session.chain_id,
+                    self.origin_chain_id,
                     token,
                     amount,
                     Some(&root.read(cx).effective_token_registry),
@@ -1351,7 +1551,15 @@ impl PrivateSwapsView {
     }
 
     fn setup_confirmation(&self, record: &ExecutorRecord) -> Option<model::SwapSetupConfirmation> {
-        model::swap_setup_confirmation(record, &self.session.observation_rx.borrow().snapshot.utxos)
+        model::swap_setup_confirmation(
+            record,
+            &self
+                .private_session()?
+                .observation_rx
+                .borrow()
+                .snapshot
+                .utxos,
+        )
     }
 
     fn setup_retry_problem(&self, record: &ExecutorRecord) -> Option<&'static str> {
@@ -1367,9 +1575,9 @@ impl PrivateSwapsView {
         let depth = root
             .read(cx)
             .effective_chain_configs
-            .get(self.session.chain_id)?
+            .get(self.origin_chain_id)?
             .finality_depth;
-        let tip = *self.session.sync_tip_rx.borrow();
+        let tip = *self.private_session()?.sync_tip_rx.borrow();
         self.setup_confirmation(record)?
             .detail(super::utxo::UtxoFinalityContext::new(
                 tip.head_block,
@@ -1503,7 +1711,7 @@ impl PrivateSwapsView {
             provider: bridge.provider,
             network: form::network_name(bridge.destination_chain),
             token: self.network_token_symbol(bridge.destination_chain, token, cx),
-            origin: form::network_name(self.session.chain_id),
+            origin: form::network_name(self.origin_chain_id),
             receiver: self
                 .receiver_label(bridge.receiver, cx)
                 .map_or_else(|| short_receiver(bridge.receiver), |(label, _)| label),
@@ -1560,7 +1768,7 @@ impl PrivateSwapsView {
         } else {
             account_setup_progress(
                 record,
-                self.session.chain_id,
+                self.origin_chain_id,
                 tracking.and_then(|tracking| tracking.setup),
                 self.submitting_setup(operation),
             )
@@ -1594,7 +1802,7 @@ impl PrivateSwapsView {
         let destination_fresh = destination.fresh_from_record_or_approval();
         [
             SwapSetupLabels {
-                network: form::network_name(self.session.chain_id),
+                network: form::network_name(self.origin_chain_id),
                 account: record.address().map(|address| SwapStepAccount {
                     index: Some(record.index()),
                     address,
@@ -1655,11 +1863,11 @@ impl PrivateSwapsView {
         let root = root.read(cx);
         let depth = root
             .effective_chain_configs
-            .get(self.session.chain_id)?
+            .get(self.origin_chain_id)?
             .finality_depth;
         let head = root
             .chain_states
-            .get(&self.session.chain_id)
+            .get(&self.origin_chain_id)
             .and_then(super::chain_load::ChainUtxoState::sync_tip)
             .and_then(|tip| tip.head_block);
         Some(SwapFillHint {
@@ -1697,14 +1905,14 @@ impl PrivateSwapsView {
         Arc<ExecutorOwner>,
         Vec<ObservationPage>,
     )> {
-        if !self.session_is_current(cx) {
+        if self.session.is_none() || !self.session_is_current(cx) {
             return None;
         }
         let confirmed = self.confirmed_block(cx)?;
         let finality_depth = self.root.upgrade().and_then(|root| {
             root.read(cx)
                 .effective_chain_configs
-                .get(self.session.chain_id)
+                .get(self.origin_chain_id)
                 .map(|chain| chain.finality_depth)
         });
         let busy = self.job.as_ref().map(|job| job.operation);
@@ -1733,7 +1941,10 @@ impl PrivateSwapsView {
                         .filter(|hint| hint.uid == order.uid())
                         .and_then(|hint| hint.trade_block)
                         .or_else(|| order.observations().traded.map(|trade| trade.block.number))
-                        .or_else(|| self.owner.synced_settlement_block(record, order.uid()))?;
+                        .or_else(|| {
+                            self.private_owner()?
+                                .synced_settlement_block(record, order.uid())
+                        })?;
                     return (block <= confirmed).then_some(ObservationPage {
                         operation: record.operation(),
                         setup: false,
@@ -1770,7 +1981,8 @@ impl PrivateSwapsView {
                     .filter_map(|record| self.destination_observation(record, cx)),
             )
             .collect::<Vec<_>>();
-        (!pages.is_empty()).then(|| (self.runtime.clone(), Arc::clone(&self.owner), pages))
+        let owner = self.private_owner().filter(|_| !pages.is_empty())?;
+        Some((self.runtime.clone(), Arc::clone(owner), pages))
     }
 
     /// The next observation of a private Bridge swap's destination stealth account, on its own
@@ -1858,7 +2070,7 @@ impl PrivateSwapsView {
         &self,
         cx: &gpui::App,
     ) -> Option<(tokio::runtime::Handle, Arc<ExecutorOwner>, Vec<HintRequest>)> {
-        if !self.session_is_current(cx) {
+        if self.session.is_none() || !self.session_is_current(cx) {
             return None;
         }
         let root = self.root.upgrade();
@@ -1916,7 +2128,8 @@ impl PrivateSwapsView {
                 })
             })
             .collect::<Vec<_>>();
-        (!requests.is_empty()).then(|| (self.runtime.clone(), Arc::clone(&self.owner), requests))
+        let owner = self.private_owner().filter(|_| !requests.is_empty())?;
+        Some((self.runtime.clone(), Arc::clone(owner), requests))
     }
 
     fn apply_order_hints(&mut self, results: Vec<HintResult>, cx: &mut Context<'_, Self>) {
@@ -2195,7 +2408,7 @@ impl PrivateSwapsView {
             .map(|root| &root.read(cx).effective_token_registry);
         let amount = |value| {
             super::format_exact_token_amount_for_display(
-                self.session.chain_id,
+                self.origin_chain_id,
                 exceeded.fee_token(),
                 value,
                 registry,
@@ -2248,8 +2461,11 @@ impl PrivateSwapsView {
             },
             None => None,
         };
+        let Some(session) = self.private_session().cloned() else {
+            return;
+        };
         let command = Arc::new(SwapAuthorization {
-            session: Arc::clone(&self.session),
+            session,
             destination_session,
             action,
             destination,

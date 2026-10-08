@@ -13,6 +13,7 @@ use alloy::rpc::types::{FeeHistory, TransactionRequest};
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
+pub use broadcaster_core::contracts::executor::AcrossPrivateDelivery;
 use broadcaster_core::contracts::shield::derive_shield_private_key;
 use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};

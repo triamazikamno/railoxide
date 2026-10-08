@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,10 +37,15 @@ mod destination;
 mod gas;
 mod observation;
 mod order;
+mod public_order;
+mod public_settlement;
+mod public_source;
+mod public_tracking;
+mod public_transactions;
 mod recovery;
 mod settlement;
 mod simulation;
-pub(crate) use admission::SwapShieldNotes;
+pub use admission::SwapShieldNotes;
 #[cfg(test)]
 pub(crate) use admission::notes_of_shield;
 pub use bridge::{
@@ -56,6 +62,20 @@ pub(crate) use order::{
     SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs,
     price_swap_review, reusable_swap_proof, swap_invalidation,
 };
+pub use public_order::{
+    PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,
+    PublicSwapReviewRequest, PublicSwapUnavailable, new_public_swap_batch_nonce,
+    public_swap_batch_terms,
+};
+pub use public_settlement::{PublicSwapOrderState, public_swap_order_state};
+pub use public_source::{PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapUseClaim};
+pub use public_tracking::{PublicSwapProgress, PublicSwapTracking};
+pub use public_transactions::{
+    AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
+    PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS,
+    PublicSwapGasPlan, PublicSwapSource, PublicSwapTransactionOutcome, PublicSwapWithdrawalReview,
+    public_swap_approvals, public_swap_gas_plan,
+};
 pub(super) use recovery::swap_recovery_call_bound;
 #[cfg(test)]
 pub(crate) use recovery::{swap_cancellation_admitted, swap_recovery_calls};
@@ -71,10 +91,15 @@ pub fn is_swap_record(record: &ExecutorRecord) -> bool {
     record.swap().is_some() || record.purpose_summary() == Some(SWAP_PURPOSE_SUMMARY)
 }
 
-/// Whether `record` is the destination stealth account of a private Bridge swap.
+/// Whether `record` is the destination stealth account of a private Bridge swap, or of a swap
+/// paid from a Public account.
 #[must_use]
-pub const fn is_swap_destination_record(record: &ExecutorRecord) -> bool {
+pub fn is_swap_destination_record(record: &ExecutorRecord) -> bool {
     record.swap_destination().is_some()
+        || record
+            .swap_uses()
+            .last()
+            .is_some_and(|swap_use| swap_use.public_swap().is_some())
 }
 
 /// Whether the swap use `id` claims `record`'s account and was not stopped.
@@ -114,10 +139,11 @@ fn require_swap_account(
 }
 
 /// Delivery of an approved setup. The fee ceiling is the reviewed maximum.
-pub struct SwapSetupRequest {
+/// Borrow the authorization when the same swap needs it again for destination shielding.
+pub struct SwapSetupRequest<A = DesktopPrivateSpendAuthorization> {
     pub maximum_private_fee: U256,
     pub session: Arc<WalletSession>,
-    pub authorization: DesktopPrivateSpendAuthorization,
+    pub authorization: A,
     pub waku: Arc<WakuClient>,
     pub verify_proof: bool,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
@@ -1029,19 +1055,19 @@ impl ExecutorOwner {
     /// stealth account's fee ceiling may not exceed the one approved with its swap, and neither
     /// may the swap's own when its approval binds one. An account its swap reuses takes no
     /// setup.
-    pub async fn submit_swap_setup(
+    pub async fn submit_swap_setup<A: Borrow<DesktopPrivateSpendAuthorization> + Send>(
         &self,
         prepared: &PreparedExecutorOperation,
-        request: SwapSetupRequest,
+        request: SwapSetupRequest<A>,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         self.while_active(Box::pin(self.submit_swap_setup_active(prepared, request)))
             .await
     }
 
-    async fn submit_swap_setup_active(
+    async fn submit_swap_setup_active<A: Borrow<DesktopPrivateSpendAuthorization> + Send>(
         &self,
         prepared: &PreparedExecutorOperation,
-        request: SwapSetupRequest,
+        request: SwapSetupRequest<A>,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         self.require_fee_session(&request.session, PaidExecutionPurpose::SwapSetup)?;
         let record = self
@@ -1120,10 +1146,27 @@ impl ExecutorOwner {
         receiver: Address,
         notes: Option<&dyn SwapShieldNotes>,
     ) -> Result<DelegatedSwapExecutor> {
+        self.delegated_destination(operation, confirmed, swap_use, notes, |record| {
+            record.serves_swap_use(swap_use, origin_chain, origin_operation)
+                && record.address() == Some(receiver)
+        })
+        .await
+    }
+
+    /// Confirm at `confirmed` the destination account `operation` that the live swap use
+    /// `swap_use` claims, as [`Self::delegated_swap_destination`] describes. `claimed` tells
+    /// whether a record is the account that use delivers to.
+    async fn delegated_destination(
+        &self,
+        operation: ExecutorOperationId,
+        confirmed: u64,
+        swap_use: SwapUseId,
+        notes: Option<&dyn SwapShieldNotes>,
+        claimed: impl Fn(&ExecutorRecord) -> bool,
+    ) -> Result<DelegatedSwapExecutor> {
         let serves = |record: &ExecutorRecord| {
             is_live_swap_use(record, swap_use)
-                && record.serves_swap_use(swap_use, origin_chain, origin_operation)
-                && record.address() == Some(receiver)
+                && claimed(record)
                 && !record.is_retired()
                 && !record.is_swap_setup_stopped()
         };
@@ -1144,6 +1187,9 @@ impl ExecutorOwner {
                 .filter(|claimed| !claimed.is_fresh())
                 .and_then(|claimed| match claimed.role() {
                     SwapUseRole::Destination {
+                        destination_token, ..
+                    }
+                    | SwapUseRole::PublicSourceDestination {
                         destination_token, ..
                     } => Some(*destination_token),
                     SwapUseRole::Source { .. } => None,
@@ -1257,7 +1303,8 @@ impl ExecutorOwner {
     }
 
     /// Refuse a destination setup's private fee ceiling above the destination setup fee approved
-    /// with its swap, which is saved in the swap's record on its own chain.
+    /// with its swap. A swap paid from a Public account saves it with the use that claims this
+    /// account, and any other in the swap's record on its own chain.
     pub(crate) fn require_swap_destination_setup_fee(
         &self,
         operation: ExecutorOperationId,
@@ -1265,10 +1312,14 @@ impl ExecutorOwner {
         maximum_private_fee: U256,
     ) -> Result<()> {
         self.ensure_active()?;
-        let approved = self
-            .store
-            .swap_destination_origin(operation)?
-            .and_then(|origin| origin.swap_approval()?.bounds.destination_setup_fee)
+        let mut approved = self.store.public_swap_destination_setup_fee(operation)?;
+        if approved.is_none() {
+            approved = self
+                .store
+                .swap_destination_origin(operation)?
+                .and_then(|origin| origin.swap_approval()?.bounds.destination_setup_fee);
+        }
+        let approved = approved
             .ok_or_else(|| eyre!("this destination stealth account has no approved setup fee"))?;
         require_private_fee_limit(
             fee_token,

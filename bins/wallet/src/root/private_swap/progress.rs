@@ -12,6 +12,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    alert::Alert,
     button::{ButtonVariant, ButtonVariants},
     collapsible::Collapsible,
     dialog::DialogButtonProps,
@@ -39,10 +40,10 @@ use super::form::{
 };
 use super::model::{
     SwapActions, SwapIdentity, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep,
-    SwapStepAccount, bridge_sent_amount, needs_executed_fee, prepared_swap_use,
+    SwapStepAccount, bridge_sent_amount, card_line, needs_executed_fee, prepared_swap_use,
     private_delivery_credit, provider_name, record_swaps, swap_actions, swap_order_group,
     swap_order_stage, swap_outcome, swap_private_delivery, swap_private_minimum, swap_steps,
-    swap_use_destination, swap_valid_to, swaps_card_line,
+    swap_use_destination, swap_valid_to,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -152,7 +153,7 @@ impl Render for PrivateSwapsView {
 
 impl PrivateSwapsView {
     pub(in crate::root) fn has_shown_swaps(&self) -> bool {
-        self.shown_swaps().next().is_some()
+        self.shown_swaps().next().is_some() || self.shown_public_swaps().next().is_some()
     }
 
     /// The one card for every unfinished swap, in the Private tab's pending-status slot.
@@ -164,7 +165,7 @@ impl PrivateSwapsView {
             .shown_swaps()
             .map(|(record, stage)| (stage, self.labels(record, cx)))
             .collect::<Vec<_>>();
-        let line = swaps_card_line(&swaps)?;
+        let line = card_line(&swaps, self.public_card_line(cx))?;
         let view = view.clone();
         let action = app_button("wallet-private-swaps-details", "Details…")
             .ghost()
@@ -187,6 +188,21 @@ impl PrivateSwapsView {
             .shown_swaps()
             .map(|(record, _)| record.operation())
             .collect::<Vec<_>>();
+        let public = self.shown_public_swaps().collect::<Vec<_>>();
+        if let ([], [(identity, _)]) = (shown.as_slice(), public.as_slice()) {
+            self.show_view(SwapDialogView::PublicDetail(*identity), window, cx);
+            return;
+        }
+        if !public.is_empty() {
+            // Several swaps open My orders filtered to Open, as private swaps alone do, unless
+            // a shown Public-paid swap is listed under another group, which Open would hide.
+            self.orders_filter = public
+                .iter()
+                .all(|(_, stage)| stage.group() == SwapOrderGroup::Open)
+                .then_some(SwapOrderGroup::Open);
+            self.show_view(SwapDialogView::Orders, window, cx);
+            return;
+        }
         match shown.as_slice() {
             [] => {}
             [operation] => self.show_detail(*operation, window, cx),
@@ -241,11 +257,11 @@ impl PrivateSwapsView {
                     } else {
                         "This swap is no longer saved in this wallet."
                     }))
-                    .children(error.map(|error| {
-                        app_muted_text(error)
-                            .text_color(rgb(theme::DANGER))
-                            .whitespace_normal()
-                    })),
+                    .children(
+                        error.map(|error| {
+                            Alert::error("swap-progress-error", error).small().min_w_0()
+                        }),
+                    ),
                 None,
             );
         };
@@ -387,7 +403,7 @@ impl PrivateSwapsView {
                 format!(
                     "Retry sends only the setup on {} again. The fee already paid on {} isn't paid again. Nothing was unshielded.",
                     network_name(chain_id),
-                    network_name(self.session.chain_id)
+                    network_name(self.origin_chain_id)
                 )
                 .into(),
             )
@@ -458,11 +474,9 @@ impl PrivateSwapsView {
             )
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
             .children(checked.map(|message| app_muted_text(message).whitespace_normal()))
-            .children(error.map(|error| {
-                app_muted_text(error)
-                    .text_color(rgb(theme::DANGER))
-                    .whitespace_normal()
-            }));
+            .children(
+                error.map(|error| Alert::error("swap-progress-error", error).small().min_w_0()),
+            );
         (
             body,
             Some(self.render_progress_actions(
@@ -631,7 +645,7 @@ impl PrivateSwapsView {
         cx: &App,
     ) -> gpui::Div {
         let network = network_name(delivery.destination_chain);
-        let origin = network_name(self.session.chain_id);
+        let origin = network_name(self.origin_chain_id);
         let provider = provider_name(delivery.provider);
         let private = delivery.is_private();
         let destination_amount = |amount| {
@@ -1738,7 +1752,10 @@ impl PrivateSwapsView {
             let (_, owner) = self.destination_owner(delivery.destination_chain, cx)?;
             Some((owner, record.destination_operation()?))
         });
-        if let Err(error) = self.owner.stop_swap_setup(operation) {
+        let Some(origin) = self.private_owner() else {
+            return false;
+        };
+        if let Err(error) = origin.stop_swap_setup(operation) {
             self.fail(operation, error.to_string());
             cx.notify();
             return false;
@@ -1830,7 +1847,7 @@ impl PrivateSwapsView {
         };
         let mut accounts = vec![account(
             CancelledAccountRole::Source,
-            self.session.chain_id,
+            self.origin_chain_id,
             Some(record),
             claimed.is_fresh(),
             record.address(),
@@ -1934,6 +1951,9 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) {
             return false;
         }
+        let Some(origin) = self.private_owner().cloned() else {
+            return false;
+        };
         let Some(record) = self.record(operation) else {
             return false;
         };
@@ -1945,7 +1965,7 @@ impl PrivateSwapsView {
         // What the use holds of each account, read before the cancellation changes it.
         let source = (
             CancelledAccountRole::Source,
-            network_name(self.session.chain_id),
+            network_name(self.origin_chain_id),
             record.address().map(|address| SwapStepAccount {
                 index: Some(record.index()),
                 address,
@@ -1984,18 +2004,15 @@ impl PrivateSwapsView {
             .map(|(_, owner)| owner);
         // A setup still being handed off in this session stops with the preparation.
         self.stop_setup_job(operation);
-        let cancellation =
-            match self
-                .owner
-                .cancel_swap_use(destination_owner.as_deref(), operation, id)
-            {
-                Ok(cancellation) => cancellation,
-                Err(error) => {
-                    self.fail(operation, format!("{error:#}"));
-                    cx.notify();
-                    return false;
-                }
-            };
+        let cancellation = match origin.cancel_swap_use(destination_owner.as_deref(), operation, id)
+        {
+            Ok(cancellation) => cancellation,
+            Err(error) => {
+                self.fail(operation, format!("{error:#}"));
+                cx.notify();
+                return false;
+            }
+        };
         let account = |(role, network, account, fresh), release| CancelledAccount {
             role,
             network,
@@ -2056,7 +2073,9 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
-        let owner = Arc::clone(&self.owner);
+        let Some(owner) = self.private_owner().cloned() else {
+            return;
+        };
         let client = self
             .tracking
             .get(&operation)
@@ -2154,7 +2173,9 @@ impl PrivateSwapsView {
         let tracking = self.tracking.get(&operation);
         let client = tracking.and_then(|tracking| tracking.orderbook.clone());
         let clients = tracking.and_then(|tracking| tracking.bridge_clients.clone());
-        let owner = Arc::clone(&self.owner);
+        let Some(owner) = self.private_owner().cloned() else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::Check,
@@ -2258,7 +2279,9 @@ impl PrivateSwapsView {
             .tracking
             .get(&operation)
             .and_then(|tracking| tracking.orderbook.clone());
-        let owner = Arc::clone(&self.owner);
+        let Some(owner) = self.private_owner().cloned() else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::Order,
@@ -2292,7 +2315,7 @@ impl PrivateSwapsView {
             return;
         };
         let (_, token, candidates) =
-            self.setup_fee_route(self.session.chain_id, sell, None, false, false, cx);
+            self.setup_fee_route(self.origin_chain_id, sell, None, false, false, cx);
         let candidate = token.and_then(|_| {
             let root = self.root.upgrade()?;
             let root = root.read(cx);
@@ -2313,8 +2336,12 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
-        let owner = Arc::clone(&self.owner);
-        let session = Arc::clone(&self.session);
+        let (Some(owner), Some(session)) = (
+            self.private_owner().cloned(),
+            self.private_session().cloned(),
+        ) else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::CancelQuote,
@@ -2444,8 +2471,12 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let operation = approval.operation;
-        let owner = Arc::clone(&self.owner);
-        let session = Arc::clone(&self.session);
+        let (Some(owner), Some(session)) = (
+            self.private_owner().cloned(),
+            self.private_session().cloned(),
+        ) else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::Cancel,
@@ -2504,7 +2535,10 @@ impl PrivateSwapsView {
             .get(&operation)
             .and_then(|tracking| tracking.stealth_balance)
             .filter(|_| token == buy);
-        let target = StealthAccountTarget::new(&self.session, operation);
+        let Some(session) = self.private_session() else {
+            return;
+        };
+        let target = StealthAccountTarget::new(session, operation);
         let return_focus = self.swap_dialog_focus();
         let _ = self.root.update(cx, |root, cx| {
             root.open_stealth_account_recovery(
@@ -2633,7 +2667,10 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Err(error) = self.owner.set_hidden(operation, true) {
+        let Some(origin) = self.private_owner() else {
+            return;
+        };
+        if let Err(error) = origin.set_hidden(operation, true) {
             self.fail(operation, error.to_string());
             cx.notify();
             return;
@@ -2671,7 +2708,7 @@ fn reported_by_across(record: &ExecutorRecord) -> bool {
 }
 
 /// A hash, shortened, with a control that copies it in full.
-fn hash_row(
+pub(super) fn hash_row(
     label: impl Into<SharedString>,
     hash: String,
     copy_id: SharedString,
@@ -2697,7 +2734,11 @@ fn hash_row(
 }
 
 /// An address, shortened, with a control that copies it in full, laid out like [`hash_row`].
-fn address_row(label: &'static str, address: Address, tooltip: &'static str) -> gpui::Div {
+pub(super) fn address_row(
+    label: &'static str,
+    address: Address,
+    tooltip: &'static str,
+) -> gpui::Div {
     let short = short_receiver(address);
     let address = address.to_checksum(None);
     let copy_id = SharedString::from(format!("swap-address-{address}-copy"));
@@ -2754,7 +2795,7 @@ fn deposit_address_box(address: Address) -> gpui::Div {
 }
 
 /// An amount and a muted note after it, wrapping to the trailing edge when narrow.
-fn amount_with_note(amount: String, note: String) -> gpui::Div {
+pub(super) fn amount_with_note(amount: String, note: String) -> gpui::Div {
     div()
         .min_w_0()
         .flex()
@@ -2766,7 +2807,7 @@ fn amount_with_note(amount: String, note: String) -> gpui::Div {
 }
 
 /// One fact, laid out like [`hash_row`].
-fn fact_row(label: impl Into<SharedString>, value: impl gpui::IntoElement) -> gpui::Div {
+pub(super) fn fact_row(label: impl Into<SharedString>, value: impl gpui::IntoElement) -> gpui::Div {
     div()
         .w_full()
         .min_w_0()
@@ -2811,8 +2852,12 @@ fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>)
 
 /// A swap step and its sub-steps for the shared stepper. A sub-step names its network and its
 /// stealth account, with a control that copies the account's address, and ends with its block
-/// or what it waits for.
-fn progress_group(step: &SwapStep, detail: String, id: String) -> SubmissionProgressGroup {
+/// or what it waits for. A step that carries its own block ends with it.
+pub(super) fn progress_group(
+    step: &SwapStep,
+    detail: String,
+    id: String,
+) -> SubmissionProgressGroup {
     let substeps = step
         .children
         .iter()
@@ -2835,8 +2880,17 @@ fn progress_group(step: &SwapStep, detail: String, id: String) -> SubmissionProg
         .collect();
     SubmissionProgressGroup {
         step: progress_step(step, detail, id),
+        outcome: step.block.map_or_else(String::new, block_label),
         substeps,
     }
+}
+
+/// A block number as a step or a fact shows it, such as "block 402,118,977".
+pub(super) fn block_label(block: u64) -> String {
+    format!(
+        "block {}",
+        railgun_ui::format_token_amount(U256::from(block), 0)
+    )
 }
 
 /// A stealth account's number and short address, with a control that copies the address in

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +8,8 @@ use alloy::primitives::U256;
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px,
+    relative, rems, rgb,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
@@ -48,7 +49,7 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
-use crate::root::ui_helpers::dialog_footer;
+use crate::root::ui_helpers::{dialog_footer, network_mention, network_name, network_token_icon};
 
 use super::governance_action::GovernanceSpendDraft;
 use super::private_action::UnshieldAssetKey;
@@ -66,6 +67,8 @@ const SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS: usize = 28;
 const SPEND_AUTHORIZATION_LIFETIME_SELECT_WIDTH: gpui::Pixels = px(248.0);
 /// The least height of a compact row, which fits its info button.
 const SUMMARY_COMPACT_ROW_MIN_HEIGHT: gpui::Pixels = px(26.0);
+const SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE: &str = "wallet-spend-auth-row-group-toggle";
+const SPEND_AUTHORIZATION_DETAILS_TOGGLE: &str = "wallet-spend-auth-details-toggle";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationLifetime {
@@ -201,6 +204,15 @@ pub(super) enum SpendAuthorizationIntent {
         Entity<super::private_swap::PrivateSwapsView>,
         Arc<super::private_swap::SwapAuthorization>,
     ),
+    PublicSwap(
+        Entity<super::private_swap::PrivateSwapsView>,
+        Arc<super::private_swap::PublicSwapAuthorization>,
+    ),
+    PublicSwapSource {
+        view: Entity<super::private_swap::PrivateSwapsView>,
+        command: Arc<super::private_swap::PublicSwapAuthorization>,
+        private_authorization: Rc<RefCell<Option<DesktopPrivateSpendAuthorization>>>,
+    },
     PrepareExecutorUnshield(
         UnshieldAssetKey,
         Arc<super::private_action::ExecutorUnshieldApproval>,
@@ -260,6 +272,7 @@ impl SpendAuthorizationIntent {
             }
             Self::StealthAccounts(_, command) => return Some(command.hardware_executor_action()),
             Self::PrivateSwap(_, command) => return Some(command.hardware_executor_action()),
+            Self::PublicSwap(_, command) => return Some(command.hardware_executor_action()),
             Self::PrivateSend(key, ..) | Self::PrivateUnshield(key, ..) => {
                 let (delivery, uuid) = if let Self::PrivateSend(..) = self {
                     let form = root.send_forms.get(key)?;
@@ -377,6 +390,9 @@ impl SpendAuthorizationIntent {
         if let Self::PrivateSwap(_, command) = self {
             return command.sessions_are_current(root);
         }
+        if let Self::PublicSwap(_, command) | Self::PublicSwapSource { command, .. } = self {
+            return command.sessions_are_current(root);
+        }
         if let Self::ExecutorUnshield(key, review, _) = self
             && !root
                 .unshield_forms
@@ -421,6 +437,7 @@ impl SpendAuthorizationIntent {
             Self::PrivateSend(..)
                 | Self::StealthAccounts(..)
                 | Self::PrivateSwap(..)
+                | Self::PublicSwap(..)
                 | Self::PrivateUnshield(..)
                 | Self::PrepareExecutorUnshield(..)
                 | Self::ExecutorUnshield(..)
@@ -536,7 +553,8 @@ pub(super) struct SpendAuthorizationSummary {
     payload: Option<SpendAuthorizationPayload>,
     requires_explicit_review: bool,
     steps: Option<SpendAuthorizationSteps>,
-    title_chip: Option<Arc<str>>,
+    title_network: Option<u64>,
+    row_group: Option<SpendAuthorizationDetails>,
     details: Option<SpendAuthorizationDetails>,
     disclosure: Option<SpendAuthorizationDisclosure>,
 }
@@ -559,7 +577,8 @@ impl SpendAuthorizationSummary {
             payload: None,
             requires_explicit_review: false,
             steps: None,
-            title_chip: None,
+            title_network: None,
+            row_group: None,
             details: None,
             disclosure: None,
         }
@@ -612,7 +631,7 @@ impl SpendAuthorizationSummary {
 
     /// A stepper under the title: the steps named by `labels`, of which `current`, counted
     /// from one, is the one this dialog authorizes. `hint` explains them.
-    pub(super) fn with_steps<L: Into<Arc<str>>>(
+    pub(super) fn with_steps<L: Into<SpendAuthorizationLabel>>(
         mut self,
         current: usize,
         labels: impl IntoIterator<Item = L>,
@@ -622,9 +641,9 @@ impl SpendAuthorizationSummary {
         self
     }
 
-    /// A small chip beside the title, such as the chain.
-    pub(super) fn with_title_chip(mut self, label: impl Into<Arc<str>>) -> Self {
-        self.title_chip = Some(label.into());
+    /// A small chip beside the title, naming the network `chain_id`.
+    pub(super) const fn with_title_network(mut self, chain_id: u64) -> Self {
+        self.title_network = Some(chain_id);
         self
     }
 
@@ -643,13 +662,44 @@ impl SpendAuthorizationSummary {
         self.details = Some(SpendAuthorizationDetails {
             title: title.into(),
             collapsed_summary: collapsed_summary.into(),
-            rows: rows
-                .into_iter()
-                .map(|(label, value)| (label.into(), value.into()))
-                .collect(),
-            note: note.map(Arc::from),
+            content: SpendAuthorizationDetailsContent::Lines {
+                rows: rows
+                    .into_iter()
+                    .map(|(label, value)| (label.into(), value.into()))
+                    .collect(),
+                note: note.map(Arc::from),
+            },
         });
         self
+    }
+
+    /// A collapsed disclosure above the rows, laid out like [`Self::with_details`]. Open, it
+    /// shows `rows` as compact rows in place of `collapsed_summary`. Fewer than two rows aren't
+    /// grouped: they lead the summary's rows.
+    pub(super) fn with_row_group(
+        mut self,
+        title: impl Into<Arc<str>>,
+        collapsed_summary: impl Into<Arc<str>>,
+        rows: Vec<SpendAuthorizationSummaryRow>,
+    ) -> Self {
+        if rows.len() < 2 {
+            self.rows.splice(0..0, rows);
+            return self;
+        }
+        self.row_group = Some(SpendAuthorizationDetails {
+            title: title.into(),
+            collapsed_summary: collapsed_summary.into(),
+            content: SpendAuthorizationDetailsContent::Rows(rows),
+        });
+        self
+    }
+
+    /// The row group's rows, which the summary's rows follow.
+    fn grouped_rows(&self) -> &[SpendAuthorizationSummaryRow] {
+        match self.row_group.as_ref().map(|group| &group.content) {
+            Some(SpendAuthorizationDetailsContent::Rows(rows)) => rows,
+            _ => &[],
+        }
     }
 
     pub(super) fn with_payload(
@@ -678,12 +728,51 @@ impl SpendAuthorizationSummary {
         self
     }
 
-    /// Each row's label and value. A copyable account's value follows its prefix, in full.
+    /// The row group's rows, then the rows outside it.
+    #[cfg(test)]
+    fn all_rows(&self) -> impl Iterator<Item = &SpendAuthorizationSummaryRow> {
+        self.grouped_rows().iter().chain(&self.rows)
+    }
+
+    /// Each row's label and value, the row group's rows first. A copyable account's value
+    /// follows its prefix, in full.
     #[cfg(test)]
     pub(in crate::root) fn rows_for_test(&self) -> Vec<(String, String)> {
-        self.rows
-            .iter()
+        self.all_rows()
             .map(SpendAuthorizationSummaryRow::values_for_test)
+            .collect()
+    }
+
+    /// The row group's title, its collapsed summary and its rows' labels.
+    #[cfg(test)]
+    pub(in crate::root) fn row_group_for_test(&self) -> Option<(String, String, Vec<String>)> {
+        self.row_group.as_ref().map(|group| {
+            (
+                group.title.to_string(),
+                group.collapsed_summary.to_string(),
+                self.grouped_rows()
+                    .iter()
+                    .map(|row| row.label.to_string())
+                    .collect(),
+            )
+        })
+    }
+
+    /// Each row's label and what the review shows for it, the row group's rows first: a
+    /// copyable address is shortened after its prefix.
+    #[cfg(test)]
+    pub(in crate::root) fn shown_rows_for_test(&self) -> Vec<(String, String)> {
+        self.all_rows()
+            .map(|row| {
+                (
+                    row.label.to_string(),
+                    if row.shortened_copyable {
+                        row.shortened_value()
+                    } else {
+                        row.value.to_string()
+                    },
+                )
+            })
             .collect()
     }
 
@@ -693,29 +782,45 @@ impl SpendAuthorizationSummary {
     }
 
     #[cfg(test)]
+    pub(in crate::root) fn steps_for_test(&self) -> Option<(usize, Vec<String>)> {
+        self.steps.as_ref().map(|steps| {
+            (
+                steps.current,
+                steps
+                    .labels
+                    .iter()
+                    .map(SpendAuthorizationLabel::text)
+                    .collect(),
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(in crate::root) fn details_for_test(&self) -> Vec<(String, String)> {
-        self.details.as_ref().map_or_else(Vec::new, |details| {
-            details
-                .rows
+        match self.details.as_ref().map(|details| &details.content) {
+            Some(SpendAuthorizationDetailsContent::Lines { rows, .. }) => rows
                 .iter()
                 .map(|(label, value)| (label.to_string(), value.to_string()))
-                .collect()
-        })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The details disclosure's note.
     #[cfg(test)]
     pub(in crate::root) fn details_note_for_test(&self) -> Option<String> {
-        self.details
-            .as_ref()
-            .and_then(|details| details.note.as_deref().map(str::to_owned))
+        match self.details.as_ref().map(|details| &details.content) {
+            Some(SpendAuthorizationDetailsContent::Lines { note, .. }) => {
+                note.as_deref().map(str::to_owned)
+            }
+            _ => None,
+        }
     }
 
     /// The text of the hint behind the info button of the row labelled `label`.
     #[cfg(test)]
     pub(in crate::root) fn row_hint_for_test(&self, label: &str) -> Option<String> {
-        self.rows
-            .iter()
+        self.all_rows()
             .find(|row| row.label.as_ref() == label)
             .and_then(|row| row.hint.as_ref())
             .map(SpendAuthorizationHint::text_for_test)
@@ -733,12 +838,28 @@ impl SpendAuthorizationSummary {
         })
     }
 
+    /// The Send card's label and amount.
+    #[cfg(test)]
+    pub(in crate::root) fn send_card_for_test(&self) -> Option<(String, String)> {
+        self.cards
+            .as_ref()
+            .map(|[send, _]| (send.label.text(), send.amount.to_string()))
+    }
+
+    /// The networks whose badges the Send and Receive cards' icons carry.
+    #[cfg(test)]
+    pub(in crate::root) fn card_networks_for_test(&self) -> Option<[Option<u64>; 2]> {
+        self.cards
+            .as_ref()
+            .map(|cards| cards.each_ref().map(|card| card.network))
+    }
+
     /// The Receive card's label, amount and text lines.
     #[cfg(test)]
     pub(in crate::root) fn receive_card_for_test(&self) -> Option<(String, String, Vec<String>)> {
         self.cards.as_ref().map(|[_, receive]| {
             (
-                receive.label.to_string(),
+                receive.label.text(),
                 receive.amount.to_string(),
                 receive
                     .lines
@@ -756,11 +877,35 @@ impl SpendAuthorizationSummary {
                                 .collect::<Vec<_>>()
                                 .join(" "),
                         ),
-                        SpendAuthorizationCardLine::Receiver { .. } => None,
+                        SpendAuthorizationCardLine::Receiver { .. }
+                        | SpendAuthorizationCardLine::Account { .. } => None,
                     })
                     .collect(),
             )
         })
+    }
+
+    /// The name and the address of the Send card's account line.
+    #[cfg(test)]
+    pub(in crate::root) fn send_account_for_test(&self) -> Option<(String, String)> {
+        self.cards.as_ref().and_then(|[send, _]| {
+            send.lines.iter().find_map(|line| match line {
+                SpendAuthorizationCardLine::Account { name, address } => {
+                    Some((name.to_string(), address.to_string()))
+                }
+                _ => None,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) fn title_for_test(&self) -> (String, Option<String>) {
+        (self.title.to_string(), self.title_network.map(network_name))
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) const fn compact_rows_for_test(&self) -> bool {
+        self.compact_rows
     }
 
     /// The Sell and Receive cards' amount changes, each with whether it is adverse.
@@ -778,8 +923,7 @@ impl SpendAuthorizationSummary {
     /// The amount change of the row labelled `label`, and whether it is adverse.
     #[cfg(test)]
     pub(in crate::root) fn row_delta_for_test(&self, label: &str) -> Option<(String, bool)> {
-        self.rows
-            .iter()
+        self.all_rows()
             .find(|row| row.label.as_ref() == label)
             .and_then(|row| row.delta.as_ref())
             .map(|delta| (delta.text.clone(), delta.adverse))
@@ -794,7 +938,8 @@ impl SpendAuthorizationSummary {
                 SpendAuthorizationCardLine::Receiver { address, label } => {
                     Some((address.to_string(), label.as_deref().map(str::to_owned)))
                 }
-                SpendAuthorizationCardLine::Text { .. } => None,
+                SpendAuthorizationCardLine::Text { .. }
+                | SpendAuthorizationCardLine::Account { .. } => None,
             })
         })
     }
@@ -860,12 +1005,12 @@ impl SpendAuthorizationHint {
 #[derive(Clone)]
 pub(super) struct SpendAuthorizationSteps {
     current: usize,
-    labels: Vec<Arc<str>>,
+    labels: Vec<SpendAuthorizationLabel>,
     hint: SpendAuthorizationHint,
 }
 
 impl SpendAuthorizationSteps {
-    pub(super) fn new<L: Into<Arc<str>>>(
+    pub(super) fn new<L: Into<SpendAuthorizationLabel>>(
         current: usize,
         labels: impl IntoIterator<Item = L>,
         hint: SpendAuthorizationHint,
@@ -888,18 +1033,82 @@ struct SpendAuthorizationDisclosure {
 struct SpendAuthorizationDetails {
     title: Arc<str>,
     collapsed_summary: Arc<str>,
-    rows: Vec<(Arc<str>, Arc<str>)>,
-    note: Option<Arc<str>>,
+    content: SpendAuthorizationDetailsContent,
+}
+
+/// What an open details disclosure shows under its line.
+#[derive(Clone)]
+enum SpendAuthorizationDetailsContent {
+    /// Plain label and value lines, then a muted note.
+    Lines {
+        rows: Vec<(Arc<str>, Arc<str>)>,
+        note: Option<Arc<str>>,
+    },
+    /// Compact rows, each with its info button.
+    Rows(Vec<SpendAuthorizationSummaryRow>),
+}
+
+/// A card's or a step's label, or a row's label or value. One that names a network shows the
+/// network's mark and name between `prefix` and `suffix`; any other is `prefix` alone.
+#[derive(Clone)]
+pub(super) struct SpendAuthorizationLabel {
+    prefix: Arc<str>,
+    network: Option<u64>,
+    suffix: Arc<str>,
+}
+
+impl SpendAuthorizationLabel {
+    /// `prefix`, a space, the network `chain_id`, then `suffix` as it is written, such as
+    /// ", exactly".
+    pub(super) fn on_network(
+        prefix: impl Into<Arc<str>>,
+        chain_id: u64,
+        suffix: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            prefix: prefix.into(),
+            network: Some(chain_id),
+            suffix: suffix.into(),
+        }
+    }
+
+    /// The label as plain text, with the network's name in place.
+    fn text(&self) -> String {
+        match self.network {
+            Some(chain_id) => {
+                let name = network_name(chain_id);
+                format!("{} {name}{}", self.prefix, self.suffix)
+            }
+            None => self.prefix.to_string(),
+        }
+    }
+}
+
+impl From<&str> for SpendAuthorizationLabel {
+    fn from(text: &str) -> Self {
+        Self {
+            prefix: text.into(),
+            network: None,
+            suffix: "".into(),
+        }
+    }
+}
+
+impl From<String> for SpendAuthorizationLabel {
+    fn from(text: String) -> Self {
+        Self::from(text.as_str())
+    }
 }
 
 /// An amount card of a review: a small label, the token's icon and amount, the amount's
 /// change beside it, the amount's USD value at the right edge, then small lines.
 #[derive(Clone)]
 pub(super) struct SpendAuthorizationCard {
-    label: Arc<str>,
+    label: SpendAuthorizationLabel,
     amount: Arc<str>,
     delta: Option<SpendAuthorizationAmountDelta>,
     icon: Option<WalletIconSource>,
+    network: Option<u64>,
     usd: Option<Arc<str>>,
     lines: Vec<SpendAuthorizationCardLine>,
 }
@@ -918,11 +1127,14 @@ enum SpendAuthorizationCardLine {
         address: Arc<str>,
         label: Option<Arc<str>>,
     },
+    /// "from", the account's `name` and its shortened `address`, with a copy button for the
+    /// full address, which hovering shows.
+    Account { name: Arc<str>, address: Arc<str> },
 }
 
 impl SpendAuthorizationCard {
     pub(super) fn new(
-        label: impl Into<Arc<str>>,
+        label: impl Into<SpendAuthorizationLabel>,
         amount: impl Into<Arc<str>>,
         icon: Option<WalletIconSource>,
     ) -> Self {
@@ -931,9 +1143,16 @@ impl SpendAuthorizationCard {
             amount: amount.into(),
             delta: None,
             icon,
+            network: None,
             usd: None,
             lines: Vec::new(),
         }
+    }
+
+    /// The network `chain_id` as a badge on the card's icon.
+    pub(super) const fn with_network(mut self, chain_id: u64) -> Self {
+        self.network = Some(chain_id);
+        self
     }
 
     /// The signed difference of the card's amount from `previous`, beside the amount.
@@ -990,6 +1209,20 @@ impl SpendAuthorizationCard {
         });
         self
     }
+
+    /// A line naming the paying account: "from", its `name` and its shortened `address`,
+    /// which it copies and shows on hover in full.
+    pub(super) fn with_account(
+        mut self,
+        name: impl Into<Arc<str>>,
+        address: impl Into<Arc<str>>,
+    ) -> Self {
+        self.lines.push(SpendAuthorizationCardLine::Account {
+            name: name.into(),
+            address: address.into(),
+        });
+        self
+    }
 }
 
 pub(in crate::root) const fn spend_authorization_can_use_cached_password(
@@ -1032,15 +1265,17 @@ impl gpui::Render for SpendAuthorizationPayloadDisclosure {
     }
 }
 
-/// The details disclosure for a dialog without its own content entity.
+/// A details disclosure for a dialog without its own content entity.
 struct SpendAuthorizationDetailsDisclosure {
+    id: &'static str,
     details: SpendAuthorizationDetails,
     open: bool,
 }
 
 impl SpendAuthorizationDetailsDisclosure {
-    const fn new(details: SpendAuthorizationDetails) -> Self {
+    const fn new(id: &'static str, details: SpendAuthorizationDetails) -> Self {
         Self {
+            id,
             details,
             open: false,
         }
@@ -1055,9 +1290,15 @@ impl SpendAuthorizationDetailsDisclosure {
 impl gpui::Render for SpendAuthorizationDetailsDisclosure {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let disclosure = cx.entity();
-        render_spend_authorization_details(&self.details, self.open, move |_, _, cx| {
-            disclosure.update(cx, Self::toggle);
-        })
+        render_spend_authorization_details(
+            self.id,
+            &self.details,
+            self.open,
+            move |_, _, cx| {
+                disclosure.update(cx, Self::toggle);
+            },
+            cx,
+        )
     }
 }
 
@@ -1065,6 +1306,10 @@ impl gpui::Render for SpendAuthorizationDetailsDisclosure {
 pub(super) struct SpendAuthorizationSummaryRow {
     label: Arc<str>,
     value: Arc<str>,
+    /// The label and the value of a row that names a network there, which a compact row shows
+    /// with the network's mark. `label` and `value` hold their text.
+    label_network: Option<SpendAuthorizationLabel>,
+    value_network: Option<SpendAuthorizationLabel>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
     /// What a shortened, copyable value follows and what its copy control calls it, such as an
@@ -1108,12 +1353,28 @@ impl SpendAuthorizationSummaryRow {
         Self {
             label: label.into(),
             value: value.into(),
+            label_network: None,
+            value_network: None,
             icon_path: None,
             shortened_copyable: false,
             copyable_account: None,
             delta: None,
             hint: None,
         }
+    }
+
+    /// A row whose label or value may name a network, which then carries the network's mark.
+    /// Shown for compact rows.
+    pub(super) fn naming_network(
+        label: impl Into<SpendAuthorizationLabel>,
+        value: impl Into<SpendAuthorizationLabel>,
+    ) -> Self {
+        let (label, value): (SpendAuthorizationLabel, SpendAuthorizationLabel) =
+            (label.into(), value.into());
+        let mut row = Self::new(label.text(), value.text());
+        row.label_network = label.network.is_some().then_some(label);
+        row.value_network = value.network.is_some().then_some(value);
+        row
     }
 
     /// An explanation behind an info button at the row's end. Shown for compact rows.
@@ -1195,6 +1456,7 @@ struct SpendAuthorizationDialogContent {
     lifetime: SpendAuthorizationLifetime,
     lifetime_select: Entity<SpendAuthorizationLifetimeSelect>,
     payload_open: bool,
+    row_group_open: bool,
     details_open: bool,
     error: Option<Arc<str>>,
     pending: bool,
@@ -1228,6 +1490,7 @@ struct HardwareSpendAuthorizationDialogContent {
     cancelled: bool,
     completed: bool,
     payload_open: bool,
+    row_group_open: bool,
     details_open: bool,
     error: Option<Arc<str>>,
 }
@@ -1251,6 +1514,7 @@ impl HardwareSpendAuthorizationDialogContent {
             cancelled: false,
             completed: false,
             payload_open: false,
+            row_group_open: false,
             details_open: false,
             error: None,
         }
@@ -1278,9 +1542,47 @@ impl HardwareSpendAuthorizationDialogContent {
         cx.notify();
     }
 
+    fn toggle_row_group(&mut self, cx: &mut Context<'_, Self>) {
+        self.row_group_open = !self.row_group_open;
+        cx.notify();
+    }
+
     fn toggle_details(&mut self, cx: &mut Context<'_, Self>) {
         self.details_open = !self.details_open;
         cx.notify();
+    }
+
+    /// The dialog's footer, which stays in view while the content scrolls.
+    fn render_footer(&self, dialog: &Entity<Self>) -> gpui::Div {
+        let dialog = dialog.clone();
+        let pending = self.pending;
+        let submit_label = if pending || self.error.is_none() {
+            format!("Approve on {}", self.device_label)
+        } else {
+            "Try again".to_owned()
+        };
+        div()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap_2()
+            .child(
+                app_button("wallet-hardware-spend-auth-cancel", "Cancel")
+                    .flex_none()
+                    .disabled(pending)
+                    .on_click(move |_event, window, cx| {
+                        window.close_dialog(cx);
+                    }),
+            )
+            .child(
+                app_button("wallet-hardware-spend-auth-submit", submit_label)
+                    .primary()
+                    .flex_none()
+                    .disabled(pending)
+                    .on_click(move |_event, window, cx| {
+                        dialog.update(cx, |dialog, cx| dialog.start(window, cx));
+                    }),
+            )
     }
 
     #[allow(clippy::needless_pass_by_ref_mut)]
@@ -1491,6 +1793,7 @@ impl SpendAuthorizationDialogContent {
             lifetime: initial_lifetime,
             lifetime_select,
             payload_open: false,
+            row_group_open: false,
             details_open: false,
             error: None,
             pending: false,
@@ -1625,27 +1928,82 @@ impl SpendAuthorizationDialogContent {
         cx.notify();
     }
 
+    fn toggle_row_group(&mut self, cx: &mut Context<'_, Self>) {
+        self.row_group_open = !self.row_group_open;
+        cx.notify();
+    }
+
     fn toggle_details(&mut self, cx: &mut Context<'_, Self>) {
         self.details_open = !self.details_open;
         cx.notify();
+    }
+
+    /// The dialog's footer, which stays in view while the content scrolls.
+    fn render_footer(&self, dialog: &Entity<Self>) -> gpui::Div {
+        let cancel_dialog = dialog.clone();
+        let dialog = dialog.clone();
+        div()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap_2()
+            .child(
+                app_button("wallet-spend-auth-cancel", "Cancel")
+                    .flex_none()
+                    .on_click(move |_event, window, cx| {
+                        cancel_dialog.update(cx, Self::cancel);
+                        window.close_dialog(cx);
+                    }),
+            )
+            .child(
+                app_button(
+                    "wallet-spend-auth-submit",
+                    self.summary.confirm_label.to_string(),
+                )
+                .track_focus(&self.review_focus)
+                .primary()
+                .flex_none()
+                .loading(self.pending)
+                .disabled(self.pending || self.cancelled)
+                .on_click(move |_event, window, cx| {
+                    dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
+                }),
+            )
     }
 }
 
 impl gpui::Render for SpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
-        let cancel_dialog = dialog.clone();
         let payload_dialog = dialog.clone();
-        let details_dialog = dialog.clone();
+        let row_group_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
             })
         });
+        let row_group = self.summary.row_group.as_ref().map(|group| {
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
+                group,
+                self.row_group_open,
+                move |_, _, cx| {
+                    row_group_dialog.update(cx, Self::toggle_row_group);
+                },
+                cx,
+            )
+            .into_any_element()
+        });
         let details = self.summary.details.as_ref().map(|details| {
-            render_spend_authorization_details(details, self.details_open, move |_, _, cx| {
-                details_dialog.update(cx, Self::toggle_details);
-            })
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_DETAILS_TOGGLE,
+                details,
+                self.details_open,
+                move |_, _, cx| {
+                    dialog.update(cx, Self::toggle_details);
+                },
+                cx,
+            )
             .into_any_element()
         });
         div()
@@ -1664,6 +2022,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             })
             .child(render_spend_authorization_summary(
                 &self.summary,
+                row_group,
                 details,
                 cx,
             ))
@@ -1715,36 +2074,6 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                         .debug_selector(|| "wallet-spend-auth-error".into()),
                 )
             })
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        app_button("wallet-spend-auth-cancel", "Cancel")
-                            .flex_none()
-                            .on_click(move |_event, window, cx| {
-                                cancel_dialog.update(cx, Self::cancel);
-                                window.close_dialog(cx);
-                            }),
-                    )
-                    .child(
-                        app_button(
-                            "wallet-spend-auth-submit",
-                            self.summary.confirm_label.to_string(),
-                        )
-                        .track_focus(&self.review_focus)
-                        .primary()
-                        .flex_none()
-                        .loading(self.pending)
-                        .disabled(self.pending || self.cancelled)
-                        .on_click(move |_event, window, cx| {
-                            dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
-                        }),
-                    ),
-            )
     }
 }
 
@@ -1752,25 +2081,38 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
         let payload_dialog = dialog.clone();
-        let details_dialog = dialog.clone();
+        let row_group_dialog = dialog.clone();
         let payload = self.summary.payload.as_ref().map(|payload| {
             render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
                 payload_dialog.update(cx, Self::toggle_payload);
             })
         });
+        let row_group = self.summary.row_group.as_ref().map(|group| {
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
+                group,
+                self.row_group_open,
+                move |_, _, cx| {
+                    row_group_dialog.update(cx, Self::toggle_row_group);
+                },
+                cx,
+            )
+            .into_any_element()
+        });
         let details = self.summary.details.as_ref().map(|details| {
-            render_spend_authorization_details(details, self.details_open, move |_, _, cx| {
-                details_dialog.update(cx, Self::toggle_details);
-            })
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_DETAILS_TOGGLE,
+                details,
+                self.details_open,
+                move |_, _, cx| {
+                    dialog.update(cx, Self::toggle_details);
+                },
+                cx,
+            )
             .into_any_element()
         });
         let pending = self.pending;
         let device = self.device_label;
-        let submit_label = if pending || self.error.is_none() {
-            format!("Approve on {device}")
-        } else {
-            "Try again".to_owned()
-        };
         let show_trezor_app_passphrase = self
             .root
             .read(cx)
@@ -1805,7 +2147,12 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .when(!self.summary.detail.is_empty(), |this| {
                 this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             })
-            .child(render_spend_authorization_summary(&self.summary, details, cx))
+            .child(render_spend_authorization_summary(
+                &self.summary,
+                row_group,
+                details,
+                cx,
+            ))
             .when_some(self.summary.context.as_ref(), |this, context| {
                 this.child(app_muted_text(context.to_string()).whitespace_normal())
             })
@@ -1865,41 +2212,19 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .when_some(self.error.as_ref(), |this, error| {
                 this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
             })
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        app_button("wallet-hardware-spend-auth-cancel", "Cancel")
-                            .flex_none()
-                            .disabled(pending)
-                            .on_click(move |_event, window, cx| {
-                                window.close_dialog(cx);
-                            }),
-                    )
-                    .child(
-                        app_button("wallet-hardware-spend-auth-submit", submit_label)
-                            .primary()
-                            .flex_none()
-                            .disabled(pending)
-                            .on_click(move |_event, window, cx| {
-                                dialog.update(cx, |dialog, cx| dialog.start(window, cx));
-                            }),
-                    ),
-            )
     }
 }
 
-/// The summary's cards, rows, details disclosure and disclosure alert. Compact rows and the
-/// details disclosure form one list.
+/// The summary's cards, row group, rows, details disclosure and disclosure alert. The row
+/// group, compact rows and the details disclosure form one list.
 fn render_spend_authorization_summary(
     summary: &SpendAuthorizationSummary,
+    row_group: Option<AnyElement>,
     details: Option<AnyElement>,
     cx: &App,
 ) -> gpui::Div {
+    // The rows count on from the row group's, so each row's controls keep their own ids.
+    let first_row = summary.grouped_rows().len();
     let rows =
         if summary.compact_rows {
             div()
@@ -1908,7 +2233,7 @@ fn render_spend_authorization_summary(
                 .flex()
                 .flex_col()
                 .children(summary.rows.iter().enumerate().map(|(row_index, row)| {
-                    render_spend_authorization_compact_row(row_index, row, cx)
+                    render_spend_authorization_compact_row(first_row + row_index, row, cx)
                 }))
                 .into_any_element()
         } else {
@@ -1936,17 +2261,20 @@ fn render_spend_authorization_summary(
                 }),
             ))
         })
-        .map(|this| match details {
-            Some(details) => this.child(
+        .map(|this| {
+            if row_group.is_none() && details.is_none() {
+                return this.child(rows);
+            }
+            this.child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .children(row_group)
                     .child(rows)
-                    .child(details),
-            ),
-            None => this.child(rows),
+                    .children(details),
+            )
         })
         .when_some(summary.disclosure.as_ref(), |this, disclosure| {
             this.child(render_spend_authorization_disclosure(disclosure))
@@ -1986,7 +2314,11 @@ fn render_spend_authorization_card(
         .border_1()
         .border_color(rgb(theme::BORDER_SUBTLE))
         .bg(rgb(theme::SURFACE))
-        .child(app_muted_text(card.label.to_string()).text_xs())
+        .child(spend_authorization_label(
+            &card.label,
+            rems(0.75).into(),
+            |text| app_muted_text(text).text_xs(),
+        ))
         .child(
             // In a narrow dialog the USD value wraps under the amount, and the change under
             // the amount before that. The amount itself never breaks.
@@ -2004,11 +2336,21 @@ fn render_spend_authorization_card(
                         .flex()
                         .items_center()
                         .gap_2()
-                        .children(
-                            card.icon
-                                .clone()
-                                .map(|icon| img(icon).size(px(20.0)).rounded_full().flex_none()),
-                        )
+                        .children(match card.network {
+                            // Larger than the plain icon, so the network chip stays readable
+                            // beside the card's amount.
+                            Some(chain_id) => Some(
+                                network_token_icon(card.icon.clone(), chain_id, 1.75)
+                                    .into_any_element(),
+                            ),
+                            None => card.icon.clone().map(|icon| {
+                                img(icon)
+                                    .size(px(20.0))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .into_any_element()
+                            }),
+                        })
                         .child(
                             div()
                                 .flex_auto()
@@ -2059,56 +2401,89 @@ fn render_spend_authorization_card(
                         this.child(app_muted_text(after.to_string()).text_xs())
                     }),
                 SpendAuthorizationCardLine::Receiver { address, label } => {
-                    let (full_address, label) = (address.to_string(), label.clone());
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(app_muted_text("to").text_xs())
-                        .child(
-                            div()
-                                .id(("wallet-spend-auth-card-receiver", card_index))
-                                .min_w_0()
-                                .tooltip(move |window, cx| {
-                                    let (full_address, label) =
-                                        (full_address.clone(), label.clone());
-                                    Tooltip::element(move |_, _| {
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .children(label.as_ref().map(ToString::to_string))
-                                            .child(
-                                                div()
-                                                    .font_family(APP_MONO_FONT_FAMILY)
-                                                    .child(full_address.clone()),
-                                            )
-                                    })
-                                    .build(window, cx)
-                                })
-                                .child(
-                                    app_text(spend_authorization_recipient_display(address))
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT))
-                                        .font_family(APP_MONO_FONT_FAMILY),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(("wallet-spend-auth-card-copy-action", card_index))
-                                .flex_none()
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("Copy receiver").build(window, cx)
-                                })
-                                .child(clipboard_with_toast(
-                                    ("wallet-spend-auth-card-copy", card_index),
-                                    address.to_string(),
-                                )),
-                        )
+                    spend_authorization_card_address_line(
+                        card_index,
+                        "to",
+                        None,
+                        address,
+                        label.clone(),
+                        "Copy receiver",
+                    )
+                }
+                SpendAuthorizationCardLine::Account { name, address } => {
+                    spend_authorization_card_address_line(
+                        card_index,
+                        "from",
+                        Some(name),
+                        address,
+                        None,
+                        "Copy address",
+                    )
                 }
             }
         }))
+}
+
+/// A card's address line: `lead`, the account's `name` when the line shows it, and the
+/// shortened `address` with a copy button. Hovering the address shows it in full, after
+/// `hover_label` when it has one.
+fn spend_authorization_card_address_line(
+    card_index: usize,
+    lead: &'static str,
+    name: Option<&Arc<str>>,
+    address: &Arc<str>,
+    hover_label: Option<Arc<str>>,
+    copy_tooltip: &'static str,
+) -> gpui::Div {
+    let full_address = address.to_string();
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(app_muted_text(lead).text_xs())
+        .children(name.map(|name| {
+            app_text(name.to_string())
+                .text_xs()
+                .text_color(rgb(theme::TEXT))
+        }))
+        .child(
+            div()
+                .id(("wallet-spend-auth-card-receiver", card_index))
+                .min_w_0()
+                .tooltip(move |window, cx| {
+                    let (full_address, label) = (full_address.clone(), hover_label.clone());
+                    Tooltip::element(move |_, _| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .children(label.as_ref().map(ToString::to_string))
+                            .child(
+                                div()
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .child(full_address.clone()),
+                            )
+                    })
+                    .build(window, cx)
+                })
+                .child(
+                    app_text(spend_authorization_recipient_display(address))
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT))
+                        .font_family(APP_MONO_FONT_FAMILY),
+                ),
+        )
+        .child(
+            div()
+                .id(("wallet-spend-auth-card-copy-action", card_index))
+                .flex_none()
+                .tooltip(move |window, cx| Tooltip::new(copy_tooltip).build(window, cx))
+                .child(clipboard_with_toast(
+                    ("wallet-spend-auth-card-copy", card_index),
+                    address.to_string(),
+                )),
+        )
 }
 
 /// A row on one line: its label, its value at the right, the value's change, and a slot for
@@ -2145,12 +2520,23 @@ fn render_spend_authorization_compact_row(
                     )),
             )
     } else {
-        app_text(row.value.to_string())
+        let value = match &row.value_network {
+            // The network wraps under the text before it, at the right edge too.
+            Some(value) => spend_authorization_row_label(value, app_text)
+                .flex_wrap()
+                .justify_end(),
+            None => app_text(row.value.to_string()),
+        };
+        value
             .flex_auto()
             .min_w_0()
             .text_right()
             .text_color(rgb(theme::TEXT))
             .whitespace_normal()
+    };
+    let label = match &row.label_network {
+        Some(label) => spend_authorization_row_label(label, app_muted_text),
+        None => app_muted_text(row.label.to_string()),
     };
     div()
         .w_full()
@@ -2160,11 +2546,7 @@ fn render_spend_authorization_compact_row(
         .flex_wrap()
         .items_center()
         .gap_x_2()
-        .child(
-            app_muted_text(row.label.to_string())
-                .flex_none()
-                .whitespace_nowrap(),
-        )
+        .child(label.flex_none().whitespace_nowrap())
         .child(value)
         .children(
             row.delta
@@ -2342,10 +2724,37 @@ fn spend_authorization_hint_card(hint: &SpendAuthorizationHint, window: &Window)
         }))
 }
 
-/// A dialog title, with the summary's chip beside it when it has one.
-fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
+/// `label` as the text `styled` makes of a string. The mark of a network it names is `mark`,
+/// that text's size, square.
+fn spend_authorization_label(
+    label: &SpendAuthorizationLabel,
+    mark: gpui::AbsoluteLength,
+    styled: impl FnOnce(String) -> gpui::Div,
+) -> gpui::Div {
+    let text = styled(label.prefix.to_string());
+    let Some(chain_id) = label.network else {
+        return text;
+    };
+    text.flex().items_center().gap_x_1().child(
+        network_mention(chain_id, mark).when(!label.suffix.is_empty(), |mention| {
+            mention.child(label.suffix.to_string())
+        }),
+    )
+}
+
+/// A compact row's label or value that names a network, as the text `styled` makes of a
+/// string. The network's mark is the size of the one in a card's label.
+fn spend_authorization_row_label(
+    label: &SpendAuthorizationLabel,
+    styled: impl FnOnce(String) -> gpui::Div,
+) -> gpui::Div {
+    spend_authorization_label(label, rems(0.75).into(), styled)
+}
+
+/// A dialog title, with a chip naming the summary's network beside it when it has one.
+fn spend_authorization_title(title: &str, network: Option<u64>) -> gpui::Div {
     let title = app_strong_text(title.to_owned());
-    let Some(chip) = chip else {
+    let Some(chain_id) = network else {
         return title;
     };
     div()
@@ -2358,9 +2767,11 @@ fn spend_authorization_title(title: &str, chip: Option<&str>) -> gpui::Div {
         .gap_2()
         .child(title)
         .child(
-            app_muted_text(chip.to_owned())
+            network_mention(chain_id, rems(0.75).into())
                 .flex_none()
                 .text_xs()
+                .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .px_2()
                 .rounded_full()
                 .border_1()
@@ -2451,7 +2862,7 @@ pub(super) fn render_spend_authorization_steps(steps: &SpendAuthorizationSteps) 
                 .gap_2()
                 .child(badge)
                 .child(
-                    app_text(label.to_string())
+                    spend_authorization_label(label, theme::APP_TEXT_SIZE.into(), app_text)
                         .min_w_0()
                         .truncate()
                         .text_color(rgb(label_color)),
@@ -2465,19 +2876,75 @@ pub(super) fn render_spend_authorization_steps(steps: &SpendAuthorizationSteps) 
     ))
 }
 
-/// The details disclosure as one more compact row: its title, its summary at the right, and a
-/// chevron where the rows have their info button. Open, its rows and note follow, indented.
+/// A details disclosure as one more compact row: its title, its summary at the right, and a
+/// chevron where the rows have their info button. Open, its lines and note or its rows follow,
+/// indented, and a row group's summary is left out, since its rows carry the amounts. `id`
+/// names its toggle.
 fn render_spend_authorization_details(
+    id: &'static str,
     details: &SpendAuthorizationDetails,
     open: bool,
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> Collapsible {
+    let list = div()
+        .min_w_0()
+        .ml_1()
+        .pl_3()
+        .flex()
+        .flex_col()
+        .border_l_1()
+        .border_color(rgb(theme::BORDER_SUBTLE));
+    let content = div().w_full().min_w_0().flex().flex_col().gap_1().py_1();
+    let content = match &details.content {
+        SpendAuthorizationDetailsContent::Lines { rows, note } => content
+            // The rows end where the values above end, clear of the chevron's column.
+            .pr(px(28.0))
+            .child(list.gap_1().children(rows.iter().map(|(label, value)| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_start()
+                    .justify_between()
+                    .gap_x_3()
+                    .child(
+                        app_muted_text(label.to_string())
+                            .flex_none()
+                            .whitespace_nowrap(),
+                    )
+                    .child(
+                        app_text(value.to_string())
+                            .flex_auto()
+                            .min_w_0()
+                            .text_right()
+                            .text_color(rgb(theme::TEXT))
+                            .whitespace_normal(),
+                    )
+            })))
+            .when_some(note.as_ref(), |this, note| {
+                this.child(
+                    app_muted_text(note.to_string())
+                        .pl_4()
+                        .text_xs()
+                        .whitespace_normal(),
+                )
+            }),
+        // Each row's info button sits in the chevron's column.
+        SpendAuthorizationDetailsContent::Rows(rows) => content.child(
+            list.children(rows.iter().enumerate().map(|(row_index, row)| {
+                render_spend_authorization_compact_row(row_index, row, cx)
+            })),
+        ),
+    };
+    let summarized = !open || !matches!(details.content, SpendAuthorizationDetailsContent::Rows(_));
     Collapsible::new()
         .open(open)
         .w_full()
         .child(
             div()
-                .id("wallet-spend-auth-details-toggle")
+                .id(id)
                 .w_full()
                 .min_w_0()
                 .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
@@ -2501,13 +2968,15 @@ fn render_spend_authorization_details(
                         .items_center()
                         .justify_end()
                         .gap_x_2()
-                        .child(
-                            app_text(details.collapsed_summary.to_string())
-                                .min_w_0()
-                                .text_right()
-                                .text_color(rgb(theme::TEXT))
-                                .whitespace_normal(),
-                        )
+                        .when(summarized, |this| {
+                            this.child(
+                                app_text(details.collapsed_summary.to_string())
+                                    .min_w_0()
+                                    .text_right()
+                                    .text_color(rgb(theme::TEXT))
+                                    .whitespace_normal(),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_none()
@@ -2526,59 +2995,7 @@ fn render_spend_authorization_details(
                         ),
                 ),
         )
-        .content(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .py_1()
-                // The rows end where the values above end, clear of the chevron's column.
-                .pr(px(28.0))
-                .child(
-                    div()
-                        .min_w_0()
-                        .ml_1()
-                        .pl_3()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .border_l_1()
-                        .border_color(rgb(theme::BORDER_SUBTLE))
-                        .children(details.rows.iter().map(|(label, value)| {
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .flex_wrap()
-                                .items_start()
-                                .justify_between()
-                                .gap_x_3()
-                                .child(
-                                    app_muted_text(label.to_string())
-                                        .flex_none()
-                                        .whitespace_nowrap(),
-                                )
-                                .child(
-                                    app_text(value.to_string())
-                                        .flex_auto()
-                                        .min_w_0()
-                                        .text_right()
-                                        .text_color(rgb(theme::TEXT))
-                                        .whitespace_normal(),
-                                )
-                        })),
-                )
-                .when_some(details.note.as_ref(), |this, note| {
-                    this.child(
-                        app_muted_text(note.to_string())
-                            .pl_4()
-                            .text_xs()
-                            .whitespace_normal(),
-                    )
-                }),
-        )
+        .content(content)
 }
 
 fn render_spend_authorization_payload(
@@ -2814,7 +3231,12 @@ impl WalletRoot {
         } else {
             summary
         };
-        let summary = if intent.gateway_execution().is_some() {
+        let summary = if intent.gateway_execution().is_some()
+            || matches!(
+                &intent,
+                SpendAuthorizationIntent::PublicSwap(..)
+                    | SpendAuthorizationIntent::PublicSwapSource { .. }
+            ) {
             summary.requiring_explicit_review()
         } else {
             summary
@@ -2933,7 +3355,7 @@ impl WalletRoot {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
         let dialog_title = summary.title.to_string();
-        let title_chip = summary.title_chip.clone();
+        let title_network = summary.title_network;
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
                 root,
@@ -2947,7 +3369,7 @@ impl WalletRoot {
             content
         });
         let focus_content = content.clone();
-        window.open_dialog(cx, move |dialog, window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
@@ -2956,14 +3378,13 @@ impl WalletRoot {
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height(window))
-                .title(spend_authorization_title(
-                    &dialog_title,
-                    title_chip.as_deref(),
-                ))
+                .title(spend_authorization_title(&dialog_title, title_network))
                 .on_close(move |_event, _window, cx| {
                     close_content.update(cx, SpendAuthorizationDialogContent::cancel);
                 })
                 .child(div().w(content_width).child(content.clone()))
+                // The footer stays in view while the content scrolls.
+                .footer(content.read(cx).render_footer(&content).w(content_width))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
@@ -2981,10 +3402,22 @@ impl WalletRoot {
             .payload
             .clone()
             .map(|payload| cx.new(|_cx| SpendAuthorizationPayloadDisclosure::new(payload)));
-        let details_disclosure = summary
-            .details
-            .clone()
-            .map(|details| cx.new(|_cx| SpendAuthorizationDetailsDisclosure::new(details)));
+        let row_group_disclosure = summary.row_group.clone().map(|group| {
+            cx.new(|_cx| {
+                SpendAuthorizationDetailsDisclosure::new(
+                    SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
+                    group,
+                )
+            })
+        });
+        let details_disclosure = summary.details.clone().map(|details| {
+            cx.new(|_cx| {
+                SpendAuthorizationDetailsDisclosure::new(
+                    SPEND_AUTHORIZATION_DETAILS_TOGGLE,
+                    details,
+                )
+            })
+        });
         let handed_off = Rc::new(Cell::new(false));
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
@@ -3022,12 +3455,51 @@ impl WalletRoot {
                         if !intent.approve_gateway_review(submit_root.read(cx)) { return true; }
                         handed_off.set(true);
                         submit_root.update(cx, |root, cx| {
-                            root.continue_authorized_spend(
-                                intent,
-                                DesktopPrivateSpendAuthorization::HardwarePublic,
-                                window,
-                                cx,
-                            );
+                            if let SpendAuthorizationIntent::PublicSwapSource {
+                                view,
+                                command,
+                                private_authorization,
+                            } = intent
+                            {
+                                let Some(private_authorization) = private_authorization.borrow_mut().take() else {
+                                    return;
+                                };
+                                // Closing this dialog clears the passphrase input before the deferred handoff.
+                                #[cfg(feature = "hardware")]
+                                let (trezor_app_passphrase, trezor_pin_matrix_provider) = {
+                                    let session = root.view_session.as_ref()
+                                        .and_then(|view| view.hardware_profile_session()).cloned();
+                                    let passphrase = session.as_ref().and_then(|session| {
+                                        root.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+                                    });
+                                    let pin = session.as_ref()
+                                        .filter(|session| session.device_kind == HardwareDeviceKind::Trezor)
+                                        .map(|_| root.trezor_pin_matrix_provider_for_operation(window, cx));
+                                    (passphrase, pin)
+                                };
+                                #[cfg(not(feature = "hardware"))]
+                                let (trezor_app_passphrase, trezor_pin_matrix_provider) = (None, None);
+                                window.defer(cx, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.continue_authorized_public_swap(
+                                            &command,
+                                            private_authorization,
+                                            Some(DesktopPrivateSpendAuthorization::HardwarePublic),
+                                            trezor_app_passphrase,
+                                            trezor_pin_matrix_provider,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                });
+                            } else {
+                                root.continue_authorized_spend(
+                                    intent,
+                                    DesktopPrivateSpendAuthorization::HardwarePublic,
+                                    window,
+                                    cx,
+                                );
+                            }
                         });
                         true
                     }
@@ -3037,11 +3509,12 @@ impl WalletRoot {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(spend_authorization_title(&summary.title, summary.title_chip.as_deref()))
+                    .child(spend_authorization_title(&summary.title, summary.title_network))
                     .children(summary.steps.as_ref().map(render_spend_authorization_steps))
                     .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
                     .child(render_spend_authorization_summary(
                         &summary,
+                        row_group_disclosure.clone().map(IntoElement::into_any_element),
                         details_disclosure.clone().map(IntoElement::into_any_element),
                         cx,
                     ))
@@ -3156,7 +3629,7 @@ impl WalletRoot {
         let device_label = hardware_device_label(descriptor.device_kind);
         let gas_review = self.hardware_gas_payment_review(&completion, cx);
         let dialog_title = summary.title.to_string();
-        let title_chip = summary.title_chip.clone();
+        let title_network = summary.title_network;
         let content = cx.new(|_cx| {
             HardwareSpendAuthorizationDialogContent::new(
                 root.clone(),
@@ -3166,7 +3639,7 @@ impl WalletRoot {
                 device_label,
             )
         });
-        window.open_dialog(cx, move |dialog, window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
@@ -3175,10 +3648,7 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height(window))
-                .title(spend_authorization_title(
-                    &dialog_title,
-                    title_chip.as_deref(),
-                ))
+                .title(spend_authorization_title(&dialog_title, title_network))
                 .on_ok({
                     let content = content.clone();
                     move |_event, window, cx| {
@@ -3194,6 +3664,8 @@ impl WalletRoot {
                     });
                 })
                 .child(div().w(content_width).child(content.clone()))
+                // The footer stays in view while the content scrolls.
+                .footer(content.read(cx).render_footer(&content).w(content_width))
         });
     }
 
@@ -3212,6 +3684,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Result<tokio::task::JoinHandle<HardwareSpendAuthorizationTaskOutput>, Arc<str>> {
+        if let Some(intent @ SpendAuthorizationIntent::PublicSwap(..)) = completion.private_intent()
+            && !intent.private_review_current(self)
+        {
+            return Err(Arc::from(
+                "The swap source or destination changed. Close this dialog and review the swap again.",
+            ));
+        }
         let Some(descriptor) = self.selected_hardware_descriptor() else {
             return Err(Arc::from(
                 "Selected wallet is missing its hardware derivation descriptor",
@@ -3250,6 +3729,9 @@ impl WalletRoot {
                 // network's owner.
                 let chain_id = match &intent {
                     SpendAuthorizationIntent::PrivateSwap(_, command) => {
+                        command.hardware_executor_chain()
+                    }
+                    SpendAuthorizationIntent::PublicSwap(_, command) => {
                         command.hardware_executor_chain()
                     }
                     _ => self.selected_chain,
@@ -3392,6 +3874,24 @@ impl WalletRoot {
                 view.update(cx, |view, cx| view.cancel_authorization(&command, cx));
             });
         }
+        if let SpendAuthorizationIntent::PublicSwap(view, command)
+        | SpendAuthorizationIntent::PublicSwapSource { view, command, .. } = intent
+        {
+            if let SpendAuthorizationIntent::PublicSwapSource {
+                private_authorization,
+                ..
+            } = intent
+            {
+                private_authorization.borrow_mut().take();
+            }
+            let view = view.clone();
+            let command = command.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |view, cx| {
+                    view.cancel_public_authorization(&command, cx);
+                });
+            });
+        }
     }
 
     pub(super) fn finish_spend_authorization(
@@ -3404,6 +3904,13 @@ impl WalletRoot {
     ) -> Result<(), Arc<str>> {
         let authorization = self.desktop_spend_authorization(password.clone())?;
         if !intent.approve_gateway_review(self) {
+            if matches!(
+                &intent,
+                SpendAuthorizationIntent::PublicSwap(..)
+                    | SpendAuthorizationIntent::PublicSwapSource { .. }
+            ) {
+                self.cancel_spend_authorization(&intent, cx);
+            }
             window.close_dialog(cx);
             return Ok(());
         }
@@ -3511,6 +4018,13 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if !intent.private_review_current(self) {
+            if matches!(
+                &intent,
+                SpendAuthorizationIntent::PublicSwap(..)
+                    | SpendAuthorizationIntent::PublicSwapSource { .. }
+            ) {
+                self.cancel_spend_authorization(&intent, cx);
+            }
             return;
         }
         match intent {
@@ -3556,6 +4070,115 @@ impl WalletRoot {
                 window.defer(cx, move |window, cx| {
                     view.update(cx, |view, cx| {
                         view.continue_authorized(&command, authorization, destination, window, cx);
+                    });
+                });
+            }
+            SpendAuthorizationIntent::PublicSwap(view, command) => {
+                let public_authorization = match command.source().source {
+                    PublicAccountSource::HardwareDerived => None,
+                    PublicAccountSource::Derived | PublicAccountSource::Imported => {
+                        match &authorization {
+                            DesktopPrivateSpendAuthorization::VaultPassword(password) => Some(
+                                DesktopPrivateSpendAuthorization::VaultPassword(password.clone()),
+                            ),
+                            DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
+                                password,
+                                session,
+                            } => Some(DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
+                                password: password.clone(),
+                                session: Arc::clone(session),
+                            }),
+                            _ => None,
+                        }
+                    }
+                    PublicAccountSource::ExecutorDerived(_) => {
+                        self.cancel_spend_authorization(
+                            &SpendAuthorizationIntent::PublicSwap(view, command),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                if let Some(public_authorization) = public_authorization {
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.continue_authorized_public_swap(
+                                &command,
+                                authorization,
+                                Some(public_authorization),
+                                None,
+                                None,
+                                window,
+                                cx,
+                            );
+                        });
+                    });
+                } else {
+                    let hardware_public =
+                        command.source().source == PublicAccountSource::HardwareDerived;
+                    // The review was approved for the wallet's device, which also holds this
+                    // account. A second dialog would repeat it and prompt nothing: the device
+                    // asks when it signs. Only an app passphrase still has to be entered.
+                    if hardware_public && !self.current_session_needs_trezor_app_passphrase() {
+                        #[cfg(feature = "hardware")]
+                        let trezor_pin_matrix_provider = self
+                            .view_session
+                            .as_ref()
+                            .and_then(|view| view.hardware_profile_session())
+                            .filter(|session| session.device_kind == HardwareDeviceKind::Trezor)
+                            .cloned()
+                            .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
+                        #[cfg(not(feature = "hardware"))]
+                        let trezor_pin_matrix_provider = None;
+                        window.defer(cx, move |window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.continue_authorized_public_swap(
+                                    &command,
+                                    authorization,
+                                    Some(DesktopPrivateSpendAuthorization::HardwarePublic),
+                                    None,
+                                    trezor_pin_matrix_provider,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        });
+                        return;
+                    }
+                    let summary = command.public_authorization_summary();
+                    let intent = SpendAuthorizationIntent::PublicSwapSource {
+                        view,
+                        command,
+                        private_authorization: Rc::new(RefCell::new(Some(authorization))),
+                    };
+                    if hardware_public {
+                        Self::open_hardware_public_action_authorization_dialog(
+                            intent, summary, window, cx,
+                        );
+                    } else {
+                        self.request_spend_authorization(intent, summary, window, cx);
+                    }
+                }
+            }
+            SpendAuthorizationIntent::PublicSwapSource {
+                view,
+                command,
+                private_authorization,
+            } => {
+                let Some(private_authorization) = private_authorization.borrow_mut().take() else {
+                    return;
+                };
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.continue_authorized_public_swap(
+                            &command,
+                            private_authorization,
+                            Some(authorization),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        );
                     });
                 });
             }

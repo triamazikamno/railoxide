@@ -35,6 +35,8 @@ pub(super) struct SubmissionProgressSubstep {
 /// A step and the sub-steps shown indented under it.
 pub(super) struct SubmissionProgressGroup {
     pub(super) step: SubmissionProgressStep,
+    /// The step's result at its trailing edge, such as the block it was included in.
+    pub(super) outcome: String,
     pub(super) substeps: Vec<SubmissionProgressSubstep>,
 }
 
@@ -43,6 +45,7 @@ pub(super) fn render_submission_progress_stepper(
 ) -> Div {
     render_submission_progress_groups(steps.into_iter().map(|step| SubmissionProgressGroup {
         step,
+        outcome: String::new(),
         substeps: Vec::new(),
     }))
 }
@@ -53,7 +56,12 @@ pub(super) fn render_submission_progress_groups(
 ) -> Div {
     let mut groups = groups.into_iter().peekable();
     let mut stepper = app_stepper_container();
-    while let Some(SubmissionProgressGroup { step, substeps }) = groups.next() {
+    while let Some(SubmissionProgressGroup {
+        step,
+        outcome,
+        substeps,
+    }) = groups.next()
+    {
         let is_last = groups.peek().is_none();
         let color = public_action_step_color(step.status);
         let selector = format!("submission-step-{}", step.error_copy_id);
@@ -64,6 +72,18 @@ pub(super) fn render_submission_progress_groups(
             color,
             step.action,
         );
+        let body = if outcome.is_empty() {
+            body
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(body)
+                .child(app_muted_text(outcome).flex_none())
+        };
         let body = if substeps.is_empty() {
             body
         } else {

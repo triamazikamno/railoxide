@@ -46,6 +46,12 @@ pub use swap::is_swap_destination_record;
 #[cfg(test)]
 pub(crate) use swap::submit_swap_pair_setups_with;
 pub use swap::{
+    AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
+    PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS,
+    PublicSwapGasPlan, PublicSwapSource, PublicSwapTransactionOutcome, PublicSwapWithdrawalReview,
+    public_swap_approvals, public_swap_gas_plan,
+};
+pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
     SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
@@ -57,11 +63,21 @@ pub use swap::{
     PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
     submit_swap_pair_setups,
 };
+pub use swap::{
+    PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,
+    PublicSwapReviewRequest, PublicSwapUnavailable, new_public_swap_batch_nonce,
+    public_swap_batch_terms,
+};
+pub use swap::{
+    PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapUseClaim, SwapShieldNotes,
+};
+pub use swap::{PublicSwapOrderState, public_swap_order_state};
+pub use swap::{PublicSwapProgress, PublicSwapTracking};
 #[cfg(test)]
 pub(crate) use swap::{
-    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, SwapShieldNotes, notes_of_shield,
-    plan_swap_inputs, price_swap_review, reusable_swap_proof, swap_cancellation_admitted,
-    swap_invalidation, swap_recovery_calls,
+    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, notes_of_shield, plan_swap_inputs,
+    price_swap_review, reusable_swap_proof, swap_cancellation_admitted, swap_invalidation,
+    swap_recovery_calls,
 };
 
 pub struct ExecutorReconciliationReport {

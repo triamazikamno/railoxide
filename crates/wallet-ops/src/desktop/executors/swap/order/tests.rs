@@ -8,13 +8,26 @@ use super::super::bridge::{
     BridgeSigning, SwapPrivateBridgeQuote, across_bridge_quote, across_order_terms,
     delivery_allowance_rate, near_bridge_quote,
 };
+use super::super::public_order::{
+    PublicSwapBatchTerms, PublicSwapReview, execute_hooks_typed_data, order_typed_data,
+    price_public_order, public_order, public_order_app_data_len, public_order_hooks,
+    public_swap_batch_terms,
+};
 use super::*;
 use crate::bridge::{AcrossFeeQuote, BridgeDestination, NearAssets, OneClickDryQuote};
 use crate::cow::{
     DeliveryAllowanceRate, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
+    public_deposit_hook_gas,
 };
-use crate::settings::BridgeReceiverRejection;
-use crate::vault::{BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation};
+use crate::hardware_typed_data::{HardwareEip712Model, HardwareEip712Type, HardwareEip712Value};
+use crate::settings::{BridgeReceiverRejection, PublicSwapProfile};
+use crate::vault::{
+    AcrossOrderTerms, BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation,
+};
+use broadcaster_core::contracts::cow_shed::{
+    COWShedFactory, decode_deposit_hook_calls, execute_hooks_calldata, execute_hooks_digest,
+    proxy_address,
+};
 
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
@@ -460,6 +473,7 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
             quoted_output: fees.output_amount,
             delivery_allowance: allowance,
             destination_shield_fee_bps: RAILGUN_PROTOCOL_FEE_BPS,
+            deposit_floor: None,
         })
     );
     assert_eq!(private.received_minimum(), U256::from(798_000_000));
@@ -504,6 +518,65 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
         ..fees
     };
     assert!(delivery_allowance_rate(delivery, Some(WETH), None, &unusable).is_err());
+}
+
+// Across's least deposit grows with the fill's gas, and the handler message adds the shield's:
+// a preview with a gas fee of 20,000 and a least deposit of 1 USDC gives 6 USDC for an allowance
+// of 100,000. A deposit below that can't be approved, and one that reaches it can. A quote
+// without a gas fee, or with Across's largest-integer least deposit, estimates nothing.
+#[test]
+fn a_private_deposit_below_the_least_across_would_take_with_its_message_cant_be_approved() {
+    let spoke_pool = Address::repeat_byte(0x5b);
+    let fees = AcrossFeeQuote {
+        output_amount: U256::from(3_960_000),
+        total_relay_fee_total: U256::from(40_000),
+        // 1% of the input, half of it gas.
+        total_relay_fee_pct: uint!(10_000_000_000_000_000_U256),
+        relayer_gas_fee_total: U256::from(20_000),
+        relayer_gas_fee_pct: uint!(5_000_000_000_000_000_U256),
+        lp_fee_total: U256::ZERO,
+        timestamp: 1,
+        fill_deadline: 2,
+        exclusive_relayer: Address::ZERO,
+        exclusivity_deadline: 0,
+        spoke_pool,
+        destination_spoke_pool: Address::repeat_byte(0x5c),
+        is_amount_too_low: false,
+        min_deposit: U256::from(1_000_000),
+        max_deposit: U256::MAX,
+        estimated_fill_time_sec: 12,
+    };
+    let allowance = Some(U256::from(100_000));
+    let bridge = across_bridge_quote(&fees, spoke_pool, allowance).unwrap();
+    let floor = U256::from(6_000_000);
+    assert_eq!(bridge.private.unwrap().deposit_floor, Some(floor));
+    let account = crate::vault::SwapApprovedAccount {
+        address: None,
+        setup: false,
+    };
+
+    let small = PublicSwapReview::for_tests(USDC, floor - U256::ONE, 100, bridge, None);
+    assert_eq!(small.too_small_to_bridge(), Some(floor));
+    assert!(small.approval(account, None, false).is_err());
+    let enough = PublicSwapReview::for_tests(USDC, floor, 100, bridge, None);
+    assert_eq!(enough.too_small_to_bridge(), None);
+    assert!(enough.approval(account, None, false).is_ok());
+
+    for unusable in [
+        AcrossFeeQuote {
+            relayer_gas_fee_total: U256::ZERO,
+            ..fees
+        },
+        AcrossFeeQuote {
+            min_deposit: U256::MAX,
+            ..fees
+        },
+    ] {
+        let bridge = across_bridge_quote(&unusable, spoke_pool, allowance).unwrap();
+        assert_eq!(bridge.private.unwrap().deposit_floor, None);
+        let review = PublicSwapReview::for_tests(USDC, U256::ONE, 100, bridge, None);
+        assert!(review.approval(account, None, false).is_ok());
+    }
 }
 
 // The destination SpokePool a quote names is never trusted as a pool. While signing, it only
@@ -986,6 +1059,7 @@ fn a_private_deliverys_destination_terms_need_a_new_review() {
             quoted_output: U256::from(output),
             delivery_allowance: U256::from(allowance),
             destination_shield_fee_bps: U256::from(shield_fee_bps),
+            deposit_floor: None,
         }),
     };
     let mut reviewed = bridge_review_for(delivery);
@@ -1240,5 +1314,491 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             approved: U256::from(1_000_000),
             current: U256::from(500_000),
         })
+    );
+}
+
+const PUBLIC_SPOKE_POOL: Address = Address::repeat_byte(0x5b);
+const PUBLIC_DESTINATION_TOKEN: Address = Address::repeat_byte(0x71);
+const PUBLIC_DESTINATION_CHAIN: u64 = 137;
+const PUBLIC_VALID_TO: u32 = 1_700_000_600;
+
+fn public_swap_profile() -> PublicSwapProfile {
+    crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+        .unwrap()
+        .get(1)
+        .unwrap()
+        .public_swap_profile()
+        .unwrap()
+}
+
+/// A signed delivery, and the terms Across quoted for depositing `buy_amount` of USDC for
+/// `destination_min` of the destination token.
+fn public_delivery_terms(
+    buy_amount: U256,
+    destination_min: U256,
+) -> (AcrossPrivateDelivery, AcrossOrderTerms) {
+    let delivery = AcrossPrivateDelivery {
+        handler: Address::repeat_byte(0x7e),
+        destination_executor: Address::repeat_byte(0xe1),
+        shield_multicall: Bytes::from_static(&[0xab; 37]),
+        fallback: Some(Address::repeat_byte(0xe1)),
+    };
+    let message = private_delivery_message(
+        delivery.handler,
+        PUBLIC_DESTINATION_TOKEN,
+        delivery.destination_executor,
+        delivery.shield_multicall.clone(),
+        delivery.fallback,
+    );
+    let terms = AcrossOrderTerms {
+        spoke_pool: PUBLIC_SPOKE_POOL,
+        input_token: USDC,
+        output_token: PUBLIC_DESTINATION_TOKEN,
+        input_amount: buy_amount,
+        output_amount: destination_min,
+        quote_timestamp: 1_700_000_000,
+        fill_deadline: 1_700_003_600,
+        exclusive_relayer: Address::repeat_byte(0x77),
+        exclusivity_parameter: 3,
+        recipient: Some(delivery.handler),
+        message_hash: Some(keccak256(&message)),
+    };
+    (delivery, terms)
+}
+
+// The deposit's output keeps the ratio of the approved destination minimum to the order's buy
+// amount. At exactly the buy amount it is exactly the minimum, also when the two tokens have
+// different decimals, and a larger balance never deposits for less.
+#[test]
+fn a_public_orders_script_deposits_for_at_least_the_destination_minimum() {
+    let profile = public_swap_profile();
+    let source = Address::repeat_byte(0x50);
+    for (buy_amount, destination_min) in [
+        (
+            uint!(100_000_000_000_000_000_000_U256),
+            uint!(99_000_000_000_000_000_001_U256),
+        ),
+        // A 6-decimal bought token to an 18-decimal destination token, and the reverse.
+        (
+            U256::from(15_000_000),
+            uint!(14_900_000_000_000_000_000_U256),
+        ),
+        (
+            uint!(15_000_000_000_000_000_000_U256),
+            U256::from(14_900_000),
+        ),
+    ] {
+        let (delivery, terms) = public_delivery_terms(buy_amount, destination_min);
+        let (hooks, deposit, proxy) = public_order_hooks(
+            &profile,
+            source,
+            PUBLIC_SPOKE_POOL,
+            buy_amount,
+            destination_min,
+            PUBLIC_DESTINATION_CHAIN,
+            &terms,
+            &delivery,
+            B256::repeat_byte(0x11),
+            PUBLIC_VALID_TO,
+        )
+        .unwrap();
+        let decoded = decode_deposit_hook_calls(&hooks.calls).unwrap();
+        assert_eq!(
+            (decoded.weiroll, &decoded.deposit),
+            (profile.weiroll(), &deposit)
+        );
+        assert_eq!((deposit.proxy, deposit.math), (proxy, profile.math()));
+        // `SwapMath.scale(balance, numerator, denominator)`, with the script's arguments.
+        let scale =
+            |balance: U256| balance * decoded.deposit.destination_min / decoded.deposit.buy_amount;
+        assert_eq!(scale(buy_amount), destination_min);
+        for surplus in [U256::ONE, buy_amount / U256::from(3), buy_amount] {
+            assert!(scale(buy_amount + surplus) >= destination_min);
+        }
+    }
+}
+
+// Both estimates cover what the fork measured, 409,967 gas when the hook deploys the proxy
+// and 203,316 on a deployed one, and the declared limit adds the hook margin to the upper bound.
+#[test]
+fn a_public_orders_hook_is_priced_higher_until_its_proxy_is_deployed() {
+    use GasEstimateMode::{Expected, UpperBound};
+    for (deployed, measured, expected, upper, limit) in [
+        (false, 409_967, 410_000, 470_000, 517_000),
+        (true, 203_316, 205_000, 260_000, 286_000),
+    ] {
+        assert_eq!(public_deposit_hook_gas(deployed, Expected), expected);
+        assert_eq!(public_deposit_hook_gas(deployed, UpperBound), upper);
+        assert!(measured <= expected && expected < upper);
+        assert_eq!(hook_gas_limit(upper), limit);
+    }
+}
+
+// An order from a Public account is priced from its quote as a private Bridge swap's is: the
+// same limit at every gas share, the same quote and the same CoW fee. Its best case is the
+// limit's at the bridge quote's ratio of the minimum received to the order's buy amount. A
+// direct deposit has no order, so none of them.
+#[test]
+fn a_public_orders_review_shows_what_a_private_bridge_review_of_its_quote_shows() {
+    let quote: CowQuote = serde_json::from_value(serde_json::json!({
+        "quote": {
+            "sellToken": WETH, "buyToken": USDC,
+            "sellAmount": "997500", "buyAmount": "10000000",
+            "validTo": 1, "feeAmount": "2500", "gasAmount": "100000", "gasPrice": "99",
+            "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+        },
+        "expiration": "", "id": 7, "verified": true, "protocolFeeBps": "2"
+    }))
+    .unwrap();
+    let price = SwapPrice::Verified {
+        rate: PairAnchorRate {
+            sell_rate: U256::ONE,
+            buy_rate: uint!(1_000_000_000_000_000_000_U256),
+        },
+        observations: Vec::new(),
+    };
+    let plan = plan_for(SwapDelivery::Bridge(BridgeDelivery {
+        provider: BridgeProvider::Across,
+        surplus: BridgeSurplus::Reshield,
+        ..near_delivery()
+    }));
+    let hook_gas = plan.hook_gas_estimate();
+    let private = price_swap_review(
+        plan,
+        quote.clone(),
+        price.clone(),
+        U256::from(25),
+        U256::from(25),
+        100,
+        GAS_SHARE_BALANCED_BPS,
+        Duration::from_mins(30),
+        1,
+        U256::from(100_000),
+        OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+    )
+    .unwrap();
+    let order = price_public_order(
+        quote,
+        &price,
+        1,
+        U256::from(100_000),
+        hook_gas,
+        USDC,
+        100,
+        GAS_SHARE_BALANCED_BPS,
+        Address::repeat_byte(0x70),
+        0,
+        1_800,
+    )
+    .unwrap();
+    // The handler receives 2,000 less than the deposit, and the shield there takes 0.25%.
+    let deposit = private.limit.buy_amount;
+    let bridge = SwapBridgeQuote {
+        provider: BridgeProvider::Across,
+        destination_minimum: deposit - U256::from(2_000),
+        expected_output: deposit - U256::from(2_000),
+        fee: Some(U256::from(1_500)),
+        leg: BridgeLegPrice::SameAsset,
+        fill_time_sec: None,
+        private: Some(SwapPrivateBridgeQuote {
+            quoted_output: deposit - U256::from(1_500),
+            delivery_allowance: U256::from(500),
+            destination_shield_fee_bps: U256::from(25),
+            deposit_floor: None,
+        }),
+    };
+    let sold = U256::from(997_500);
+    let public = PublicSwapReview::for_tests(USDC, sold, 100, bridge, Some(order));
+    assert_eq!(public.buy_amount(), Some(deposit));
+    assert_eq!(public.quote(), Some(private.quote()));
+    assert!(private.cow_fee().is_some());
+    assert_eq!(public.cow_fee(), private.cow_fee());
+    assert_eq!(
+        public.best_case(),
+        Some(private.best_case() * bridge.received_minimum() / deposit)
+    );
+    for share in [0, GAS_SHARE_TIGHT_BPS, GAS_SHARE_LOOSE_BPS] {
+        assert_eq!(
+            public.order_limit_at(share).unwrap(),
+            private.with_gas_share(share).unwrap().limit,
+            "{share}"
+        );
+    }
+
+    let direct = PublicSwapReview::for_tests(USDC, sold, 100, bridge, None);
+    assert_eq!(
+        (direct.best_case(), direct.cow_fee(), direct.quote()),
+        (None, None, None)
+    );
+    assert!(direct.order_limit_at(GAS_SHARE_BALANCED_BPS).is_err());
+}
+
+// The order pays the proxy, can only fill whole, and carries the signed batch as its one hook.
+// That hook decodes back to the script the batch was built from. The review's size check
+// measures the same app data from placeholders, and refuses one beyond the byte budget.
+#[test]
+fn a_public_order_pays_its_proxy_and_runs_the_signed_batch_as_its_only_hook() {
+    let profile = public_swap_profile();
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(7)).unwrap();
+    let source = signer.address();
+    let (buy_amount, destination_min) = (U256::from(15_000_000), U256::from(14_900_000));
+    let (delivery, terms) = public_delivery_terms(buy_amount, destination_min);
+    let nonce = B256::repeat_byte(0x11);
+    let (hooks, deposit, proxy) = public_order_hooks(
+        &profile,
+        source,
+        PUBLIC_SPOKE_POOL,
+        buy_amount,
+        destination_min,
+        PUBLIC_DESTINATION_CHAIN,
+        &terms,
+        &delivery,
+        nonce,
+        PUBLIC_VALID_TO,
+    )
+    .unwrap();
+    let (factory, implementation) = (
+        profile.cow_shed_factory(),
+        profile.cow_shed_implementation(),
+    );
+    assert_eq!(proxy, proxy_address(factory, implementation, source));
+    assert_eq!(
+        public_swap_batch_terms(&hooks, &deposit),
+        PublicSwapBatchTerms {
+            proxy,
+            guard_token: USDC,
+            guard_amount: buy_amount,
+            depositor: source,
+            recipient: delivery.handler,
+            input_token: USDC,
+            output_token: PUBLIC_DESTINATION_TOKEN,
+            destination_chain: PUBLIC_DESTINATION_CHAIN,
+            scale_numerator: destination_min,
+            scale_denominator: buy_amount,
+            deadline: PUBLIC_VALID_TO,
+            nonce,
+        }
+    );
+
+    let signature = signer
+        .sign_hash_sync(&execute_hooks_digest(&hooks, 1, proxy))
+        .unwrap();
+    let hook =
+        execute_hooks_calldata(hooks, source, &signature, 1, factory, implementation).unwrap();
+    let gas_limit = hook_gas_limit(public_deposit_hook_gas(false, GasEstimateMode::UpperBound));
+    let sell_amount = uint!(1_000_000_000_000_000_000_U256);
+    let (order, app_data) = public_order(
+        &profile,
+        WETH,
+        USDC,
+        sell_amount,
+        buy_amount,
+        PUBLIC_VALID_TO,
+        proxy,
+        hook.clone(),
+        gas_limit,
+    )
+    .unwrap();
+    assert_eq!(
+        order,
+        Order {
+            sellToken: WETH,
+            buyToken: USDC,
+            receiver: proxy,
+            sellAmount: sell_amount,
+            buyAmount: buy_amount,
+            validTo: PUBLIC_VALID_TO,
+            appData: app_data.hash,
+            feeAmount: U256::ZERO,
+            kind: ORDER_KIND_SELL.to_owned(),
+            partiallyFillable: false,
+            sellTokenBalance: TOKEN_BALANCE_ERC20.to_owned(),
+            buyTokenBalance: TOKEN_BALANCE_ERC20.to_owned(),
+        }
+    );
+    assert_eq!(app_data.hash, keccak256(app_data.document.as_bytes()));
+    let document: AppData = serde_json::from_str(&app_data.document).unwrap();
+    assert!(document.metadata.hooks.pre.is_empty());
+    let [post] = document.metadata.hooks.post.as_slice() else {
+        panic!("the order has one post-hook");
+    };
+    assert_eq!(
+        (post.target, post.gas_limit, &post.call_data),
+        (factory, gas_limit, &hook)
+    );
+    let call = COWShedFactory::executeHooksCall::abi_decode(&post.call_data).unwrap();
+    assert_eq!(
+        (call.user, call.nonce, call.deadline),
+        (source, nonce, U256::from(PUBLIC_VALID_TO))
+    );
+    assert_eq!(
+        decode_deposit_hook_calls(&call.calls).unwrap().deposit,
+        deposit
+    );
+
+    let measured = |shield_multicall: Bytes| {
+        public_order_app_data_len(
+            &profile,
+            PUBLIC_DESTINATION_TOKEN,
+            shield_multicall,
+            gas_limit,
+        )
+    };
+    assert_eq!(
+        measured(delivery.shield_multicall).unwrap(),
+        app_data.document.len()
+    );
+    let oversized = Bytes::from(vec![0; profile.app_data_byte_budget()]);
+    assert!(
+        measured(oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("too large for CoW's orderbook")
+    );
+}
+
+// What the Public account signs is typed data a hardware device can show: the batch in its
+// proxy's domain with every call as a nested struct, and the order in the settlement's domain.
+// Each hashes to the digest its contract verifies.
+#[test]
+fn a_public_orders_typed_data_hashes_to_the_digests_its_contracts_verify() {
+    let profile = public_swap_profile();
+    let source = Address::repeat_byte(0x50);
+    let chain_id = 42_161;
+    let (buy_amount, destination_min) = (U256::from(15_000_000), U256::from(14_900_000));
+    let (delivery, terms) = public_delivery_terms(buy_amount, destination_min);
+    let (hooks, _, proxy) = public_order_hooks(
+        &profile,
+        source,
+        PUBLIC_SPOKE_POOL,
+        buy_amount,
+        destination_min,
+        PUBLIC_DESTINATION_CHAIN,
+        &terms,
+        &delivery,
+        B256::repeat_byte(0x11),
+        PUBLIC_VALID_TO,
+    )
+    .unwrap();
+    let field = |fields: &[crate::hardware_typed_data::HardwareEip712FieldValue], name: &str| {
+        fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap()
+            .value
+            .clone()
+    };
+
+    let batch = HardwareEip712Model::from_walletconnect_typed_data_json(
+        execute_hooks_typed_data(&hooks, chain_id, proxy).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        batch.signing_hash(),
+        execute_hooks_digest(&hooks, chain_id, proxy)
+    );
+    assert_eq!(batch.primary_type(), "ExecuteHooks");
+    let domain = &batch.domain().fields;
+    assert_eq!(
+        (
+            field(domain, "name"),
+            field(domain, "version"),
+            field(domain, "chainId"),
+            field(domain, "verifyingContract"),
+        ),
+        (
+            HardwareEip712Value::String("COWShed".to_owned()),
+            HardwareEip712Value::String("2.1.0".to_owned()),
+            HardwareEip712Value::Uint {
+                value: U256::from(chain_id),
+                bits: 256,
+            },
+            HardwareEip712Value::Address(proxy),
+        )
+    );
+    assert_eq!(domain.len(), 4);
+    let message = batch.message().unwrap();
+    let calls = message
+        .fields
+        .iter()
+        .find(|field| field.name == "calls")
+        .unwrap();
+    assert_eq!(
+        calls.value_type,
+        HardwareEip712Type::DynamicArray(Box::new(HardwareEip712Type::Struct("Call".to_owned())))
+    );
+    let HardwareEip712Value::DynamicArray(shown) = &calls.value else {
+        panic!("the batch's calls are an array");
+    };
+    assert_eq!(shown.len(), hooks.calls.len());
+    for (shown, call) in shown.iter().zip(&hooks.calls) {
+        let HardwareEip712Value::Struct(shown) = &shown.value else {
+            panic!("each call is a struct");
+        };
+        assert_eq!(shown.type_name, "Call");
+        assert_eq!(
+            (
+                field(&shown.fields, "target"),
+                field(&shown.fields, "callData"),
+                field(&shown.fields, "isDelegateCall"),
+            ),
+            (
+                HardwareEip712Value::Address(call.target),
+                HardwareEip712Value::Bytes(call.callData.to_vec()),
+                HardwareEip712Value::Bool(call.isDelegateCall),
+            )
+        );
+    }
+    assert_eq!(
+        field(&message.fields, "nonce"),
+        HardwareEip712Value::FixedBytes {
+            bytes: vec![0x11; 32],
+            size: 32,
+        }
+    );
+
+    let (order, _) = public_order(
+        &profile,
+        WETH,
+        USDC,
+        uint!(1_000_000_000_000_000_000_U256),
+        buy_amount,
+        PUBLIC_VALID_TO,
+        proxy,
+        Bytes::from_static(b"signed batch"),
+        517_000,
+    )
+    .unwrap();
+    let settlement = profile.settlement();
+    let signed = HardwareEip712Model::from_walletconnect_typed_data_json(
+        order_typed_data(&order, chain_id, settlement).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        signed.signing_hash(),
+        order_digest(&order, chain_id, settlement)
+    );
+    assert_eq!(signed.primary_type(), "Order");
+    assert_eq!(
+        field(&signed.domain().fields, "verifyingContract"),
+        HardwareEip712Value::Address(settlement)
+    );
+    let shown = &signed.message().unwrap().fields;
+    assert_eq!(
+        (
+            field(shown, "receiver"),
+            field(shown, "validTo"),
+            field(shown, "partiallyFillable"),
+            field(shown, "kind"),
+        ),
+        (
+            HardwareEip712Value::Address(proxy),
+            HardwareEip712Value::Uint {
+                value: U256::from(PUBLIC_VALID_TO),
+                bits: 32,
+            },
+            HardwareEip712Value::Bool(false),
+            HardwareEip712Value::String(ORDER_KIND_SELL.to_owned()),
+        )
     );
 }

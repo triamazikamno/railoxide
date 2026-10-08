@@ -19,6 +19,12 @@
 //! The refund transaction Across names is looked up only for its block number, and the refund
 //! is matched in that block's finalized whole-block receipts. Like the explicit balance check
 //! it accompanies, that lookup identifies the stealth account to this chain's RPC.
+//!
+//! A swap paid from a Public account is tracked by the same code from the other side: its
+//! record is on the destination chain's owner, which reads the fill on its own chain and the
+//! refund, paid to the Public account, on the chain that account pays on. [`BridgeTracking`]
+//! is what the two share: the expected fill, the recorded outcome, the chain the fill is read
+//! on and where a new outcome is written.
 
 use std::collections::BTreeSet;
 
@@ -44,8 +50,9 @@ use crate::bridge::{
 use crate::desktop::executor_observation::{LATE_ADMISSION_WAIT, ObservationEndpoints, trace_step};
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::vault::{
-    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, ExecutorOperationId, SwapBridgeOutcome,
-    SwapDelivery, SwapObservation,
+    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgePrivateDelivery, BridgeProvider,
+    BridgeSurplus, ExecutorOperationId, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
+    SwapObservation, SwapUseId, SwapUseRecord, SwapUseRole,
 };
 
 impl ExecutorOwner {
@@ -104,24 +111,16 @@ impl ExecutorOwner {
         ) else {
             return Ok(known);
         };
-        // An explicit check asks Across again about a deposit it reported expired, until the
-        // refund is verified on this chain.
-        let is_across = matches!(terms, BridgeOrderTerms::Across(_));
-        let rechecks_refund = explicit
-            && known == Some(SwapBridgeOutcome::Refunding)
-            && observations.bridge_refund.is_none()
-            && is_across;
-        // Nothing on the destination chain backs a delivery Across only reported, so an explicit
-        // check asks Across about it again.
-        let rechecks_reported = explicit
-            && matches!(known, Some(SwapBridgeOutcome::DeliveredReported { .. }))
-            && is_across;
-        if known.is_some_and(|known| {
-            !explicit || known.is_final() && !rechecks_refund && !rechecks_reported
-        }) {
+        if !asks_again(
+            known,
+            explicit,
+            matches!(terms, BridgeOrderTerms::Across(_)),
+            observations.bridge_refund.is_some(),
+        ) {
             return Ok(known);
         }
-        let (outcome, refund_tx) = match terms {
+        let target = OutcomeTarget::Order(uid);
+        let (current, refund_tx) = match terms {
             BridgeOrderTerms::Across(across) => {
                 let deposit_id = handoff
                     .deposit_id
@@ -129,48 +128,34 @@ impl ExecutorOwner {
                 let fill = ExpectedFill {
                     origin_chain: self.chain.chain_id,
                     deposit_id,
-                    executor: record
+                    depositor: record
                         .address()
                         .ok_or_else(|| eyre!("swap account is unavailable"))?,
                     delivery,
                     terms: *across,
                 };
-                let (outcome, refund_tx) = self
-                    .while_active(Box::pin(self.across_outcome(
-                        &clients.across,
-                        destination,
+                Box::pin(self.track_across(
+                    &clients.across,
+                    BridgeTracking {
+                        record: &record,
+                        target,
                         fill,
-                    )))
+                        known,
+                        destination,
+                        endpoints: None,
+                    },
+                ))
+                .await?
+            }
+            BridgeOrderTerms::NearIntents(near) => {
+                let outcome = self
+                    .while_active(Box::pin(near_outcome(&clients.near, near.deposit_address)))
                     .await?;
-                // A reported fill never replaces a known outcome: a refund yields only to a
-                // verified fill, and an earlier report stands whatever Across now reports.
-                let reported = matches!(outcome, Some(SwapBridgeOutcome::DeliveredReported { .. }));
-                (outcome.filter(|_| known.is_none() || !reported), refund_tx)
+                let current = self
+                    .record_bridge_outcome(&record, target, terms.provider(), known, outcome)
+                    .await?;
+                (current, None)
             }
-            BridgeOrderTerms::NearIntents(near) => (
-                self.while_active(Box::pin(near_outcome(&clients.near, near.deposit_address)))
-                    .await?,
-                None,
-            ),
-        };
-        tracing::debug!(
-            target: "executor_observation",
-            provider = ?terms.provider(),
-            step = "swap_bridge",
-            result = outcome_label(outcome),
-            "finished"
-        );
-        // An inconclusive answer keeps the known outcome.
-        let current = match outcome.filter(|outcome| Some(*outcome) != known) {
-            Some(outcome) => {
-                let _guard = self.lock_activity().await;
-                self.require_record_unchanged(&record)?;
-                self.store
-                    .record_swap_bridge_outcome(operation, uid, outcome)?;
-                self.notify_change();
-                Some(outcome)
-            }
-            None => known,
         };
         // Only an explicit check looks the refund up, since the lookup names it to the RPC.
         if explicit
@@ -182,8 +167,80 @@ impl ExecutorOwner {
         Ok(current)
     }
 
+    /// One poll of Across about the deposit `tracking` describes. Returns the outcome after
+    /// the poll, persisting a new one, and the refund transaction Across names.
+    async fn track_across(
+        &self,
+        across: &AcrossClient,
+        tracking: BridgeTracking<'_>,
+    ) -> Result<(Option<SwapBridgeOutcome>, Option<B256>)> {
+        let BridgeTracking {
+            record,
+            target,
+            fill,
+            known,
+            destination,
+            endpoints,
+        } = tracking;
+        let (outcome, refund_tx) = self
+            .while_active(Box::pin(self.across_outcome(
+                across,
+                destination,
+                endpoints,
+                fill,
+            )))
+            .await?;
+        // A reported fill never replaces a known outcome: a refund yields only to a
+        // verified fill, and an earlier report stands whatever Across now reports.
+        let reported = matches!(outcome, Some(SwapBridgeOutcome::DeliveredReported { .. }));
+        let outcome = outcome.filter(|_| known.is_none() || !reported);
+        let current = self
+            .record_bridge_outcome(record, target, BridgeProvider::Across, known, outcome)
+            .await?;
+        Ok((current, refund_tx))
+    }
+
+    /// Persist `outcome`, what `provider` answered about the deposit `target` names in
+    /// `record`, and return the outcome after it. An inconclusive answer keeps the known one.
+    async fn record_bridge_outcome(
+        &self,
+        record: &ExecutorRecord,
+        target: OutcomeTarget,
+        provider: BridgeProvider,
+        known: Option<SwapBridgeOutcome>,
+        outcome: Option<SwapBridgeOutcome>,
+    ) -> Result<Option<SwapBridgeOutcome>> {
+        tracing::debug!(
+            target: "executor_observation",
+            provider = ?provider,
+            step = "swap_bridge",
+            result = outcome_label(outcome),
+            "finished"
+        );
+        let Some(outcome) = outcome.filter(|outcome| Some(*outcome) != known) else {
+            return Ok(known);
+        };
+        let _guard = self.lock_activity().await;
+        self.require_record_unchanged(record)?;
+        let operation = record.operation();
+        match target {
+            OutcomeTarget::Order(uid) => {
+                self.store
+                    .record_swap_bridge_outcome(operation, uid, outcome)?;
+            }
+            OutcomeTarget::PublicSwap(swap_use) => {
+                self.store
+                    .record_public_swap_bridge_outcome(operation, swap_use, outcome)?;
+            }
+        }
+        self.notify_change();
+        Ok(Some(outcome))
+    }
+
     /// Across's report locates a fill block, which is then checked on the destination chain.
     /// Expiry and refund are Across's word, returned with the refund transaction it names.
+    /// The fill is read through `endpoints`, or through endpoints opened for `destination`
+    /// once there is a fill block to read.
     ///
     /// A public delivery is `DeliveredReported`, with the amount and fill transaction Across
     /// names, in two cases: an endpoint read the final fill block whole and it holds no
@@ -195,6 +252,7 @@ impl ExecutorOwner {
         &self,
         across: &AcrossClient,
         destination: &EffectiveChainConfig,
+        endpoints: Option<&ObservationEndpoints>,
         fill: ExpectedFill,
     ) -> Result<(Option<SwapBridgeOutcome>, Option<B256>)> {
         let Some(deposit) = trace_step(
@@ -242,9 +300,15 @@ impl ExecutorOwner {
                 amount_out: Some(deposit.output_amount),
                 transaction_hash: deposit.fill_tx,
             });
-        let endpoints = ObservationEndpoints::new(destination, &self.http);
+        let opened;
+        let endpoints = if let Some(endpoints) = endpoints {
+            endpoints
+        } else {
+            opened = ObservationEndpoints::new(destination, &self.http);
+            &opened
+        };
         let read = Box::pin(read_fill_from_endpoints(
-            &endpoints,
+            endpoints,
             destination,
             number,
             spoke_pool,
@@ -306,42 +370,286 @@ impl ExecutorOwner {
         let refund = ExpectedRefund {
             spoke_pool: terms.spoke_pool,
             token: terms.input_token,
-            executor,
+            payee: executor,
             amount: terms.input_amount,
         };
-        for endpoint in self.endpoints.providers().await {
+        let Some(found) = self
+            .read_refund_from_endpoints(
+                &self.endpoints,
+                self.chain.finality_depth,
+                refund_tx,
+                &refund,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let _guard = self.lock_activity().await;
+        self.require_record_unchanged(&record)?;
+        self.store
+            .record_swap_bridge_refund(operation, uid, found)?;
+        self.notify_change();
+        Ok(())
+    }
+
+    /// [`read_refund`] through `endpoints`, those of the chain the deposit was made on, from
+    /// the first that serves it. `None` when that endpoint doesn't hold the refund yet.
+    async fn read_refund_from_endpoints(
+        &self,
+        endpoints: &ObservationEndpoints,
+        finality_depth: u64,
+        refund_tx: B256,
+        refund: &ExpectedRefund,
+    ) -> Result<Option<SwapObservation>> {
+        for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
                 "swap_bridge_refund",
                 self.while_active(Box::pin(read_refund(
                     &endpoint.provider,
-                    self.chain.finality_depth,
+                    finality_depth,
                     refund_tx,
-                    &refund,
+                    refund,
                 ))),
             )
             .instrument(span)
             .await;
             match result {
                 Ok(found) => {
-                    self.endpoints.succeeded(&endpoint);
-                    let Some(found) = found else {
-                        return Ok(());
-                    };
-                    let _guard = self.lock_activity().await;
-                    self.require_record_unchanged(&record)?;
-                    self.store
-                        .record_swap_bridge_refund(operation, uid, found)?;
-                    self.notify_change();
-                    return Ok(());
+                    endpoints.succeeded(&endpoint);
+                    return Ok(found);
                 }
-                Err(error) => self.endpoints.failed(&endpoint, &error),
+                Err(error) => endpoints.failed(&endpoint, &error),
             }
         }
         Err(eyre!(
             "Refund verification is unavailable. Check status again later."
         ))
     }
+
+    /// Track the Across deposit of a Public-paid swap on this chain, as `observe_swap_bridge`
+    /// does for a stealth pair. This chain is the delivery's destination, so the fill is read
+    /// through this owner's own endpoints. `None` while there is no hand-off yet.
+    pub async fn observe_public_swap_bridge(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        across: &AcrossClient,
+    ) -> Result<Option<SwapBridgeOutcome>> {
+        self.track_public_swap_bridge(operation, swap_use, across, false)
+            .await
+    }
+
+    /// The explicit status check, which may replace an outcome as `check_swap_bridge` may: a
+    /// verified fill corrects a `Refunding` whose refund isn't verified. The refund itself is
+    /// verified by [`Self::observe_public_swap_refund`], on the chain the Public account pays
+    /// on.
+    pub async fn check_public_swap_bridge(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        across: &AcrossClient,
+    ) -> Result<Option<SwapBridgeOutcome>> {
+        self.track_public_swap_bridge(operation, swap_use, across, true)
+            .await
+    }
+
+    async fn track_public_swap_bridge(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        across: &AcrossClient,
+        explicit: bool,
+    ) -> Result<Option<SwapBridgeOutcome>> {
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+        let Some(SwapUseRole::PublicSourceDestination {
+            origin_chain,
+            source,
+            destination_token,
+            swap,
+            ..
+        }) = record.swap_use(swap_use).map(SwapUseRecord::role)
+        else {
+            return Err(eyre!(
+                "this stealth account isn't claimed by a swap paid from a Public account"
+            ));
+        };
+        let observations = swap.observations();
+        let known = observations.bridge_outcome;
+        let (Some(terms), Some(handoff), Some(deposited)) = (
+            swap.bridge(),
+            observations.bridge_handoff,
+            observations.deposited,
+        ) else {
+            return Ok(known);
+        };
+        if !asks_again(known, explicit, true, observations.bridge_refund.is_some()) {
+            return Ok(known);
+        }
+        let fill = ExpectedFill {
+            origin_chain: *origin_chain,
+            deposit_id: handoff
+                .deposit_id
+                .ok_or_else(|| eyre!("the Across deposit is unknown"))?,
+            depositor: *source,
+            // The delivery the swap signed: private, to this account.
+            delivery: BridgeDelivery {
+                provider: BridgeProvider::Across,
+                destination_chain: self.chain.chain_id,
+                receiver: record
+                    .address()
+                    .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?,
+                destination_token: *destination_token,
+                surplus: BridgeSurplus::Reshield,
+                private: Some(BridgePrivateDelivery {
+                    on_shield_failure: swap.approval().on_shield_failure,
+                }),
+            },
+            // The fill repeats the deposit's event, whose amounts an order's hook sets above
+            // the signed minimums.
+            terms: AcrossOrderTerms {
+                input_amount: deposited.input_amount,
+                output_amount: deposited.output_amount,
+                ..*terms
+            },
+        };
+        let (current, _) = Box::pin(self.track_across(
+            across,
+            BridgeTracking {
+                record: &record,
+                target: OutcomeTarget::PublicSwap(swap_use),
+                fill,
+                known,
+                destination: &self.chain,
+                endpoints: Some(&self.endpoints),
+            },
+        ))
+        .await?;
+        Ok(current)
+    }
+
+    /// Verify Across's refund of a refunding Public-paid swap to its Public account, in the
+    /// origin chain's finalized receipts, and record it. The refund pays the deposited input
+    /// amount of the deposit's input token from `origin`'s pinned `SpokePool` to the Public
+    /// account. Across is asked for the refund transaction, which is looked up on `origin` for
+    /// its block number alone. That chain already sees the Public account.
+    ///
+    /// Returns `Some` exactly when this call newly verified the refund, which is when the
+    /// Public account's balances on `origin` are due a refresh. A swap that isn't refunding,
+    /// a refund that is already recorded and one that isn't final yet all return `None`.
+    /// Nothing is recovered: the tokens are back in the Public account. The destination
+    /// stealth account's shield stays signed, and keeps guarding that account.
+    pub async fn observe_public_swap_refund(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        origin: &EffectiveChainConfig,
+        across: &AcrossClient,
+    ) -> Result<Option<SwapObservation>> {
+        let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
+        let observed = claimed.swap.observations();
+        if observed.bridge_outcome != Some(SwapBridgeOutcome::Refunding)
+            || observed.bridge_refund.is_some()
+        {
+            return Ok(None);
+        }
+        let (Some(terms), Some(deposited), Some(deposit_id)) = (
+            claimed.swap.bridge(),
+            observed.deposited,
+            observed
+                .bridge_handoff
+                .and_then(|handoff| handoff.deposit_id),
+        ) else {
+            return Ok(None);
+        };
+        let deposit = self
+            .while_active(async {
+                Ok(trace_step(
+                    "swap_bridge_across_deposit",
+                    across.deposit(origin.chain_id, deposit_id),
+                )
+                .await?)
+            })
+            .await?;
+        let Some(refund_tx) = deposit.and_then(|deposit| deposit.deposit_refund_tx) else {
+            return Ok(None);
+        };
+        let refund = ExpectedRefund {
+            spoke_pool: claimed.spoke_pool,
+            token: terms.input_token,
+            payee: claimed.source,
+            amount: deposited.input_amount,
+        };
+        let endpoints = ObservationEndpoints::new(origin, &self.http);
+        let Some(found) = self
+            .read_refund_from_endpoints(&endpoints, origin.finality_depth, refund_tx, &refund)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let _guard = self.lock_activity().await;
+        let current = self.swap_account_record(operation)?.and_then(|record| {
+            record
+                .public_swap_use(swap_use)
+                .map(|(_, swap)| swap.observations())
+        });
+        // Another observation of the swap wrote meanwhile. This read is repeated by the next
+        // call rather than written over it.
+        if current != Some(observed) {
+            return Ok(None);
+        }
+        self.store
+            .record_public_swap_bridge_refund(operation, swap_use, found)?;
+        self.notify_change();
+        Ok(Some(found))
+    }
+}
+
+/// Whether a poll asks the provider about a deposit whose recorded outcome is `known`. A
+/// routine poll asks only while there is none. An explicit check asks again after
+/// `NeedsAttention`, after an Across `Refunding` until its refund is verified, and after an
+/// Across `DeliveredReported`, which nothing on the destination chain backs.
+const fn asks_again(
+    known: Option<SwapBridgeOutcome>,
+    explicit: bool,
+    across: bool,
+    refund_verified: bool,
+) -> bool {
+    let Some(known) = known else {
+        return true;
+    };
+    let rechecks_refund =
+        matches!(known, SwapBridgeOutcome::Refunding) && !refund_verified && across;
+    let rechecks_reported = matches!(known, SwapBridgeOutcome::DeliveredReported { .. }) && across;
+    explicit && (!known.is_final() || rechecks_refund || rechecks_reported)
+}
+
+/// What tracking an Across deposit's fill needs, apart from the record that holds the
+/// deposit: a Bridge order's on its origin chain's owner, or a Public-paid swap's on its
+/// destination chain's. The origin chain and the deposit id are in `fill`.
+struct BridgeTracking<'a> {
+    /// The record the outcome is written to, as it was read.
+    record: &'a ExecutorRecord,
+    target: OutcomeTarget,
+    fill: ExpectedFill,
+    /// The recorded outcome.
+    known: Option<SwapBridgeOutcome>,
+    /// The chain the fill is read on.
+    destination: &'a EffectiveChainConfig,
+    /// That chain's endpoints, when it is this owner's own. Otherwise they are opened for the
+    /// read.
+    endpoints: Option<&'a ObservationEndpoints>,
+}
+
+/// Where a tracked deposit's outcome is written in its record.
+#[derive(Clone, Copy)]
+enum OutcomeTarget {
+    /// The Bridge order of a stealth account, on its origin chain.
+    Order(OrderUid),
+    /// The use of a swap paid from a Public account, on its destination chain.
+    PublicSwap(SwapUseId),
 }
 
 /// 1Click's report. Unknown deposit addresses and unfinished states leave no outcome.
@@ -443,8 +751,10 @@ async fn read_fill_from_endpoints(
 struct ExpectedFill {
     origin_chain: u64,
     deposit_id: U256,
-    executor: Address,
+    /// The stealth account that deposited, or the Public account of a swap it pays.
+    depositor: Address,
     delivery: BridgeDelivery,
+    /// The deposit's terms, with the amounts its event recorded.
     terms: AcrossOrderTerms,
 }
 
@@ -459,7 +769,7 @@ impl ExpectedFill {
         let message_hash = self.terms.deposit_message_hash();
         fill.originChainId == U256::from(self.origin_chain)
             && fill.depositId == self.deposit_id
-            && fill.depositor == address_to_bytes32(self.executor)
+            && fill.depositor == address_to_bytes32(self.depositor)
             && fill.recipient == recipient
             && fill.inputToken == address_to_bytes32(self.terms.input_token)
             && fill.inputAmount == self.terms.input_amount
@@ -560,11 +870,12 @@ struct ExpectedShield {
     railgun: Address,
 }
 
-/// The transfer that refunds an Across deposit to the executor on this chain.
+/// The transfer that refunds an Across deposit to its depositor on the chain it was made on.
 struct ExpectedRefund {
     spoke_pool: Address,
     token: Address,
-    executor: Address,
+    /// The depositor: the stealth account, or the Public account of a swap it pays.
+    payee: Address,
     amount: U256,
 }
 
@@ -576,7 +887,7 @@ impl ExpectedRefund {
             && log.log_decode::<Transfer>().is_ok_and(|transfer| {
                 let transfer = transfer.inner.data;
                 transfer.from == self.spoke_pool
-                    && transfer.to == self.executor
+                    && transfer.to == self.payee
                     && transfer.value >= self.amount
             })
     }
@@ -698,7 +1009,7 @@ async fn read_refund(
 
 /// The successful receipts of block `number` once it is final, read whole by block identifiers
 /// only. `None` while the block isn't final yet.
-async fn finalized_receipts(
+pub(super) async fn finalized_receipts(
     provider: &DynProvider,
     finality_depth: u64,
     number: u64,
@@ -753,7 +1064,10 @@ async fn finalized_receipts(
 }
 
 /// Whether `identity` is still canonical. A block fetched before a reorg may still be served.
-async fn still_canonical(provider: &DynProvider, identity: BlockNumHash) -> Result<bool> {
+pub(super) async fn still_canonical(
+    provider: &DynProvider,
+    identity: BlockNumHash,
+) -> Result<bool> {
     Ok(trace_step("swap_bridge_block_canonical_recheck", async {
         provider.get_block_by_number(identity.number.into()).await
     })

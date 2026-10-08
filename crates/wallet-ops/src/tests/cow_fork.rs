@@ -2,8 +2,8 @@
 //!
 //! Tests using it are `#[ignore]`d and read `ETH_FORK_RPC_URL`. Tests that also
 //! fork the destination chain of a private Bridge delivery read that chain's RPC
-//! from `DESTINATION_FORK_RPC_URL`. Set `ANVIL_BIN`
-//! when `anvil` is not on `PATH`. Railgun accepts any proof when
+//! from `DESTINATION_FORK_RPC_URL`, or from `BNB_FORK_RPC_URL` when that chain is BNB Chain.
+//! Set `ANVIL_BIN` when `anvil` is not on `PATH`. Railgun accepts any proof when
 //! `tx.origin == 0x…dEaD` (its `VERIFICATION_BYPASS`); verification still runs,
 //! so gas matches real proofs. Every transaction here is sent from that address,
 //! which is also added as an allow-listed `GPv2` solver, so a settlement runs its
@@ -27,6 +27,7 @@ use url::Url;
 
 pub(crate) const FORK_RPC_URL_ENV: &str = "ETH_FORK_RPC_URL";
 pub(crate) const DESTINATION_FORK_RPC_URL_ENV: &str = "DESTINATION_FORK_RPC_URL";
+pub(crate) const BNB_FORK_RPC_URL_ENV: &str = "BNB_FORK_RPC_URL";
 /// Railgun's `VERIFICATION_BYPASS` origin, used as sender and solver.
 pub(crate) const VERIFICATION_BYPASS: Address =
     address!("000000000000000000000000000000000000dEaD");
@@ -139,7 +140,12 @@ impl ForkChain {
     /// Spawn the fork of `chain_id`, the destination chain of a private Bridge delivery, and
     /// impersonate the bypass origin. No order settles there, so it has no solver.
     pub(crate) async fn start_destination(chain_id: u64) -> Self {
-        Self::spawn(DESTINATION_FORK_RPC_URL_ENV, chain_id).await
+        Self::start_destination_from(DESTINATION_FORK_RPC_URL_ENV, chain_id).await
+    }
+
+    /// [`Self::start_destination`] from the RPC that `url_env` names.
+    pub(crate) async fn start_destination_from(url_env: &str, chain_id: u64) -> Self {
+        Self::spawn(url_env, chain_id).await
     }
 
     /// Spawn a fork of the chain `chain_id` from the RPC that `url_env` names, and impersonate
@@ -255,6 +261,20 @@ impl ForkChain {
             .await
             .unwrap_or_else(|error| panic!("evm_revert: {error}"));
         assert!(reverted, "the fork returns to its snapshot");
+    }
+
+    /// `account`'s code, empty for an address without any.
+    pub(crate) async fn code(&self, account: Address) -> Bytes {
+        self.provider.get_code_at(account).await.unwrap()
+    }
+
+    /// The receipt of the mined `transaction`.
+    pub(crate) async fn receipt(&self, transaction: B256) -> TransactionReceipt {
+        self.provider
+            .get_transaction_receipt(transaction)
+            .await
+            .unwrap()
+            .expect("transaction receipt")
     }
 
     pub(crate) async fn storage_at(&self, account: Address, slot: U256) -> U256 {

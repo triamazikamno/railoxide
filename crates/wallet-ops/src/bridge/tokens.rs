@@ -2,8 +2,10 @@
 //! chain to hand to the provider.
 //!
 //! Both lists are limited to the destination chain's configured tokens, plus the native asset
-//! where NEAR Intents delivers it. A provider's route never adds a token. A destination that is
-//! the same asset as the sell token is left out: same-token bridging isn't supported.
+//! where NEAR Intents delivers it. A provider's route never adds a token. A swap paid from the
+//! private balance leaves out a destination that is the same asset as the sell token:
+//! same-token bridging isn't supported there. A swap paid from a Public account keeps it as a
+//! direct deposit.
 
 use alloy::primitives::Address;
 
@@ -72,6 +74,98 @@ pub fn across_destination_tokens(
             Some(known) if !known.1 && matched => *known = (destination, matched),
             Some(_) => {}
             None => destinations.push((destination, matched)),
+        }
+    }
+    destinations
+        .into_iter()
+        .map(|(destination, _)| destination)
+        .collect()
+}
+
+/// How a swap paid from a Public account reaches a destination token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicBridgePath {
+    /// The destination token is the Across counterpart of the Sell token: the account deposits
+    /// it itself.
+    Deposit,
+    /// Another token: a `CoW` order buys the route's origin token and its post-hook deposits it.
+    Order,
+}
+
+/// A destination a swap paid from a Public account can deliver, and the path that reaches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicBridgeDestination {
+    pub destination: BridgeDestination,
+    pub path: PublicBridgePath,
+}
+
+/// What the sell side of a Public-paid swap is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicSellAsset {
+    Erc20(Address),
+    /// The chain's native asset, deposited as this wrapped native token.
+    Native {
+        wrapped: Address,
+    },
+}
+
+/// Destinations of Across `routes` from a Public account's chain to `destination_chain` whose
+/// destination token is configured there. A route that starts from the sell token, or from
+/// the wrapped token of a native sell asset, is a direct deposit. Any other route takes an
+/// order, offered only when the chain can swap (`can_swap`) and the sell asset is an ERC-20: a
+/// native asset is never the sell side of an order. When several routes reach one destination
+/// token, a deposit is kept over an order, then an order whose origin symbol matches the
+/// destination symbol, otherwise the first in the provider's order.
+#[must_use]
+pub fn public_across_destination_tokens(
+    routes: &[AcrossRoute],
+    sell: PublicSellAsset,
+    can_swap: bool,
+    registry: &EffectiveTokenRegistry,
+    destination_chain: u64,
+) -> Vec<PublicBridgeDestination> {
+    let (source, orders) = match sell {
+        PublicSellAsset::Erc20(token) => (token, can_swap),
+        PublicSellAsset::Native { wrapped } => (wrapped, false),
+    };
+    // Each destination with its route's preference: a deposit, then a symbol-matched order.
+    let mut destinations: Vec<(PublicBridgeDestination, u8)> = Vec::new();
+    for route in routes {
+        if route.origin_token == Address::ZERO {
+            continue;
+        }
+        let (path, preference) = if route.origin_token == source {
+            (PublicBridgePath::Deposit, 2)
+        } else if !orders {
+            continue;
+        } else if route
+            .origin_symbol
+            .eq_ignore_ascii_case(&route.destination_symbol)
+        {
+            (PublicBridgePath::Order, 1)
+        } else {
+            (PublicBridgePath::Order, 0)
+        };
+        let Some(configured) = registry.get(destination_chain, &route.destination_token) else {
+            continue;
+        };
+        let destination = PublicBridgeDestination {
+            destination: BridgeDestination {
+                destination_token: route.destination_token,
+                intermediate: route.origin_token,
+                symbol: configured.symbol.clone(),
+                same_asset: true,
+                near: None,
+            },
+            path,
+        };
+        match destinations
+            .iter_mut()
+            .find(|(known, _)| known.destination.destination_token == route.destination_token)
+        {
+            Some(known) if known.1 < preference => *known = (destination, preference),
+            Some(_) => {}
+            None => destinations.push((destination, preference)),
         }
     }
     destinations
@@ -268,6 +362,67 @@ mod tests {
                 (POL_USDT, ARB_USDT),
                 (POL_WETH, ARB_WETH)
             ]
+        );
+    }
+
+    #[test]
+    fn public_across_keeps_the_sell_tokens_routes_as_deposits_and_orders_the_rest() {
+        use PublicBridgePath::{Deposit, Order};
+        let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
+        let routes = [
+            // Another origin for a destination the sell token reaches itself.
+            route(ARB_USDC_E, "USDC.e", POL_USDC, "USDC"),
+            route(ARB_USDC, "USDC", POL_USDC, "USDC"),
+            route(ARB_USDC, "USDC", POL_USDC_E, "USDC.e"),
+            route(ARB_USDT, "USDT", POL_USDT, "USDT"),
+            route(ARB_WETH, "WETH", POL_WETH, "WETH"),
+        ];
+        let offered = |sell, can_swap| {
+            public_across_destination_tokens(&routes, sell, can_swap, &registry, 137)
+                .into_iter()
+                .map(|offer| {
+                    (
+                        offer.destination.destination_token,
+                        offer.destination.intermediate,
+                        offer.path,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Selling USDC: its own routes are deposits, and the deposit to USDC replaces the
+        // earlier order from USDC.e.
+        assert_eq!(
+            offered(PublicSellAsset::Erc20(ARB_USDC), true),
+            [
+                (POL_USDC, ARB_USDC, Deposit),
+                (POL_USDC_E, ARB_USDC, Deposit),
+                (POL_USDT, ARB_USDT, Order),
+                (POL_WETH, ARB_WETH, Order)
+            ]
+        );
+        // A chain with only an origin profile has no orders.
+        assert_eq!(
+            offered(PublicSellAsset::Erc20(ARB_USDC), false),
+            [
+                (POL_USDC, ARB_USDC, Deposit),
+                (POL_USDC_E, ARB_USDC, Deposit)
+            ]
+        );
+        // Selling WETH: an order buys USDC, the origin whose symbol matches the destination's.
+        assert_eq!(
+            offered(PublicSellAsset::Erc20(ARB_WETH), true),
+            [
+                (POL_USDC, ARB_USDC, Order),
+                (POL_USDC_E, ARB_USDC, Order),
+                (POL_USDT, ARB_USDT, Order),
+                (POL_WETH, ARB_WETH, Deposit)
+            ]
+        );
+        // The native asset is deposited as WETH and is never the sell side of an order.
+        assert_eq!(
+            offered(PublicSellAsset::Native { wrapped: ARB_WETH }, true),
+            [(POL_WETH, ARB_WETH, Deposit)]
         );
     }
 

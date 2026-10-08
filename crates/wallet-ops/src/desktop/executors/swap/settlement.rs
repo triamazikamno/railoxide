@@ -3,7 +3,9 @@
 //! receipt's trade establishes the outcome, together with its private credit for Reshield
 //! delivery, or its Across deposit for Bridge delivery.
 
-use alloy::network::{AnyRpcBlock, ReceiptResponse as _, primitives::HeaderResponse as _};
+use alloy::network::{
+    AnyRpcBlock, AnyTransactionReceipt, ReceiptResponse as _, primitives::HeaderResponse as _,
+};
 use alloy::primitives::{Address, U256, keccak256};
 use alloy::providers::{DynProvider, EthGetBlock, Provider as _};
 use alloy::rpc::types::Log;
@@ -202,6 +204,13 @@ async fn read_settlement(
         )?,
         None => Vec::new(),
     };
+    let expected = ExpectedTrade {
+        settlement,
+        owner: executor,
+        uid: order.uid(),
+        sell_token: terms.sell_token(),
+        buy_token,
+    };
     let mut found = None;
     for receipt in receipts {
         if !receipt.status() {
@@ -218,20 +227,9 @@ async fn read_settlement(
             return Err(eyre!("settlement receipt logs have inconsistent inclusion"));
         }
         for (trade_index, log) in logs.iter().enumerate() {
-            if log.address() != settlement {
-                continue;
-            }
-            let Ok(trade) = log.log_decode::<SwapSettlement::Trade>() else {
+            let Some(trade) = order_trade(log, &expected) else {
                 continue;
             };
-            let trade = trade.inner.data;
-            if trade.owner != executor
-                || trade.orderUid != order.uid().0[..]
-                || trade.sellToken != terms.sell_token()
-                || trade.buyToken != buy_token
-            {
-                continue;
-            }
             if found.is_some() {
                 return Err(eyre!("settlement contains ambiguous trade evidence"));
             }
@@ -242,23 +240,14 @@ async fn read_settlement(
             // A second matching payout could mean a funded post-hook ran before the
             // actual fill's payout. Do not attribute that earlier credit or deposit to this
             // trade. The single payout must follow the trade.
-            let mut payouts = logs
-                .iter()
-                .enumerate()
-                .filter(|(_, log)| log.address() == terms.buy_token())
-                .filter_map(|(index, log)| Some((index, log.log_decode::<Transfer>().ok()?)))
-                .filter(|(_, log)| {
-                    log.inner.data.from == settlement
-                        && log.inner.data.to == executor
-                        && log.inner.data.value == trade.buyAmount
-                })
-                .map(|(index, _)| index);
-            let payout = match (payouts.next(), payouts.next()) {
-                (Some(index), None) if index > trade_index && !trade.buyAmount.is_zero() => {
-                    Some(index)
-                }
-                _ => None,
-            };
+            let payout = settlement_payout(
+                logs,
+                trade_index,
+                settlement,
+                terms.buy_token(),
+                executor,
+                trade.buyAmount,
+            );
             let credits = |start: usize| {
                 shield_credits(logs, start, &shields, terms.buy_token(), executor, railgun).map(
                     move |(private_amount, fee)| SwapShieldObservation {
@@ -333,17 +322,7 @@ async fn read_settlement(
             };
             found = Some(Settlement {
                 trade: observation,
-                amounts: SwapTradeAmounts {
-                    sell_amount: trade.sellAmount,
-                    buy_amount: trade.buyAmount,
-                    fee_amount: trade.feeAmount,
-                    // The settlement's cost comes from the receipt already read, the one
-                    // that emits this Trade.
-                    settlement_gas_used: Some(receipt.gas_used()),
-                    settlement_effective_gas_price: Some(receipt.effective_gas_price()),
-                    executed_fee: None,
-                    executed_fee_token: None,
-                },
+                amounts: trade_amounts(&trade, &receipt),
                 credit,
                 handoff,
             });
@@ -358,6 +337,75 @@ async fn read_settlement(
         return Err(eyre!("settlement block changed during verification"));
     }
     Ok(found)
+}
+
+/// What identifies an order's trade among a settlement transaction's logs.
+pub(super) struct ExpectedTrade {
+    /// The chain's pinned settlement contract.
+    pub(super) settlement: Address,
+    pub(super) owner: Address,
+    pub(super) uid: OrderUid,
+    pub(super) sell_token: Address,
+    /// The buy token as the `Trade` event reports it.
+    pub(super) buy_token: Address,
+}
+
+/// The `Trade` event of the `expected` order in `log`, which only the pinned settlement emits.
+pub(super) fn order_trade(log: &Log, expected: &ExpectedTrade) -> Option<SwapSettlement::Trade> {
+    if log.address() != expected.settlement {
+        return None;
+    }
+    let trade = log.log_decode::<SwapSettlement::Trade>().ok()?.inner.data;
+    (trade.owner == expected.owner
+        && trade.orderUid == expected.uid.0[..]
+        && trade.sellToken == expected.sell_token
+        && trade.buyToken == expected.buy_token)
+        .then_some(trade)
+}
+
+/// The index among `logs` of the settlement's payout of the trade at `trade_index`: the one
+/// transfer of `amount` of `token` from `settlement` to `receiver`, which must follow the
+/// trade. `None` without exactly one, or for a zero amount.
+pub(super) fn settlement_payout(
+    logs: &[Log],
+    trade_index: usize,
+    settlement: Address,
+    token: Address,
+    receiver: Address,
+    amount: U256,
+) -> Option<usize> {
+    let mut payouts = logs
+        .iter()
+        .enumerate()
+        .filter(|(_, log)| log.address() == token)
+        .filter_map(|(index, log)| Some((index, log.log_decode::<Transfer>().ok()?)))
+        .filter(|(_, log)| {
+            log.inner.data.from == settlement
+                && log.inner.data.to == receiver
+                && log.inner.data.value == amount
+        })
+        .map(|(index, _)| index);
+    match (payouts.next(), payouts.next()) {
+        (Some(index), None) if index > trade_index && !amount.is_zero() => Some(index),
+        _ => None,
+    }
+}
+
+/// The executed amounts of `trade`, with the cost of the settlement from `receipt`, the receipt
+/// already read that emits it.
+pub(super) const fn trade_amounts(
+    trade: &SwapSettlement::Trade,
+    receipt: &AnyTransactionReceipt,
+) -> SwapTradeAmounts {
+    SwapTradeAmounts {
+        sell_amount: trade.sellAmount,
+        buy_amount: trade.buyAmount,
+        fee_amount: trade.feeAmount,
+        settlement_gas_used: Some(receipt.gas_used()),
+        settlement_effective_gas_price: Some(receipt.effective_gas_price()),
+        executed_fee: None,
+        executed_fee_token: None,
+    }
 }
 
 /// Credits from the post-hook's `shields` at or after `logs[start]`, which callers place

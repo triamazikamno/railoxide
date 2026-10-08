@@ -462,7 +462,6 @@ const TOKENS: &[TokenRow] = &[
     (137, address!("0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"), "LINK", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_LINK_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (137, address!("0xb33EaAd8d922B1083446DC23f610c2567fB5180f"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (137, address!("0xD6DF932A45C0f255f85145f286eA0b292B21C90B"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
-    (137, address!("0x0000000000000000000000000000000000001010"), "POL", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("137-0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270.png")),
     // Arbitrum (42161)
     (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
     (42161, address!("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"), "USDT", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),

@@ -240,6 +240,25 @@ pub(super) fn public_balance_entry_for_chain(
         .cloned()
 }
 
+/// Every balance the snapshot read for the account on `chain_id`, zero and unreadable ones
+/// included. `None` while the snapshot doesn't hold the account there.
+pub(super) fn public_account_balances_for_chain<'a>(
+    snapshot: Option<&'a PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    status: PublicAccountStatus,
+) -> Option<&'a [PublicBalanceEntry]> {
+    snapshot
+        .filter(|snapshot| snapshot.chain_id == chain_id)?
+        .accounts
+        .iter()
+        .find(|account| {
+            account.account.public_account_uuid.as_str() == public_account_uuid
+                && account.account.status == status
+        })
+        .map(|account| account.balances.as_slice())
+}
+
 pub(super) fn public_account_visible_balances_for_chain(
     snapshot: Option<&PublicBalanceSnapshot>,
     chain_id: u64,

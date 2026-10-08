@@ -5,6 +5,7 @@ mod public_account;
 mod swap_fork;
 mod swap_observation;
 mod swap_order;
+mod swap_public;
 mod swap_setup;
 use crate::{ExecutorDelivery, ExecutorOwner, HttpContext, WalletSyncTip};
 use alloy::providers::bindings::IMulticall3;

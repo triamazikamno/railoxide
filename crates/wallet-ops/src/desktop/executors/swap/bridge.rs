@@ -40,7 +40,7 @@ use crate::vault::{
     SwapDelivery,
 };
 use crate::{
-    ExecutorOwner, PairAnchorRate, QuoteDeviationError, RAILGUN_PROTOCOL_FEE_BPS,
+    ExecutorOwner, HttpContext, PairAnchorRate, QuoteDeviationError, RAILGUN_PROTOCOL_FEE_BPS,
     TokenAnchorRateCache, check_quote_against_anchor, railgun_protocol_fee_amount,
 };
 
@@ -124,6 +124,9 @@ pub struct SwapPrivateBridgeQuote {
     pub delivery_allowance: U256,
     /// The destination chain's shield fee rate, in basis points.
     pub destination_shield_fee_bps: U256,
+    /// The least deposit Across is expected to take with the handler message, in input-token
+    /// base units, estimated from the preview quote. `None` when it gives no estimate.
+    pub deposit_floor: Option<U256>,
 }
 
 impl SwapBridgeQuote {
@@ -181,32 +184,21 @@ impl ExecutorOwner {
                     .bridge_profile()
                     .ok_or_else(|| eyre!("this network doesn't support bridging"))?
                     .spoke_pool();
-                let fees = route
-                    .clients
-                    .across
-                    .suggested_fees(&AcrossFeeRequest {
-                        input_token: destination.intermediate,
-                        output_token: delivery.destination_token,
-                        origin_chain: self.chain.chain_id,
-                        destination_chain: delivery.destination_chain,
-                        amount: buy_amount,
-                    })
-                    .await?;
-                let allowance = if delivery.is_private() {
-                    Some(
-                        self.private_delivery_allowance(
-                            route,
-                            delivery,
-                            &fees,
-                            anchor_cache,
-                            token_registry,
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                across_bridge_quote(&fees, spoke_pool, allowance)?
+                quote_across_preview(
+                    &self.http,
+                    &route.clients.across,
+                    AcrossOrigin {
+                        chain_id: self.chain.chain_id,
+                        spoke_pool,
+                        token: destination.intermediate,
+                    },
+                    route.destination_chain,
+                    delivery,
+                    buy_amount,
+                    anchor_cache,
+                    token_registry,
+                )
+                .await?
             }
             BridgeProvider::NearIntents => {
                 let assets = destination
@@ -252,69 +244,6 @@ impl ExecutorOwner {
             return Err(eyre!("nothing is left to receive after the bridge fee"));
         }
         Ok(quote)
-    }
-
-    /// The delivery allowance of a private `delivery` for the Across quote `fees`, in
-    /// destination-token base units: [`private_delivery_gas`] on the destination chain's gas
-    /// model, converted by [`delivery_allowance_rate`]. With a rate, the gas is priced at the
-    /// destination chain's RPC gas price with the 25% cushion of the order's gas estimate, plus
-    /// the rollup data cost of the handler message there. Scaled from the quote, it needs no
-    /// request.
-    async fn private_delivery_allowance(
-        &self,
-        route: SwapBridgeRoute<'_>,
-        delivery: BridgeDelivery,
-        fees: &AcrossFeeQuote,
-        anchor_cache: Option<&TokenAnchorRateCache>,
-        token_registry: &EffectiveTokenRegistry,
-    ) -> Result<U256> {
-        let chain_id = delivery.destination_chain;
-        let wrapped_native = crate::amounts::wrapped_native_token_for_chain(chain_id);
-        // Destination-token base units per whole native token, like the `buy_rate` that
-        // prices the order's gas estimate on the swap's chain.
-        let anchor = anchor_cache
-            .zip(wrapped_native)
-            .and_then(|(cache, native)| {
-                cache
-                    .cached_pair_rate(chain_id, native, delivery.destination_token, token_registry)
-                    .ok()
-                    .flatten()
-                    .map(|rate| rate.buy_rate)
-            });
-        let rate = delivery_allowance_rate(delivery, wrapped_native, anchor, fees)?;
-        let (gas_price_wei, data_cost_wei) =
-            if matches!(rate, DeliveryAllowanceRate::QuoteScaled { .. }) {
-                (0, U256::ZERO)
-            } else {
-                let chain = effective_desktop_chain_config(chain_id, route.destination_chain)?;
-                let pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
-                // The data cost counts two hex characters per byte, as in app data.
-                let message_len = placeholder_private_delivery_message_len(delivery)?;
-                let (gas_price_wei, data_cost_wei) = tokio::try_join!(
-                    gas_price_from_rpc_pool_with_policy(&pool, 1, 1),
-                    hook_data_cost_from_rpc_pool(
-                        &pool,
-                        chain_id,
-                        message_len.saturating_mul(2),
-                        &chain.gas,
-                    ),
-                )?;
-                (
-                    gas_price_wei
-                        .checked_add(gas_price_wei.div_ceil(4))
-                        .ok_or(OrderLimitError::Overflow)?,
-                    data_cost_wei,
-                )
-            };
-        Ok(delivery_allowance(&DeliveryAllowanceParams {
-            gas: private_delivery_gas(
-                RailgunGasModel::for_chain(chain_id),
-                GasEstimateMode::UpperBound,
-            ),
-            gas_price_wei,
-            data_cost_wei,
-            rate,
-        })?)
     }
 
     /// Quote `route`'s provider again for `review`'s approved order: `buy_amount` of the bought
@@ -371,6 +300,9 @@ impl ExecutorOwner {
                         .map_err(|error| match error {
                             BridgeApiError::FillSimulationFailed => eyre!(
                                 "Across can't deliver this swap now: the shield on the destination network fails in its simulation. The order wasn't placed."
+                            ),
+                            BridgeApiError::AmountTooLow => eyre!(
+                                "Across won't bridge this amount: the shield's gas on the destination network is too large a share of it. The order wasn't placed. Try a larger amount."
                             ),
                             error => error.into(),
                         })?,
@@ -468,6 +400,119 @@ impl ExecutorOwner {
     }
 }
 
+/// What an Across preview quote needs of the chain a swap deposits on: its id, its pinned
+/// `SpokePool`, and the token deposited there.
+#[derive(Clone, Copy)]
+pub(super) struct AcrossOrigin {
+    pub(super) chain_id: u64,
+    pub(super) spoke_pool: Address,
+    pub(super) token: Address,
+}
+
+/// Across's preview quote for depositing `amount` of `origin`'s token for `delivery`. The
+/// request names only tokens, chains and the amount. A private delivery's output is then
+/// reduced by its delivery allowance, read on `destination_chain`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn quote_across_preview(
+    http: &HttpContext,
+    across: &AcrossClient,
+    origin: AcrossOrigin,
+    destination_chain: &EffectiveChainConfig,
+    delivery: BridgeDelivery,
+    amount: U256,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+    token_registry: &EffectiveTokenRegistry,
+) -> Result<SwapBridgeQuote> {
+    let fees = across
+        .suggested_fees(&AcrossFeeRequest {
+            input_token: origin.token,
+            output_token: delivery.destination_token,
+            origin_chain: origin.chain_id,
+            destination_chain: delivery.destination_chain,
+            amount,
+        })
+        .await?;
+    let allowance = if delivery.is_private() {
+        Some(
+            private_delivery_allowance(
+                http,
+                destination_chain,
+                delivery,
+                &fees,
+                anchor_cache,
+                token_registry,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    across_bridge_quote(&fees, origin.spoke_pool, allowance)
+}
+
+/// The delivery allowance of a private `delivery` for the Across quote `fees`, in
+/// destination-token base units: [`private_delivery_gas`] on the destination chain's gas
+/// model, converted by [`delivery_allowance_rate`]. With a rate, the gas is priced at the
+/// destination chain's RPC gas price with the 25% cushion of the order's gas estimate, plus
+/// the rollup data cost of the handler message there. Scaled from the quote, it needs no
+/// request.
+async fn private_delivery_allowance(
+    http: &HttpContext,
+    destination_chain: &EffectiveChainConfig,
+    delivery: BridgeDelivery,
+    fees: &AcrossFeeQuote,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+    token_registry: &EffectiveTokenRegistry,
+) -> Result<U256> {
+    let chain_id = delivery.destination_chain;
+    let wrapped_native = crate::amounts::wrapped_native_token_for_chain(chain_id);
+    // Destination-token base units per whole native token, like the `buy_rate` that
+    // prices the order's gas estimate on the swap's chain.
+    let anchor = anchor_cache
+        .zip(wrapped_native)
+        .and_then(|(cache, native)| {
+            cache
+                .cached_pair_rate(chain_id, native, delivery.destination_token, token_registry)
+                .ok()
+                .flatten()
+                .map(|rate| rate.buy_rate)
+        });
+    let rate = delivery_allowance_rate(delivery, wrapped_native, anchor, fees)?;
+    let (gas_price_wei, data_cost_wei) =
+        if matches!(rate, DeliveryAllowanceRate::QuoteScaled { .. }) {
+            (0, U256::ZERO)
+        } else {
+            let chain = effective_desktop_chain_config(chain_id, destination_chain)?;
+            let pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+            // The data cost counts two hex characters per byte, as in app data.
+            let message_len = placeholder_private_delivery_message_len(delivery)?;
+            let (gas_price_wei, data_cost_wei) = tokio::try_join!(
+                gas_price_from_rpc_pool_with_policy(&pool, 1, 1),
+                hook_data_cost_from_rpc_pool(
+                    &pool,
+                    chain_id,
+                    message_len.saturating_mul(2),
+                    &chain.gas,
+                ),
+            )?;
+            (
+                gas_price_wei
+                    .checked_add(gas_price_wei.div_ceil(4))
+                    .ok_or(OrderLimitError::Overflow)?,
+                data_cost_wei,
+            )
+        };
+    Ok(delivery_allowance(&DeliveryAllowanceParams {
+        gas: private_delivery_gas(
+            RailgunGasModel::for_chain(chain_id),
+            GasEstimateMode::UpperBound,
+        ),
+        gas_price_wei,
+        data_cost_wei,
+        rate,
+    })?)
+}
+
 /// The validated route of `plan`'s Bridge delivery, which requires one; other deliveries take
 /// none. The route must bridge the plan's bought token to the delivery's token and chain with
 /// the delivery's provider.
@@ -537,6 +582,7 @@ pub(super) fn across_bridge_quote(
                 quoted_output: fees.output_amount,
                 delivery_allowance: allowance,
                 destination_shield_fee_bps: RAILGUN_PROTOCOL_FEE_BPS,
+                deposit_floor: private_deposit_floor(fees, allowance),
             }),
         ),
         None => (fees.output_amount, None),
@@ -550,6 +596,28 @@ pub(super) fn across_bridge_quote(
         fill_time_sec: Some(fees.estimated_fill_time_sec),
         private,
     })
+}
+
+/// The least deposit Across is expected to take once the quote carries a private delivery's
+/// handler message, in input-token base units, estimated from the preview quote `fees` alone.
+/// Across's least deposit is proportional to the relayer's gas fee, and the message adds the
+/// shield's gas, which `allowance` estimates in destination-token base units:
+/// `min_deposit * (gas_fee + allowance) / gas_fee`, with the gas fee in output-token units like
+/// the allowance. `None` when the quote states no gas fee or no usable least deposit, which
+/// Across gives as zero or as the largest integer.
+fn private_deposit_floor(fees: &AcrossFeeQuote, allowance: U256) -> Option<U256> {
+    if fees.relayer_gas_fee_total.is_zero()
+        || fees.min_deposit.is_zero()
+        || fees.min_deposit == U256::MAX
+    {
+        return None;
+    }
+    let gas_fee = fees
+        .relayer_gas_fee_in_output()
+        .filter(|gas_fee| !gas_fee.is_zero())?;
+    fees.min_deposit
+        .checked_mul(gas_fee.checked_add(allowance)?)
+        .map(|scaled| scaled / gas_fee)
 }
 
 /// The deposit terms of a fresh Across quote for an approved order: `buy_amount` of
@@ -585,13 +653,7 @@ pub(super) fn across_order_terms(
             },
         ));
     }
-    let timestamp = u64::from(fees.timestamp);
-    let fill_deadline = u64::from(fees.fill_deadline);
-    let valid_to = u64::from(valid_to);
-    if fill_deadline < valid_to + ACROSS_FILL_MARGIN_SECS
-        || fill_deadline > timestamp + ACROSS_FILL_DEADLINE_BUFFER_SECS
-        || timestamp + ACROSS_QUOTE_TIME_BUFFER_SECS < valid_to
-    {
+    if !across_quote_covers(fees.timestamp, fees.fill_deadline, valid_to) {
         return Err(eyre!(
             "Across's quote can't be used for this order; try again"
         ));
@@ -611,6 +673,18 @@ pub(super) fn across_order_terms(
             message_hash: handler_message.map(|(_, hash)| hash),
         },
     )))
+}
+
+/// Whether an Across quote taken at `quote_timestamp` with `fill_deadline` can be deposited by
+/// any settlement before `valid_to`: the fill deadline leaves relayers 30 minutes after the
+/// order expires, and the timestamp and the fill deadline pass the `SpokePool`'s buffers.
+pub(super) fn across_quote_covers(quote_timestamp: u32, fill_deadline: u32, valid_to: u32) -> bool {
+    let timestamp = u64::from(quote_timestamp);
+    let fill_deadline = u64::from(fill_deadline);
+    let valid_to = u64::from(valid_to);
+    fill_deadline >= valid_to + ACROSS_FILL_MARGIN_SECS
+        && fill_deadline <= timestamp + ACROSS_FILL_DEADLINE_BUFFER_SECS
+        && timestamp + ACROSS_QUOTE_TIME_BUFFER_SECS >= valid_to
 }
 
 /// The `depositV3` call of an Across order's post-hook: `terms`, deposited by the executor for

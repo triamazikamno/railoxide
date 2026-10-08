@@ -4,6 +4,7 @@
 use super::*;
 use crate::vault::{SwapAccountRefusal, SwapAccountRole, SwapAccountUse};
 use crate::{SwapOrderState, swap_order_state};
+use alloy::consensus::Transaction as _;
 use alloy::consensus::transaction::Recovered;
 use alloy::consensus::{
     Eip658Value, Receipt, ReceiptEnvelope, SignableTransaction, TxEip1559, TxEnvelope,
@@ -26,7 +27,7 @@ use broadcaster_core::contracts::railgun::{
 const SELL: Address = super::swap_setup::WETH;
 const BUY: Address = super::swap_setup::USDC;
 const OTHER_BUY: Address = address!("6b175474e89094c44da98b954eedeac495271d0f");
-const EXECUTOR: Address = address!("e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0");
+pub(super) const EXECUTOR: Address = address!("e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0");
 const SELL_AMOUNT: u64 = 10_000;
 const BUY_AMOUNT: u64 = 9_999;
 const PRE_HOOK_NULLIFIER: u8 = 0x21;
@@ -85,31 +86,31 @@ fn quantity(value: &Value) -> u64 {
 /// A chain whose block hashes change from each reorg height on. Logs and
 /// transactions keep the hash of the block they were added to, so a reorg
 /// removes them.
-struct MockChain {
+pub(super) struct MockChain {
     chain_id: u64,
     railgun: Address,
     delegate: Address,
-    head: u64,
+    pub(super) head: u64,
     reorgs: Vec<u64>,
-    nonces: Vec<(u64, u64)>,
+    pub(super) nonces: Vec<(u64, u64)>,
     buy_balance: Vec<(u64, u64)>,
     /// Per order, the block from which the settlement reads its fill as zero, as
     /// after it frees an expired order's storage.
     fill_cleared: Vec<(OrderUid, u64)>,
     /// Per order, the block from which the settlement reads its fill as the maximum,
     /// as after `invalidateOrder`.
-    invalidated: Vec<(OrderUid, u64)>,
+    pub(super) invalidated: Vec<(OrderUid, u64)>,
     logs: Vec<Log>,
-    transactions: Vec<(B256, alloy::rpc::types::Transaction, TransactionReceipt)>,
+    pub(super) transactions: Vec<(B256, alloy::rpc::types::Transaction, TransactionReceipt)>,
     log_queries: usize,
     rpc_methods: Vec<String>,
     rpc_requests: Vec<Value>,
-    receipt_error: Option<i64>,
+    pub(super) receipt_error: Option<i64>,
     reorg_on_receipts: bool,
 }
 
 impl MockChain {
-    const fn new(chain_id: u64, railgun: Address, delegate: Address) -> Self {
+    pub(super) const fn new(chain_id: u64, railgun: Address, delegate: Address) -> Self {
         Self {
             chain_id,
             railgun,
@@ -142,11 +143,11 @@ impl MockChain {
         B256::from(hash)
     }
 
-    fn block(&self, number: u64) -> BlockNumHash {
+    pub(super) fn block(&self, number: u64) -> BlockNumHash {
         BlockNumHash::new(number, self.hash(number))
     }
 
-    fn reorg(&mut self, from: u64) {
+    pub(super) fn reorg(&mut self, from: u64) {
         self.reorgs.push(from);
     }
 
@@ -177,7 +178,13 @@ impl MockChain {
     }
 
     /// A successful transaction sent to `to`, whose receipt carries Railgun `logs`.
-    fn add_transaction(&mut self, number: u64, to: Address, input: Bytes, logs: Vec<LogData>) {
+    pub(super) fn add_transaction(
+        &mut self,
+        number: u64,
+        to: Address,
+        input: Bytes,
+        logs: Vec<LogData>,
+    ) {
         self.add_addressed_transaction(
             number,
             to,
@@ -186,7 +193,7 @@ impl MockChain {
         );
     }
 
-    fn add_addressed_transaction(
+    pub(super) fn add_addressed_transaction(
         &mut self,
         number: u64,
         to: Address,
@@ -203,20 +210,42 @@ impl MockChain {
             ..TxEip1559::default()
         }
         .into_signed(Signature::test_signature());
-        let hash = *signed.hash();
+        self.include(
+            number,
+            TxEnvelope::Eip1559(signed),
+            Address::repeat_byte(0xbb),
+            true,
+            logs,
+        );
+    }
+
+    /// `transaction` from `from`, included in block `number` with `status` and `logs`.
+    pub(super) fn include(
+        &mut self,
+        number: u64,
+        transaction: TxEnvelope,
+        from: Address,
+        status: bool,
+        logs: Vec<(Address, LogData)>,
+    ) {
+        let hash = *transaction.tx_hash();
+        let to = transaction.to();
         let block_hash = self.hash(number);
-        let from = Address::repeat_byte(0xbb);
         self.add_logs(number, hash, logs);
         let receipt_logs = self
             .logs
             .iter()
-            .filter(|log| log.transaction_hash == Some(hash))
+            .filter(|log| {
+                log.transaction_hash == Some(hash)
+                    && log.block_number == Some(number)
+                    && log.block_hash == Some(block_hash)
+            })
             .cloned()
             .collect();
         let receipt = TransactionReceipt {
             inner: ReceiptEnvelope::Eip1559(
                 Receipt {
-                    status: Eip658Value::Eip658(true),
+                    status: Eip658Value::Eip658(status),
                     cumulative_gas_used: 1,
                     logs: receipt_logs,
                 }
@@ -231,11 +260,11 @@ impl MockChain {
             blob_gas_used: None,
             blob_gas_price: None,
             from,
-            to: Some(to),
+            to,
             contract_address: None,
         };
         let transaction = alloy::rpc::types::Transaction {
-            inner: Recovered::new_unchecked(TxEnvelope::Eip1559(signed), from),
+            inner: Recovered::new_unchecked(transaction, from),
             block_hash: Some(block_hash),
             block_number: Some(number),
             transaction_index: Some(0),
@@ -283,7 +312,7 @@ impl MockChain {
             .sum()
     }
 
-    fn respond(&mut self, request: &Value) -> Value {
+    pub(super) fn respond(&mut self, request: &Value) -> Value {
         self.rpc_methods
             .push(request["method"].as_str().unwrap().to_owned());
         self.rpc_requests.push(request.clone());
@@ -422,7 +451,7 @@ const fn ciphertext() -> CommitmentCiphertext {
     }
 }
 
-fn private_transaction(nullifier: u8, commitment: u8) -> Transaction {
+pub(super) fn private_transaction(nullifier: u8, commitment: u8) -> Transaction {
     Transaction {
         proof: SnarkProof::default(),
         merkleRoot: B256::ZERO,
@@ -434,7 +463,7 @@ fn private_transaction(nullifier: u8, commitment: u8) -> Transaction {
 }
 
 /// The Railgun events of `private_transaction`.
-fn private_logs(nullifier: u8, commitment: u8) -> Vec<LogData> {
+pub(super) fn private_logs(nullifier: u8, commitment: u8) -> Vec<LogData> {
     vec![
         Nullified {
             treeNumber: 0,
@@ -451,7 +480,7 @@ fn private_logs(nullifier: u8, commitment: u8) -> Vec<LogData> {
     ]
 }
 
-fn execute(transactions: Vec<Transaction>, calls: Vec<Call>, nonce: u64) -> Bytes {
+pub(super) fn execute(transactions: Vec<Transaction>, calls: Vec<Call>, nonce: u64) -> Bytes {
     RelayAdapt7702::executeCall {
         _transactions: transactions,
         _actionData: RelayAdapt7702ActionData {

@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 mod public_account;
+mod public_swap;
 mod recovery;
 mod spare;
 mod swap;
 mod swap_admission;
 mod swap_use;
+pub use public_swap::*;
 pub use recovery::*;
 pub(crate) use spare::ExecutorSpare;
 pub use swap::*;
@@ -66,6 +68,25 @@ pub enum ExecutorStoreError {
     SwapAttemptOutstanding,
     #[error("this account is reserved by another swap")]
     SwapUseActive,
+    #[error("a Public account shared between Private wallets can't pay for a swap")]
+    PublicSwapSourceShared,
+    /// Another swap paid from the same Public account on the same chain can still buy the
+    /// token. `chain_id` is the chain it delivers to, whose store holds it. `available_at` is
+    /// set, in Unix seconds, when only its hook batch's deadline keeps it open.
+    #[error("another swap from this Public account can still buy the same token")]
+    PublicSwapBuysSameToken {
+        swap: SwapUseId,
+        chain_id: u64,
+        available_at: Option<u64>,
+    },
+    /// Another swap's order from the same Public account on the same chain can still sell the
+    /// token. `expires_at` is that order's `validTo`, once it is placed.
+    #[error("another swap's order from this Public account can still sell the same token")]
+    PublicSwapSellsSameToken {
+        swap: SwapUseId,
+        chain_id: u64,
+        expires_at: Option<u64>,
+    },
 }
 
 /// Stable native operation identity, retained across retries and presentation cleanup.
@@ -1230,28 +1251,36 @@ impl ExecutorStore {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
             // A destination shield belongs to the account's active destination use, whose
-            // origin swap on the other chain must name this account for the same use.
+            // origin swap on the other chain must name this account for the same use. A swap
+            // paid from a Public account has no origin record to name it.
             let shield_use = if purpose == ExecutorPayloadPurpose::SwapDestinationShield {
                 let Some(SwapUseRecord {
                     id,
                     stopped: false,
-                    role:
-                        SwapUseRole::Destination {
-                            origin_chain,
-                            origin_operation,
-                            ..
-                        },
+                    role,
                     ..
                 }) = record.active_use()
                 else {
                     return Err(ExecutorStoreError::OperationMismatch);
                 };
-                if !self
-                    .for_chain(*origin_chain)
-                    .record(*origin_operation)?
-                    .is_some_and(|origin| origin.links_swap_destination(*id, operation))
-                {
-                    return Err(ExecutorStoreError::OperationMismatch);
+                match role {
+                    SwapUseRole::Destination {
+                        origin_chain,
+                        origin_operation,
+                        ..
+                    } => {
+                        if !self
+                            .for_chain(*origin_chain)
+                            .record(*origin_operation)?
+                            .is_some_and(|origin| origin.links_swap_destination(*id, operation))
+                        {
+                            return Err(ExecutorStoreError::OperationMismatch);
+                        }
+                    }
+                    SwapUseRole::PublicSourceDestination { .. } => {}
+                    SwapUseRole::Source { .. } => {
+                        return Err(ExecutorStoreError::OperationMismatch);
+                    }
                 }
                 Some(*id)
             } else {
@@ -1334,6 +1363,9 @@ impl ExecutorStore {
                 && let Some(SwapUseRecord {
                     role:
                         SwapUseRole::Destination {
+                            shields, outcome, ..
+                        }
+                        | SwapUseRole::PublicSourceDestination {
                             shields, outcome, ..
                         },
                     ..
@@ -1508,6 +1540,30 @@ impl ExecutorStore {
             view: Arc::clone(&self.view),
             chain_id,
         }
+    }
+
+    /// Every record of this wallet with its chain, on every chain that holds executor data. It
+    /// takes no lock, like `for_chain`. Each chain's records are read as `records` reads them,
+    /// so one that fails to decode fails the listing.
+    fn wallet_records(&self) -> Result<Vec<(u64, ExecutorRecord)>, ExecutorStoreError> {
+        let prefix = executor_wallet_prefix(self.view.wallet_id());
+        let mut chains = std::collections::BTreeSet::new();
+        for stored in self.vault.db.list_desktop_wallet_vault_records(&prefix)? {
+            // The chain follows the wallet prefix in every executor key.
+            let chain_id = stored
+                .key
+                .strip_prefix(&prefix)
+                .and_then(|key| key.split_once('|'))
+                .and_then(|(chain_id, _)| chain_id.parse::<u64>().ok())
+                .ok_or(ExecutorStoreError::InvalidRecord)?;
+            chains.insert(chain_id);
+        }
+        let mut records = Vec::new();
+        for chain_id in chains {
+            let chain_records = self.for_chain(chain_id).records()?;
+            records.extend(chain_records.into_iter().map(|record| (chain_id, record)));
+        }
+        Ok(records)
     }
 
     /// Replace the last canonical observation, including when a reorg removes a
@@ -1816,7 +1872,8 @@ struct ReservationLinks {
     swap_destination: Option<SwapDestinationRecord>,
 }
 
-/// A destination use's identity, its origin swap's chain and operation, and its outcome.
+/// A destination use's identity, its origin swap's chain and operation, and its outcome. A use
+/// paid from a Public account has no origin swap.
 const fn destination_link(
     swap_use: &SwapUseRecord,
 ) -> Option<(
@@ -1832,7 +1889,7 @@ const fn destination_link(
             outcome,
             ..
         } => Some((swap_use.id(), *origin_chain, *origin_operation, *outcome)),
-        SwapUseRole::Source { .. } => None,
+        SwapUseRole::Source { .. } | SwapUseRole::PublicSourceDestination { .. } => None,
     }
 }
 

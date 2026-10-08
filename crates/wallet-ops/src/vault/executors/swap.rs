@@ -747,6 +747,84 @@ impl SwapBridgeOutcome {
     }
 }
 
+/// What the rules for recording a bridge outcome read of the delivery it belongs to: a Bridge
+/// order's, or that of a swap paid from a Public account.
+pub(super) struct BridgeOutcomeRules {
+    pub(super) handed_off: bool,
+    pub(super) private: bool,
+    pub(super) destination_minimum: Option<U256>,
+    /// Whether Across bridges the delivery. Only its outcomes are corrected.
+    pub(super) across: bool,
+    /// The recorded outcome.
+    pub(super) known: Option<SwapBridgeOutcome>,
+    /// Whether a refund of the deposit was verified, which rules a later fill out.
+    pub(super) refund_verified: bool,
+}
+
+impl BridgeOutcomeRules {
+    /// Whether `outcome` may be recorded. A final outcome is never replaced, though recording
+    /// it again is accepted; `NeedsAttention` may be replaced by any outcome. The exceptions
+    /// are an Across `Refunding` without a verified refund, which a verified fill replaces, and
+    /// an Across `DeliveredReported`, which a verified fill or a refund replaces. A verified
+    /// delivery must meet the approved destination minimum. A private delivery's fill is a
+    /// shielded delivery or held on the destination chain, and no other delivery is either.
+    pub(super) fn admits(&self, outcome: SwapBridgeOutcome) -> bool {
+        let private_fits = match outcome {
+            SwapBridgeOutcome::DeliveredVerified { shielded, .. } => shielded == self.private,
+            SwapBridgeOutcome::HeldOnDestination { .. } => self.private,
+            _ => true,
+        };
+        let below_minimum = match outcome {
+            SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => self
+                .destination_minimum
+                .is_none_or(|minimum| output_amount < minimum),
+            _ => false,
+        };
+        // Across may have filled a deposit it reported expired. A refund verified on the
+        // deposit's chain rules that fill out.
+        let corrects_refund = self.known == Some(SwapBridgeOutcome::Refunding)
+            && matches!(
+                outcome,
+                SwapBridgeOutcome::DeliveredVerified { .. }
+                    | SwapBridgeOutcome::HeldOnDestination { .. }
+            )
+            && self.across
+            && !self.refund_verified;
+        // Nothing on the destination chain backs a delivery Across only reported, so a
+        // verified fill or a refund replaces it.
+        let corrects_report = matches!(
+            self.known,
+            Some(SwapBridgeOutcome::DeliveredReported { .. })
+        ) && matches!(
+            outcome,
+            SwapBridgeOutcome::DeliveredVerified { .. } | SwapBridgeOutcome::Refunding
+        ) && self.across;
+        self.handed_off
+            && private_fits
+            && !below_minimum
+            && !self.known.is_some_and(|known| {
+                known.is_final() && known != outcome && !corrects_refund && !corrects_report
+            })
+    }
+}
+
+/// Whether Across's `refund` of a refunding deposit may be recorded: in a block after the
+/// deposit's `handoff`, on the same chain, with its transaction. A recorded refund, `known`, is
+/// never replaced, though recording it again is accepted.
+pub(super) fn bridge_refund_admitted(
+    across: bool,
+    outcome: Option<SwapBridgeOutcome>,
+    handoff: Option<SwapBridgeHandoff>,
+    known: Option<SwapObservation>,
+    refund: SwapObservation,
+) -> bool {
+    across
+        && outcome == Some(SwapBridgeOutcome::Refunding)
+        && refund.transaction_hash.is_some()
+        && handoff.is_some_and(|handoff| refund.block.number > handoff.observation.block.number)
+        && known.is_none_or(|known| known == refund)
+}
+
 /// The original signed request, retained encrypted so submission can resume after restart.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapSubmission {
@@ -935,9 +1013,12 @@ impl ExecutorRecord {
             .map_or(&[][..], |swap| swap.orders.as_slice());
         let mut delivered_shields = Vec::new();
         for swap_use in &self.swap_uses {
-            let SwapUseRole::Destination {
+            let (SwapUseRole::Destination {
                 shields, outcome, ..
-            } = &swap_use.role
+            }
+            | SwapUseRole::PublicSourceDestination {
+                shields, outcome, ..
+            }) = &swap_use.role
             else {
                 continue;
             };
@@ -1823,47 +1904,15 @@ impl ExecutorStore {
             let SwapDelivery::Bridge(delivery) = order.delivery else {
                 return Err(ExecutorStoreError::OperationMismatch);
             };
-            let private_fits = match outcome {
-                SwapBridgeOutcome::DeliveredVerified { shielded, .. } => {
-                    shielded == delivery.is_private()
-                }
-                SwapBridgeOutcome::HeldOnDestination { .. } => delivery.is_private(),
-                _ => true,
+            let rules = BridgeOutcomeRules {
+                handed_off: order.observations.bridge_handoff.is_some(),
+                private: delivery.is_private(),
+                destination_minimum: order.bounds.destination_minimum,
+                across: matches!(order.bridge, Some(BridgeOrderTerms::Across(_))),
+                known: order.observations.bridge_outcome,
+                refund_verified: order.observations.bridge_refund.is_some(),
             };
-            let below_minimum = match outcome {
-                SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => order
-                    .bounds
-                    .destination_minimum
-                    .is_none_or(|minimum| output_amount < minimum),
-                _ => false,
-            };
-            // Across may have filled a deposit it reported expired. A refund verified on this
-            // chain rules that fill out.
-            let corrects_refund = order.observations.bridge_outcome
-                == Some(SwapBridgeOutcome::Refunding)
-                && matches!(
-                    outcome,
-                    SwapBridgeOutcome::DeliveredVerified { .. }
-                        | SwapBridgeOutcome::HeldOnDestination { .. }
-                )
-                && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
-                && order.observations.bridge_refund.is_none();
-            // Nothing on the destination chain backs a delivery Across only reported, so a
-            // verified fill or a refund replaces it.
-            let corrects_report = matches!(
-                order.observations.bridge_outcome,
-                Some(SwapBridgeOutcome::DeliveredReported { .. })
-            ) && matches!(
-                outcome,
-                SwapBridgeOutcome::DeliveredVerified { .. } | SwapBridgeOutcome::Refunding
-            ) && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)));
-            if order.observations.bridge_handoff.is_none()
-                || !private_fits
-                || below_minimum
-                || order.observations.bridge_outcome.is_some_and(|known| {
-                    known.is_final() && known != outcome && !corrects_refund && !corrects_report
-                })
-            {
+            if !rules.admits(outcome) {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
             order.observations.bridge_outcome = Some(outcome);
@@ -1886,14 +1935,13 @@ impl ExecutorStore {
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
             let observed = order.observations;
-            if !matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
-                || observed.bridge_outcome != Some(SwapBridgeOutcome::Refunding)
-                || refund.transaction_hash.is_none()
-                || observed
-                    .bridge_handoff
-                    .is_none_or(|handoff| refund.block.number <= handoff.observation.block.number)
-                || observed.bridge_refund.is_some_and(|known| known != refund)
-            {
+            if !bridge_refund_admitted(
+                matches!(order.bridge, Some(BridgeOrderTerms::Across(_))),
+                observed.bridge_outcome,
+                observed.bridge_handoff,
+                observed.bridge_refund,
+                refund,
+            ) {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
             order.observations.bridge_refund = Some(refund);

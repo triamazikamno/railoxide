@@ -194,6 +194,9 @@ pub fn swap_account_refusal(
                     (
                         SwapUseRole::Destination {
                             destination_token, ..
+                        }
+                        | SwapUseRole::PublicSourceDestination {
+                            destination_token, ..
                         },
                         SwapAccountRole::Destination { token },
                     ) => *destination_token == token,
@@ -230,6 +233,9 @@ pub fn swap_account_refusal(
         .filter(|earlier| Some(earlier.id) != claimed)
         .find_map(|earlier| match &earlier.role {
             SwapUseRole::Destination {
+                shields, outcome, ..
+            }
+            | SwapUseRole::PublicSourceDestination {
                 shields, outcome, ..
             } if !shields.is_empty() => match outcome {
                 Some(SwapDestinationOutcome::Shielded { .. }) => None,
@@ -299,6 +305,14 @@ impl ExecutorRecord {
                             transaction_hash, ..
                         }),
                     ..
+                }
+                | SwapUseRole::PublicSourceDestination {
+                    destination_token,
+                    outcome:
+                        Some(SwapDestinationOutcome::Shielded {
+                            transaction_hash, ..
+                        }),
+                    ..
                 } => Some(SwapEarlierShield {
                     swap_use: swap_use.id,
                     token: *destination_token,
@@ -317,7 +331,8 @@ fn active_use_finished(record: &ExecutorRecord) -> bool {
             .swap_use(active)
             .is_some_and(|swap_use| match &swap_use.role {
                 SwapUseRole::Source { .. } => record.has_swap_use_order(active),
-                SwapUseRole::Destination { shields, .. } => !shields.is_empty(),
+                SwapUseRole::Destination { shields, .. }
+                | SwapUseRole::PublicSourceDestination { shields, .. } => !shields.is_empty(),
             })
     })
 }
@@ -341,7 +356,9 @@ fn invalidated_orderless_shields(
     swap_use: &super::SwapUseRecord,
     evidence: SwapAdmissionEvidence,
 ) -> bool {
-    let SwapUseRole::Destination { shields, .. } = &swap_use.role else {
+    let (SwapUseRole::Destination { shields, .. }
+    | SwapUseRole::PublicSourceDestination { shields, .. }) = &swap_use.role
+    else {
         return false;
     };
     swap_use.stopped
@@ -405,7 +422,8 @@ fn has_executable_work(
     let own_shields = claimed
         .and_then(|id| record.swap_use(id))
         .map_or(&[][..], |claimed| match &claimed.role {
-            SwapUseRole::Destination { shields, .. } => shields.as_slice(),
+            SwapUseRole::Destination { shields, .. }
+            | SwapUseRole::PublicSourceDestination { shields, .. } => shields.as_slice(),
             SwapUseRole::Source { .. } => &[][..],
         });
     let shield_outstanding = record.issued.iter().any(|payload| {

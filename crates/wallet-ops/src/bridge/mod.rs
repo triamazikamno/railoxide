@@ -43,7 +43,8 @@ pub use near_intents::{
 #[cfg(feature = "test-support")]
 pub use near_intents::{sign_quote_response_with_stand_in, stand_in_quote_key};
 pub use tokens::{
-    BridgeDestination, NearAssets, across_destination_tokens, near_destination_tokens,
+    BridgeDestination, NearAssets, PublicBridgeDestination, PublicBridgePath, PublicSellAsset,
+    across_destination_tokens, near_destination_tokens, public_across_destination_tokens,
 };
 
 const BRIDGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);

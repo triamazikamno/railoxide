@@ -176,7 +176,7 @@ async fn spawn_bridge_stub_with(
 
 /// One HTTP request's JSON body, `Null` when it has none, or `None` when the client closed the
 /// connection first.
-async fn read_json_body(stream: &mut BufReader<tokio::net::TcpStream>) -> Option<Value> {
+pub(super) async fn read_json_body(stream: &mut BufReader<tokio::net::TcpStream>) -> Option<Value> {
     let mut content_length = 0;
     loop {
         let mut line = String::new();
@@ -2195,7 +2195,7 @@ async fn set_up_account(
 }
 
 /// An Across fee quote for `output` whose fill deadline is `fill_after` seconds from now.
-fn across_fee_quote(spoke_pool: Address, output: U256, fill_after: u64) -> String {
+pub(super) fn across_fee_quote(spoke_pool: Address, output: U256, fill_after: u64) -> String {
     let now = unix_now();
     json!({
         "outputAmount": output.to_string(),
@@ -3052,6 +3052,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 quoted_output: U256::from(1_050),
                 delivery_allowance: U256::from(50),
                 destination_shield_fee_bps: crate::RAILGUN_PROTOCOL_FEE_BPS,
+                deposit_floor: None,
             }),
         });
 
