@@ -1,6 +1,6 @@
 use super::{
     Arc, DesktopViewSession, ExecutorOperationId, ExecutorOwner, ExecutorReconciliationReport,
-    ExecutorRecord, Future, Range, Result, eyre,
+    ExecutorRecord, Future, Result, eyre,
 };
 use crate::DesktopPrivateSpendAuthorization;
 use crate::desktop::executor_discovery::inspect_for_recovery_signing;
@@ -22,16 +22,15 @@ impl ExecutorPublicSigningGuard {
         self.owner.while_active(work).await
     }
 
-    pub(crate) async fn reconcile_history(
+    pub(crate) async fn reconcile_account(
         &self,
         owner: &Arc<ExecutorOwner>,
         operation: ExecutorOperationId,
-        range: Range<u64>,
     ) -> Result<ExecutorReconciliationReport> {
         if !Arc::ptr_eq(owner, &self.owner) {
             return Err(eyre!("executor signing owner changed"));
         }
-        owner.reconcile_history_admitted(operation, range).await
+        owner.reconcile_account_admitted(operation).await
     }
 
     pub(crate) fn ensure_chain(&self, chain_id: Option<u64>) -> Result<()> {
@@ -197,26 +196,25 @@ impl ExecutorOwner {
         {
             return Err(eyre!("Public account no longer matches its saved identity"));
         }
-        if !record.issued().is_empty() || !record.recovery_transactions().is_empty() {
+        if !record.issued().is_empty() {
             // Never trust a previous session's completion or an observation that
-            // may have been reorganized away. No local payload means no scan.
+            // may have been reorganized away. No local payload means no read.
             let mut chain = self
                 .chain_for_delegate(record.delegate())
                 .ok_or_else(|| eyre!("chain does not support Railgun"))?;
             chain.enabled = true;
-            let (inspection, nonce) = self
+            let (_, nonce) = self
                 .while_active(inspect_for_recovery_signing(
                     &chain,
                     &self.http,
                     account.address,
                     &[],
                     !record.issued().is_empty(),
-                    None,
                 ))
                 .await?;
-            let current = self
-                .reconcile_recovery_before_signing(&record, &chain, &inspection, nonce)
-                .await?;
+            // Without the account's current nonce nothing recorded counts as resolved.
+            let observed = nonce.ok_or_else(|| eyre!("executor execution nonce is unknown"))?;
+            let current = self.admit_signing_read(&record, &chain, observed).await?;
             require_resolved_public_work(&current)?;
             if current.swap().is_some()
                 && !self

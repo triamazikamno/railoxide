@@ -79,7 +79,20 @@ pub enum PublicSwapDelivery {
         terms: AcrossOrderTerms,
     },
     /// A term changed since the review. The Public account must sign nothing for it.
-    ReviewRequired(SwapReviewChange),
+    ReviewRequired {
+        change: SwapReviewChange,
+        /// The real delivery quote at the originally reviewed input amount, when its output
+        /// fell below the approved minimum. It can replace the preview for another review.
+        quote: Option<PublicSwapDeliveryQuote>,
+    },
+}
+
+/// A signing-time delivery quote bound to the original reviewed route and deposit amount.
+/// It carries no account, handler message or signed payload.
+#[derive(Debug, Clone)]
+pub struct PublicSwapDeliveryQuote {
+    pub(super) request: AcrossFeeRequest,
+    pub(super) fees: AcrossFeeQuote,
 }
 
 impl ExecutorOwner {
@@ -335,9 +348,10 @@ impl ExecutorOwner {
             .destination_shield_fee_bps
             .unwrap_or_default();
         if approved != current {
-            return Ok(PublicSwapDelivery::ReviewRequired(
-                SwapReviewChange::DestinationShieldFee { approved, current },
-            ));
+            return Ok(PublicSwapDelivery::ReviewRequired {
+                change: SwapReviewChange::DestinationShieldFee { approved, current },
+                quote: None,
+            });
         }
 
         // The shield's payload is durable in this account's record before the quote request
@@ -396,6 +410,10 @@ impl ExecutorOwner {
             private: Some(BridgePrivateDelivery { on_shield_failure }),
         };
         let handler_message = Some((handler, keccak256(&message)));
+        let quote = PublicSwapDeliveryQuote {
+            request: request.fee,
+            fees,
+        };
         let mut signing = across_order_terms(
             &fees,
             spoke_pool,
@@ -420,7 +438,7 @@ impl ExecutorOwner {
             let fees = self
                 .public_swap_bridge_quote(across, &request, true)
                 .await?;
-            signing = across_order_terms(
+            let raised_signing = across_order_terms(
                 &fees,
                 spoke_pool,
                 intent.bridged_token,
@@ -430,9 +448,18 @@ impl ExecutorOwner {
                 valid_to,
                 handler_message,
             )?;
+            // A still-short quote for the raised amount can't replace the review at its
+            // original input. Keep that first quote and change together.
+            if matches!(raised_signing, BridgeSigning::Terms(_)) {
+                signing = raised_signing;
+            }
         }
         match signing {
-            BridgeSigning::Changed(change) => Ok(PublicSwapDelivery::ReviewRequired(change)),
+            BridgeSigning::Changed(change) => Ok(PublicSwapDelivery::ReviewRequired {
+                quote: matches!(change, SwapReviewChange::DestinationMinimum { .. })
+                    .then_some(quote),
+                change,
+            }),
             BridgeSigning::Terms(BridgeOrderTerms::Across(terms)) => {
                 Ok(PublicSwapDelivery::Signed {
                     delivery,

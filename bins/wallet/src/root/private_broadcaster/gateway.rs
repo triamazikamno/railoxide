@@ -56,7 +56,7 @@ pub(in crate::root) fn gateway_self_broadcast_status(
         GatewayPrivateDraftResult::Submitted => (
             GatewayDraftStatus::Done,
             "Execution not confirmed".into(),
-            "The transaction has a receipt, but its approved effects are not confirmed. Check Stealth accounts in the desktop app for reconciliation and recovery.".into(),
+            "The transaction has a receipt, but its execution is not confirmed yet. Check its account in Stealth accounts in the desktop app.".into(),
         ),
         GatewayPrivateDraftResult::Reverted => (
             GatewayDraftStatus::Failed,

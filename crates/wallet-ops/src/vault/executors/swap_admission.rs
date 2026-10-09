@@ -3,9 +3,8 @@
 //! about the result: every rule reads the record.
 
 use super::{
-    Address, B256, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
-    SwapBridgeOutcome, SwapDelivery, SwapDestinationOutcome, SwapOrderRecord, SwapUseId,
-    SwapUseRole, U256,
+    Address, B256, ExecutorPayloadPurpose, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
+    SwapDestinationOutcome, SwapOrderRecord, SwapUseId, SwapUseRole, U256,
 };
 use crate::settings::ExecutorProfile;
 
@@ -215,7 +214,7 @@ pub fn swap_account_refusal(
     // reserved fresh. Fresh evidence comes after that setup.
     let own_setup = evidence == SwapAdmissionEvidence::Recorded
         && claimed.is_some_and(|id| record.swap_use(id).is_none_or(|claimed| claimed.fresh));
-    if !own_setup && !setup_executed(record, evidence) {
+    if !own_setup && !setup_executed(record) {
         return Some(Refusal::SetupUnconfirmed);
     }
     if let Some(swap) = record.swap.as_ref().filter(|swap| !swap.admits_attempt()) {
@@ -241,7 +240,7 @@ pub fn swap_account_refusal(
                 Some(SwapDestinationOutcome::Shielded { .. }) => None,
                 Some(SwapDestinationOutcome::Held { .. }) => Some(Refusal::EarlierDeliveryHeld),
                 Some(SwapDestinationOutcome::Unfilled) | None => {
-                    (!invalidated_orderless_shields(record, earlier, evidence))
+                    (!invalidated_orderless_shields(record, earlier))
                         .then_some(Refusal::EarlierDeliveryUnresolved)
                 }
             },
@@ -250,7 +249,7 @@ pub fn swap_account_refusal(
     if unresolved_delivery.is_some() {
         return unresolved_delivery;
     }
-    if !own_setup && has_executable_work(record, claimed, evidence) {
+    if !own_setup && has_executable_work(record, claimed) {
         return Some(Refusal::UnfinishedWork);
     }
     None
@@ -337,25 +336,12 @@ fn active_use_finished(record: &ExecutorRecord) -> bool {
     })
 }
 
-fn payload_status(
-    record: &ExecutorRecord,
-    hash: B256,
-    evidence: SwapAdmissionEvidence,
-) -> Option<ExecutorPayloadStatus> {
-    match evidence {
-        SwapAdmissionEvidence::Recorded => record.recorded_payload_status(hash),
-        SwapAdmissionEvidence::Fresh => record.payload_status(hash),
-    }
-}
-
 /// Only a stopped use whose exact source had no order can lose its delivery guard when
 /// every shield is canonically invalidated by another known payload. A consumed nonce alone
-/// does not establish which payload ran, or exclude a later bridge delivery.
-fn invalidated_orderless_shields(
-    record: &ExecutorRecord,
-    swap_use: &super::SwapUseRecord,
-    evidence: SwapAdmissionEvidence,
-) -> bool {
+/// does not establish which payload ran, or exclude a later bridge delivery, so this reads
+/// the winner an earlier version stored with an inclusion. Nothing stores one any more, and
+/// a record without one keeps its guard.
+fn invalidated_orderless_shields(record: &ExecutorRecord, swap_use: &super::SwapUseRecord) -> bool {
     let (SwapUseRole::Destination { shields, .. }
     | SwapUseRole::PublicSourceDestination { shields, .. }) = &swap_use.role
     else {
@@ -368,53 +354,30 @@ fn invalidated_orderless_shields(
             record.issued.iter().any(|payload| {
                 payload.hash == *hash
                     && payload.purpose == ExecutorPayloadPurpose::SwapDestinationShield
-            }) && matches!(
-                payload_status(record, *hash, evidence),
-                Some(ExecutorPayloadStatus::Invalidated { .. })
-            )
+                    && record
+                        .recorded_winner(payload.nonce)
+                        .is_some_and(|winner| winner != *hash)
+            })
         })
 }
 
-fn setup_executed(record: &ExecutorRecord, evidence: SwapAdmissionEvidence) -> bool {
+/// Whether a setup's nonce is resolved. Fresh evidence has a nonce observation by now, and
+/// recorded evidence reads the watermark that outlives it.
+fn setup_executed(record: &ExecutorRecord) -> bool {
     record.issued.iter().any(|payload| {
-        payload.purpose == ExecutorPayloadPurpose::Operation
-            && payload_status(record, payload.hash, evidence)
-                == Some(ExecutorPayloadStatus::Executed)
+        payload.purpose == ExecutorPayloadPurpose::Operation && record.nonce_resolved(payload.nonce)
     })
 }
 
 /// Whether a payload the account signed can still execute, besides the shields of the use
 /// `claimed`, which a retry signs again at the same nonce. A destination shield resolves only
 /// once the reconciled nonce passes its own. The order rule judges its own hooks; recovery
-/// payloads and transactions must resolve independently of those orders.
-fn has_executable_work(
-    record: &ExecutorRecord,
-    claimed: Option<SwapUseId>,
-    evidence: SwapAdmissionEvidence,
-) -> bool {
-    // Historical swap orders do not account for a later recovery. These signatures and
-    // ordinary transactions can still spend the account after its orderless claim released.
+/// payloads must resolve independently of those orders.
+fn has_executable_work(record: &ExecutorRecord, claimed: Option<SwapUseId>) -> bool {
+    // Historical swap orders do not account for a later recovery. These signatures can still
+    // spend the account after its orderless claim released.
     let recovery_outstanding = record.issued.iter().any(|payload| {
-        payload.purpose == ExecutorPayloadPurpose::Recovery
-            && !matches!(
-                payload_status(record, payload.hash, evidence),
-                Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
-            )
-    }) || record.recovery_transactions.iter().any(|transaction| {
-        let status = match evidence {
-            SwapAdmissionEvidence::Recorded => {
-                record.recorded_recovery_transaction_status(transaction.hash())
-            }
-            SwapAdmissionEvidence::Fresh => record.recovery_transaction_status(transaction.hash()),
-        };
-        !matches!(
-            status,
-            Some(
-                ExecutorPayloadStatus::Executed
-                    | ExecutorPayloadStatus::Reverted
-                    | ExecutorPayloadStatus::Invalidated { .. }
-            )
-        )
+        payload.purpose == ExecutorPayloadPurpose::Recovery && !record.nonce_resolved(payload.nonce)
     });
     if recovery_outstanding {
         return true;
@@ -436,10 +399,7 @@ fn has_executable_work(
     }
     record.issued.iter().any(|payload| {
         payload.purpose != ExecutorPayloadPurpose::SwapDestinationShield
-            && !matches!(
-                payload_status(record, payload.hash, evidence),
-                Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
-            )
+            && !record.nonce_resolved(payload.nonce)
     })
 }
 

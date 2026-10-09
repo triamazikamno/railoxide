@@ -20,7 +20,7 @@ use gpui_component::{
     tag::Tag,
 };
 use wallet_ops::{
-    ExecutorAccountOutcome, ExecutorAccountStatus, SwapOrderState, is_swap_record,
+    ExecutorAccountOutcome, ExecutorAccountStatus, ExecutorOwner, SwapOrderState, is_swap_record,
     vault::ExecutorRecordOrigin,
 };
 
@@ -169,7 +169,7 @@ impl StealthAccountsView {
     pub(super) fn needs_attention(&self, record: &ExecutorRecord) -> bool {
         self.status(record).needs_attention()
             || self.holding(record.operation())
-            || swap_needs_recovery(record)
+            || swap_needs_recovery(&self.owner, record)
     }
 
     fn swap_purpose(&self, record: &ExecutorRecord, cx: &App) -> Option<String> {
@@ -242,7 +242,9 @@ impl StealthAccountsView {
                 let status = self.status(record);
                 let holding = self.holding(record.operation());
                 AccountVisibility {
-                    attention: status.needs_attention() || holding || swap_needs_recovery(record),
+                    attention: status.needs_attention()
+                        || holding
+                        || swap_needs_recovery(&self.owner, record),
                     unresolved: status.unresolved(),
                     holding,
                 }
@@ -333,7 +335,7 @@ impl StealthAccountsView {
         let dim = matches!(
             status.outcome(),
             ExecutorAccountOutcome::Executed | ExecutorAccountOutcome::RecoveryConfirmed
-        ) && status.rechecked().is_some()
+        ) && status.read_this_session().is_some()
             && !status.unresolved()
             && self
                 .observations
@@ -399,7 +401,7 @@ impl StealthAccountsView {
                         })
                     }),
             );
-        let status_cell = if let Some(stage) = record_swap_stage(record) {
+        let status_cell = if let Some(stage) = record_swap_stage(&self.owner, record) {
             div()
                 .w_full()
                 .flex()
@@ -645,11 +647,7 @@ impl StealthAccountsView {
         };
         let disabled = this.job.is_some() || record.address().is_none();
         let recovery_disabled = this.recovery_disabled_reason(record, cx).is_some();
-        let holding = this.holding(operation) || swap_holds_funds(record);
-        let pending_recovery = record.recovery_transactions().iter().any(|transaction| {
-            record.recovery_transaction_status(transaction.hash())
-                == Some(wallet_ops::vault::ExecutorPayloadStatus::Uncertain)
-        });
+        let holding = this.holding(operation) || swap_holds_funds(&this.owner, record);
         let public_label = if record.public_account_uuid().is_some() {
             "Open in Public"
         } else {
@@ -678,19 +676,15 @@ impl StealthAccountsView {
                     });
                 }),
         )
-        .when(holding || pending_recovery, |menu| {
+        .when(holding, |menu| {
             menu.item(
-                PopupMenuItem::new(if holding {
-                    "Recover…"
-                } else {
-                    "Resume recovery…"
-                })
-                .disabled(recovery_disabled)
-                .on_click(move |_, window, cx| {
-                    recover_view.update(cx, |view, cx| {
-                        view.open_recovery(operation, None, None, window, cx);
-                    });
-                }),
+                PopupMenuItem::new("Recover…")
+                    .disabled(recovery_disabled)
+                    .on_click(move |_, window, cx| {
+                        recover_view.update(cx, |view, cx| {
+                            view.open_recovery(operation, None, None, window, cx);
+                        });
+                    }),
             )
         })
         .when(swaps_available, |menu| {
@@ -1253,24 +1247,26 @@ pub(super) fn account_caption(label: impl Into<SharedString>) -> gpui::Div {
     app_muted_text(label).text_xs()
 }
 
-/// A private swap's stage from its record alone; this view doesn't observe swaps.
-fn record_swap_stage(record: &ExecutorRecord) -> Option<SwapStage> {
-    is_swap_record(record).then(|| swap_stage(record, None, false))
+/// A private swap's stage from its record and its owner's attribution evidence; this view
+/// doesn't observe swaps.
+fn record_swap_stage(owner: &ExecutorOwner, record: &ExecutorRecord) -> Option<SwapStage> {
+    is_swap_record(record)
+        .then(|| swap_stage(record, None, false, owner.attribution(record).as_ref()))
 }
 
 /// Funds a swap left in its stealth account. Recovery stays reachable here after the swap is
 /// dismissed from the Private tab.
-pub(super) fn swap_needs_recovery(record: &ExecutorRecord) -> bool {
-    record_swap_stage(record).is_some_and(SwapStage::needs_recovery)
+pub(super) fn swap_needs_recovery(owner: &ExecutorOwner, record: &ExecutorRecord) -> bool {
+    record_swap_stage(owner, record).is_some_and(SwapStage::needs_recovery)
 }
 
 /// The swap's own record says its stealth account holds the swap's funds, including while
 /// the order can still fill. Recovery then also invalidates the order, and reads the balance
 /// before anything is signed. A bridge's refund isn't among them: only a balance check shows
 /// that it arrived.
-pub(super) fn swap_holds_funds(record: &ExecutorRecord) -> bool {
+pub(super) fn swap_holds_funds(owner: &ExecutorOwner, record: &ExecutorRecord) -> bool {
     matches!(
-        record_swap_stage(record),
+        record_swap_stage(owner, record),
         Some(SwapStage::Order(
             SwapOrderState::PreHookOnly { .. } | SwapOrderState::NotDelivered
         ))
@@ -1295,8 +1291,6 @@ fn swap_status_tag(stage: SwapStage) -> Tag {
 fn outcome_tag(outcome: ExecutorAccountOutcome) -> Tag {
     let tag = match outcome {
         ExecutorAccountOutcome::Executed => Tag::success(),
-        ExecutorAccountOutcome::Reverted => Tag::danger(),
-        ExecutorAccountOutcome::MissingEffects => Tag::warning(),
         ExecutorAccountOutcome::Unconfirmed | ExecutorAccountOutcome::RecoveryPending => {
             Tag::info()
         }
@@ -1315,8 +1309,8 @@ pub(super) const fn outcome_label(outcome: ExecutorAccountOutcome) -> &'static s
         ExecutorAccountOutcome::HistoryUnknown => "History unknown",
         ExecutorAccountOutcome::Unconfirmed => "Unconfirmed",
         ExecutorAccountOutcome::Executed => "Executed",
-        ExecutorAccountOutcome::Reverted => "Reverted",
-        ExecutorAccountOutcome::MissingEffects => "Effects missing",
+        ExecutorAccountOutcome::Superseded => "Superseded",
+        ExecutorAccountOutcome::Resolved => "Nonce used",
         ExecutorAccountOutcome::RecoveryPending => "Recovery pending",
         ExecutorAccountOutcome::RecoveryConfirmed => "Recovery confirmed",
     }
@@ -1332,11 +1326,11 @@ fn observation_age(at: std::time::SystemTime) -> String {
 }
 
 pub(super) fn has_local_history(record: &ExecutorRecord) -> bool {
-    record.origin() == ExecutorRecordOrigin::Reserved
-        || !record.issued().is_empty()
-        || !record.recovery_transactions().is_empty()
+    record.origin() == ExecutorRecordOrigin::Reserved || !record.issued().is_empty()
 }
 
+/// A restore check that found the account used, or a signed payload whose nonce is
+/// recorded as consumed.
 fn was_used(record: &ExecutorRecord) -> bool {
     record
         .use_check()
@@ -1345,11 +1339,7 @@ fn was_used(record: &ExecutorRecord) -> bool {
         || record
             .issued()
             .iter()
-            .any(|payload| payload.inclusion().is_some())
-        || record
-            .recovery_transactions()
-            .iter()
-            .any(|transaction| transaction.inclusion().is_some())
+            .any(|payload| record.nonce_resolved(payload.nonce()))
 }
 
 const fn use_label(record: &ExecutorRecord) -> &'static str {
@@ -1426,15 +1416,14 @@ mod tests {
     use alloy::primitives::Address;
 
     #[test]
-    fn used_filter_includes_recorded_transactions_without_a_restore_check() {
+    fn used_filter_includes_a_consumed_nonce_without_a_restore_check() {
         use alloy::{
             eips::BlockNumHash,
             primitives::{B256, Bytes, U256},
-            rpc::types::TransactionRequest,
         };
         use wallet_ops::vault::{
-            ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-            ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
+            ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorPayloadContext,
+            ExecutorPayloadPurpose, IssuedExecutorPayload,
         };
 
         let block = BlockNumHash::new(10, B256::repeat_byte(10));
@@ -1452,55 +1441,38 @@ mod tests {
         ))
         .unwrap();
         payload["transaction_hashes"] = serde_json::json!([hash]);
-        let recovery = serde_json::json!({
-            "recovery": ExecutorOperationId::random().unwrap(),
-            "step": 0, "kind": "Shield", "hash": hash, "observed": block,
-            "transaction": TransactionRequest::default().nonce(0),
-            "inclusion": null,
-        });
-        for (field, transaction) in [("issued", payload), ("recovery_transactions", recovery)] {
-            let records = [
-                None,
-                Some(ExecutorExecutionResult::Executed),
-                Some(ExecutorExecutionResult::Reverted),
-            ]
+        // The account's nonce is recorded as unconsumed, then as consumed. No Restore
+        // observation is present.
+        let records = [0_u64, 1]
             .into_iter()
-            .enumerate()
-            .map(|(index, result)| {
-                let mut record = serde_json::json!({
+            .map(|consumed| {
+                serde_json::from_value::<ExecutorRecord>(serde_json::json!({
                     "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
-                    "operation": ExecutorOperationId::random().unwrap(), "index": index,
+                    "operation": ExecutorOperationId::random().unwrap(), "index": consumed,
                     "address": Address::ZERO, "delegate": Address::ZERO,
-                    "retired": true, "issued": [], "recovery_transactions": [],
-                });
-                let mut transaction = transaction.clone();
-                transaction["inclusion"] = serde_json::to_value(
-                    result.map(|result| ExecutorPayloadInclusion::new(block, hash, result)),
-                )
-                .unwrap();
-                record[field] = serde_json::json!([transaction]);
-                // No Restore observation or current-session reconciliation is present.
-                serde_json::from_value::<ExecutorRecord>(record).unwrap()
+                    "retired": true, "issued": [payload.clone()],
+                    "nonce_watermark": ExecutorNonceWatermark::new(U256::from(consumed), 10),
+                }))
+                .unwrap()
             })
             .collect::<Vec<_>>();
-            let used = visible_accounts(
-                &records,
-                AccountFilter::Used,
-                false,
-                "",
-                |_| AccountVisibility {
-                    attention: false,
-                    unresolved: false,
-                    holding: false,
-                },
-                |_| String::new(),
-            );
-            assert_eq!(
-                used,
-                vec![records[2].operation(), records[1].operation()],
-                "{field}: recorded use must count while an unconfirmed transaction must not"
-            );
-        }
+        let used = visible_accounts(
+            &records,
+            AccountFilter::Used,
+            false,
+            "",
+            |_| AccountVisibility {
+                attention: false,
+                unresolved: false,
+                holding: false,
+            },
+            |_| String::new(),
+        );
+        assert_eq!(
+            used,
+            vec![records[1].operation()],
+            "a consumed nonce must count while an unconfirmed transaction must not"
+        );
     }
 
     #[test]

@@ -17,8 +17,7 @@ use railgun_wallet::tx::RailgunGasModel;
 
 use super::super::recovery::{PaidExecutionPurpose, recovery_allowance, recovery_gas_limits};
 use super::super::{
-    ExecutorOwner, ExecutorRecoveryExecution, ExecutorRecoveryFeeEstimate, ExecutorRecoveryFunding,
-    PreparedExecutorRecovery,
+    ExecutorOwner, ExecutorRecoveryFeeEstimate, ExecutorRecoveryFunding, PreparedExecutorRecovery,
 };
 use super::order::fillable_swap_orders;
 use super::{SwapOrderState, swap_order_state};
@@ -53,7 +52,6 @@ impl ExecutorOwner {
                 recovery_gas_limits(
                     RailgunGasModel::for_chain(self.chain.chain_id),
                     &vec![PublicActionProgressStep::Approve; calls],
-                    ExecutorRecoveryExecution::PaidExecute { nonce: U256::ZERO },
                     buffer,
                 )[0]
             },

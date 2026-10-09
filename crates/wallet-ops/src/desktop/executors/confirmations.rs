@@ -1,21 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::B256;
 use broadcaster_core::contracts::cow::OrderUid;
 use eyre::Result;
 use sync_service::{WalletCurrentSnapshot, WalletHandle};
 use tokio::sync::watch;
 
 use super::ExecutorOwner;
+use super::attribution::synced_resolution;
 use crate::WalletSyncTip;
-use crate::desktop::executor_observation::observe_synced_executor_history;
 use crate::vault::{ExecutorOperationId, ExecutorRecord};
 
 impl ExecutorOwner {
     /// Resume submitted executions from the private actor's durable receive/spend
-    /// locations. Only block-scoped RPC is used; no account or transaction queries.
+    /// locations, and settle resolved nonces that private sync has scanned past. It reads
+    /// the private snapshot and local records only: no chain read starts here.
     pub(crate) fn start_confirmation_observation(
         self: &Arc<Self>,
         wallet: WalletHandle,
@@ -44,8 +43,8 @@ impl ExecutorOwner {
                 let safe_head = tip.borrow_and_update().safe_head_block;
                 observations.borrow_and_update();
                 changes.borrow_and_update();
-                // Unavailable RPC leaves the durable history untouched. Fast chain
-                // tips must not turn failures into a continuous RPC retry loop.
+                // A failed pass leaves the records untouched. Fast chain tips must not
+                // turn failures into a continuous retry loop.
                 let result = owner
                     .while_active(Box::pin(owner.confirm_synced_history(&wallet, safe_head)))
                     .await;
@@ -82,10 +81,10 @@ impl ExecutorOwner {
         let Some(snapshot) = wallet.current_snapshot() else {
             return Ok(());
         };
-        let locations = synced_locations(&snapshot);
+        let current = || wallet.current_snapshot();
         for record in self.store.records()? {
             if !self
-                .confirm_synced_record(wallet, &snapshot, &locations, safe_head, record)
+                .confirm_synced_record(&snapshot, &current, safe_head, record)
                 .await?
             {
                 return Ok(());
@@ -95,8 +94,8 @@ impl ExecutorOwner {
     }
 
     /// Foreground counterpart of the confirmation observer for one operation, run
-    /// before a history page read. It only records verified inclusions; the page
-    /// read still evaluates the nonce and grants no admission from a location alone.
+    /// before an account read. It only records what private sync shows; the account
+    /// read still evaluates the nonce and grants no admission from sync alone.
     pub(super) async fn confirm_synced_operation(
         &self,
         operation: ExecutorOperationId,
@@ -121,9 +120,9 @@ impl ExecutorOwner {
         else {
             return Ok(());
         };
-        let locations = synced_locations(&snapshot);
+        let current = || wallet.current_snapshot();
         self.while_active(Box::pin(
-            self.confirm_synced_record(&wallet, &snapshot, &locations, safe_head, record),
+            self.confirm_synced_record(&snapshot, &current, safe_head, record),
         ))
         .await?;
         Ok(())
@@ -159,64 +158,34 @@ impl ExecutorOwner {
             .min()
     }
 
-    /// Record the verified inclusions of `record`'s payloads located by private sync
-    /// at or below the safe head. Returns false once the private snapshot was reset,
-    /// so callers stop using its locations.
-    async fn confirm_synced_record(
+    /// Record what `snapshot` shows about `record`, with no chain read: a pending payload
+    /// that private sync shows executed at or below the safe head moves the watermark, and
+    /// nonces resolved at a block sync has scanned are settled. `current` is the private
+    /// snapshot at the time of the write. Returns false once the private snapshot was
+    /// reset, so callers stop using it.
+    pub(crate) async fn confirm_synced_record(
         &self,
-        wallet: &WalletHandle,
         snapshot: &WalletCurrentSnapshot,
-        locations: &BTreeMap<B256, u64>,
+        current: &impl Fn() -> Option<Arc<WalletCurrentSnapshot>>,
         safe_head: Option<u64>,
-        mut record: ExecutorRecord,
+        record: ExecutorRecord,
     ) -> Result<bool> {
-        let numbers = record
-            .issued()
-            .iter()
-            .filter(|payload| payload.inclusion().is_none())
-            .flat_map(crate::vault::IssuedExecutorPayload::transaction_hashes)
-            .filter_map(|hash| locations.get(hash).copied())
-            .filter(|number| safe_head.is_none_or(|head| *number <= head))
-            .collect::<BTreeSet<_>>();
-        for number in numbers {
-            let observed =
-                observe_synced_executor_history(&self.endpoints, &self.chain, &record, number)
-                    .await?;
-            let _guard = self.lock_activity().await;
-            self.require_record_unchanged(&record)?;
-            if wallet
-                .current_snapshot()
-                .is_none_or(|current| current.reset_generation != snapshot.reset_generation)
-            {
-                return Ok(false);
-            }
-            let unchanged = record.issued().iter().all(|payload| {
-                payload.inclusion()
-                    == observed
-                        .inclusions
-                        .iter()
-                        .find(|(hash, _)| *hash == payload.hash())
-                        .map(|(_, inclusion)| *inclusion)
-            });
-            if !unchanged {
-                record = self.store.record_history(
-                    record.operation(),
-                    observed.block,
-                    &observed.inclusions,
-                )?;
-                self.notify_change();
-            }
+        let resolved = self.chain.railgun.as_ref().and_then(|railgun| {
+            synced_resolution(&record, railgun.deployment.contract, snapshot, safe_head)
+        });
+        let mut synced = record.clone();
+        synced.apply_synced(resolved, snapshot.last_scanned);
+        if synced == record {
+            return Ok(true);
         }
+        let _guard = self.lock_activity().await;
+        self.require_record_unchanged(&record)?;
+        if current().is_none_or(|latest| latest.reset_generation != snapshot.reset_generation) {
+            return Ok(false);
+        }
+        self.store
+            .record_synced(record.operation(), resolved, snapshot.last_scanned)?;
+        self.notify_change();
         Ok(true)
     }
-}
-
-/// Private-sync receive and spend locations, by transaction hash.
-fn synced_locations(snapshot: &WalletCurrentSnapshot) -> BTreeMap<B256, u64> {
-    snapshot
-        .utxos
-        .iter()
-        .flat_map(|utxo| std::iter::once(&utxo.utxo.source).chain(utxo.spent.iter()))
-        .map(|source| (source.tx_hash, source.block_number))
-        .collect()
 }

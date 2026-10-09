@@ -78,17 +78,6 @@ impl UnusedInspections {
     pub(super) fn remove(&mut self, index: u32) {
         self.reads.remove(&index);
     }
-
-    pub(super) fn history_start(
-        &self,
-        observed: ExecutorNonceObservation,
-        finality_depth: u64,
-    ) -> u64 {
-        let observed = observed.block().number;
-        self.head.map_or(observed, |head| {
-            head.saturating_sub(finality_depth).max(observed)
-        })
-    }
 }
 
 impl ExecutorOwner {

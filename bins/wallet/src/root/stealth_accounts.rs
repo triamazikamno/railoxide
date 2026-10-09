@@ -79,10 +79,6 @@ impl StealthAuthorization {
                 HardwareExecutorAction::Register(*operation)
             }
             StealthAction::Recover(recovery) => match recovery {
-                RecoveryAuthorization::Retry { prepared } => HardwareExecutorAction::Retry {
-                    operation: prepared.operation(),
-                    transaction: prepared.original().hash(),
-                },
                 RecoveryAuthorization::Prepare { approval } => {
                     HardwareExecutorAction::Recover(approval.operation())
                 }
@@ -397,6 +393,12 @@ impl WalletRoot {
     }
 }
 
+/// The wallet's stealth account records, or the debug UI fixture's own in its `accounts`
+/// mode, which no release build has.
+fn load_records(owner: &ExecutorOwner) -> eyre::Result<Vec<ExecutorRecord>> {
+    super::private_swap::ui_fixture_stealth_accounts().map_or_else(|| owner.records(), Ok)
+}
+
 impl StealthAccountsView {
     fn new(
         root: WeakEntity<WalletRoot>,
@@ -439,7 +441,7 @@ impl StealthAccountsView {
             })
             .detach();
         }
-        let (records, records_error) = match owner.records() {
+        let (records, records_error) = match load_records(&owner) {
             Ok(records) => (records, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -505,7 +507,7 @@ impl StealthAccountsView {
     }
 
     fn reload_records(&mut self) {
-        match self.owner.records() {
+        match load_records(&self.owner) {
             Ok(records) => {
                 self.records = records;
                 self.records_error = None;
@@ -549,6 +551,8 @@ impl StealthAccountsView {
                 .is_some_and(|root| root.read(cx).stealth_session_is_current(&self.session))
     }
 
+    /// Check balances: the account's balances, and its execution nonce at the confirmed
+    /// block, which updates the recorded results. Only this user action reads the account.
     fn check_record(
         &mut self,
         operation: ExecutorOperationId,
@@ -568,7 +572,7 @@ impl StealthAccountsView {
             .begin(&assets);
         let owner = Arc::clone(&self.owner);
         self.start_job(
-            async move { Ok((owner.inspect_record(operation, &assets).await, assets)) },
+            async move { Ok((owner.check_record(operation, &assets).await, assets)) },
             move |this, (result, assets)| {
                 let observations = this.observations.entry(operation).or_default();
                 match result {

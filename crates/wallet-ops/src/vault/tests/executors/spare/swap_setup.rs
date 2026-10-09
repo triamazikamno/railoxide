@@ -666,16 +666,16 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
             .is_err()
     );
 
-    // The swap's setup is confirmed and the destination's reverted.
+    // The swap's setup nonce is read as consumed and the destination's as unconsumed.
     let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
     let settle = |chain_id: u64,
                   operation: ExecutorOperationId,
                   delegate: Address,
-                  result: ExecutorExecutionResult| {
+                  consumed: bool| {
         let store = ExecutorStore::new(db.clone(), view.clone(), chain_id).unwrap();
         let signed_at =
             ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-        store.reconcile(operation, signed_at, &[]).unwrap();
+        store.record_account_read(operation, signed_at).unwrap();
         let setup = B256::repeat_byte(3);
         store
             .record_issued(
@@ -693,19 +693,10 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
                 ),
             )
             .unwrap();
-        let nonce = u8::from(result == ExecutorExecutionResult::Executed);
         store
-            .reconcile(
+            .record_account_read(
                 operation,
-                ExecutorNonceObservation::new(confirmed, U256::from(nonce)),
-                &[(
-                    setup,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(4),
-                        result,
-                    ),
-                )],
+                ExecutorNonceObservation::new(confirmed, U256::from(u8::from(consumed))),
             )
             .unwrap()
     };
@@ -717,28 +708,23 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
         .concat();
         swap_setup_status(record, confirmed, &code, profile)
     };
-    let delegated = settle(
-        1,
-        operation,
-        profile.delegate(),
-        ExecutorExecutionResult::Executed,
-    );
-    let failed = settle(
+    let delegated = settle(1, operation, profile.delegate(), true);
+    let pending = settle(
         DESTINATION_CHAIN,
         destination_operation,
         destination_profile.delegate(),
-        ExecutorExecutionResult::Reverted,
+        false,
     );
     assert!(matches!(
         status(&delegated, profile),
         SwapSetupStatus::Delegated(_)
     ));
     assert_eq!(
-        status(&failed, destination_profile),
-        SwapSetupStatus::Failed
+        status(&pending, destination_profile),
+        SwapSetupStatus::Pending
     );
 
-    // A retry prepares only the failed setup, with the account it reserved. The confirmed
+    // A retry prepares only the pending setup, with the account it reserved. The confirmed
     // setup takes no retry and its record is untouched.
     let retried = destination
         .resume_swap_setup(
@@ -1313,86 +1299,175 @@ async fn a_swap_use_cancelled_during_inspection_refuses_its_late_preparation() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce() {
+// Each pass of a setup wait is one read of the account's code and execution nonce at the
+// confirmed tip, and that state alone decides the setup.
+#[tokio::test]
+async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce() {
+    use railgun_wallet::WalletUtxo;
+    use sync_service::{WalletCurrentSnapshot, WalletPendingOverlay};
+
+    let rpc = Rpc::start().await;
     let (root, db, vault) = desktop_store_with_vault();
     let view = Arc::new(import_wallet_with_metadata(
         &vault,
         TEST_WALLET_ID,
         "Wallet",
     ));
-    let profile =
-        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
-            .unwrap()
-            .get(1)
-            .unwrap()
-            .accepted_executor_profile()
-            .unwrap();
+    let chain = chain(&rpc);
+    let profile = chain.accepted_executor_profile().unwrap();
+    let delegate = profile.delegate();
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
     let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
     let operation = ExecutorOperationId::random().unwrap();
-    let executor = Address::repeat_byte(2);
-    store
-        .reserve(operation, profile.delegate(), Some("Private swap"), &[])
-        .unwrap();
-    store.bind_address(operation, executor).unwrap();
-    let signed_at =
-        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    store.reconcile(operation, signed_at, &[]).unwrap();
-    let setup = B256::repeat_byte(3);
-    store
-        .record_issued(
+    let prepared = owner
+        .prepare_swap_setup(
             operation,
-            IssuedExecutorPayload::new(
-                U256::ZERO,
-                profile.delegate(),
-                setup,
-                ExecutorPayloadPurpose::Operation,
-                ExecutorPayloadContext::new(Bytes::from_static(b"setup"), signed_at, Vec::new()),
-            ),
+            broadcaster(delegate),
+            setup_approval(WETH, USDC, SwapDelivery::Reshield),
+            None,
+            &password(),
         )
+        .await
         .unwrap();
-    let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
-    let delegated = [
-        EIP7702_DELEGATION_DESIGNATOR.as_slice(),
-        profile.delegate().as_slice(),
-    ]
-    .concat();
-    let reconcile = |nonce: u64, result: Option<ExecutorExecutionResult>| {
-        let inclusions = result
-            .map(|result| {
-                (
-                    setup,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(4),
-                        result,
-                    ),
-                )
-            })
+    let executor = prepared.context().executor;
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(
+            view.scan_keys().master_public_key,
+            Address::repeat_byte(0x33),
+            U256::from(9),
+            [7; 16],
+        ),
+        0,
+        0,
+        UtxoSource {
+            tx_hash: B256::ZERO,
+            block_number: 0,
+            block_timestamp: 0,
+        },
+        UtxoCommitmentKind::Shield,
+    );
+    let call = railgun_wallet::TransactionCall {
+        to: executor,
+        data: RelayAdapt7702::executeCall {
+            _transactions: vec![Transaction {
+                proof: SnarkProof::default(),
+                merkleRoot: B256::ZERO,
+                nullifiers: vec![B256::from(input.nullifier(view.scan_keys().nullifying_key))],
+                commitments: Vec::new(),
+                boundParams: BoundParams::new_transact(0, 0, 1, Vec::new(), executor, B256::ZERO),
+                unshieldPreimage: CommitmentPreimage::empty(),
+            }],
+            _actionData: RelayAdapt7702ActionData {
+                requireSuccess: true,
+                minGasLimit: U256::ZERO,
+                calls: Vec::new(),
+            },
+            _nonce: prepared.context().execution_nonce,
+            _signature: Bytes::new(),
+        }
+        .abi_encode()
+        .into(),
+    };
+    let setup = owner
+        .issue_operation(&prepared, &call, std::slice::from_ref(&input), &password())
+        .await
+        .unwrap()
+        .payload_hash();
+    store
+        .record_submission(operation, setup, B256::repeat_byte(5))
+        .unwrap();
+    let record = || {
+        owner
+            .records()
+            .unwrap()
             .into_iter()
-            .collect::<Vec<_>>();
-        store
-            .reconcile(
-                operation,
-                ExecutorNonceObservation::new(confirmed, U256::from(nonce)),
-                &inclusions,
-            )
+            .find(|record| record.operation() == operation)
             .unwrap()
     };
-    let status =
-        |record: &ExecutorRecord, code: &[u8]| swap_setup_status(record, confirmed, code, profile);
+    // One pass at the confirmed block below `head`, with the requests it made.
+    let pass = async |head: u64| {
+        rpc.state.head.store(head, Ordering::Relaxed);
+        let before = rpc.state.requests.lock().unwrap().len();
+        let status = owner.observe_swap_setup(operation).await.unwrap();
+        let requests = rpc.state.requests.lock().unwrap()[before..].to_vec();
+        (status, requests)
+    };
+    let reads_account = |requests: &[Value]| {
+        requests.iter().any(|request| {
+            request["method"] == "eth_getCode" && request["params"][0] == json!(executor)
+        })
+    };
 
-    // Handed off but not yet included at the confirmed block.
+    // The nonce is unconsumed at the confirmed block: not yet included, or included with
+    // its authorization skipped. The setup stays pending and the next pass reads again,
+    // without whole blocks or logs.
+    for head in [20, 21] {
+        let (status, requests) = pass(head).await;
+        assert_eq!(status, SwapSetupStatus::Pending);
+        assert!(reads_account(&requests));
+        assert!(requests.iter().all(|request| {
+            request["method"] != "eth_getLogs"
+                && (request["method"] != "eth_getBlockByNumber"
+                    || request["params"][1] != json!(true))
+        }));
+        assert_eq!(
+            record().nonce_observation().unwrap().block().number,
+            head - 1
+        );
+    }
+
+    // Another writer changes the record while the pass reads. The pass keeps waiting.
+    rpc.hold.send_replace(Some(executor));
+    let held = rpc.state.requests.lock().unwrap().len();
+    let (status, ()) = tokio::join!(owner.observe_swap_setup(operation), async {
+        rpc.wait_for(|requests| reads_account(&requests[held..]))
+            .await;
+        owner.set_hidden(operation, true).unwrap();
+        rpc.hold.send_replace(None);
+    });
+    assert_eq!(status.unwrap(), SwapSetupStatus::Pending);
+    owner.set_hidden(operation, false).unwrap();
+
+    // The user releases the setup's notes and a transaction that is not recorded for the
+    // setup spends them. That is no evidence about the setup: it stays pending and a retry
+    // is admitted with the same account.
+    owner.release_input_lock(operation).unwrap();
+    let mut spent = WalletUtxo::new(input);
+    spent.spent = Some(UtxoSource {
+        tx_hash: B256::repeat_byte(6),
+        block_number: 14,
+        block_timestamp: 1,
+    });
+    let synced = WalletCurrentSnapshot::new(21, 0, 0, vec![spent], WalletPendingOverlay::default());
+    owner
+        .confirm_synced_record(&synced, &|| Some(synced.clone()), Some(21), record())
+        .await
+        .unwrap();
     assert_eq!(
-        status(&reconcile(0, None), &delegated),
-        SwapSetupStatus::Pending
+        record().payload_state(setup),
+        Some(ExecutorPayloadState::Pending)
     );
-    // Included and successful, but the authorization was not applied.
-    let skipped = reconcile(0, Some(ExecutorExecutionResult::MissingEffects));
-    assert_eq!(status(&skipped, &[]), SwapSetupStatus::MissingDelegation);
+    assert_eq!(pass(22).await.0, SwapSetupStatus::Pending);
+    let retried = owner
+        .resume_swap_setup(operation, broadcaster(delegate), &password())
+        .await
+        .unwrap();
+    assert_eq!(retried.context().executor, executor);
 
-    let executed = reconcile(1, Some(ExecutorExecutionResult::Executed));
-    let SwapSetupStatus::Delegated(handle) = status(&executed, &delegated) else {
+    // The nonce is past the setup and the account has no code: the delegation is missing.
+    rpc.state.used.lock().unwrap().insert(executor);
+    assert_eq!(pass(23).await.0, SwapSetupStatus::MissingDelegation);
+
+    // The nonce is past the setup under the accepted delegation: the account is set up.
+    rpc.set_delegated_account(executor, delegate, U256::ONE);
+    let (SwapSetupStatus::Delegated(handle), _) = pass(24).await else {
         panic!("the confirmed delegation completes the setup");
     };
     assert_eq!(
@@ -1403,13 +1478,24 @@ fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce() {
         ),
         (operation, executor, setup)
     );
-    assert_eq!(status(&executed, &[]), SwapSetupStatus::MissingDelegation);
     // Code read at any block other than the nonce observation is not evidence.
+    let code = [
+        EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+        delegate.as_slice(),
+    ]
+    .concat();
     assert_eq!(
-        swap_setup_status(&executed, signed_at.block(), &delegated, profile),
+        swap_setup_status(
+            &record(),
+            BlockNumHash::new(22, B256::repeat_byte(22)),
+            &code,
+            profile
+        ),
         SwapSetupStatus::Pending
     );
 
+    owner.shutdown().await;
+    drop(owner);
     drop(store);
     drop(view);
     drop(vault);

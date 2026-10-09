@@ -788,7 +788,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
         destination_setup.context().execution_nonce,
     );
     destination_store
-        .reconcile(destination_operation, observed, &[])
+        .record_account_read(destination_operation, observed)
         .unwrap();
     destination_store
         .record_swap_destination_shield(

@@ -27,7 +27,7 @@ use wallet_ops::{
     SwapOrderState, WakuDeliveryClient,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
-        ExecutorPayloadStatus, ExecutorRecord, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
+        ExecutorPayloadState, ExecutorRecord, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
         SwapPreHookDeathCause, SwapSubmissionStatus, SwapUseId, SwapUseRecord, SwapUseRelease,
         SwapUseRole,
     },
@@ -516,7 +516,7 @@ impl PrivateSwapsView {
                 Some(footer),
             );
         };
-        let stage = swap_order_stage(record, order);
+        let stage = swap_order_stage(record, order, self.attribution(record));
         let labels = self.past_labels(record, order, cx);
         let steps = swap_steps(stage, &labels)
             .into_iter()
@@ -1812,22 +1812,16 @@ impl PrivateSwapsView {
                        address: Option<alloy::primitives::Address>| {
             let unresolved = record.is_some_and(|record| {
                 if fresh {
-                    return record.has_recorded_unresolved_issued_work();
+                    return record.has_unresolved_issued_work();
                 }
                 let Some(SwapUseRole::Destination { shields, .. }) =
                     record.swap_use(swap.swap_use).map(SwapUseRecord::role)
                 else {
                     return false;
                 };
-                shields.iter().any(|hash| {
-                    !matches!(
-                        record.recorded_payload_status(*hash),
-                        Some(
-                            ExecutorPayloadStatus::Executed
-                                | ExecutorPayloadStatus::Invalidated { .. }
-                        )
-                    )
-                })
+                shields
+                    .iter()
+                    .any(|hash| record.payload_state(*hash) != Some(ExecutorPayloadState::Resolved))
             });
             CancelledAccount {
                 role,
@@ -2063,7 +2057,7 @@ impl PrivateSwapsView {
         };
         let Some(mut cursor) = self
             .record(operation)
-            .and_then(super::model::swap_history_start)
+            .and_then(super::model::swap_observation_start)
         else {
             self.fail(
                 operation,
@@ -2089,7 +2083,13 @@ impl PrivateSwapsView {
                     cursor = range.end;
                     let report = owner.observe_swap(operation, range).await?;
                     if cursor > confirmed
-                        || !super::model::swap_stage(report.record(), None, false).is_observed()
+                        || !super::model::swap_stage(
+                            report.record(),
+                            None,
+                            false,
+                            owner.attribution(report.record()).as_ref(),
+                        )
+                        .is_observed()
                     {
                         break report
                             .record()

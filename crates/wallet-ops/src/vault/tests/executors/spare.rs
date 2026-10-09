@@ -135,6 +135,8 @@ struct RpcState {
     /// The word an `eth_call` to a contract returns, or `None` for a call that fails. Calls to
     /// any other contract return zero.
     calls: Mutex<std::collections::BTreeMap<Address, Option<U256>>>,
+    /// A block number that another block now holds, with a different hash.
+    reorged: Mutex<Option<u64>>,
 }
 
 struct Rpc {
@@ -272,7 +274,11 @@ async fn serve(
                 .and_then(|value| value.strip_prefix("0x"))
                 .and_then(|number| u64::from_str_radix(number, 16).ok())
                 .unwrap_or_else(|| state.head.load(Ordering::Relaxed));
-            block.header.hash = B256::repeat_byte(block.header.number as u8);
+            block.header.hash = if *state.reorged.lock().unwrap() == Some(block.header.number) {
+                B256::repeat_byte(0xee)
+            } else {
+                B256::repeat_byte(block.header.number as u8)
+            };
             serde_json::to_value(block).unwrap()
         }
         "eth_getTransactionCount" => json!(if used { "0x1" } else { "0x0" }),
@@ -566,18 +572,6 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
         "issued work must not start implicit history or account reads"
     );
     tokio::time::resume();
-    assert_eq!(
-        store
-            .records()
-            .unwrap()
-            .iter()
-            .find(|record| record.operation() == operation)
-            .unwrap()
-            .issued()[0]
-            .context()
-            .history_start(),
-        999
-    );
     rpc.state.used.lock().unwrap().insert(address);
     assert!(
         owner
@@ -809,6 +803,24 @@ async fn paid_fee_retry_reuses_only_its_own_unsent_evidence() {
         requests() > before,
         "a sent payload requires fresh evidence"
     );
+    {
+        let seen = rpc.state.requests.lock().unwrap();
+        let round = &seen[before..];
+        assert!(
+            round
+                .iter()
+                .any(|request| request["method"] == "eth_getCode"),
+            "a retry with issued payloads reads the account's delegation"
+        );
+        assert!(
+            round
+                .iter()
+                .all(|request| request["method"] != "eth_getLogs"
+                    && (request["method"] != "eth_getBlockByNumber"
+                        || request["params"][1] != json!(true))),
+            "a retry reads no block history"
+        );
+    }
 
     // History reconciliation may drop the durable observation between rounds.
     let operation = ExecutorOperationId::random().unwrap();
@@ -845,6 +857,41 @@ async fn paid_fee_retry_reuses_only_its_own_unsent_evidence() {
         "an invalidated observation requires fresh evidence"
     );
     assert_eq!(record(operation).issued().len(), 2);
+
+    // The retry's account read is taken at the inspection's confirmed block. Once another
+    // block holds that height, the inspection's nonce is not reused and nothing is signed.
+    store.invalidate_observation(operation).unwrap();
+    rpc.hold.send_replace(Some(prepared.context().executor));
+    let before = requests();
+    let reorged_call = call(&prepared, &spent, 2);
+    let authorization = password();
+    let error = {
+        let pending = owner.issue_operation_retrying(
+            &prepared,
+            &reorged_call,
+            std::slice::from_ref(&spent),
+            &authorization,
+            &mut retry,
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("signing did not inspect the account: {}", result.is_ok()),
+            () = rpc.wait_for(|requests| requests[before..].iter().any(|request| request["method"] == "eth_getCode")) => {}
+        }
+        // The inspection already holds its confirmed block, at the head minus the finality depth.
+        *rpc.state.reorged.lock().unwrap() = Some(rpc.state.head.load(Ordering::Relaxed) - 1);
+        rpc.hold.send_replace(None);
+        pending
+            .await
+            .err()
+            .expect("a replaced signing block is refused")
+    };
+    assert!(
+        format!("{error:#}").contains("no longer canonical"),
+        "{error:#}"
+    );
+    assert_eq!(record(operation).issued().len(), 2);
+    assert!(record(operation).nonce_observation().is_none());
     owner.shutdown().await;
     drop(owner);
     drop(store);
@@ -1205,4 +1252,223 @@ async fn hardware_restore_batches_64_use_checks_and_preserves_success_after_fail
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn background_confirmation_resolves_from_private_sync_without_reading_the_chain() {
+    use railgun_wallet::WalletUtxo;
+    use sync_service::{WalletCurrentSnapshot, WalletPendingOverlay};
+
+    /// One pass of the observer over the only record. `current` is the private snapshot by
+    /// the time the pass writes.
+    async fn pass(
+        owner: &ExecutorOwner,
+        seen: &Arc<WalletCurrentSnapshot>,
+        current: &Arc<WalletCurrentSnapshot>,
+        safe_head: Option<u64>,
+    ) -> (bool, ExecutorRecord) {
+        let record = owner.records().unwrap().remove(0);
+        let kept = owner
+            .confirm_synced_record(seen, &|| Some(current.clone()), safe_head, record)
+            .await
+            .unwrap();
+        (kept, owner.records().unwrap().remove(0))
+    }
+
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain(&rpc),
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let delegate = Address::repeat_byte(1);
+    store.reserve(operation, delegate, None, &[]).unwrap();
+    store
+        .bind_address(operation, Address::repeat_byte(3))
+        .unwrap();
+    let input = Utxo::new(
+        broadcaster_core::notes::Note::new_change(U256::ONE, Address::ZERO, U256::from(9), [7; 16]),
+        2,
+        3,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(9),
+            block_number: 1,
+            block_timestamp: 1,
+        },
+        UtxoCommitmentKind::Transact,
+    );
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::from(3));
+    store.record_account_read(operation, observed).unwrap();
+    store
+        .record_issued(
+            operation,
+            IssuedExecutorPayload::new(
+                U256::from(3),
+                delegate,
+                B256::repeat_byte(4),
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(
+                    Bytes::from_static(b"operation"),
+                    observed,
+                    vec![ExecutorInputIdentity::from_utxo(&input)],
+                ),
+            ),
+        )
+        .unwrap();
+    store
+        .record_submission(operation, B256::repeat_byte(4), B256::repeat_byte(5))
+        .unwrap();
+    // Private sync's view of the payload's note, spent in block 14 by `transaction` if any.
+    let snapshot = |reset_generation: u64, transaction: Option<u8>| {
+        let mut note = WalletUtxo::new(input.clone());
+        note.spent = transaction.map(|transaction| UtxoSource {
+            tx_hash: B256::repeat_byte(transaction),
+            block_number: 14,
+            block_timestamp: 1,
+        });
+        WalletCurrentSnapshot::new(
+            20,
+            0,
+            reset_generation,
+            vec![note],
+            WalletPendingOverlay::default(),
+        )
+    };
+
+    // Startup with a pending payload: private sync is past the last read, which settles the
+    // nonces below the payload's. The payload stays pending and reserved, also as the tip
+    // advances.
+    let unspent = snapshot(0, None);
+    let (_, pending) = pass(&owner, &unspent, &unspent, None).await;
+    assert_eq!(pending.settled_nonce(), Some(U256::from(3)));
+    assert_eq!(
+        pending.payload_state(B256::repeat_byte(4)),
+        Some(ExecutorPayloadState::Pending)
+    );
+    assert_eq!(pending.reserved_inputs().len(), 1);
+    for safe_head in [Some(15), Some(16)] {
+        assert_eq!(pass(&owner, &unspent, &unspent, safe_head).await.1, pending);
+    }
+    // A spend in a transaction that is not recorded for the payload, a recorded spend above
+    // the safe head, and a snapshot that private sync reset before the write change nothing.
+    let unrelated = snapshot(0, Some(6));
+    assert_eq!(pass(&owner, &unrelated, &unrelated, None).await.1, pending);
+    let spent = snapshot(0, Some(5));
+    assert_eq!(pass(&owner, &spent, &spent, Some(13)).await.1, pending);
+    assert_eq!(
+        pass(&owner, &spent, &snapshot(1, None), Some(14)).await,
+        (false, pending.clone())
+    );
+
+    // The recorded spend at the safe head resolves the payload and settles its nonce at
+    // once. It is no account read, so the nonce observation stays.
+    let (_, resolved) = pass(&owner, &spent, &spent, Some(14)).await;
+    assert_eq!(
+        resolved.nonce_watermark(),
+        Some(ExecutorNonceWatermark::new(U256::from(4), 14))
+    );
+    assert_eq!(resolved.settled_nonce(), Some(U256::from(4)));
+    assert_eq!(resolved.nonce_observation(), pending.nonce_observation());
+    assert!(resolved.reserved_inputs().is_empty());
+    assert!(rpc.state.requests.lock().unwrap().is_empty());
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// A broadcaster's reply was lost, so the operation has no recorded transaction and private
+// sync cannot confirm it. After a restart Check balance reads the account's execution nonce
+// at the confirmed block, which resolves it without reading a block, a receipt or a log.
+#[tokio::test]
+async fn check_balance_resolves_a_lost_reply_operation_after_a_restart() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let delegate = chain.accepted_executor_profile().unwrap().delegate();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let executor = Address::repeat_byte(3);
+    store.reserve(operation, delegate, None, &[]).unwrap();
+    store.bind_address(operation, executor).unwrap();
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(5, B256::repeat_byte(5)), U256::ZERO);
+    store.record_account_read(operation, observed).unwrap();
+    let payload = B256::repeat_byte(4);
+    store
+        .record_issued(
+            operation,
+            IssuedExecutorPayload::new(
+                U256::ZERO,
+                delegate,
+                payload,
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(Bytes::from_static(b"operation"), observed, Vec::new()),
+            ),
+        )
+        .unwrap();
+
+    // The owner of the session after the restart. Its status reads no chain state.
+    let owner = ExecutorOwner::new(
+        1,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let record = || owner.records().unwrap().remove(0);
+    let before = owner.account_status(&record()).unwrap();
+    assert_eq!(before.outcome(), crate::ExecutorAccountOutcome::Unconfirmed);
+    assert!(before.read_this_session().is_none());
+    assert!(rpc.state.requests.lock().unwrap().is_empty());
+
+    // The operation ran: the account is delegated and its nonce is past the payload's.
+    rpc.set_delegated_account(executor, delegate, U256::ONE);
+    rpc.state.head.store(30, Ordering::Relaxed);
+    owner
+        .check_record(operation, &[ExecutorAsset::Native])
+        .await
+        .unwrap();
+    let after = owner.account_status(&record()).unwrap();
+    assert_eq!(after.outcome(), crate::ExecutorAccountOutcome::Executed);
+    assert_eq!(
+        record().payload_state(payload),
+        Some(ExecutorPayloadState::Resolved)
+    );
+    // The nonce is read at the confirmed block, one below the head on this chain.
+    let confirmed = BlockNumHash::new(29, B256::repeat_byte(29));
+    assert_eq!(after.read_this_session(), Some(confirmed));
+    assert_eq!(record().nonce_observation().unwrap().block(), confirmed);
+    assert!(rpc.state.requests.lock().unwrap().iter().all(|request| {
+        request["method"] != "eth_getLogs"
+            && (request["method"] != "eth_getBlockByNumber" || request["params"][1] != json!(true))
+    }));
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }

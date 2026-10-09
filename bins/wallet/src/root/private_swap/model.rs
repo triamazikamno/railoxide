@@ -6,11 +6,10 @@
 
 use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
-    SwapOrderState, SwapSetupStatus, swap_order_state,
+    ExecutorAttribution, SwapOrderState, SwapSetupStatus, swap_order_state,
     vault::{
-        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult,
-        ExecutorOperationId, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
-        ExecutorPayloadStatus, ExecutorRecord, ExecutorRecoveryStepKind, SwapApprovedBounds,
+        BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
+        ExecutorPayloadPurpose, ExecutorPayloadState, ExecutorRecord, SwapApprovedBounds,
         SwapDelivery, SwapOrderObservations, SwapOrderRecord, SwapPreHookDeathCause,
         SwapSubmissionStatus, SwapTradeAmounts, SwapUseId, SwapUseRecord, SwapUseRole,
     },
@@ -171,14 +170,16 @@ pub(in crate::root) const fn swap_form_mode(stage: Option<SwapStage>) -> SwapFor
 }
 
 /// Derive a swap's stage from its record. `setup` is this session's last setup observation;
-/// without it the recorded setup outcome is used.
+/// without it the recorded setup outcome is used. `attribution` is the owner's evidence for
+/// the record, which decides whether a recovery returned stranded funds.
 pub(in crate::root) fn swap_stage(
     record: &ExecutorRecord,
     setup: Option<SwapSetupStatus>,
     submitting: bool,
+    attribution: Option<&ExecutorAttribution>,
 ) -> SwapStage {
     if let Some(order) = record.swap().and_then(|swap| swap.orders().last()) {
-        return swap_order_stage(record, order);
+        return swap_order_stage(record, order, attribution);
     }
     if record.is_retired() {
         return SwapStage::SetupRetired;
@@ -188,17 +189,15 @@ pub(in crate::root) fn swap_stage(
     }
     let stage = match setup {
         Some(SwapSetupStatus::Delegated(_)) => SwapStage::Ready,
-        Some(SwapSetupStatus::Failed | SwapSetupStatus::MissingDelegation) => {
-            SwapStage::SetupFailed
-        }
+        Some(SwapSetupStatus::MissingDelegation) => SwapStage::SetupFailed,
         Some(SwapSetupStatus::Pending) | None => {
-            let statuses = record
+            let setups = record
                 .issued()
                 .iter()
                 .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
-                .map(|payload| record.recorded_payload_status(payload.hash()))
+                .filter_map(|payload| record.payload_state(payload.hash()))
                 .collect::<Vec<_>>();
-            recorded_setup_stage(&statuses, setup.is_some())
+            recorded_setup_stage(&setups, setup.is_some())
         }
     };
     // An approval binds a first order while its swap use claims the account. A reused account
@@ -211,10 +210,14 @@ pub(in crate::root) fn swap_stage(
     }
 }
 
-/// A setup's local inclusion is a progress hint, not permission to place its order.
-/// Its effects and delegation still need canonical verification.
+/// What private sync and the record show of a setup that this session has not confirmed:
+/// a progress hint, not permission to place its order. Its delegation still needs an
+/// account read.
 pub(super) enum SwapSetupConfirmation {
+    /// Private sync shows a note the setup spends or creates in a transaction recorded for
+    /// it, in this block, while its nonce is not read as consumed.
     Included(u64),
+    /// A setup's nonce is recorded as consumed.
     Executed,
 }
 
@@ -246,13 +249,13 @@ pub(super) fn swap_setup_confirmation(
         .iter()
         .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
     {
-        match record.recorded_payload_status(payload.hash()) {
-            Some(ExecutorPayloadStatus::Executed) => return Some(SwapSetupConfirmation::Executed),
-            Some(ExecutorPayloadStatus::Uncertain) | None => {
-                transactions.extend(payload.transaction_hashes().iter().copied());
-            }
-            _ => {}
+        if record.nonce_resolved(payload.nonce()) {
+            return Some(SwapSetupConfirmation::Executed);
         }
+        transactions.extend(payload.transaction_hashes().iter().copied());
+    }
+    if transactions.is_empty() {
+        return None;
     }
     let block = utxos
         .iter()
@@ -272,6 +275,7 @@ pub(super) fn swap_setup_confirmation(
 pub(in crate::root) fn swap_order_stage(
     record: &ExecutorRecord,
     order: &SwapOrderRecord,
+    attribution: Option<&ExecutorAttribution>,
 ) -> SwapStage {
     let state = swap_order_state(order);
     if state == SwapOrderState::Open {
@@ -282,10 +286,10 @@ pub(in crate::root) fn swap_order_stage(
         }
     }
     let observed = order.observations();
-    // Funds reach the stealth account when the pre-hook runs. A recovery confirmed after
-    // that returned them; an earlier cancellation, which is also recovery, didn't. An Across
-    // refund reaches it later, and surplus kept there can be recovered before, so only a
-    // recovery after the verified refund returned it. Without that refund, none did.
+    // Funds reach the stealth account when the pre-hook runs. A recovery whose shield arrived
+    // after that returned them; a cancellation, which is also recovery, shields nothing. An
+    // Across refund reaches it later, and surplus kept there can be recovered before, so only
+    // a recovery after the verified refund returned it. Without that refund, none did.
     let stranded_since = match (state, order.bridge()) {
         (SwapOrderState::Refunding, Some(BridgeOrderTerms::Across(_))) => observed
             .bridge_refund
@@ -302,7 +306,9 @@ pub(in crate::root) fn swap_order_stage(
             | SwapOrderState::Refunding
     );
     match stranded_since {
-        Some(block) if stranded && recovered_since(record, block) => SwapStage::Recovered,
+        Some(block) if stranded && recovered_since(record, block, attribution) => {
+            SwapStage::Recovered
+        }
         _ => SwapStage::Order(state),
     }
 }
@@ -429,7 +435,8 @@ pub(super) fn public_swap_stage(
     claimed: &SwapUseRecord,
     setup: Option<SwapSetupStatus>,
     now: u64,
-    railgun: Option<Address>,
+    attribution: Option<&ExecutorAttribution>,
+    destination_balance: Option<(U256, alloy::eips::BlockNumHash)>,
 ) -> Option<PublicSwapStage> {
     use wallet_ops::vault::{PublicSwapTransactionKind as Kind, SwapBridgeOutcome};
     let swap = claimed.public_swap()?;
@@ -442,10 +449,28 @@ pub(super) fn public_swap_stage(
                 PublicSwapStage::Refunded
             }
             Some(SwapBridgeOutcome::Refunding) => PublicSwapStage::Refunding,
-            Some(SwapBridgeOutcome::HeldOnDestination { .. }) => {
-                if public_held_remaining(record, claimed, railgun)
-                    .is_some_and(|amount| amount.is_zero())
-                {
+            Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) => {
+                let recovered_at = attribution.and_then(|attribution| {
+                    let SwapUseRole::PublicSourceDestination {
+                        destination_token, ..
+                    } = claimed.role()
+                    else {
+                        return None;
+                    };
+                    wallet_ops::executor_recovered_token_since(
+                        record,
+                        *destination_token,
+                        block.number,
+                        &attribution.evidence(),
+                    )
+                });
+                if recovered_at.is_some_and(|recovered_at| {
+                    destination_balance.is_some_and(|(amount, read_at)| {
+                        amount.is_zero()
+                            && read_at.number >= block.number
+                            && read_at.number >= recovered_at
+                    })
+                }) {
                     PublicSwapStage::Recovered
                 } else {
                     PublicSwapStage::HeldOnDestination
@@ -532,24 +557,18 @@ pub(super) fn public_swap_stage(
         }
     }
     Some(PublicSwapStage::Preparing(if claimed.is_fresh() {
-        swap_stage(record, setup, false)
+        swap_stage(record, setup, false, attribution)
     } else {
         SwapStage::Ready
     }))
 }
 
-/// The exact ERC20 amount still held after verified recovery shields.
+/// The latest confirmed balance after the fill, falling back to its dated amount for display.
 pub(super) fn public_held_remaining(
-    record: &ExecutorRecord,
     claimed: &SwapUseRecord,
-    railgun: Option<Address>,
+    destination_balance: Option<(U256, alloy::eips::BlockNumHash)>,
 ) -> Option<U256> {
-    let SwapUseRole::PublicSourceDestination {
-        destination_token,
-        swap,
-        ..
-    } = claimed.role()
-    else {
+    let SwapUseRole::PublicSourceDestination { swap, .. } = claimed.role() else {
         return None;
     };
     let wallet_ops::vault::SwapBridgeOutcome::HeldOnDestination { amount, block, .. } =
@@ -557,15 +576,13 @@ pub(super) fn public_held_remaining(
     else {
         return None;
     };
-    Some(railgun.map_or(amount, |railgun| {
-        wallet_ops::executor_recovery_remaining_amount(
-            record,
-            *destination_token,
-            amount,
-            block.number,
-            railgun,
-        )
-    }))
+    wallet_ops::executor_recovery_remaining_amount(
+        std::iter::once((amount, block.number)).chain(
+            destination_balance
+                .filter(|(_, read_at)| read_at.number >= block.number)
+                .map(|(balance, read_at)| (balance, read_at.number)),
+        ),
+    )
 }
 
 /// Values on the origin and destination networks, formatted independently.
@@ -587,7 +604,8 @@ pub(super) struct PublicSwapLabels {
     pub(super) minimum: String,
     /// "#57 · 0x9a3D…41e0", with " · reused" for an account the swap didn't set up.
     pub(super) account: String,
-    /// The block of the destination account's setup. `None` for a reused account.
+    /// The block that showed the destination account's setup nonce consumed, which the
+    /// steps don't show. `None` for a reused account and while the setup is unresolved.
     pub(super) setup_block: Option<u64>,
 }
 
@@ -626,10 +644,11 @@ pub(super) fn public_swap_steps(
         }
         _ => format!("Account on {destination} set up"),
     };
-    let mut steps = vec![
-        SwapStep::new(setup_title, labels.account.clone(), setup_status)
-            .in_block(labels.setup_block.filter(|_| setup_status == Done)),
-    ];
+    let mut steps = vec![SwapStep::new(
+        setup_title,
+        labels.account.clone(),
+        setup_status,
+    )];
     // Existing allowance and native deposits have no approval transaction to display.
     for tx in swap
         .transactions()
@@ -929,42 +948,28 @@ pub(in crate::root) fn cancelled_swap_uses(
     })
 }
 
-/// A recovery shield confirmed at or after `block`, paid by a broadcaster or by the account.
-fn recovered_since(record: &ExecutorRecord, block: u64) -> bool {
-    let confirmed = |inclusion: Option<ExecutorPayloadInclusion>| {
-        inclusion.is_some_and(|inclusion| {
-            inclusion.result() == ExecutorExecutionResult::Executed
-                && inclusion.block().number >= block
-        })
-    };
-    record.issued().iter().any(|payload| {
-        payload.purpose() == ExecutorPayloadPurpose::Recovery && confirmed(payload.inclusion())
-    }) || record.recovery_transactions().iter().any(|transaction| {
-        transaction.kind() == ExecutorRecoveryStepKind::Shield && confirmed(transaction.inclusion())
+/// A recovery returned funds at or after `block`: a batch, paid by a broadcaster or by the
+/// account, that is the action attributed at its nonce with its shield received since then.
+/// Without `attribution` no batch counts.
+fn recovered_since(
+    record: &ExecutorRecord,
+    block: u64,
+    attribution: Option<&ExecutorAttribution>,
+) -> bool {
+    attribution.is_some_and(|attribution| {
+        wallet_ops::executor_recovered_since(record, block, &attribution.evidence())
     })
 }
 
-/// The setup stage from recorded setup outcomes alone. While this session observes the setup,
-/// a recorded execution stays pending until the delegation itself is confirmed.
-fn recorded_setup_stage(statuses: &[Option<ExecutorPayloadStatus>], observing: bool) -> SwapStage {
-    if statuses.is_empty() {
-        return SwapStage::SetupNotSent;
-    }
-    if statuses.contains(&Some(ExecutorPayloadStatus::Executed)) {
-        return if observing {
-            SwapStage::SetupPending
-        } else {
-            SwapStage::Ready
-        };
-    }
-    let failed = statuses.iter().all(|status| {
-        matches!(
-            status,
-            Some(ExecutorPayloadStatus::Reverted | ExecutorPayloadStatus::Invalidated { .. })
-        )
-    });
-    if failed {
-        SwapStage::SetupFailed
+/// The setup stage from the recorded state of each signed setup alone. A setup whose nonce
+/// is not consumed stays pending and can be retried, whatever became of a transaction that
+/// carried it. While this session observes the setup, a consumed nonce stays pending until
+/// the delegation itself is confirmed.
+fn recorded_setup_stage(setups: &[ExecutorPayloadState], observing: bool) -> SwapStage {
+    if setups.is_empty() {
+        SwapStage::SetupNotSent
+    } else if setups.contains(&ExecutorPayloadState::Resolved) && !observing {
+        SwapStage::Ready
     } else {
         SwapStage::SetupPending
     }
@@ -1026,8 +1031,9 @@ pub(in crate::root) fn swap_valid_to(record: &ExecutorRecord) -> Option<u64> {
         .map(|order| u64::from(order.valid_to()))
 }
 
-/// The first block a scan must cover to observe the swap's current step.
-pub(in crate::root) fn swap_history_start(record: &ExecutorRecord) -> Option<u64> {
+/// The first block the swap's evidence pages must cover to observe its current step: the
+/// block the step's payload was signed against.
+pub(in crate::root) fn swap_observation_start(record: &ExecutorRecord) -> Option<u64> {
     let latest_pre_hook = record
         .swap()
         .and_then(|swap| swap.orders().last())
@@ -1039,7 +1045,7 @@ pub(in crate::root) fn swap_history_start(record: &ExecutorRecord) -> Option<u64
             Some(pre_hook) => payload.hash() == pre_hook,
             None => payload.purpose() == ExecutorPayloadPurpose::Operation,
         })
-        .map(|payload| payload.context().history_start())
+        .map(|payload| payload.context().observed().block().number)
         .min()
 }
 
@@ -1136,8 +1142,6 @@ pub(in crate::root) struct SwapSetupLabels {
     pub(in crate::root) progress: SwapSetupProgress,
     /// The swap reuses the account, which was set up before it, so it sends no setup for it.
     pub(in crate::root) reused: bool,
-    /// The block the setup was included in, once recorded.
-    pub(in crate::root) block: Option<u64>,
     /// What a setup on its way waits for, when this session knows it.
     pub(in crate::root) detail: Option<String>,
 }
@@ -1198,18 +1202,21 @@ pub(in crate::root) const fn private_bridge_setup_stage(
     }
 }
 
-/// The block a record's executed setup was included in.
+/// The block that showed a record's setup nonce consumed. `None` while no setup is resolved.
 pub(in crate::root) fn swap_setup_block(record: &ExecutorRecord) -> Option<u64> {
     record
         .issued()
         .iter()
-        .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
-        .find_map(|payload| {
-            payload
-                .inclusion()
-                .filter(|inclusion| inclusion.result() == ExecutorExecutionResult::Executed)
-                .map(|inclusion| inclusion.block().number)
+        .any(|payload| {
+            payload.purpose() == ExecutorPayloadPurpose::Operation
+                && record.nonce_resolved(payload.nonce())
         })
+        .then(|| {
+            record
+                .nonce_watermark()
+                .map(wallet_ops::vault::ExecutorNonceWatermark::block)
+        })
+        .flatten()
 }
 
 /// The record's delivery when it shields to the wallet on another network.
@@ -1234,8 +1241,9 @@ pub(in crate::root) fn private_delivery_credit(amount: U256, bounds: &SwapApprov
 pub(in crate::root) fn held_proceeds_recovered(
     destination: &ExecutorRecord,
     held_block: u64,
+    attribution: Option<&ExecutorAttribution>,
 ) -> bool {
-    recovered_since(destination, held_block)
+    recovered_since(destination, held_block, attribution)
 }
 
 pub(in crate::root) const fn provider_name(provider: BridgeProvider) -> &'static str {
@@ -1973,12 +1981,7 @@ fn private_setup_step(
                         .clone()
                         .unwrap_or_else(|| "Waiting for broadcaster…".into()),
                 ),
-                SwapSetupProgress::Done => (
-                    Done,
-                    account
-                        .block
-                        .map_or_else(String::new, |block| format!("block {block}")),
-                ),
+                SwapSetupProgress::Done => (Done, String::new()),
                 SwapSetupProgress::Failed => (Error, "Not confirmed".to_owned()),
             };
             SwapStep {
@@ -3185,7 +3188,7 @@ pub(super) mod tests {
         const RECEIVER: &str = "0x9a9A…9a9A";
         let destination = Address::repeat_byte(0x9a);
         let private = |origin: Setup, arrival: Setup| {
-            let setup = |network: &str, index, address, progress, block| SwapSetupLabels {
+            let setup = |network: &str, index, address, progress| SwapSetupLabels {
                 network: network.into(),
                 account: Some(SwapStepAccount {
                     index: Some(index),
@@ -3193,7 +3196,6 @@ pub(super) mod tests {
                 }),
                 progress,
                 reused: false,
-                block: (progress == Setup::Done).then_some(block),
                 detail: None,
             };
             SwapLabels {
@@ -3208,14 +3210,8 @@ pub(super) mod tests {
                     minimum: Some("990.12 USDC".into()),
                     private: Some(SwapPrivateBridgeLabels {
                         setups: [
-                            setup(
-                                "Ethereum",
-                                191,
-                                Address::repeat_byte(0x4e),
-                                origin,
-                                23_481_902,
-                            ),
-                            setup("Arbitrum One", 57, destination, arrival, 402_118_977),
+                            setup("Ethereum", 191, Address::repeat_byte(0x4e), origin),
+                            setup("Arbitrum One", 57, destination, arrival),
                         ],
                         held: Some("992.74 USDC".into()),
                     }),
@@ -3254,7 +3250,7 @@ pub(super) mod tests {
         assert_eq!(
             children(&pending[0]),
             [
-                child("Ethereum", Done, "block 23481902"),
+                child("Ethereum", Done, ""),
                 child("Arbitrum One", Pending, "Waiting for broadcaster…"),
             ]
         );
@@ -3286,7 +3282,7 @@ pub(super) mod tests {
         assert_eq!(
             children(&failed[0]),
             [
-                child("Ethereum", Done, "block 23481902"),
+                child("Ethereum", Done, ""),
                 child("Arbitrum One", Error, "Not confirmed"),
             ]
         );
@@ -3382,10 +3378,7 @@ pub(super) mod tests {
             assert_eq!(steps[0].status, Done, "{state:?}");
             assert_eq!(
                 children(&steps[0]),
-                [
-                    child("Ethereum", Done, "block 23481902"),
-                    child("Arbitrum One", Done, "block 402118977"),
-                ],
+                [child("Ethereum", Done, ""), child("Arbitrum One", Done, ""),],
                 "{state:?}"
             );
             let shown = steps.last().unwrap();
@@ -3673,27 +3666,22 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_recorded_setup_outcome_stands_in_for_an_unobserved_session() {
-        use alloy::primitives::B256;
-        let executed = Some(ExecutorPayloadStatus::Executed);
-        let reverted = Some(ExecutorPayloadStatus::Reverted);
-        let lost = Some(ExecutorPayloadStatus::Invalidated { winner: B256::ZERO });
+    fn a_recorded_setup_state_stands_in_for_an_unobserved_session() {
+        use ExecutorPayloadState::{Pending, Resolved};
         assert_eq!(recorded_setup_stage(&[], false), SwapStage::SetupNotSent);
+        // Two setups signed at one nonce, which is consumed.
         assert_eq!(
-            recorded_setup_stage(&[reverted, executed], false),
+            recorded_setup_stage(&[Resolved, Resolved], false),
             SwapStage::Ready
         );
         // This session confirms the delegation itself before offering the order.
         assert_eq!(
-            recorded_setup_stage(&[executed], true),
+            recorded_setup_stage(&[Resolved], true),
             SwapStage::SetupPending
         );
+        // An unconsumed nonce stays pending and retryable, whatever a transaction did.
         assert_eq!(
-            recorded_setup_stage(&[reverted, lost], false),
-            SwapStage::SetupFailed
-        );
-        assert_eq!(
-            recorded_setup_stage(&[reverted, None], false),
+            recorded_setup_stage(&[Pending, Pending], false),
             SwapStage::SetupPending
         );
     }
@@ -3843,11 +3831,8 @@ pub(super) mod tests {
             Vec<Action>,
         );
         const VALID_TO: u32 = 1_000;
-        const ACCOUNT: (&str, &str, Option<u64>) = (
-            "Account on Arbitrum One set up",
-            "#57 · 0x0303…0303",
-            Some(402_118_977),
-        );
+        const ACCOUNT: (&str, &str, Option<u64>) =
+            ("Account on Arbitrum One set up", "#57 · 0x0303…0303", None);
         const APPROVED: (&str, &str, Option<u64>) = ("DAI approved from Main", "", Some(30));
         const FILLED: (&str, &str, Option<u64>) =
             ("Order filled", "1,000 DAI for 994.47 USDC", Some(51));
@@ -4154,7 +4139,7 @@ pub(super) mod tests {
         for (expected, record, labels, now, steps, facts, actions) in cases {
             let claimed = &record.swap_uses()[0];
             let swap = claimed.public_swap().unwrap();
-            let stage = public_swap_stage(&record, claimed, None, now, None).unwrap();
+            let stage = public_swap_stage(&record, claimed, None, now, None, None).unwrap();
             assert_eq!(stage, expected);
             let shown = public_swap_steps(claimed, stage, labels);
             assert_eq!(
@@ -4184,7 +4169,7 @@ pub(super) mod tests {
         // says it is being prepared.
         let reused = public_presentation_record(false, &PublicSwapObservations::default());
         let claimed = &reused.swap_uses()[0];
-        let stage = public_swap_stage(&reused, claimed, None, 101, None).unwrap();
+        let stage = public_swap_stage(&reused, claimed, None, 101, None, None).unwrap();
         assert_eq!(stage, PublicSwapStage::Preparing(SwapStage::Ready));
         assert_eq!(stage.label(), "Account ready");
         assert_eq!(
@@ -4295,7 +4280,7 @@ pub(super) mod tests {
         ] {
             let record = public_presentation_record(true, &observed);
             let claimed = &record.swap_uses()[0];
-            let stage = public_swap_stage(&record, claimed, None, 101, None).unwrap();
+            let stage = public_swap_stage(&record, claimed, None, 101, None, None).unwrap();
             assert_eq!(stage, expected);
             let actions = super::super::public_progress::public_swap_actions(
                 claimed.public_swap().unwrap(),
@@ -4350,7 +4335,7 @@ pub(super) mod tests {
             })).collect::<Vec<_>>());
             let record: ExecutorRecord = serde_json::from_value(value).unwrap();
             assert_eq!(
-                public_swap_stage(&record, &record.swap_uses()[0], None, 101, None),
+                public_swap_stage(&record, &record.swap_uses()[0], None, 101, None, None),
                 Some(expected)
             );
         }
@@ -4444,7 +4429,7 @@ pub(super) mod tests {
         ] {
             let record = public_presentation_record(true, &observed);
             let claimed = &record.swap_uses()[0];
-            let stage = public_swap_stage(&record, claimed, None, 101, None).unwrap();
+            let stage = public_swap_stage(&record, claimed, None, 101, None, None).unwrap();
             assert_eq!(stage, expected);
             assert_eq!(stage.group(), group);
             let actions = super::super::public_progress::public_swap_actions(

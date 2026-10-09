@@ -93,7 +93,7 @@ pub(super) struct MockChain {
     pub(super) head: u64,
     reorgs: Vec<u64>,
     pub(super) nonces: Vec<(u64, u64)>,
-    buy_balance: Vec<(u64, u64)>,
+    pub(super) buy_balance: Vec<(u64, u64)>,
     /// Per order, the block from which the settlement reads its fill as zero, as
     /// after it frees an expired order's storage.
     fill_cleared: Vec<(OrderUid, u64)>,
@@ -104,7 +104,7 @@ pub(super) struct MockChain {
     pub(super) transactions: Vec<(B256, alloy::rpc::types::Transaction, TransactionReceipt)>,
     log_queries: usize,
     rpc_methods: Vec<String>,
-    rpc_requests: Vec<Value>,
+    pub(super) rpc_requests: Vec<Value>,
     pub(super) receipt_error: Option<i64>,
     reorg_on_receipts: bool,
 }
@@ -645,7 +645,7 @@ impl Fixture {
         store.bind_address(operation, EXECUTOR).unwrap();
         let before_setup =
             ExecutorNonceObservation::new(BlockNumHash::new(10, B256::ZERO), U256::ZERO);
-        store.reconcile(operation, before_setup, &[]).unwrap();
+        store.record_account_read(operation, before_setup).unwrap();
         let setup_call = execute(vec![private_transaction(0x11, 0x12)], Vec::new(), 0);
         let setup = B256::repeat_byte(3);
         store
@@ -664,10 +664,10 @@ impl Fixture {
             .lock()
             .unwrap()
             .add_transaction(11, EXECUTOR, setup_call, private_logs(0x11, 0x12));
-        let reconciled = owner.reconcile_history(operation, 10..14).await.unwrap();
+        let reconciled = owner.reconcile_account(operation).await.unwrap();
         assert_eq!(
-            reconciled.record().payload_status(setup),
-            Some(ExecutorPayloadStatus::Executed)
+            reconciled.record().payload_state(setup),
+            Some(ExecutorPayloadState::Resolved)
         );
         let input = sell_note(3);
         Self {
@@ -846,6 +846,22 @@ impl Fixture {
             .clone()
     }
 
+    /// [`Self::observe`] with `sync` as private sync's snapshot.
+    async fn observe_synced(
+        &self,
+        head: u64,
+        start: u64,
+        sync: Arc<sync_service::WalletCurrentSnapshot>,
+    ) -> ExecutorRecord {
+        self.chain.lock().unwrap().head = head;
+        self.owner
+            .observe_swap_synced(self.operation, start..head, Some(sync))
+            .await
+            .unwrap()
+            .record()
+            .clone()
+    }
+
     /// Observe `range` at the current head. Unlike [`Self::observe`], the page may
     /// end before the confirmed block.
     async fn observe_page(&self, range: std::ops::Range<u64>) -> ExecutorRecord {
@@ -871,6 +887,17 @@ impl Fixture {
         drop(self.db);
         std::fs::remove_dir_all(self.root).unwrap();
     }
+}
+
+/// Private sync's snapshot holding `notes`, scanned past every block the tests observe.
+fn synced(notes: Vec<railgun_wallet::WalletUtxo>) -> Arc<sync_service::WalletCurrentSnapshot> {
+    sync_service::WalletCurrentSnapshot::new(
+        1_000,
+        0,
+        0,
+        notes,
+        sync_service::WalletPendingOverlay::default(),
+    )
 }
 
 fn state(record: &ExecutorRecord, attempt: usize) -> SwapOrderState {
@@ -1129,7 +1156,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
             .filter(|method| method.as_str() == "eth_blockNumber")
             .count(),
         1,
-        "checking setup and prior orders must share one history reconciliation"
+        "checking setup and prior orders must share one account read"
     );
     fixture.record_pair_attempt(1, 100, OTHER_BUY);
     let refused = fixture
@@ -1582,7 +1609,7 @@ async fn orders_closed_at(fixture: &Fixture, head: u64) -> (ExecutorRecord, eyre
     fixture.chain.lock().unwrap().head = head;
     let record = fixture
         .owner
-        .reconcile_history(fixture.operation, head - 1..head)
+        .reconcile_account(fixture.operation)
         .await
         .unwrap()
         .record()
@@ -1650,7 +1677,7 @@ async fn public_signing_needs_every_order_closed_at_the_fresh_confirmed_block() 
 }
 
 #[tokio::test]
-async fn expired_pre_hook_releases_inputs_at_finality_and_a_reorg_restores_them() {
+async fn expired_pre_hook_releases_inputs_at_finality_and_stays_released_after_restart() {
     let fixture = Fixture::start().await;
     fixture.record_attempt(0, 28);
 
@@ -1678,22 +1705,6 @@ async fn expired_pre_hook_releases_inputs_at_finality_and_a_reorg_restores_them(
     assert!(restarted.input_locks(&[sell_note(3)]).unwrap().is_empty());
     assert_eq!(fixture.chain.lock().unwrap().rpc_methods.len(), requests);
     restarted.shutdown().await;
-
-    // The chain reorganizes to a shorter one whose confirmed block is before `validTo`.
-    {
-        let mut chain = fixture.chain.lock().unwrap();
-        chain.reorg(25);
-    }
-    let record = fixture.observe(27, 20).await;
-    assert_eq!(state(&record, 0), SwapOrderState::Open);
-    assert!(fixture.reserved(&record));
-
-    let record = fixture.observe(41, 27).await;
-    assert_eq!(
-        state(&record, 0),
-        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
-    );
-    assert!(!fixture.reserved(&record));
     fixture.finish().await;
 }
 
@@ -1723,26 +1734,70 @@ async fn checking_an_expired_orders_lock_observes_the_order_and_frees_its_notes(
 }
 
 #[tokio::test]
+async fn invalidated_order_names_a_cancellation_without_a_reported_transaction_or_sync() {
+    for previously_unknown in [false, true] {
+        let fixture = Fixture::start().await;
+        fixture.record_attempt(0, 200);
+        let order = uid(0, 200);
+        let observed = fixture.record().nonce_observation().unwrap();
+        fixture
+            .store
+            .record_issued(
+                fixture.operation,
+                IssuedExecutorPayload::new(
+                    U256::ONE,
+                    fixture.delegate,
+                    B256::repeat_byte(0x39),
+                    ExecutorPayloadPurpose::Recovery,
+                    ExecutorPayloadContext::new(
+                        execute(
+                            vec![private_transaction(0x31, 0x32)],
+                            vec![invalidation(fixture.settlement, order)],
+                            1,
+                        ),
+                        observed,
+                        vec![ExecutorInputIdentity::from_utxo(&sell_note(4))],
+                    ),
+                ),
+            )
+            .unwrap();
+        fixture.chain.lock().unwrap().nonces.push((30, 2));
+        if previously_unknown {
+            let record = fixture.observe(36, 25).await;
+            assert_eq!(
+                state(&record, 0),
+                SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Unknown)
+            );
+            // The unresolved post-hook makes the next page worth reading, so page selection
+            // skips the filled-amount probe. The Unknown cause still needs that order state.
+            fixture.chain.lock().unwrap().nonces.push((31, 3));
+        }
+        fixture.chain.lock().unwrap().invalidated.push((order, 30));
+        let record = fixture.observe(37, 25).await;
+        assert_eq!(
+            state(&record, 0),
+            SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
+        );
+        assert_eq!(
+            crate::swap_invalidation(&record, &swap_profile(), at_block(37)).unwrap(),
+            None
+        );
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn cancellation_and_an_older_post_hook_end_attempts_but_a_copied_shield_does_not() {
     let fixture = Fixture::start().await;
     fixture.record_attempt(0, 200);
     let first = uid(0, 200);
 
-    // A broadcaster-funded cancellation at the pre-hook's nonce invalidates the order.
+    // A broadcaster-funded cancellation at the pre-hook's nonce invalidates the order. The
+    // broadcaster reported its transaction, which pays the fee with a note of its own.
     let observed = fixture.record().nonce_observation().unwrap();
-    let cancellation_call = execute(
-        vec![private_transaction(0x31, 0x32)],
-        vec![Call {
-            to: fixture.settlement,
-            value: U256::ZERO,
-            data: GPv2Settlement::invalidateOrderCall {
-                orderUid: first.0.to_vec().into(),
-            }
-            .abi_encode()
-            .into(),
-        }],
-        1,
-    );
+    let cancellation = B256::repeat_byte(0x39);
+    let sent = B256::repeat_byte(0x3b);
+    let fee = sell_note(4);
     fixture
         .store
         .record_issued(
@@ -1750,28 +1805,55 @@ async fn cancellation_and_an_older_post_hook_end_attempts_but_a_copied_shield_do
             IssuedExecutorPayload::new(
                 U256::ONE,
                 fixture.delegate,
-                B256::repeat_byte(0x39),
+                cancellation,
                 ExecutorPayloadPurpose::Recovery,
-                ExecutorPayloadContext::new(cancellation_call.clone(), observed, Vec::new()),
+                ExecutorPayloadContext::new(
+                    execute(
+                        vec![private_transaction(0x31, 0x32)],
+                        vec![invalidation(fixture.settlement, first)],
+                        1,
+                    ),
+                    observed,
+                    vec![ExecutorInputIdentity::from_utxo(&fee)],
+                ),
             ),
         )
         .unwrap();
-    let include_cancellation = |number: u64| {
-        let mut chain = fixture.chain.lock().unwrap();
-        chain.add_transaction(
-            number,
-            EXECUTOR,
-            cancellation_call.clone(),
-            private_logs(0x31, 0x32),
-        );
-        chain.nonces.push((number, 2));
-    };
-    include_cancellation(30);
+    fixture
+        .store
+        .record_submission(fixture.operation, cancellation, sent)
+        .unwrap();
+    // No read finds the transaction: only the nonce shows that something ran.
+    fixture.chain.lock().unwrap().nonces.push((30, 2));
     let record = fixture.observe(36, 25).await;
+    assert_eq!(
+        state(&record, 0),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Unknown)
+    );
+    // Until the cause is known the order counts as fillable, so a retry invalidates it again.
+    assert_eq!(
+        crate::swap_invalidation(&record, &swap_profile(), at_block(36)).unwrap(),
+        Some(first)
+    );
+    // Private sync shows the fee note spent in the recorded transaction.
+    let mut spent = railgun_wallet::WalletUtxo::new(fee);
+    spent.spent = Some(UtxoSource {
+        tx_hash: sent,
+        block_number: 30,
+        block_timestamp: timestamp(30),
+    });
+    let record = fixture.observe_synced(36, 25, synced(vec![spent])).await;
     assert_eq!(
         state(&record, 0),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
     );
+    // The pre-hook's nonce is consumed, so its notes wait for private sync to pass that read.
+    assert!(fixture.reserved(&record));
+    let resolved_at = record.nonce_watermark().unwrap().block();
+    let record = fixture
+        .store
+        .record_synced(fixture.operation, None, resolved_at)
+        .unwrap();
     assert!(!fixture.reserved(&record));
 
     // The retry signs its pre-hook at k + 1, the nonce of the first attempt's post-hook.
@@ -1821,29 +1903,103 @@ async fn cancellation_and_an_older_post_hook_end_attempts_but_a_copied_shield_do
         crate::swap_invalidation(&record, &profile, now).unwrap(),
         Some(uid(1, 300))
     );
-    // No direct call to the executor won nonce k + 1, but the observed post-hook resolves it,
-    // so the next retry is admitted at k + 2 while ordinary operations stay blocked.
+    // No direct call to the executor won nonce k + 1, but the nonce read past it resolves it,
+    // so the next retry is admitted at k + 2.
     fixture.record_attempt(2, 400);
     let record = fixture.record();
     assert_eq!(
         record.swap().unwrap().orders()[2].pre_hook().nonce(),
         U256::from(3)
     );
-    let observed = record.nonce_observation().unwrap();
-    assert!(matches!(
-        fixture.store.record_issued(
-            fixture.operation,
-            IssuedExecutorPayload::new(
-                U256::from(3),
-                fixture.delegate,
-                B256::repeat_byte(0x3f),
-                ExecutorPayloadPurpose::Operation,
-                ExecutorPayloadContext::new(Bytes::from_static(b"operation"), observed, Vec::new()),
-            ),
-        ),
-        Err(ExecutorStoreError::OutstandingNonce)
-    ));
     fixture.finish().await;
+}
+
+#[tokio::test]
+async fn a_received_shield_names_the_recovery_over_a_cancellation_at_the_pre_hooks_nonce() {
+    let fixture = Fixture::start().await;
+    fixture.record_attempt(0, 200);
+    let first = uid(0, 200);
+    let observed = fixture.record().nonce_observation().unwrap();
+    // A cancellation and a recovery that also shields the sell token, both at the pre-hook's
+    // nonce and neither with a recorded transaction.
+    let request = ShieldRequest {
+        preimage: CommitmentPreimage {
+            npk: B256::repeat_byte(0x70),
+            token: TokenData::erc20(SELL),
+            value: U120::from(SELL_AMOUNT),
+        },
+        ..post_hook_shield(0)
+    };
+    let shield = Call {
+        to: EXECUTOR,
+        value: U256::ZERO,
+        data: shieldCall {
+            _shieldRequests: vec![request.clone()],
+        }
+        .abi_encode()
+        .into(),
+    };
+    let invalidate = invalidation(fixture.settlement, first);
+    for (hash, calls) in [
+        (0x39, vec![invalidate.clone()]),
+        (0x3a, vec![invalidate, shield]),
+    ] {
+        fixture
+            .store
+            .record_issued(
+                fixture.operation,
+                IssuedExecutorPayload::new(
+                    U256::ONE,
+                    fixture.delegate,
+                    B256::repeat_byte(hash),
+                    ExecutorPayloadPurpose::Recovery,
+                    ExecutorPayloadContext::new(
+                        execute(vec![private_transaction(0x31, 0x32)], calls, 1),
+                        observed,
+                        Vec::new(),
+                    ),
+                ),
+            )
+            .unwrap();
+    }
+    fixture.chain.lock().unwrap().nonces.push((30, 2));
+    // Nothing tells the two apart, and the cancellation is not named for lack of a shield.
+    let record = fixture.observe(36, 25).await;
+    assert_eq!(
+        state(&record, 0),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Unknown)
+    );
+
+    let received = railgun_wallet::WalletUtxo::new(Utxo::new(
+        request.preimage.note_with_random([0; 16]),
+        0,
+        50,
+        UtxoSource {
+            tx_hash: B256::repeat_byte(0x3c),
+            block_number: 30,
+            block_timestamp: timestamp(30),
+        },
+        UtxoCommitmentKind::Shield,
+    ));
+    let record = fixture.observe_synced(36, 25, synced(vec![received])).await;
+    assert_eq!(
+        state(&record, 0),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Recovery)
+    );
+    fixture.finish().await;
+}
+
+/// `invalidateOrder(uid)` on the settlement.
+fn invalidation(settlement: Address, uid: OrderUid) -> Call {
+    Call {
+        to: settlement,
+        value: U256::ZERO,
+        data: GPv2Settlement::invalidateOrderCall {
+            orderUid: uid.0.to_vec().into(),
+        }
+        .abi_encode()
+        .into(),
+    }
 }
 
 fn swap_profile() -> crate::settings::SwapProfile {
@@ -1983,10 +2139,15 @@ async fn a_settled_pre_hook_beats_a_cancellation_and_recovery_is_offered() {
         state(&record, 0),
         SwapOrderState::PreHookOnly { expired: false }
     );
-    assert_ne!(
-        record.payload_status(B256::repeat_byte(0x39)),
-        Some(ExecutorPayloadStatus::Executed)
+    assert!(
+        record.reserved_inputs().contains(&fee),
+        "the loser's fee note waits for private sync like every note at the consumed nonce"
     );
+    let resolved_at = record.nonce_watermark().unwrap().block();
+    let record = fixture
+        .store
+        .record_synced(fixture.operation, None, resolved_at)
+        .unwrap();
     assert!(
         !record.reserved_inputs().contains(&fee),
         "the loser's fee note is released"
@@ -2143,10 +2304,12 @@ fn assert_block_only_requests(requests: &[Value], block: BlockNumHash) {
 }
 
 #[tokio::test]
-async fn pending_observations_release_activity_and_reject_concurrent_changes() {
-    // Exercise history reconciliation, receipt-only settlement and a settled account's reuse
+async fn pending_observations_release_activity_and_never_overwrite_concurrent_changes() {
+    // Exercise the account read, receipt-only settlement and a settled account's reuse
     // refresh: none may hold activity over RPC, and none may overwrite a changed local record.
-    for path in ["history", "settlement", "settled reuse"] {
+    // The account read is a fact about the chain and is applied to the record as changed;
+    // the other two decide from their snapshot and are refused.
+    for path in ["account", "settlement", "settled reuse"] {
         let fixture = Fixture::start().await;
         fixture.record_attempt(1, 20);
         let logs = settlement_logs(&fixture, 1, 20);
@@ -2198,7 +2361,7 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
                     .reuse_swap_account(operation, 15, SwapAccountRole::Source, SwapAccountUse::New)
                     .await
                     .map(|_| ()),
-                _ => owner.reconcile_history(operation, 15..16).await.map(|_| ()),
+                _ => owner.reconcile_account(operation).await.map(|_| ()),
             }
         };
         tokio::pin!(pending);
@@ -2210,7 +2373,7 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(2),
-                owner.reconcile_history(ExecutorOperationId::random().unwrap(), 1..2),
+                owner.reconcile_account(ExecutorOperationId::random().unwrap()),
             )
             .await
             .expect("pending observation must release activity")
@@ -2225,16 +2388,29 @@ async fn pending_observations_release_activity_and_reject_concurrent_changes() {
                 gate.release_response.notify_one();
             }
         });
-        let error = tokio::time::timeout(Duration::from_secs(5), pending)
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pending)
             .await
-            .unwrap()
-            .unwrap_err();
-        assert!(error.is::<crate::ExecutorRecordChanged>(), "{error:#}");
-        assert_eq!(
-            fixture.record(),
-            changed,
-            "late observation changed the record"
-        );
+            .unwrap();
+        if path == "account" {
+            outcome.unwrap();
+            let record = fixture.record();
+            assert!(record.is_hidden(), "the read kept the concurrent change");
+            assert_eq!(
+                record.nonce_observation(),
+                Some(ExecutorNonceObservation::new(
+                    fixture.chain.lock().unwrap().block(15),
+                    U256::ONE
+                ))
+            );
+        } else {
+            let error = outcome.unwrap_err();
+            assert!(error.is::<crate::ExecutorRecordChanged>(), "{error:#}");
+            assert_eq!(
+                fixture.record(),
+                changed,
+                "late observation changed the record"
+            );
+        }
         release.abort();
         server.abort();
         owner.shutdown().await;

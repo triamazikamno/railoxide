@@ -128,9 +128,24 @@ pub(super) const fn public_swap_facts(stage: PublicSwapStage) -> &'static [Publi
 }
 
 impl PrivateSwapsView {
-    pub(super) fn public_destination_railgun(&self, record: &ExecutorRecord) -> Option<Address> {
+    pub(super) fn public_destination_balance(
+        &self,
+        record: &ExecutorRecord,
+        claimed: &SwapUseRecord,
+    ) -> Option<(U256, alloy::eips::BlockNumHash)> {
         let chain = self.public_record_chain(record)?;
-        self.public_railgun.get(&chain).copied()
+        self.public_destination_balances
+            .get(&(chain, record.operation(), claimed.id()))
+            .copied()
+            .filter(|(_, read_at)| {
+                claimed.public_swap().is_some_and(|swap| {
+                    matches!(
+                        swap.observations().bridge_outcome,
+                        Some(SwapBridgeOutcome::HeldOnDestination { block, .. })
+                            if read_at.number >= block.number
+                    )
+                })
+            })
     }
 
     pub(super) fn public_swap_record(
@@ -162,7 +177,8 @@ impl PrivateSwapsView {
                         claimed,
                         None,
                         now_unix(),
-                        self.public_destination_railgun(record),
+                        self.attribution(record),
+                        self.public_destination_balance(record, claimed),
                     )?;
                     // Held funds stay visible for recovery. Reported delivery stays in history.
                     (stage.group() != SwapOrderGroup::Ended
@@ -264,9 +280,8 @@ impl PrivateSwapsView {
         let held = match observed.bridge_outcome {
             Some(SwapBridgeOutcome::HeldOnDestination { .. }) => {
                 super::model::public_held_remaining(
-                    record,
                     claimed,
-                    self.public_destination_railgun(record),
+                    self.public_destination_balance(record, claimed),
                 )
                 .map(|amount| self.public_chain_amount(destination, *destination_token, amount, cx))
             }
@@ -376,7 +391,8 @@ impl PrivateSwapsView {
             claimed,
             None,
             now_unix(),
-            self.public_destination_railgun(record),
+            self.attribution(record),
+            self.public_destination_balance(record, claimed),
         ) else {
             return (div(), None);
         };

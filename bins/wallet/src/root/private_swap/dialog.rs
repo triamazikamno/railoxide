@@ -505,7 +505,7 @@ impl PrivateSwapsView {
                     continue;
                 };
                 // An earlier swap ended before the next one could start.
-                let stage = swap_order_stage(record, order);
+                let stage = swap_order_stage(record, order, self.attribution(record));
                 entries.push(OrderEntry {
                     record,
                     view: SwapDialogView::PastDetail(
@@ -555,7 +555,8 @@ impl PrivateSwapsView {
                     claimed,
                     None,
                     super::now_unix(),
-                    self.public_destination_railgun(record),
+                    self.attribution(record),
+                    self.public_destination_balance(record, claimed),
                 ) else {
                     continue;
                 };
@@ -719,9 +720,14 @@ impl PrivateSwapsView {
             Some(SwapDialogView::Detail(operation)) => self
                 .record(operation)
                 .map(|record| (self.progress_stage(record), swap_delivery(record))),
-            Some(SwapDialogView::PastDetail(swap, first)) => self
-                .past_swap(swap, first)
-                .map(|(record, _, order)| (swap_order_stage(record, order), order.delivery())),
+            Some(SwapDialogView::PastDetail(swap, first)) => {
+                self.past_swap(swap, first).map(|(record, _, order)| {
+                    (
+                        swap_order_stage(record, order, self.attribution(record)),
+                        order.delivery(),
+                    )
+                })
+            }
             _ => None,
         };
         let completed = stage.and_then(|(stage, delivery)| {
@@ -981,7 +987,8 @@ impl PrivateSwapsView {
                 claimed,
                 None,
                 super::now_unix(),
-                self.public_destination_railgun(record),
+                self.attribution(record),
+                self.public_destination_balance(record, claimed),
             )
             .expect("public use");
             let amount = match stage {

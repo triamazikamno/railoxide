@@ -2,9 +2,9 @@ use broadcaster_core::contracts::cow::OrderUid;
 
 use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorInputIdentity, ExecutorOperationId,
-    ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStore,
-    ExecutorStoreError, FixedBytes, IssuedExecutorPayload, Serialize, SwapDestinationOutcome,
-    SwapUseId, SwapUseRecord, SwapUseRole, U256,
+    ExecutorPayloadPurpose, ExecutorRecord, ExecutorStore, ExecutorStoreError, FixedBytes,
+    IssuedExecutorPayload, Serialize, SwapDestinationOutcome, SwapUseId, SwapUseRecord,
+    SwapUseRole, U256,
 };
 
 /// Public components of the Railgun address that every post-hook of one swap
@@ -39,7 +39,8 @@ pub struct SwapTerms {
     sell_token: Address,
     buy_token: Address,
     recipient: SwapRecipient,
-    /// The delegation-only setup operation, which must win its nonce first.
+    /// The latest delegation-only setup issued when the order was signed. Its nonce must be
+    /// resolved first; which setup signed at that nonce ran is not recorded.
     setup_payload: B256,
 }
 
@@ -1003,9 +1004,10 @@ impl ExecutorRecord {
     /// Completed swaps are durable at the accepted safety cutoff, whichever role the account
     /// had in them: every order traded and delivered, and every destination use that signed a
     /// shield had its fill run one, all at or below the cutoff. Reuse still needs a fresh nonce
-    /// and delegation, but no historical RPC evidence for these outcomes. A consumed nonce is
-    /// not such an outcome: a signed shield without a shielded delivery leaves the account
-    /// unsettled, as does any recovery.
+    /// and delegation, but no historical RPC evidence for these outcomes. A setup is settled
+    /// once its nonce is resolved. For a shield a consumed nonce is not such an outcome: a
+    /// signed shield without a shielded delivery leaves the account unsettled, as does any
+    /// recovery.
     pub(crate) fn settled_swaps_at(&self, cutoff: u64) -> bool {
         let orders = self
             .swap
@@ -1033,7 +1035,6 @@ impl ExecutorRecord {
         self.nonce_observation
             .is_some_and(|observed| observed.block.number <= cutoff)
             && !(orders.is_empty() && delivered_shields.is_empty())
-            && self.recovery_transactions.is_empty()
             && orders.iter().all(|order| order.settled_at(cutoff))
             && self.issued.iter().all(|payload| match payload.purpose {
                 ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook => {
@@ -1044,10 +1045,7 @@ impl ExecutorRecord {
                                 .is_some_and(|hook| hook.payload == payload.hash)
                     })
                 }
-                ExecutorPayloadPurpose::Operation => payload.inclusion.is_some_and(|inclusion| {
-                    inclusion.block.number <= cutoff
-                        && inclusion.result == super::ExecutorExecutionResult::Executed
-                }),
+                ExecutorPayloadPurpose::Operation => self.nonce_resolved(payload.nonce),
                 ExecutorPayloadPurpose::SwapDestinationShield => {
                     delivered_shields.contains(&payload.hash)
                 }
@@ -1100,9 +1098,10 @@ impl ExecutorRecord {
         self.swap_setup_stopped
     }
 
-    /// Keep executed pre-hook inputs reserved while private sync catches up, just
-    /// like ordinary winning payloads. Only a dead, unexecuted pre-hook releases
-    /// its notes. Removing that observation on reorg restores the reservation.
+    /// Only a dead, unexecuted pre-hook releases its notes. Removing that observation on
+    /// reorg restores the reservation. Input reservation asks this while the pre-hook's
+    /// nonce is unconsumed; at a resolved nonce its notes wait for private sync like any
+    /// other payload's.
     pub(super) fn releases_swap_inputs(&self, pre_hook: B256) -> bool {
         self.nonce_observation.is_some()
             && self.swap.as_ref().is_some_and(|swap| {
@@ -1205,24 +1204,23 @@ impl ExecutorRecord {
         })
     }
 
-    /// Whether a recovery review warns of a competing payload. Unresolved payloads compete.
-    /// Swap hooks run inside settlements, and a destination shield inside a relayer's fill,
-    /// where direct-call reconciliation never resolves them, so they compete only while
-    /// outstanding at the last reconciled nonce.
+    /// Whether a recovery review warns of a competing payload. A payload competes until the
+    /// account's nonce is read past its own. Swap hooks run inside settlements, and a
+    /// destination shield inside a relayer's fill, so they compete only while outstanding
+    /// at the last nonce read.
     #[must_use]
     pub fn has_competing_payloads(&self) -> bool {
         self.issued.iter().any(|payload| {
-            !matches!(
-                self.payload_status(payload.hash),
-                Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
-            ) && (!matches!(
-                payload.purpose,
-                ExecutorPayloadPurpose::SwapPreHook
-                    | ExecutorPayloadPurpose::SwapPostHook
-                    | ExecutorPayloadPurpose::SwapDestinationShield
-            ) || self
-                .nonce_observation
-                .is_none_or(|observed| self.is_outstanding_at(payload, observed.nonce)))
+            self.nonce_observation
+                .is_none_or(|observed| payload.nonce >= observed.nonce)
+                && (!matches!(
+                    payload.purpose,
+                    ExecutorPayloadPurpose::SwapPreHook
+                        | ExecutorPayloadPurpose::SwapPostHook
+                        | ExecutorPayloadPurpose::SwapDestinationShield
+                ) || self
+                    .nonce_observation
+                    .is_none_or(|observed| self.is_outstanding_at(payload, observed.nonce)))
         })
     }
 
@@ -1255,18 +1253,6 @@ impl ExecutorRecord {
             })
     }
 
-    /// A pre-hook that runs inside a settlement never becomes a direct-call winner. Once its
-    /// execution is observed, it won its nonce, and any other payload at that nonce, such as
-    /// an early cancellation, lost.
-    pub(super) fn swap_pre_hook_took_nonce(&self, nonce: U256) -> bool {
-        self.nonce_observation.is_some()
-            && self.swap.as_ref().is_some_and(|swap| {
-                swap.orders.iter().any(|order| {
-                    order.pre_hook.nonce == nonce && order.observations.pre_hook_executed.is_some()
-                })
-            })
-    }
-
     /// A post-hook that runs inside a settlement never becomes a direct-call winner. Its nonce
     /// is resolved by its observed shield or Across deposit and consumed nonce, including when
     /// an older post-hook took another order's pre-hook nonce.
@@ -1286,14 +1272,33 @@ impl ExecutorRecord {
         })
     }
 
-    /// The swap hook payload that took `nonce`, based on recorded observations and the same
-    /// facts as `swap_pre_hook_took_nonce` and `swap_post_hook_took_nonce`. When an older
+    /// The swap hook payload that took `nonce`, based on recorded observations: a pre-hook
+    /// observed as executed, or the facts of `swap_post_hook_took_nonce`. When an older
     /// post-hook took an order's pre-hook nonce, it is named only if one order holds a
     /// post-hook at that nonce.
     #[must_use]
     pub fn swap_hook_winner(&self, nonce: U256) -> Option<B256> {
+        self.swap_hook_at(
+            nonce,
+            self.nonce_observation.is_some(),
+            self.nonce_observation
+                .is_some_and(|observed| observed.nonce > nonce),
+        )
+    }
+
+    /// [`Self::swap_hook_winner`] for a nonce the watermark shows consumed. It reads recorded
+    /// observations only, so it holds without a current nonce observation.
+    #[must_use]
+    pub fn resolved_swap_hook(&self, nonce: U256) -> Option<B256> {
+        let resolved = self.nonce_resolved(nonce);
+        self.swap_hook_at(nonce, resolved, resolved)
+    }
+
+    /// `pre_hook` and `post_hook` say whether an executed pre-hook and a post-hook with
+    /// evidence may be named at `nonce`.
+    fn swap_hook_at(&self, nonce: U256, pre_hook: bool, post_hook: bool) -> Option<B256> {
         let swap = self.swap.as_ref()?;
-        if self.nonce_observation.is_some()
+        if pre_hook
             && let Some(order) = swap.orders.iter().find(|order| {
                 order.pre_hook.nonce == nonce && order.observations.pre_hook_executed.is_some()
             })
@@ -1302,11 +1307,7 @@ impl ExecutorRecord {
         }
         if let Some(post_hook) = swap.orders.iter().find_map(|order| {
             order.post_hook.filter(|hook| {
-                hook.nonce == nonce
-                    && order.observations.post_hook_evidence()
-                    && self
-                        .nonce_observation
-                        .is_some_and(|observed| observed.nonce > nonce)
+                post_hook && hook.nonce == nonce && order.observations.post_hook_evidence()
             })
         }) {
             return Some(post_hook.payload);
@@ -1379,6 +1380,7 @@ impl ExecutorStore {
                 return Err(ExecutorStoreError::OutstandingNonce);
             }
             record.nonce_observation = Some(observed);
+            record.set_nonce_watermark(observed.into());
             Ok(())
         })
     }
@@ -1477,10 +1479,10 @@ impl ExecutorStore {
                 || record.swap_setup_stopped
                 || record.address != Some(uid.owner())
                 || record.public_account_uuid.is_some()
-                || record.swap.as_ref().is_some_and(|swap| {
-                    swap.terms.recipient != terms.recipient
-                        || swap.terms.setup_payload != terms.setup_payload
-                })
+                || record
+                    .swap
+                    .as_ref()
+                    .is_some_and(|swap| swap.terms.recipient != terms.recipient)
                 || pre_hook.delegate != record.delegate
                 || pre_hook.purpose != ExecutorPayloadPurpose::SwapPreHook
                 || record
@@ -1529,11 +1531,9 @@ impl ExecutorStore {
             }
             let observed = pre_hook.context.observed;
             let nonce = pre_hook.nonce;
-            // The setup must have won its nonce. Earlier pre-hooks have ended or executed.
-            // Post-hooks below the current nonce need execution evidence or finalized
-            // delivery; the current nonce makes their old signatures unusable either way.
-            // The same holds for a shield this account signed as an earlier swap's
-            // destination, which needs that swap's shielded delivery.
+            // The setup's nonce must be resolved, whichever setup signed at it ran. Every
+            // nonce below the current one is resolved with it, which makes the old
+            // signatures of earlier hooks and shields unusable.
             if record.nonce_observation != Some(observed)
                 || observed.nonce != nonce
                 || pre_hook.context.calldata.is_empty()
@@ -1543,12 +1543,11 @@ impl ExecutorStore {
                         || post_hook.context.calldata.is_empty()
                 })
                 || !record.issued.iter().any(|issued| {
-                    issued.hash == terms.setup_payload
-                        && record.winner(issued.nonce) == Some(issued.hash)
+                    issued.hash == terms.setup_payload && record.nonce_resolved(issued.nonce)
                 })
                 || record.issued.iter().any(|issued| {
                     issued.nonce < nonce
-                        && record.winner(issued.nonce).is_none()
+                        && !record.nonce_resolved(issued.nonce)
                         && !(issued.purpose == ExecutorPayloadPurpose::SwapPostHook
                             && (record.swap_post_hook_took_nonce(issued.nonce)
                                 || orders.iter().any(|order| {

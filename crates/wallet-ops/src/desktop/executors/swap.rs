@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,17 +13,19 @@ use super::execution::OperationReservation;
 use super::recovery::{PaidExecutionPurpose, recovery_gas_limits, require_private_fee_limit};
 use super::{
     ExecutorDelivery, ExecutorOwner, ExecutorPaidRecoveryOutcome, ExecutorReconciliationReport,
-    ExecutorRecoveryExecution, ExecutorRecoveryFeeEstimate, PreparedExecutorOperation,
+    ExecutorRecoveryFeeEstimate, PreparedExecutorOperation,
 };
 use crate::desktop::executor_discovery::{execution_nonce_with_code, matches_executor_delegation};
-use crate::desktop::executor_observation::{ObservationEndpoints, trace_step};
+use crate::desktop::executor_observation::{
+    ObservationEndpoints, read_executor_account, trace_step,
+};
 use crate::settings::{ExecutorProfile, SwapTokenEligibility};
 use crate::vault::{
     BridgeDelivery, ClaimedSwapPair, ExecutorNonceObservation, ExecutorOperationId,
-    ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, SwapAccountChoice,
-    SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence, SwapApproval, SwapApprovalTokens,
-    SwapApprovedAccount, SwapApprovedAccounts, SwapDelivery, SwapDestinationClaim, SwapPairClaim,
-    SwapUseCancellation, SwapUseId, SwapUseRecord, SwapUseRole, swap_account_refusal,
+    ExecutorPayloadPurpose, ExecutorRecord, SwapAccountChoice, SwapAccountRole, SwapAccountUse,
+    SwapAdmissionEvidence, SwapApproval, SwapApprovalTokens, SwapApprovedAccount,
+    SwapApprovedAccounts, SwapDelivery, SwapDestinationClaim, SwapPairClaim, SwapUseCancellation,
+    SwapUseId, SwapUseRecord, SwapUseRole, swap_account_refusal,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction,
@@ -52,6 +53,7 @@ pub use bridge::{
     BridgeLegPrice, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapPrivateBridgeQuote,
 };
 pub use observation::{SwapOrderState, swap_order_state};
+pub(super) use order::invalidates_order;
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,
     SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
@@ -68,7 +70,9 @@ pub use public_order::{
     public_swap_batch_terms,
 };
 pub use public_settlement::{PublicSwapOrderState, public_swap_order_state};
-pub use public_source::{PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapUseClaim};
+pub use public_source::{
+    PublicSwapDelivery, PublicSwapDeliveryQuote, PublicSwapDeliverySigning, PublicSwapUseClaim,
+};
 pub use public_tracking::{PublicSwapProgress, PublicSwapTracking};
 pub use public_transactions::{
     AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
@@ -476,8 +480,8 @@ where
     })
 }
 
-/// A swap executor whose setup canonically installed the accepted delegation and
-/// consumed its execution nonce. Order preparation for the swap starts here.
+/// A swap executor that canonically carries the accepted delegation, with an execution
+/// nonce past its setup's. Order preparation for the swap starts here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegatedSwapExecutor {
     operation: ExecutorOperationId,
@@ -500,7 +504,8 @@ impl DelegatedSwapExecutor {
     pub const fn delegate(&self) -> Address {
         self.delegate
     }
-    /// The winning setup, recorded in the swap's terms with its first order.
+    /// The latest issued setup whose nonce is resolved, recorded in the swap's terms with
+    /// its first order. Which setup signed at that nonce ran is not established.
     #[must_use]
     pub const fn setup_payload(&self) -> B256 {
         self.setup_payload
@@ -611,18 +616,18 @@ impl From<DelegatedSwapExecutor> for SwapExecutor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapSetupStatus {
-    /// No setup outcome is canonical at the confirmed block yet.
+    /// No setup's nonce is consumed at the confirmed block yet. A setup that reverted or
+    /// whose authorization was skipped leaves its nonce unconsumed and stays here.
     Pending,
-    /// Every issued setup reverted or lost its nonce. Resume with the same executor.
-    Failed,
-    /// A setup transaction succeeded but its authorization was not applied.
+    /// A setup's nonce is consumed and the account lacks the accepted delegation.
     MissingDelegation,
     Delegated(DelegatedSwapExecutor),
 }
 
 /// Evaluate a reconciled swap record against the account code read at its nonce
-/// observation block. Delegation needs the accepted designator, an executed setup,
-/// and an execution nonce past that setup's nonce; no single signal suffices.
+/// observation block. Delegation needs the accepted designator and an execution nonce
+/// past a setup's nonce; neither signal suffices alone. Which of several setups signed at
+/// that nonce ran is not asked.
 #[must_use]
 pub fn swap_setup_status(
     record: &ExecutorRecord,
@@ -636,58 +641,48 @@ pub fn swap_setup_status(
     if observed.block() != code_block || record.delegate() != profile.delegate() {
         return SwapSetupStatus::Pending;
     }
-    let delegated = matches_executor_delegation(code, profile);
-    let (mut failed, mut pending) = (false, false);
-    for setup in record
-        .issued()
-        .iter()
-        .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
-    {
-        match record.payload_status(setup.hash()) {
-            Some(ExecutorPayloadStatus::Executed)
-                if delegated && observed.nonce() > setup.nonce() =>
-            {
-                return SwapSetupStatus::Delegated(DelegatedSwapExecutor {
-                    operation: record.operation(),
-                    executor,
-                    delegate: record.delegate(),
-                    setup_payload: setup.hash(),
-                    observed,
-                });
-            }
-            // A call to an undelegated account succeeds without the setup's effects.
-            Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::MissingEffects)
-                if !delegated =>
-            {
-                return SwapSetupStatus::MissingDelegation;
-            }
-            Some(ExecutorPayloadStatus::Reverted | ExecutorPayloadStatus::Invalidated { .. }) => {
-                failed = true;
-            }
-            _ => pending = true,
-        }
+    let Some(setup) = resolved_swap_setup(record) else {
+        return SwapSetupStatus::Pending;
+    };
+    if !matches_executor_delegation(code, profile) {
+        return SwapSetupStatus::MissingDelegation;
     }
-    if failed && !pending {
-        SwapSetupStatus::Failed
-    } else {
-        SwapSetupStatus::Pending
-    }
+    SwapSetupStatus::Delegated(DelegatedSwapExecutor {
+        operation: record.operation(),
+        executor,
+        delegate: record.delegate(),
+        setup_payload: setup,
+        observed,
+    })
 }
 
-/// Whether a swap without orders records an executed setup for `profile`'s delegate: the
-/// recorded winner of a setup nonce, which may be an earlier attempt that invalidated its
-/// replacement. This is recorded progress under the wallet's issuance assumptions. The
-/// inclusion's receipt check verifies the Railgun-emitted effects, not the authorization,
-/// the delegation designator, or the nonce, so this never authorizes signing; order
-/// preparation checks the account afresh with [`swap_setup_status`].
+/// The latest issued setup whose nonce is resolved. Several setups signed at one nonce,
+/// as fee re-quotes and retries leave, are one outcome.
+fn resolved_swap_setup(record: &ExecutorRecord) -> Option<B256> {
+    record
+        .issued()
+        .iter()
+        .rev()
+        .find(|payload| {
+            payload.purpose() == ExecutorPayloadPurpose::Operation
+                && record.payload_state(payload.hash())
+                    == Some(crate::vault::ExecutorPayloadState::Resolved)
+        })
+        .map(crate::vault::IssuedExecutorPayload::hash)
+}
+
+/// Whether a swap without orders records a resolved setup for `profile`'s delegate: a setup
+/// nonce the watermark shows consumed, whichever setup signed at it ran. This is recorded
+/// progress under the wallet's issuance assumptions. A consumed nonce says nothing about
+/// the delegation designator, so this never authorizes signing; order preparation checks
+/// the account afresh with [`swap_setup_status`].
 #[must_use]
 pub fn swap_setup_recorded_executed(record: &ExecutorRecord, profile: ExecutorProfile) -> bool {
     record.swap().is_none()
         && record.delegate() == profile.delegate()
         && record.issued().iter().any(|payload| {
             payload.purpose() == ExecutorPayloadPurpose::Operation
-                && record.recorded_payload_status(payload.hash())
-                    == Some(ExecutorPayloadStatus::Executed)
+                && record.nonce_resolved(payload.nonce())
         })
 }
 
@@ -1111,19 +1106,49 @@ impl ExecutorOwner {
         .await
     }
 
-    /// Reconcile the setup over `range`, rechecking earlier inclusions, at the
-    /// confirmed block, and read the executor's code at that same block. A retry
-    /// of a delegated swap resumes from the returned executor.
+    /// One pass of a setup wait: read the executor's code and execution nonce at the
+    /// confirmed tip, record the nonce, and decide from that state alone. No block, receipt
+    /// or transaction is read, so a pass costs the same however long ago the setup was
+    /// signed. A retry of a delegated swap resumes from the returned executor.
+    ///
+    /// The read is a fact about the chain, not a decision taken from a snapshot of the
+    /// record, so it is applied to the record as it is by then. Another observation
+    /// writing during the read leaves the setup pending at worst, and the next pass reads
+    /// again.
     pub async fn observe_swap_setup(
         &self,
         operation: ExecutorOperationId,
-        range: Range<u64>,
     ) -> Result<SwapSetupStatus> {
-        if self.swap_account_record(operation)?.is_none() {
-            return Err(eyre!("swap executor is unavailable"));
-        }
-        let report = trace_step("setup_history", self.reconcile_history(operation, range)).await?;
-        self.check_swap_setup(&report).await
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let Some(executor) = record.address() else {
+            return Ok(SwapSetupStatus::Pending);
+        };
+        let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
+            .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
+        chain.enabled = true;
+        let read = trace_step(
+            "setup_account",
+            self.while_active(read_executor_account(
+                &self.endpoints,
+                &chain,
+                executor,
+                None,
+            )),
+        )
+        .await?;
+        // Code the execution nonce is not read under shows nothing about the setup's nonce.
+        let Some(observed) = read.nonce else {
+            return Ok(SwapSetupStatus::Pending);
+        };
+        let _guard = self.lock_activity().await;
+        self.ensure_active()?;
+        let record = self.apply_account_read(operation, observed)?;
+        Ok(swap_setup_status(&record, read.block, &read.code, profile))
     }
 
     /// Confirm this chain's destination stealth account of a private Bridge swap at
@@ -1132,7 +1157,8 @@ impl ExecutorOwner {
     /// `origin_operation`, and be `receiver`, the account the order's delivery names. Nothing
     /// is signed.
     ///
-    /// An account the use reserved fresh is confirmed from its setup. An account the use
+    /// An account the use reserved fresh is confirmed from its setup by one account read at
+    /// the confirmed tip. An account the use
     /// reuses passes [`Self::reuse_swap_account`] as a destination, and `notes`, the wallet's
     /// local notes on this chain, must show no earlier shield with an open POI verdict or
     /// refund. Its receiving-token balance is read when the shield is issued.
@@ -1210,9 +1236,8 @@ impl ExecutorOwner {
                 admission::require_earlier_shields_resolved(&record, swap_use, notes)?;
                 return Ok(delegated);
             }
-            let range = confirmed..confirmed.saturating_add(1);
             let report =
-                trace_step("destination_history", self.reconcile_history(operation, range)).await?;
+                trace_step("destination_account", self.reconcile_account(operation)).await?;
             let SwapSetupStatus::Delegated(delegated) =
                 trace_step("destination_setup", self.check_swap_setup(&report)).await?
             else {
@@ -1243,26 +1268,13 @@ impl ExecutorOwner {
         };
         let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
-        // Only an executed or effect-less setup call depends on the account's code.
-        let executed = record
-            .issued()
-            .iter()
-            .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
-            .any(|payload| {
-                matches!(
-                    record.payload_status(payload.hash()),
-                    Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::MissingEffects)
-                )
-            });
-        // The history's nonce read loaded the code; reuse it when read at the same block.
-        let code = if !executed {
+        // Only a setup whose nonce is resolved depends on the account's code.
+        let resolved = resolved_swap_setup(record).is_some();
+        // The account read loaded the code; reuse it when the record's nonce is from that block.
+        let code = if !resolved {
             Bytes::new()
-        } else if let Some((_, code)) = report
-            .code
-            .as_ref()
-            .filter(|(block, _)| *block == observed.block())
-        {
-            code.clone()
+        } else if report.code.0 == observed.block() {
+            report.code.1.clone()
         } else {
             trace_step(
                 "setup_delegation",
@@ -1401,7 +1413,7 @@ impl ExecutorOwner {
             .find(|record| record.operation() == operation))
     }
 
-    /// User-selected reuse needs current account state, not another history scan when all
+    /// User-selected reuse needs current account state, not another swap observation, when all
     /// swaps already have finalized delivery, whichever role the account had in them. Reads
     /// are outside activity; commit checks that no signing, recovery or observation changed
     /// the snapshot meanwhile, and then judges the refreshed record for `swap_use` in `role`.
@@ -1487,21 +1499,14 @@ impl ExecutorOwner {
                         swap_use,
                         SwapAdmissionEvidence::Fresh,
                     )?;
-                    // Use the retained setup and fresh nonce; no historical winner is added.
-                    let setup = record
-                        .issued()
-                        .iter()
-                        .find(|payload| {
-                            payload.purpose() == ExecutorPayloadPurpose::Operation
-                                && record.payload_status(payload.hash())
-                                    == Some(ExecutorPayloadStatus::Executed)
-                        })
+                    // Use the retained setup and fresh nonce; nothing is attributed.
+                    let setup = resolved_swap_setup(&record)
                         .ok_or_else(|| eyre!("the account's setup is unavailable"))?;
                     return Ok(SwapExecutor::from(DelegatedSwapExecutor {
                         operation: record.operation(),
                         executor,
                         delegate: record.delegate(),
-                        setup_payload: setup.hash(),
+                        setup_payload: setup,
                         observed,
                     }));
                 }
@@ -1553,13 +1558,7 @@ impl ExecutorOwner {
 /// A setup is a paid execute without actions: only the shared execution overhead. Without
 /// steps to carry it, the budget adds the chain's gas limit `buffer` once.
 fn setup_gas_budget(chain_id: u64, buffer: u64) -> u64 {
-    recovery_gas_limits(
-        RailgunGasModel::for_chain(chain_id),
-        &[],
-        ExecutorRecoveryExecution::PaidExecute { nonce: U256::ZERO },
-        0,
-    )[0]
-    .saturating_add(buffer)
+    recovery_gas_limits(RailgunGasModel::for_chain(chain_id), &[], 0)[0].saturating_add(buffer)
 }
 
 /// Account code at a canonical block, read only from endpoints admitted for this chain.

@@ -2737,6 +2737,8 @@ impl PrivateSwapsView {
         // Debug UI fixture: a `detail:` mode shows its synthesized swap in place of the form.
         #[cfg(debug_assertions)]
         self.open_ui_fixture_detail(source, sell, window, cx);
+        #[cfg(debug_assertions)]
+        self.stage_public_route_error_for_fixture(window, cx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3674,6 +3676,12 @@ impl PrivateSwapsView {
         };
         if let Some(public) = form.public.as_mut() {
             public.invalidate_quote_route();
+            form.quote_revision = form.quote_revision.wrapping_add(1);
+            form.quote_task = None;
+            form.quote = QuoteState::Idle;
+            form.bridge_quote_error = None;
+            form.price_acknowledged = false;
+            form.high_costs_acknowledged = false;
             public.route_errors.clear();
             public.route_tasks.clear();
             self.load_bridge_routes(window, cx);
@@ -5619,16 +5627,12 @@ impl PrivateSwapsView {
         if approval.origin.is_some() {
             tracking.setup = None;
             tracking.cursor = None;
-            tracking.setup_read_at = None;
-            tracking.located_at = None;
         }
         if destination
             .as_ref()
             .is_some_and(|destination| destination.plan.setup().is_some())
         {
             tracking.destination_setup = None;
-            tracking.destination_cursor = None;
-            tracking.destination_read_at = None;
         }
         if draft.is_some() {
             tracking.pending_order = draft;
@@ -6090,11 +6094,9 @@ impl PrivateSwapsView {
             }
         };
         let network = network_name(retry.setup.chain_id);
-        // The new attempt is observed from its own start.
+        // The new attempt is observed afresh.
         let tracking = self.tracking.entry(operation).or_default();
         tracking.destination_setup = None;
-        tracking.destination_cursor = None;
-        tracking.destination_read_at = None;
         tracking.error = None;
         tracking.auto_place = true;
         self.start_job(

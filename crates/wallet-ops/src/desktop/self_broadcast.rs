@@ -269,16 +269,15 @@ pub(super) async fn submit_self_broadcast_plan(
                         if let Some((owner, identity)) = &executor
                             && let SelfBroadcastTxOutcome::Receipt(receipt) = tx
                         {
-                            let range = receipt.block_number..receipt.block_number.saturating_add(1);
                             let reconciliation = match &signer {
-                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_history(owner, identity.operation(), range).await,
-                                _ => owner.reconcile_history(identity.operation(), range).await,
+                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_account(owner, identity.operation()).await,
+                                _ => owner.reconcile_account(identity.operation()).await,
                             };
-                            let status = reconciliation
+                            let state = reconciliation
                                 .ok()
-                                .and_then(|report| report.record().payload_status(identity.payload()))
-                                .unwrap_or(vault::ExecutorPayloadStatus::Uncertain);
-                            tx = SelfBroadcastTxOutcome::ExecutorReceipt { receipt, status };
+                                .and_then(|report| report.record().payload_state(identity.payload()))
+                                .unwrap_or(vault::ExecutorPayloadState::Pending);
+                            tx = SelfBroadcastTxOutcome::ExecutorReceipt { receipt, state };
                         }
                         return Ok(DesktopSelfBroadcastResult {
                             chain_id,

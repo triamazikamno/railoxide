@@ -332,7 +332,8 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
         status.size.width < gpui::px(130.),
         "Status badge stretched across its column: {status:?}"
     );
-    // Only the mined payload is shown for a consumed nonce, identified by its transaction.
+    // Each action signed at a consumed nonce has a row. The submitted one is identified by
+    // its transaction.
     let winner = alloy::primitives::B256::repeat_byte(32);
     let transaction = alloy::primitives::B256::repeat_byte(40);
     let superseded = alloy::primitives::B256::repeat_byte(31);
@@ -342,8 +343,8 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             primitives::{Bytes, U256},
         };
         use wallet_ops::vault::{
-            ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-            ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
+            ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorPayloadContext,
+            ExecutorPayloadPurpose, IssuedExecutorPayload,
         };
         let block = BlockNumHash::new(25_990_899, transaction);
         let payloads = [superseded, winner].map(|hash| {
@@ -360,12 +361,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             ))
             .unwrap();
             if hash == winner {
-                payload["inclusion"] = serde_json::to_value(ExecutorPayloadInclusion::new(
-                    block,
-                    transaction,
-                    ExecutorExecutionResult::Executed,
-                ))
-                .unwrap();
+                payload["transaction_hashes"] = serde_json::json!([transaction]);
             }
             payload
         });
@@ -376,6 +372,8 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             .unwrap();
         let mut saved = serde_json::to_value(&*record).unwrap();
         saved["issued"] = serde_json::json!(payloads);
+        saved["nonce_watermark"] =
+            serde_json::json!(ExecutorNonceWatermark::new(U256::ONE, block.number));
         *record = serde_json::from_value(saved).unwrap();
         cx.notify();
     });
@@ -561,38 +559,31 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             .is_hidden()
     );
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    // A retained pending transaction must remain reachable for retry even
-    // without a balance observation in this session. Load its saved shape into
-    // the view fixture without exposing the owner's private write API.
+    // Recover is reachable from the row menu only through a completed positive balance.
+    // Load one into the view fixture as a check would have left it, without starting one.
     panel.update(cx, |panel, cx| {
-        use alloy::{eips::BlockNumHash, primitives::B256, rpc::types::TransactionRequest};
-        use wallet_ops::vault::{ExecutorOperationId, ExecutorRecoveryStepKind};
-        let record = panel
-            .records
-            .iter_mut()
-            .find(|record| record.operation() == operations[1])
-            .unwrap();
-        let transaction = TransactionRequest {
-            from: record.address(),
-            chain_id: Some(1),
-            nonce: Some(7),
-            gas: Some(100_000),
-            max_fee_per_gas: Some(2),
-            max_priority_fee_per_gas: Some(1),
-            ..TransactionRequest::default().to(recipient)
+        use super::super::observations::{BalanceObservation, BalanceValue, CheckAttempt};
+        use alloy::{
+            eips::BlockNumHash,
+            primitives::{B256, U256},
         };
-        let mut saved = serde_json::to_value(&*record).unwrap();
-        saved["recovery_transactions"] = serde_json::json!([{
-            "recovery": ExecutorOperationId::random().unwrap(),
-            "step": 0,
-            "kind": ExecutorRecoveryStepKind::Shield,
-            "transaction": transaction,
-            "hash": B256::repeat_byte(4),
-            "observed": BlockNumHash::new(10, B256::repeat_byte(10)),
-            "remaining_gas_limit": 100_000,
-            "inclusion": null,
-        }]);
-        *record = serde_json::from_value(saved).unwrap();
+        panel
+            .observations
+            .entry(operations[1])
+            .or_default()
+            .assets
+            .insert(
+                wallet_ops::ExecutorAsset::Erc20(recipient),
+                BalanceObservation {
+                    value: Some(BalanceValue {
+                        amount: U256::ONE,
+                        block: BlockNumHash::new(10, B256::repeat_byte(10)),
+                        checked_at: std::time::SystemTime::now(),
+                    }),
+                    attempt: CheckAttempt::Available,
+                    attempted_at: None,
+                },
+            );
         panel.refresh_visible(cx);
         cx.notify();
     });
@@ -614,7 +605,10 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(panel.read_with(cx, |panel, _| panel.job.is_none()
-        && panel.observations.is_empty()));
+        && panel.observations.len() == 1
+        && panel.observations[&operations[1]].assets.values().all(
+            |balance| balance.attempt == super::super::observations::CheckAttempt::Available
+        )));
     assert!(panel.read_with(cx, |panel, _| panel.expanded.is_none()));
     cx.simulate_keystrokes("down down enter");
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -632,6 +626,12 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
     cx.simulate_keystrokes("down down enter");
     assert!(cx.update(WindowExt::has_active_dialog));
     cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    panel.update(cx, |panel, cx| {
+        panel.observations.clear();
+        panel.refresh_visible(cx);
+        cx.notify();
+    });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let expand = cx
         .debug_bounds(format!("stealth-expand-{operation}").leak())

@@ -521,9 +521,11 @@ pub struct DesktopSponsoredSelfBroadcastResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfBroadcastTxOutcome {
     Receipt(TxReceiptOutput),
+    /// The receipt of a transaction the wallet sent for a stealth account, with whether
+    /// the account's nonce was read past the payload's afterwards.
     ExecutorReceipt {
         receipt: TxReceiptOutput,
-        status: vault::ExecutorPayloadStatus,
+        state: vault::ExecutorPayloadState,
     },
     InclusionUnobserved {
         tx_hash: String,
@@ -539,21 +541,18 @@ impl SelfBroadcastTxOutcome {
         }
     }
 
-    /// Receipt success only establishes completion once the executor's intended
-    /// effects have been observed on the canonical chain.
+    /// A stealth account's receipt tells a revert at the time. Its success establishes
+    /// completion only once the account's nonce is read past the payload's.
     #[must_use]
     pub const fn execution_status(&self) -> Option<bool> {
         match self {
             Self::Receipt(receipt) => Some(receipt.status),
-            Self::ExecutorReceipt {
-                status: vault::ExecutorPayloadStatus::Executed,
-                ..
-            } => Some(true),
-            Self::ExecutorReceipt {
-                status: vault::ExecutorPayloadStatus::Reverted,
-                ..
-            } => Some(false),
-            Self::ExecutorReceipt { .. } | Self::InclusionUnobserved { .. } => None,
+            Self::ExecutorReceipt { receipt, state } => match (receipt.status, state) {
+                (false, _) => Some(false),
+                (true, vault::ExecutorPayloadState::Resolved) => Some(true),
+                (true, vault::ExecutorPayloadState::Pending) => None,
+            },
+            Self::InclusionUnobserved { .. } => None,
         }
     }
 

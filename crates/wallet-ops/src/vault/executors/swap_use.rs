@@ -1,12 +1,11 @@
 use super::{
-    Address, B256, BlockNumHash, Deserialize, ExecutorAsset, ExecutorDerivationScheme,
-    ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord,
+    Address, B256, Deserialize, ExecutorAsset, ExecutorDerivationScheme, ExecutorNonceObservation,
+    ExecutorNonceWatermark, ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord,
     ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck, FixedBytes,
-    IssuedExecutorPayload, IssuedExecutorRecoveryTransaction, LEGACY_VERSION, PublicSwapRecord,
-    SWAP_DESTINATION_PURPOSE_SUMMARY, Serialize, SwapAccountRole, SwapAccountUse,
-    SwapAdmissionEvidence, SwapApproval, SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome,
-    SwapDestinationRecord, SwapOperationRecord, SwapOrderRecord, VERSION, local_timestamp,
-    swap_account_refusal,
+    IssuedExecutorPayload, LEGACY_VERSION, PublicSwapRecord, SWAP_DESTINATION_PURPOSE_SUMMARY,
+    Serialize, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence, SwapApproval,
+    SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome, SwapDestinationRecord,
+    SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp, swap_account_refusal,
 };
 
 /// One logical swap: its review, account pair, setup choices and order attempts.
@@ -380,7 +379,7 @@ impl ExecutorRecord {
         if fresh && self.active_swap_use == Some(id) {
             self.swap_setup_stopped = true;
             self.retired |= destination;
-            return if self.has_recorded_unresolved_issued_work() {
+            return if self.has_unresolved_issued_work() {
                 SwapUseRelease::IssuedWorkRemains
             } else {
                 SwapUseRelease::Released
@@ -473,6 +472,10 @@ const fn destination_view(swap_use: &SwapUseRecord) -> Option<SwapDestinationRec
 /// The stored shape of an [`ExecutorRecord`]. Version 1 holds one swap's links in
 /// `swap_approval`, `swap_destination` and `destination_operation`. Version 2 leaves those
 /// empty and holds them in `swap_uses`.
+///
+/// Earlier builds also stored `recovery_transactions` and `recovery_observation`, for a
+/// step-by-step recovery no build can start. A stored record may still carry those keys.
+/// They are fields of nothing here, so they are skipped on read and never written.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ExecutorRecordWire {
     version: u32,
@@ -496,10 +499,6 @@ pub(super) struct ExecutorRecordWire {
     #[serde(default)]
     nonce_observation: Option<ExecutorNonceObservation>,
     #[serde(default)]
-    recovery_transactions: Vec<IssuedExecutorRecoveryTransaction>,
-    #[serde(default)]
-    recovery_observation: Option<BlockNumHash>,
-    #[serde(default)]
     public_account_uuid: Option<String>,
     #[serde(default)]
     swap: Option<SwapOperationRecord>,
@@ -517,6 +516,10 @@ pub(super) struct ExecutorRecordWire {
     swap_uses: Vec<SwapUseRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_swap_use: Option<SwapUseId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce_watermark: Option<ExecutorNonceWatermark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_nonce: Option<U256>,
 }
 
 impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
@@ -542,8 +545,6 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
             use_check,
             issued,
             nonce_observation,
-            recovery_transactions,
-            recovery_observation,
             public_account_uuid,
             mut swap,
             swap_approval,
@@ -553,6 +554,8 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
             destination_operation,
             mut swap_uses,
             mut active_swap_use,
+            nonce_watermark,
+            settled_nonce,
         } = wire;
         let has_use_metadata = !swap_uses.is_empty()
             || active_swap_use.is_some()
@@ -626,8 +629,8 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
             use_check,
             issued,
             nonce_observation,
-            recovery_transactions,
-            recovery_observation,
+            nonce_watermark,
+            settled_nonce,
             public_account_uuid,
             swap,
             swap_setup_stopped,
@@ -663,8 +666,8 @@ impl From<ExecutorRecord> for ExecutorRecordWire {
             use_check,
             issued,
             nonce_observation,
-            recovery_transactions,
-            recovery_observation,
+            nonce_watermark,
+            settled_nonce,
             public_account_uuid,
             swap,
             swap_setup_stopped,
@@ -689,8 +692,6 @@ impl From<ExecutorRecord> for ExecutorRecordWire {
             use_check,
             issued,
             nonce_observation,
-            recovery_transactions,
-            recovery_observation,
             public_account_uuid,
             swap,
             swap_approval: None,
@@ -700,6 +701,8 @@ impl From<ExecutorRecord> for ExecutorRecordWire {
             destination_operation: None,
             swap_uses,
             active_swap_use,
+            nonce_watermark,
+            settled_nonce,
         }
     }
 }

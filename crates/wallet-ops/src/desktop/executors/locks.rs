@@ -13,8 +13,7 @@ use railgun_wallet::Utxo;
 use super::ExecutorOwner;
 use crate::WalletSession;
 use crate::vault::{
-    ExecutorOperationId, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
-    IssuedExecutorPayload,
+    ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +32,12 @@ pub enum ExecutorInputLockReason {
     /// A swap order's pre-hook can still run while the order is open. `valid_to` is in Unix
     /// seconds.
     OrderOpen { valid_to: u32 },
-    /// No inclusion was observed, so the signed payload can still execute.
+    /// The payload's nonce is not known to be consumed, so the signed payload can still
+    /// execute.
     SignedNotConfirmed,
-    /// The payload executed, and private sync has not yet recorded its notes as spent.
-    SpentAwaitingSync,
+    /// The payload's nonce is consumed, whichever action ran at it, and private sync has
+    /// not yet scanned past the block that showed it.
+    ResolvedAwaitingSync,
 }
 
 impl ExecutorInputLockReason {
@@ -45,7 +46,7 @@ impl ExecutorInputLockReason {
             Self::NeedsChainCheck => 0,
             Self::OrderOpen { .. } => 1,
             Self::SignedNotConfirmed => 2,
-            Self::SpentAwaitingSync => 3,
+            Self::ResolvedAwaitingSync => 3,
         }
     }
 }
@@ -180,9 +181,10 @@ impl ExecutorOwner {
         Ok(())
     }
 
-    /// Check one operation's executor account at the `confirmed` block, as the user asked,
-    /// and return its lock on `notes` afterwards. A swap's orders are observed too, so an
-    /// expired order's pre-hook can stop reserving its notes.
+    /// Check one operation's executor account, as the user asked, and return its lock on
+    /// `notes` afterwards: one read of the account's execution nonce at the confirmed tip,
+    /// as Check balance makes. A swap's orders are observed too, at the `confirmed` block,
+    /// so an expired order's pre-hook can stop reserving its notes.
     pub async fn check_input_lock(
         &self,
         operation: ExecutorOperationId,
@@ -194,13 +196,13 @@ impl ExecutorOwner {
             .into_iter()
             .find(|record| record.operation() == operation)
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
-        let range = confirmed..confirmed.saturating_add(1);
-        let report = if record.swap().is_some() {
-            self.observe_swap(operation, range).await?
+        let record = if record.swap().is_some() {
+            let range = confirmed..confirmed.saturating_add(1);
+            self.observe_swap(operation, range).await?.record
         } else {
-            self.reconcile_history(operation, range).await?
+            self.read_account(operation).await?
         };
-        Ok(input_lock(report.record(), notes))
+        Ok(input_lock(&record, notes))
     }
 }
 
@@ -346,10 +348,16 @@ fn payload_reason(
     record: &ExecutorRecord,
     payload: &IssuedExecutorPayload,
 ) -> ExecutorInputLockReason {
+    // A resolved nonce reserves its payloads' notes only until private sync passes the
+    // block that resolved it, whichever of them ran.
+    if record.nonce_resolved(payload.nonce()) {
+        return ExecutorInputLockReason::ResolvedAwaitingSync;
+    }
     if record.nonce_observation().is_none() {
         return ExecutorInputLockReason::NeedsChainCheck;
     }
-    // A reserving pre-hook's order has not ended; it runs inside a settlement.
+    // A reserving pre-hook's order has not ended; it runs inside a settlement, which the
+    // swap can observe before any account read resolves the hook's nonce.
     let order = (payload.purpose() == ExecutorPayloadPurpose::SwapPreHook)
         .then(|| {
             record.swap().and_then(|swap| {
@@ -361,18 +369,14 @@ fn payload_reason(
         .flatten();
     if let Some(order) = order {
         return if order.observations().pre_hook_executed.is_some() {
-            ExecutorInputLockReason::SpentAwaitingSync
+            ExecutorInputLockReason::ResolvedAwaitingSync
         } else {
             ExecutorInputLockReason::OrderOpen {
                 valid_to: order.valid_to(),
             }
         };
     }
-    if record.payload_status(payload.hash()) == Some(ExecutorPayloadStatus::Executed) {
-        ExecutorInputLockReason::SpentAwaitingSync
-    } else {
-        ExecutorInputLockReason::SignedNotConfirmed
-    }
+    ExecutorInputLockReason::SignedNotConfirmed
 }
 
 fn payload_kind(record: &ExecutorRecord, payload: &IssuedExecutorPayload) -> ExecutorInputLockKind {

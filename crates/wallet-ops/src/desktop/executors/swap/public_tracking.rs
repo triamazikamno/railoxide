@@ -7,6 +7,8 @@
 //!
 //! [`ExecutorRecord::public_swaps_to_track`]: crate::vault::ExecutorRecord::public_swaps_to_track
 
+use alloy::eips::BlockNumHash;
+use alloy::primitives::U256;
 use eyre::{Result, eyre};
 
 use super::public_order::RESUBMISSION_MARGIN;
@@ -14,6 +16,7 @@ use super::public_settlement::unix_now;
 use crate::ExecutorOwner;
 use crate::bridge::AcrossClient;
 use crate::cow::CowOrderbookClient;
+use crate::desktop::executor_observation::read_executor_asset_balance;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, SwapBridgeOutcome, SwapSubmissionStatus, SwapUseId};
 
@@ -36,6 +39,9 @@ pub struct PublicSwapProgress {
     /// verified.
     pub refresh_public_balances: bool,
     pub finished: bool,
+    /// The destination token's confirmed balance, read only by an explicit check of a
+    /// held-on-destination outcome.
+    pub destination_balance: Option<(U256, BlockNumHash)>,
 }
 
 impl ExecutorOwner {
@@ -102,6 +108,23 @@ impl ExecutorOwner {
         } else {
             false
         };
+        let destination_balance =
+            if explicit && matches!(outcome, Some(SwapBridgeOutcome::HeldOnDestination { .. })) {
+                let address = claimed
+                    .destination
+                    .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+                Some(
+                    self.while_active(read_executor_asset_balance(
+                        &self.endpoints,
+                        &self.chain,
+                        address,
+                        crate::ExecutorAsset::Erc20(claimed.destination_token),
+                    ))
+                    .await?,
+                )
+            } else {
+                None
+            };
 
         let record = self
             .swap_account_record(operation)?
@@ -111,10 +134,12 @@ impl ExecutorOwner {
         })?;
         let withdrawn =
             before.observations().withdrawn.is_none() && after.observations().withdrawn.is_some();
+        self.ensure_active()?;
         Ok(PublicSwapProgress {
             changed: after != before,
             refresh_public_balances: refunded || withdrawn,
             finished: after.is_finished(after_use.is_stopped(), now),
+            destination_balance,
         })
     }
 }

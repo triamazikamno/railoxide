@@ -729,7 +729,7 @@ impl WalletRoot {
             && let Some(step) = progress.steps.last_mut()
         {
             step.message = Some(Arc::from(
-                "The approved execution effects are not confirmed. This operation remains available in Stealth accounts.",
+                "The execution is not confirmed yet. This operation remains available in Stealth accounts.",
             ));
         }
         progress
@@ -1364,17 +1364,15 @@ fn self_broadcast_progress_context_rows(
         if let Some(receipt) = result.tx.receipt() {
             values.push(("Block", receipt.block_number.to_string()));
         }
-        if let wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt { status, .. } = &result.tx {
-            let execution = match status {
-                wallet_ops::vault::ExecutorPayloadStatus::Executed => "approved effects confirmed",
-                wallet_ops::vault::ExecutorPayloadStatus::Reverted => "reverted",
-                wallet_ops::vault::ExecutorPayloadStatus::MissingEffects => {
-                    "expected effects missing"
-                }
-                wallet_ops::vault::ExecutorPayloadStatus::Invalidated { .. } => {
-                    "another approved payload executed"
-                }
-                wallet_ops::vault::ExecutorPayloadStatus::Uncertain => "not confirmed",
+        if matches!(
+            result.tx,
+            wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt { .. }
+        ) {
+            // The receipt tells a revert at the time. It is recorded nowhere.
+            let execution = match result.tx.execution_status() {
+                Some(true) => "confirmed",
+                Some(false) => "reverted",
+                None => "not confirmed",
             };
             values.push(("Execution", execution.into()));
         }
@@ -1679,7 +1677,7 @@ pub(super) fn render_private_self_broadcast_status_notice(
         ),
         None if result.tx.receipt().is_some() => (
             "Execution not confirmed",
-            "The receipt does not establish the approved effects. Stealth accounts retains this operation for reconciliation and recovery.",
+            "The receipt alone does not confirm the execution. Stealth accounts keeps this operation, where Check balances updates its result.",
             theme::WARNING,
         ),
         None => (

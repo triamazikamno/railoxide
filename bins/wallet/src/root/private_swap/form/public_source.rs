@@ -62,6 +62,8 @@ pub(super) struct PublicSwapForm {
     proxy_holds: Option<(String, Address)>,
     /// What changed between the last review and its signing, which the next review says.
     review_change: Option<SwapReviewChange>,
+    /// The signing-time delivery quote is retained until the draft terms change.
+    delivery_review: bool,
 }
 
 /// What the gas strip shows of an order paid from a Public account: its limit at the form's
@@ -142,6 +144,7 @@ pub(super) struct PublicFormReason {
     pub(super) blocks_review: bool,
     /// The open swap the reason names, for "Open it…".
     open: Option<super::super::model::SwapIdentity>,
+    retry_routes: bool,
 }
 
 /// One row of the details section.
@@ -203,6 +206,12 @@ impl PublicSwapForm {
         self.clients = None;
         self.review = None;
         self.quote_terms = None;
+        self.delivery_review = false;
+    }
+
+    #[cfg(test)]
+    pub(super) const fn quote_route_is_invalidated_for_tests(&self) -> bool {
+        self.clients.is_none() && self.review.is_none() && self.quote_terms.is_none()
     }
 
     /// Whether the account's chain was read to take orders. Not read yet, and a failed read,
@@ -228,6 +237,7 @@ impl PublicSwapForm {
             conflict: None,
             proxy_holds: None,
             review_change: None,
+            delivery_review: false,
         }
     }
 }
@@ -282,6 +292,7 @@ enum PublicSwapCommand {
         destination_token: Address,
         candidate: Option<PublicBroadcasterCandidate>,
         review: Arc<PublicSwapReview>,
+        quote_terms: PublicQuoteTerms,
         approval: PublicSwapApproval,
         clients: PublicSwapClients,
         waku: Option<Arc<WakuDeliveryClient>>,
@@ -339,8 +350,6 @@ impl PublicSwapAuthorization {
 pub(in crate::root::private_swap) struct PublicSwapExecution {
     command: Arc<PublicSwapAuthorization>,
     private_authorization: Option<DesktopPrivateSpendAuthorization>,
-    /// The next block of the destination setup's history to observe.
-    setup_cursor: Option<u64>,
     signer: AuthorizedPublicSwapSource,
     signed: Option<PublicSwapSigned>,
 }
@@ -610,7 +619,9 @@ impl PrivateSwapsView {
                     public.route_tasks.remove(&key);
                     match result {
                         Ok(Ok((clients, sell, routes))) => {
-                            public.clients = Some(clients);
+                            if !public.delivery_review {
+                                public.clients = Some(clients);
+                            }
                             public.across_routes.insert(key, (sell, routes));
                             view.list_public_routes(cx);
                         }
@@ -633,6 +644,25 @@ impl PrivateSwapsView {
 
     pub(super) fn schedule_public_quote(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         self.load_public_orders_available(window, cx);
+        // Route-list replies must not replace a signing-time quote with another optimistic
+        // preview. An ordinary draft edit still invalidates it through the same terms check.
+        let retain_delivery = self.form.as_ref().is_some_and(|form| {
+            form.public.as_ref().is_some_and(|public| {
+                public.delivery_review
+                    && self
+                        .public_origin(cx)
+                        .zip(self.form_amount(form, cx).ok())
+                        .is_some_and(|(origin, amount)| {
+                            public
+                                .quote_terms
+                                .as_ref()
+                                .is_some_and(|terms| terms.matches(form, &origin, amount))
+                        })
+            })
+        });
+        if retain_delivery {
+            return;
+        }
         // A changed draft loses its old review even when the new route or destination is
         // unavailable. An unquotable pair must never retain approval of a different pair.
         let revision = {
@@ -650,6 +680,7 @@ impl PrivateSwapsView {
             form.bridge_quote_error = None;
             public.review = None;
             public.quote_terms = None;
+            public.delivery_review = false;
             form.quote_revision
         };
         // The draft's pair may have changed, and with it the open swap that blocks it.
@@ -853,6 +884,9 @@ impl PrivateSwapsView {
         }
         form.price_acknowledged = false;
         form.high_costs_acknowledged = false;
+        if let Some(public) = form.public.as_mut() {
+            public.delivery_review = false;
+        }
         let (Some(clients), Some(owner), Some((anchors, registry))) = (clients, owner, registries)
         else {
             form.bridge_quote_error =
@@ -978,6 +1012,43 @@ impl PrivateSwapsView {
         }
     }
 
+    /// Hold the route lookup failure on a scratch wallet for a real-window screenshot.
+    #[cfg(debug_assertions)]
+    pub(super) fn stage_public_route_error_for_fixture(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !ui_fixture::route_error() {
+            return;
+        }
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(public) = form.public.as_mut() else {
+            return;
+        };
+        form.network = Some(42_161);
+        form.buy = Some(alloy::primitives::address!(
+            "fd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+        ));
+        form.quote_task = None;
+        form.quote_revision = form.quote_revision.wrapping_add(1);
+        form.quote = QuoteState::Idle;
+        form.amount_input
+            .update(cx, |input, cx| input.set_value("7", window, cx));
+        public.route_tasks.clear();
+        public.orders_task = None;
+        public.orders_available = Some(true);
+        public.routes.clear();
+        public.route_errors.insert(
+            (form.sell, 42_161),
+            "Across rejected the routes request (HTTP 403).".into(),
+        );
+        self.refresh_form_delivery(cx);
+        cx.notify();
+    }
+
     /// Take the account's chain as one that takes orders or not, in place of the form's read.
     #[cfg(test)]
     pub(super) fn stub_public_orders_for_tests(&mut self, available: bool, cx: &App) {
@@ -1078,6 +1149,49 @@ impl PrivateSwapsView {
             cx,
         );
         Ok(identity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn return_public_review_change_for_tests(
+        &mut self,
+        command: &PublicSwapAuthorization,
+        review: PublicSwapReview,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> eyre::Result<()> {
+        let PublicSwapCommand::Swap {
+            account,
+            destination_token,
+            review: original,
+            approval,
+            ..
+        } = &command.action
+        else {
+            return Err(eyre::eyre!("Expected a swap command."));
+        };
+        command.owner.claim_public_swap(PublicSwapUseClaim {
+            id: command.swap_use,
+            origin_chain: command.origin.chain_id,
+            source: command.source.address,
+            source_scope: command.source.scope.clone(),
+            account: *account,
+            destination_token: *destination_token,
+            intent: original.intent(),
+            approval: approval.clone(),
+        })?;
+        self.public_authorization = None;
+        self.refresh_public_swap_records(cx);
+        self.apply_public_review_change(
+            command,
+            SwapReviewChange::DestinationMinimum {
+                approved: original.bridge().received_minimum(),
+                current: review.bridge().received_minimum(),
+            },
+            Some(Arc::new(review)),
+            window,
+            cx,
+        );
+        Ok(())
     }
 
     pub(super) fn request_public_review(
@@ -1334,6 +1448,7 @@ impl PrivateSwapsView {
                 destination_token: form.buy.ok_or("Choose a destination token.")?,
                 candidate,
                 review,
+                quote_terms: public.quote_terms.clone().expect("matched review terms"),
                 approval,
                 clients,
                 waku,
@@ -1925,7 +2040,6 @@ impl PrivateSwapsView {
                 let execution = PublicSwapExecution {
                     command,
                     private_authorization: Some(private_authorization),
-                    setup_cursor: None,
                     signer,
                     signed: None,
                 };
@@ -2049,16 +2163,8 @@ impl PrivateSwapsView {
                             view.submit_public_signed(false, window, cx);
                         }
                     }
-                    Ok(Ok(PublicExecutionResult::Changed(change))) => {
-                        // Nothing was placed or deposited. The form comes back from the saved
-                        // swap and quotes again, and the next review names the change, as a
-                        // private swap's does.
-                        view.reopen_public_swap_form(command.identity(), false, window, cx);
-                        if let Some(public) =
-                            view.form.as_mut().and_then(|form| form.public.as_mut())
-                        {
-                            public.review_change = Some(change);
-                        }
+                    Ok(Ok(PublicExecutionResult::Changed { change, review })) => {
+                        view.apply_public_review_change(&command, change, review, window, cx);
                     }
                     Ok(Ok(PublicExecutionResult::ProxyHolds { proxy, balance })) => {
                         let message = view.public_proxy_holds_text(&command, proxy, balance, cx);
@@ -2532,7 +2638,7 @@ impl PrivateSwapsView {
             .iter()
             .find(|(_, record)| record.operation() == operation)?;
         Some(
-            match super::super::account_stage(record, *chain, None, false) {
+            match super::super::account_stage(record, *chain, None, false, None) {
                 SwapStage::Ready => SwapSetupProgress::Done,
                 SwapStage::SetupPending => SwapSetupProgress::Pending,
                 SwapStage::SetupFailed => SwapSetupProgress::Failed,
@@ -2581,7 +2687,14 @@ impl PrivateSwapsView {
                                 .iter()
                                 .any(|swap_use| swap_use.public_swap().is_some())
                         })
-                        .map(|record| (*chain, record)),
+                        .map(|record| {
+                            self.attributions.extend(
+                                owner
+                                    .attribution(&record)
+                                    .map(|attribution| (record.operation(), attribution)),
+                            );
+                            (*chain, record)
+                        }),
                 ),
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
@@ -2617,7 +2730,7 @@ impl PrivateSwapsView {
     pub(in crate::root::private_swap) fn track_public_swaps(
         &mut self,
         window: &Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         let requests = self
             .public_records
@@ -2646,7 +2759,7 @@ impl PrivateSwapsView {
         origin_chain: u64,
         explicit: bool,
         window: &Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) {
         // Debug UI fixture: a synthesized record has no swap to track.
         if ui_fixture::holds_records() {
@@ -2656,7 +2769,11 @@ impl PrivateSwapsView {
         if !self.public_tracking.insert(key) {
             return;
         }
-        let Some((_, owner)) = self.destination_owner(chain, cx) else {
+        if explicit {
+            self.public_destination_balances.remove(&key);
+            cx.notify();
+        }
+        let Some((session, owner)) = self.destination_owner(chain, cx) else {
             self.public_tracking.remove(&key);
             return;
         };
@@ -2696,9 +2813,22 @@ impl PrivateSwapsView {
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.public_tracking.remove(&key);
+                if !view.session_is_current(cx)
+                    || !view
+                        .destination_owner(chain, cx)
+                        .is_some_and(|(current, _)| Arc::ptr_eq(&current, &session))
+                {
+                    return;
+                }
                 view.refresh_public_swap_records(cx);
                 match &result {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(progress)) => {
+                        if explicit {
+                            view.public_destination_balances.remove(&key);
+                            if let Some(balance) = progress.destination_balance {
+                                view.public_destination_balances.insert(key, balance);
+                            }
+                        }
                         view.public_tracking_failures.remove(&(operation, id));
                     }
                     Ok(Err(_)) => {
@@ -2821,6 +2951,9 @@ impl PrivateSwapsView {
                 );
             }
             PublicSwapAction::RecoverDestination => {
+                let checked = record
+                    .swap_use(identity.swap_use)
+                    .and_then(|claimed| self.public_destination_balance(record, claimed));
                 let root = self.root.clone();
                 window.defer(cx, move |window, cx| {
                     let _ = root.update(cx, |root, cx| {
@@ -2828,7 +2961,7 @@ impl PrivateSwapsView {
                             chain,
                             identity.operation,
                             wallet_ops::vault::ExecutorAsset::Erc20(destination_token),
-                            None,
+                            checked,
                             window,
                             cx,
                         );
@@ -2915,6 +3048,49 @@ impl PrivateSwapsView {
             window,
             cx,
         );
+    }
+
+    /// Restore a changed delivery for explicit consent, using the actual fees from signing.
+    fn apply_public_review_change(
+        &mut self,
+        command: &PublicSwapAuthorization,
+        change: SwapReviewChange,
+        review: Option<Arc<PublicSwapReview>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.reopen_public_swap_form(command.identity(), false, window, cx);
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(public) = form.public.as_mut() else {
+            return;
+        };
+        public.review_change = Some(change);
+        if let (
+            Some(review),
+            PublicSwapCommand::Swap {
+                clients,
+                quote_terms,
+                ..
+            },
+        ) = (review, &command.action)
+        {
+            // Cancel the generic preview started while restoring the saved draft. Its reply
+            // cannot overwrite the actual quote, even if it was already on its way back.
+            form.quote_revision = form.quote_revision.wrapping_add(1);
+            form.quote_task = None;
+            form.quote = QuoteState::Idle;
+            form.bridge_quote_error = None;
+            form.price_acknowledged = false;
+            form.high_costs_acknowledged = false;
+            public.review = Some(review);
+            public.clients = Some(clients.clone());
+            public.quote_terms = Some(quote_terms.clone());
+            public.delivery_review = true;
+        }
+        self.sync_gas_controls(window, cx);
+        cx.notify();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3867,6 +4043,7 @@ impl PrivateSwapsView {
             return Some(PublicFormReason {
                 text,
                 blocks_review: true,
+                retry_routes: false,
                 open: self.public_records.iter().find_map(|(_, record)| {
                     record.public_swap_use(conflict.swap).map(|_| {
                         super::super::model::SwapIdentity {
@@ -3887,6 +4064,7 @@ impl PrivateSwapsView {
             text,
             blocks_review: true,
             open: None,
+            retry_routes: false,
         };
         // The routes of the form's sell token to its network, once they are read, and whether
         // one of them delivers the picked Buy token.
@@ -3938,10 +4116,15 @@ impl PrivateSwapsView {
             if routes.is_none()
                 && let Some(error) = public.route_errors.get(&(form.sell, network))
             {
-                return Some(blocking(format!(
-                    "Couldn't read what Across delivers on {}. {error}",
-                    network_name(network)
-                )));
+                return Some(PublicFormReason {
+                    text: format!(
+                        "Couldn't read what Across delivers on {}. {error}",
+                        network_name(network)
+                    ),
+                    blocks_review: true,
+                    open: None,
+                    retry_routes: true,
+                });
             }
         }
         // Across's least deposit with the shield's gas, estimated from the review's own quote.
@@ -3977,6 +4160,7 @@ impl PrivateSwapsView {
                 )),
                 blocks_review: false,
                 open: None,
+                retry_routes: false,
             });
         }
         // Said only once it is known: a chain not read yet may still take orders.
@@ -3989,6 +4173,7 @@ impl PrivateSwapsView {
             ),
             blocks_review: false,
             open: None,
+            retry_routes: false,
         })
     }
 
@@ -4013,6 +4198,12 @@ impl PrivateSwapsView {
     /// from quoting: the conditions of [`Self::ready_destination`], read without loading
     /// anything.
     fn public_destination_problem(&self, network: u64, cx: &App) -> Option<String> {
+        // The screenshot fixture holds a route failure without a live destination session.
+        // Review still uses ready_destination; this exemption only exposes the error action.
+        #[cfg(debug_assertions)]
+        if ui_fixture::route_error() {
+            return None;
+        }
         let name = network_name(network);
         let root = self.root.upgrade()?;
         Some(match root.read(cx).chain_states.get(&network) {
@@ -4062,6 +4253,14 @@ impl PrivateSwapsView {
             .items_center()
             .gap_2();
         if reason.blocks_review {
+            if reason.retry_routes {
+                return line.child(action_alert(
+                    "swap-public-reason-text",
+                    reason.text,
+                    self.bridge_routes_retry(cx),
+                    cx,
+                ));
+            }
             return line.child(match open {
                 Some(open) => action_alert("swap-public-reason-text", reason.text, open, cx),
                 None => error_alert("swap-public-reason-text", reason.text),
@@ -4289,7 +4488,10 @@ enum PublicExecutionResult {
     Claimed(PublicSwapExecution),
     Waiting(PublicSwapExecution),
     Ready(PublicSwapExecution),
-    Changed(SwapReviewChange),
+    Changed {
+        change: SwapReviewChange,
+        review: Option<Arc<PublicSwapReview>>,
+    },
     /// The account's `CoW` proxy holds the bought token, or its balance there couldn't be read:
     /// no order was placed.
     ProxyHolds {
@@ -4312,7 +4514,10 @@ async fn ui_fixture_job(
         Step::Claimed => PublicExecutionResult::Claimed(execution),
         Step::Waiting => PublicExecutionResult::Waiting(execution),
         Step::Ready => PublicExecutionResult::Ready(execution),
-        Step::Changed(change) => PublicExecutionResult::Changed(change),
+        Step::Changed(change) => PublicExecutionResult::Changed {
+            change,
+            review: None,
+        },
         Step::Fail(message) => return Err(eyre::eyre!(message)),
     })
 }
@@ -4501,6 +4706,29 @@ async fn prepare_public_destination(
 const PUBLIC_SIGNING_RETRIES: u32 = 3;
 const PUBLIC_SIGNING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
+async fn changed_public_delivery(
+    command: &PublicSwapAuthorization,
+    review: &PublicSwapReview,
+    change: SwapReviewChange,
+    quote: Option<&wallet_ops::PublicSwapDeliveryQuote>,
+) -> eyre::Result<PublicExecutionResult> {
+    let review = match quote {
+        Some(quote) => Some(Arc::new(
+            command
+                .owner
+                .requote_public_swap_delivery(
+                    review,
+                    quote,
+                    &command.origin,
+                    command.source.address,
+                )
+                .await?,
+        )),
+        None => None,
+    };
+    Ok(PublicExecutionResult::Changed { change, review })
+}
+
 async fn advance_public_execution(
     mut execution: PublicSwapExecution,
     confirmed: u64,
@@ -4522,49 +4750,17 @@ async fn advance_public_execution(
     else {
         return Err(eyre::eyre!("This action has no destination delivery."));
     };
-    let record = command
-        .owner
-        .records()?
-        .into_iter()
-        .find(|record| record.operation() == command.operation)
-        .ok_or_else(|| eyre::eyre!("The destination account is unavailable."))?;
     if approval.destination.setup {
-        // One read covers a bounded page, so a history longer than that is caught up page by
-        // page, as the private swap's observation does.
-        let mut cursor = execution
-            .setup_cursor
-            .or_else(|| super::super::model::swap_history_start(&record))
-            .unwrap_or(confirmed);
-        loop {
-            let range = super::super::model::swap_observation_range(cursor, confirmed);
-            let end = range.end;
-            let observed = match command
-                .owner
-                .observe_swap_setup(command.operation, range)
-                .await
-            {
-                // A background read updated the account under this one, most often private
-                // sync recording the setup's block. Nothing failed, so the page stays due
-                // for the next pass, as in the private swap's observation.
-                Err(error) if error.is::<wallet_ops::ExecutorRecordChanged>() => {
-                    execution.setup_cursor = Some(cursor);
-                    return Ok(PublicExecutionResult::Waiting(execution));
-                }
-                observed => observed?,
-            };
-            match observed {
-                SwapSetupStatus::Pending if end > confirmed => {
-                    execution.setup_cursor = Some(end);
-                    return Ok(PublicExecutionResult::Waiting(execution));
-                }
-                SwapSetupStatus::Pending => cursor = end,
-                SwapSetupStatus::Failed | SwapSetupStatus::MissingDelegation => {
-                    return Err(eyre::eyre!(
-                        "The destination setup failed. Review its retry before continuing."
-                    ));
-                }
-                SwapSetupStatus::Delegated(_) => break,
+        // One read of the destination account at its confirmed block. A setup that is still
+        // pending is read again on the next pass.
+        match command.owner.observe_swap_setup(command.operation).await? {
+            SwapSetupStatus::Pending => return Ok(PublicExecutionResult::Waiting(execution)),
+            SwapSetupStatus::MissingDelegation => {
+                return Err(eyre::eyre!(
+                    "The destination setup failed. Review its retry before continuing."
+                ));
             }
+            SwapSetupStatus::Delegated(_) => {}
         }
     }
     let notes = Some(command.destination_session.as_ref() as &dyn wallet_ops::SwapShieldNotes);
@@ -4623,9 +4819,9 @@ async fn advance_public_execution(
     // fill that fails in its simulation or changed terms stop the swap with nothing sent. The
     // delivery signed here is not used: its quote is taken again once the approvals confirm.
     if !review.gas_plan().approval_gas_limits.is_empty()
-        && let PublicSwapDelivery::ReviewRequired(change) = sign(valid_to()?).await?
+        && let PublicSwapDelivery::ReviewRequired { change, quote } = sign(valid_to()?).await?
     {
-        return Ok(PublicExecutionResult::Changed(change));
+        return changed_public_delivery(command, review, change, quote.as_ref()).await;
     }
     command
         .owner
@@ -4640,7 +4836,9 @@ async fn advance_public_execution(
         .await?;
     let valid_to = valid_to()?;
     match sign(valid_to).await? {
-        PublicSwapDelivery::ReviewRequired(change) => Ok(PublicExecutionResult::Changed(change)),
+        PublicSwapDelivery::ReviewRequired { change, quote } => {
+            changed_public_delivery(command, review, change, quote.as_ref()).await
+        }
         PublicSwapDelivery::Signed {
             delivery, terms, ..
         } => {

@@ -429,12 +429,11 @@ impl Wallet {
         let (executor, destination_executor) = (placed.swap.executor, placed.account.executor());
 
         // A claim judges recorded outcomes only. The wallet's routine observation records the
-        // nonce that the first swap's fill consumed, and one reconciliation at the final head
+        // nonce that the first swap's fill consumed, and one account read at the confirmed head
         // stands in for it here.
-        let confirmed = destination_fork.block_number().await - destination.chain.finality_depth;
         let SwapSetupStatus::Delegated(observed) = destination
             .owner
-            .observe_swap_setup(destination_operation, confirmed..confirmed + 1)
+            .observe_swap_setup(destination_operation)
             .await
             .unwrap()
         else {
@@ -613,29 +612,19 @@ impl Wallet {
             )
             .await;
         assert!(receipt.status(), "the setup delegates the executor");
-        let setup_block = receipt.block_number.unwrap();
         fork.mine(chain.finality_depth).await;
-        let SwapSetupStatus::Delegated(delegated) = owner
-            .observe_swap_setup(operation, setup_block..setup_block + 1)
-            .await
-            .unwrap()
+        let SwapSetupStatus::Delegated(delegated) =
+            owner.observe_swap_setup(operation).await.unwrap()
         else {
             panic!("the confirmed setup delegated the executor");
         };
         delegated
     }
 
-    /// The executor at its current confirmed nonce, for a retry after `block`.
-    async fn redelegate(
-        &self,
-        operation: ExecutorOperationId,
-        block: u64,
-    ) -> DelegatedSwapExecutor {
-        let SwapSetupStatus::Delegated(delegated) = self
-            .owner
-            .observe_swap_setup(operation, block..block + 1)
-            .await
-            .unwrap()
+    /// The executor at its current confirmed nonce, for a retry.
+    async fn redelegate(&self, operation: ExecutorOperationId) -> DelegatedSwapExecutor {
+        let SwapSetupStatus::Delegated(delegated) =
+            self.owner.observe_swap_setup(operation).await.unwrap()
         else {
             panic!("the swap executor stays delegated");
         };
@@ -1606,7 +1595,31 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     assert!(receipt.status(), "the cancellation wins nonce k");
     let cancelled = receipt.block_number.unwrap();
     fork.mine(wallet.chain.finality_depth).await;
-    let observed = wallet.observe(operation, cancelled..cancelled + 1).await;
+    // Private sync shows the cancellation's fee note spent in its recorded transaction, which
+    // is what names it at nonce k.
+    store
+        .record_submission(operation, hash, receipt.transaction_hash)
+        .unwrap();
+    let mut spent = railgun_wallet::WalletUtxo::new(fee);
+    spent.spent = Some(UtxoSource {
+        tx_hash: receipt.transaction_hash,
+        block_number: cancelled,
+        block_timestamp: 0,
+    });
+    let sync = sync_service::WalletCurrentSnapshot::new(
+        cancelled,
+        0,
+        0,
+        vec![spent],
+        sync_service::WalletPendingOverlay::default(),
+    );
+    let observed = wallet
+        .owner
+        .observe_swap_synced(operation, cancelled..cancelled + 1, Some(sync))
+        .await
+        .unwrap()
+        .record()
+        .clone();
     assert_eq!(
         state_of(&observed, 0),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
@@ -1619,7 +1632,7 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     );
 
     // The retry signs at k + 1 with the same proof, where the first post-hook is also valid.
-    let delegated = wallet.redelegate(operation, cancelled).await;
+    let delegated = wallet.redelegate(operation).await;
     let retry = wallet
         .submit(&fork, delegated, first.note.clone(), None, None)
         .await;
@@ -1653,6 +1666,12 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
         state_of(&observed, 1),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::OlderPostHook)
     );
+    assert!(observed.reserved_inputs().contains(&first.input));
+    let resolved_at = observed.nonce_watermark().unwrap().block();
+    let observed = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1)
+        .unwrap()
+        .record_synced(operation, None, resolved_at)
+        .unwrap();
     assert!(!observed.reserved_inputs().contains(&first.input));
     assert_eq!(filled(retry.uid).await, U256::ZERO);
     let invalidates =
@@ -1661,7 +1680,7 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
 
     // The next retry is admitted at k + 2 although the older post-hook never won a direct
     // call, and its pre-hook invalidates the stalled order.
-    let delegated = wallet.redelegate(operation, stalled_at).await;
+    let delegated = wallet.redelegate(operation).await;
     let latest = wallet
         .submit(&fork, delegated, first.note, None, invalidates)
         .await;
@@ -1802,8 +1821,8 @@ async fn swap_fork_recovery_after_expiry_resets_the_approval_and_skips_dead_pre_
         .observe(early.operation, recovered..recovered + 1)
         .await;
     assert_eq!(
-        record.payload_status(issued.payload_hash()),
-        Some(ExecutorPayloadStatus::Executed)
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
     );
 
     // An expired pre-hook with its nonce k unused is not outstanding: recovery of tokens sent
@@ -1880,8 +1899,8 @@ async fn swap_fork_recovery_shields_the_buy_token_a_skipped_post_hook_left() {
         .observe(swap.operation, recovered..recovered + 1)
         .await;
     assert_eq!(
-        record.payload_status(issued.payload_hash()),
-        Some(ExecutorPayloadStatus::Executed)
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
     );
     wallet.finish().await;
 }
@@ -1933,6 +1952,9 @@ async fn swap_fork_early_cancellation_wins_and_releases_the_inputs_at_finality()
         U256::MAX
     );
     fork.mine(wallet.chain.finality_depth).await;
+    // The account read shows nonce k consumed. The order reads as invalidated while the
+    // pre-hook's notes are unspent, and that state names the cancellation: no block or
+    // receipt of its transaction is read.
     let record = wallet
         .observe(swap.operation, cancelled..cancelled + 1)
         .await;
@@ -1941,9 +1963,17 @@ async fn swap_fork_early_cancellation_wins_and_releases_the_inputs_at_finality()
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
     );
     assert_eq!(
-        record.payload_status(issued.payload_hash()),
-        Some(ExecutorPayloadStatus::Executed)
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
     );
+    // Every payload at nonce k keeps its notes until private sync has scanned the block of
+    // that read.
+    assert!(record.reserved_inputs().contains(&swap.input));
+    let resolved_at = record.nonce_watermark().unwrap().block();
+    let record = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1)
+        .unwrap()
+        .record_synced(swap.operation, None, resolved_at)
+        .unwrap();
     assert!(!record.reserved_inputs().contains(&swap.input));
     let receipt = fork
         .settle(
@@ -1989,10 +2019,12 @@ async fn swap_fork_pre_hook_beats_the_cancellation_and_recovery_invalidates_the_
         swap_order_state(first_order(&record)),
         SwapOrderState::PreHookOnly { expired: false }
     );
-    assert!(matches!(
-        record.payload_status(cancellation.payload_hash()),
-        Some(ExecutorPayloadStatus::Invalidated { .. })
-    ));
+    // The pre-hook's settlement evidence names what ran. The cancellation's nonce is
+    // consumed, so its signature can no longer execute.
+    assert_eq!(
+        record.payload_state(cancellation.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
+    );
     assert!(record.reserved_inputs().contains(&swap.input));
 
     // Recovery is offered. It invalidates the order that can still fill, resets the approval,
@@ -2380,8 +2412,8 @@ async fn swap_fork_refunded_across_deposit_is_recovered_to_the_wallet() {
         .observe(swap.operation, recovered..recovered + 1)
         .await;
     assert_eq!(
-        record.payload_status(issued.payload_hash()),
-        Some(ExecutorPayloadStatus::Executed)
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
     );
     drop(store);
     wallet.finish().await;

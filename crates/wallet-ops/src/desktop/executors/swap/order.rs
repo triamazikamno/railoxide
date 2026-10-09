@@ -80,12 +80,11 @@ use crate::settings::{EffectiveTokenRegistry, ExecutorProfile, SwapProfile, Swap
 use crate::vault::{
     BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
     ExecutorInputIdentity, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
-    ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStoreError,
-    IssuedExecutorPayload, SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse,
-    SwapAdmissionEvidence, SwapAnchorObservation, SwapApproval, SwapApprovalTokens,
-    SwapApprovedBounds, SwapAttempt, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
-    SwapProof, SwapRecipient, SwapSubmission, SwapSubmissionStatus, SwapTerms, SwapUseId,
-    SwapUseRecord, SwapUseRole, swap_account_refusal,
+    ExecutorPayloadPurpose, ExecutorRecord, ExecutorStoreError, IssuedExecutorPayload,
+    SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
+    SwapAnchorObservation, SwapApproval, SwapApprovalTokens, SwapApprovedBounds, SwapAttempt,
+    SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSubmission,
+    SwapSubmissionStatus, SwapTerms, SwapUseId, SwapUseRecord, SwapUseRole, swap_account_refusal,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
@@ -2962,8 +2961,7 @@ impl ExecutorOwner {
             && (!super::is_swap_record(&record)
                 || !record.issued().iter().any(|payload| {
                     payload.purpose() == ExecutorPayloadPurpose::Operation
-                        && record.recorded_payload_status(payload.hash())
-                            == Some(ExecutorPayloadStatus::Executed)
+                        && record.nonce_resolved(payload.nonce())
                 }))
         {
             return Err(eyre!("this swap's setup is not confirmed"));
@@ -3072,11 +3070,11 @@ impl ExecutorOwner {
             executor.reused = true;
             return Ok(executor);
         }
-        let range = confirmed..confirmed.saturating_add(1);
         let report = if record.swap().is_some() {
+            let range = confirmed..confirmed.saturating_add(1);
             trace_step("reuse_orders", self.observe_swap(operation, range)).await?
         } else {
-            trace_step("reuse_history", self.reconcile_history(operation, range)).await?
+            trace_step("reuse_account", self.reconcile_account(operation)).await?
         };
         let super::SwapSetupStatus::Delegated(delegated) =
             trace_step("reuse_setup", self.check_swap_setup(&report)).await?
@@ -3279,7 +3277,7 @@ pub(crate) fn swap_invalidation(
 }
 
 /// Orders of this executor that can still fill. An order can't once it traded, a finalized
-/// block passed its `validTo`, or a payload that won its nonce invalidated it, such as a
+/// block passed its `validTo`, or a recovery known to have run invalidated it, such as a
 /// cancellation. Orders within one validity window of local time count as live, to tolerate
 /// clock skew.
 pub(super) fn fillable_swap_orders(
@@ -3304,29 +3302,54 @@ pub(super) fn fillable_swap_orders(
                     .pre_hook_dead
                     .is_none_or(|death| death.cause != SwapPreHookDeathCause::Expired)
                 && u64::from(order.valid_to()) >= horizon
-                && !invalidated_by_winner(record, profile.settlement(), order.uid())
+                && !invalidated_by_recovery(record, profile.settlement(), order.uid())
         })
         .map(SwapOrderRecord::uid)
         .collect()
 }
 
-/// Whether a reconciled winning payload of the executor called `invalidateOrder(uid)`.
-fn invalidated_by_winner(record: &ExecutorRecord, settlement: Address, uid: OrderUid) -> bool {
+/// Whether a recovery that ran called `invalidateOrder(uid)`, from the record alone: a
+/// resolved recovery payload whose calls invalidate the order, where the order whose pre-hook
+/// was signed at that payload's nonce has a recorded death cause of cancellation or recovery.
+/// While that cause is unknown the order counts as fillable, so at worst it is invalidated
+/// twice.
+fn invalidated_by_recovery(record: &ExecutorRecord, settlement: Address, uid: OrderUid) -> bool {
+    let Some(swap) = record.swap() else {
+        return false;
+    };
     record.issued().iter().any(|payload| {
-        if record.payload_status(payload.hash()) != Some(ExecutorPayloadStatus::Executed) {
+        if payload.purpose() != ExecutorPayloadPurpose::Recovery
+            || !record.nonce_resolved(payload.nonce())
+            || !swap.orders().iter().any(|order| {
+                order.pre_hook().nonce() == payload.nonce()
+                    && order.observations().pre_hook_dead.is_some_and(|death| {
+                        matches!(
+                            death.cause,
+                            SwapPreHookDeathCause::Cancellation | SwapPreHookDeathCause::Recovery
+                        )
+                    })
+            })
+        {
             return false;
         }
         let data = payload.context().calldata();
         let calls = RelayAdapt7702::executeCall::abi_decode(data)
             .map(|call| call._actionData.calls)
             .or_else(|_| RelayAdapt7702::multicallCall::abi_decode(data).map(|call| call._calls));
-        calls.is_ok_and(|calls| {
-            calls.iter().any(|call| {
-                call.to == settlement
-                    && GPv2Settlement::invalidateOrderCall::abi_decode(&call.data)
-                        .is_ok_and(|call| call.orderUid[..] == uid.0[..])
-            })
-        })
+        calls.is_ok_and(|calls| invalidates_order(&calls, settlement, uid))
+    })
+}
+
+/// Whether `calls` include `invalidateOrder(uid)` on `settlement`.
+pub(in crate::desktop::executors) fn invalidates_order(
+    calls: &[Call],
+    settlement: Address,
+    uid: OrderUid,
+) -> bool {
+    calls.iter().any(|call| {
+        call.to == settlement
+            && GPv2Settlement::invalidateOrderCall::abi_decode(&call.data)
+                .is_ok_and(|call| call.orderUid[..] == uid.0[..])
     })
 }
 

@@ -8,9 +8,10 @@
 //! invalidation. After the hand-off the destination chain's owner tracks the fill on its own
 //! chain and the refund on the chain the account pays on, also after a restart.
 
-use super::swap_observation::{EXECUTOR, MockChain, execute, private_logs, private_transaction};
+use super::swap_observation::{EXECUTOR, MockChain, execute, private_transaction};
 use super::swap_order::{
-    across_fee_quote, delegate_setup, read_json_body, spawn_bridge_stub, submitted_order,
+    across_fee_quote, delegate_setup, read_json_body, spawn_bridge_stub, spawn_bridge_stub_with,
+    submitted_order,
 };
 use super::swap_setup::{
     DESTINATION_CHAIN, DESTINATION_TOKEN, USDC, WETH, broadcaster, destination_chain_config,
@@ -242,10 +243,10 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
         (U256::from(1_000), U256::from(1_001))
     );
 
-    // The setup is handed off and reverts.
+    // The setup is handed off and its nonce stays unconsumed.
     let signed_at =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    store.reconcile(operation, signed_at, &[]).unwrap();
+    store.record_account_read(operation, signed_at).unwrap();
     let setup = B256::repeat_byte(3);
     store
         .record_issued(
@@ -260,23 +261,15 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
         )
         .unwrap();
     let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
-    let failed = store
-        .reconcile(
+    let pending = store
+        .record_account_read(
             operation,
             ExecutorNonceObservation::new(confirmed, U256::ZERO),
-            &[(
-                setup,
-                ExecutorPayloadInclusion::new(
-                    BlockNumHash::new(11, B256::repeat_byte(11)),
-                    B256::repeat_byte(4),
-                    ExecutorExecutionResult::Reverted,
-                ),
-            )],
         )
         .unwrap();
     assert_eq!(
-        swap_setup_status(&failed, confirmed, &[], profile),
-        SwapSetupStatus::Failed
+        swap_setup_status(&pending, confirmed, &[], profile),
+        SwapSetupStatus::Pending
     );
 
     // Nothing of the Public account is recorded: no path, no transaction, no deposit terms and
@@ -294,7 +287,7 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
         .await
         .unwrap()
     else {
-        panic!("the failed setup is retried");
+        panic!("the pending setup is retried");
     };
     assert_eq!(retried.context().executor, executor);
     assert_eq!(saved(&store, operation, id).swap, claimed.swap);
@@ -308,10 +301,53 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// The actual Public review path for the direct-deposit route used by delivery tests.
+async fn delivery_review(
+    owner: &ExecutorOwner,
+    origin: &EffectiveChainConfig,
+    source: Address,
+    input_amount: U256,
+    across: &AcrossClient,
+) -> crate::PublicSwapReview {
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let destination = crate::bridge::PublicBridgeDestination {
+        destination: crate::bridge::BridgeDestination {
+            destination_token: DESTINATION_TOKEN,
+            intermediate: USDC,
+            symbol: "USDC".into(),
+            same_asset: true,
+            near: None,
+        },
+        path: crate::bridge::PublicBridgePath::Deposit,
+    };
+    owner
+        .review_public_swap(crate::PublicSwapReviewRequest {
+            origin,
+            source,
+            sell: crate::bridge::PublicSellAsset::Erc20(USDC),
+            sell_amount: input_amount,
+            destination: &destination,
+            slippage_bps: 50,
+            gas_share_bps: 5_000,
+            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+            orderbook: None,
+            across,
+            anchor_cache: None,
+            token_registry: &registry,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        })
+        .await
+        .unwrap()
+}
+
 // The delivery is signed against a quote requested with the handler and the real message. A
 // quote below the approved destination minimum returns to review with the shield recorded and
-// nothing of the Public account signed. A full new review lowers the approved minimum and
-// signs a new guarded delivery while retaining the earlier shield.
+// nothing of the Public account signed. Reviewing the real quote lowers the approved minimum
+// and signs a new guarded delivery while retaining the earlier shield.
 #[tokio::test]
 async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
     use alloy::sol_types::SolValue as _;
@@ -323,7 +359,10 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         TEST_WALLET_ID,
         "Wallet",
     ));
-    let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    let (mut origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    // This RPC stub returns an allowance word directly; its default Multicall response has
+    // empty return data, which cannot decode the Public review's ERC-20 allowance.
+    origin_chain.rpc_route = crate::RpcChainRoute::new(1, vec![rpc.url.clone()]);
     let profile = destination_chain.accepted_executor_profile().unwrap();
     let spoke_pool = origin_chain.bridge_origin_profile().unwrap().spoke_pool();
     let handler = destination_chain
@@ -346,22 +385,21 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         SwapUseId::random().unwrap(),
     );
     let authorization = password();
-    owner
-        .claim_public_swap(claim(id, operation, 1, USDC, DESTINATION_TOKEN))
-        .unwrap();
-    let executor = owner
-        .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
-        .await
-        .unwrap()
-        .executor();
-    let delegated = delegate_setup(&store, operation, profile);
-    assert_eq!(delegated.executor(), executor);
-
-    // Across answers every quote with the output the test sets.
-    let quoted = Arc::new(Mutex::new(U256::from(999)));
-    let answer = quoted.clone();
-    let (across_url, requests, across_task) = spawn_bridge_stub(move |_| {
-        across_fee_quote(spoke_pool, *answer.lock().unwrap(), 3 * 60 * 60)
+    // The preview stays at 1,000 while quotes with the real handler message stay at 999.
+    // A new preview would therefore repeat the original approval forever.
+    let (across_url, requests, across_task) = spawn_bridge_stub_with(move |path, _| {
+        let has_message = url::Url::parse(&format!("http://across{path}"))
+            .unwrap()
+            .query_pairs()
+            .any(|(name, _)| name == "message");
+        (
+            200,
+            across_fee_quote(
+                spoke_pool,
+                U256::from(if has_message { 999 } else { 1_000 }),
+                3 * 60 * 60,
+            ),
+        )
     })
     .await;
     let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
@@ -370,6 +408,23 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         across_url,
     )
     .unwrap();
+    let input_amount = U256::from(1_010);
+    let mut request = claim(id, operation, 1, USDC, DESTINATION_TOKEN);
+    let review =
+        delivery_review(&owner, &origin_chain, request.source, input_amount, &across).await;
+    assert_eq!(review.bridge().destination_minimum, U256::from(1_000));
+    request.approval = review
+        .approval(request.approval.destination, Some(U256::from(1_000)), true)
+        .unwrap();
+    owner.claim_public_swap(request).unwrap();
+    let executor = owner
+        .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+        .await
+        .unwrap()
+        .executor();
+    let delegated = delegate_setup(&store, operation, profile);
+    assert_eq!(delegated.executor(), executor);
+
     let valid_to = u32::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -378,7 +433,6 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
             + 30 * 60,
     )
     .unwrap();
-    let input_amount = U256::from(1_010);
     let sign = || {
         owner.sign_public_swap_delivery(PublicSwapDeliverySigning {
             operation,
@@ -403,7 +457,11 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
             .unwrap()
     };
 
-    let PublicSwapDelivery::ReviewRequired(change) = sign().await.unwrap() else {
+    let PublicSwapDelivery::ReviewRequired {
+        change,
+        quote: Some(quote),
+    } = sign().await.unwrap()
+    else {
         panic!("a quote below the approved destination minimum signs no delivery");
     };
     assert_eq!(
@@ -485,10 +543,60 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
     assert!(stopped.swap.transactions().is_empty());
     assert!(stopped.swap.bridge().is_none());
 
-    // The user accepts a new minimum at full review. The destination's bound address and its
-    // original setup need cannot be changed by that review.
-    let mut approval = stopped.swap.approval().clone();
-    approval.bounds.destination_minimum = Some(U256::from(990));
+    // The real quote replaces the optimistic preview, without changing the persisted
+    // approval. The user must explicitly accept these corrected terms before another sign.
+    assert!(!review.gas_plan().approval_gas_limits.is_empty());
+    // The Public account has now paid its approval. Re-review must retain only the deposit
+    // gas while using the actual Across quote, at the original fee rates.
+    rpc.state
+        .calls
+        .lock()
+        .unwrap()
+        .insert(USDC, Some(input_amount));
+    let corrected = owner
+        .requote_public_swap_delivery(&review, &quote, &origin_chain, Address::repeat_byte(0x50))
+        .await
+        .unwrap();
+    assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+    assert_eq!(
+        corrected.gas_plan().deposit_gas_limit,
+        review.gas_plan().deposit_gas_limit
+    );
+    assert_eq!(
+        corrected.gas_plan().max_gas_cost,
+        public_swap_gas_plan(&origin_chain, 0, true, 1, 1)
+            .unwrap()
+            .max_gas_cost
+    );
+    assert_eq!(corrected.bridge().destination_minimum, U256::from(999));
+    assert_eq!(
+        corrected.bridge().private.unwrap().delivery_allowance,
+        U256::ZERO
+    );
+    assert_eq!(
+        corrected.bridge().private.unwrap().deposit_floor,
+        Some(U256::ONE)
+    );
+    assert_eq!(
+        corrected
+            .bridge()
+            .private
+            .unwrap()
+            .destination_shield_fee_bps,
+        review.bridge().private.unwrap().destination_shield_fee_bps
+    );
+    assert_eq!(
+        saved(&store, operation, id).swap.approval(),
+        stopped.swap.approval()
+    );
+    let approval = corrected
+        .approval(
+            stopped.swap.approval().destination,
+            stopped.swap.approval().bounds.destination_setup_fee,
+            true,
+        )
+        .unwrap();
+    // The destination's bound address and its original setup need cannot change on review.
     for destination in [
         SwapApprovedAccount {
             address: None,
@@ -538,7 +646,7 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
     );
     assert_eq!(
         (terms.input_amount, terms.output_amount),
-        (input_amount, U256::from(990))
+        (input_amount, U256::from(999))
     );
     assert_eq!(
         (terms.spoke_pool, terms.input_token, terms.output_token),
@@ -558,7 +666,7 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
     assert_ne!(delivery.shield_multicall, shield.callData);
     let new_shield = RelayAdapt7702::multicallCall::abi_decode(&delivery.shield_multicall).unwrap();
     let guard = transferCall::abi_decode(&new_shield._calls[0].data).unwrap();
-    assert_eq!(guard._transfers[0].value, U256::from(990));
+    assert_eq!(guard._transfers[0].value, U256::from(999));
     assert!(signed.record.issued().iter().any(|payload| {
         signed.shields.contains(&payload.hash())
             && *payload.context().calldata() == delivery.shield_multicall
@@ -588,7 +696,10 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
         TEST_WALLET_ID,
         "Wallet",
     ));
-    let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    let (mut origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    // This RPC stub returns an allowance word directly; its default Multicall response has
+    // empty return data, which cannot decode the Public review's ERC-20 allowance.
+    origin_chain.rpc_route = crate::RpcChainRoute::new(1, vec![rpc.url.clone()]);
     let profile = destination_chain.accepted_executor_profile().unwrap();
     let spoke_pool = origin_chain.bridge_origin_profile().unwrap().spoke_pool();
     let owner = ExecutorOwner::new(
@@ -671,7 +782,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
 
     // 900 for 1,010 needs a deposit of 1,124, which is 114 more: beyond the cushion.
     *outputs.lock().unwrap() = vec![U256::from(900)];
-    let PublicSwapDelivery::ReviewRequired(change) = sign().await.unwrap() else {
+    let PublicSwapDelivery::ReviewRequired { change, quote } = sign().await.unwrap() else {
         panic!("a shortfall beyond the cushion signs no delivery");
     };
     assert_eq!(
@@ -681,7 +792,150 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
             current: U256::from(900),
         }
     );
+    assert!(quote.is_some());
     assert_eq!(quoted().len(), 1);
+
+    // Even when the raised amount is still short, the returned change is for the original
+    // input. Returning the raised quote would associate its output with the wrong review.
+    *outputs.lock().unwrap() = vec![U256::from(999), U256::from(998)];
+    let PublicSwapDelivery::ReviewRequired {
+        change,
+        quote: Some(quote),
+    } = sign().await.unwrap()
+    else {
+        panic!("a raised quote that still falls short returns to review");
+    };
+    assert_eq!(
+        change,
+        SwapReviewChange::DestinationMinimum {
+            approved: U256::from(1_000),
+            current: U256::from(999),
+        }
+    );
+    assert_eq!(quoted().len(), 3);
+    let (preview_url, _, preview_task) =
+        spawn_bridge_stub(move |_| across_fee_quote(spoke_pool, U256::from(1_000), 3 * 60 * 60))
+            .await;
+    let preview = AcrossClient::new(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        ),
+        preview_url,
+    )
+    .unwrap();
+    // The original source order needed an approval. Its updated review must read the
+    // allowance again after that transaction is paid, so no ETH is needed for another one.
+    rpc.state.codes.lock().unwrap().insert(
+        origin_chain.public_swap_profile().unwrap().math(),
+        swap_math_runtime_code(),
+    );
+    let (orderbook_url, _, orderbook_task) = spawn_bridge_stub(move |_| {
+        json!({
+            "quote": {
+                "sellToken": ORDER_SELL_TOKEN, "buyToken": USDC,
+                "sellAmount": "1010", "buyAmount": "1010", "validTo": 1,
+                "feeAmount": "0", "gasAmount": "0", "gasPrice": "0",
+                "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        })
+        .to_string()
+    })
+    .await;
+    let orderbook = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        ),
+        orderbook_url,
+        1,
+    )
+    .unwrap();
+    let destination = crate::bridge::PublicBridgeDestination {
+        destination: crate::bridge::BridgeDestination {
+            destination_token: DESTINATION_TOKEN,
+            intermediate: USDC,
+            symbol: "USDC".into(),
+            same_asset: true,
+            near: None,
+        },
+        path: crate::bridge::PublicBridgePath::Order,
+    };
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let review = owner
+        .review_public_swap(crate::PublicSwapReviewRequest {
+            origin: &origin_chain,
+            source: Address::repeat_byte(0x50),
+            sell: crate::bridge::PublicSellAsset::Erc20(ORDER_SELL_TOKEN),
+            sell_amount: U256::from(1_010),
+            destination: &destination,
+            slippage_bps: 0,
+            gas_share_bps: 0,
+            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+            orderbook: Some(&orderbook),
+            across: &preview,
+            anchor_cache: None,
+            token_registry: &registry,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(review.buy_amount(), Some(U256::from(1_010)));
+    assert!(!review.gas_plan().approval_gas_limits.is_empty());
+    let saved_approval = saved(&store, operation, id).swap.approval().clone();
+    rpc.state
+        .calls
+        .lock()
+        .unwrap()
+        .insert(ORDER_SELL_TOKEN, Some(U256::MAX));
+    let corrected = owner
+        .requote_public_swap_delivery(&review, &quote, &origin_chain, Address::repeat_byte(0x50))
+        .await
+        .unwrap();
+    assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+    assert_eq!(corrected.gas_plan().deposit_gas_limit, None);
+    assert_eq!(corrected.gas_plan().max_gas_cost, U256::ZERO);
+    assert_eq!(
+        corrected.gas_plan().max_fee_per_gas,
+        review.gas_plan().max_fee_per_gas
+    );
+    assert_eq!(
+        corrected.gas_plan().max_priority_fee_per_gas,
+        review.gas_plan().max_priority_fee_per_gas
+    );
+    assert_eq!(corrected.quote(), review.quote());
+    assert_eq!(corrected.buy_amount(), review.buy_amount());
+    assert_eq!(corrected.bridge().destination_minimum, U256::from(999));
+    assert_eq!(
+        saved(&store, operation, id).swap.approval(),
+        &saved_approval
+    );
+    orderbook_task.abort();
+    let raised_review = delivery_review(
+        &owner,
+        &origin_chain,
+        Address::repeat_byte(0x50),
+        U256::from(1_013),
+        &preview,
+    )
+    .await;
+    assert!(
+        owner
+            .requote_public_swap_delivery(
+                &raised_review,
+                &quote,
+                &origin_chain,
+                Address::repeat_byte(0x50)
+            )
+            .await
+            .is_err()
+    );
+    preview_task.abort();
 
     // 999 for 1,010 needs ceil(1,010 * 1,000 / 999) = 1,012 and a margin of 1: 3 more, within
     // the cushion. Across quotes 1,013 with the same message, and its 1,002 covers the minimum.
@@ -696,6 +950,8 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
     assert_eq!(terms.message_hash, Some(keccak256(&message)));
     let quoted = quoted();
     let [
+        _,
+        _,
         _,
         (first_amount, first_message),
         (raised_amount, raised_message),
@@ -733,7 +989,7 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
         TEST_WALLET_ID,
         "Wallet",
     ));
-    // The destination chain is the mock chain, whose history holds the setup.
+    // The destination chain is the mock chain, whose nonce is past the setup's.
     let mut config =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
             .unwrap()
@@ -745,8 +1001,7 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
     let mut mock = MockChain::new(1, railgun, profile.delegate());
     mock.head = 14;
     mock.nonces = vec![(11, 1)];
-    let chain = Arc::new(Mutex::new(mock));
-    let served = chain.clone();
+    let served = Arc::new(Mutex::new(mock));
     let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
         Arc::new(move |request: Value| served.lock().unwrap().respond(&request)),
         Arc::default(),
@@ -772,8 +1027,8 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
     );
     let request = || claim(id, operation, DESTINATION_CHAIN, DESTINATION_TOKEN, USDC);
 
-    // The claimed account is the mock chain's executor. Its setup won nonce 0 in block 11 and
-    // is reconciled there.
+    // The claimed account is the mock chain's executor. Its setup's nonce 0 reads as consumed
+    // from block 11 on.
     let owner = start(0);
     owner.claim_public_swap(request()).unwrap();
     store.bind_address(operation, EXECUTOR).unwrap();
@@ -781,7 +1036,7 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
         .bind_public_swap_destination(operation, id, EXECUTOR)
         .unwrap();
     let before_setup = ExecutorNonceObservation::new(BlockNumHash::new(10, B256::ZERO), U256::ZERO);
-    store.reconcile(operation, before_setup, &[]).unwrap();
+    store.record_account_read(operation, before_setup).unwrap();
     let setup_call = execute(vec![private_transaction(0x11, 0x12)], Vec::new(), 0);
     let setup = B256::repeat_byte(3);
     store
@@ -792,18 +1047,14 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
                 profile.delegate(),
                 setup,
                 ExecutorPayloadPurpose::Operation,
-                ExecutorPayloadContext::new(setup_call.clone(), before_setup, Vec::new()),
+                ExecutorPayloadContext::new(setup_call, before_setup, Vec::new()),
             ),
         )
         .unwrap();
-    chain
-        .lock()
-        .unwrap()
-        .add_transaction(11, EXECUTOR, setup_call, private_logs(0x11, 0x12));
-    let reconciled = owner.reconcile_history(operation, 10..14).await.unwrap();
+    let reconciled = owner.reconcile_account(operation).await.unwrap();
     assert_eq!(
-        reconciled.record().payload_status(setup),
-        Some(ExecutorPayloadStatus::Executed)
+        reconciled.record().payload_state(setup),
+        Some(ExecutorPayloadState::Resolved)
     );
     let before = saved(&store, operation, id);
     owner.shutdown().await;
@@ -1914,7 +2165,7 @@ async fn a_reverted_public_swap_deposit_hands_nothing_off() {
         let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
         payment.chain.lock().unwrap().deposits_revert = true;
         let before = payment.saved();
-        let shield_status = before.record.payload_status(payment.shield);
+        let shield_state = before.record.payload_state(payment.shield);
         assert_eq!(before.shields, [payment.shield]);
 
         let PublicSwapTransactionOutcome::Reverted {
@@ -1982,10 +2233,7 @@ async fn a_reverted_public_swap_deposit_hands_nothing_off() {
             );
         }
         assert_eq!(observed.shields, [payment.shield]);
-        assert_eq!(
-            observed.record.payload_status(payment.shield),
-            shield_status
-        );
+        assert_eq!(observed.record.payload_state(payment.shield), shield_state);
         assert!(
             !payment
                 .chain
@@ -3889,6 +4137,90 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
         })
     );
 
+    let balance_selector = alloy::hex::encode_prefixed(PublicErc20::balanceOfCall::SELECTOR);
+    let balance_reads = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "eth_call"
+                    && request["params"][0]
+                        .get("input")
+                        .or_else(|| request["params"][0].get("data"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|input| input.starts_with(&balance_selector))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    {
+        let mut chain = payment.delivery_chain.lock().unwrap();
+        let head = chain.head;
+        chain.buy_balance.extend([(block.number, 1_000), (head, 0)]);
+        chain.rpc_requests.clear();
+    }
+    // Background tracking keeps the receipt's held outcome and does not disclose a balance.
+    assert_eq!(
+        payment
+            .track(&owner, &across, None)
+            .await
+            .unwrap()
+            .destination_balance,
+        None
+    );
+    assert!(balance_reads(&payment.delivery_chain.lock().unwrap().rpc_requests).is_empty());
+    let explicit = || PublicSwapTracking {
+        origin: &payment.origin,
+        across: &across,
+        orderbook: None,
+        explicit: true,
+    };
+    let progress = owner
+        .track_public_swap(payment.operation, payment.id, explicit())
+        .await
+        .unwrap();
+    // The unconfirmed next block already has zero; Check status still reads the confirmed fill.
+    assert_eq!(progress.destination_balance, Some((amount, block)));
+    {
+        let mut chain = payment.delivery_chain.lock().unwrap();
+        let reads = balance_reads(&chain.rpc_requests);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0]["params"][0]["to"], json!(USDC));
+        let input: Bytes = serde_json::from_value(
+            reads[0]["params"][0]
+                .get("input")
+                .or_else(|| reads[0]["params"][0].get("data"))
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            PublicErc20::balanceOfCall::abi_decode(&input)
+                .unwrap()
+                .account,
+            EXECUTOR
+        );
+        assert_eq!(
+            reads[0]["params"][1],
+            json!({"blockHash": block.hash, "requireCanonical": true})
+        );
+        for request in &chain.rpc_requests {
+            if request["method"] == "eth_getBlockByNumber" {
+                assert_eq!(request["params"][1], false);
+            }
+        }
+        chain.head += 1;
+    }
+    let progress = owner
+        .track_public_swap(payment.operation, payment.id, explicit())
+        .await
+        .unwrap();
+    let at = payment
+        .delivery_chain
+        .lock()
+        .unwrap()
+        .block(block.number + 1);
+    assert_eq!(progress.destination_balance, Some((U256::ZERO, at)));
+
     across_task.abort();
     payment.finish(owner).await;
 }
@@ -4087,6 +4419,7 @@ const NO_PROGRESS: PublicSwapProgress = PublicSwapProgress {
     changed: false,
     refresh_public_balances: false,
     finished: false,
+    destination_balance: None,
 };
 
 // The wallet stops after a direct deposit was included. Only the destination chain's owner is
@@ -4157,6 +4490,7 @@ async fn a_public_swap_resumes_from_its_destination_chains_owner_alone() {
         changed: true,
         refresh_public_balances: false,
         finished: true,
+        destination_balance: None,
     };
     assert_eq!(
         payment.track(&restarted, &across, None).await.unwrap(),
@@ -4228,6 +4562,7 @@ async fn a_public_order_resumes_from_its_destination_chains_owner_alone() {
             changed: true,
             refresh_public_balances: false,
             finished: true,
+            destination_balance: None,
         }
     );
     assert_eq!(

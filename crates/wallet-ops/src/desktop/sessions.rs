@@ -883,7 +883,7 @@ mod tests {
             U256::from(3),
         );
         records
-            .reconcile(record.operation(), observed, &[])
+            .record_account_read(record.operation(), observed)
             .unwrap();
         let payload_hash = FixedBytes::repeat_byte(4);
         records
@@ -903,20 +903,12 @@ mod tests {
             )
             .unwrap();
         records
-            .reconcile(
+            .record_account_read(
                 record.operation(),
                 vault::ExecutorNonceObservation::new(
                     alloy::eips::BlockNumHash::new(12, FixedBytes::repeat_byte(12)),
                     U256::from(4),
                 ),
-                &[(
-                    payload_hash,
-                    vault::ExecutorPayloadInclusion::new(
-                        alloy::eips::BlockNumHash::new(11, FixedBytes::repeat_byte(11)),
-                        FixedBytes::repeat_byte(5),
-                        vault::ExecutorExecutionResult::Executed,
-                    ),
-                )],
             )
             .unwrap();
         let reading_owner = owner.clone();
@@ -937,8 +929,8 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            records.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            records.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(2), reading)
@@ -953,12 +945,12 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.records().unwrap().len(), 1);
         assert_eq!(
-            replacement.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            replacement.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert_eq!(
-            records.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            records.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert_eq!(records.next_index().unwrap(), 8);
         sessions.shutdown().await;

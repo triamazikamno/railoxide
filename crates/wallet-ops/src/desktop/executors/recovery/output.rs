@@ -1,649 +1,325 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use alloy::primitives::{Address, B256, U256};
-use alloy::sol_types::SolCall;
-use broadcaster_core::contracts::railgun::{RelayAdapt7702, ShieldRequest, TokenData, shieldCall};
-use eyre::{Result, eyre};
-use railgun_wallet::{UtxoCommitmentKind, WalletUtxo};
+use broadcaster_core::contracts::railgun::ShieldRequest;
+use railgun_wallet::{Utxo, UtxoCommitmentKind};
 
-use super::ExecutorOwner;
-use crate::WalletSession;
 use crate::desktop::executor_observation::expected_shields;
-use crate::vault::{
-    ExecutorOperationId, ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorPayloadStatus,
-    ExecutorRecord, ExecutorRecoveryStepKind,
+use crate::desktop::executors::attribution::{
+    ExecutorAttributionEvidence, ExecutorPayloadOutcome, payload_calls, payload_outcome,
 };
-use crate::walletconnect::WrappedNative;
+use crate::vault::{ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload};
 
-/// The original held amount still needing recovery, from verified record history only.
-/// Same-block recoveries have no ordering evidence and leave the amount unchanged.
-/// Newly wrapped native funds are excluded even when they shield the same ERC-20.
+/// Where a batch or paid recovery stands, from its nonce, the action attributed there and
+/// the shields private sync shows. Derived on each call and never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorRecoveryCompletion {
+    /// The nonce is not known to be consumed. The recovery can still execute and keeps its
+    /// reservations.
+    Pending,
+    /// The recovery ran, and private sync does not show every shield it requested yet.
+    ShieldPending,
+    /// The recovery ran and every shield it requested is received. One that requested none,
+    /// as a cancellation, is complete once it is the action that ran.
+    Complete,
+    /// Another action ran at the recovery's nonce.
+    Superseded,
+    /// The nonce is consumed and nothing names what ran. The recovery is not complete, and
+    /// another stays available for whatever the account's balances show.
+    Unattributed,
+}
+
+/// The completion of the recovery payload `hash`, or `None` when `record` holds no such
+/// recovery. A consumed nonce alone completes nothing: the recovery must be the action
+/// attributed at it, and private sync must show every shield it requested.
 #[must_use]
-pub fn executor_recovery_remaining_amount(
+pub fn executor_recovery_completion(
     record: &ExecutorRecord,
-    token: Address,
-    gross_amount: U256,
-    held_block: u64,
-    railgun: Address,
-) -> U256 {
-    let Some(source) = record.address() else {
-        return gross_amount;
-    };
-    let token = TokenData::erc20(token);
-    let mut seen = BTreeSet::new();
-    let mut recovered = U256::ZERO;
-    for payload in record
+    hash: B256,
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> Option<ExecutorRecoveryCompletion> {
+    let payload = record.issued().iter().find(|payload| {
+        payload.hash() == hash && payload.purpose() == ExecutorPayloadPurpose::Recovery
+    })?;
+    Some(match payload_outcome(record, hash, evidence)? {
+        ExecutorPayloadOutcome::Pending => ExecutorRecoveryCompletion::Pending,
+        ExecutorPayloadOutcome::Superseded => ExecutorRecoveryCompletion::Superseded,
+        ExecutorPayloadOutcome::Resolved => ExecutorRecoveryCompletion::Unattributed,
+        ExecutorPayloadOutcome::Executed => {
+            if received_shields(record, payload, evidence).is_some() {
+                ExecutorRecoveryCompletion::Complete
+            } else {
+                ExecutorRecoveryCompletion::ShieldPending
+            }
+        }
+    })
+}
+
+/// Whether a recovery of `record` is the action that ran at its nonce and private sync shows
+/// every shield it requested, one of them received at or after `block`. A cancellation
+/// shields nothing and never counts.
+#[must_use]
+pub fn executor_recovered_since(
+    record: &ExecutorRecord,
+    block: u64,
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> bool {
+    record
         .issued()
         .iter()
         .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Recovery)
-    {
-        let Some(inclusion) = payload.inclusion() else {
-            continue;
-        };
-        if record.recorded_payload_status(payload.hash()) != Some(ExecutorPayloadStatus::Executed)
-            || inclusion.block().number <= held_block
-            || !seen.insert(inclusion.transaction_hash())
-        {
-            continue;
-        }
-        let data = payload.context().calldata();
-        let calls = if let Ok(call) = RelayAdapt7702::executeCall::abi_decode(data) {
-            if call._nonce != payload.nonce() || !call._actionData.requireSuccess {
-                continue;
-            }
-            call._actionData.calls
-        } else if let Ok(call) = RelayAdapt7702::multicallCall::abi_decode(data) {
-            if call._nonce != payload.nonce() || !call._requireSuccess {
-                continue;
-            }
-            call._calls
-        } else {
-            continue;
-        };
-        let Ok(requests) = expected_shields(source, railgun, &calls) else {
-            continue;
-        };
-        let Some(wrapped) = calls
-            .iter()
-            .filter(|call| {
-                call.to == token.tokenAddress
-                    && call.data.starts_with(&WrappedNative::depositCall::SELECTOR)
-            })
-            .try_fold(U256::ZERO, |amount, call| {
-                WrappedNative::depositCall::abi_decode(&call.data)
-                    .ok()
-                    .map(|_| amount.saturating_add(call.value))
-            })
-        else {
-            continue;
-        };
-        recovered =
-            recovered.saturating_add(shielded_amount(&requests, &token).saturating_sub(wrapped));
-    }
-
-    // Ordinary native recovery wraps and shields in separate transactions belonging
-    // to the same reviewed recovery. Deduct the wrap once across that group's shields.
-    let mut wrapped_by_recovery = BTreeMap::new();
-    let mut seen_wraps = seen.clone();
-    for transaction in record
-        .recovery_transactions()
-        .iter()
-        .filter(|transaction| transaction.kind() == ExecutorRecoveryStepKind::Wrap)
-    {
-        if record.recorded_recovery_transaction_status(transaction.hash())
-            != Some(ExecutorPayloadStatus::Executed)
-            || !seen_wraps.insert(transaction.hash())
-        {
-            continue;
-        }
-        let request = transaction.transaction();
-        let wrapped = wrapped_by_recovery
-            .entry(transaction.recovery())
-            .or_insert(Some(U256::ZERO));
-        if request.from != Some(source) || request.to.as_ref().and_then(|to| to.to()).is_none() {
-            *wrapped = None;
-        } else if request.to.as_ref().and_then(|to| to.to()) == Some(&token.tokenAddress) {
-            if request
-                .input
-                .input()
-                .is_none_or(|input| WrappedNative::depositCall::abi_decode(input).is_err())
-            {
-                *wrapped = None;
-            } else if let Some(amount) = wrapped {
-                *amount = amount.saturating_add(request.value.unwrap_or_default());
-            }
-        }
-    }
-    for transaction in record
-        .recovery_transactions()
-        .iter()
-        .filter(|transaction| transaction.kind() == ExecutorRecoveryStepKind::Shield)
-    {
-        let Some(inclusion) = transaction.inclusion() else {
-            continue;
-        };
-        if record.recorded_recovery_transaction_status(transaction.hash())
-            != Some(ExecutorPayloadStatus::Executed)
-            || inclusion.block().number <= held_block
-            || !seen.insert(inclusion.transaction_hash())
-        {
-            continue;
-        }
-        let request = transaction.transaction();
-        if request.from != Some(source)
-            || request.to.as_ref().and_then(|to| to.to()) != Some(&railgun)
-        {
-            continue;
-        }
-        let Some(input) = request.input.input() else {
-            continue;
-        };
-        let Ok(call) = shieldCall::abi_decode(input) else {
-            continue;
-        };
-        let mut amount = shielded_amount(&call._shieldRequests, &token);
-        if let Some(wrapped) = wrapped_by_recovery.get_mut(&transaction.recovery()) {
-            let Some(wrapped) = wrapped else {
-                continue;
-            };
-            let newly_wrapped = amount.min(*wrapped);
-            amount -= newly_wrapped;
-            *wrapped -= newly_wrapped;
-        }
-        recovered = recovered.saturating_add(amount);
-    }
-    gross_amount.saturating_sub(recovered)
+        .any(|payload| {
+            payload_outcome(record, payload.hash(), evidence)
+                == Some(ExecutorPayloadOutcome::Executed)
+                && received_shields(record, payload, evidence)
+                    .is_some_and(|shields| shields.iter().any(|(_, received)| *received >= block))
+        })
 }
 
-fn shielded_amount(requests: &[ShieldRequest], token: &TokenData) -> U256 {
+/// The latest received shield of `token` at or after `block` from an attributed recovery
+/// whose every requested shield private sync shows. A recovery of another asset or a
+/// cancellation does not count.
+#[must_use]
+pub fn executor_recovered_token_since(
+    record: &ExecutorRecord,
+    token: Address,
+    block: u64,
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> Option<u64> {
+    record
+        .issued()
+        .iter()
+        .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Recovery)
+        .filter(|payload| {
+            payload_outcome(record, payload.hash(), evidence)
+                == Some(ExecutorPayloadOutcome::Executed)
+        })
+        .filter_map(|payload| received_shields(record, payload, evidence))
+        .flatten()
+        .filter(|(request, received)| {
+            request.preimage.token.tokenType == 0
+                && request.preimage.token.tokenAddress == token
+                && *received >= block
+        })
+        .map(|(_, received)| received)
+        .max()
+}
+
+/// Each requested shield and the block where private sync shows it, once it shows them
+/// all. Empty for a payload that requested none. Each request is salted, so its note names it.
+fn received_shields(
+    record: &ExecutorRecord,
+    payload: &IssuedExecutorPayload,
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> Option<Vec<(ShieldRequest, u64)>> {
+    let requests = expected_shields(
+        record.address()?,
+        evidence.railgun,
+        &payload_calls(payload)?,
+    )
+    .ok()?;
+    if requests.is_empty() {
+        return Some(Vec::new());
+    }
+    let utxos = &evidence.sync?.utxos;
     requests
-        .iter()
-        .filter(|request| {
-            let shield_token = &request.preimage.token;
-            shield_token.tokenType == token.tokenType
-                && shield_token.tokenAddress == token.tokenAddress
-                && shield_token.tokenSubID == token.tokenSubID
-        })
-        .fold(U256::ZERO, |amount, request| {
-            amount.saturating_add(U256::from(request.preimage.value))
-        })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutorRecoveryOutputId {
-    OrdinaryTransaction(B256),
-    ExecutionPayload(B256),
-}
-
-/// Current observation only, recomputed from the canonical record and private actor.
-/// Receiving the shield does not assert that its POIs are ready for another spend.
-pub struct ExecutorRecoveryOutputStatus {
-    pub id: ExecutorRecoveryOutputId,
-    pub execution: ExecutorPayloadStatus,
-    pub transaction_hash: Option<B256>,
-    pub expected_outputs: usize,
-    /// None while the private snapshot is unavailable or execution is unconfirmed.
-    pub observed_private_outputs: Option<usize>,
-}
-
-impl ExecutorRecoveryOutputStatus {
-    #[must_use]
-    pub fn is_received(&self) -> bool {
-        self.execution == ExecutorPayloadStatus::Executed
-            && self.expected_outputs != 0
-            && self.observed_private_outputs == Some(self.expected_outputs)
-    }
-}
-
-impl ExecutorOwner {
-    /// Local-only progress. No RPC query or private projection mutation is performed.
-    pub fn recovery_output_statuses(
-        &self,
-        session: &WalletSession,
-        operation: ExecutorOperationId,
-    ) -> Result<Vec<ExecutorRecoveryOutputStatus>> {
-        self.ensure_active()?;
-        if session
-            .executor_owner
-            .as_ref()
-            .is_none_or(|owner| !std::ptr::eq(owner.as_ref(), self))
-        {
-            return Err(eyre!(
-                "recovery outputs belong to a different wallet session"
-            ));
-        }
-        // History display can use verified inclusions without a fresh signing
-        // nonce. Receipt matching still requires the actor's current projection.
-        let record = self
-            .records()?
-            .into_iter()
-            .find(|record| record.operation() == operation)
-            .ok_or_else(|| eyre!("historical executor record is unavailable"))?;
-        let source = record
-            .address()
-            .ok_or_else(|| eyre!("executor address is unavailable"))?;
-        let railgun = self.chain.require_railgun()?.deployment.contract;
-        let snapshot = session.handle.current_snapshot();
-        let utxos = snapshot.as_ref().map(|snapshot| snapshot.utxos.as_ref());
-        let mut statuses = Vec::new();
-        for transaction in record
-            .recovery_transactions()
-            .iter()
-            .filter(|transaction| transaction.kind() == ExecutorRecoveryStepKind::Shield)
-        {
-            let input = transaction
-                .transaction()
-                .input
-                .input()
-                .ok_or_else(|| eyre!("retained shield call is unavailable"))?;
-            let requests = shieldCall::abi_decode(input)?._shieldRequests;
-            statuses.push(output_status(
-                ExecutorRecoveryOutputId::OrdinaryTransaction(transaction.hash()),
-                record
-                    .recovery_transaction_status(transaction.hash())
-                    .unwrap_or(ExecutorPayloadStatus::Uncertain),
-                transaction.inclusion(),
-                &requests,
-                utxos,
-            ));
-        }
-        for payload in record
-            .issued()
-            .iter()
-            .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Recovery)
-        {
-            let calls = if let Ok(call) =
-                RelayAdapt7702::executeCall::abi_decode(payload.context().calldata())
-            {
-                call._actionData.calls
-            } else {
-                RelayAdapt7702::multicallCall::abi_decode(payload.context().calldata())?._calls
-            };
-            let requests = expected_shields(source, railgun, &calls)?;
-            statuses.push(output_status(
-                ExecutorRecoveryOutputId::ExecutionPayload(payload.hash()),
-                record
-                    .recorded_payload_status(payload.hash())
-                    .unwrap_or(ExecutorPayloadStatus::Uncertain),
-                payload.inclusion(),
-                &requests,
-                utxos,
-            ));
-        }
-        Ok(statuses)
-    }
-}
-
-fn output_status(
-    id: ExecutorRecoveryOutputId,
-    execution: ExecutorPayloadStatus,
-    inclusion: Option<ExecutorPayloadInclusion>,
-    requests: &[ShieldRequest],
-    utxos: Option<&[WalletUtxo]>,
-) -> ExecutorRecoveryOutputStatus {
-    let observed_private_outputs = if execution == ExecutorPayloadStatus::Executed {
-        inclusion.zip(utxos).map(|(inclusion, utxos)| {
-            let mut matched = std::collections::BTreeSet::new();
-            requests
+        .into_iter()
+        .map(|request| {
+            utxos
                 .iter()
-                .filter(|request| {
-                    let token = request.preimage.token.id();
-                    utxos
-                        .iter()
-                        .enumerate()
-                        .find(|(index, wallet_utxo)| {
-                            let utxo = &wallet_utxo.utxo;
-                            // The canonical receipt verified gross = net + protocol fee.
-                            // Include a matching shield note even if it was spent later.
-                            !matched.contains(index)
-                                && utxo.poi.commitment_kind == UtxoCommitmentKind::Shield
-                                && utxo.source.tx_hash == inclusion.transaction_hash()
-                                && utxo.source.block_number == inclusion.block().number
-                                && utxo.note.npk == U256::from_be_bytes(request.preimage.npk.0)
-                                && utxo.note.token_hash == token
-                                && utxo.note.value <= U256::from(request.preimage.value)
-                        })
-                        .is_some_and(|(index, _)| matched.insert(index))
-                })
-                .count()
+                .find(|entry| is_shield_of(&entry.utxo, &request))
+                .map(|entry| (request, entry.utxo.source.block_number))
         })
-    } else {
-        None
-    };
-    ExecutorRecoveryOutputStatus {
-        id,
-        execution,
-        transaction_hash: inclusion.map(ExecutorPayloadInclusion::transaction_hash),
-        expected_outputs: requests.len(),
-        observed_private_outputs,
-    }
+        .collect()
+}
+
+/// The amount of a token an account still holds: its balance at the latest confirmed read
+/// among `observed`, each a balance with the number of the block it was read at. `None`
+/// without a read. Anyone can raise a balance, so this says how much is held, where more is
+/// safe, and that nothing is left, where zero is exact. Completion never rests on it.
+#[must_use]
+pub fn executor_recovery_remaining_amount(
+    observed: impl IntoIterator<Item = (U256, u64)>,
+) -> Option<U256> {
+    observed
+        .into_iter()
+        .max_by_key(|(_, block)| *block)
+        .map(|(amount, _)| amount)
+}
+
+/// Whether `utxo` is a shield note `request` created. The request's own key identifies it,
+/// and the note holds the requested value less the protocol fee.
+pub(in crate::desktop::executors) fn is_shield_of(utxo: &Utxo, request: &ShieldRequest) -> bool {
+    utxo.poi.commitment_kind == UtxoCommitmentKind::Shield
+        && utxo.note.npk == U256::from_be_bytes(request.preimage.npk.0)
+        && utxo.note.token_hash == request.preimage.token.id()
+        && utxo.note.value <= U256::from(request.preimage.value)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-        IssuedExecutorPayload, IssuedExecutorRecoveryTransaction,
+    use crate::desktop::executors::attribution::InvalidatedSwapOrders;
+    use crate::desktop::executors::attribution::tests::{
+        RAILGUN, RESOLVED_AT, SETTLEMENT, execute, note, operation_and_recovery, payload,
+        pre_hook_and_cancellation, pre_hook_executed, record, recovery, shield, shield_call,
+        shielded, spent, synced,
     };
-    use alloy::eips::BlockNumHash;
-    use alloy::primitives::{Address, Bytes, Uint};
-    use alloy::rpc::types::TransactionRequest;
-    use broadcaster_core::contracts::railgun::{Call, CommitmentPreimage, ShieldCiphertext};
-    use railgun_wallet::{Utxo, UtxoSource};
+    use crate::vault::SwapOrderObservations;
+    use sync_service::WalletCurrentSnapshot;
 
-    fn recovery_shield(token: &TokenData, amount: u64) -> ShieldRequest {
-        ShieldRequest {
-            preimage: CommitmentPreimage {
-                npk: B256::repeat_byte(1),
-                token: token.clone(),
-                value: Uint::from(amount),
-            },
-            ciphertext: ShieldCiphertext {
-                encryptedBundle: [B256::ZERO; 3],
-                shieldKey: B256::ZERO,
-            },
+    fn evidence(sync: Option<&Arc<WalletCurrentSnapshot>>) -> ExecutorAttributionEvidence<'_> {
+        ExecutorAttributionEvidence {
+            railgun: RAILGUN,
+            sync: sync.map(Arc::as_ref),
+            invalidated_orders: Some(InvalidatedSwapOrders {
+                settlement: SETTLEMENT,
+                orders: &[],
+            }),
         }
     }
 
-    fn recovery_record(
-        issued: Vec<serde_json::Value>,
-        transactions: Vec<serde_json::Value>,
-    ) -> ExecutorRecord {
-        serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "derivation": "Railgun7702V1",
-            "origin": "Discovered",
-            "operation": ExecutorOperationId::random().unwrap(),
-            "index": 1,
-            "address": Address::repeat_byte(1),
-            "delegate": Address::repeat_byte(2),
-            "retired": true,
-            "issued": serde_json::Value::Array(issued),
-            "recovery_transactions": serde_json::Value::Array(transactions),
-        }))
-        .unwrap()
+    fn completion(
+        record: &ExecutorRecord,
+        sync: Option<&Arc<WalletCurrentSnapshot>>,
+        hash: u8,
+    ) -> ExecutorRecoveryCompletion {
+        executor_recovery_completion(record, B256::repeat_byte(hash), &evidence(sync)).unwrap()
     }
 
-    fn recovery_batch(nonce: u64, outer: u8, calls: Vec<Call>) -> serde_json::Value {
-        let calldata = RelayAdapt7702::multicallCall {
-            _requireSuccess: true,
-            _calls: calls,
-            _nonce: U256::from(nonce),
-            _signature: Bytes::default(),
-        }
-        .abi_encode();
-        let observed = BlockNumHash::new(10, B256::repeat_byte(10));
-        let mut payload = serde_json::to_value(IssuedExecutorPayload::new(
-            U256::from(nonce),
-            Address::repeat_byte(2),
-            B256::repeat_byte(outer),
-            ExecutorPayloadPurpose::Recovery,
-            ExecutorPayloadContext::new(
-                calldata.into(),
-                ExecutorNonceObservation::new(observed, U256::from(nonce)),
-                Vec::new(),
-            ),
-        ))
-        .unwrap();
-        payload["inclusion"] = serde_json::to_value(ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(outer),
-            ExecutorExecutionResult::Executed,
-        ))
-        .unwrap();
-        payload
-    }
-
-    fn ordinary_recovery(
-        recovery: ExecutorOperationId,
-        step: u32,
-        outer: u8,
-        kind: ExecutorRecoveryStepKind,
-        call: Call,
-    ) -> serde_json::Value {
-        let request = TransactionRequest::default()
-            .from(Address::repeat_byte(1))
-            .to(call.to)
-            .value(call.value)
-            .input(call.data.into());
-        let mut transaction = serde_json::to_value(IssuedExecutorRecoveryTransaction::new(
-            recovery,
-            step,
-            kind,
-            request,
-            B256::repeat_byte(outer),
-            BlockNumHash::new(10, B256::repeat_byte(10)),
-        ))
-        .unwrap();
-        transaction["inclusion"] = serde_json::to_value(ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(outer),
-            ExecutorExecutionResult::Executed,
-        ))
-        .unwrap();
-        transaction
-    }
-
-    fn shield_call(to: Address, token: &TokenData, amount: u64) -> Call {
-        Call {
-            to,
-            data: shieldCall {
-                _shieldRequests: vec![recovery_shield(token, amount)],
-            }
-            .abi_encode()
-            .into(),
-            value: U256::ZERO,
+    #[test]
+    fn recovery_completes_once_attributed_with_its_shield_received() {
+        let request = shield(7);
+        // Its nonce is not consumed yet, so it can still execute.
+        assert_eq!(
+            completion(&record(vec![recovery(2, &request)], 0), None, 2),
+            ExecutorRecoveryCompletion::Pending
+        );
+        // The only action signed at its nonce ran. Its shield is still to be shown.
+        let alone = record(vec![recovery(2, &request)], 1);
+        assert_eq!(
+            completion(&alone, None, 2),
+            ExecutorRecoveryCompletion::ShieldPending
+        );
+        let behind = synced(RESOLVED_AT, Vec::new());
+        assert_eq!(
+            completion(&alone, Some(&behind), 2),
+            ExecutorRecoveryCompletion::ShieldPending
+        );
+        assert!(!executor_recovered_since(
+            &alone,
+            0,
+            &evidence(Some(&behind))
+        ));
+        // Against an operation at the same nonce, the shield is what attributes it.
+        let input = note(1);
+        let contested = operation_and_recovery(&input, &[], &request);
+        let sync = synced(RESOLVED_AT, vec![input, shielded(&request)]);
+        for saved in [&alone, &contested] {
+            assert_eq!(
+                completion(saved, Some(&sync), 2),
+                ExecutorRecoveryCompletion::Complete
+            );
+            // The shield arrives in block 15.
+            assert!(executor_recovered_since(saved, 15, &evidence(Some(&sync))));
+            assert!(!executor_recovered_since(saved, 16, &evidence(Some(&sync))));
         }
     }
 
     #[test]
-    fn held_recovery_amount_accumulates_exact_asset_winners_and_reopens_after_reorg() {
-        let railgun = Address::repeat_byte(3);
-        let source = Address::repeat_byte(1);
-        let token = TokenData::erc20(Address::repeat_byte(4));
-        let recovery = ExecutorOperationId::random().unwrap();
-        let ordinary = ordinary_recovery(
-            recovery,
-            0,
-            20,
-            ExecutorRecoveryStepKind::Shield,
-            shield_call(railgun, &token, 10),
-        );
-        let partial = recovery_record(Vec::new(), vec![ordinary.clone()]);
-        let remaining = |record: &ExecutorRecord| {
-            executor_recovery_remaining_amount(
-                record,
-                token.tokenAddress,
-                U256::from(100),
-                10,
-                railgun,
-            )
-        };
-        assert_eq!(remaining(&partial), U256::from(90));
+    fn token_recovery_requires_every_shield_and_returns_only_matching_erc20_blocks() {
+        use broadcaster_core::contracts::railgun::TokenData;
 
-        let batch = recovery_batch(1, 21, vec![shield_call(source, &token, 90)]);
-        let unrelated = recovery_batch(
+        let token = Address::repeat_byte(5);
+        let first = shield(7);
+        let later = shield(8);
+        let mut other = shield(9);
+        other.preimage.token = TokenData::erc20(Address::repeat_byte(6));
+        let mut nft = shield(10);
+        nft.preimage.token.tokenType = 1;
+        nft.preimage.token.tokenSubID = U256::ONE;
+        let issued = payload(
+            0,
             2,
-            22,
-            vec![shield_call(
-                source,
-                &TokenData::erc20(Address::repeat_byte(5)),
-                100,
-            )],
+            ExecutorPayloadPurpose::Recovery,
+            &execute(0, [&first, &later, &other, &nft].map(shield_call).into()),
+            &[],
+            &[],
         );
-        let mut pending = recovery_batch(3, 23, vec![shield_call(source, &token, 100)]);
-        pending["inclusion"] = serde_json::Value::Null;
-        let mut reverted = recovery_batch(4, 24, vec![shield_call(source, &token, 100)]);
-        reverted["inclusion"]["result"] = serde_json::json!("Reverted");
-        let mut same_block = recovery_batch(5, 25, vec![shield_call(source, &token, 100)]);
-        same_block["inclusion"]["block"]["number"] = serde_json::json!(10);
-        let ignored = vec![unrelated, pending, reverted, same_block];
-        assert_eq!(
-            remaining(&recovery_record(ignored.clone(), vec![ordinary.clone()])),
-            U256::from(90)
+        let saved = record(vec![issued.clone()], 1);
+        let received = |request: &ShieldRequest, block| {
+            let mut utxo = shielded(request);
+            utxo.utxo.source.block_number = block;
+            utxo
+        };
+        // Seeing both shields of the requested token is insufficient while another request
+        // in the recovery remains missing.
+        let incomplete = synced(
+            RESOLVED_AT + 10,
+            vec![
+                received(&first, 15),
+                received(&later, 20),
+                received(&nft, 30),
+            ],
         );
-        let mut completed = ignored.clone();
-        completed.push(batch.clone());
         assert_eq!(
-            remaining(&recovery_record(completed, vec![ordinary.clone()])),
-            U256::ZERO
+            executor_recovered_token_since(&saved, token, 0, &evidence(Some(&incomplete))),
+            None
         );
-        let mut reorged = batch;
-        reorged["inclusion"] = serde_json::Value::Null;
-        let mut evidence = ignored;
-        evidence.push(reorged);
+        let complete = synced(
+            RESOLVED_AT + 10,
+            vec![
+                received(&first, 15),
+                received(&later, 20),
+                received(&other, 25),
+                received(&nft, 30),
+            ],
+        );
+        let evidence = evidence(Some(&complete));
         assert_eq!(
-            remaining(&recovery_record(evidence, vec![ordinary])),
-            U256::from(90)
+            executor_recovered_token_since(&saved, token, 15, &evidence),
+            Some(20)
+        );
+        assert_eq!(
+            executor_recovered_token_since(&saved, token, 21, &evidence),
+            None
+        );
+        assert_eq!(
+            executor_recovered_token_since(&saved, Address::repeat_byte(6), 15, &evidence),
+            Some(25)
+        );
+        // The account-wide helper retains its existing meaning, including the later NFT.
+        assert!(executor_recovered_since(&saved, 30, &evidence));
+        let pending = record(vec![issued], 0);
+        assert_eq!(
+            executor_recovered_token_since(&pending, token, 0, &evidence),
+            None
         );
     }
 
     #[test]
-    fn held_weth_recovery_excludes_new_wraps_and_counts_each_outer_transaction_once() {
-        let railgun = Address::repeat_byte(3);
-        let source = Address::repeat_byte(1);
-        let token = TokenData::erc20(Address::repeat_byte(4));
-        let wrap = |amount| Call {
-            to: token.tokenAddress,
-            data: WrappedNative::depositCall {}.abi_encode().into(),
-            value: U256::from(amount),
-        };
-        let batch = recovery_batch(1, 20, vec![wrap(80_u64), shield_call(source, &token, 90)]);
-        let recovery = ExecutorOperationId::random().unwrap();
-        let ordinary = vec![
-            ordinary_recovery(
-                recovery,
-                0,
-                21,
-                ExecutorRecoveryStepKind::Wrap,
-                wrap(30_u64),
-            ),
-            ordinary_recovery(
-                recovery,
-                1,
-                22,
-                ExecutorRecoveryStepKind::Shield,
-                shield_call(railgun, &token, 40),
-            ),
-        ];
-        let remaining = |record: &ExecutorRecord| {
-            executor_recovery_remaining_amount(
-                record,
-                token.tokenAddress,
-                U256::from(100),
-                10,
-                railgun,
-            )
-        };
+    fn resolved_nonce_with_nothing_attributed_leaves_recovery_incomplete_and_available() {
+        // A cancellation whose broadcaster reply was lost, at its pre-hook's nonce. Its fee
+        // note is spent in a transaction the wallet never recorded.
+        let fee = note(1);
+        let saved = pre_hook_and_cancellation(&fee, Vec::new(), &SwapOrderObservations::default());
+        let sync = synced(RESOLVED_AT + 10, vec![spent(fee, 31, 15)]);
         assert_eq!(
-            remaining(&recovery_record(vec![batch.clone()], ordinary.clone())),
-            U256::from(80)
+            completion(&saved, Some(&sync), 4),
+            ExecutorRecoveryCompletion::Unattributed
         );
-        let mut duplicate = ordinary;
-        duplicate.push(ordinary_recovery(
-            ExecutorOperationId::random().unwrap(),
-            0,
-            20,
-            ExecutorRecoveryStepKind::Shield,
-            shield_call(railgun, &token, 90),
-        ));
-        assert_eq!(
-            remaining(&recovery_record(vec![batch], duplicate)),
-            U256::from(80)
-        );
+        assert!(!executor_recovered_since(&saved, 0, &evidence(Some(&sync))));
+        // Nothing at the consumed nonce is outstanding, so it blocks no further recovery.
+        assert!(!saved.has_unresolved_issued_work());
     }
 
     #[test]
-    fn executor_recovery_output_waits_for_matching_private_shield_and_reopens_after_reorg() {
-        let request = ShieldRequest {
-            preimage: CommitmentPreimage {
-                npk: B256::repeat_byte(1),
-                token: TokenData::erc20(Address::repeat_byte(2)),
-                value: Uint::from(100),
-            },
-            ciphertext: ShieldCiphertext {
-                encryptedBundle: [B256::ZERO; 3],
-                shieldKey: B256::ZERO,
-            },
-        };
-        let hash = B256::repeat_byte(3);
-        let id = ExecutorRecoveryOutputId::ExecutionPayload(B256::repeat_byte(4));
-        let inclusion = Some(ExecutorPayloadInclusion::new(
-            BlockNumHash::new(10, B256::repeat_byte(10)),
-            hash,
-            ExecutorExecutionResult::Executed,
-        ));
-        let mut note = request.preimage.note_with_random([0; 16]);
-        note.value = U256::from(99);
-        let mut output = WalletUtxo::new(Utxo::new(
-            note,
-            0,
-            0,
-            UtxoSource {
-                tx_hash: hash,
-                block_number: 10,
-                block_timestamp: 0,
-            },
-            UtxoCommitmentKind::Shield,
-        ));
-        let requests = [request];
-        let status = |execution, outputs: Option<&[WalletUtxo]>| {
-            output_status(id, execution, inclusion, &requests, outputs)
-        };
-        assert!(!status(ExecutorPayloadStatus::Executed, None).is_received());
-        assert!(!status(ExecutorPayloadStatus::Executed, Some(&[])).is_received());
-        output.utxo.source.tx_hash = B256::repeat_byte(5);
-        assert!(
-            !status(
-                ExecutorPayloadStatus::Executed,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
-        );
-        output.utxo.source.tx_hash = hash;
-        output.utxo.source.block_number = 9;
-        assert!(
-            !status(
-                ExecutorPayloadStatus::Executed,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
-        );
-        output.utxo.source.block_number = 10;
-        output.spent = Some(UtxoSource {
-            tx_hash: B256::repeat_byte(6),
-            block_number: 11,
-            block_timestamp: 0,
-        });
-        assert!(
-            status(
-                ExecutorPayloadStatus::Executed,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
-        );
-        assert!(
-            !status(
-                ExecutorPayloadStatus::MissingEffects,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
-        );
-        assert!(
-            !status(
-                ExecutorPayloadStatus::Uncertain,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
-        );
-        output.utxo.note.npk += U256::ONE;
-        assert!(
-            !status(
-                ExecutorPayloadStatus::Executed,
-                Some(std::slice::from_ref(&output))
-            )
-            .is_received()
+    fn cancellation_that_lost_its_nonce_to_a_recorded_pre_hook_is_superseded() {
+        let saved = pre_hook_and_cancellation(&note(1), Vec::new(), &pre_hook_executed());
+        // It requested no shield, so only attribution keeps it from counting as complete.
+        assert_eq!(
+            completion(&saved, None, 4),
+            ExecutorRecoveryCompletion::Superseded
         );
     }
 }

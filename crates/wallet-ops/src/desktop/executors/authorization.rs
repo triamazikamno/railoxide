@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use eyre::{Result, eyre};
 use railgun_wallet::keys::derive_executor_signer;
@@ -20,10 +20,6 @@ pub enum HardwareExecutorAction {
     RecoverPrepared {
         operation: ExecutorOperationId,
         recovery: ExecutorOperationId,
-    },
-    Retry {
-        operation: ExecutorOperationId,
-        transaction: B256,
     },
     Restore(Range<u32>),
     Register(ExecutorOperationId),
@@ -273,7 +269,6 @@ impl HardwareExecutorAuthorizationRequest {
             HardwareExecutorAction::Public { operation, .. }
             | HardwareExecutorAction::GasPayment { operation, .. }
             | HardwareExecutorAction::Register(operation)
-            | HardwareExecutorAction::Retry { operation, .. }
             | HardwareExecutorAction::Recover(operation)
             | HardwareExecutorAction::RecoverPrepared { operation, .. } => {
                 let record = self

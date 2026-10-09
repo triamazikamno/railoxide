@@ -1,6 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::root::chain_load::{ChainUtxoState, WalletSyncLifecycle};
+use alloy::primitives::B256;
 use broadcaster_core::contracts::swap_math::{SWAP_MATH_ADDRESS, SWAP_MATH_CREATION_CODE};
 use gpui::{IntoElement, ParentElement, Render, Styled, TestAppContext, div};
 use gpui_component::{Root, WindowExt};
@@ -523,27 +524,17 @@ fn selected_account_swap_allows_changing_both_tokens_without_starting_setup(
 ) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::B256;
-    use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadInclusion,
-    };
+    use wallet_ops::vault::ExecutorNonceObservation;
     with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
-        let setup = pending_setup(executors, operation);
+        pending_setup(executors, operation);
         // The setup won its nonce, so a new swap can offer this account.
         executors
-            .reconcile(
+            .record_account_read(
                 operation,
                 ExecutorNonceObservation::new(
                     BlockNumHash::new(12, B256::repeat_byte(12)),
                     U256::ONE,
                 ),
-                &[(
-                    setup.issued()[0].hash(),
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(5),
-                        ExecutorExecutionResult::Executed,
-                    ),
-                )],
             )
             .unwrap();
         cx.update(|window, cx| {
@@ -674,7 +665,7 @@ fn record_setup(
     };
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    executors.reconcile(operation, observed, &[]).unwrap();
+    executors.record_account_read(operation, observed).unwrap();
     executors
         .record_issued(
             operation,
@@ -740,7 +731,10 @@ fn setup_confirmation_tracks_local_inclusion_without_advancing_the_swap(cx: &mut
                     .as_deref(),
                 Some(expected)
             );
-            assert_eq!(swap_stage(&record, None, false), SwapStage::SetupPending);
+            assert_eq!(
+                swap_stage(&record, None, false, None),
+                SwapStage::SetupPending
+            );
         }
         // If private sync rolls the inclusion back, an unrelated transaction must
         // not leave the setup showing a stale confirmation count.
@@ -761,73 +755,46 @@ fn setup_confirmation_tracks_local_inclusion_without_advancing_the_swap(cx: &mut
 }
 
 #[gpui::test]
-fn observation_catchup_continues_successful_pages_but_waits_after_failure(cx: &mut TestAppContext) {
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+fn stale_setup_read_is_dropped_and_a_failed_read_records_its_error(cx: &mut TestAppContext) {
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         pending_setup(executors, operation);
         cx.update(|window, cx| {
-            root.update(cx, |root, _| {
-                let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
-                else {
-                    panic!("ready fixture");
-                };
-                sync_tip.head_block = Some(400);
-            });
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
-                let confirmed = swaps.confirmed_block(cx).unwrap();
-                let result = |end, outcome| {
+                // A setup's read pages through no history, so it has no range.
+                let result = |outcome| {
                     vec![ObservationResult {
                         operation,
-                        range_end: end,
+                        range_end: None,
                         outcome,
                         destination: None,
                     }]
                 };
-                assert_eq!(
-                    swaps.apply_observations(result(164, Ok(None)), window, cx),
-                    [operation],
-                    "a successful page behind the safe head continues without the polling delay"
-                );
-                let (_, _, pages) = swaps.next_observations(cx).unwrap();
-                assert_eq!(pages[0].range, 164..228);
                 // Either account's background read can lose a race with confirmation.
-                // Its stale page must neither show a review error nor advance tracking.
-                for destination in [None, Some((operation, confirmed))] {
+                // Its stale result must neither show a review error nor advance tracking.
+                for destination in [None, Some(operation)] {
                     let error = eyre::Report::from(wallet_ops::ExecutorRecordChanged)
                         .wrap_err("checking setup");
-                    let mut stale = result(228, Err(error));
+                    let mut stale = result(Err(error));
                     stale[0].destination = destination;
                     assert!(swaps.apply_observations(stale, window, cx).is_empty());
-                    let tracking = swaps.tracking.get(&operation).unwrap();
-                    assert!(tracking.error.is_none());
-                    assert_eq!(tracking.cursor, Some(164));
-                    assert!(tracking.destination_cursor.is_none());
-                    assert!(tracking.setup.is_none() && tracking.destination_setup.is_none());
+                    assert!(swaps.tracking.get(&operation).is_none_or(|tracking| {
+                        tracking.error.is_none()
+                            && tracking.setup.is_none()
+                            && tracking.destination_setup.is_none()
+                    }));
                 }
-                let (_, _, pages) = swaps.next_observations(cx).unwrap();
-                assert_eq!(pages[0].range, 164..228, "the stale page is still due");
                 assert!(
                     swaps
                         .apply_observations(
-                            result(228, Err(eyre::eyre!("RPC unavailable"))),
+                            result(Err(eyre::eyre!("RPC unavailable"))),
                             window,
                             cx,
                         )
                         .is_empty(),
                     "failed reads wait before retrying"
                 );
-                assert_eq!(
-                    swaps.tracking.get(&operation).unwrap().cursor,
-                    Some(164),
-                    "a failed page must not skip unobserved blocks"
-                );
                 assert!(swaps.tracking.get(&operation).unwrap().error.is_some());
-                assert!(
-                    swaps
-                        .apply_observations(result(confirmed + 1, Ok(None)), window, cx,)
-                        .is_empty(),
-                    "caught-up reads return to the polling interval"
-                );
             });
         });
     });
@@ -837,9 +804,7 @@ fn observation_catchup_continues_successful_pages_but_waits_after_failure(cx: &m
 fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut TestAppContext) {
     use alloy::eips::{BlockNumHash, eip7702::constants::EIP7702_DELEGATION_DESIGNATOR};
     use alloy::primitives::B256;
-    use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadInclusion,
-    };
+    use wallet_ops::vault::ExecutorNonceObservation;
     with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let issued = pending_setup(executors, operation);
         executors
@@ -852,7 +817,7 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
                 .next_observations(cx)
                 .is_some_and(|(_, _, pages)| pages.iter().any(|page| page.operation == operation))
         };
-        // A setup unconfirmed for long is checked every few minutes, not every block.
+        // A setup unconfirmed for long is still read on every pass.
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
                 let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
@@ -863,11 +828,6 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
             });
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
-                assert!(observed(swaps, cx));
-                swaps.tracking.entry(operation).or_default().setup_read_at = Some(Instant::now());
-                assert!(!observed(swaps, cx));
-                swaps.tracking.get_mut(&operation).unwrap().setup_read_at =
-                    Instant::now().checked_sub(DEFERRED_SETUP_OBSERVATION_INTERVAL);
                 assert!(observed(swaps, cx));
             });
         });
@@ -930,7 +890,6 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
         // Nothing waits on a stopped setup, so the swap view stops reading its account.
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
-                swaps.tracking.get_mut(&operation).unwrap().setup_read_at = None;
                 assert!(!observed(swaps, cx));
             });
         });
@@ -952,17 +911,9 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
         );
         let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
         let record = executors
-            .reconcile(
+            .record_account_read(
                 operation,
                 ExecutorNonceObservation::new(confirmed, U256::ONE),
-                &[(
-                    issued.issued()[0].hash(),
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(5),
-                        ExecutorExecutionResult::Executed,
-                    ),
-                )],
             )
             .unwrap();
         let profile = root.read_with(cx, |root, _| {
@@ -998,16 +949,14 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
 }
 
 #[gpui::test]
-fn handed_off_setup_waits_for_its_located_inclusion(cx: &mut TestAppContext) {
+fn setup_whose_nonce_is_recorded_as_consumed_is_approved_and_needs_no_setup_page(
+    cx: &mut TestAppContext,
+) {
     use alloy::eips::BlockNumHash;
-    use alloy::primitives::{B256, Bytes};
-    use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-        ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorPayloadStatus,
-        IssuedExecutorPayload,
-    };
+    use alloy::primitives::B256;
+    use wallet_ops::vault::ExecutorNonceObservation;
     with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
-        let issued = pending_setup(executors, operation);
+        pending_setup(executors, operation);
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
             .unwrap();
@@ -1016,179 +965,32 @@ fn handed_off_setup_waits_for_its_located_inclusion(cx: &mut TestAppContext) {
                 .next_observations(cx)
                 .is_some_and(|(_, _, pages)| pages.iter().any(|page| page.operation == operation))
         };
-        // Whether a reload counted a newly recorded setup inclusion since the last check.
-        let seen = std::cell::Cell::new(0);
-        let woke = |swaps: &PrivateSwapsView| {
-            let wakes = *swaps.observation_wake.borrow();
-            seen.replace(wakes) != wakes
-        };
-        let history_start = issued.issued()[0].context().history_start();
-        let set_head = |head, cx: &mut gpui::App| {
+        cx.update(|_, cx| {
             root.update(cx, |root, _| {
                 let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
                 else {
                     panic!("ready fixture");
                 };
-                sync_tip.head_block = Some(head);
+                sync_tip.head_block = Some(100);
             });
-        };
-        let depth = cx.update(|_, cx| {
-            root.read(cx)
-                .effective_chain_configs
-                .get(1)
-                .unwrap()
-                .finality_depth
-        });
-        // The confirmed block is one short of the setup's history start plus the depth.
-        let early_head = history_start + 2 * depth - 1;
-        cx.update(|_, cx| {
-            set_head(early_head, cx);
-            swaps.update(cx, |swaps, cx| {
+            swaps.update(cx, |swaps, _| {
                 swaps.reload_records();
-                assert!(
-                    !woke(swaps),
-                    "a setup without an inclusion does not wake polling"
-                );
-                let tracking = swaps.tracking.entry(operation).or_default();
-                tracking.setup = Some(wallet_ops::SwapSetupStatus::Pending);
-                tracking.setup_read_at = Some(Instant::now());
-                assert!(
-                    observed(swaps, cx),
-                    "an unlocated recent setup keeps the polling pace"
-                );
+                swaps.tracking.entry(operation).or_default().setup =
+                    Some(wallet_ops::SwapSetupStatus::Pending);
             });
         });
-        let setup = issued.issued()[0].hash();
-        executors
-            .record_submission(operation, setup, B256::repeat_byte(80))
-            .unwrap();
-        let located_at =
-            |swaps: &PrivateSwapsView| swaps.tracking.get(&operation).unwrap().located_at;
-        let expired = || {
-            Instant::now()
-                .checked_sub(DEFERRED_SETUP_OBSERVATION_INTERVAL)
-                .unwrap()
-        };
-        cx.update(|_, cx| {
-            swaps.update(cx, |swaps, cx| {
-                swaps.reload_records();
-                swaps.tracking.get_mut(&operation).unwrap().setup_read_at = None;
-                assert!(
-                    !observed(swaps, cx),
-                    "no confirmed block can contain a located setup sent after signing yet"
-                );
-            });
-            set_head(100, cx);
-            swaps.update(cx, |swaps, cx| {
-                let handed_off = located_at(swaps).expect("the hand-off is recorded");
-                assert_eq!(handed_off.0, setup);
-                assert!(
-                    !observed(swaps, cx),
-                    "private sync locates a handed-off setup, so even its first read waits"
-                );
-                swaps.reload_records();
-                assert_eq!(
-                    located_at(swaps),
-                    Some(handed_off),
-                    "reloads keep the hand-off time"
-                );
-                swaps.tracking.get_mut(&operation).unwrap().located_at = Some((setup, expired()));
-                assert!(observed(swaps, cx), "a fallback read still happens");
-                swaps.tracking.get_mut(&operation).unwrap().setup_read_at = Some(Instant::now());
-                assert!(!observed(swaps, cx), "the last read restarts the wait");
-                swaps.tracking.get_mut(&operation).unwrap().setup_read_at = Some(expired());
-            });
-        });
-        // A replacement attempt at the same nonce waits again after its own hand-off.
-        let retry_observed =
-            ExecutorNonceObservation::new(BlockNumHash::new(20, B256::repeat_byte(20)), U256::ZERO);
-        executors.reconcile(operation, retry_observed, &[]).unwrap();
-        let replacement = B256::repeat_byte(6);
-        executors
-            .record_issued(
-                operation,
-                IssuedExecutorPayload::new(
-                    U256::ZERO,
-                    issued.delegate(),
-                    replacement,
-                    ExecutorPayloadPurpose::Operation,
-                    ExecutorPayloadContext::new(
-                        Bytes::from_static(b"retry"),
-                        retry_observed,
-                        Vec::new(),
-                    ),
-                ),
-            )
-            .unwrap();
-        executors
-            .record_submission(operation, replacement, B256::repeat_byte(81))
-            .unwrap();
-        cx.update(|_, cx| {
-            swaps.update(cx, |swaps, cx| {
-                swaps.reload_records();
-                assert_eq!(located_at(swaps).map(|(hash, _)| hash), Some(replacement));
-                assert!(
-                    !observed(swaps, cx),
-                    "the replacement's hand-off defers its first read"
-                );
-            });
-        });
-        // An effect-less inclusion still needs the account check that reports it.
-        let observed_after = |nonce| {
-            ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), nonce)
-        };
-        executors
-            .reconcile(
-                operation,
-                observed_after(U256::ONE),
-                &[(
-                    replacement,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(25, B256::repeat_byte(25)),
-                        B256::repeat_byte(81),
-                        ExecutorExecutionResult::MissingEffects,
-                    ),
-                )],
-            )
-            .unwrap();
-        cx.update(|_, cx| {
-            swaps.update(cx, |swaps, cx| {
-                swaps.reload_records();
-                assert!(woke(swaps), "a newly recorded inclusion wakes polling");
-                assert!(
-                    observed(swaps, cx),
-                    "an effect-less inclusion is checked at once"
-                );
-            });
-        });
-        // The earlier attempt won the nonce. Confirmation observation records that from
-        // private sync's location without a nonce observation, and the swap is ready to
-        // place its approved order without another account read.
-        executors
-            .reconcile(
-                operation,
-                observed_after(U256::ONE),
-                &[(
-                    setup,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(80),
-                        ExecutorExecutionResult::Executed,
-                    ),
-                )],
-            )
-            .unwrap();
+        // The account's nonce is read past the setup. The swap is ready to place its approved
+        // order without another account read, also once that read's observation is
+        // invalidated.
+        let consumed =
+            ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
+        executors.record_account_read(operation, consumed).unwrap();
         executors.invalidate_observation(operation).unwrap();
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
-                assert!(woke(swaps), "a newly recorded inclusion wakes polling");
                 let record = swaps.record(operation).unwrap();
                 assert!(record.nonce_observation().is_none());
-                assert!(matches!(
-                    record.recorded_payload_status(replacement),
-                    Some(ExecutorPayloadStatus::Invalidated { .. })
-                ));
                 assert_eq!(
                     swaps.tracking.get(&operation).unwrap().setup,
                     Some(wallet_ops::SwapSetupStatus::Pending)
@@ -1196,12 +998,7 @@ fn handed_off_setup_waits_for_its_located_inclusion(cx: &mut TestAppContext) {
                 assert_eq!(swaps.stage(record), SwapStage::Approved);
                 assert!(
                     !observed(swaps, cx),
-                    "a recorded executed setup needs no setup page"
-                );
-                swaps.reload_records();
-                assert!(
-                    !woke(swaps),
-                    "an already known inclusion does not wake polling again"
+                    "a setup recorded as resolved needs no setup page"
                 );
             });
         });
@@ -1214,30 +1011,17 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
     use alloy::primitives::{B256, Bytes};
     use broadcaster_core::contracts::cow::OrderUid;
     use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorInputIdentity, ExecutorNonceObservation,
-        ExecutorPayloadContext, ExecutorPayloadInclusion, ExecutorPayloadPurpose,
-        IssuedExecutorPayload, SwapAttempt, SwapDelivery, SwapObservation, SwapOrderObservations,
-        SwapPreHookDeath, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapTerms,
+        ExecutorInputIdentity, ExecutorNonceObservation, ExecutorPayloadContext,
+        ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAttempt, SwapDelivery, SwapObservation,
+        SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause, SwapProof, SwapRecipient,
+        SwapTerms,
     };
     with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let setup = pending_setup(executors, operation);
         let setup_hash = setup.issued()[0].hash();
         let observed =
             ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
-        executors
-            .reconcile(
-                operation,
-                observed,
-                &[(
-                    setup_hash,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(5),
-                        ExecutorExecutionResult::Executed,
-                    ),
-                )],
-            )
-            .unwrap();
+        executors.record_account_read(operation, observed).unwrap();
         let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
             "tree": 4, "position": 16198, "commitment": "0x2"
         }))
@@ -1368,7 +1152,9 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
             .bind_address(pending, Address::repeat_byte(9))
             .unwrap();
         let pending_nonce = ExecutorNonceObservation::new(observed.block(), U256::ZERO);
-        executors.reconcile(pending, pending_nonce, &[]).unwrap();
+        executors
+            .record_account_read(pending, pending_nonce)
+            .unwrap();
         executors
             .record_issued(
                 pending,
@@ -1671,8 +1457,8 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
         use alloy::eips::{BlockNumHash, eip7702::constants::EIP7702_DELEGATION_DESIGNATOR};
         use alloy::primitives::{B256, Bytes};
         use wallet_ops::vault::{
-            ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-            ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
+            ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+            IssuedExecutorPayload,
         };
 
         let profile = root.read_with(cx, |root, _| {
@@ -1687,7 +1473,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
             .unwrap();
         let observed =
             ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-        executors.reconcile(operation, observed, &[]).unwrap();
+        executors.record_account_read(operation, observed).unwrap();
         let payload = B256::repeat_byte(4);
         executors
             .record_issued(
@@ -1703,17 +1489,9 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
             .unwrap();
         let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
         let record = executors
-            .reconcile(
+            .record_account_read(
                 operation,
                 ExecutorNonceObservation::new(confirmed, U256::ONE),
-                &[(
-                    payload,
-                    ExecutorPayloadInclusion::new(
-                        BlockNumHash::new(11, B256::repeat_byte(11)),
-                        B256::repeat_byte(5),
-                        ExecutorExecutionResult::Executed,
-                    ),
-                )],
             )
             .unwrap();
         let code = [
@@ -2025,7 +1803,6 @@ struct PlacedPrivateBridge {
     uid: broadcaster_core::contracts::cow::OrderUid,
     origin_observed: wallet_ops::vault::ExecutorNonceObservation,
     destination_observed: wallet_ops::vault::ExecutorNonceObservation,
-    setup_hash: alloy::primitives::B256,
 }
 
 /// Linked Ethereum and Polygon accounts with a private Bridge order and its destination
@@ -2084,13 +1861,7 @@ fn placed_private_bridge(
     );
     let destination_observed =
         ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
-    confirm_setup(
-        destination,
-        destination_operation,
-        setup_hash,
-        B256::repeat_byte(68),
-        destination_observed,
-    );
+    confirm_setup(destination, destination_operation, destination_observed);
     destination
         .record_issued(
             destination_operation,
@@ -2125,7 +1896,6 @@ fn placed_private_bridge(
         uid,
         origin_observed,
         destination_observed,
-        setup_hash,
     }
 }
 
@@ -2143,29 +1913,16 @@ fn placed_swap_with(
     use alloy::primitives::{B256, Bytes};
     use broadcaster_core::contracts::cow::OrderUid;
     use wallet_ops::vault::{
-        AcrossOrderTerms, BridgeOrderTerms, BridgeProvider, ExecutorExecutionResult,
-        ExecutorInputIdentity, ExecutorNonceObservation, ExecutorPayloadContext,
-        ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
-        NearIntentsOrderTerms, SwapAttempt, SwapDelivery, SwapProof, SwapRecipient, SwapTerms,
+        AcrossOrderTerms, BridgeOrderTerms, BridgeProvider, ExecutorInputIdentity,
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload, NearIntentsOrderTerms, SwapAttempt, SwapDelivery, SwapProof,
+        SwapRecipient, SwapTerms,
     };
     let setup = pending_setup(executors, operation);
     let setup_hash = setup.issued()[0].hash();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
-    executors
-        .reconcile(
-            operation,
-            observed,
-            &[(
-                setup_hash,
-                ExecutorPayloadInclusion::new(
-                    BlockNumHash::new(11, B256::repeat_byte(11)),
-                    B256::repeat_byte(5),
-                    ExecutorExecutionResult::Executed,
-                ),
-            )],
-        )
-        .unwrap();
+    executors.record_account_read(operation, observed).unwrap();
     let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
         "tree": 4, "position": 16198, "commitment": "0x2"
     }))
@@ -2479,13 +2236,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             U256::from(3),
         );
         let setup = &record.issued()[0];
-        executors
-            .reconcile(
-                operation,
-                observed,
-                &[(setup.hash(), setup.inclusion().unwrap())],
-            )
-            .unwrap();
+        executors.record_account_read(operation, observed).unwrap();
         let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
             "tree": 4, "position": 16199, "commitment": "0x3"
         }))
@@ -2771,9 +2522,11 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
                 let (_, _, pages) = swaps.next_observations(cx).unwrap();
                 assert_eq!(pages.len(), 1);
                 assert_eq!(pages[0].settlement, Some((uid, confirmed)));
-                assert!(!pages[0].setup);
                 assert!(
-                    pages[0].range.end > confirmed,
+                    pages[0]
+                        .range
+                        .as_ref()
+                        .is_some_and(|range| range.end > confirmed),
                     "no immediate account-history catchup loop"
                 );
                 assert!(
@@ -2833,40 +2586,21 @@ fn reusable_account(executors: &ExecutorStore, operation: ExecutorOperationId) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::B256;
     use wallet_ops::vault::ExecutorNonceObservation;
-    let setup = pending_setup(executors, operation);
+    pending_setup(executors, operation);
     confirm_setup(
         executors,
         operation,
-        setup.issued()[0].hash(),
-        B256::repeat_byte(5),
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE),
     );
 }
 
+/// Record a confirmed read of the account's execution nonce past its setup's.
 fn confirm_setup(
     executors: &ExecutorStore,
     operation: ExecutorOperationId,
-    setup_hash: alloy::primitives::B256,
-    transaction_hash: alloy::primitives::B256,
     observed: wallet_ops::vault::ExecutorNonceObservation,
 ) -> wallet_ops::vault::ExecutorRecord {
-    use alloy::eips::BlockNumHash;
-    use alloy::primitives::B256;
-    use wallet_ops::vault::{ExecutorExecutionResult, ExecutorPayloadInclusion};
-    executors
-        .reconcile(
-            operation,
-            observed,
-            &[(
-                setup_hash,
-                ExecutorPayloadInclusion::new(
-                    BlockNumHash::new(11, B256::repeat_byte(11)),
-                    transaction_hash,
-                    ExecutorExecutionResult::Executed,
-                ),
-            )],
-        )
-        .unwrap()
+    executors.record_account_read(operation, observed).unwrap()
 }
 
 fn cold_wallet_entry(address: Address) -> wallet_ops::vault::PublicAddressBookEntry {
@@ -5696,8 +5430,6 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
             confirm_setup(
                 &polygon_store,
                 destination,
-                setup_hash,
-                B256::repeat_byte(5),
                 ExecutorNonceObservation::new(
                     BlockNumHash::new(12, B256::repeat_byte(12)),
                     U256::ONE,
@@ -6337,7 +6069,6 @@ fn a_shielded_delivery_reads_its_destination_account_which_is_then_offered_again
                 uid,
                 origin_observed: observed,
                 destination_observed: signed,
-                setup_hash,
                 ..
             } = placed_private_bridge(
                 origin,
@@ -6433,8 +6164,6 @@ fn a_shielded_delivery_reads_its_destination_account_which_is_then_offered_again
             confirm_setup(
                 &destination,
                 destination_operation,
-                setup_hash,
-                B256::repeat_byte(68),
                 ExecutorNonceObservation::new(
                     BlockNumHash::new(990, B256::repeat_byte(99)),
                     U256::from(2),
@@ -8587,11 +8316,15 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
 fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::{
+        Call, CommitmentPreimage, RelayAdapt7702, ShieldCiphertext, ShieldRequest, TokenData,
+        shieldCall,
+    };
     use wallet_ops::vault::{
-        BridgeDelivery, BridgeProvider, BridgeSurplus, ExecutorExecutionResult,
-        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadInclusion,
-        ExecutorPayloadPurpose, IssuedExecutorPayload, SwapBridgeOutcome, SwapObservation,
-        SwapOrderObservations,
+        BridgeDelivery, BridgeProvider, BridgeSurplus, ExecutorNonceObservation,
+        ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload, SwapBridgeOutcome,
+        SwapObservation, SwapOrderObservations,
     };
 
     with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
@@ -8613,56 +8346,79 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
                 .unwrap()
         };
         let setup = record().issued()[0].clone();
-        let mut won = vec![(setup.hash(), setup.inclusion().unwrap())];
+        let source = record().address().unwrap();
         let at = |number: u64| {
             BlockNumHash::new(number, B256::repeat_byte(u8::try_from(number).unwrap()))
         };
-        // A recovery shield at `nonce` confirmed in block `number`, and the account reconciled
-        // past it.
-        let mut recover = |nonce: u64, number: u64| {
+        // A recovery batch signed at `nonce`, the only action there, with the account read
+        // past it. Returns its shield request with `number`, the block that shield is
+        // received in.
+        let recover = |nonce: u64, number: u64| {
             let before = ExecutorNonceObservation::new(at(number - 1), U256::from(nonce));
-            executors.reconcile(operation, before, &won).unwrap();
-            let hash = B256::repeat_byte(0x70 + u8::try_from(nonce).unwrap());
+            executors.record_account_read(operation, before).unwrap();
+            let salt = 0x70 + u8::try_from(nonce).unwrap();
+            let request = ShieldRequest {
+                preimage: CommitmentPreimage {
+                    npk: B256::repeat_byte(salt),
+                    token: TokenData::erc20(Address::repeat_byte(2)),
+                    value: alloy::primitives::Uint::from(100_u64),
+                },
+                ciphertext: ShieldCiphertext {
+                    encryptedBundle: [B256::ZERO; 3],
+                    shieldKey: B256::ZERO,
+                },
+            };
+            let calldata = RelayAdapt7702::multicallCall {
+                _requireSuccess: true,
+                _calls: vec![Call {
+                    to: source,
+                    data: shieldCall {
+                        _shieldRequests: vec![request.clone()],
+                    }
+                    .abi_encode()
+                    .into(),
+                    value: U256::ZERO,
+                }],
+                _nonce: U256::from(nonce),
+                _signature: Bytes::new(),
+            }
+            .abi_encode();
             executors
                 .record_issued(
                     operation,
                     IssuedExecutorPayload::new(
                         U256::from(nonce),
                         setup.delegate(),
-                        hash,
+                        B256::repeat_byte(salt),
                         ExecutorPayloadPurpose::Recovery,
-                        ExecutorPayloadContext::new(
-                            Bytes::from_static(b"recover"),
-                            before,
-                            Vec::new(),
-                        ),
+                        ExecutorPayloadContext::new(calldata.into(), before, Vec::new()),
                     ),
                 )
                 .unwrap();
-            won.push((
-                hash,
-                ExecutorPayloadInclusion::new(
-                    at(number),
-                    B256::repeat_byte(0x80 + u8::try_from(nonce).unwrap()),
-                    ExecutorExecutionResult::Executed,
-                ),
-            ));
             executors
-                .reconcile(
+                .record_account_read(
                     operation,
                     ExecutorNonceObservation::new(at(number + 1), U256::from(nonce + 1)),
-                    &won,
                 )
                 .unwrap();
+            (request, number)
         };
         let handed_off = |outcome, bridge_refund| SwapOrderObservations {
             bridge_refund,
             ..bridge_observations(observed, Some(U256::from(7)), outcome)
         };
-        let stage = |cx: &mut gpui::VisualTestContext| {
+        // This session doesn't sync, so the shields private sync would show stand in for it.
+        let stage = |cx: &mut gpui::VisualTestContext, shields: &[(ShieldRequest, u64)]| {
             cx.update(|_, cx| {
                 swaps.update(cx, |swaps, _| {
                     swaps.reload_records();
+                    swaps.attributions.insert(
+                        operation,
+                        wallet_ops::ExecutorAttribution::with_shields_for_tests(
+                            Address::ZERO,
+                            shields,
+                        ),
+                    );
                     swaps.stage(swaps.record(operation).unwrap())
                 })
             })
@@ -8671,13 +8427,19 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
             .record_swap_observations(operation, uid, handed_off(None, None))
             .unwrap();
         // The surplus is recovered while the deposit is bridging.
-        recover(3, 40);
-        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Bridging));
+        let mut shields = vec![recover(3, 40)];
+        assert_eq!(
+            stage(cx, &shields),
+            SwapStage::Order(SwapOrderState::Bridging)
+        );
         let refunding = Some(SwapBridgeOutcome::Refunding);
         executors
             .record_swap_observations(operation, uid, handed_off(refunding, None))
             .unwrap();
-        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Refunding));
+        assert_eq!(
+            stage(cx, &shields),
+            SwapStage::Order(SwapOrderState::Refunding)
+        );
         // The refund arrives after that recovery.
         let refund = SwapObservation {
             block: at(41),
@@ -8686,9 +8448,12 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
         executors
             .record_swap_observations(operation, uid, handed_off(refunding, Some(refund)))
             .unwrap();
-        assert_eq!(stage(cx), SwapStage::Order(SwapOrderState::Refunding));
-        recover(4, 55);
-        assert_eq!(stage(cx), SwapStage::Recovered);
+        assert_eq!(
+            stage(cx, &shields),
+            SwapStage::Order(SwapOrderState::Refunding)
+        );
+        shields.push(recover(4, 55));
+        assert_eq!(stage(cx, &shields), SwapStage::Recovered);
     });
 }
 
@@ -8807,7 +8572,6 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                 delivery: initial_delivery,
                 uid: earlier_uid,
                 origin_observed,
-                setup_hash,
                 ..
             } = placed_private_bridge(
                 origin,
@@ -8821,13 +8585,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                     BlockNumHash::new(block, B256::repeat_byte(30)),
                     U256::from(nonce),
                 );
-                confirm_setup(
-                    &destination,
-                    destination_operation,
-                    setup_hash,
-                    B256::repeat_byte(68),
-                    observed,
-                );
+                confirm_setup(&destination, destination_operation, observed);
                 IssuedExecutorPayload::new(
                     U256::from(nonce),
                     delegate,
@@ -8877,11 +8635,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                 U256::from(3),
             );
             origin
-                .reconcile(
-                    operation,
-                    origin_observed,
-                    &[(origin_setup.hash(), origin_setup.inclusion().unwrap())],
-                )
+                .record_account_read(operation, origin_observed)
                 .unwrap();
             let shield = shield_at(2, 38, 71);
             origin
@@ -9029,7 +8783,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                     let (_, _, order) = swaps.past_swap(past, 0).unwrap();
                     assert_eq!(order.uid(), earlier_uid);
                     assert_eq!(
-                        model::swap_order_stage(record, order),
+                        model::swap_order_stage(record, order, swaps.attribution(record)),
                         SwapStage::Order(SwapOrderState::Done)
                     );
                     // Each swap resolves the destination account its own use names.
@@ -9500,6 +9254,7 @@ struct SwapStubs {
     failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
     gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
     public_review_rpc: Arc<std::sync::atomic::AtomicBool>,
+    public_allowance_complete: Arc<std::sync::atomic::AtomicBool>,
     math_deployed: Arc<std::sync::atomic::AtomicBool>,
     fee_amount: Arc<std::sync::atomic::AtomicU64>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -9517,6 +9272,7 @@ struct StubBridge {
     across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     failing: Arc<std::sync::Mutex<Vec<&'static str>>>,
     public_review_rpc: Arc<std::sync::atomic::AtomicBool>,
+    public_allowance_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the math contract an order's post-hook calls has its code on the stub chain.
     math_deployed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -9538,6 +9294,7 @@ impl SwapStubs {
         let failing = Arc::<std::sync::Mutex<Vec<&'static str>>>::default();
         let gas_price_wei = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let public_review_rpc = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let public_allowance_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let math_deployed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let served_gas_price = Arc::clone(&gas_price_wei);
         let fee_amount = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -9561,6 +9318,7 @@ impl SwapStubs {
             across_delay_ms: Arc::clone(&across_delay_ms),
             failing: Arc::clone(&failing),
             public_review_rpc: Arc::clone(&public_review_rpc),
+            public_allowance_complete: Arc::clone(&public_allowance_complete),
             math_deployed: Arc::clone(&math_deployed),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -9603,6 +9361,7 @@ impl SwapStubs {
             failing,
             gas_price_wei,
             public_review_rpc,
+            public_allowance_complete,
             math_deployed,
             fee_amount,
             stop: Some(stop),
@@ -9800,8 +9559,21 @@ async fn stub_response(
         .load(std::sync::atomic::Ordering::Relaxed)
         && body["method"] == "eth_call"
     {
+        let allowance = body["params"][0]["input"]
+            .as_str()
+            .or_else(|| body["params"][0]["data"].as_str())
+            .is_some_and(|input| input.starts_with("0xdd62ed3e"));
+        let amount = if allowance
+            && bridge
+                .public_allowance_complete
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            U256::MAX
+        } else {
+            U256::ZERO
+        };
         serde_json::json!({"jsonrpc": "2.0", "id": body["id"],
-            "result": format!("0x{}", alloy::hex::encode(U256::ZERO.to_be_bytes::<32>()))})
+            "result": format!("0x{}", alloy::hex::encode(amount.to_be_bytes::<32>()))})
     } else if bridge
         .public_review_rpc
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -10258,8 +10030,8 @@ fn approved_swap(
     use alloy::eips::{BlockNumHash, eip7702::constants::EIP7702_DELEGATION_DESIGNATOR};
     use alloy::primitives::{B256, Bytes};
     use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorNonceObservation, ExecutorPayloadContext,
-        ExecutorPayloadInclusion, ExecutorPayloadPurpose, IssuedExecutorPayload,
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload,
     };
     let profile = root.read_with(cx, |root, _| {
         root.effective_chain_configs
@@ -10273,7 +10045,7 @@ fn approved_swap(
         .unwrap();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    executors.reconcile(operation, observed, &[]).unwrap();
+    executors.record_account_read(operation, observed).unwrap();
     let payload = B256::repeat_byte(4);
     executors
         .record_issued(
@@ -10289,17 +10061,9 @@ fn approved_swap(
         .unwrap();
     let confirmed = BlockNumHash::new(12, B256::repeat_byte(12));
     let record = executors
-        .reconcile(
+        .record_account_read(
             operation,
             ExecutorNonceObservation::new(confirmed, U256::ONE),
-            &[(
-                payload,
-                ExecutorPayloadInclusion::new(
-                    BlockNumHash::new(11, B256::repeat_byte(11)),
-                    B256::repeat_byte(5),
-                    ExecutorExecutionResult::Executed,
-                ),
-            )],
         )
         .unwrap();
     executors
@@ -10951,6 +10715,331 @@ fn public_bridge_opens_before_a_destination_or_origin_private_session_exists(
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
     });
+}
+
+#[gpui::test]
+fn public_route_error_retry_discards_the_client_and_preserves_the_setup(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, operation) = reusable_polygon_account(root, cx);
+            let destination = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let (review, across, orderbook, _) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                STUB_USDT,
+                U256::from(7_000_000),
+                true,
+                cx,
+            );
+            let use_id = SwapUseId::random().unwrap();
+            let revision = cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source, STUB_USDT, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    let public = form.public.as_mut().unwrap();
+                    public.operation = Some(operation);
+                    public.swap_use = Some(use_id);
+                    public.route_tasks.clear();
+                    public.routes.clear();
+                    public.route_errors.insert(
+                        (STUB_USDT, 137),
+                        "Across rejected the routes request (HTTP 403).".into(),
+                    );
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    form.quote_task =
+                        Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+                    cx.notify();
+                    form.quote_revision
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let retry = cx
+                .debug_bounds("swap-bridge-routes-retry")
+                .expect("the route error offers Retry");
+            cx.simulate_click(retry.center(), gpui::Modifiers::none());
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                let public = form.public.as_ref().unwrap();
+                assert!(
+                    public.quote_route_is_invalidated_for_tests(),
+                    "Retry discards the isolated operation client and old review"
+                );
+                assert!(
+                    form.quote_task.is_none() && form.quote_revision != revision,
+                    "an old preview cannot restore the discarded client"
+                );
+                assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                assert_eq!(
+                    (public.operation, public.swap_use),
+                    (Some(operation), Some(use_id))
+                );
+                assert_eq!(
+                    (form.sell, form.network, form.buy),
+                    (STUB_USDT, Some(137), Some(STUB_POLYGON_USDC))
+                );
+                assert_eq!(form.amount_input.read(cx).value().as_ref(), "7");
+                assert!(public.route_errors.is_empty());
+                assert!(
+                    public.route_tasks.contains_key(&(STUB_USDT, 137)),
+                    "Retry restarts route discovery"
+                );
+            });
+            assert_eq!(
+                destination_store
+                    .records()
+                    .unwrap()
+                    .into_iter()
+                    .find(|record| record.operation() == operation)
+                    .unwrap(),
+                destination
+            );
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, _| {
+                    swaps
+                        .form
+                        .as_mut()
+                        .unwrap()
+                        .public
+                        .as_mut()
+                        .unwrap()
+                        .route_tasks
+                        .clear();
+                });
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
+#[gpui::test]
+fn changed_public_delivery_keeps_the_corrected_review_until_the_draft_changes(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, operation) = reusable_polygon_account(root, cx);
+            let destination = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let (review, across, orderbook, route) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                STUB_USDT,
+                U256::from(7_000_000),
+                true,
+                cx,
+            );
+            let original_gas_maximum = review.gas_plan().max_gas_cost;
+            assert!(!original_gas_maximum.is_zero());
+            let original_minimum = review.bridge().received_minimum();
+            let original_destination_minimum = review.bridge().destination_minimum;
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source, STUB_USDT, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation,
+                        index: destination.index(),
+                        address: destination.address().unwrap(),
+                    });
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((STUB_USDT, 137), vec![route.clone()]);
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                });
+            });
+            let command =
+                swaps.read_with(cx, |swaps, _| swaps.public_authorization.clone().unwrap());
+            cx.update(WindowExt::close_dialog);
+            // The backend regression owns actual-fee derivation and signing. This real review
+            // with changed fees exercises the UI's production Changed restoration path.
+            stubs.set_across_fee_bps(50);
+            // Approval completed before signing found the lower bridge minimum. The next
+            // review must charge only the remaining work, so this balance can continue.
+            stubs
+                .public_allowance_complete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    let snapshot = Arc::make_mut(root.public_balance_snapshot.as_mut().unwrap());
+                    for balance in snapshot
+                        .accounts
+                        .iter_mut()
+                        .flat_map(|account| &mut account.balances)
+                    {
+                        if balance.asset.id == wallet_ops::PublicAssetId::Native {
+                            balance.amount = wallet_ops::PublicBalanceAmount::Available(
+                                original_gas_maximum - U256::ONE,
+                            );
+                        }
+                    }
+                });
+            });
+            let (corrected, _, _, _) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                STUB_USDT,
+                U256::from(7_000_000),
+                true,
+                cx,
+            );
+            assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+            assert!(corrected.gas_plan().max_gas_cost < original_gas_maximum);
+            let corrected_minimum = corrected.bridge().received_minimum();
+            assert!(corrected_minimum < original_minimum);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps
+                        .return_public_review_change_for_tests(&command, corrected, window, cx)
+                        .unwrap();
+                    // A late route-list refresh must preserve the signing-time review.
+                    swaps
+                        .form
+                        .as_mut()
+                        .unwrap()
+                        .public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((STUB_USDT, 137), vec![route]);
+                    swaps.refresh_form_delivery(cx);
+                    swaps.schedule_public_quote(window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(
+                        form.public
+                            .as_ref()
+                            .unwrap()
+                            .review
+                            .as_ref()
+                            .unwrap()
+                            .bridge()
+                            .received_minimum(),
+                        corrected_minimum
+                    );
+                    assert!(form.quote_task.is_none());
+                    assert!(!form.price_acknowledged && !form.high_costs_acknowledged);
+                    assert!(swaps.public_authorization.is_none());
+                });
+            });
+            let held = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            assert_eq!(
+                held.issued(),
+                destination.issued(),
+                "reapproval must reuse the completed setup"
+            );
+            assert_eq!(
+                held.swap_uses()[0]
+                    .public_swap()
+                    .unwrap()
+                    .approval()
+                    .bounds
+                    .destination_minimum,
+                Some(original_destination_minimum),
+                "the corrected terms need explicit consent before persistence"
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                    assert!(swaps.public_authorization.is_some(), "completed approvals must not block the corrected review with an obsolete gas budget");
+                });
+            });
+            cx.update(|window, cx| {
+                use gpui_kit::test::TestWindowExt;
+                window.click("wallet-spend-auth-cancel", cx);
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_form_sell(STUB_USDC, window, cx);
+                    assert!(
+                        swaps
+                            .form
+                            .as_ref()
+                            .unwrap()
+                            .public
+                            .as_ref()
+                            .unwrap()
+                            .review
+                            .is_none(),
+                        "editing the pair discards the corrected review"
+                    );
+                });
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
 }
 
 #[gpui::test]
@@ -12237,28 +12326,20 @@ fn public_form_lists_only_direct_routes_until_its_chain_takes_orders(cx: &mut Te
 }
 
 #[gpui::test]
-fn partial_public_destination_recovery_keeps_the_remaining_amount_and_action(
-    cx: &mut TestAppContext,
-) {
-    use alloy::{eips::BlockNumHash, sol_types::SolCall};
+fn held_public_destination_shows_the_held_amount_and_the_recovery_action(cx: &mut TestAppContext) {
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::Bytes;
+    use alloy::sol_types::SolCall;
     use broadcaster_core::contracts::railgun::{
-        CommitmentPreimage, ShieldCiphertext, ShieldRequest, TokenData, shieldCall,
+        Call, CommitmentPreimage, RelayAdapt7702, ShieldCiphertext, ShieldRequest, TokenData,
+        shieldCall,
     };
     use wallet_ops::vault::{
-        ExecutorExecutionResult, ExecutorPayloadInclusion, PublicSwapObservations,
-        SwapBridgeHandoff, SwapBridgeOutcome, SwapObservation,
+        ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorPayloadContext,
+        ExecutorPayloadPurpose, IssuedExecutorPayload, PublicSwapObservations, SwapBridgeHandoff,
+        SwapBridgeOutcome, SwapObservation,
     };
-    with_swap_view(cx, |root, swaps, _, _, _, cx| {
-        let railgun = root.read_with(cx, |root, _| {
-            root.effective_chain_configs
-                .get(1)
-                .unwrap()
-                .railgun
-                .as_ref()
-                .unwrap()
-                .deployment
-                .contract
-        });
+    with_swap_view(cx, |_, swaps, _, _, _, cx| {
         let observed = SwapObservation {
             block: BlockNumHash::new(20, B256::ZERO),
             transaction_hash: Some(B256::ZERO),
@@ -12271,45 +12352,18 @@ fn partial_public_destination_recovery_keeps_the_remaining_amount_and_action(
             bridge_outcome: Some(SwapBridgeOutcome::HeldOnDestination {
                 block: observed.block,
                 transaction_hash: B256::ZERO,
-                amount: U256::from(995),
+                amount: U256::from(100),
             }),
             ..Default::default()
         };
         let record = model::tests::public_presentation_record(true, &held);
-        let hash = B256::repeat_byte(0x91);
-        let request = ShieldRequest {
-            preimage: CommitmentPreimage {
-                npk: B256::ZERO,
-                token: TokenData::erc20(Address::repeat_byte(7)),
-                value: alloy::primitives::Uint::from(400_u64),
-            },
-            ciphertext: ShieldCiphertext {
-                encryptedBundle: [B256::ZERO; 3],
-                shieldKey: B256::ZERO,
-            },
-        };
-        let transaction = alloy::rpc::types::TransactionRequest::default()
-            .from(record.address().unwrap())
-            .to(railgun)
-            .input(
-                shieldCall {
-                    _shieldRequests: vec![request],
-                }
-                .abi_encode()
-                .into(),
-            );
-        let mut value = serde_json::to_value(record).unwrap();
-        value["recovery_transactions"] = serde_json::json!([{ "recovery": ExecutorOperationId::random().unwrap(), "step": 0, "kind": "Shield",
-            "transaction": transaction, "hash": hash, "observed": observed.block,
-            "inclusion": ExecutorPayloadInclusion::new(BlockNumHash::new(21, B256::ZERO), hash, ExecutorExecutionResult::Executed) }]);
-        let record: ExecutorRecord = serde_json::from_value(value).unwrap();
         let identity = model::SwapIdentity {
             operation: record.operation(),
             swap_use: record.swap_uses()[0].id(),
         };
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
-                swaps.public_records = vec![(1, record)];
+                swaps.public_records = vec![(1, record.clone())];
                 swaps.show_view(SwapDialogView::PublicDetail(identity), window, cx);
             });
             window.draw(cx).clear(cx);
@@ -12322,18 +12376,19 @@ fn partial_public_destination_recovery_keeps_the_remaining_amount_and_action(
                 claimed,
                 None,
                 now_unix(),
-                swaps.public_destination_railgun(record),
+                swaps.attribution(record),
+                swaps.public_destination_balance(record, claimed),
             )
             .unwrap();
             assert_eq!(stage, model::PublicSwapStage::HeldOnDestination);
-            // The wallet has no metadata for the held token: the detail keeps the remaining
+            // The wallet has no metadata for the held token: the detail keeps the held
             // amount as a private swap words it, and the card's title names only the token.
             let held = swaps.public_labels(record, claimed, cx).unwrap().held;
-            assert!(held.as_deref().is_some_and(|held| held.starts_with("595 ")));
+            assert!(held.as_deref().is_some_and(|held| held.starts_with("100 ")));
             let title = swaps.public_card_line(cx).unwrap().title;
             let held_on = format!(" held on {}", network_name(1));
             assert!(
-                !title.starts_with("595") && title.ends_with(&held_on),
+                !title.starts_with("100") && title.ends_with(&held_on),
                 "{title}"
             );
             assert!(
@@ -12355,6 +12410,145 @@ fn partial_public_destination_recovery_keeps_the_remaining_amount_and_action(
                     .visible()
             );
         });
+
+        // A completed recovery returns only its requested amount. A different asset's
+        // recovery says nothing about these proceeds, even if an explicit check reads zero.
+        let recovered = |token: Address| {
+            let request = ShieldRequest {
+                preimage: CommitmentPreimage {
+                    npk: B256::repeat_byte(0x71),
+                    token: TokenData::erc20(token),
+                    value: alloy::primitives::Uint::from(10_u64),
+                },
+                ciphertext: ShieldCiphertext {
+                    encryptedBundle: [B256::ZERO; 3],
+                    shieldKey: B256::ZERO,
+                },
+            };
+            let before =
+                ExecutorNonceObservation::new(BlockNumHash::new(29, B256::ZERO), U256::ZERO);
+            let calldata = RelayAdapt7702::multicallCall {
+                _requireSuccess: true,
+                _calls: vec![Call {
+                    to: record.address().unwrap(),
+                    data: shieldCall {
+                        _shieldRequests: vec![request.clone()],
+                    }
+                    .abi_encode()
+                    .into(),
+                    value: U256::ZERO,
+                }],
+                _nonce: U256::ZERO,
+                _signature: Bytes::new(),
+            }
+            .abi_encode();
+            let payload = IssuedExecutorPayload::new(
+                U256::ZERO,
+                record.delegate(),
+                B256::repeat_byte(0x71),
+                ExecutorPayloadPurpose::Recovery,
+                ExecutorPayloadContext::new(calldata.into(), before, Vec::new()),
+            );
+            let mut saved = serde_json::to_value(&record).unwrap();
+            saved["issued"] = serde_json::json!([payload]);
+            saved["nonce_watermark"] =
+                serde_json::to_value(ExecutorNonceWatermark::new(U256::ONE, 31)).unwrap();
+            (
+                serde_json::from_value::<ExecutorRecord>(saved).unwrap(),
+                wallet_ops::ExecutorAttribution::with_shields_for_tests(
+                    Address::ZERO,
+                    &[(request, 30)],
+                ),
+            )
+        };
+        let (partial, relevant) = recovered(Address::repeat_byte(7));
+        let (unrelated, other_asset) = recovered(Address::repeat_byte(8));
+        let at = |amount, number| Some((U256::from(amount), BlockNumHash::new(number, B256::ZERO)));
+        let cases = [
+            // No explicit read, including after a failed refresh, keeps recovery available.
+            (partial.clone(), relevant.clone(), None, 100, false),
+            (partial.clone(), relevant.clone(), at(90_u64, 31), 90, false),
+            // A read before the fill isn't a current held amount or completion evidence.
+            (partial.clone(), relevant.clone(), at(0_u64, 19), 100, false),
+            // Zero before the recovery's shield can't establish that recovery emptied it.
+            (partial.clone(), relevant.clone(), at(0_u64, 29), 0, false),
+            (unrelated, other_asset, at(0_u64, 31), 0, false),
+            (partial, relevant, at(0_u64, 31), 0, true),
+        ];
+        for (record, attribution, balance, amount, complete) in cases {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.public_records = vec![(1, record)];
+                    swaps.attributions.insert(identity.operation, attribution);
+                    swaps.public_destination_balances.clear();
+                    if let Some(balance) = balance {
+                        swaps
+                            .public_destination_balances
+                            .insert((1, identity.operation, identity.swap_use), balance);
+                    }
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                let (record, claimed, swap) = swaps.public_swap_record(identity).unwrap();
+                let stage = model::public_swap_stage(
+                    record,
+                    claimed,
+                    None,
+                    now_unix(),
+                    swaps.attribution(record),
+                    swaps.public_destination_balance(record, claimed),
+                )
+                .unwrap();
+                assert_eq!(
+                    stage,
+                    if complete {
+                        model::PublicSwapStage::Recovered
+                    } else {
+                        model::PublicSwapStage::HeldOnDestination
+                    },
+                );
+                let label = swaps
+                    .public_labels(record, claimed, cx)
+                    .unwrap()
+                    .held
+                    .unwrap();
+                assert!(label.starts_with(&format!("{amount} ")), "{label}");
+                let actions =
+                    public_progress::public_swap_actions(swap, claimed, stage, now_unix());
+                assert_eq!(
+                    actions.contains(&public_progress::PublicSwapAction::RecoverDestination),
+                    !complete,
+                );
+                assert_eq!(
+                    actions.contains(&public_progress::PublicSwapAction::CheckStatus),
+                    !complete,
+                );
+                assert_eq!(
+                    swaps
+                        .shown_public_swaps()
+                        .any(|(shown, _)| shown == identity),
+                    !complete,
+                );
+                // The confirmed read never rewrites the bridge's original fill evidence.
+                assert!(matches!(
+                    swap.observations().bridge_outcome,
+                    Some(SwapBridgeOutcome::HeldOnDestination { amount, block, .. })
+                        if amount == U256::from(100) && block.number == 20
+                ));
+            });
+            cx.update(|window, cx| {
+                use gpui_kit::test::TestWindowExt;
+                window.render_frame(cx);
+                assert_eq!(
+                    window
+                        .try_find("public-swap-action-RecoverDestination")
+                        .is_some_and(|button| button.visible()),
+                    !complete,
+                );
+            });
+        }
     });
 }
 

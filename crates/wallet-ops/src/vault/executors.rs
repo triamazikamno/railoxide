@@ -7,13 +7,11 @@ use zeroize::Zeroizing;
 
 mod public_account;
 mod public_swap;
-mod recovery;
 mod spare;
 mod swap;
 mod swap_admission;
 mod swap_use;
 pub use public_swap::*;
-pub use recovery::*;
 pub(crate) use spare::ExecutorSpare;
 pub use swap::*;
 pub use swap_admission::*;
@@ -225,15 +223,54 @@ impl ExecutorNonceObservation {
     }
 }
 
+/// The execution nonce below which every nonce is consumed, with the number of the block
+/// that showed it. Private sync reports a spend's block number without its hash, so no
+/// hash is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorNonceWatermark {
+    nonce: U256,
+    block: u64,
+}
+
+impl ExecutorNonceWatermark {
+    #[must_use]
+    pub const fn new(nonce: U256, block: u64) -> Self {
+        Self { nonce, block }
+    }
+    #[must_use]
+    pub const fn nonce(self) -> U256 {
+        self.nonce
+    }
+    #[must_use]
+    pub const fn block(self) -> u64 {
+        self.block
+    }
+}
+
+impl From<ExecutorNonceObservation> for ExecutorNonceWatermark {
+    fn from(observed: ExecutorNonceObservation) -> Self {
+        Self::new(observed.nonce, observed.block.number)
+    }
+}
+
+/// Whether a signed payload can still execute, from [`ExecutorRecord::nonce_watermark`]
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorPayloadState {
+    /// The payload's nonce is not known to be consumed.
+    Pending,
+    /// The execution nonce is past the payload's, so its signature can no longer execute.
+    Resolved,
+}
+
 /// The full issued call retains expected private transactions and recovery actions.
-/// It stays encrypted, and permits block-scoped discovery if handoff returned no hash.
+/// It stays encrypted. A context stored by an earlier version may carry a `history_start`
+/// key, which is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorPayloadContext {
     calldata: Bytes,
     observed: ExecutorNonceObservation,
     inputs: Vec<ExecutorInputIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    history_start: Option<u64>,
 }
 
 impl ExecutorPayloadContext {
@@ -247,7 +284,6 @@ impl ExecutorPayloadContext {
             calldata,
             observed,
             inputs,
-            history_start: None,
         }
     }
     #[must_use]
@@ -262,84 +298,26 @@ impl ExecutorPayloadContext {
     pub fn inputs(&self) -> &[ExecutorInputIdentity] {
         &self.inputs
     }
-
-    /// The checked nonce may predate signing when an unused spare was prefetched.
-    pub(crate) const fn with_history_start(mut self, block: u64) -> Self {
-        self.history_start = Some(block);
-        self
-    }
-
-    /// First block a canonical scan must cover to find this payload's inclusion.
-    #[must_use]
-    pub const fn history_start(&self) -> u64 {
-        match self.history_start {
-            Some(block) => block,
-            None => self.observed.block().number,
-        }
-    }
 }
 
+/// What an earlier version's block scan recorded for a payload. Nothing writes one any
+/// more; see [`ExecutorPayloadInclusion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecutorExecutionResult {
+enum ExecutorExecutionResult {
     Reverted,
     MissingEffects,
     Executed,
 }
 
-/// Supplied by canonical observation after checking the issued call and its effects.
+/// A payload's inclusion as an earlier version stored it. It is compatibility data: kept
+/// as stored, never written, and read only where an `Executed` one places
+/// [`ExecutorRecord::nonce_watermark`] for a record without a stored watermark and names
+/// the payload that ran at its nonce for a stopped swap destination's delivery guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutorPayloadInclusion {
+struct ExecutorPayloadInclusion {
     block: BlockNumHash,
     transaction_hash: B256,
     result: ExecutorExecutionResult,
-    /// Present only when the verified outer sender is this executor. Older rows
-    /// omit this evidence and acquire it on canonical reobservation.
-    #[serde(default)]
-    executor_account_nonce: Option<u64>,
-}
-
-impl ExecutorPayloadInclusion {
-    #[must_use]
-    pub const fn new(
-        block: BlockNumHash,
-        transaction_hash: B256,
-        result: ExecutorExecutionResult,
-    ) -> Self {
-        Self {
-            block,
-            transaction_hash,
-            result,
-            executor_account_nonce: None,
-        }
-    }
-    pub(crate) const fn with_executor_account_nonce(mut self, nonce: Option<u64>) -> Self {
-        self.executor_account_nonce = nonce;
-        self
-    }
-    pub(crate) const fn executor_account_nonce(self) -> Option<u64> {
-        self.executor_account_nonce
-    }
-    #[must_use]
-    pub const fn block(self) -> BlockNumHash {
-        self.block
-    }
-    #[must_use]
-    pub const fn transaction_hash(self) -> B256 {
-        self.transaction_hash
-    }
-    #[must_use]
-    pub const fn result(self) -> ExecutorExecutionResult {
-        self.result
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutorPayloadStatus {
-    Uncertain,
-    Reverted,
-    MissingEffects,
-    Executed,
-    Invalidated { winner: B256 },
 }
 
 /// Issued signatures remain relevant even after a reverted transaction or local stop.
@@ -403,10 +381,6 @@ impl IssuedExecutorPayload {
     #[must_use]
     pub const fn context(&self) -> &ExecutorPayloadContext {
         &self.context
-    }
-    #[must_use]
-    pub const fn inclusion(&self) -> Option<ExecutorPayloadInclusion> {
-        self.inclusion
     }
 }
 
@@ -483,8 +457,14 @@ pub struct ExecutorRecord {
     use_check: ExecutorUseCheck,
     issued: Vec<IssuedExecutorPayload>,
     nonce_observation: Option<ExecutorNonceObservation>,
-    recovery_transactions: Vec<IssuedExecutorRecoveryTransaction>,
-    recovery_observation: Option<BlockNumHash>,
+    /// The last confirmed nonce read under a readable layout, with its block number. Unlike
+    /// `nonce_observation` it survives [`Self::require_reconciliation`]. Records from
+    /// earlier builds have none; see [`Self::nonce_watermark`].
+    nonce_watermark: Option<ExecutorNonceWatermark>,
+    /// The nonce below which private sync has scanned past the block that resolved each
+    /// nonce, so payloads there stop reserving their notes. It only rises, except that a
+    /// read lowering the watermark below it lowers it too. With none, nothing is settled.
+    settled_nonce: Option<U256>,
     public_account_uuid: Option<String>,
     swap: Option<SwapOperationRecord>,
     swap_setup_stopped: bool,
@@ -498,46 +478,13 @@ pub struct ExecutorRecord {
 }
 
 impl ExecutorRecord {
-    /// Ordinary Public signing requires a freshly reconciled record. A reverted
-    /// executor call still has a replayable execution signature; an ordinary
-    /// recovery transaction consumes its account nonce even when it reverts. A swap
-    /// hook or destination shield never gets a direct-call status, so it resolves once
-    /// the reconciled nonce passes its own. A bridge refund does not revoke a destination
-    /// shield's signature.
+    /// Whether a signed payload can still execute. An issued payload is pending until the
+    /// watermark passes its nonce: a reverted executor call still has a replayable execution
+    /// signature, and a bridge refund does not revoke a destination shield's signature.
     #[must_use]
     pub fn has_unresolved_issued_work(&self) -> bool {
-        self.unresolved_issued_work(Self::payload_status, Self::recovery_transaction_status)
-    }
-
-    /// [`Self::has_unresolved_issued_work`] from the last recorded outcomes, which a restart
-    /// keeps. For local presentation only; it does not establish signing eligibility.
-    #[must_use]
-    pub fn has_recorded_unresolved_issued_work(&self) -> bool {
-        self.unresolved_issued_work(
-            Self::recorded_payload_status,
-            Self::recorded_recovery_transaction_status,
-        )
-    }
-
-    fn unresolved_issued_work(
-        &self,
-        payload_status: impl Fn(&Self, B256) -> Option<ExecutorPayloadStatus>,
-        recovery_status: impl Fn(&Self, B256) -> Option<ExecutorPayloadStatus>,
-    ) -> bool {
         self.issued().iter().any(|payload| {
-            !matches!(
-                payload_status(self, payload.hash()),
-                Some(ExecutorPayloadStatus::Executed | ExecutorPayloadStatus::Invalidated { .. })
-            ) && !self.swap_hook_nonce_passed(payload)
-        }) || self.recovery_transactions().iter().any(|transaction| {
-            !matches!(
-                recovery_status(self, transaction.hash()),
-                Some(
-                    ExecutorPayloadStatus::Executed
-                        | ExecutorPayloadStatus::Reverted
-                        | ExecutorPayloadStatus::Invalidated { .. }
-                )
-            )
+            !self.nonce_resolved(payload.nonce) && !self.swap_hook_nonce_passed(payload)
         })
     }
 
@@ -611,16 +558,109 @@ impl ExecutorRecord {
         self.nonce_observation
     }
 
-    pub(crate) const fn require_reconciliation(&mut self) {
+    /// The nonce below which every execution nonce is consumed, with the block that
+    /// showed it. A record without the stored field takes the highest of its nonce
+    /// observation and one past each payload with an executed inclusion, at that
+    /// inclusion's block.
+    #[must_use]
+    pub fn nonce_watermark(&self) -> Option<ExecutorNonceWatermark> {
+        self.nonce_watermark.or_else(|| {
+            self.issued
+                .iter()
+                .filter_map(|payload| {
+                    let inclusion = payload.inclusion?;
+                    (inclusion.result == ExecutorExecutionResult::Executed).then(|| {
+                        ExecutorNonceWatermark::new(
+                            payload.nonce.saturating_add(U256::ONE),
+                            inclusion.block.number,
+                        )
+                    })
+                })
+                .chain(self.nonce_observation.map(ExecutorNonceWatermark::from))
+                .max_by_key(|watermark| watermark.nonce)
+        })
+    }
+
+    /// Whether `nonce` lies below [`Self::nonce_watermark`], so that no payload signed
+    /// at it can still execute.
+    #[must_use]
+    pub fn nonce_resolved(&self, nonce: U256) -> bool {
+        self.nonce_watermark()
+            .is_some_and(|watermark| nonce < watermark.nonce)
+    }
+
+    /// Whether the issued payload `hash` is pending or resolved. This reads the watermark
+    /// only, so it holds without a current nonce observation and names no winner.
+    #[must_use]
+    pub fn payload_state(&self, hash: B256) -> Option<ExecutorPayloadState> {
+        let payload = self.issued.iter().find(|payload| payload.hash == hash)?;
+        Some(if self.nonce_resolved(payload.nonce) {
+            ExecutorPayloadState::Resolved
+        } else {
+            ExecutorPayloadState::Pending
+        })
+    }
+
+    /// The nonce below which notes follow private sync alone. `None` when nothing is settled.
+    #[must_use]
+    pub const fn settled_nonce(&self) -> Option<U256> {
+        self.settled_nonce
+    }
+
+    /// Whether `nonce` is resolved and private sync has scanned past the block that
+    /// resolved it. Payloads signed at it no longer reserve their notes: private sync's
+    /// spent status is the only record of which were spent.
+    #[must_use]
+    pub fn nonce_settled(&self, nonce: U256) -> bool {
+        self.nonce_resolved(nonce) && self.settled_nonce.is_some_and(|settled| nonce < settled)
+    }
+
+    /// Store a confirmed nonce read. A read below the settled nonce shows those nonces
+    /// unconsumed again, so the settled nonce falls with it.
+    fn set_nonce_watermark(&mut self, watermark: ExecutorNonceWatermark) {
+        self.nonce_watermark = Some(watermark);
+        if self
+            .settled_nonce
+            .is_some_and(|settled| watermark.nonce < settled)
+        {
+            self.settled_nonce = Some(watermark.nonce);
+        }
+    }
+
+    /// Take private sync's evidence from a snapshot scanned to `last_scanned`. `resolved`
+    /// is one past the nonce of a pending payload that sync itself showed executed, with
+    /// that block: it only ever raises the watermark, and is settled at once, since sync has
+    /// scanned that block. Every nonce the watermark resolved at a block sync has reached is
+    /// settled too. This is not an account read, so `nonce_observation` stays as it is.
+    pub(crate) fn apply_synced(
+        &mut self,
+        resolved: Option<ExecutorNonceWatermark>,
+        last_scanned: u64,
+    ) {
+        let mut settled = self.settled_nonce;
+        if let Some(resolved) = resolved
+            && self
+                .nonce_watermark()
+                .is_none_or(|watermark| watermark.nonce < resolved.nonce)
+        {
+            self.nonce_watermark = Some(resolved);
+            settled = settled.max(Some(resolved.nonce));
+        }
+        if let Some(watermark) = self.nonce_watermark()
+            && watermark.block <= last_scanned
+        {
+            settled = settled.max(Some(watermark.nonce));
+        }
+        self.settled_nonce = settled;
+    }
+
+    pub(crate) fn require_reconciliation(&mut self) {
+        self.nonce_watermark = self.nonce_watermark();
         self.nonce_observation = None;
-        self.recovery_observation = None;
     }
 
-    fn winner(&self, nonce: U256) -> Option<B256> {
-        self.nonce_observation?;
-        self.recorded_winner(nonce)
-    }
-
+    /// The payload an earlier version's block scan stored as executed at `nonce`. Nothing
+    /// stores one any more, so a record written by this version has none.
     fn recorded_winner(&self, nonce: U256) -> Option<B256> {
         self.issued
             .iter()
@@ -633,41 +673,12 @@ impl ExecutorRecord {
             .map(|payload| payload.hash)
     }
 
-    #[must_use]
-    pub fn payload_status(&self, hash: B256) -> Option<ExecutorPayloadStatus> {
-        let recorded = self.recorded_payload_status(hash)?;
-        if self.nonce_observation.is_none() {
-            return Some(ExecutorPayloadStatus::Uncertain);
-        }
-        Some(recorded)
-    }
-
-    /// Last recorded outcome for history display, without current reconciliation.
-    /// This does not establish current signing or recovery eligibility.
-    #[must_use]
-    pub fn recorded_payload_status(&self, hash: B256) -> Option<ExecutorPayloadStatus> {
-        let payload = self.issued.iter().find(|payload| payload.hash == hash)?;
-        if let Some(winner) = self.recorded_winner(payload.nonce) {
-            return Some(if winner == hash {
-                ExecutorPayloadStatus::Executed
-            } else {
-                ExecutorPayloadStatus::Invalidated { winner }
-            });
-        }
-        Some(match payload.inclusion.map(|inclusion| inclusion.result) {
-            Some(ExecutorExecutionResult::Reverted) => ExecutorPayloadStatus::Reverted,
-            Some(ExecutorExecutionResult::MissingEffects) => ExecutorPayloadStatus::MissingEffects,
-            Some(ExecutorExecutionResult::Executed) => ExecutorPayloadStatus::Executed,
-            None => ExecutorPayloadStatus::Uncertain,
-        })
-    }
-
     /// A reverted attempt does not revoke its signed payload or free its private inputs.
-    /// Keep the winning payload's spent inputs protected while private sync catches up;
-    /// only a losing, invalidated payload releases its otherwise unspent inputs. A swap
-    /// pre-hook runs inside a settlement, so its inputs follow the order's observations,
-    /// and a payload that lost its nonce to that pre-hook is released the same way. A
-    /// payload the user explicitly released no longer reserves its inputs.
+    /// Every payload at a resolved nonce, whichever of them ran, keeps its inputs
+    /// protected until [`Self::nonce_settled`]; from then on private sync's spent status
+    /// rules. A swap pre-hook whose order ended while its nonce stayed unconsumed can never
+    /// run and releases its inputs. A payload the user explicitly released no longer
+    /// reserves its inputs. This needs no private sync snapshot.
     #[must_use]
     pub fn reserved_inputs(&self) -> Vec<ExecutorInputIdentity> {
         self.reserving_payloads()
@@ -687,21 +698,13 @@ impl ExecutorRecord {
             .filter(|payload| !self.released_payloads.contains(&payload.hash))
     }
 
-    /// Whether any payload would reserve inputs if the user had released none. A
-    /// release frees notes for other operations; it does not resolve this account.
-    pub(crate) fn reserves_inputs_before_release(&self) -> bool {
-        self.reserving_payloads_before_release()
-            .any(|payload| !payload.context.inputs.is_empty())
-    }
-
     fn reserving_payloads_before_release(&self) -> impl Iterator<Item = &IssuedExecutorPayload> {
         self.issued.iter().filter(|payload| {
-            if payload.purpose == ExecutorPayloadPurpose::SwapPreHook {
-                return !self.releases_swap_inputs(payload.hash);
+            if self.nonce_resolved(payload.nonce) {
+                return !self.nonce_settled(payload.nonce);
             }
-            self.winner(payload.nonce)
-                .is_none_or(|winner| winner == payload.hash)
-                && !self.swap_pre_hook_took_nonce(payload.nonce)
+            payload.purpose != ExecutorPayloadPurpose::SwapPreHook
+                || !self.releases_swap_inputs(payload.hash)
         })
     }
 }
@@ -1008,8 +1011,8 @@ impl ExecutorStore {
             use_check: ExecutorUseCheck::default(),
             issued: Vec::new(),
             nonce_observation: None,
-            recovery_transactions: Vec::new(),
-            recovery_observation: None,
+            nonce_watermark: None,
+            settled_nonce: None,
             public_account_uuid: None,
             swap: None,
             swap_setup_stopped: false,
@@ -1119,8 +1122,8 @@ impl ExecutorStore {
             use_check: ExecutorUseCheck::default(),
             issued: Vec::new(),
             nonce_observation: None,
-            recovery_transactions: Vec::new(),
-            recovery_observation: None,
+            nonce_watermark: None,
+            settled_nonce: None,
             public_account_uuid: None,
             swap: None,
             swap_setup_stopped: false,
@@ -1331,7 +1334,7 @@ impl ExecutorStore {
                 || payload.context.calldata.is_empty()
                 || payload.purpose == ExecutorPayloadPurpose::Operation
                     && record.issued.iter().any(|issued| {
-                        issued.nonce < payload.nonce && record.winner(issued.nonce).is_none()
+                        issued.nonce < payload.nonce && !record.nonce_resolved(issued.nonce)
                     })
             {
                 return Err(ExecutorStoreError::OutstandingNonce);
@@ -1566,66 +1569,46 @@ impl ExecutorStore {
         Ok(records)
     }
 
-    /// Replace the last canonical observation, including when a reorg removes a
-    /// previous winner. Missing payloads become uncertain; issued identities and
-    /// transaction hashes survive. Callers verify receipts and expected effects.
-    pub fn reconcile(
+    /// Persist what private sync's snapshot, scanned to `last_scanned`, shows about a
+    /// record, in one write: see [`ExecutorRecord::apply_synced`]. It grants no current
+    /// nonce or signing admission.
+    pub(crate) fn record_synced(
+        &self,
+        operation: ExecutorOperationId,
+        resolved: Option<ExecutorNonceWatermark>,
+        last_scanned: u64,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            record.apply_synced(resolved, last_scanned);
+            Ok(())
+        })
+    }
+
+    /// Persist a confirmed read of the account's execution nonce: the nonce observation
+    /// and the watermark. Stored inclusions are left as they are and no longer consulted.
+    /// The read is applied to the record as it is now. One taken at a block below a read
+    /// or a resolution already recorded says nothing newer: it leaves the watermark alone,
+    /// and stands as the nonce observation only while it agrees with the watermark, as a
+    /// signing inspection at a slightly older block does.
+    pub fn record_account_read(
         &self,
         operation: ExecutorOperationId,
         observation: ExecutorNonceObservation,
-        inclusions: &[(B256, ExecutorPayloadInclusion)],
-    ) -> Result<ExecutorRecord, ExecutorStoreError> {
-        self.reconcile_inclusions(operation, observation.block, Some(observation), inclusions)
-    }
-
-    /// Persist verified history without granting current nonce/signing admission.
-    /// The caller must revalidate all retained inclusions, as for reconciliation.
-    pub(crate) fn record_history(
-        &self,
-        operation: ExecutorOperationId,
-        block: BlockNumHash,
-        inclusions: &[(B256, ExecutorPayloadInclusion)],
-    ) -> Result<ExecutorRecord, ExecutorStoreError> {
-        self.reconcile_inclusions(operation, block, None, inclusions)
-    }
-
-    fn reconcile_inclusions(
-        &self,
-        operation: ExecutorOperationId,
-        block: BlockNumHash,
-        observation: Option<ExecutorNonceObservation>,
-        inclusions: &[(B256, ExecutorPayloadInclusion)],
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         self.update(operation, |record| {
-            for payload in &mut record.issued {
-                payload.inclusion = None;
+            let watermark = record.nonce_watermark();
+            let recorded = record
+                .nonce_observation
+                .map(|observed| observed.block.number)
+                .max(watermark.map(|watermark| watermark.block));
+            if recorded.is_none_or(|recorded| recorded <= observation.block.number) {
+                record.nonce_observation = Some(observation);
+                record.set_nonce_watermark(observation.into());
+            } else if record.nonce_observation.is_none()
+                && watermark.is_some_and(|watermark| watermark.nonce == observation.nonce)
+            {
+                record.nonce_observation = Some(observation);
             }
-            let mut seen = std::collections::BTreeSet::new();
-            let mut winners = std::collections::BTreeSet::new();
-            for (hash, inclusion) in inclusions {
-                let payload = record
-                    .issued
-                    .iter_mut()
-                    .find(|payload| payload.hash == *hash)
-                    .ok_or(ExecutorStoreError::OperationMismatch)?;
-                if !seen.insert(*hash) || inclusion.block.number > block.number {
-                    return Err(ExecutorStoreError::InvalidRecord);
-                }
-                if inclusion.result == ExecutorExecutionResult::Executed
-                    && (observation.is_some_and(|observed| payload.nonce >= observed.nonce)
-                        || !winners.insert(payload.nonce))
-                {
-                    return Err(ExecutorStoreError::InvalidRecord);
-                }
-                payload.inclusion = Some(*inclusion);
-                if !payload
-                    .transaction_hashes
-                    .contains(&inclusion.transaction_hash)
-                {
-                    payload.transaction_hashes.push(inclusion.transaction_hash);
-                }
-            }
-            record.nonce_observation = observation;
             Ok(())
         })
     }

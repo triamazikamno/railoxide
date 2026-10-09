@@ -1,9 +1,11 @@
-//! A debug-only fixture for looking at the Public account swap screens: it opens them on a
-//! scratch wallet without private funds and holds a chosen state on screen. It is compiled
-//! only with `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
+//! A debug-only fixture for looking at the Public account swap screens and at the Stealth
+//! accounts inspector: it opens them on a scratch wallet without private funds and holds a
+//! chosen state on screen. It is compiled only with `debug_assertions`, and does nothing
+//! unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
+//! - `route-error` opens the Public form with a failed Across route lookup and its Retry.
 //! - `form` lets the Buy picker pick a network without private funds there, and gives a new
 //!   destination account a stand-in setup fee in place of an estimate, so a live quote can
 //!   be reviewed. Approving the review ends in an error.
@@ -15,11 +17,20 @@
 //!   record of the wallet is read, and the detail's actions do nothing.
 //! - `detail:<stage>` opens the swap dialog of a Public account on the detail of one
 //!   synthesized swap, at `setup-not-sent`, `setup-pending`, `account-ready`, `approving`,
-//!   `order-open`, `bridging`, `delivered`, `held-on-destination`, `refunded` or `expired`.
+//!   `order-open`, `bridging`, `delivered`, `held-on-destination`,
+//!   `held-after-partial-recovery`, `refunded` or `expired`. The partial recovery holds a
+//!   confirmed balance at 90% of the original fill without changing its bridge evidence.
 //!   The detail's actions do nothing.
+//! - `accounts` shows two synthesized accounts in Stealth accounts in place of the wallet's
+//!   own. Account #7 is a swap account whose inspector shows each result tag: an executed
+//!   setup, a pre-hook that executed with the cancellation it superseded at the same nonce,
+//!   a consumed nonce that names neither of two recoveries, and an unconfirmed recovery.
+//!   Account #8 holds one executed operation. The wallet holds neither account, so Check
+//!   balances and the other actions fail.
 //!
 //! In every mode the jobs of a swap paid from a Public account are scripted: nothing is
-//! claimed, signed, paid or sent, and no record is written.
+//! claimed, signed, paid or sent, and no record is written. The synthesized records live in
+//! memory only.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -29,11 +40,12 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use gpui::{App, Context, Window};
 use wallet_ops::SwapReviewChange;
 use wallet_ops::vault::{
-    BridgeShieldFailure, ExecutorExecutionResult, ExecutorNonceObservation, ExecutorOperationId,
-    ExecutorPayloadContext, ExecutorPayloadInclusion, ExecutorPayloadPurpose, ExecutorRecord,
-    IssuedExecutorPayload, PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent,
-    PublicSwapObservations, PublicSwapRecord, SwapApprovedAccount, SwapApprovedBounds,
-    SwapBridgeHandoff, SwapBridgeOutcome, SwapObservation, SwapUseId,
+    BridgeShieldFailure, ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId,
+    ExecutorPayloadContext, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
+    PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent, PublicSwapObservations,
+    PublicSwapRecord, SwapApprovedAccount, SwapApprovedBounds, SwapBridgeHandoff,
+    SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapProof,
+    SwapRecipient, SwapTerms, SwapUseId,
 };
 
 use super::dialog::SwapDialogView;
@@ -47,8 +59,10 @@ const BEAT: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     Form,
+    RouteError,
     Flow(Flow),
     Detail(Detail),
+    Accounts,
 }
 
 /// Where a reviewed swap is held.
@@ -73,6 +87,7 @@ enum Detail {
     Bridging,
     Delivered,
     HeldOnDestination,
+    HeldAfterPartialRecovery,
     Refunded,
     Expired,
 }
@@ -81,6 +96,12 @@ fn parse(value: &str) -> Option<Mode> {
     let value = value.trim();
     if value == "form" {
         return Some(Mode::Form);
+    }
+    if value == "route-error" {
+        return Some(Mode::RouteError);
+    }
+    if value == "accounts" {
+        return Some(Mode::Accounts);
     }
     if let Some(stage) = value.strip_prefix("flow:") {
         return Some(Mode::Flow(match stage {
@@ -102,6 +123,7 @@ fn parse(value: &str) -> Option<Mode> {
         "bridging" => Detail::Bridging,
         "delivered" => Detail::Delivered,
         "held-on-destination" => Detail::HeldOnDestination,
+        "held-after-partial-recovery" => Detail::HeldAfterPartialRecovery,
         "refunded" => Detail::Refunded,
         "expired" => Detail::Expired,
         _ => return None,
@@ -123,6 +145,11 @@ fn mode() -> Option<Mode> {
         }
         mode
     })
+}
+
+/// Whether the Public form should show its failed route lookup.
+pub(super) fn route_error() -> bool {
+    matches!(mode(), Some(Mode::RouteError))
 }
 
 /// Whether a fixture mode is on. The form of a swap paid from a Public account then works
@@ -182,7 +209,7 @@ pub(super) enum Step {
 pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
     use Flow::{Changed, Error, Finishing, Placing, SetupWaiting};
     Some(match (mode()?, phase) {
-        (Mode::Form | Mode::Detail(_), Phase::Approved) => (
+        (Mode::Form | Mode::RouteError | Mode::Detail(_) | Mode::Accounts, Phase::Approved) => (
             Duration::ZERO,
             Step::Fail("Fixture: this mode stops at the review. Nothing was sent."),
         ),
@@ -231,6 +258,19 @@ impl PrivateSwapsView {
             tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
             return;
         };
+        if stage == Detail::HeldAfterPartialRecovery
+            && let Some(SwapBridgeOutcome::HeldOnDestination { amount, block, .. }) = record
+                .public_swap_use(identity.swap_use)
+                .and_then(|(_, swap)| swap.observations().bridge_outcome)
+        {
+            self.public_destination_balances.insert(
+                (chain, identity.operation, identity.swap_use),
+                (
+                    amount * U256::from(9_u8) / U256::from(10_u8),
+                    BlockNumHash::new(block.number + 1, block.hash),
+                ),
+            );
+        }
         self.public_records = vec![(chain, record)];
         self.navigate(SwapDialogView::PublicDetail(identity), window, cx);
     }
@@ -360,11 +400,13 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
             output_amount: swap.received,
             shielded: true,
         })),
-        Detail::HeldOnDestination => handed_off(Some(SwapBridgeOutcome::HeldOnDestination {
-            block: fill,
-            transaction_hash: hash,
-            amount: swap.received,
-        })),
+        Detail::HeldOnDestination | Detail::HeldAfterPartialRecovery => {
+            handed_off(Some(SwapBridgeOutcome::HeldOnDestination {
+                block: fill,
+                transaction_hash: hash,
+                amount: swap.received,
+            }))
+        }
         Detail::Refunded => PublicSwapObservations {
             bridge_refund: Some(at(ORIGIN_BLOCK + 900)),
             ..handed_off(Some(SwapBridgeOutcome::Refunding))
@@ -384,7 +426,10 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
             price_verified: Some(true),
             price_acknowledged: false,
             sell_token: swap.sell,
-            on_shield_failure: if stage == Detail::HeldOnDestination {
+            on_shield_failure: if matches!(
+                stage,
+                Detail::HeldOnDestination | Detail::HeldAfterPartialRecovery
+            ) {
                 BridgeShieldFailure::KeepOnDestination
             } else {
                 BridgeShieldFailure::RefundOnOrigin
@@ -435,7 +480,7 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
         }});
     }
     let setup_block = BlockNumHash::new(DESTINATION_BLOCK, B256::repeat_byte(0xb3));
-    let mut setup = serde_json::to_value(IssuedExecutorPayload::new(
+    let setup = serde_json::to_value(IssuedExecutorPayload::new(
         U256::ZERO,
         delegate,
         B256::repeat_byte(0x5e),
@@ -447,24 +492,19 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
         ),
     ))
     .ok()?;
-    if set_up {
-        setup["inclusion"] = serde_json::to_value(ExecutorPayloadInclusion::new(
-            setup_block,
-            B256::repeat_byte(0x5e),
-            ExecutorExecutionResult::Executed,
-        ))
-        .ok()?;
-    }
     // A setup that wasn't sent issued no payload.
     let issued = if stage == Detail::SetupNotSent {
         Vec::new()
     } else {
         vec![setup]
     };
+    // A confirmed setup is one whose nonce an account read showed consumed.
+    let consumed = set_up.then(|| ExecutorNonceWatermark::new(U256::ONE, DESTINATION_BLOCK));
     serde_json::from_value(serde_json::json!({
         "version": 2, "derivation": "Railgun7702V1", "origin": "Reserved",
         "operation": identity.operation, "index": 3,
         "address": account, "delegate": delegate, "retired": false, "issued": issued,
+        "nonce_watermark": consumed,
         "swap_uses": [{ "id": identity.swap_use, "started_at": now.saturating_sub(240),
             "fresh": true,
             "role": { "PublicSourceDestination": { "origin_chain": swap.origin,
@@ -473,4 +513,139 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
         }]
     }))
     .ok()
+}
+
+/// The stealth accounts an `accounts` mode shows in place of the wallet's own, synthesized
+/// once. `None` in every other mode.
+pub(in crate::root) fn stealth_accounts() -> Option<Vec<ExecutorRecord>> {
+    static ACCOUNTS: OnceLock<Vec<ExecutorRecord>> = OnceLock::new();
+    matches!(mode(), Some(Mode::Accounts)).then(|| {
+        ACCOUNTS
+            .get_or_init(|| {
+                let accounts = staged_accounts();
+                if accounts.len() != 2 {
+                    tracing::warn!("the debug UI fixture couldn't synthesize its stealth accounts");
+                }
+                accounts
+            })
+            .clone()
+    })
+}
+
+/// The payload `hash` signed at `nonce`, handed off in `transaction` when it has one. Its
+/// calldata does not decode, so each payload is an action of its own.
+fn staged_payload(
+    nonce: u64,
+    hash: u8,
+    purpose: ExecutorPayloadPurpose,
+    transaction: Option<u8>,
+) -> Option<serde_json::Value> {
+    let signed = BlockNumHash::new(402_118_900, B256::repeat_byte(0xb4));
+    let mut payload = serde_json::to_value(IssuedExecutorPayload::new(
+        U256::from(nonce),
+        Address::repeat_byte(0x5d),
+        B256::repeat_byte(hash),
+        purpose,
+        ExecutorPayloadContext::new(
+            Bytes::new(),
+            ExecutorNonceObservation::new(signed, U256::from(nonce)),
+            Vec::new(),
+        ),
+    ))
+    .ok()?;
+    payload["transaction_hashes"] = serde_json::json!(
+        transaction
+            .map(B256::repeat_byte)
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    Some(payload)
+}
+
+/// The two accounts of the `accounts` mode, decoded from the JSON a stored record has. An
+/// account that fails to decode is left out.
+fn staged_accounts() -> Vec<ExecutorRecord> {
+    use ExecutorPayloadPurpose::{Operation, Recovery, SwapPreHook};
+    const READ_AT: u64 = 402_119_640;
+    let now = now_unix();
+    let delegate = Address::repeat_byte(0x5d);
+    let account = |index: u32,
+                   address: u8,
+                   consumed: u64,
+                   issued: Vec<Option<serde_json::Value>>|
+     -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
+            "operation": ExecutorOperationId::random().ok()?, "index": index,
+            "address": Address::repeat_byte(address), "delegate": delegate, "retired": false,
+            "created_at": now.saturating_sub(3_600),
+            "issued": issued.into_iter().collect::<Option<Vec<_>>>()?,
+            "nonce_watermark": ExecutorNonceWatermark::new(U256::from(consumed), READ_AT),
+        }))
+    };
+    // The swap's order expired, with its pre-hook recorded as executed at nonce 1.
+    let swap = || {
+        let mut uid = [0_u8; 56];
+        uid[52..].copy_from_slice(&u32::try_from(now.saturating_sub(600)).ok()?.to_be_bytes());
+        let mut swap = account(
+            7,
+            0x3b,
+            3,
+            vec![
+                staged_payload(0, 0xb0, Operation, Some(0xc0)),
+                staged_payload(1, 0xb1, SwapPreHook, None),
+                staged_payload(1, 0xb2, Recovery, Some(0xc2)),
+                staged_payload(2, 0xb3, Recovery, Some(0xc3)),
+                staged_payload(2, 0xb4, Recovery, None),
+                staged_payload(3, 0xb5, Recovery, Some(0xc5)),
+            ],
+        )?;
+        swap["swap"] = serde_json::json!({
+            "terms": SwapTerms::new(
+                Address::repeat_byte(0x11),
+                Address::ZERO,
+                SwapRecipient::new(U256::ONE, [0; 32]),
+                B256::repeat_byte(0xb0),
+            ),
+            "proof": SwapProof::new(B256::repeat_byte(0xb6), Vec::new()),
+            "orders": [{
+                "attempt": 0, "uid": alloy::hex::encode_prefixed(uid),
+                "delivery": SwapDelivery::External { receiver: Address::repeat_byte(0x42) },
+                "bounds": {
+                    "sell_amount": "0x5af3107a4000", "buy_amount": "0x5af3107a4000",
+                    "private_minimum": "0x5af3107a4000", "shield_fee_bps": "0x0",
+                    "slippage_bps": 50, "pre_hook_gas_limit": 0, "post_hook_gas_limit": 0,
+                    "anchors": []
+                },
+                "pre_hook": { "nonce": U256::ONE, "payload": B256::repeat_byte(0xb1) },
+                "post_hook": null, "invalidates": null,
+                "observations": SwapOrderObservations {
+                    pre_hook_executed: Some(SwapObservation {
+                        block: BlockNumHash::new(READ_AT - 80, B256::repeat_byte(0xb7)),
+                        transaction_hash: None,
+                    }),
+                    ..Default::default()
+                },
+            }],
+        });
+        Some(swap)
+    };
+    let operation = || {
+        let mut operation = account(
+            8,
+            0x3c,
+            1,
+            vec![staged_payload(0, 0xa0, Operation, Some(0xc8))],
+        )?;
+        operation["purpose_summary"] = serde_json::json!(format!(
+            "Unshield 0.001 WETH → {} (unwrap)",
+            Address::repeat_byte(0x42)
+        ));
+        Some(operation)
+    };
+    [swap(), operation()]
+        .into_iter()
+        .flatten()
+        .filter_map(|account| serde_json::from_value(account).ok())
+        .collect()
 }

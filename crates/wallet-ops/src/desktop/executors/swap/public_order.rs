@@ -36,7 +36,8 @@ use railgun_wallet::tx::GasEstimateMode;
 use serde_json::{Value, json};
 
 use super::bridge::{
-    AcrossOrigin, BridgeLegPrice, SwapBridgeQuote, across_quote_covers, quote_across_preview,
+    AcrossOrigin, BridgeLegPrice, SwapBridgeQuote, across_bridge_quote, across_quote_covers,
+    quote_across_preview,
 };
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::order::{
@@ -44,6 +45,7 @@ use super::order::{
     order_limit_or_tight, placeholder_destination_shield_multicall, swap_gas_pricing, swap_order,
     swap_order_limit, swap_submission_outcome, swap_submission_status, valid_to_after,
 };
+use super::public_source::PublicSwapDeliveryQuote;
 use super::public_transactions::{
     AuthorizedPublicSwapSource, ClaimedPublicSwap, PublicSwapGasPlan, proxy_deployed,
     require_public_swap_source,
@@ -184,6 +186,39 @@ impl PublicSwapReview {
     pub const fn bridge(&self) -> &SwapBridgeQuote {
         &self.bridge
     }
+    /// Replace this review's preview with the actual delivery costs that stopped signing.
+    /// The route and input must still be the ones reviewed. This changes no saved approval;
+    /// the resulting terms need explicit approval before signing can resume.
+    fn with_delivery_quote(&self, quote: &PublicSwapDeliveryQuote) -> Result<Self> {
+        let request = quote.request;
+        if request.origin_chain != self.origin_chain
+            || request.destination_chain != self.delivery.destination_chain
+            || request.input_token != self.bridged_token
+            || request.output_token != self.delivery.destination_token
+            || request.amount != self.buy_amount().unwrap_or(self.sell_amount)
+        {
+            return Err(eyre!("the delivery quote differs from the reviewed swap"));
+        }
+        let original = self
+            .bridge
+            .private
+            .ok_or_else(|| eyre!("the reviewed swap has no private delivery"))?;
+        // The real message already priced the shield's gas; adding the preview allowance
+        // again would charge it twice. Across's real minimum deposit needs no extrapolation.
+        let mut bridge = across_bridge_quote(&quote.fees, self.spoke_pool, Some(U256::ZERO))?;
+        if let Some(private) = &mut bridge.private {
+            private.destination_shield_fee_bps = original.destination_shield_fee_bps;
+            private.deposit_floor = (!quote.fees.min_deposit.is_zero()
+                && quote.fees.min_deposit != U256::MAX)
+                .then_some(quote.fees.min_deposit);
+        }
+        bridge.leg = self.bridge.leg;
+        Ok(Self {
+            bridge,
+            ..self.clone()
+        })
+    }
+
     /// An order's hook-free `CoW` quote, for display only; `None` for a direct deposit.
     #[must_use]
     pub fn quote(&self) -> Option<&CowQuoteParameters> {
@@ -1043,6 +1078,48 @@ impl ExecutorOwner {
             price,
             order,
         })
+    }
+
+    /// Review the actual delivery costs that stopped signing, with only the Public account's
+    /// remaining transactions priced at its originally reviewed fee rates. Approval already
+    /// paid on-chain must not be charged again. No bridge preview or order quote is requested.
+    pub async fn requote_public_swap_delivery(
+        &self,
+        review: &PublicSwapReview,
+        quote: &PublicSwapDeliveryQuote,
+        origin: &EffectiveChainConfig,
+        source: Address,
+    ) -> Result<PublicSwapReview> {
+        self.while_active(Box::pin(async {
+            if origin.chain_id != review.origin_chain
+                || review.delivery.destination_chain != self.chain.chain_id
+            {
+                return Err(eyre!("the reviewed swap belongs to another network"));
+            }
+            let mut corrected = review.with_delivery_quote(quote)?;
+            let spender = if review.order.is_some() {
+                origin
+                    .public_swap_profile()
+                    .ok_or_else(|| eyre!(NO_PUBLIC_SWAPS))?
+                    .vault_relayer()
+            } else {
+                review.spoke_pool
+            };
+            corrected.gas_plan = self
+                .plan_public_swap_gas(
+                    origin,
+                    source,
+                    review.sell_token,
+                    spender,
+                    review.sell_amount,
+                    review.order.is_none(),
+                    review.gas_plan.max_fee_per_gas,
+                    review.gas_plan.max_priority_fee_per_gas,
+                )
+                .await?;
+            Ok(corrected)
+        }))
+        .await
     }
 
     /// `review`, of an order, at another gas share, with its bridge leg previewed again for

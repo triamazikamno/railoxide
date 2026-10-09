@@ -137,7 +137,7 @@ pub(super) async fn spawn_bridge_stub(
 
 /// [`spawn_bridge_stub`] whose `respond(path, body)` also sees the request's path and chooses
 /// the HTTP status.
-async fn spawn_bridge_stub_with(
+pub(super) async fn spawn_bridge_stub_with(
     respond: impl Fn(&str, &Value) -> (u16, String) + Send + 'static,
 ) -> (
     url::Url,
@@ -598,7 +598,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
     let before =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    store.reconcile(operation, before, &[]).unwrap();
+    store.record_account_read(operation, before).unwrap();
     let setup = B256::repeat_byte(3);
     store
         .record_issued(
@@ -614,15 +614,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         .unwrap();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
-    let setup_won = (
-        setup,
-        ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(4),
-            ExecutorExecutionResult::Executed,
-        ),
-    );
-    let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+    let record = store.record_account_read(operation, observed).unwrap();
     let code = [
         EIP7702_DELEGATION_DESIGNATOR.as_slice(),
         delegate.as_slice(),
@@ -853,7 +845,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         }
         let unrelated = tokio::time::timeout(
             Duration::from_secs(2),
-            preparing.reconcile_history(ExecutorOperationId::random().unwrap(), 1..2),
+            preparing.reconcile_account(ExecutorOperationId::random().unwrap()),
         )
         .await
         .expect("network preparation must release activity");
@@ -880,7 +872,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
                 .is_none()
         );
         preparing.shutdown().await;
-        store.reconcile(operation, observed, &[setup_won]).unwrap();
+        store.record_account_read(operation, observed).unwrap();
     }
     let signed_from = unix_now();
     assert!(
@@ -926,7 +918,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         .address()
         .unwrap_or(Address::repeat_byte(9));
     store.bind_address(other, other_address).unwrap();
-    store.reconcile(other, before, &[]).unwrap();
+    store.record_account_read(other, before).unwrap();
     store
         .record_issued(
             other,
@@ -1628,7 +1620,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .executor;
     let before =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    store.reconcile(operation, before, &[]).unwrap();
+    store.record_account_read(operation, before).unwrap();
     let setup = B256::repeat_byte(3);
     store
         .record_issued(
@@ -1644,15 +1636,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .unwrap();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
-    let setup_won = (
-        setup,
-        ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(4),
-            ExecutorExecutionResult::Executed,
-        ),
-    );
-    let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+    let record = store.record_account_read(operation, observed).unwrap();
     let code = [
         EIP7702_DELEGATION_DESIGNATOR.as_slice(),
         delegate.as_slice(),
@@ -2134,7 +2118,7 @@ pub(super) fn delegate_setup(
     let delegate = profile.delegate();
     let before =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
-    store.reconcile(operation, before, &[]).unwrap();
+    store.record_account_read(operation, before).unwrap();
     let setup = B256::repeat_byte(3);
     store
         .record_issued(
@@ -2150,15 +2134,7 @@ pub(super) fn delegate_setup(
         .unwrap();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
-    let setup_won = (
-        setup,
-        ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(4),
-            ExecutorExecutionResult::Executed,
-        ),
-    );
-    let record = store.reconcile(operation, observed, &[setup_won]).unwrap();
+    let record = store.record_account_read(operation, observed).unwrap();
     let code = [
         EIP7702_DELEGATION_DESIGNATOR.as_slice(),
         delegate.as_slice(),
@@ -3549,15 +3525,13 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 .unwrap(),
             Some(SwapAccountRefusal::UnfinishedWork)
         );
-        let setup = destination_record().issued()[0].clone();
         destination_store
-            .reconcile(
+            .record_account_read(
                 destination_operation,
                 ExecutorNonceObservation::new(
                     BlockNumHash::new(20, B256::repeat_byte(20)),
                     U256::from(2),
                 ),
-                &[(setup.hash(), setup.inclusion().unwrap())],
             )
             .unwrap();
 

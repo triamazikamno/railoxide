@@ -186,13 +186,12 @@ impl IssueRetry {
     ) -> Option<Arc<super::spare::CheckedExecutor>> {
         let seed = self.seed.as_ref()?;
         (prepared.recovery.is_none()
-            && record.recovery_transactions().is_empty()
             && seed.operation == prepared.operation
             && seed.execution_nonce == prepared.context.execution_nonce
             && record.issued().iter().all(|payload| {
                 seed.issued.contains(&payload.hash())
                     && payload.transaction_hashes().is_empty()
-                    && payload.inclusion().is_none()
+                    && !record.nonce_resolved(payload.nonce())
             })
             && seed.checked.ensure_valid().is_ok()
             && record.nonce_observation() == Some(seed.checked.observed))
@@ -201,9 +200,11 @@ impl IssueRetry {
 }
 
 fn require_unfinished_operation(record: &crate::vault::ExecutorRecord) -> Result<()> {
-    if record.issued().iter().any(|payload| {
-        record.payload_status(payload.hash()) == Some(crate::vault::ExecutorPayloadStatus::Executed)
-    }) {
+    if record
+        .issued()
+        .iter()
+        .any(|payload| record.nonce_resolved(payload.nonce()))
+    {
         return Err(eyre!(
             "this executor operation has already completed; start a new action"
         ));
@@ -476,7 +477,7 @@ impl ExecutorOwner {
         drop(guard);
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "chain_inspection", "started");
-        let result = if record.issued().is_empty() && record.recovery_transactions().is_empty() {
+        let result = if record.issued().is_empty() {
             self.unused_inspection(record.index(), address, assets)
                 .await
         } else {
@@ -645,9 +646,7 @@ impl ExecutorOwner {
                 "private inputs are reserved by another executor operation"
             ));
         }
-        let initially_unissued = prepared.recovery.is_none()
-            && record.issued().is_empty()
-            && record.recovery_transactions().is_empty();
+        let initially_unissued = prepared.recovery.is_none() && record.issued().is_empty();
         let reused = match retry.as_deref_mut() {
             Some(retry) if !initially_unissued => {
                 let reused = retry.reusable(prepared, &record);
@@ -678,7 +677,6 @@ impl ExecutorOwner {
                         &self.http,
                         prepared.context.executor,
                         &[recovery.asset()],
-                        recovery.replacement_nonce(),
                     ),
                 ))
                 .await?
@@ -724,30 +722,11 @@ impl ExecutorOwner {
             )?;
             recovery.validate_inspection(inspection)?;
         }
-        // Recheck known inclusions even when the latest page does not cover all
-        // issued history. Unknown older winners keep future-nonce signing blocked.
-        // A reused round keeps the durable observation its evidence matched.
+        // A retry with issued payloads reads the account again at the inspection's block.
+        // An unresolved earlier nonce keeps future-nonce signing blocked. A reused round
+        // keeps the durable observation its evidence matched.
         if reused.is_none() {
-            self.store.invalidate_observation(prepared.operation)?;
-            let history = self
-                .while_active(
-                    crate::desktop::executor_observation::observe_executor_history(
-                        &self.endpoints,
-                        &chain,
-                        &record,
-                        observed.block().number..observed.block().number + 1,
-                        Some(observed),
-                    ),
-                )
-                .await?;
-            if history.nonce != Some(observed) {
-                return Err(eyre!(
-                    "executor chain observation changed; retry preparation"
-                ));
-            }
-            let reconciled =
-                self.store
-                    .reconcile(prepared.operation, observed, &history.inclusions)?;
+            let reconciled = self.admit_signing_read(&record, &chain, observed).await?;
             if prepared.recovery.is_none() {
                 require_unfinished_operation(&reconciled)?;
             }
@@ -788,7 +767,7 @@ impl ExecutorOwner {
         )?;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let mut payload_context = ExecutorPayloadContext::new(
+        let payload_context = ExecutorPayloadContext::new(
             signed_call.data,
             observed,
             inputs
@@ -796,14 +775,6 @@ impl ExecutorOwner {
                 .map(ExecutorInputIdentity::from_utxo)
                 .collect(),
         );
-        if checked.revision.is_some() {
-            let history_start = self
-                .unused
-                .lock()
-                .map_err(|_| eyre!("executor preparation is unavailable"))?
-                .history_start(observed, self.chain.finality_depth);
-            payload_context = payload_context.with_history_start(history_start);
-        }
         let payload = IssuedExecutorPayload::new(
             observed.nonce(),
             profile.delegate(),

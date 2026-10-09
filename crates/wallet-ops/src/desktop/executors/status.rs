@@ -1,32 +1,42 @@
 //! Local presentation of retained history. This never supplies signing admission.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use alloy::eips::BlockNumHash;
 use alloy::primitives::B256;
 use eyre::{Result, eyre};
 
-use super::ExecutorOwner;
+use super::attribution::{ExecutorAttributionEvidence, ExecutorPayloadOutcome, signed_actions};
+use super::{ExecutorOwner, ExecutorRecoveryCompletion, executor_recovery_completion};
 use crate::vault::{
-    ExecutorExecutionResult, ExecutorPayloadPurpose, ExecutorRecord, ExecutorRecordOrigin,
-    ExecutorRecoveryStepKind,
+    ExecutorNonceObservation, ExecutorPayloadPurpose, ExecutorRecord, ExecutorRecordOrigin,
 };
 
+/// What an account's signed work came to. Work that can still execute decides first, then
+/// the actions that ran at the account's resolved nonces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutorAccountOutcome {
     NotSigned,
     HistoryUnknown,
+    /// A signed payload's nonce is not known to be consumed, so it can still execute.
     Unconfirmed,
+    /// An operation ran at its nonce.
     Executed,
-    Reverted,
-    MissingEffects,
+    /// An action the account signed lost its nonce to another, and no operation or recovery
+    /// of the account ran. A swap hook that took the nonce leaves this.
+    Superseded,
+    /// A nonce is consumed and nothing names the action that ran at it.
+    Resolved,
+    /// A recovery can still execute, or it ran and private sync does not show its shield.
     RecoveryPending,
+    /// A recovery ran and private sync shows every shield it requested.
     RecoveryConfirmed,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorAccountStatus {
     outcome: ExecutorAccountOutcome,
-    rechecked: Option<BlockNumHash>,
+    read: Option<BlockNumHash>,
+    overdue: bool,
     needs_attention: bool,
     unresolved: bool,
 }
@@ -35,7 +45,8 @@ impl Default for ExecutorAccountStatus {
     fn default() -> Self {
         Self {
             outcome: ExecutorAccountOutcome::HistoryUnknown,
-            rechecked: None,
+            read: None,
+            overdue: false,
             needs_attention: true,
             unresolved: true,
         }
@@ -47,9 +58,18 @@ impl ExecutorAccountStatus {
     pub const fn outcome(self) -> ExecutorAccountOutcome {
         self.outcome
     }
+    /// The block of the latest read of the account's execution nonce in this session.
+    /// `None` when the account has not been read since the session started.
     #[must_use]
-    pub const fn rechecked(self) -> Option<BlockNumHash> {
-        self.rechecked
+    pub const fn read_this_session(self) -> Option<BlockNumHash> {
+        self.read
+    }
+    /// Whether an account read of this session shows a submitted payload's nonce unconsumed
+    /// at a confirmed block past the block its submission is dated to. Without such a read
+    /// nothing is asserted.
+    #[must_use]
+    pub const fn overdue(self) -> bool {
+        self.overdue
     }
     #[must_use]
     pub const fn needs_attention(self) -> bool {
@@ -61,536 +81,250 @@ impl ExecutorAccountStatus {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct HistoryCoverage {
-    pub range: std::ops::Range<u64>,
-    pub observed: BlockNumHash,
-}
-
-impl HistoryCoverage {
-    fn is_overdue(
-        &self,
-        record: &ExecutorRecord,
-        submissions: &BTreeMap<B256, Option<u64>>,
-    ) -> bool {
-        self.range.end > self.observed.number
-            && record
-                .issued()
-                .iter()
-                .all(|payload| self.range.start <= payload.context().history_start())
-            && record.issued().iter().any(|payload| {
-                // observed is the canonical head minus this chain's finality depth.
-                // A page behind that head never establishes an overdue operation.
-                submissions
-                    .get(&payload.hash())
-                    .copied()
-                    .flatten()
-                    .is_some_and(|submitted| submitted < self.observed.number)
-                    && !record.issued().iter().any(|other| {
-                        other.nonce() == payload.nonce()
-                            && other.inclusion().is_some_and(|inclusion| {
-                                inclusion.result() == ExecutorExecutionResult::Executed
-                            })
-                    })
-            })
-    }
+/// Whether `read`, an account read of this session, shows a submitted payload's nonce
+/// unconsumed at a confirmed block past the block the submission is dated to. `submissions`
+/// holds that block for each payload handed off in this session, once a read dated it.
+fn is_overdue(
+    record: &ExecutorRecord,
+    read: ExecutorNonceObservation,
+    submissions: &BTreeMap<B256, Option<u64>>,
+) -> bool {
+    record.issued().iter().any(|payload| {
+        payload.nonce() >= read.nonce()
+            && !record.nonce_resolved(payload.nonce())
+            && submissions
+                .get(&payload.hash())
+                .copied()
+                .flatten()
+                .is_some_and(|submitted| submitted < read.block().number)
+    })
 }
 
 impl ExecutorOwner {
-    /// Uses encrypted local history and this owner's observation coverage; no RPC.
+    /// Uses encrypted local history, private sync's snapshot and this session's account
+    /// reads; no RPC.
     pub fn account_status(&self, record: &ExecutorRecord) -> Result<ExecutorAccountStatus> {
         self.ensure_active()?;
-        let coverage = self
-            .history_coverage
+        let read = self
+            .account_reads
             .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?;
-        let submissions = self
-            .submission_blocks
-            .lock()
-            .map_err(|_| eyre!("executor observations are unavailable"))?;
-        let overdue = coverage
+            .map_err(|_| eyre!("executor observations are unavailable"))?
             .get(&record.operation())
-            .zip(submissions.get(&record.operation()))
-            .is_some_and(|(coverage, submissions)| coverage.is_overdue(record, submissions));
-        Ok(account_status(record, overdue))
+            .copied();
+        let overdue = match read {
+            Some(read) => self
+                .submission_blocks
+                .lock()
+                .map_err(|_| eyre!("executor observations are unavailable"))?
+                .get(&record.operation())
+                .is_some_and(|submissions| is_overdue(record, read, submissions)),
+            None => false,
+        };
+        let attribution = self.attribution(record);
+        let evidence = match &attribution {
+            Some(attribution) => attribution.evidence(),
+            None => ExecutorAttributionEvidence::record_only(),
+        };
+        Ok(account_status(record, &evidence, read, overdue))
     }
 }
 
-fn account_status(record: &ExecutorRecord, overdue: bool) -> ExecutorAccountStatus {
+fn account_status(
+    record: &ExecutorRecord,
+    evidence: &ExecutorAttributionEvidence<'_>,
+    read: Option<ExecutorNonceObservation>,
+    overdue: bool,
+) -> ExecutorAccountStatus {
     use ExecutorAccountOutcome as Outcome;
-    let mut outcome = match record.origin() {
-        ExecutorRecordOrigin::Reserved => Outcome::NotSigned,
-        ExecutorRecordOrigin::Discovered => Outcome::HistoryUnknown,
-    };
-    let mut unresolved = false;
-    let mut missing = false;
-    let mut reverted = false;
-    let mut reserved_revert = false;
-    let mut recovery_pending = false;
     let mut unconfirmed = false;
+    let mut recovery_pending = false;
     let mut recovered = false;
     let mut executed = false;
-    let mut nonces = BTreeSet::new();
-    for payload in record.issued() {
-        if !nonces.insert(payload.nonce()) {
-            continue;
-        }
-        let group = || {
-            record
-                .issued()
-                .iter()
-                .filter(|other| other.nonce() == payload.nonce())
-        };
-        if let Some(winner) = group().find(|other| {
-            other
-                .inclusion()
-                .is_some_and(|inclusion| inclusion.result() == ExecutorExecutionResult::Executed)
-        }) {
-            recovered |= winner.purpose() == ExecutorPayloadPurpose::Recovery;
-            executed |= winner.purpose() == ExecutorPayloadPurpose::Operation;
-            continue;
-        }
-        // Swap hooks run inside settlements and never get a direct-call inclusion. A hook
-        // that took this nonce by recorded observations settles the group.
-        if record.swap_hook_winner(payload.nonce()).is_some() {
-            continue;
-        }
-        unresolved = true;
-        for pending in group() {
-            recovery_pending |= pending.purpose() == ExecutorPayloadPurpose::Recovery;
-            match pending
-                .inclusion()
-                .map(crate::vault::ExecutorPayloadInclusion::result)
-            {
-                Some(ExecutorExecutionResult::MissingEffects) => missing = true,
-                Some(ExecutorExecutionResult::Reverted) => {
-                    reverted = true;
-                    reserved_revert |= !pending.context().inputs().is_empty();
-                }
-                None => unconfirmed = true,
-                Some(ExecutorExecutionResult::Executed) => unreachable!(),
+    let mut unnamed = false;
+    let mut superseded = false;
+    for action in signed_actions(record, evidence) {
+        let recovery = action.purpose() == ExecutorPayloadPurpose::Recovery;
+        match action.outcome() {
+            ExecutorPayloadOutcome::Pending if recovery => recovery_pending = true,
+            ExecutorPayloadOutcome::Pending => unconfirmed = true,
+            ExecutorPayloadOutcome::Executed if recovery => {
+                // Fee rounds share their calls, so any payload of the action tells.
+                let complete = action
+                    .payloads()
+                    .first()
+                    .and_then(|hash| executor_recovery_completion(record, *hash, evidence))
+                    == Some(ExecutorRecoveryCompletion::Complete);
+                recovered |= complete;
+                recovery_pending |= !complete;
             }
+            // A swap hook that ran settles its nonce and is no outcome of the account.
+            ExecutorPayloadOutcome::Executed => {
+                executed |= action.purpose() == ExecutorPayloadPurpose::Operation;
+            }
+            ExecutorPayloadOutcome::Superseded => superseded = true,
+            ExecutorPayloadOutcome::Resolved => unnamed = true,
         }
     }
-    // A successful approval or wrap does not complete a recovery. Group retries
-    // by recovery identity; a canonical shield winner resolves earlier attempts.
-    let recoveries = record
-        .recovery_transactions()
-        .iter()
-        .map(crate::vault::IssuedExecutorRecoveryTransaction::recovery)
-        .collect::<BTreeSet<_>>();
-    for recovery in recoveries {
-        let group = || {
-            record
-                .recovery_transactions()
-                .iter()
-                .filter(|tx| tx.recovery() == recovery)
-        };
-        if group().any(|tx| {
-            tx.kind() == ExecutorRecoveryStepKind::Shield
-                && tx.inclusion().is_some_and(|inclusion| {
-                    inclusion.result() == ExecutorExecutionResult::Executed
-                })
-        }) {
-            recovered = true;
-            continue;
+    let outcome = if recovery_pending {
+        Outcome::RecoveryPending
+    } else if unconfirmed {
+        Outcome::Unconfirmed
+    } else if recovered {
+        Outcome::RecoveryConfirmed
+    } else if unnamed {
+        Outcome::Resolved
+    } else if executed {
+        Outcome::Executed
+    } else if superseded {
+        Outcome::Superseded
+    } else {
+        match record.origin() {
+            ExecutorRecordOrigin::Reserved => Outcome::NotSigned,
+            ExecutorRecordOrigin::Discovered => Outcome::HistoryUnknown,
         }
-        // Remove canonical losers before deciding whether this recovery still
-        // has work. A replaced earlier attempt cannot override its winner.
-        let active = group()
-            .filter(|tx| {
-                !record.recovery_transactions().iter().any(|other| {
-                    other.hash() != tx.hash()
-                        && tx.transaction().nonce.is_some()
-                        && other.transaction().nonce == tx.transaction().nonce
-                        && other.inclusion().is_some()
-                })
-            })
-            .collect::<Vec<_>>();
-        let shield_invalidated = group().any(|tx| tx.kind() == ExecutorRecoveryStepKind::Shield)
-            && active.iter().all(|tx| {
-                tx.kind() != ExecutorRecoveryStepKind::Shield
-                    && tx.inclusion().is_some_and(|inclusion| {
-                        inclusion.result() == ExecutorExecutionResult::Executed
-                    })
-            });
-        if active.is_empty() || shield_invalidated {
-            continue;
-        }
-        unresolved = true;
-        recovery_pending = true;
-        for tx in active {
-            missing |= tx.inclusion().is_some_and(|inclusion| {
-                inclusion.result() == ExecutorExecutionResult::MissingEffects
-            });
-        }
-    }
-    if executed {
-        outcome = Outcome::Executed;
-    }
-    if recovered {
-        outcome = Outcome::RecoveryConfirmed;
-    }
-    if unconfirmed {
-        outcome = Outcome::Unconfirmed;
-    }
-    if reverted {
-        outcome = Outcome::Reverted;
-    }
-    if recovery_pending {
-        outcome = Outcome::RecoveryPending;
-    }
-    if missing {
-        outcome = Outcome::MissingEffects;
-    }
-    let rechecked = match (
-        record.issued().is_empty(),
-        record.recovery_transactions().is_empty(),
-    ) {
-        (false, true) => record
-            .nonce_observation()
-            .map(crate::vault::ExecutorNonceObservation::block),
-        (true, false) => record.recovery_observation(),
-        (false, false) => record
-            .nonce_observation()
-            .map(crate::vault::ExecutorNonceObservation::block)
-            .zip(record.recovery_observation())
-            .map(|(payload, recovery)| {
-                if payload.number < recovery.number {
-                    payload
-                } else {
-                    recovery
-                }
-            }),
-        (true, true) => None,
     };
     ExecutorAccountStatus {
         outcome,
-        rechecked,
-        needs_attention: missing
-            || recovery_pending
-            || reserved_revert
-            || (unconfirmed && overdue && rechecked.is_some()),
-        unresolved: unresolved || (rechecked.is_none() && record.reserves_inputs_before_release()),
+        read: read.map(ExecutorNonceObservation::block),
+        overdue,
+        needs_attention: recovery_pending || (unconfirmed && overdue),
+        unresolved: unconfirmed || recovery_pending,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use alloy::primitives::U256;
+    use sync_service::WalletCurrentSnapshot;
+
+    use super::ExecutorAccountOutcome as Outcome;
     use super::*;
-    use crate::vault::{
-        ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
-        ExecutorPayloadInclusion, IssuedExecutorPayload, IssuedExecutorRecoveryTransaction,
-        SwapDelivery, SwapObservation, SwapOrderObservations, SwapProof, SwapRecipient,
-        SwapShieldObservation, SwapTerms,
+    use crate::desktop::executors::attribution::tests::{
+        RAILGUN, RESOLVED_AT, execute, note, operation_and_recovery, payload,
+        pre_hook_and_cancellation, pre_hook_executed, record, recovery, shield, shielded, synced,
     };
-    use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
-    use alloy::rpc::types::TransactionRequest;
+    use crate::vault::ExecutorPayloadPurpose::Operation;
 
-    fn record(
-        payloads: &[serde_json::Value],
-        transactions: &[serde_json::Value],
-    ) -> ExecutorRecord {
-        serde_json::from_value(serde_json::json!({
-            "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
-            "operation": ExecutorOperationId::random().unwrap(), "index": 0,
-            "address": Address::repeat_byte(1), "delegate": Address::repeat_byte(2),
-            "retired": true, "hidden": true, "assets": [],
-            "created_at": null, "restored_at": null, "purpose_summary": null,
-            "issued": payloads, "recovery_transactions": transactions,
-            "nonce_observation": ExecutorNonceObservation::new(BlockNumHash::new(20, B256::repeat_byte(20)), U256::ONE),
-            "recovery_observation": BlockNumHash::new(20, B256::repeat_byte(20)),
-        })).unwrap()
+    fn status(
+        record: &ExecutorRecord,
+        sync: Option<&Arc<WalletCurrentSnapshot>>,
+        read: Option<ExecutorNonceObservation>,
+        overdue: bool,
+    ) -> ExecutorAccountStatus {
+        let evidence = ExecutorAttributionEvidence {
+            railgun: RAILGUN,
+            sync: sync.map(Arc::as_ref),
+            invalidated_orders: None,
+        };
+        account_status(record, &evidence, read, overdue)
     }
 
-    fn with_inclusion(
-        value: impl serde::Serialize,
-        result: Option<ExecutorExecutionResult>,
-    ) -> serde_json::Value {
-        let mut value = serde_json::to_value(value).unwrap();
-        value["inclusion"] = serde_json::to_value(result.map(|result| {
-            ExecutorPayloadInclusion::new(
-                BlockNumHash::new(12, B256::repeat_byte(12)),
-                B256::repeat_byte(3),
-                result,
-            )
-        }))
-        .unwrap();
-        value
+    /// An operation at nonce 0, payload 1, with no private inputs.
+    fn operation() -> serde_json::Value {
+        payload(0, 1, Operation, &execute(0, Vec::new()), &[], &[])
     }
 
-    fn payload(
-        purpose: ExecutorPayloadPurpose,
-        result: Option<ExecutorExecutionResult>,
-    ) -> serde_json::Value {
-        with_inclusion(
-            IssuedExecutorPayload::new(
-                U256::ZERO,
-                Address::repeat_byte(2),
-                B256::repeat_byte(if purpose == ExecutorPayloadPurpose::Recovery {
-                    4
-                } else {
-                    5
-                }),
-                purpose,
-                ExecutorPayloadContext::new(
-                    Bytes::new(),
-                    ExecutorNonceObservation::new(
-                        BlockNumHash::new(10, B256::repeat_byte(10)),
-                        U256::ZERO,
-                    ),
-                    Vec::new(),
-                ),
-            ),
-            result,
+    /// An account read at `block` that shows `nonce` as the next execution nonce.
+    fn read(block: u64, nonce: u64) -> ExecutorNonceObservation {
+        ExecutorNonceObservation::new(
+            BlockNumHash::new(block, B256::repeat_byte(9)),
+            U256::from(nonce),
         )
     }
 
     #[test]
-    fn canonical_winner_remains_visible_when_an_explicit_check_is_unavailable() {
-        let saved = record(
-            &[
-                payload(
-                    ExecutorPayloadPurpose::Operation,
-                    Some(ExecutorExecutionResult::MissingEffects),
-                ),
-                payload(
-                    ExecutorPayloadPurpose::Recovery,
-                    Some(ExecutorExecutionResult::Executed),
-                ),
-            ],
-            &[],
+    fn account_outcome_follows_pending_work_and_the_action_that_ran_at_each_nonce() {
+        let outcome = |record: &ExecutorRecord, sync| status(record, sync, None, false).outcome;
+        assert_eq!(outcome(&record(Vec::new(), 0), None), Outcome::NotSigned);
+        assert_eq!(
+            outcome(&record(vec![operation()], 0), None),
+            Outcome::Unconfirmed
         );
-        let status = account_status(&saved, true);
-        assert_eq!(status.outcome, ExecutorAccountOutcome::RecoveryConfirmed);
-        assert!(!status.needs_attention && !status.unresolved);
-        assert!(status.rechecked.is_some());
-        let mut unavailable = saved;
-        unavailable.require_reconciliation();
-        let status = account_status(&unavailable, true);
-        assert_eq!(status.outcome, ExecutorAccountOutcome::RecoveryConfirmed);
-        assert!(status.rechecked.is_none());
-        // A release frees the winner's notes for other operations, but an account whose
-        // explicit check failed stays unresolved.
-        let mut spent = payload(
-            ExecutorPayloadPurpose::Operation,
-            Some(ExecutorExecutionResult::Executed),
+        // The only action signed at a consumed nonce is the one that ran.
+        assert_eq!(
+            outcome(&record(vec![operation()], 1), None),
+            Outcome::Executed
         );
-        spent["context"]["inputs"] =
-            serde_json::json!([{ "tree": 0, "position": 1, "commitment": U256::from(7) }]);
-        let mut released = serde_json::to_value(record(&[spent], &[])).unwrap();
-        released["released_payloads"] = serde_json::json!([B256::repeat_byte(5)]);
-        let mut released: ExecutorRecord = serde_json::from_value(released).unwrap();
-        released.require_reconciliation();
-        assert!(released.reserved_inputs().is_empty());
-        let status = account_status(&released, false);
-        assert!(status.rechecked.is_none() && status.unresolved);
-        // Reorg removes the winner; the older signed operation is live again.
-        let reorg = record(
-            &[
-                payload(
-                    ExecutorPayloadPurpose::Operation,
-                    Some(ExecutorExecutionResult::MissingEffects),
-                ),
-                payload(ExecutorPayloadPurpose::Recovery, None),
-            ],
-            &[],
-        );
-        let status = account_status(&reorg, false);
-        assert_eq!(status.outcome, ExecutorAccountOutcome::MissingEffects);
-        assert!(status.needs_attention && status.unresolved);
+        // A recorded pre-hook took the nonce its order's cancellation was signed at.
+        let lost = pre_hook_and_cancellation(&note(1), Vec::new(), &pre_hook_executed());
+        assert_eq!(outcome(&lost, None), Outcome::Superseded);
+        assert!(!status(&lost, None, Some(read(RESOLVED_AT, 2)), false).unresolved);
+        // An operation and a recovery share a consumed nonce and neither left evidence.
+        let input = note(1);
+        let request = shield(7);
+        let shared = operation_and_recovery(&input, &[], &request);
+        let behind = synced(RESOLVED_AT, vec![input.clone()]);
+        assert_eq!(outcome(&shared, Some(&behind)), Outcome::Resolved);
+        // The recovery's shield names it, and completes it.
+        let arrived = synced(RESOLVED_AT, vec![input, shielded(&request)]);
+        assert_eq!(outcome(&shared, Some(&arrived)), Outcome::RecoveryConfirmed);
+        let pending = status(&record(vec![recovery(2, &request)], 0), None, None, false);
+        assert_eq!(pending.outcome, Outcome::RecoveryPending);
+        assert!(pending.needs_attention && pending.unresolved);
     }
 
     #[test]
-    fn approval_is_pending_until_shield_succeeds_and_a_later_recovery_remains_visible() {
-        let recovery = ExecutorOperationId::random().unwrap();
-        let tx = |recovery, step, kind, result| {
-            with_inclusion(
-                IssuedExecutorRecoveryTransaction::new(
-                    recovery,
-                    step,
-                    kind,
-                    TransactionRequest::default().nonce(u64::from(step)),
-                    B256::repeat_byte(u8::try_from(step + 6).unwrap()),
-                    BlockNumHash::new(10, B256::repeat_byte(10)),
-                ),
-                result,
-            )
-        };
-        let approval = tx(
-            recovery,
-            0,
-            ExecutorRecoveryStepKind::ApproveErc20,
-            Some(ExecutorExecutionResult::Executed),
-        );
-        let failed = tx(
-            recovery,
-            1,
-            ExecutorRecoveryStepKind::Shield,
-            Some(ExecutorExecutionResult::Reverted),
-        );
-        let pending = record(&[], &[approval.clone(), failed]);
-        let status = account_status(&pending, false);
-        assert_eq!(status.outcome, ExecutorAccountOutcome::RecoveryPending);
-        assert!(status.needs_attention && status.unresolved);
-        let shield = tx(
-            recovery,
-            1,
-            ExecutorRecoveryStepKind::Shield,
-            Some(ExecutorExecutionResult::Executed),
-        );
-        let complete = record(&[], &[approval.clone(), shield.clone()]);
-        assert_eq!(
-            account_status(&complete, false).outcome,
-            ExecutorAccountOutcome::RecoveryConfirmed
-        );
-        let mut replaced = tx(
-            ExecutorOperationId::random().unwrap(),
-            1,
-            ExecutorRecoveryStepKind::ApproveErc20,
-            None,
-        );
-        replaced["hash"] = serde_json::json!(B256::repeat_byte(9));
-        let with_loser = record(&[], &[approval.clone(), shield.clone(), replaced]);
-        assert_eq!(
-            account_status(&with_loser, false).outcome,
-            ExecutorAccountOutcome::RecoveryConfirmed
-        );
-        assert!(!account_status(&with_loser, false).needs_attention);
-        let next = tx(
-            ExecutorOperationId::random().unwrap(),
-            2,
-            ExecutorRecoveryStepKind::Wrap,
-            None,
-        );
-        let later = record(&[], &[approval, shield, next]);
-        assert!(account_status(&later, false).needs_attention);
-    }
-    #[test]
-    fn attention_requires_reserved_reverted_inputs_or_caught_up_confirmation_coverage() {
-        let mut reverted = payload(
-            ExecutorPayloadPurpose::Operation,
-            Some(ExecutorExecutionResult::Reverted),
-        );
-        reverted["context"]["inputs"] =
-            serde_json::json!([{"tree": 0, "position": 1, "commitment": U256::ONE}]);
-        let reverted = record(&[reverted], &[]);
-        assert!(account_status(&reverted, false).needs_attention);
-        let pending = record(&[payload(ExecutorPayloadPurpose::Operation, None)], &[]);
-        let coverage = HistoryCoverage {
-            range: 10..21,
-            observed: BlockNumHash::new(20, B256::repeat_byte(20)),
-        };
-        let submissions = BTreeMap::from([(B256::repeat_byte(5), Some(10))]);
-        assert!(
-            !coverage.is_overdue(&pending, &BTreeMap::new()),
-            "prefetched state alone cannot date submission"
-        );
-        assert!(coverage.is_overdue(&pending, &submissions));
-        assert!(
-            account_status(&pending, coverage.is_overdue(&pending, &submissions)).needs_attention
-        );
-        let behind = HistoryCoverage {
-            range: 10..15,
-            ..coverage
-        };
-        assert!(!behind.is_overdue(&pending, &submissions));
-        let mut unavailable = pending;
-        unavailable.require_reconciliation();
-        assert!(!account_status(&unavailable, true).needs_attention);
-        let mut newer = payload(ExecutorPayloadPurpose::Operation, None);
-        newer["nonce"] = serde_json::json!(U256::ONE);
-        newer["hash"] = serde_json::json!(B256::repeat_byte(6));
-        newer["context"]["observed"] =
-            serde_json::json!(ExecutorNonceObservation::new(coverage.observed, U256::ONE));
-        let mixed = record(
-            &[
-                payload(
-                    ExecutorPayloadPurpose::Operation,
-                    Some(ExecutorExecutionResult::Executed),
-                ),
-                newer,
-            ],
-            &[],
-        );
-        assert!(
-            !coverage.is_overdue(&mixed, &submissions),
-            "a completed older operation cannot age a newly signed one"
-        );
-    }
-
-    #[test]
-    fn swap_hooks_settle_their_nonces_from_recorded_order_observations() {
-        let hook = |nonce: u64, hash: u8, purpose| {
-            let mut hook = payload(purpose, None);
-            hook["nonce"] = serde_json::json!(U256::from(nonce));
-            hook["hash"] = serde_json::json!(B256::repeat_byte(hash));
-            hook
-        };
-        let swap = |observations: SwapOrderObservations| {
-            let mut saved = serde_json::to_value(record(
-                &[
-                    payload(
-                        ExecutorPayloadPurpose::Operation,
-                        Some(ExecutorExecutionResult::Executed),
-                    ),
-                    hook(1, 6, ExecutorPayloadPurpose::SwapPreHook),
-                    hook(2, 7, ExecutorPayloadPurpose::SwapPostHook),
-                ],
-                &[],
-            ))
-            .unwrap();
-            saved["nonce_observation"] = serde_json::json!(ExecutorNonceObservation::new(
-                BlockNumHash::new(20, B256::repeat_byte(20)),
-                U256::from(3),
-            ));
-            saved["swap"] = serde_json::json!({
-                "terms": SwapTerms::new(
-                    Address::repeat_byte(3),
-                    Address::repeat_byte(4),
-                    SwapRecipient::new(U256::ONE, [0; 32]),
-                    B256::repeat_byte(5),
-                ),
-                "proof": SwapProof::new(B256::repeat_byte(9), Vec::new()),
-                "orders": [{
-                    "attempt": 0, "uid": FixedBytes::<56>::repeat_byte(8),
-                    "delivery": SwapDelivery::Reshield,
-                    "bounds": {
-                        "sell_amount": U256::ONE, "buy_amount": U256::ONE,
-                        "private_minimum": U256::ONE, "shield_fee_bps": U256::ZERO,
-                        "slippage_bps": 0, "pre_hook_gas_limit": 0, "post_hook_gas_limit": 0,
-                        "anchors": [],
-                    },
-                    "pre_hook": { "nonce": U256::ONE, "payload": B256::repeat_byte(6) },
-                    "post_hook": { "nonce": U256::from(2), "payload": B256::repeat_byte(7) },
-                    "invalidates": null, "observations": observations,
-                }],
+    fn payload_recorded_as_reverted_by_an_earlier_version_is_unconfirmed() {
+        for result in ["Reverted", "MissingEffects"] {
+            let mut stored = operation();
+            stored["inclusion"] = serde_json::json!({
+                "block": BlockNumHash::new(12, B256::repeat_byte(12)),
+                "transaction_hash": B256::repeat_byte(3),
+                "result": result,
             });
-            serde_json::from_value::<ExecutorRecord>(saved).unwrap()
-        };
-        let observation = SwapObservation {
-            block: BlockNumHash::new(15, B256::repeat_byte(15)),
-            transaction_hash: None,
-        };
-        let traded = SwapOrderObservations {
-            pre_hook_executed: Some(observation),
-            traded: Some(observation),
-            ..SwapOrderObservations::default()
-        };
+            // Its nonce is unconsumed, so its signature can still execute.
+            let status = status(&record(vec![stored], 0), None, None, false);
+            assert_eq!(status.outcome, Outcome::Unconfirmed, "{result}");
+            assert!(status.unresolved && !status.needs_attention, "{result}");
+        }
+    }
+
+    #[test]
+    fn sole_shielding_recovery_is_pending_until_private_sync_shows_its_shield() {
+        let request = shield(7);
+        // The recovery is the only action at its consumed nonce, so it ran.
+        let saved = record(vec![recovery(2, &request)], 1);
+        let read = Some(read(RESOLVED_AT, 1));
+        let behind = synced(RESOLVED_AT, Vec::new());
+        for sync in [None, Some(&behind)] {
+            let status = status(&saved, sync, read, false);
+            assert_eq!(status.outcome, Outcome::RecoveryPending);
+            assert!(status.needs_attention && status.unresolved);
+        }
+        let arrived = synced(RESOLVED_AT, vec![shielded(&request)]);
+        let status = status(&saved, Some(&arrived), read, false);
+        assert_eq!(status.outcome, Outcome::RecoveryConfirmed);
+        assert!(!status.needs_attention && !status.unresolved);
+    }
+
+    #[test]
+    fn overdue_needs_an_account_read_past_the_submissions_dated_block() {
+        let saved = record(vec![operation()], 0);
+        let hash = B256::repeat_byte(1);
+        // The first read after handoff dated the submission to block 12.
+        let dated = BTreeMap::from([(hash, Some(12))]);
         assert!(
-            account_status(&swap(traded), false).unresolved,
-            "the post-hook has not taken its nonce before its shield is recorded"
+            !is_overdue(&saved, read(12, 0), &dated),
+            "the read that dated the submission says nothing yet"
         );
-        let shielded = SwapOrderObservations {
-            shielded: Some(SwapShieldObservation {
-                observation,
-                private_amount: U256::ONE,
-                fee: None,
-            }),
-            ..traded
-        };
-        let status = account_status(&swap(shielded), false);
-        assert_eq!(status.outcome, ExecutorAccountOutcome::Executed);
-        assert!(!status.unresolved);
+        assert!(is_overdue(&saved, read(13, 0), &dated));
+        assert!(
+            !is_overdue(&saved, read(13, 0), &BTreeMap::from([(hash, None)])),
+            "a submission no read has dated has no known age"
+        );
+        assert!(
+            !is_overdue(&saved, read(13, 0), &BTreeMap::new()),
+            "a payload handed off before this session has no known age"
+        );
+        assert!(
+            !is_overdue(&record(vec![operation()], 1), read(13, 1), &dated),
+            "a consumed nonce is not overdue"
+        );
+        // Attention follows the assertion, never the passing of time alone.
+        assert!(status(&saved, None, Some(read(13, 0)), true).needs_attention);
+        let unread = status(&saved, None, None, false);
+        assert!(!unread.needs_attention && unread.read_this_session().is_none());
     }
 }

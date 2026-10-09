@@ -7,17 +7,16 @@ use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
 
 use super::{
-    ExecutorOwner, ExecutorRecoveryExecution, ExecutorRecoveryFunding, ExecutorRecoveryStepOutcome,
-    PreparedExecutorRecovery, recovery_funding_admission,
+    ExecutorOwner, ExecutorRecoveryBatchOutcome, ExecutorRecoveryCompletion,
+    ExecutorRecoveryExecution, ExecutorRecoveryFunding, PreparedExecutorRecovery,
+    executor_recovery_completion, recovery_funding_admission,
 };
 use crate::desktop::executor_discovery::inspect_for_recovery_batch;
 use crate::desktop::executors::execution::authorize_delegation;
 use crate::public_wallet::{VaultedPublicSigner, submit_executor_recovery_step};
 use crate::settings::ExecutorProfile;
 use crate::signer::SoftwareEvmSigner;
-use crate::vault::{
-    ExecutorPayloadContext, ExecutorPayloadPurpose, ExecutorPayloadStatus, IssuedExecutorPayload,
-};
+use crate::vault::{ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload};
 use crate::{
     DesktopPrivateSpendAuthorization, PublicActionProgressStep, PublicActionProgressUpdate,
 };
@@ -25,12 +24,14 @@ use crate::{
 impl ExecutorOwner {
     /// Execute the reviewed recovery atomically at the current contract nonce.
     /// A signed payload remains durable even if simulation, submission or local waiting fails.
+    /// The returned completion is the batch's standing right after the send: its nonce as
+    /// the account read shows it, the action attributed there, and its shield in private sync.
     pub async fn submit_native_recovery_batch(
         &self,
         prepared: &PreparedExecutorRecovery,
         authorization: &DesktopPrivateSpendAuthorization,
         mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
-    ) -> Result<ExecutorRecoveryStepOutcome> {
+    ) -> Result<ExecutorRecoveryBatchOutcome> {
         self.ensure_active()?;
         let guard = self.lock_activity().await;
         let record = self.validate_recovery(prepared)?;
@@ -56,7 +57,6 @@ impl ExecutorOwner {
                 &self.http,
                 prepared.source,
                 &[prepared.asset],
-                prepared.replacement_nonce,
             ))
             .await?;
         prepared.validate_inspection(&inspection)?;
@@ -65,9 +65,7 @@ impl ExecutorOwner {
                 "execution nonce changed; review the rebuilt recovery"
             ));
         }
-        let record = self
-            .reconcile_recovery_before_signing(&record, &chain, &inspection, Some(observed))
-            .await?;
+        let record = self.admit_signing_read(&record, &chain, observed).await?;
         recovery_funding_admission(
             &inspection,
             prepared.asset,
@@ -145,16 +143,17 @@ impl ExecutorOwner {
             )))
             .await?;
         drop(guard);
-        let observed = self
-            .reconcile_history(
-                prepared.operation,
-                receipt.block_number..receipt.block_number + 1,
-            )
-            .await?;
-        let status = observed
-            .record()
-            .payload_status(hash)
-            .unwrap_or(ExecutorPayloadStatus::Uncertain);
-        Ok(ExecutorRecoveryStepOutcome { receipt, status })
+        let observed = self.reconcile_account(prepared.operation).await?;
+        let record = observed.record();
+        let completion = self
+            .attribution(record)
+            .and_then(|attribution| {
+                executor_recovery_completion(record, hash, &attribution.evidence())
+            })
+            .unwrap_or(ExecutorRecoveryCompletion::Pending);
+        Ok(ExecutorRecoveryBatchOutcome {
+            receipt,
+            completion,
+        })
     }
 }

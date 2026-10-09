@@ -1108,26 +1108,22 @@ fn private_self_broadcast_success_requires_successful_receipt() {
     );
     assert!(!private_broadcaster_progress_is_successful(&progress));
 
-    // An outer success without expected effects must not become browser Confirmed.
-    // Canonical execution can confirm it; losing that observation reopens it.
-    for (status, expected) in [
+    // An outer success must not become browser Confirmed before the account's nonce is
+    // read past the payload's.
+    for (state, expected) in [
         (
-            wallet_ops::vault::ExecutorPayloadStatus::MissingEffects,
+            wallet_ops::vault::ExecutorPayloadState::Pending,
             ResultKind::Submitted,
         ),
         (
-            wallet_ops::vault::ExecutorPayloadStatus::Executed,
+            wallet_ops::vault::ExecutorPayloadState::Resolved,
             ResultKind::Confirmed,
-        ),
-        (
-            wallet_ops::vault::ExecutorPayloadStatus::Uncertain,
-            ResultKind::Submitted,
         ),
     ] {
         let mut result = test_self_broadcast_result(true);
         result.tx = wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt {
             receipt: result.tx.receipt().unwrap().clone(),
-            status,
+            state,
         };
         progress.self_broadcast_result = Some(result);
         assert_eq!(

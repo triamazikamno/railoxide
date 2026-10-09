@@ -179,271 +179,6 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
 }
 
 #[test]
-fn executor_ordinary_recovery_handoff_survives_restart_and_reorg_without_recycling() {
-    #[derive(serde::Serialize)]
-    struct LegacyInclusion {
-        block: BlockNumHash,
-        transaction_hash: B256,
-        result: ExecutorExecutionResult,
-    }
-    use alloy::rpc::types::TransactionRequest;
-    let (root, db, vault) = desktop_store_with_vault();
-    let view = Arc::new(import_wallet_with_metadata(
-        &vault,
-        TEST_WALLET_ID,
-        "Wallet",
-    ));
-    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
-    let address = Address::repeat_byte(1);
-    let record = store
-        .restore_index(5_000_000, address, Address::repeat_byte(2), &[])
-        .unwrap();
-    let floor = store.next_index().unwrap();
-    let mut request = TransactionRequest::default()
-        .to(Address::repeat_byte(3))
-        .input(Bytes::from_static(b"approved recovery fixture").into());
-    request.from = Some(address);
-    request.chain_id = Some(1);
-    request.nonce = Some(7);
-    request.gas = Some(100_000);
-    request.max_fee_per_gas = Some(2);
-    request.max_priority_fee_per_gas = Some(1);
-    let hash = B256::repeat_byte(4);
-    let observed = BlockNumHash::new(10, B256::repeat_byte(10));
-    let recovery = ExecutorOperationId::random().unwrap();
-    let transaction = IssuedExecutorRecoveryTransaction::new(
-        recovery,
-        0,
-        ExecutorRecoveryStepKind::ApproveErc20,
-        request.clone(),
-        hash,
-        observed,
-    );
-    store
-        .record_recovery_transaction(record.operation(), transaction.clone())
-        .unwrap();
-    store
-        .record_recovery_transaction(record.operation(), transaction)
-        .unwrap();
-    drop(store);
-    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
-    let restored = store.records().unwrap().remove(0);
-    assert_eq!(restored.recovery_transactions().len(), 1);
-    assert_eq!(restored.recovery_transactions()[0].transaction(), &request);
-    assert_eq!(
-        restored.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    let included = BlockNumHash::new(11, B256::repeat_byte(11));
-    store
-        .reconcile_recovery(
-            record.operation(),
-            included,
-            &[(
-                hash,
-                ExecutorPayloadInclusion::new(included, hash, ExecutorExecutionResult::Executed),
-            )],
-        )
-        .unwrap();
-    let cold = store.invalidate_observation(record.operation()).unwrap();
-    assert_eq!(
-        cold.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    assert_eq!(
-        cold.recorded_recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Executed)
-    );
-    assert!(cold.recovery_transactions()[0].inclusion().is_some());
-    let reorged = store
-        .reconcile_recovery(record.operation(), observed, &[])
-        .unwrap();
-    assert_eq!(
-        reorged.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    assert!(reorged.recovery_transactions()[0].inclusion().is_none());
-    assert_eq!(store.next_index().unwrap(), floor);
-    let mut replacement_request = request.clone();
-    replacement_request.max_fee_per_gas = Some(3);
-    let replacement_hash = B256::repeat_byte(5);
-    store
-        .record_recovery_transaction(
-            record.operation(),
-            IssuedExecutorRecoveryTransaction::new(
-                recovery,
-                0,
-                ExecutorRecoveryStepKind::ApproveErc20,
-                replacement_request,
-                replacement_hash,
-                observed,
-            ),
-        )
-        .unwrap();
-    let replacement_inclusion = ExecutorPayloadInclusion::new(
-        included,
-        replacement_hash,
-        ExecutorExecutionResult::Reverted,
-    );
-    let replaced = store
-        .reconcile_recovery(
-            record.operation(),
-            included,
-            &[(replacement_hash, replacement_inclusion)],
-        )
-        .unwrap();
-    assert_eq!(
-        replaced.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Invalidated {
-            winner: replacement_hash
-        })
-    );
-    assert_eq!(
-        replaced.recovery_transaction_status(replacement_hash),
-        Some(ExecutorPayloadStatus::Reverted)
-    );
-    let stale = store.invalidate_observation(record.operation()).unwrap();
-    for (transaction, outcome) in [
-        (
-            hash,
-            ExecutorPayloadStatus::Invalidated {
-                winner: replacement_hash,
-            },
-        ),
-        (replacement_hash, ExecutorPayloadStatus::Reverted),
-    ] {
-        assert_eq!(
-            stale.recorded_recovery_transaction_status(transaction),
-            Some(outcome)
-        );
-        assert_eq!(
-            stale.recovery_transaction_status(transaction),
-            Some(ExecutorPayloadStatus::Uncertain)
-        );
-    }
-    assert!(matches!(
-        store.reconcile_recovery(
-            record.operation(),
-            included,
-            &[
-                (
-                    hash,
-                    ExecutorPayloadInclusion::new(
-                        included,
-                        hash,
-                        ExecutorExecutionResult::Executed
-                    )
-                ),
-                (replacement_hash, replacement_inclusion),
-            ]
-        ),
-        Err(ExecutorStoreError::InvalidRecord)
-    ));
-    let reopened = store
-        .reconcile_recovery(record.operation(), observed, &[])
-        .unwrap();
-    assert_eq!(
-        reopened.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    request.value = Some(U256::ONE);
-    let changed = IssuedExecutorRecoveryTransaction::new(
-        recovery,
-        0,
-        ExecutorRecoveryStepKind::ApproveErc20,
-        request,
-        B256::repeat_byte(6),
-        observed,
-    );
-    assert!(matches!(
-        store.record_recovery_transaction(record.operation(), changed),
-        Err(ExecutorStoreError::OperationMismatch)
-    ));
-    // An atomic replacement consumes the same sender nonce even if its asset
-    // execution reverts. Broadcaster or different-nonce receipts are not evidence.
-    let nonce = ExecutorNonceObservation::new(observed, U256::ZERO);
-    store.reconcile(record.operation(), nonce, &[]).unwrap();
-    let batch = B256::repeat_byte(8);
-    store
-        .record_issued(
-            record.operation(),
-            IssuedExecutorPayload::new(
-                U256::ZERO,
-                record.delegate(),
-                batch,
-                ExecutorPayloadPurpose::Recovery,
-                ExecutorPayloadContext::new(
-                    Bytes::from_static(b"atomic recovery"),
-                    nonce,
-                    Vec::new(),
-                ),
-            ),
-        )
-        .unwrap();
-    let batch_inclusion =
-        ExecutorPayloadInclusion::new(included, batch, ExecutorExecutionResult::Reverted);
-    for sender_nonce in [None, Some(8), Some(7)] {
-        store
-            .reconcile(
-                record.operation(),
-                ExecutorNonceObservation::new(included, U256::ZERO),
-                &[(
-                    batch,
-                    batch_inclusion.with_executor_account_nonce(sender_nonce),
-                )],
-            )
-            .unwrap();
-        let current = store
-            .reconcile_recovery(record.operation(), included, &[])
-            .unwrap();
-        assert_eq!(
-            current.recovery_transaction_status(hash),
-            Some(if sender_nonce == Some(7) {
-                ExecutorPayloadStatus::Invalidated { winner: batch }
-            } else {
-                ExecutorPayloadStatus::Uncertain
-            })
-        );
-    }
-    let cold = store.invalidate_observation(record.operation()).unwrap();
-    assert_eq!(
-        cold.recorded_recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Invalidated { winner: batch })
-    );
-    assert_eq!(
-        cold.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    let partial = store
-        .reconcile_recovery(record.operation(), included, &[])
-        .unwrap();
-    assert_eq!(
-        partial.recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    let reorged = store.reconcile(record.operation(), nonce, &[]).unwrap();
-    assert_eq!(
-        reorged.recorded_recovery_transaction_status(hash),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-
-    // Stored inclusions written before sender-nonce evidence remain readable.
-    let legacy = rmp_serde::to_vec_named(&LegacyInclusion {
-        block: included,
-        transaction_hash: batch,
-        result: ExecutorExecutionResult::Reverted,
-    })
-    .unwrap();
-    let decoded: ExecutorPayloadInclusion = rmp_serde::from_slice(&legacy).unwrap();
-    assert_eq!(decoded, batch_inclusion);
-    drop(store);
-    drop(view);
-    drop(vault);
-    drop(db);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn hardware_executor_reservations_survive_restart_and_never_recycle_or_enter_position_range() {
     for descriptor in [
         None,
@@ -644,7 +379,7 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     let inputs = vec![ExecutorInputIdentity::from_utxo(&input)];
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::from(3));
-    store.reconcile(operation, observed, &[]).unwrap();
+    store.record_account_read(operation, observed).unwrap();
     let original = IssuedExecutorPayload::new(
         U256::from(3),
         delegate,
@@ -658,7 +393,7 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     store
         .bind_address(conflicting, Address::repeat_byte(8))
         .unwrap();
-    store.reconcile(conflicting, observed, &[]).unwrap();
+    store.record_account_read(conflicting, observed).unwrap();
     assert!(matches!(
         store.record_issued(conflicting, original.clone()),
         Err(ExecutorStoreError::InputReserved)
@@ -710,51 +445,18 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     );
     assert!(records[0].reserved_inputs()[0].matches(&input));
 
-    // Nonce advancement alone cannot establish a winner or release its inputs.
+    // Nonce advancement resolves every payload at the consumed nonce and names none of
+    // them. It does not release their inputs.
     let advanced =
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::from(4));
-    let future = IssuedExecutorPayload::new(
-        U256::from(4),
-        delegate,
-        B256::repeat_byte(7),
-        ExecutorPayloadPurpose::Operation,
-        ExecutorPayloadContext::new(Bytes::from_static(b"future"), advanced, inputs.clone()),
-    );
-    let uncertain = store.reconcile(operation, advanced, &[]).unwrap();
-    assert_eq!(
-        uncertain.payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    assert_eq!(uncertain.reserved_inputs(), inputs);
-    assert!(matches!(
-        store.record_issued(operation, future.clone()),
-        Err(ExecutorStoreError::OutstandingNonce)
-    ));
-
-    let inclusion = |result| {
-        ExecutorPayloadInclusion::new(
-            BlockNumHash::new(11, B256::repeat_byte(11)),
-            B256::repeat_byte(5),
-            result,
-        )
-    };
-    for result in [
-        ExecutorExecutionResult::MissingEffects,
-        ExecutorExecutionResult::Reverted,
-    ] {
-        let incomplete = store
-            .reconcile(
-                operation,
-                advanced,
-                &[(B256::repeat_byte(6), inclusion(result))],
-            )
-            .unwrap();
-        assert_eq!(incomplete.reserved_inputs(), inputs);
-        assert!(matches!(
-            store.record_issued(operation, future.clone()),
-            Err(ExecutorStoreError::OutstandingNonce)
-        ));
+    let resolved = store.record_account_read(operation, advanced).unwrap();
+    for hash in [4, 6] {
+        assert_eq!(
+            resolved.payload_state(B256::repeat_byte(hash)),
+            Some(ExecutorPayloadState::Resolved)
+        );
     }
+    assert_eq!(resolved.reserved_inputs(), inputs);
     let recovery = store
         .record_issued(
             operation,
@@ -772,50 +474,12 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
         )
         .unwrap();
     assert_eq!(recovery.reserved_inputs(), inputs);
-    assert_eq!(
-        recovery.payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    // A background block observation persists the winner for history without
-    // freeing inputs or admitting another signature from a stale nonce snapshot.
-    let history = store
-        .record_history(
-            operation,
-            advanced.block(),
-            &[(
-                B256::repeat_byte(6),
-                inclusion(ExecutorExecutionResult::Executed),
-            )],
-        )
+    // Every payload at the consumed nonce keeps its notes until private sync has scanned
+    // the block of that read.
+    let settled = store
+        .record_synced(operation, None, advanced.block().number)
         .unwrap();
-    assert_eq!(
-        history.recorded_payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Invalidated {
-            winner: B256::repeat_byte(6)
-        })
-    );
-    assert_eq!(
-        history.payload_status(B256::repeat_byte(6)),
-        Some(ExecutorPayloadStatus::Uncertain)
-    );
-    assert_eq!(history.reserved_inputs(), inputs);
-    let recovery_won = store
-        .reconcile(
-            operation,
-            advanced,
-            &[(
-                B256::repeat_byte(6),
-                inclusion(ExecutorExecutionResult::Executed),
-            )],
-        )
-        .unwrap();
-    assert_eq!(
-        recovery_won.payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Invalidated {
-            winner: B256::repeat_byte(6)
-        })
-    );
-    assert!(recovery_won.reserved_inputs().is_empty());
+    assert!(settled.reserved_inputs().is_empty());
     let cold_owner = crate::ExecutorOwner::new(
         0,
         db.clone(),
@@ -831,74 +495,398 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     assert_eq!(
         cold_owner.available_inputs(vec![input]).unwrap().len(),
         1,
-        "a confirmed losing payload must not reserve its notes again after restart"
+        "a settled nonce's payloads must not reserve their notes again after restart"
     );
     drop(cold_owner);
 
-    // A reorg reopens pending state, and a subsequently observed original is
-    // executed, never reported as cancelled because recovery was attempted.
-    let reorganized = store.reconcile(operation, observed, &[]).unwrap();
+    // A later read that shows the nonce unconsumed again reopens pending state and lowers
+    // the settled nonce.
+    let reopened =
+        ExecutorNonceObservation::new(BlockNumHash::new(13, B256::repeat_byte(13)), U256::from(3));
+    let reorganized = store.record_account_read(operation, reopened).unwrap();
     assert_eq!(reorganized.reserved_inputs(), inputs);
     assert_eq!(
-        reorganized.payload_status(B256::repeat_byte(6)),
-        Some(ExecutorPayloadStatus::Uncertain)
+        reorganized.payload_state(B256::repeat_byte(6)),
+        Some(ExecutorPayloadState::Pending)
     );
-    let original_won = store
-        .reconcile(
+    // Consumed again, the nonce's payloads reserve their notes until private sync passes
+    // the new block.
+    let readvanced =
+        ExecutorNonceObservation::new(BlockNumHash::new(14, B256::repeat_byte(14)), U256::from(4));
+    let consumed = store.record_account_read(operation, readvanced).unwrap();
+    assert_eq!(consumed.reserved_inputs(), inputs);
+    store
+        .record_issued(
             operation,
-            advanced,
-            &[(
-                B256::repeat_byte(4),
-                inclusion(ExecutorExecutionResult::Executed),
-            )],
+            IssuedExecutorPayload::new(
+                U256::from(4),
+                delegate,
+                B256::repeat_byte(7),
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(
+                    Bytes::from_static(b"future"),
+                    readvanced,
+                    inputs.clone(),
+                ),
+            ),
         )
         .unwrap();
-    assert_eq!(
-        original_won.payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Executed)
-    );
-    assert_eq!(
-        original_won.payload_status(B256::repeat_byte(6)),
-        Some(ExecutorPayloadStatus::Invalidated {
-            winner: B256::repeat_byte(4)
-        })
-    );
-    // Canonical execution can precede the actor's private-note projection.
-    assert_eq!(original_won.reserved_inputs(), inputs);
-    store.record_issued(operation, future).unwrap();
     drop(store);
     let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
     let record = store.records().unwrap().remove(0);
     assert_eq!(record.issued().len(), 4);
-    assert_eq!(
-        record.payload_status(B256::repeat_byte(4)),
-        Some(ExecutorPayloadStatus::Executed)
-    );
     assert_eq!(record.reserved_inputs(), inputs);
     let stale = store.invalidate_observation(operation).unwrap();
-    // Historical results survive loss of current authority. The winner only
-    // supersedes competitors for its own nonce, not the next signed payload.
-    for (hash, outcome) in [
-        (B256::repeat_byte(4), ExecutorPayloadStatus::Executed),
-        (
-            B256::repeat_byte(6),
-            ExecutorPayloadStatus::Invalidated {
-                winner: B256::repeat_byte(4),
-            },
-        ),
-        (B256::repeat_byte(7), ExecutorPayloadStatus::Uncertain),
+    // Resolution survives loss of the current observation, and reaches only the nonces
+    // below the watermark, not the next signed payload.
+    assert!(stale.nonce_observation().is_none());
+    for (hash, state) in [
+        (4, ExecutorPayloadState::Resolved),
+        (6, ExecutorPayloadState::Resolved),
+        (7, ExecutorPayloadState::Pending),
     ] {
-        assert_eq!(stale.recorded_payload_status(hash), Some(outcome));
-        assert_eq!(
-            stale.payload_status(hash),
-            Some(ExecutorPayloadStatus::Uncertain)
+        assert_eq!(stale.payload_state(B256::repeat_byte(hash)), Some(state));
+    }
+    assert_eq!(stale.reserved_inputs(), inputs);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn notes_at_a_resolved_nonce_stay_reserved_until_private_sync_settles_it() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let namespace = namespace(&vault, &view, 1);
+    let store = ExecutorStore::new(db.clone(), view.clone(), namespace.chain_id).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let delegate = Address::repeat_byte(1);
+    store.reserve(operation, delegate, None, &[]).unwrap();
+    store
+        .bind_address(operation, Address::repeat_byte(3))
+        .unwrap();
+    let note = |position: u64| {
+        Utxo::new(
+            broadcaster_core::notes::Note::new_change(
+                U256::ONE,
+                Address::ZERO,
+                U256::from(9),
+                [7; 16],
+            ),
+            2,
+            position,
+            UtxoSource {
+                tx_hash: B256::repeat_byte(9),
+                block_number: 1,
+                block_timestamp: 1,
+            },
+            UtxoCommitmentKind::Transact,
+        )
+    };
+    let notes = [note(3), note(4), note(5)];
+    let [setup, variant, order] = notes.each_ref().map(ExecutorInputIdentity::from_utxo);
+    let read = |number: u8, nonce: u64| {
+        let observed = ExecutorNonceObservation::new(
+            BlockNumHash::new(number.into(), B256::repeat_byte(number)),
+            U256::from(nonce),
+        );
+        store.record_account_read(operation, observed).unwrap();
+        observed
+    };
+    let issue = |hash: u8, observed: ExecutorNonceObservation, input: &ExecutorInputIdentity| {
+        store
+            .record_issued(
+                operation,
+                IssuedExecutorPayload::new(
+                    observed.nonce(),
+                    delegate,
+                    B256::repeat_byte(hash),
+                    ExecutorPayloadPurpose::Operation,
+                    ExecutorPayloadContext::new(
+                        Bytes::from(vec![hash]),
+                        observed,
+                        vec![input.clone()],
+                    ),
+                ),
+            )
+            .unwrap()
+    };
+    let synced = |last_scanned: u64| store.record_synced(operation, None, last_scanned).unwrap();
+    let owner = crate::ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap(),
+        crate::HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let own_candidates = |record: &ExecutorRecord| {
+        owner
+            .inputs_for_record(notes.to_vec(), record)
+            .unwrap()
+            .iter()
+            .map(|input| input.position)
+            .collect::<Vec<_>>()
+    };
+
+    // Two fee rounds of a setup at nonce 0, then a read at block 20 that shows it consumed.
+    let signed = read(10, 0);
+    issue(4, signed, &setup);
+    issue(5, signed, &variant);
+    let consumed = read(20, 1);
+    // Private sync is behind block 20: whichever round ran, both keep their notes, and the
+    // account's own next payload cannot select them.
+    let behind = synced(19);
+    assert_eq!(behind.settled_nonce(), None);
+    assert_eq!(behind.reserved_inputs(), [setup, variant]);
+    assert_eq!(own_candidates(&behind), [5]);
+
+    // Private sync reaches block 20. Its spent status is now the only record of those notes.
+    let settled = synced(20);
+    assert_eq!(settled.settled_nonce(), Some(U256::ONE));
+    assert!(settled.reserved_inputs().is_empty());
+    assert_eq!(own_candidates(&settled), [3, 4, 5]);
+    // A reset of private sync leaves the settled nonce settled.
+    assert_eq!(synced(0), settled);
+
+    // A later nonce is consumed at a block private sync has not reached. Only its notes wait.
+    issue(6, consumed, &order);
+    read(30, 2);
+    let reset = synced(5);
+    assert_eq!(reset.settled_nonce(), Some(U256::ONE));
+    assert_eq!(reset.reserved_inputs(), std::slice::from_ref(&order));
+    assert_eq!(own_candidates(&reset), [3, 4]);
+    let rescanned = synced(30);
+    assert_eq!(rescanned.settled_nonce(), Some(U256::from(2)));
+    assert!(rescanned.reserved_inputs().is_empty());
+
+    // A read that shows nonce 1 unconsumed again lowers the settled nonce with the watermark.
+    read(31, 1);
+    let lowered = synced(31);
+    assert_eq!(lowered.settled_nonce(), Some(U256::ONE));
+    assert_eq!(lowered.reserved_inputs(), [order]);
+    assert_eq!(own_candidates(&lowered), [3, 4, 5]);
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn record_stored_with_inclusions_loads_and_only_an_executed_one_resolves_its_nonce() {
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::from(3));
+    let included = BlockNumHash::new(11, B256::repeat_byte(11));
+    // Payloads as an earlier build stored them after its block scan: each with the
+    // inclusion it found, one of them still carrying a key that no longer has a field.
+    let stored_payload = |nonce: u64, hash: u8, inclusion: serde_json::Value| {
+        let mut payload = serde_json::to_value(IssuedExecutorPayload::new(
+            U256::from(nonce),
+            Address::repeat_byte(1),
+            B256::repeat_byte(hash),
+            ExecutorPayloadPurpose::Operation,
+            ExecutorPayloadContext::new(Bytes::from_static(b"call"), observed, Vec::new()),
+        ))
+        .unwrap();
+        payload["inclusion"] = inclusion;
+        payload
+    };
+    let executed = stored_payload(
+        3,
+        4,
+        serde_json::json!({
+            "block": included,
+            "transaction_hash": B256::repeat_byte(5),
+            "result": "Executed",
+            "executor_account_nonce": 7,
+        }),
+    );
+    let reverted = stored_payload(
+        4,
+        6,
+        serde_json::json!({
+            "block": BlockNumHash::new(12, B256::repeat_byte(12)),
+            "transaction_hash": B256::repeat_byte(7),
+            "result": "Reverted",
+        }),
+    );
+    // Background confirmation cleared the nonce observation when it stored an inclusion,
+    // and no earlier build stored a watermark. Earlier builds also wrote two recovery keys
+    // that no longer have fields.
+    let record: ExecutorRecord = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "derivation": "Railgun7702V1",
+        "origin": "Reserved",
+        "operation": ExecutorOperationId::random().unwrap(),
+        "index": 0,
+        "address": Address::repeat_byte(2),
+        "delegate": Address::repeat_byte(1),
+        "retired": false,
+        "created_at": null,
+        "restored_at": null,
+        "purpose_summary": null,
+        "issued": [executed, reverted],
+        "recovery_transactions": [],
+        "recovery_observation": null,
+    }))
+    .expect("a record stored with inclusions remains readable");
+    assert!(record.nonce_observation().is_none());
+    // The executed inclusion places the watermark with no chain read. The reverted one
+    // resolves nothing: its nonce is unconsumed and its signature can still execute.
+    assert_eq!(
+        record.nonce_watermark(),
+        Some(ExecutorNonceWatermark::new(U256::from(4), included.number))
+    );
+    assert_eq!(
+        record.payload_state(B256::repeat_byte(4)),
+        Some(ExecutorPayloadState::Resolved)
+    );
+    assert_eq!(
+        record.payload_state(B256::repeat_byte(6)),
+        Some(ExecutorPayloadState::Pending)
+    );
+    assert!(record.has_unresolved_issued_work());
+    // Reading the effective value stores nothing: the record keeps its earlier form.
+    let stored = serde_json::to_value(&record).unwrap();
+    assert!(stored.get("nonce_watermark").is_none());
+    // The next write drops the recovery keys.
+    assert!(stored.get("recovery_transactions").is_none());
+    assert!(stored.get("recovery_observation").is_none());
+    assert_eq!(
+        serde_json::to_value(serde_json::from_value::<ExecutorRecord>(stored.clone()).unwrap())
+            .unwrap(),
+        stored
+    );
+
+    // A legacy record can also retain a read above its executed inclusion. Invalidation
+    // must keep that read's resolution after private sync has settled its payloads.
+    let later =
+        ExecutorNonceObservation::new(BlockNumHash::new(20, B256::repeat_byte(20)), U256::from(7));
+    let inputs = [5, 7].map(|position| {
+        ExecutorInputIdentity::from_utxo(&Utxo::new(
+            broadcaster_core::notes::Note::new_unshield(Address::ZERO, Address::ZERO, U256::ONE),
+            2,
+            position,
+            UtxoSource {
+                tx_hash: B256::repeat_byte(9),
+                block_number: 1,
+                block_timestamp: 1,
+            },
+            UtxoCommitmentKind::Transact,
+        ))
+    });
+    let mut legacy = stored;
+    legacy["nonce_observation"] = serde_json::to_value(later).unwrap();
+    for (nonce, input) in [5, 7].into_iter().zip(&inputs) {
+        legacy["issued"].as_array_mut().unwrap().push(
+            serde_json::to_value(IssuedExecutorPayload::new(
+                U256::from(nonce),
+                record.delegate(),
+                B256::repeat_byte(nonce),
+                ExecutorPayloadPurpose::Operation,
+                ExecutorPayloadContext::new(
+                    Bytes::from_static(b"call"),
+                    observed,
+                    vec![input.clone()],
+                ),
+            ))
+            .unwrap(),
         );
     }
-    assert_eq!(
-        stale.issued()[0].inclusion(),
-        record.issued()[0].inclusion()
+    let legacy: ExecutorRecord = serde_json::from_value(legacy).unwrap();
+    let watermark = Some(ExecutorNonceWatermark::from(later));
+    assert_eq!(legacy.nonce_watermark(), watermark);
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("nonce_watermark")
+            .is_none()
     );
-    assert_eq!(stale.reserved_inputs(), inputs);
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let operation = legacy.operation();
+    let key = format!(
+        "{}{}",
+        super::super::executors::executor_operation_prefix(view.wallet_id(), 1),
+        operation.opaque_id()
+    );
+    let identity = format!("{}:{}:1:{key}", view.wallet_id().len(), view.wallet_id());
+    let encrypted = view
+        .private_view
+        .encrypt_record(
+            RecordKind::ExecutorOperation,
+            &identity,
+            &rmp_serde::to_vec_named(&legacy).unwrap(),
+        )
+        .unwrap()
+        .to_record_entry(key)
+        .unwrap();
+    db.put_desktop_wallet_vault_records(&[encrypted]).unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let settled = store
+        .record_synced(operation, None, later.block().number)
+        .unwrap();
+    assert_eq!(settled.settled_nonce(), Some(U256::from(7)));
+    assert_eq!(
+        settled.payload_state(B256::repeat_byte(5)),
+        Some(ExecutorPayloadState::Resolved)
+    );
+    assert_eq!(
+        settled.payload_state(B256::repeat_byte(7)),
+        Some(ExecutorPayloadState::Pending)
+    );
+    assert_eq!(settled.reserved_inputs(), std::slice::from_ref(&inputs[1]));
+    store.invalidate_observation(operation).unwrap();
+    drop(store);
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let reloaded = store.records().unwrap().remove(0);
+    assert!(reloaded.nonce_observation().is_none());
+    assert_eq!(reloaded.nonce_watermark(), watermark);
+    assert_eq!(reloaded.settled_nonce(), settled.settled_nonce());
+    for payload in settled.issued() {
+        assert_eq!(
+            reloaded.payload_state(payload.hash()),
+            settled.payload_state(payload.hash())
+        );
+    }
+    assert_eq!(reloaded.reserved_inputs(), settled.reserved_inputs());
+
+    let lowered = store
+        .record_account_read(
+            operation,
+            ExecutorNonceObservation::new(
+                BlockNumHash::new(21, B256::repeat_byte(21)),
+                U256::from(5),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        lowered.nonce_watermark(),
+        Some(ExecutorNonceWatermark::new(U256::from(5), 21))
+    );
+    assert_eq!(lowered.settled_nonce(), Some(U256::from(5)));
+    assert_eq!(
+        lowered.payload_state(B256::repeat_byte(5)),
+        Some(ExecutorPayloadState::Pending)
+    );
+    assert_eq!(lowered.reserved_inputs(), inputs);
     drop(store);
     drop(view);
     drop(vault);
@@ -938,7 +926,7 @@ async fn released_executor_inputs_stay_spendable_until_a_later_payload_reserves_
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::from(3));
     let issue = |hash: u8| {
-        store.reconcile(operation, observed, &[]).unwrap();
+        store.record_account_read(operation, observed).unwrap();
         store
             .record_issued(
                 operation,

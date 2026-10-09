@@ -1,6 +1,6 @@
 use super::{
     AppContext, Arc, Context, DesktopPrivateSpendAuthorization, Disableable, Entity, ExecutorAsset,
-    ExecutorOperationId, ExecutorRecord, Focusable, InputEvent, InputState, ParentElement,
+    ExecutorOperationId, Focusable, InputEvent, InputState, ParentElement,
     SpendAuthorizationSummary, SpendAuthorizationSummaryRow, StealthAccountsView, StealthAction,
     Styled, Task, U256, Window, app_button, app_input, app_muted_text, app_segment_button,
     app_strong_text, div, labeled_field,
@@ -12,11 +12,11 @@ use gpui_component::{
 };
 use ui::gas_fee::{GasFeeEditTarget, GasFeeEditor, GasFeeEditorEvent, GasFeeMode};
 use wallet_ops::{
-    ExecutorPaidRecoveryRequest, ExecutorRecoveryApproval, ExecutorRecoveryExecution,
-    ExecutorRecoveryFeeEstimate, ExecutorRecoveryFunding, PreparedExecutorRecovery,
-    PreparedExecutorRecoveryRetry, PublicActionGasFeeSelection, PublicActionProgressUpdate,
-    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SelfBroadcastGasFeeQuote,
-    TransactionGenerationStage, WakuDeliveryClient, vault::ExecutorPayloadStatus,
+    ExecutorPaidRecoveryRequest, ExecutorRecoveryApproval, ExecutorRecoveryBatchOutcome,
+    ExecutorRecoveryCompletion, ExecutorRecoveryExecution, ExecutorRecoveryFeeEstimate,
+    ExecutorRecoveryFunding, PreparedExecutorRecovery, PublicActionGasFeeSelection,
+    PublicActionProgressUpdate, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
+    SelfBroadcastGasFeeQuote, TransactionGenerationStage, WakuDeliveryClient,
 };
 
 use crate::root::gas_fee::{GasRetryInputs, format_gwei, parse_gwei_to_wei};
@@ -25,26 +25,21 @@ use crate::root::public_balances::public_asset_decimals;
 mod assets;
 mod broadcaster;
 mod progress;
-mod retry;
 pub(in crate::root) use broadcaster::{RecoveryPickerContext, same_offer};
 
 use crate::root::public_action::PublicActionStepStatus;
-use progress::{RecoveryProgress, RecoveryProgressSource, recovery_execution_status};
+use progress::{RecoveryProgress, RecoveryProgressSource};
 
 use crate::root::public_broadcaster::PublicBroadcasterFeeTokenOption;
 use assets::RecoveryAssetItem;
 
 #[derive(Clone)]
 pub(super) enum RecoveryAuthorization {
-    Retry {
-        prepared: Arc<PreparedExecutorRecoveryRetry>,
-    },
     Prepare {
         approval: Arc<ExecutorRecoveryApproval>,
     },
     Submit {
         prepared: Arc<PreparedExecutorRecovery>,
-        step: usize,
         waku: Option<Arc<WakuDeliveryClient>>,
     },
 }
@@ -55,7 +50,6 @@ pub(super) struct RecoveryForm {
     pub(super) asset_select: Entity<SelectState<SearchableVec<RecoveryAssetItem>>>,
     asset_items: Vec<RecoveryAssetItem>,
     pub(super) amount: Entity<InputState>,
-    retry_gas_limit: Entity<InputState>,
     pub(super) native_funding: bool,
     gas: GasRetryInputs,
     gas_mode: GasFeeMode,
@@ -82,7 +76,6 @@ pub(super) struct RecoveryForm {
 impl RecoveryForm {
     pub(super) fn new(window: &mut Window, cx: &mut Context<'_, StealthAccountsView>) -> Self {
         let amount = cx.new(|cx| InputState::new(window, cx));
-        let retry_gas_limit = cx.new(|cx| InputState::new(window, cx));
         let asset_select = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::<RecoveryAssetItem>::new(Vec::new()),
@@ -101,12 +94,7 @@ impl RecoveryForm {
         })
         .detach();
         let gas = GasRetryInputs::new(1_000_000_000, 1_000_000_000, window, cx);
-        for input in [
-            &amount,
-            &retry_gas_limit,
-            &gas.max_fee_input,
-            &gas.max_tip_input,
-        ] {
+        for input in [&amount, &gas.max_fee_input, &gas.max_tip_input] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.invalidate_recovery();
@@ -122,7 +110,6 @@ impl RecoveryForm {
             asset_select,
             asset_items: Vec::new(),
             amount,
-            retry_gas_limit,
             native_funding: true,
             gas,
             gas_mode: GasFeeMode::Auto,
@@ -213,13 +200,13 @@ impl StealthAccountsView {
 
     pub(super) fn render_recovery_form(&self, cx: &Context<'_, Self>) -> gpui::Div {
         let mut form = div().w_full().min_w_0().flex().flex_col().gap_3();
-        let Some(record) = self
+        if !self
             .records
             .iter()
-            .find(|record| Some(record.operation()) == self.selected)
-        else {
+            .any(|record| Some(record.operation()) == self.selected)
+        {
             return form;
-        };
+        }
         let busy = self.job.is_some();
         if matches!(self.recovery.asset, Some(ExecutorAsset::Erc721 { .. })) {
             form = form.child(app_muted_text("Recover exactly the selected NFT."));
@@ -362,19 +349,14 @@ impl StealthAccountsView {
             .debug_selector(|| "stealth-prepare-recovery".into())
             .primary()
             .disabled(
-                busy || self
-                    .recovery
-                    .prepared
-                    .as_ref()
-                    .is_some_and(|prepared| self.next_recovery_step(prepared).is_none())
-                    || self.recovery.prepared.is_none()
-                        && if self.recovery.native_funding {
-                            !self.recovery_has_native_balance()
-                                || self.recovery.gas_quote.is_none()
-                                    && self.recovery.gas_mode == GasFeeMode::Auto
-                        } else {
-                            self.recovery.fee_estimate.is_none()
-                        },
+                busy || self.recovery.prepared.is_none()
+                    && if self.recovery.native_funding {
+                        !self.recovery_has_native_balance()
+                            || self.recovery.gas_quote.is_none()
+                                && self.recovery.gas_mode == GasFeeMode::Auto
+                    } else {
+                        self.recovery.fee_estimate.is_none()
+                    },
             )
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.recovery.prepared.is_some() {
@@ -394,7 +376,6 @@ impl StealthAccountsView {
                     })),
             );
         }
-        form = form.children(self.render_recovery_retries(record, cx));
         form
     }
 
@@ -418,9 +399,6 @@ impl StealthAccountsView {
     ) {
         let owner = Arc::clone(&self.owner);
         match action {
-            RecoveryAuthorization::Retry { prepared } => {
-                self.continue_recovery_retry(prepared, authorization, window, cx);
-            }
             RecoveryAuthorization::Prepare { approval } => {
                 self.start_recovery_job(
                     RecoveryProgressSource::Preparation,
@@ -465,11 +443,7 @@ impl StealthAccountsView {
                     cx,
                 );
             }
-            RecoveryAuthorization::Submit {
-                prepared,
-                step,
-                waku,
-            } => {
+            RecoveryAuthorization::Submit { prepared, waku } => {
                 if !self
                     .recovery
                     .prepared
@@ -479,26 +453,41 @@ impl StealthAccountsView {
                     return;
                 }
                 let session = Arc::clone(&self.session);
-                if prepared.execution() == ExecutorRecoveryExecution::Ordinary
-                    || matches!(
-                        prepared.execution(),
-                        ExecutorRecoveryExecution::SignedMulticall { .. }
-                    )
-                {
+                if matches!(
+                    prepared.execution(),
+                    ExecutorRecoveryExecution::SignedMulticall { .. }
+                ) {
                     let (progress, receiver) =
                         tokio::sync::watch::channel(None::<PublicActionProgressUpdate>);
-                    self.start_recovery_job(RecoveryProgressSource::Native(receiver), show_progress, async move {
-                        let report = move |update| { let _ = progress.send(Some(update)); };
-                        let outcome = match prepared.execution() {
-                            ExecutorRecoveryExecution::Ordinary => Box::pin(owner.submit_ordinary_recovery_step(&prepared, step, &authorization, report)).await?,
-                            _ => Box::pin(owner.submit_native_recovery_batch(&prepared, &authorization, report)).await?,
-                        };
-                        Ok((format!("{} Check the private receipt before considering recovery complete.", payload_status(outcome.status)), recovery_execution_status(outcome.status)))
-                    }, |this, (status, result), _, _| {
-                        if let Some(dialog) = &mut this.recovery.dialog {
-                            dialog.finish(result, status);
-                        }
-                    }, window, cx);
+                    self.start_recovery_job(
+                        RecoveryProgressSource::Native(receiver),
+                        show_progress,
+                        async move {
+                            let report = move |update| {
+                                let _ = progress.send(Some(update));
+                            };
+                            Ok(batch_recovery_result(
+                                &Box::pin(owner.submit_native_recovery_batch(
+                                    &prepared,
+                                    &authorization,
+                                    report,
+                                ))
+                                .await?,
+                            ))
+                        },
+                        |this, (status, result), _, _| {
+                            // A sent batch used its nonce, so it can't be submitted again.
+                            // Only a reverted one is left to review.
+                            if result != PublicActionStepStatus::Error {
+                                this.recovery.prepared = None;
+                            }
+                            if let Some(dialog) = &mut this.recovery.dialog {
+                                dialog.finish(result, status);
+                            }
+                        },
+                        window,
+                        cx,
+                    );
                 } else {
                     let Some(waku) = waku else {
                         self.error =
@@ -540,24 +529,6 @@ impl StealthAccountsView {
         }
     }
 
-    fn next_recovery_step(&self, prepared: &PreparedExecutorRecovery) -> Option<usize> {
-        if prepared.execution() != ExecutorRecoveryExecution::Ordinary {
-            return Some(0);
-        }
-        let record = self
-            .records
-            .iter()
-            .find(|record| record.operation() == prepared.operation())?;
-        (0..prepared.calls().len()).find(|step| {
-            !record.recovery_transactions().iter().any(|transaction| {
-                transaction.recovery() == prepared.recovery()
-                    && transaction.step() as usize == *step
-                    && record.recovery_transaction_status(transaction.hash())
-                        == Some(ExecutorPayloadStatus::Executed)
-            })
-        })
-    }
-
     fn request_recovery_submission(
         &mut self,
         authorization: Option<(
@@ -568,9 +539,6 @@ impl StealthAccountsView {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(prepared) = self.recovery.prepared.clone() else {
-            return;
-        };
-        let Some(step) = self.next_recovery_step(&prepared) else {
             return;
         };
         let record = match self.owner.validate_recovery(&prepared) {
@@ -629,20 +597,6 @@ impl StealthAccountsView {
                 "Delegation remains installed even if the recovery transaction reverts.",
             ));
         }
-        if let Some(nonce) = prepared.replacement_nonce() {
-            rows.push(SpendAuthorizationSummaryRow::new(
-                "Earlier recovery attempt",
-                match prepared.funding() {
-                    ExecutorRecoveryFunding::ExecutorNative { .. } => format!(
-                        "Replace the account transaction at nonce {nonce} with this recovery batch."
-                    ),
-                    ExecutorRecoveryFunding::PublicBroadcaster { .. } => {
-                        "An earlier account transaction may still execute before this recovery."
-                            .into()
-                    }
-                },
-            ));
-        }
         rows.extend(self.recovery_fee_authorization_rows(
             prepared.funding(),
             prepared.maximum_native_fee(),
@@ -652,16 +606,7 @@ impl StealthAccountsView {
             ExecutorRecoveryFunding::ExecutorNative { .. } => {
                 rows.push(SpendAuthorizationSummaryRow::new(
                     "Signing",
-                    if prepared.execution() == ExecutorRecoveryExecution::Ordinary {
-                        format!(
-                            "Step {} of {}: {}",
-                            step + 1,
-                            prepared.calls().len(),
-                            step_label(prepared.steps()[step])
-                        )
-                    } else {
-                        "Shield the selected asset in one atomic transaction".into()
-                    },
+                    "Shield the selected asset in one atomic transaction",
                 ));
                 None
             }
@@ -692,11 +637,7 @@ impl StealthAccountsView {
             "Shield only this approved amount.",
             rows,
         );
-        let action = RecoveryAuthorization::Submit {
-            prepared,
-            step,
-            waku,
-        };
+        let action = RecoveryAuthorization::Submit { prepared, waku };
         if let Some((authorization, _)) = authorization {
             if approved {
                 self.continue_recovery_with_progress(
@@ -958,21 +899,37 @@ fn funding_label(funding: &ExecutorRecoveryFunding) -> String {
     }
 }
 
-const fn step_label(step: wallet_ops::PublicActionProgressStep) -> &'static str {
-    match step {
-        wallet_ops::PublicActionProgressStep::Wrap => "Wrap native currency",
-        wallet_ops::PublicActionProgressStep::Approve => "Approve the exact shield amount",
-        wallet_ops::PublicActionProgressStep::Shield => "Shield to private balance",
-        _ => "Recover assets",
-    }
-}
-
-const fn payload_status(status: ExecutorPayloadStatus) -> &'static str {
-    match status {
-        ExecutorPayloadStatus::Uncertain => "Execution is not yet confirmed",
-        ExecutorPayloadStatus::Reverted => "Transaction reverted",
-        ExecutorPayloadStatus::MissingEffects => "Receipt found; expected effects are missing",
-        ExecutorPayloadStatus::Executed => "Expected execution effects confirmed",
-        ExecutorPayloadStatus::Invalidated { .. } => "Another recorded payload consumed this nonce",
-    }
+/// What a recovery batch the account sent itself reports once it is sent. Its own receipt
+/// tells a revert at the time; otherwise the batch's completion decides.
+fn batch_recovery_result(
+    outcome: &ExecutorRecoveryBatchOutcome,
+) -> (String, PublicActionStepStatus) {
+    use ExecutorRecoveryCompletion as Completion;
+    let (label, status) = if outcome.receipt.status {
+        match outcome.completion {
+            Completion::Complete => {
+                return ("Recovery complete.".into(), PublicActionStepStatus::Done);
+            }
+            Completion::ShieldPending => ("Recovery executed", PublicActionStepStatus::Done),
+            // The receipt shows the batch ran. The confirmed block is behind it for a while.
+            Completion::Pending => (
+                "Recovery sent and awaiting confirmation",
+                PublicActionStepStatus::Done,
+            ),
+            Completion::Superseded => (
+                "Another recorded payload consumed this nonce",
+                PublicActionStepStatus::Error,
+            ),
+            Completion::Unattributed => (
+                "This nonce was used and nothing shows which payload ran",
+                PublicActionStepStatus::Warning,
+            ),
+        }
+    } else {
+        ("Transaction reverted", PublicActionStepStatus::Error)
+    };
+    (
+        format!("{label}. Check the private receipt before considering recovery complete."),
+        status,
+    )
 }
