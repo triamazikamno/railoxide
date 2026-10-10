@@ -143,6 +143,19 @@ pub const fn chain_icon_asset_path(chain_id: u64) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Icon for a chain's native currency. Chains whose native currency is ETH show the Ethereum
+/// mark, and every other native currency shares its network's mark.
+#[must_use]
+pub const fn native_currency_icon_asset_path(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        42161 | 4663 | 130 | 57073 | 8453 | 10 | 81457 | 59144 | 747_474 | 4326 | 480 => {
+            chain_icon_asset_path(1)
+        }
+        _ => chain_icon_asset_path(chain_id),
+    }
+}
+
 /// Configured native-currency metadata, shared by desktop and browser presentation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

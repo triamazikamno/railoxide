@@ -139,7 +139,7 @@ impl StealthAccountsView {
             };
             let icon = address.map_or_else(
                 || {
-                    railgun_ui::chain_icon_asset_path(self.session.chain_id)
+                    railgun_ui::native_currency_icon_asset_path(self.session.chain_id)
                         .map(crate::assets::WalletIconSource::embedded)
                 },
                 |address| {

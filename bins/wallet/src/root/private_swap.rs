@@ -1455,7 +1455,7 @@ impl PrivateSwapsView {
             return Some(super::tokens::TokenDisplayMetadata {
                 symbol: native.symbol.clone(),
                 decimals: native.decimals,
-                icon_path: railgun_ui::chain_icon_asset_path(chain_id)
+                icon_path: railgun_ui::native_currency_icon_asset_path(chain_id)
                     .map(crate::assets::WalletIconSource::embedded),
             });
         }

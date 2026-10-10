@@ -1690,6 +1690,20 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
 }
 
 #[test]
+fn native_eth_presets_show_the_ethereum_mark() {
+    for chain_id in railgun_ui::built_in_chain_ids() {
+        let preset = super::presets::EvmPreset::for_chain(chain_id).unwrap();
+        let shows_ethereum_mark = railgun_ui::native_currency_icon_asset_path(chain_id)
+            == railgun_ui::chain_icon_asset_path(1);
+        assert_eq!(
+            shows_ethereum_mark,
+            preset.native_currency.symbol == "ETH",
+            "chain {chain_id}"
+        );
+    }
+}
+
+#[test]
 fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
     let mut settings = WalletSettings::default();
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");

@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, U256};
 use gpui::{Pixels, px};
-use railgun_ui::{chain_icon_asset_path, format_usd_micro_value};
+use railgun_ui::{format_usd_micro_value, native_currency_icon_asset_path};
 use serde_json::Value;
 use wallet_ops::{
     TokenAnchorRateCache, WalletConnectDecodedCallKind, WalletConnectDecodedTransaction,
@@ -745,8 +745,8 @@ fn resolve_transaction(
 
     let Some(kind) = decoded.map(|decoded| &decoded.kind) else {
         if resolved.attached_native.is_some() {
-            resolved.icon =
-                chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+            resolved.icon = native_currency_icon_asset_path(context.chain.chain_id)
+                .map(WalletIconSource::embedded);
         }
         if let Some(target) = target {
             resolved.parties.push(party_for(
@@ -795,8 +795,8 @@ fn resolve_transaction(
                     .cached_native_usd_micro_value(context.chain.chain_id, native_value)
                     .map(format_usd_micro_value),
             };
-            resolved.icon =
-                chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+            resolved.icon = native_currency_icon_asset_path(context.chain.chain_id)
+                .map(WalletIconSource::embedded);
             resolved.hero_summary = WalletConnectHeroSummary::Amount;
             resolved.parties.push(party_for(
                 WalletConnectPartyRole::Sender,
@@ -895,8 +895,8 @@ fn resolve_transaction(
             if is_trusted_wrapped_native(context.chain, target) {
                 resolved.action = WalletConnectIntentAction::Wrap;
                 resolved.amount = native_amount_as_amount(context, native_value);
-                resolved.icon =
-                    chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+                resolved.icon = native_currency_icon_asset_path(context.chain.chain_id)
+                    .map(WalletIconSource::embedded);
                 resolved.hero_summary = WalletConnectHeroSummary::Amount;
                 add_wrap_parties(
                     &mut resolved.parties,
@@ -1005,7 +1005,7 @@ fn add_undecoded_call(
     resolved.action = WalletConnectIntentAction::ContractCall;
     if resolved.attached_native.is_some() {
         resolved.icon =
-            chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+            native_currency_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
     }
     resolved.hero_summary = WalletConnectHeroSummary::UndecodedCall { selector };
     resolved.parties.push(party_for(

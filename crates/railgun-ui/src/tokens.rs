@@ -463,7 +463,7 @@ const TOKENS: &[TokenRow] = &[
     (137, address!("0xb33EaAd8d922B1083446DC23f610c2567fB5180f"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (137, address!("0xD6DF932A45C0f255f85145f286eA0b292B21C90B"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
     // Arbitrum (42161)
-    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
+    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (42161, address!("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"), "USDT", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
     (42161, address!("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"), "USDC.e", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
     (42161, address!("0xaf88d065e77c8cc2239327c5edb3a432268e5831"), "USDC", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
@@ -517,7 +517,7 @@ const TOKENS: &[TokenRow] = &[
     (10, address!("0x350a791Bfc2C21F9Ed5d10980Dad2e2638ffa7f6"), "LINK", 18, &[feed(OP_LINK_ETH_FEED, 18, 18, true)], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (10, address!("0x6fd9d7AD17242c41f7131d257212c54A0e816691"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (10, address!("0x76FB31fb4af56892A25e32cFC43De717950c9278"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
-    (10, address!("0x4200000000000000000000000000000000000042"), "OP", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_OP_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
+    (10, address!("0x4200000000000000000000000000000000000042"), "OP", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_OP_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Own),
     // Gnosis (100)
     (100, address!("0xfc421aD3C883Bf9E7C4f42dE845C4e4405799e73"), "GHO", 18, &[feed(GNOSIS_XDAI_USD_FEED, 8, 18, false)], TokenIcon::None),
     (100, address!("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"), "WXDAI", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::None),
