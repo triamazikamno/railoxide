@@ -179,6 +179,15 @@ pub const fn public_deposit_hook_gas(proxy_deployed: bool, mode: GasEstimateMode
     }
 }
 
+/// Estimated gas of the pre-hook of an order paid from a Public account that signs a permit:
+/// the sold token's `permit` call.
+///
+/// Fork measurements on 2026-10-09 of a first permit from an account, sent as a transaction,
+/// used 65,420 to 70,212 execution gas: USDC on Ethereum, Base and Arbitrum, `cbBTC` on Base,
+/// and USDT and WETH on Arbitrum. A hook also pays for the token's cold account and the
+/// trampoline's call.
+pub const PUBLIC_PERMIT_HOOK_GAS: u64 = 100_000;
+
 /// Gas limit to declare for a hook in the app data: the estimate plus 10%. The margin covers
 /// the 1/64 of gas a call keeps back from the calls it makes, and variation the measurements
 /// didn't cover.

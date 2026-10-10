@@ -318,6 +318,13 @@ pub struct PublicSwapOrder {
     submission: SwapSubmission,
     #[serde(default)]
     submission_status: SwapSubmissionStatus,
+    /// The signed permit the order's pre-hook submits. `None` for an order without one.
+    ///
+    /// A build from before this field drops it on read, rebuilds the app data without the
+    /// pre-hook and gets another UID, so it refuses to resend the order. An order the
+    /// orderbook already accepted keeps its app data and can still fill.
+    #[serde(default)]
+    permit: Option<PublicSwapPermit>,
 }
 
 impl PublicSwapOrder {
@@ -337,7 +344,18 @@ impl PublicSwapOrder {
             batch,
             submission,
             submission_status: SwapSubmissionStatus::Pending,
+            permit: None,
         }
+    }
+    /// This order with the signed permit its pre-hook submits.
+    #[must_use]
+    pub const fn with_permit(mut self, permit: Option<PublicSwapPermit>) -> Self {
+        self.permit = permit;
+        self
+    }
+    #[must_use]
+    pub const fn permit(&self) -> Option<&PublicSwapPermit> {
+        self.permit.as_ref()
     }
     #[must_use]
     pub const fn uid(&self) -> OrderUid {
@@ -367,6 +385,56 @@ impl PublicSwapOrder {
     #[must_use]
     pub const fn submission_status(&self) -> SwapSubmissionStatus {
         self.submission_status
+    }
+}
+
+/// The EIP-2612 permit an order's pre-hook submits: the Public account's approval of `value`
+/// of the sold token to `CoW`'s vault relayer, signed under `nonce` until `deadline`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicSwapPermit {
+    nonce: U256,
+    /// Unix seconds; the order's `validTo`.
+    deadline: u32,
+    value: U256,
+    signature: FixedBytes<65>,
+}
+
+// The signature is not formatted.
+impl std::fmt::Debug for PublicSwapPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicSwapPermit")
+            .field("nonce", &self.nonce)
+            .field("deadline", &self.deadline)
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublicSwapPermit {
+    #[must_use]
+    pub const fn new(nonce: U256, deadline: u32, value: U256, signature: [u8; 65]) -> Self {
+        Self {
+            nonce,
+            deadline,
+            value,
+            signature: FixedBytes(signature),
+        }
+    }
+    #[must_use]
+    pub const fn nonce(&self) -> U256 {
+        self.nonce
+    }
+    #[must_use]
+    pub const fn deadline(&self) -> u32 {
+        self.deadline
+    }
+    #[must_use]
+    pub const fn value(&self) -> U256 {
+        self.value
+    }
+    #[must_use]
+    pub const fn signature(&self) -> &[u8; 65] {
+        &self.signature.0
     }
 }
 

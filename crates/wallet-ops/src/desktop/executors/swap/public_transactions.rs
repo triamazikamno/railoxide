@@ -76,26 +76,11 @@ pub const PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS: u64 = 400_000;
 /// the 335,199 gas measured with it.
 pub const PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS: u64 = 120_000;
 
-/// The approvals a Public account sends before a swap that sells `amount`: none when `allowance`
-/// covers it, the exact approval when the allowance is zero, and a reset to zero first when it is
-/// short and not zero. Tokens such as Ethereum's USDT reject a change from one nonzero allowance
-/// to another, so the reset applies to every token.
-#[must_use]
-pub fn public_swap_approvals(allowance: U256, amount: U256) -> Vec<U256> {
-    if allowance >= amount {
-        Vec::new()
-    } else if allowance.is_zero() {
-        vec![amount]
-    } else {
-        vec![U256::ZERO, amount]
-    }
-}
-
 /// What the Public account's own transactions for a swap can cost at most, and the limits that
 /// maximum assumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicSwapGasPlan {
-    /// One gas limit per approval transaction `public_swap_approvals` returns, in order.
+    /// One gas limit per approval transaction of the swap's `PublicSwapApprovalPlan`, in order.
     pub approval_gas_limits: Vec<u64>,
     /// The deposit's gas limit. `None` for an order, which the Public account doesn't send.
     pub deposit_gas_limit: Option<u64>,
@@ -210,6 +195,22 @@ impl AuthorizedPublicSwapSource {
     }
 }
 
+/// What sending a swap's approvals came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicSwapApprovalsOutcome {
+    /// Nothing is left to send: the allowance covers the sale, the approved order signs a
+    /// permit, or the approvals the review priced were sent and succeeded.
+    Ready,
+    /// The approval plan differs from the reviewed one. Nothing was sent, and the saved
+    /// approval is unchanged.
+    ReviewRequired {
+        /// Whether the account must now send transactions the approval doesn't cover, which
+        /// [`ExecutorOwner::requote_public_swap_approvals`] prices. Otherwise it can now sign
+        /// a permit the order wasn't priced with, and the swap is quoted afresh.
+        transactions: bool,
+    },
+}
+
 /// What became of a deposit, a withdrawal or an invalidation a swap's Public account sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicSwapTransactionOutcome {
@@ -303,9 +304,9 @@ enum HandoffAt {
 }
 
 impl ExecutorOwner {
-    /// Read the Public account's allowance of the swap's Sell token to `spender` on the origin
-    /// chain and plan its transactions at the given fee: for the review, and again before
-    /// sending.
+    /// Read how the Public account lets `spender` take the swap's Sell token on the origin
+    /// chain and plan its transactions at the given fee. An order, which makes no `deposit`,
+    /// pays no gas for an approval its token lets it sign.
     pub async fn plan_public_swap_gas(
         &self,
         origin: &EffectiveChainConfig,
@@ -317,19 +318,12 @@ impl ExecutorOwner {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
     ) -> Result<PublicSwapGasPlan> {
-        self.ensure_active()?;
-        // The native asset is deposited as value and takes no approval.
-        let approvals = if sell_token == Address::ZERO {
-            0
-        } else {
-            let allowance = self
-                .public_swap_allowance(origin, source, sell_token, spender)
-                .await?;
-            public_swap_approvals(allowance, amount).len()
-        };
+        let plan = self
+            .public_swap_approval_plan(origin, source, sell_token, spender, amount, !deposit)
+            .await?;
         public_swap_gas_plan(
             origin,
-            approvals,
+            plan.transactions().len(),
             deposit,
             max_fee_per_gas,
             max_priority_fee_per_gas,
@@ -337,7 +331,7 @@ impl ExecutorOwner {
     }
 
     /// Send the approvals the swap needs from its Public account, each persisted before it is
-    /// broadcast.
+    /// broadcast. A plan the review didn't price sends nothing and returns to review.
     pub async fn submit_public_swap_approvals(
         &self,
         operation: ExecutorOperationId,
@@ -346,7 +340,7 @@ impl ExecutorOwner {
         source: &AuthorizedPublicSwapSource,
         gas_fee: PublicActionGasFeeSelection,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
-    ) -> Result<()> {
+    ) -> Result<PublicSwapApprovalsOutcome> {
         Box::pin(self.submit_public_swap_approvals_with_signer(
             operation,
             swap_use,
@@ -360,8 +354,11 @@ impl ExecutorOwner {
 
     /// [`Self::submit_public_swap_approvals`] with the Public account's signer.
     ///
-    /// The allowance read decides what is still needed, so running this again after a restart
-    /// sends only the approvals that are missing.
+    /// The approval plan is read again and decides what is still needed, so running this again
+    /// after a restart sends only the approvals that are missing. An order approved with a
+    /// permit sends nothing while its token still lets it sign one. Transactions the saved
+    /// approval's gas maximum doesn't cover, and a permit the order wasn't priced with, send
+    /// nothing either and need another review.
     pub(crate) async fn submit_public_swap_approvals_with_signer(
         &self,
         operation: ExecutorOperationId,
@@ -370,14 +367,14 @@ impl ExecutorOwner {
         signer: &VaultedPublicSigner,
         mut gas_fee: PublicActionGasFeeSelection,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
-    ) -> Result<()> {
+    ) -> Result<PublicSwapApprovalsOutcome> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         require_public_swap_source(signer, &claimed)?;
         let (approval, intent) = (claimed.swap.approval(), claimed.swap.intent());
         let sell_token = approval.sell_token;
         // The native asset is deposited as value and takes no approval.
         if sell_token == Address::ZERO {
-            return Ok(());
+            return Ok(PublicSwapApprovalsOutcome::Ready);
         }
         let amount = approval.bounds.sell_amount;
         // An order's Sell token is pulled by `CoW`'s vault relayer, a deposit's by the pool.
@@ -391,11 +388,42 @@ impl ExecutorOwner {
         } else {
             claimed.spoke_pool
         };
-        let allowance = self
-            .public_swap_allowance(origin, claimed.source, sell_token, spender)
+        let plan = self
+            .public_swap_approval_plan(
+                origin,
+                claimed.source,
+                sell_token,
+                spender,
+                amount,
+                intent.order,
+            )
             .await?;
-        let values = public_swap_approvals(allowance, amount);
-        let mut remaining = values.as_slice();
+        if plan.signs_permit() {
+            // The order signs the permit. One whose hook the approval didn't price is quoted
+            // again.
+            return Ok(if approval.bounds.pre_hook_gas_limit == 0 {
+                PublicSwapApprovalsOutcome::ReviewRequired {
+                    transactions: false,
+                }
+            } else {
+                PublicSwapApprovalsOutcome::Ready
+            });
+        }
+        let mut remaining = plan.transactions();
+        if !remaining.is_empty() {
+            // Transactions the review didn't price are reviewed before any of them is sent.
+            let (max_fee_per_gas, max_priority_fee_per_gas) = reviewed_gas_fee(gas_fee)?;
+            let needed = public_swap_gas_plan(
+                origin,
+                remaining.len(),
+                !intent.order,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            )?;
+            if needed.max_gas_cost > approval.max_gas_cost {
+                return Ok(PublicSwapApprovalsOutcome::ReviewRequired { transactions: true });
+            }
+        }
         let mut nonce = None;
         while let Some((value, later)) = remaining.split_first() {
             let (max_fee_per_gas, max_priority_fee_per_gas) = reviewed_gas_fee(gas_fee)?;
@@ -447,7 +475,7 @@ impl ExecutorOwner {
             gas_fee = outcome.gas_fee;
             remaining = later;
         }
-        Ok(())
+        Ok(PublicSwapApprovalsOutcome::Ready)
     }
 
     /// Send the swap's deposit from its Public account, for a signed delivery.
@@ -1078,7 +1106,7 @@ impl ExecutorOwner {
     }
 
     /// The Public account's allowance of `token` to `spender` on the origin chain.
-    async fn public_swap_allowance(
+    pub(super) async fn public_swap_allowance(
         &self,
         origin: &EffectiveChainConfig,
         source: Address,
@@ -1606,18 +1634,6 @@ mod tests {
         };
         public_swap_handoff(&[log], SPOKE_POOL, SOURCE, DESTINATION_CHAIN, &terms())
             .map(|(id, amounts)| (id, amounts.input_amount, amounts.output_amount))
-    }
-
-    #[test]
-    fn approvals_reset_a_short_nonzero_allowance_first() {
-        let amount = U256::from(200);
-        assert!(public_swap_approvals(amount, amount).is_empty());
-        assert!(public_swap_approvals(U256::MAX, amount).is_empty());
-        assert_eq!(public_swap_approvals(U256::ZERO, amount), [amount]);
-        assert_eq!(
-            public_swap_approvals(U256::from(100), amount),
-            [U256::ZERO, amount]
-        );
     }
 
     #[test]

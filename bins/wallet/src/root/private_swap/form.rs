@@ -13267,6 +13267,7 @@ const fn review_change_label(change: SwapReviewChange) -> &'static str {
             "shielding on the destination network got more expensive, which left less than the minimum you approved then"
         }
         SwapReviewChange::Accounts => "the stealth accounts or their setup changed",
+        SwapReviewChange::ApprovalPlan => "the token approval the swap needs changed",
     }
 }
 

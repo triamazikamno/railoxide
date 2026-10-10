@@ -948,6 +948,10 @@ pub enum SwapReviewChange {
     /// either needs setup differs from the accounts the approval binds. An approved new
     /// account that took its derived address is not a change. This always needs a full review.
     Accounts,
+    /// How a Public account lets its swap take what it sells differs from the review: it must
+    /// now send approval transactions the review didn't price, or sign a permit whose hook the
+    /// order wasn't priced with. Nothing was sent.
+    ApprovalPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

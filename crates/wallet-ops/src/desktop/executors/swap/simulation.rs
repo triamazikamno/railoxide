@@ -110,7 +110,7 @@ async fn simulate_at(
     Ok(PreHookSimulation::Failed(reason))
 }
 
-enum Execution {
+pub(super) enum Execution {
     Succeeded,
     /// With the decoded revert reason, when there is one.
     Reverted(Option<String>),
@@ -120,7 +120,7 @@ enum Execution {
 
 /// `eth_call` at the latest block. An error response that reports an execution outcome is a
 /// revert or a gas shortfall; any other error is returned.
-async fn execute(
+pub(super) async fn execute(
     provider: &DynProvider,
     call: TransactionRequest,
 ) -> Result<Execution, TransportError> {

@@ -6,7 +6,8 @@
 //! request, which a restart resends unchanged. What became of the order is read from fabricated
 //! settlement receipts: its deposit, proceeds its proxy holds, their withdrawal, and its
 //! invalidation. After the hand-off the destination chain's owner tracks the fill on its own
-//! chain and the refund on the chain the account pays on, also after a restart.
+//! chain and the refund on the chain the account pays on, also after a restart. An order whose
+//! sold token has a permit signs it in place of an approval and carries it as its pre-hook.
 
 use super::swap_observation::{EXECUTOR, MockChain, execute, private_transaction};
 use super::swap_order::{
@@ -26,24 +27,24 @@ use crate::signer::SoftwareEvmSigner;
 use crate::vault::{
     AcrossOrderTerms, PublicAccountScope, PublicSwapApproval, PublicSwapDeposited,
     PublicSwapInclusion, PublicSwapIntent, PublicSwapObservations, PublicSwapOrder, PublicSwapPath,
-    PublicSwapProxyHolding, PublicSwapRecord, PublicSwapTransactionKind, SwapAccountChoice,
-    SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
+    PublicSwapProxyHolding, PublicSwapRecord, PublicSwapSourceTerms, PublicSwapTransactionKind,
+    SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
     SwapApprovedAccount, SwapBridgeHandoff, SwapBridgeOutcome, SwapDestinationOutcome,
     SwapObservation, SwapSubmissionStatus, SwapUseId, SwapUseRole, swap_account_refusal,
 };
 use crate::{
     ExecutorPrivateFeeLimitExceeded, OperationHttpClient, OperationNetworkIsolation,
     PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PublicActionGasFeeSelection,
-    PublicActionProgressUpdate, PublicSwapDelivery, PublicSwapDeliverySigning,
-    PublicSwapOrderOutcome, PublicSwapOrderState, PublicSwapProgress, PublicSwapTracking,
-    PublicSwapTransactionOutcome, PublicSwapUseClaim, SwapPairSide, SwapReviewChange,
-    SwapSetupStatus, WalletNetworkMode, new_public_swap_batch_nonce, public_swap_batch_terms,
-    public_swap_gas_plan, public_swap_order_state, swap_setup_status,
+    PublicActionProgressUpdate, PublicSwapApprovalsOutcome, PublicSwapDelivery,
+    PublicSwapDeliverySigning, PublicSwapOrderOutcome, PublicSwapOrderState, PublicSwapProgress,
+    PublicSwapTracking, PublicSwapTransactionOutcome, PublicSwapUseClaim, SwapPairSide,
+    SwapReviewChange, SwapSetupStatus, WalletNetworkMode, new_public_swap_batch_nonce,
+    public_swap_batch_terms, public_swap_gas_plan, public_swap_order_state, swap_setup_status,
 };
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::Decodable2718 as _;
-use alloy::primitives::keccak256;
-use alloy::sol_types::SolEvent as _;
+use alloy::primitives::{Signature, keccak256};
+use alloy::sol_types::{Eip712Domain, SolEvent as _, SolStruct as _, SolValue as _};
 use broadcaster_core::contracts::across::{
     MulticallHandler, SpokePool, V3RelayExecutionEventInfo, address_to_bytes32,
     private_delivery_message,
@@ -56,15 +57,18 @@ use broadcaster_core::contracts::cow_shed::{
     COWShedFactory, ExecuteHooks, decode_deposit_hook_calls, decode_withdrawal_calls,
     execute_hooks_digest, proxy_address,
 };
+use broadcaster_core::contracts::erc20_permit::{IERC20Permit, Permit};
 use broadcaster_core::contracts::executor::AcrossPrivateDelivery;
 use broadcaster_core::contracts::railgun::transferCall;
 use broadcaster_core::contracts::shield::build_approve_calldata;
 use broadcaster_core::contracts::swap_math::{SWAP_MATH_ADDRESS, SWAP_MATH_CREATION_CODE};
 
-// The settlement's events, as the origin chain's fabricated receipts carry them.
+// The settlement's events, as the origin chain's fabricated receipts carry them, and its read
+// of an order's fill.
 alloy::sol! {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Trade(address indexed owner, address sellToken, address buyToken, uint256 sellAmount, uint256 buyAmount, uint256 feeAmount, bytes orderUid);
+    function filledAmount(bytes orderUid) external view returns (uint256);
 }
 
 /// The claim of a direct deposit of `bridged_token` from a Public account on `origin_chain`,
@@ -81,6 +85,8 @@ fn claim(
     bounds.destination_minimum = Some(U256::from(1_000));
     bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
     bounds.destination_setup_fee = Some(U256::from(1_000));
+    // A Public account's order has a pre-hook only when it carries a permit.
+    bounds.pre_hook_gas_limit = 0;
     PublicSwapUseClaim {
         id,
         origin_chain,
@@ -1121,6 +1127,24 @@ const ORDER_SELL_TOKEN: Address = Address::repeat_byte(0x5e);
 const ORDER_HOOK_GAS_LIMIT: u64 = 517_000;
 /// The id of the quote an order was reviewed with.
 const ORDER_QUOTE_ID: i64 = 42;
+/// The gas limit the permit pre-hook of an order's approval declares.
+const PERMIT_HOOK_GAS_LIMIT: u64 = crate::cow::hook_gas_limit(crate::cow::PUBLIC_PERMIT_HOOK_GAS);
+/// The Public account's permit nonce on the token an order sells.
+const PERMIT_NONCE: U256 = U256::from_limbs([4, 0, 0, 0]);
+/// A JSON-RPC error for an `eth_call` that reverted without data.
+const REVERTED: &str = r#"{"code": 3, "message": "execution reverted", "data": "0x"}"#;
+
+/// The typed-data domain of the token an order sells, which it reports through `name()`,
+/// `version()` and `DOMAIN_SEPARATOR()`.
+fn permit_domain() -> Eip712Domain {
+    Eip712Domain::new(
+        Some("Token".into()),
+        Some("2".into()),
+        Some(U256::from(DESTINATION_CHAIN)),
+        Some(ORDER_SELL_TOKEN),
+        None,
+    )
+}
 
 /// The math contract's runtime code: what its creation code returns after the 30-byte
 /// constructor.
@@ -1159,6 +1183,18 @@ struct OriginChain {
     allowance_reads: Vec<(Address, Address, Address)>,
     /// The token and account of every balance read.
     balance_reads: Vec<(Address, Address)>,
+    /// The sold token's permit: its typed-data domain and the account's nonce. Without one
+    /// every read of it reverts.
+    permit: Option<(Eip712Domain, U256)>,
+    /// Whether a read of the permit sent by itself fails without reverting.
+    permit_reads_fail: bool,
+    /// Whether a call of a signed permit reverts.
+    permit_reverts: bool,
+    /// The calldata of every allowance and permit read, grouped by the request that carried
+    /// it: the members of an aggregated request, or the one call of a direct one.
+    token_reads: Vec<Vec<Bytes>>,
+    /// Every signed permit called by itself.
+    simulated: Vec<Bytes>,
     /// Every transaction broadcast, in order.
     broadcasts: Vec<(B256, TxEnvelope)>,
     /// Called with a transaction's hash when its broadcast arrives, before it is included.
@@ -1170,6 +1206,35 @@ impl OriginChain {
         self.requests
             .iter()
             .map(|request| request["method"].as_str().unwrap())
+    }
+
+    /// What the sold token answers a read of the allowance or of its permit. `None` reverts.
+    fn token_read(&mut self, token: Address, input: &[u8]) -> Option<Bytes> {
+        if let Ok(read) = PublicErc20::allowanceCall::abi_decode(input) {
+            self.allowance_reads.push((token, read.owner, read.spender));
+            return Some(B256::from(self.allowance).to_vec().into());
+        }
+        let (domain, nonce) = self.permit.as_ref()?;
+        if input.starts_with(&IERC20Permit::noncesCall::SELECTOR) {
+            Some(B256::from(*nonce).to_vec().into())
+        } else if input.starts_with(&IERC20Permit::DOMAIN_SEPARATORCall::SELECTOR) {
+            Some(domain.separator().to_vec().into())
+        } else if input.starts_with(&IERC20Permit::nameCall::SELECTOR) {
+            Some(
+                IERC20Permit::nameCall::abi_encode_returns(&domain.name.as_ref()?.to_string())
+                    .into(),
+            )
+        } else if input.starts_with(&IERC20Permit::versionCall::SELECTOR) {
+            Some(
+                IERC20Permit::versionCall::abi_encode_returns(
+                    &domain.version.as_ref()?.to_string(),
+                )
+                .into(),
+            )
+        } else {
+            // The token has no `eip712Domain()`.
+            None
+        }
     }
 
     fn respond(&mut self, request: &Value) -> Value {
@@ -1193,7 +1258,57 @@ impl OriginChain {
                 )
                 .unwrap();
                 let token = serde_json::from_value(call["to"].clone()).unwrap();
-                if let Ok(read) = PublicErc20::balanceOfCall::abi_decode(&input) {
+                let failure = |error: &str| {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "error":
+                        serde_json::from_str::<Value>(error).unwrap()})
+                };
+                let permit_read = [
+                    IERC20Permit::eip712DomainCall::SELECTOR,
+                    IERC20Permit::nameCall::SELECTOR,
+                    IERC20Permit::versionCall::SELECTOR,
+                    IERC20Permit::DOMAIN_SEPARATORCall::SELECTOR,
+                    IERC20Permit::noncesCall::SELECTOR,
+                ]
+                .iter()
+                .any(|selector| input.starts_with(selector));
+                if let Ok(aggregate) = IMulticall3::tryAggregateCall::abi_decode(&input) {
+                    self.token_reads.push(
+                        aggregate
+                            .calls
+                            .iter()
+                            .map(|call| call.callData.clone())
+                            .collect(),
+                    );
+                    let results: Vec<_> = aggregate
+                        .calls
+                        .iter()
+                        .map(|call| {
+                            let answer = self.token_read(call.target, &call.callData);
+                            IMulticall3::Result {
+                                success: answer.is_some(),
+                                returnData: answer.unwrap_or_default(),
+                            }
+                        })
+                        .collect();
+                    json!(Bytes::from(
+                        IMulticall3::tryAggregateCall::abi_encode_returns(&results)
+                    ))
+                } else if input.starts_with(&IERC20Permit::permitCall::SELECTOR) {
+                    self.simulated.push(input.clone());
+                    if self.permit_reverts {
+                        return failure(REVERTED);
+                    }
+                    json!("0x")
+                } else if permit_read {
+                    self.token_reads.push(vec![input.clone()]);
+                    if self.permit_reads_fail {
+                        return failure(r#"{"code": -32002, "message": "unavailable"}"#);
+                    }
+                    match self.token_read(token, &input) {
+                        Some(answer) => json!(answer),
+                        None => return failure(REVERTED),
+                    }
+                } else if let Ok(read) = PublicErc20::balanceOfCall::abi_decode(&input) {
                     self.balance_reads.push((token, read.account));
                     let Some(balance) = self.balance else {
                         return json!({"jsonrpc": "2.0", "id": request["id"], "error": {
@@ -1202,8 +1317,14 @@ impl OriginChain {
                     };
                     serde_json::to_value(B256::from(balance)).unwrap()
                 } else if let Ok(read) = PublicErc20::allowanceCall::abi_decode(&input) {
+                    self.token_reads.push(vec![input.clone()]);
                     self.allowance_reads.push((token, read.owner, read.spender));
                     serde_json::to_value(B256::from(self.allowance)).unwrap()
+                } else if input.starts_with(&filledAmountCall::SELECTOR) && params[1] == "latest" {
+                    // A permit order's tracking reads its fill at the latest block by its tag.
+                    let mut at_head = request.clone();
+                    at_head["params"][1] = json!(self.chain.block(self.chain.head).hash);
+                    return self.chain.respond(&at_head);
                 } else {
                     return self.chain.respond(request);
                 }
@@ -1331,17 +1452,29 @@ impl PublicPayment {
     /// A swap that sells `sell_token` on the origin chain, where the Public account's
     /// allowance to the pool is `allowance`. Its approval covers one approval and the deposit.
     async fn start(sell_token: Address, allowance: U256) -> (Self, ExecutorOwner) {
-        Self::start_on(sell_token, allowance, false).await
+        Self::start_on(sell_token, allowance, false, false).await
     }
 
     /// A swap whose Public account sells another token through an order that buys at least
     /// 1,010 of the bridged token, with a signed delivery quoted for that amount and for
     /// [`Self::valid_to`]. Its approval allows 100 for gas, so its cushion is 20.
     async fn start_order() -> (Self, ExecutorOwner) {
-        Self::start_on(ORDER_SELL_TOKEN, U256::MAX, true).await
+        Self::start_on(ORDER_SELL_TOKEN, U256::MAX, true, false).await
     }
 
-    async fn start_on(sell_token: Address, allowance: U256, order: bool) -> (Self, ExecutorOwner) {
+    /// [`Self::start_order`] for a token with a permit and no allowance to the vault relayer.
+    /// The order was reviewed with the permit: its approval binds the pre-hook's gas limit
+    /// and no gas from the account.
+    async fn start_permit_order() -> (Self, ExecutorOwner) {
+        Self::start_on(ORDER_SELL_TOKEN, U256::ZERO, true, true).await
+    }
+
+    async fn start_on(
+        sell_token: Address,
+        allowance: U256,
+        order: bool,
+        permit: bool,
+    ) -> (Self, ExecutorOwner) {
         let (root, db, vault) = desktop_store_with_vault();
         let view = Arc::new(import_wallet_with_metadata(
             &vault,
@@ -1378,6 +1511,11 @@ impl PublicPayment {
             requests: Vec::new(),
             allowance_reads: Vec::new(),
             balance_reads: Vec::new(),
+            permit: permit.then(|| (permit_domain(), PERMIT_NONCE)),
+            permit_reads_fail: false,
+            permit_reverts: false,
+            token_reads: Vec::new(),
+            simulated: Vec::new(),
             broadcasts: Vec::new(),
             on_broadcast: Box::new(|_| {}),
         }));
@@ -1425,6 +1563,10 @@ impl PublicPayment {
             request.approval.bounds.buy_amount = U256::from(1_010);
             request.approval.bounds.gas_allowance = Some(U256::from(100));
             request.approval.bounds.post_hook_gas_limit = Some(ORDER_HOOK_GAS_LIMIT);
+        }
+        if permit {
+            request.approval.bounds.pre_hook_gas_limit = PERMIT_HOOK_GAS_LIMIT;
+            request.approval.max_gas_cost = U256::ZERO;
         }
         let sell_amount = request.approval.bounds.sell_amount;
         // A deposit bridges what it sells, an order what it buys.
@@ -1550,7 +1692,7 @@ impl PublicPayment {
         saved(&self.store, self.operation, self.id)
     }
 
-    async fn approve(&self, owner: &ExecutorOwner) -> eyre::Result<()> {
+    async fn approve(&self, owner: &ExecutorOwner) -> eyre::Result<PublicSwapApprovalsOutcome> {
         owner
             .submit_public_swap_approvals_with_signer(
                 self.operation,
@@ -1995,11 +2137,15 @@ async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::ONE).await;
 
     // A short allowance that isn't zero takes a reset and an approval. The review covered one
-    // approval, so nothing is sent.
-    let error = payment.approve(&owner).await.unwrap_err();
-    assert!(error.to_string().contains("review the swap again"));
+    // approval, so nothing is sent and the swap returns to review with its approval as saved.
+    let approval = payment.saved().swap.approval().clone();
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::ReviewRequired { transactions: true }
+    );
     assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
     assert!(payment.saved().swap.transactions().is_empty());
+    assert_eq!(payment.saved().swap.approval(), &approval);
 
     payment.chain.lock().unwrap().allowance = U256::ZERO;
     payment.approve(&owner).await.unwrap();
@@ -4419,6 +4565,7 @@ const NO_PROGRESS: PublicSwapProgress = PublicSwapProgress {
     changed: false,
     refresh_public_balances: false,
     finished: false,
+    permit_used_up: false,
     destination_balance: None,
 };
 
@@ -4490,6 +4637,7 @@ async fn a_public_swap_resumes_from_its_destination_chains_owner_alone() {
         changed: true,
         refresh_public_balances: false,
         finished: true,
+        permit_used_up: false,
         destination_balance: None,
     };
     assert_eq!(
@@ -4562,6 +4710,7 @@ async fn a_public_order_resumes_from_its_destination_chains_owner_alone() {
             changed: true,
             refresh_public_balances: false,
             finished: true,
+            permit_used_up: false,
             destination_balance: None,
         }
     );
@@ -4580,4 +4729,537 @@ async fn a_public_order_resumes_from_its_destination_chains_owner_alone() {
     orderbook_task.abort();
     let _ = orderbook_task.await;
     payment.finish(restarted).await;
+}
+
+/// How many calls each request of allowance and permit reads carried since the last count.
+fn token_reads_served(payment: &PublicPayment) -> Vec<usize> {
+    std::mem::take(&mut payment.chain.lock().unwrap().token_reads)
+        .iter()
+        .map(Vec::len)
+        .collect()
+}
+
+// The reads that decide a token's permit travel in the allowance read's one request. A
+// confirmed domain is kept for the session, so the next plan adds only the account's nonce. A
+// permit the claimed order wasn't priced with returns to review. Reads that failed decide
+// nothing and are asked again, while a token that answered without a permit is asked no more.
+#[tokio::test]
+async fn permit_reads_travel_with_the_allowance_read_and_are_kept_for_the_session() {
+    let (payment, owner) = PublicPayment::start_on(ORDER_SELL_TOKEN, U256::ZERO, true, false).await;
+    payment.chain.lock().unwrap().permit = Some((permit_domain(), PERMIT_NONCE));
+    let relayer = payment
+        .origin
+        .public_swap_profile()
+        .unwrap()
+        .vault_relayer();
+    let mut aggregating = payment.origin.clone();
+    aggregating.rpc_route = aggregating
+        .rpc_route
+        .clone()
+        .with_multicall(Address::repeat_byte(0xca));
+    let plan = async |origin: &EffectiveChainConfig, token: Address| {
+        owner
+            .public_swap_approval_plan(
+                origin,
+                payment.source,
+                token,
+                relayer,
+                payment.sell_amount,
+                true,
+            )
+            .await
+            .unwrap()
+    };
+
+    assert!(plan(&aggregating, ORDER_SELL_TOKEN).await.signs_permit());
+    assert_eq!(token_reads_served(&payment), [6]);
+    assert!(plan(&aggregating, ORDER_SELL_TOKEN).await.signs_permit());
+    assert_eq!(token_reads_served(&payment), [2]);
+
+    // The order was approved while its allowance covered the sale, without a pre-hook.
+    let approval = payment.saved().swap.approval().clone();
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::ReviewRequired {
+            transactions: false
+        }
+    );
+    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
+    assert_eq!(payment.saved().swap.approval(), &approval);
+    token_reads_served(&payment);
+
+    // Without Multicall3 each read is a request of its own, and one that fails is no answer.
+    let other = Address::repeat_byte(0x5f);
+    payment.chain.lock().unwrap().permit_reads_fail = true;
+    for _ in 0..2 {
+        assert_eq!(
+            plan(&payment.origin, other).await.transactions(),
+            [payment.sell_amount]
+        );
+        assert_eq!(token_reads_served(&payment), [1; 6]);
+    }
+    {
+        let mut chain = payment.chain.lock().unwrap();
+        chain.permit_reads_fail = false;
+        chain.permit = None;
+    }
+    for reads in [6, 1] {
+        assert_eq!(
+            plan(&payment.origin, other).await.transactions(),
+            [payment.sell_amount]
+        );
+        assert_eq!(token_reads_served(&payment), vec![1; reads]);
+    }
+
+    payment.finish(owner).await;
+}
+
+// An order whose sold token has a permit sends no approval. The account signs the permit for
+// exactly the sold amount to the vault relayer until the order's `validTo`, under its current
+// nonce, and the order carries it as a pre-hook on the token. The signature recovers the
+// account over the digest the token computes, encoded here by hand. The signed call ran on
+// the token by itself before the order left, and the permit is recorded with the order.
+#[tokio::test]
+async fn a_public_order_carries_a_signed_permit_in_place_of_an_approval() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let relayer = payment
+        .origin
+        .public_swap_profile()
+        .unwrap()
+        .vault_relayer();
+    let (orderbook, requests, orderbook_task) = payment.orderbook(false).await;
+
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::Ready
+    );
+    let uid = payment.submitted(&owner, &orderbook).await;
+
+    let served = requests.lock().unwrap().clone();
+    let [(_, body)] = served.as_slice() else {
+        panic!("one order request was sent");
+    };
+    let app_data: AppData = serde_json::from_str(body["appData"].as_str().unwrap()).unwrap();
+    let [hook] = app_data.metadata.hooks.pre.as_slice() else {
+        panic!("the order has one pre-hook");
+    };
+    assert_eq!(
+        (hook.target, hook.gas_limit),
+        (ORDER_SELL_TOKEN, PERMIT_HOOK_GAS_LIMIT)
+    );
+    let call = IERC20Permit::permitCall::abi_decode(&hook.call_data).unwrap();
+    let deadline = U256::from(payment.valid_to);
+    assert_eq!(
+        (call.owner, call.spender, call.value, call.deadline),
+        (payment.source, relayer, payment.sell_amount, deadline)
+    );
+
+    let separator = keccak256(
+        (
+            keccak256(
+                "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+            ),
+            keccak256("Token"),
+            keccak256("2"),
+            U256::from(DESTINATION_CHAIN),
+            ORDER_SELL_TOKEN,
+        )
+            .abi_encode(),
+    );
+    let permit = keccak256(
+        (
+            keccak256(
+                "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+            ),
+            payment.source,
+            relayer,
+            payment.sell_amount,
+            PERMIT_NONCE,
+            deadline,
+        )
+            .abi_encode(),
+    );
+    let digest = keccak256([&[0x19, 0x01][..], &separator[..], &permit[..]].concat());
+    assert!(matches!(call.v, 27 | 28));
+    assert_eq!(
+        Signature::from_scalars_and_parity(call.r, call.s, call.v == 28)
+            .recover_address_from_prehash(&digest)
+            .unwrap(),
+        payment.source
+    );
+
+    let order = payment.saved().swap.order().unwrap().clone();
+    let recorded = order.permit().unwrap();
+    assert_eq!(
+        (
+            order.uid(),
+            recorded.nonce(),
+            recorded.deadline(),
+            recorded.value()
+        ),
+        (uid, PERMIT_NONCE, payment.valid_to, payment.sell_amount)
+    );
+    {
+        let chain = payment.chain.lock().unwrap();
+        assert_eq!(chain.simulated, std::slice::from_ref(&hook.call_data));
+        assert!(chain.broadcasts.is_empty());
+    }
+
+    orderbook_task.abort();
+    let _ = orderbook_task.await;
+    payment.finish(owner).await;
+}
+
+// A signed permit that reverts on the token stops the order: no path is recorded and the
+// orderbook hears nothing. The account's nonce is still the signed one, so the token's permit
+// isn't the standard one, and the session plans transactions for it. The approval covers
+// none, so they return to review unsent.
+#[tokio::test]
+async fn a_permit_that_reverts_on_its_token_stops_the_order_before_it_is_recorded() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let (orderbook, requests, orderbook_task) = payment.orderbook(false).await;
+    payment.chain.lock().unwrap().permit_reverts = true;
+    let approval = payment.saved().swap.approval().clone();
+
+    let error = payment.order(&owner, &orderbook).await.unwrap_err();
+    assert!(error.to_string().contains("permit couldn't be used"));
+    assert_eq!(payment.chain.lock().unwrap().simulated.len(), 1);
+    assert!(payment.saved().swap.path().is_none());
+    assert!(requests.lock().unwrap().is_empty());
+
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::ReviewRequired { transactions: true }
+    );
+    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
+    assert_eq!(payment.saved().swap.approval(), &approval);
+
+    orderbook_task.abort();
+    let _ = orderbook_task.await;
+    payment.finish(owner).await;
+}
+
+// A token whose domain changed after the session confirmed it, here by a new version, reverts
+// the permit signed under the old one. The token is asked again and the domain it now reports
+// replaces the old, so that attempt fails and the next signs under the new domain.
+#[tokio::test]
+async fn a_permit_under_a_domain_the_token_replaced_fails_once_then_signs_under_the_new_one() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let (orderbook, requests, orderbook_task) = payment.orderbook(false).await;
+    // The first plan confirms the domain the token reports then.
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::Ready
+    );
+    let replaced = Eip712Domain::new(
+        Some("Token".into()),
+        Some("3".into()),
+        Some(U256::from(DESTINATION_CHAIN)),
+        Some(ORDER_SELL_TOKEN),
+        None,
+    );
+    {
+        let mut chain = payment.chain.lock().unwrap();
+        chain.permit = Some((replaced.clone(), PERMIT_NONCE));
+        chain.permit_reverts = true;
+    }
+
+    let error = payment.order(&owner, &orderbook).await.unwrap_err();
+    assert!(error.to_string().contains("permit couldn't be used"));
+    assert!(payment.saved().swap.path().is_none());
+    assert!(requests.lock().unwrap().is_empty());
+
+    // The mock token checks no signature, so the next permit is let through and the domain
+    // it was signed under is checked here.
+    payment.chain.lock().unwrap().permit_reverts = false;
+    payment.submitted(&owner, &orderbook).await;
+    let simulated = payment.chain.lock().unwrap().simulated.clone();
+    let [_, signed] = simulated.as_slice() else {
+        panic!("each attempt called its signed permit");
+    };
+    let call = IERC20Permit::permitCall::abi_decode(signed).unwrap();
+    let digest = Permit {
+        owner: call.owner,
+        spender: call.spender,
+        value: call.value,
+        nonce: PERMIT_NONCE,
+        deadline: call.deadline,
+    }
+    .eip712_signing_hash(&replaced);
+    assert_eq!(
+        Signature::from_scalars_and_parity(call.r, call.s, call.v == 28)
+            .recover_address_from_prehash(&digest)
+            .unwrap(),
+        payment.source
+    );
+
+    orderbook_task.abort();
+    let _ = orderbook_task.await;
+    payment.finish(owner).await;
+}
+
+// The approval's pre-hook gas limit is what authorizes a permit, so it follows the review's
+// approval plan. A permit review corrected once the allowance covers the sale binds no
+// pre-hook. When the allowance is gone again, the permit the plan then finds returns to
+// review, and nothing is signed.
+#[tokio::test]
+async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let client = || {
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        )
+    };
+    let spoke_pool = payment.spoke_pool;
+    let (across_url, _, across_task) =
+        spawn_bridge_stub(move |_| across_fee_quote(spoke_pool, U256::from(1_000), 3 * 60 * 60))
+            .await;
+    let across = AcrossClient::new(client(), across_url).unwrap();
+    let (orderbook_url, _, orderbook_task) = spawn_bridge_stub(move |_| {
+        json!({
+            "quote": {
+                "sellToken": ORDER_SELL_TOKEN, "buyToken": DESTINATION_TOKEN,
+                "sellAmount": "1010", "buyAmount": "1010", "validTo": 1,
+                "feeAmount": "0", "gasAmount": "0", "gasPrice": "0",
+                "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        })
+        .to_string()
+    })
+    .await;
+    let orderbook = CowOrderbookClient::new(client(), orderbook_url, DESTINATION_CHAIN).unwrap();
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let destination = crate::bridge::PublicBridgeDestination {
+        destination: crate::bridge::BridgeDestination {
+            destination_token: USDC,
+            intermediate: DESTINATION_TOKEN,
+            symbol: "USDC".into(),
+            same_asset: true,
+            near: None,
+        },
+        path: crate::bridge::PublicBridgePath::Order,
+    };
+    let review = owner
+        .review_public_swap(crate::PublicSwapReviewRequest {
+            origin: &payment.origin,
+            source: payment.source,
+            sell: crate::bridge::PublicSellAsset::Erc20(ORDER_SELL_TOKEN),
+            sell_amount: U256::from(1_010),
+            destination: &destination,
+            slippage_bps: 0,
+            gas_share_bps: 0,
+            on_shield_failure: BridgeShieldFailure::KeepOnDestination,
+            orderbook: Some(&orderbook),
+            across: &across,
+            anchor_cache: None,
+            token_registry: &registry,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 1,
+        })
+        .await
+        .unwrap();
+    let claimed = payment.saved().swap.approval().clone();
+    let approval = |review: &crate::PublicSwapReview| {
+        review
+            .approval(
+                claimed.destination,
+                claimed.bounds.destination_setup_fee,
+                true,
+            )
+            .unwrap()
+    };
+    assert!(review.approval_plan().signs_permit());
+    assert_eq!(
+        approval(&review).bounds.pre_hook_gas_limit,
+        PERMIT_HOOK_GAS_LIMIT
+    );
+
+    payment.chain.lock().unwrap().allowance = U256::MAX;
+    let corrected = owner
+        .requote_public_swap_approvals(&review, &payment.origin, payment.source)
+        .await
+        .unwrap();
+    assert!(!corrected.approval_plan().signs_permit());
+    assert!(corrected.approval_plan().transactions().is_empty());
+    let corrected = approval(&corrected);
+    assert_eq!(corrected.bounds.pre_hook_gas_limit, 0);
+
+    owner
+        .reapprove_public_swap(payment.operation, payment.id, corrected)
+        .unwrap();
+    payment.chain.lock().unwrap().allowance = U256::ZERO;
+    assert_eq!(
+        payment.approve(&owner).await.unwrap(),
+        PublicSwapApprovalsOutcome::ReviewRequired {
+            transactions: false
+        }
+    );
+    assert!(payment.chain.lock().unwrap().simulated.is_empty());
+
+    for task in [across_task, orderbook_task] {
+        task.abort();
+        let _ = task.await;
+    }
+    payment.finish(owner).await;
+}
+
+/// The signed permit in a record's JSON.
+fn recorded_permit(value: &mut Value) -> Option<&mut Value> {
+    match value {
+        Value::Object(fields) => {
+            if fields.contains_key("permit") {
+                return fields.get_mut("permit");
+            }
+            fields.values_mut().find_map(recorded_permit)
+        }
+        Value::Array(items) => items.iter_mut().find_map(recorded_permit),
+        _ => None,
+    }
+}
+
+// The orderbook's answer to a permit order is lost and the wallet stops. A new owner resends
+// the recorded order with the recorded permit as its pre-hook: the same body, and nothing is
+// read from the token or signed. A record whose permit isn't the signed one rebuilds another
+// order, which isn't sent.
+#[tokio::test]
+async fn a_restart_resends_a_permit_order_with_its_recorded_permit() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let (orderbook, requests, orderbook_task) = payment.orderbook(true).await;
+    assert!(payment.order(&owner, &orderbook).await.is_err());
+    let interrupted = payment.saved();
+    let order = interrupted.swap.order().unwrap().clone();
+    assert!(order.permit().is_some());
+    owner.shutdown().await;
+    drop(owner);
+
+    let restarted = ExecutorOwner::new(
+        1,
+        payment.db.clone(),
+        payment.view.clone(),
+        payment.destination.clone(),
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let mut altered = serde_json::to_value(&interrupted.record).unwrap();
+    recorded_permit(&mut altered).unwrap()["value"] = json!(U256::ONE);
+    let altered: ExecutorRecord = serde_json::from_value(altered).unwrap();
+    payment
+        .store
+        .put_operation_fixture(payment.operation, &altered)
+        .unwrap();
+    let refused = restarted
+        .resubmit_public_swap_order(payment.operation, payment.id, &payment.origin, &orderbook)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("reconstructed unchanged"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    payment
+        .store
+        .put_operation_fixture(payment.operation, &interrupted.record)
+        .unwrap();
+    token_reads_served(&payment);
+    let uid = restarted
+        .resubmit_public_swap_order(payment.operation, payment.id, &payment.origin, &orderbook)
+        .await
+        .unwrap();
+    assert_eq!(uid, order.uid());
+    let served = requests.lock().unwrap().clone();
+    let [(_, first), (at_resend, resent)] = served.as_slice() else {
+        panic!("the order was sent twice");
+    };
+    assert_eq!(first.to_string(), resent.to_string());
+    assert_eq!(at_resend.as_ref(), Some(&order));
+    let app_data: AppData = serde_json::from_str(resent["appData"].as_str().unwrap()).unwrap();
+    assert_eq!(app_data.metadata.hooks.pre.len(), 1);
+    assert!(token_reads_served(&payment).is_empty());
+    assert_eq!(payment.chain.lock().unwrap().simulated.len(), 1);
+
+    orderbook_task.abort();
+    let _ = orderbook_task.await;
+    payment.finish(restarted).await;
+}
+
+// While a permit order is open, its tracking reads the account's permit nonce and allowance
+// and the settlement's fill of the order. A permit someone submitted early leaves the
+// allowance in place and is no warning. A nonce another signature used with the allowance
+// short is one: the order stays open, tracked and exclusive, and nothing is written. The
+// warning clears once the allowance covers the sale. A settlement uses the nonce and the
+// allowance too, and its fill keeps the warning off before the record holds the trade final,
+// also while the orderbook reports no trade yet.
+#[tokio::test]
+async fn a_used_up_permit_warns_while_its_order_stays_open_and_exclusive() {
+    let (payment, owner) = PublicPayment::start_permit_order().await;
+    let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
+    let (across, _reply, _lookups, across_task) = across_stub().await;
+    let uid = payment.submitted(&owner, &orderbook).await;
+    let track = async |nonce: u64, allowance: U256| {
+        {
+            let mut chain = payment.chain.lock().unwrap();
+            chain.permit = Some((permit_domain(), U256::from(nonce)));
+            chain.allowance = allowance;
+        }
+        payment
+            .track(&owner, &across, Some(&orderbook))
+            .await
+            .unwrap()
+    };
+
+    assert!(!track(4, U256::ZERO).await.permit_used_up);
+    assert!(!track(5, payment.sell_amount).await.permit_used_up);
+
+    let open = payment.saved().swap;
+    let warned = track(6, U256::ZERO).await;
+    assert_eq!(
+        (warned.changed, warned.permit_used_up, warned.finished),
+        (true, true, false)
+    );
+    assert!(owner.public_swap_permit_used_up(payment.id));
+    assert_eq!(payment.saved().swap, open);
+    assert_eq!(payment.state(), Some(PublicSwapOrderState::Open));
+    assert_eq!(payment.to_track(&owner), [payment.id]);
+    assert!(matches!(
+        payment
+            .store
+            .public_swap_source_conflict(&PublicSwapSourceTerms {
+                id: None,
+                origin_chain: DESTINATION_CHAIN,
+                source: payment.source,
+                source_scope: PublicAccountScope::PrivateWallet {
+                    wallet_uuid: TEST_WALLET_ID.to_owned(),
+                },
+                sell_token: ORDER_SELL_TOKEN,
+                bridged_token: WETH,
+                order: true,
+                now: unix_now(),
+            })
+            .unwrap(),
+        Some(ExecutorStoreError::PublicSwapSellsSameToken { .. })
+    ));
+
+    let covered = track(6, payment.sell_amount).await;
+    assert_eq!((covered.changed, covered.permit_used_up), (true, false));
+    assert!(!owner.public_swap_permit_used_up(payment.id));
+
+    // The settlement's block isn't final yet, so the record holds no trade, and the orderbook
+    // doesn't report it yet either. The settlement's fill of the order is what shows it.
+    let (input, output) = (U256::from(1_020), U256::from(1_009));
+    let block = payment.settle(uid, input, Some(&payment.deposited(input, output)));
+    *payment.trade_block.lock().unwrap() = None;
+    assert!(!track(7, U256::ZERO).await.permit_used_up);
+    assert_eq!(payment.state(), Some(PublicSwapOrderState::Open));
+    *payment.trade_block.lock().unwrap() = Some(block);
+    payment.mine();
+    assert!(!track(7, U256::ZERO).await.permit_used_up);
+    assert_eq!(payment.state(), Some(PublicSwapOrderState::Bridged));
+
+    across_task.abort();
+    orderbook_task.abort();
+    let _ = orderbook_task.await;
+    payment.finish(owner).await;
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::Location;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -14,7 +14,7 @@ use super::executor_observation::{ExecutorAccountRead, read_executor_account, tr
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     DesktopVaultStore, DesktopViewSession, ExecutorNonceObservation, ExecutorOperationId,
-    ExecutorRecord, ExecutorStore,
+    ExecutorRecord, ExecutorStore, SwapUseId,
 };
 use crate::{ExecutorAsset, ExecutorInspection, HttpContext, WalletSyncTip, inspect_executor};
 
@@ -54,8 +54,9 @@ pub(crate) use swap::submit_swap_pair_setups_with;
 pub use swap::{
     AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
     PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS,
-    PublicSwapGasPlan, PublicSwapSource, PublicSwapTransactionOutcome, PublicSwapWithdrawalReview,
-    public_swap_approvals, public_swap_gas_plan,
+    PublicSwapApprovalPlan, PublicSwapApprovalsOutcome, PublicSwapGasPlan, PublicSwapPermitPlan,
+    PublicSwapPermitTerms, PublicSwapSource, PublicSwapTransactionOutcome,
+    PublicSwapWithdrawalReview, public_swap_gas_plan,
 };
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
@@ -121,6 +122,11 @@ pub struct ExecutorOwner {
     /// The latest confirmed read of each account's execution nonce applied in this session.
     account_reads: StdMutex<BTreeMap<ExecutorOperationId, ExecutorNonceObservation>>,
     submission_blocks: StdMutex<BTreeMap<ExecutorOperationId, BTreeMap<B256, Option<u64>>>>,
+    /// What this session found of each sold token's permit, by chain and token: its typed-data
+    /// domain, or that it has none. A read that failed is not kept.
+    permit_support: StdMutex<BTreeMap<(u64, Address), swap::PermitSupport>>,
+    /// The swaps whose open order's signed permit was used up while the allowance is short.
+    permit_used_up: StdMutex<BTreeSet<SwapUseId>>,
     tip_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     confirmation_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Confirmation observer inputs, reused by foreground account reads until close.
@@ -177,6 +183,8 @@ impl ExecutorOwner {
             activity: Arc::new(Mutex::new(())),
             account_reads: StdMutex::new(BTreeMap::new()),
             submission_blocks: StdMutex::new(BTreeMap::new()),
+            permit_support: StdMutex::new(BTreeMap::new()),
+            permit_used_up: StdMutex::new(BTreeSet::new()),
             tip_observation_join: StdMutex::new(None),
             confirmation_observation_join: StdMutex::new(None),
             synced_observation: StdMutex::new(None),

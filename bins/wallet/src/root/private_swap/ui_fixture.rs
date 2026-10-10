@@ -8,11 +8,17 @@
 //! - `route-error` opens the Public form with a failed Across route lookup and its Retry.
 //! - `form` lets the Buy picker pick a network without private funds there, and gives a new
 //!   destination account a stand-in setup fee in place of an estimate, so a live quote can
-//!   be reviewed. Approving the review ends in an error.
+//!   be reviewed. Approving the review ends in an error. The quote is the wallet's own, so
+//!   the review signs a permit when the Sell token has one and the account's allowance is
+//!   short, as USDC's is on Ethereum, Base and Arbitrum. Such an order asks the account for
+//!   no gas, so an account without native balance can review it.
 //! - `flow:<stage>` does what `form` does, and after the review is approved shows the
 //!   detail of the reviewed swap, as a synthesized record, and holds it at `setup-sending`,
 //!   `setup-waiting`, `finishing`, `placing` or `error`. `changed` ends on the form again,
-//!   with the terms that changed to review. The record is staged once, at the stage the mode
+//!   with the terms that changed to review. `signatures` opens the review a hardware
+//!   account sees before its device prompts, for any account and without a device: two
+//!   groups for an order, and three, the signed approval first, for an order whose review
+//!   signs a permit. The record is staged once, at the stage the mode
 //!   names, and the steps past the first wait start on the view's next observation pass. No
 //!   record of the wallet is read, and the detail's actions do nothing.
 //! - `detail:<stage>` opens the swap dialog of a Public account on the detail of one
@@ -20,6 +26,9 @@
 //!   `order-open`, `bridging`, `delivered`, `held-on-destination`,
 //!   `held-after-partial-recovery`, `refunded` or `expired`. The partial recovery holds a
 //!   confirmed balance at 90% of the original fill without changing its bridge evidence.
+//!   `permit-order-open` is an open order whose approval was signed as a permit, with no
+//!   approval transaction, and `permit-used-up` is that order with the warning that its
+//!   signed approval was used up.
 //!   The detail's actions do nothing.
 //! - `accounts` shows two synthesized accounts in Stealth accounts in place of the wallet's
 //!   own. Account #7 is a swap account whose inspector shows each result tag: an executed
@@ -72,6 +81,7 @@ enum Flow {
     SetupWaiting,
     Finishing,
     Placing,
+    Signatures,
     Changed,
     Error,
 }
@@ -84,6 +94,8 @@ enum Detail {
     AccountReady,
     Approving,
     OrderOpen,
+    PermitOrderOpen,
+    PermitUsedUp,
     Bridging,
     Delivered,
     HeldOnDestination,
@@ -109,6 +121,7 @@ fn parse(value: &str) -> Option<Mode> {
             "setup-waiting" => Flow::SetupWaiting,
             "finishing" => Flow::Finishing,
             "placing" => Flow::Placing,
+            "signatures" => Flow::Signatures,
             "changed" => Flow::Changed,
             "error" => Flow::Error,
             _ => return None,
@@ -120,6 +133,8 @@ fn parse(value: &str) -> Option<Mode> {
         "account-ready" => Detail::AccountReady,
         "approving" => Detail::Approving,
         "order-open" => Detail::OrderOpen,
+        "permit-order-open" => Detail::PermitOrderOpen,
+        "permit-used-up" => Detail::PermitUsedUp,
         "bridging" => Detail::Bridging,
         "delivered" => Detail::Delivered,
         "held-on-destination" => Detail::HeldOnDestination,
@@ -173,7 +188,12 @@ pub(super) fn setup_fee(decimals: u8) -> Option<U256> {
 /// Whether the staged swap's destination setup counts as confirmed, so its status names what
 /// follows it.
 pub(super) fn setup_done() -> bool {
-    matches!(mode(), Some(Mode::Flow(Flow::Finishing | Flow::Placing)))
+    matches!(
+        mode(),
+        Some(Mode::Flow(
+            Flow::Finishing | Flow::Placing | Flow::Signatures
+        ))
+    )
 }
 
 /// `count` ten-thousandths of a token of `decimals`.
@@ -200,6 +220,8 @@ pub(super) enum Step {
     Claimed,
     Waiting,
     Ready,
+    /// The order's signatures are staged for the review a hardware account sees.
+    Signatures,
     Changed(SwapReviewChange),
     Fail(&'static str),
 }
@@ -207,20 +229,23 @@ pub(super) enum Step {
 /// The scripted answer at `phase`, and how long the job takes to give it: a hold wherever the
 /// mode scripts nothing else. `None` unless a fixture mode is on.
 pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
-    use Flow::{Changed, Error, Finishing, Placing, SetupWaiting};
+    use Flow::{Changed, Error, Finishing, Placing, SetupWaiting, Signatures};
     Some(match (mode()?, phase) {
         (Mode::Form | Mode::RouteError | Mode::Detail(_) | Mode::Accounts, Phase::Approved) => (
             Duration::ZERO,
             Step::Fail("Fixture: this mode stops at the review. Nothing was sent."),
         ),
         (Mode::Flow(_), Phase::Approved) => (BEAT, Step::Claimed),
-        (Mode::Flow(SetupWaiting | Finishing | Placing), Phase::Claimed) => (BEAT, Step::Waiting),
+        (Mode::Flow(SetupWaiting | Finishing | Placing | Signatures), Phase::Claimed) => {
+            (BEAT, Step::Waiting)
+        }
         (Mode::Flow(Changed), Phase::Claimed) => (BEAT, Step::Changed(SwapReviewChange::Delivery)),
         (Mode::Flow(Error), Phase::Claimed) => (
             BEAT,
             Step::Fail("Fixture: the broadcaster couldn't submit the destination setup."),
         ),
         (Mode::Flow(Placing), Phase::Setup) => (BEAT, Step::Ready),
+        (Mode::Flow(Signatures), Phase::Setup) => (BEAT, Step::Signatures),
         _ => (Duration::ZERO, Step::Hold),
     })
 }
@@ -271,6 +296,10 @@ impl PrivateSwapsView {
                 ),
             );
         }
+        if stage == Detail::PermitUsedUp {
+            self.public_permit_used_up
+                .insert((identity.operation, identity.swap_use));
+        }
         self.public_records = vec![(chain, record)];
         self.navigate(SwapDialogView::PublicDetail(identity), window, cx);
     }
@@ -290,7 +319,9 @@ impl PrivateSwapsView {
             Flow::SetupSending | Flow::Error => Detail::SetupNotSent,
             Flow::SetupWaiting => Detail::SetupPending,
             // Terms change at signing time, after the account is set up.
-            Flow::Finishing | Flow::Placing | Flow::Changed => Detail::AccountReady,
+            Flow::Finishing | Flow::Placing | Flow::Signatures | Flow::Changed => {
+                Detail::AccountReady
+            }
         };
         let Some(record) = staged_record(stage, identity, swap) else {
             tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
@@ -385,7 +416,9 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
         | Detail::SetupPending
         | Detail::AccountReady
         | Detail::Approving
-        | Detail::OrderOpen => PublicSwapObservations::default(),
+        | Detail::OrderOpen
+        | Detail::PermitOrderOpen
+        | Detail::PermitUsedUp => PublicSwapObservations::default(),
         Detail::Expired => PublicSwapObservations {
             expired: Some(SwapObservation {
                 transaction_hash: None,
@@ -414,10 +447,14 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     };
     let account = Address::repeat_byte(0x3a);
     let delegate = Address::repeat_byte(0x5d);
+    // An approval signed as a permit binds its pre-hook's gas limit and sends no transaction.
+    let permit = matches!(stage, Detail::PermitOrderOpen | Detail::PermitUsedUp);
+    let pre_hook_gas_limit = if permit { 110_000_u64 } else { 0 };
     let bounds: SwapApprovedBounds = serde_json::from_value(serde_json::json!({
         "sell_amount": swap.sold, "buy_amount": swap.bought,
         "private_minimum": swap.received * U256::from(99_u8) / U256::from(100_u8),
-        "shield_fee_bps": "0x0", "slippage_bps": 50, "pre_hook_gas_limit": 0, "anchors": []
+        "shield_fee_bps": "0x0", "slippage_bps": 50,
+        "pre_hook_gas_limit": pre_hook_gas_limit, "anchors": []
     }))
     .ok()?;
     let saved = PublicSwapRecord::new(
@@ -456,7 +493,7 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     // The setup is on its way until the Public account approves, and its order follows.
     let set_up = !matches!(stage, Detail::SetupNotSent | Detail::SetupPending);
     let approves = set_up && stage != Detail::AccountReady;
-    if approves {
+    if approves && !permit {
         let inclusion = (stage != Detail::Approving).then(|| {
             serde_json::json!({
                 "observation": at(ORIGIN_BLOCK), "finalized": true, "succeeded": true
@@ -478,6 +515,12 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
             },
             "submission_status": "Accepted"
         }});
+        if permit {
+            saved["path"]["Order"]["permit"] = serde_json::json!({
+                "nonce": U256::ZERO, "deadline": valid_to, "value": swap.sold,
+                "signature": alloy::hex::encode_prefixed([0_u8; 65])
+            });
+        }
     }
     let setup_block = BlockNumHash::new(DESTINATION_BLOCK, B256::repeat_byte(0xb3));
     let setup = serde_json::to_value(IssuedExecutorPayload::new(

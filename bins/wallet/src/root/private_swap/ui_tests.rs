@@ -11042,6 +11042,197 @@ fn changed_public_delivery_keeps_the_corrected_review_until_the_draft_changes(
     );
 }
 
+/// An order whose approval is a signed permit asks the Public account for no gas: with no
+/// native balance it reaches its review, which says the approval is signed, and it stays
+/// approvable when signing returns it with a corrected delivery.
+#[gpui::test]
+fn permit_public_order_needs_no_native_balance_through_a_corrected_delivery(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                    let snapshot = Arc::make_mut(root.public_balance_snapshot.as_mut().unwrap());
+                    for balance in snapshot
+                        .accounts
+                        .iter_mut()
+                        .flat_map(|account| &mut account.balances)
+                    {
+                        if balance.asset.id == wallet_ops::PublicAssetId::Native {
+                            balance.amount = wallet_ops::PublicBalanceAmount::Available(U256::ZERO);
+                        }
+                    }
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, operation) = reusable_polygon_account(root, cx);
+            let destination = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let label = public_source_label(&source);
+            let (review, across, orderbook, route) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                STUB_USDT,
+                U256::from(7_000_000),
+                true,
+                cx,
+            );
+            // The stub token has no permit, so the review is turned into the one a token with
+            // a permit gets.
+            let review = review.signing_permit_for_tests();
+            let original_minimum = review.bridge().received_minimum();
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source, STUB_USDT, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation,
+                        index: destination.index(),
+                        address: destination.address().unwrap(),
+                    });
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((STUB_USDT, 137), vec![route.clone()]);
+                    swaps.install_public_review_for_tests(
+                        review.clone(),
+                        across,
+                        Some(orderbook),
+                        cx,
+                    );
+                    let form = swaps.form.as_ref().unwrap();
+                    assert!(
+                        swaps
+                            .public_form_reason(form, cx)
+                            .is_none_or(|reason| !reason.blocks_review),
+                        "a signed approval needs no gas from the account"
+                    );
+                    let details = swaps.public_details(form, &review, cx);
+                    let approval = details
+                        .iter()
+                        .find(|row| row.label == format!("Approval from {label}"))
+                        .expect("the Costs details name the approval");
+                    assert_eq!(
+                        approval.text_for_test(),
+                        Some(("signed, not sent", Some("no gas")))
+                    );
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                    assert!(
+                        swaps.public_authorization.is_some(),
+                        "{:?}",
+                        swaps.form.as_ref().unwrap().error
+                    );
+                });
+            });
+            let command =
+                swaps.read_with(cx, |swaps, _| swaps.public_authorization.clone().unwrap());
+            let summary = command.public_authorization_summary();
+            let rows = summary.rows_for_test();
+            assert!(
+                !rows.iter().any(|(row, _)| row == "Pay now"),
+                "nothing is paid now by the account: {rows:?}"
+            );
+            assert!(
+                rows.contains(&(
+                    "Approval".to_owned(),
+                    format!("signed by {label}, not sent · no gas")
+                )),
+                "{rows:?}"
+            );
+            let (_, collapsed, costs) = summary.row_group_for_test().unwrap();
+            assert!(costs.contains(&"Approval".to_owned()), "{costs:?}");
+            assert!(!collapsed.contains("now, not refunded"), "{collapsed}");
+            let signed = summary.row_hint_for_test("Approval").unwrap();
+            assert!(
+                signed.contains(&format!(
+                    "{label} signs an approval that lets CoW take exactly"
+                )) && signed.contains("It sends no transaction for it and pays no gas."),
+                "{signed}"
+            );
+            cx.update(WindowExt::close_dialog);
+            // Signing found a lower bridge minimum. The corrected review still signs the permit.
+            stubs.set_across_fee_bps(50);
+            let (corrected, _, _, _) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                STUB_USDT,
+                U256::from(7_000_000),
+                true,
+                cx,
+            );
+            let corrected = corrected.signing_permit_for_tests();
+            let corrected_minimum = corrected.bridge().received_minimum();
+            assert!(corrected_minimum < original_minimum);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps
+                        .return_public_review_change_for_tests(&command, corrected, window, cx)
+                        .unwrap();
+                    // A late route-list refresh must preserve the signing-time review.
+                    swaps
+                        .form
+                        .as_mut()
+                        .unwrap()
+                        .public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((STUB_USDT, 137), vec![route]);
+                    swaps.refresh_form_delivery(cx);
+                    swaps.schedule_public_quote(window, cx);
+                    let form = swaps.form.as_ref().unwrap();
+                    let shown = form.public.as_ref().unwrap().review.as_ref().unwrap();
+                    assert_eq!(shown.bridge().received_minimum(), corrected_minimum);
+                    assert!(shown.signs_permit());
+                    assert!(form.quote_task.is_none());
+                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                    assert!(
+                        swaps.public_authorization.is_some(),
+                        "the corrected permit review needs no native balance: {:?}",
+                        swaps.form.as_ref().unwrap().error
+                    );
+                });
+            });
+            cx.update(|window, cx| {
+                use gpui_kit::test::TestWindowExt;
+                window.click("wallet-spend-auth-cancel", cx);
+            });
+            cx.run_until_parked();
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
 #[gpui::test]
 fn closing_public_preparation_aborts_continuation_and_continue_keeps_the_durable_use(
     cx: &mut TestAppContext,
@@ -11985,7 +12176,8 @@ fn public_form_and_review_follow_the_path_and_name_the_paying_account(cx: &mut T
 /// An order to a new destination account, on the open form of an order: its review has the
 /// mockup's two steps, and one Pay now row for the setup fee and the account's gas, whose hint
 /// names the network the fee is paid on and what the account sends. A hardware account
-/// then sees what its device will sign as two groups of decoded, formatted terms.
+/// then sees what its device will sign as two groups of decoded, formatted terms, and as
+/// three when the order carries a permit, whose group comes first.
 fn public_order_setup_review_and_signatures(
     swaps: &Entity<PrivateSwapsView>,
     source: &wallet_ops::vault::PublicAccountMetadata,
@@ -12076,17 +12268,75 @@ fn public_order_setup_review_and_signatures(
             deadline: 1_700_000_000,
             nonce: alloy::primitives::B256::ZERO,
         };
-        let [(instructions, batch_rows), (order, order_rows)] = swaps.public_signature_groups(
+        let mut groups = swaps.public_signature_groups(
             source,
             destination,
             review,
             STUB_USDT,
+            None,
             &batch,
             1_700_000_000,
             cx,
         );
+        assert_eq!(groups.len(), 2, "an order without a permit signs twice");
+        let (order, order_rows) = groups.pop().unwrap();
+        let (instructions, batch_rows) = groups.pop().unwrap();
         assert_eq!(instructions, "1 · Bridge instructions for your CoW proxy");
         assert_eq!(order, "2 · CoW order");
+        // The device signs the permit first, so its group leads and the others move down.
+        let relayer = Address::repeat_byte(0xc0);
+        let permit = wallet_ops::PublicSwapPermitTerms {
+            token: STUB_USDT,
+            spender: relayer,
+            amount: review.sell_amount(),
+            deadline: 1_700_000_000,
+        };
+        let with_permit = swaps.public_signature_groups(
+            source,
+            destination,
+            review,
+            STUB_USDT,
+            Some(&permit),
+            &batch,
+            1_700_000_000,
+            cx,
+        );
+        assert_eq!(
+            with_permit
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "1 · Approval for CoW",
+                "2 · Bridge instructions for your CoW proxy",
+                "3 · CoW order"
+            ]
+        );
+        let permit_rows = &with_permit[0].1;
+        assert_eq!(
+            permit_rows
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.clone(), row.address.clone()))
+                .collect::<Vec<_>>()[..3],
+            [
+                (
+                    "Token",
+                    swaps.token_symbol(STUB_USDT, cx),
+                    Some(railgun_ui::short_address(&STUB_USDT))
+                ),
+                (
+                    "Spender",
+                    "CoW's vault relayer".to_owned(),
+                    Some(railgun_ui::short_address(&relayer))
+                ),
+                (
+                    "Amount",
+                    swaps.form_sell_amount(form, review.sell_amount(), cx),
+                    None
+                ),
+            ]
+        );
+        assert_eq!(permit_rows[3].label, "Valid until");
         assert_eq!(
             batch_rows
                 .iter()
@@ -12127,7 +12377,7 @@ fn public_order_setup_review_and_signatures(
             order_rows[2].address,
             Some(railgun_ui::short_address(&proxy))
         );
-        for row in batch_rows.iter().chain(&order_rows) {
+        for row in batch_rows.iter().chain(&order_rows).chain(permit_rows) {
             assert!(
                 !row.value.contains("1700000000")
                     && !row.value.contains(&bought.to_string())

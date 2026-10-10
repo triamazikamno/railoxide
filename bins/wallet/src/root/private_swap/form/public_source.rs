@@ -12,8 +12,9 @@ use alloy::primitives::B256;
 use wallet_ops::{
     AcrossPrivateDelivery, AuthorizedPublicSwapSource, PublicActionGasFeeSelection,
     PublicSwapBatchTerms, PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapOrderOutcome,
-    PublicSwapOrderRequest, PublicSwapReview, PublicSwapReviewRequest, PublicSwapSource,
-    PublicSwapTracking, PublicSwapUseClaim, PublicSwapWithdrawalReview, SwapSetupStatus,
+    PublicSwapOrderRequest, PublicSwapPermitTerms, PublicSwapReview, PublicSwapReviewRequest,
+    PublicSwapSource, PublicSwapTracking, PublicSwapUseClaim, PublicSwapWithdrawalReview,
+    SwapSetupStatus,
     bridge::{
         AcrossClient, AcrossRoute, PublicBridgeDestination, PublicSellAsset,
         public_across_destination_tokens,
@@ -174,6 +175,15 @@ impl PublicDetail {
             value: PublicDetailValue::Text { value, note },
             indented: true,
             help: Some(help),
+        }
+    }
+
+    /// A text row's value and the note after it.
+    #[cfg(test)]
+    pub(super) fn text_for_test(&self) -> Option<(&str, Option<&str>)> {
+        match &self.value {
+            PublicDetailValue::Text { value, note } => Some((value, note.as_deref())),
+            _ => None,
         }
     }
 }
@@ -360,6 +370,8 @@ struct PublicSwapSigned {
     valid_to: u32,
     nonce: B256,
     batch: Option<PublicSwapBatchTerms>,
+    /// What the order's signed approval grants, for an order that carries one.
+    permit: Option<PublicSwapPermitTerms>,
 }
 
 async fn public_swap_clients(
@@ -1633,10 +1645,13 @@ impl PrivateSwapsView {
             (Some(approvals), false) => format!("{approvals} and deposit"),
             (None, false) => "deposit".to_owned(),
         };
+        // A permit is the account's approval as a signature the order carries.
+        let permit = review.signs_permit();
         // What the account does in the second step, which names an approval only when one is
-        // sent.
+        // sent or signed.
         let acts = match (approvals.is_some(), order) {
             (true, true) => "sends its approval and signs the order",
+            (false, true) if permit => "signs its approval and the order",
             (false, true) => "signs the order",
             (true, false) => "sends its approval and the deposit",
             (false, false) => "sends the deposit",
@@ -1645,6 +1660,12 @@ impl PrivateSwapsView {
             (Some(approvals), true) => vec![
                 format!(
                     "{label} sends {approvals}, so CoW can take exactly {sold}. It pays that gas in {native}."
+                ),
+                "The swap and the bridge deposit are sent by a CoW solver. Their gas comes out of what you receive.".to_owned(),
+            ],
+            (None, true) if permit => vec![
+                format!(
+                    "{label} signs an approval that lets CoW take exactly {sold}. It sends no transaction for it and pays no gas."
                 ),
                 "The swap and the bridge deposit are sent by a CoW solver. Their gas comes out of what you receive.".to_owned(),
             ],
@@ -1663,6 +1684,17 @@ impl PrivateSwapsView {
         // the Public account sends itself. An order whose approval stands sends nothing.
         let gas = (approvals.is_some() || !order)
             .then(|| self.token_amount(Address::ZERO, approval.max_gas_cost, cx));
+        // A signed approval has a row of its own, as it is in no amount paid now.
+        let signed_approval = permit.then(|| {
+            SpendAuthorizationSummaryRow::new(
+                "Approval",
+                format!("signed by {label}, not sent · no gas"),
+            )
+            .with_hint(SpendAuthorizationHint::new(
+                "Signed approval",
+                gas_paragraphs.clone(),
+            ))
+        });
         // Neither the setup fee nor the account's own gas is refunded.
         let pay_now = if let Some(fee) = setup {
             let amount = self.setup_fee_amount(fee, cx);
@@ -1698,6 +1730,7 @@ impl PrivateSwapsView {
         } else {
             None
         };
+        costs.extend(signed_approval);
         let valid_for = u64::from(bounds.valid_for_secs.unwrap_or_default()) / 60;
         if let (Some(share), Some(allowance), Some(estimate)) = (
             bounds.gas_share_bps,
@@ -2156,6 +2189,9 @@ impl PrivateSwapsView {
                             .signed
                             .as_ref()
                             .is_some_and(|signed| signed.batch.is_some());
+                        // Debug UI fixture: its staged signatures are reviewed without a device.
+                        let decoded =
+                            decoded || (ui_fixture::active() && execution.signed.is_some());
                         view.public_execution = Some(execution);
                         if decoded {
                             view.review_public_signatures(window, cx);
@@ -2388,7 +2424,8 @@ impl PrivateSwapsView {
     }
 
     /// What a hardware Public account's device is about to sign for an order, decoded: its
-    /// proxy's bridge instructions, then the order. The device may show both as raw data.
+    /// signed approval when the order carries one, its proxy's bridge instructions, then the
+    /// order. The device may show them as raw data.
     fn review_public_signatures(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(execution) = self.public_execution.as_ref() else {
             return;
@@ -2406,11 +2443,17 @@ impl PrivateSwapsView {
             return;
         };
         let device = self.public_device_label(cx);
+        let count = if signed.permit.is_some() {
+            "three"
+        } else {
+            "two"
+        };
         let groups = Arc::new(self.public_signature_groups(
             &execution.command.source,
             execution.command.operation,
             review,
             approval.sell_token,
+            signed.permit.as_ref(),
             batch,
             signed.valid_to,
             cx,
@@ -2441,7 +2484,7 @@ impl PrivateSwapsView {
                         .gap_3()
                         .child(
                             app_muted_text(format!(
-                                "Your {device} will ask for two signatures. It may show them as raw data, so check them here first."
+                                "Your {device} will ask for {count} signatures. It may show them as raw data, so check them here first."
                             ))
                             .whitespace_normal(),
                         )
@@ -2495,9 +2538,10 @@ impl PrivateSwapsView {
             .unwrap_or("device")
     }
 
-    /// The two groups a hardware review decodes for an order paid by `source`: the bridge
-    /// instructions of `batch`, then the order of `review` that sells `sell_token`, valid
-    /// until `valid_to`. `operation` is the destination stealth account.
+    /// The groups a hardware review decodes for an order paid by `source`, numbered in the
+    /// order the device signs them: the approval `permit` grants, for an order that carries
+    /// one, the bridge instructions of `batch`, then the order of `review` that sells
+    /// `sell_token`, valid until `valid_to`. `operation` is the destination stealth account.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn public_signature_groups(
         &self,
@@ -2505,10 +2549,11 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         review: &PublicSwapReview,
         sell_token: Address,
+        permit: Option<&PublicSwapPermitTerms>,
         batch: &PublicSwapBatchTerms,
         valid_to: u32,
         cx: &App,
-    ) -> [(String, Vec<PublicSignatureRow>); 2] {
+    ) -> Vec<(String, Vec<PublicSignatureRow>)> {
         let network = batch.destination_chain;
         let bought = self.token_symbol(batch.input_token, cx);
         let delivered = self.network_token_symbol(network, batch.output_token, cx);
@@ -2529,62 +2574,87 @@ impl PrivateSwapsView {
                 |(_, record)| format!("account #{}", record.index()),
             );
         // The form names the Sell token as the account's balance does.
-        let sold = self
-            .form
-            .as_ref()
-            .filter(|form| form.sell == sell_token)
-            .map_or_else(
-                || self.token_amount(sell_token, review.sell_amount(), cx),
-                |form| self.form_sell_amount(form, review.sell_amount(), cx),
-            );
-        [
+        let sold = |token: Address, amount: U256| {
+            self.form
+                .as_ref()
+                .filter(|form| form.sell == token)
+                .map_or_else(
+                    || self.token_amount(token, amount, cx),
+                    |form| self.form_sell_amount(form, amount, cx),
+                )
+        };
+        let approval = permit.map(|permit| {
             (
-                "1 · Bridge instructions for your CoW proxy".to_owned(),
+                "Approval for CoW",
                 vec![
-                    PublicSignatureRow::new(
-                        "Runs only if the proxy holds",
-                        format!(
-                            "at least {}",
-                            self.token_amount(batch.guard_token, batch.guard_amount, cx)
-                        ),
-                    ),
-                    PublicSignatureRow::new(
-                        "Deposits into Across",
-                        format!("all {bought} in the proxy"),
-                    ),
-                    PublicSignatureRow::new("Refunds go to", public_source_label(source))
-                        .naming(batch.depositor),
-                    PublicSignatureRow::new(
-                        format!("Delivered on {}", network_name(network)),
-                        scale.map_or_else(
-                            || format!("{delivered} for the {bought} in the proxy"),
-                            |scale| format!("at least {scale} {delivered} per {bought}"),
-                        ),
-                    ),
-                    PublicSignatureRow::new("Recipient", format!("Across handler, then {account}")),
+                    PublicSignatureRow::new("Token", self.token_symbol(permit.token, cx))
+                        .naming(permit.token),
+                    PublicSignatureRow::new("Spender", "CoW's vault relayer")
+                        .naming(permit.spender),
+                    PublicSignatureRow::new("Amount", sold(permit.token, permit.amount)),
                     PublicSignatureRow::new(
                         "Valid until",
-                        local_date_time_label(u64::from(batch.deadline)),
+                        local_date_time_label(u64::from(permit.deadline)),
                     ),
                 ],
-            ),
-            (
-                "2 · CoW order".to_owned(),
-                vec![
-                    PublicSignatureRow::new("Sell", sold),
-                    PublicSignatureRow::new(
-                        "Buy at least",
-                        // The signed order's amount, which a short bridge quote can raise.
-                        self.token_amount(batch.guard_token, batch.guard_amount, cx),
-                    ),
-                    PublicSignatureRow::new("Receiver", "Your CoW proxy").naming(batch.proxy),
-                    PublicSignatureRow::new(
-                        "Valid until",
-                        local_date_time_label(u64::from(valid_to)),
-                    ),
-                ],
-            ),
-        ]
+            )
+        });
+        approval
+            .into_iter()
+            .chain([
+                (
+                    "Bridge instructions for your CoW proxy",
+                    vec![
+                        PublicSignatureRow::new(
+                            "Runs only if the proxy holds",
+                            format!(
+                                "at least {}",
+                                self.token_amount(batch.guard_token, batch.guard_amount, cx)
+                            ),
+                        ),
+                        PublicSignatureRow::new(
+                            "Deposits into Across",
+                            format!("all {bought} in the proxy"),
+                        ),
+                        PublicSignatureRow::new("Refunds go to", public_source_label(source))
+                            .naming(batch.depositor),
+                        PublicSignatureRow::new(
+                            format!("Delivered on {}", network_name(network)),
+                            scale.map_or_else(
+                                || format!("{delivered} for the {bought} in the proxy"),
+                                |scale| format!("at least {scale} {delivered} per {bought}"),
+                            ),
+                        ),
+                        PublicSignatureRow::new(
+                            "Recipient",
+                            format!("Across handler, then {account}"),
+                        ),
+                        PublicSignatureRow::new(
+                            "Valid until",
+                            local_date_time_label(u64::from(batch.deadline)),
+                        ),
+                    ],
+                ),
+                (
+                    "CoW order",
+                    vec![
+                        PublicSignatureRow::new("Sell", sold(sell_token, review.sell_amount())),
+                        PublicSignatureRow::new(
+                            "Buy at least",
+                            // The signed order's amount, which a short bridge quote can raise.
+                            self.token_amount(batch.guard_token, batch.guard_amount, cx),
+                        ),
+                        PublicSignatureRow::new("Receiver", "Your CoW proxy").naming(batch.proxy),
+                        PublicSignatureRow::new(
+                            "Valid until",
+                            local_date_time_label(u64::from(valid_to)),
+                        ),
+                    ],
+                ),
+            ])
+            .enumerate()
+            .map(|(index, (title, rows))| (format!("{} · {title}", index + 1), rows))
+            .collect()
     }
 
     fn submit_public_signed(
@@ -2830,6 +2900,13 @@ impl PrivateSwapsView {
                             }
                         }
                         view.public_tracking_failures.remove(&(operation, id));
+                        // A warning of the latest step only: it is off again once the
+                        // allowance covers the sale or the order can no longer fill.
+                        if progress.permit_used_up {
+                            view.public_permit_used_up.insert((operation, id));
+                        } else {
+                            view.public_permit_used_up.remove(&(operation, id));
+                        }
                     }
                     Ok(Err(_)) => {
                         let failures = view
@@ -3843,6 +3920,7 @@ impl PrivateSwapsView {
         let max_gas = review.gas_plan().max_gas_cost;
         // An allowance that already covers the amount needs no approval, as the review says.
         let approves = !review.gas_plan().approval_gas_limits.is_empty();
+        let permit = review.signs_permit();
         let up_to = format!("up to {}", self.token_amount(Address::ZERO, max_gas, cx));
         let usd = self.usd_label(Address::ZERO, max_gas, cx);
         rows.push(match (approves, order) {
@@ -3852,6 +3930,14 @@ impl PrivateSwapsView {
                 usd,
                 format!(
                     "The most {label} pays in {native} for its approval. The swap and the bridge deposit are sent by a CoW solver."
+                ),
+            ),
+            (false, true) if permit => PublicDetail::cost(
+                format!("Approval from {label}"),
+                "signed, not sent".to_owned(),
+                Some("no gas".to_owned()),
+                format!(
+                    "{label} signs an approval that lets CoW take exactly the amount. It sends no transaction for it and pays no gas. The swap and the bridge deposit are sent by a CoW solver."
                 ),
             ),
             (false, true) => PublicDetail::cost(
@@ -4514,12 +4600,88 @@ async fn ui_fixture_job(
         Step::Claimed => PublicExecutionResult::Claimed(execution),
         Step::Waiting => PublicExecutionResult::Waiting(execution),
         Step::Ready => PublicExecutionResult::Ready(execution),
+        Step::Signatures => PublicExecutionResult::Ready(ui_fixture_signed(execution)?),
         Step::Changed(change) => PublicExecutionResult::Changed {
             change,
             review: None,
         },
         Step::Fail(message) => return Err(eyre::eyre!(message)),
     })
+}
+
+/// Debug UI fixture: `execution` with the signatures its reviewed order would ask for, staged
+/// from the review alone. The delivery and its terms are stand-ins that are never sent.
+#[cfg(debug_assertions)]
+fn ui_fixture_signed(mut execution: PublicSwapExecution) -> eyre::Result<PublicSwapExecution> {
+    let command = &execution.command;
+    let PublicSwapCommand::Swap {
+        destination_token,
+        review,
+        approval,
+        ..
+    } = &command.action
+    else {
+        return Err(eyre::eyre!("Fixture: this action signs no order."));
+    };
+    let (Some(proxy), Some(bought)) = (review.proxy(), review.buy_amount()) else {
+        return Err(eyre::eyre!(
+            "Fixture: a deposit has no signatures to review. Sell a token that needs an order."
+        ));
+    };
+    let valid_to = u32::try_from(
+        now_unix().saturating_add(u64::from(approval.bounds.valid_for_secs.unwrap_or(600))),
+    )?;
+    let bridged = review.intent().bridged_token;
+    let destination_chain = command.destination_session.chain_id;
+    let permit = review
+        .signs_permit()
+        .then(|| command.origin.public_swap_profile())
+        .flatten()
+        .map(|profile| PublicSwapPermitTerms {
+            token: approval.sell_token,
+            spender: profile.vault_relayer(),
+            amount: review.sell_amount(),
+            deadline: valid_to,
+        });
+    execution.signed = Some(PublicSwapSigned {
+        delivery: AcrossPrivateDelivery {
+            handler: Address::ZERO,
+            destination_executor: Address::ZERO,
+            shield_multicall: alloy::primitives::Bytes::new(),
+            fallback: None,
+        },
+        terms: AcrossOrderTerms {
+            spoke_pool: Address::ZERO,
+            input_token: bridged,
+            output_token: *destination_token,
+            input_amount: bought,
+            output_amount: review.bridge().destination_minimum,
+            quote_timestamp: 0,
+            fill_deadline: valid_to,
+            exclusive_relayer: Address::ZERO,
+            exclusivity_parameter: 0,
+            recipient: None,
+            message_hash: None,
+        },
+        valid_to,
+        nonce: B256::ZERO,
+        batch: Some(PublicSwapBatchTerms {
+            proxy,
+            guard_token: bridged,
+            guard_amount: bought,
+            depositor: command.source.address,
+            recipient: Address::ZERO,
+            input_token: bridged,
+            output_token: *destination_token,
+            destination_chain,
+            scale_numerator: review.bridge().destination_minimum,
+            scale_denominator: bought,
+            deadline: valid_to,
+            nonce: B256::ZERO,
+        }),
+        permit,
+    });
+    Ok(execution)
 }
 
 async fn prepare_public_execution(
@@ -4823,7 +4985,7 @@ async fn advance_public_execution(
     {
         return changed_public_delivery(command, review, change, quote.as_ref()).await;
     }
-    command
+    if let wallet_ops::PublicSwapApprovalsOutcome::ReviewRequired { transactions } = command
         .owner
         .submit_public_swap_approvals(
             command.operation,
@@ -4833,7 +4995,25 @@ async fn advance_public_execution(
             public_gas_fee(review),
             &mut |_| {},
         )
-        .await?;
+        .await?
+    {
+        // Transactions the review didn't price return to it with their gas. A permit it
+        // didn't price takes a fresh quote.
+        let review = if transactions {
+            Some(Arc::new(
+                command
+                    .owner
+                    .requote_public_swap_approvals(review, &command.origin, command.source.address)
+                    .await?,
+            ))
+        } else {
+            None
+        };
+        return Ok(PublicExecutionResult::Changed {
+            change: SwapReviewChange::ApprovalPlan,
+            review,
+        });
+    }
     let valid_to = valid_to()?;
     match sign(valid_to).await? {
         PublicSwapDelivery::ReviewRequired { change, quote } => {
@@ -4856,6 +5036,13 @@ async fn advance_public_execution(
             } else {
                 None
             };
+            // `None` for a deposit, and for an order approved without a permit.
+            let permit = command.owner.public_swap_order_permit_terms(
+                command.operation,
+                command.swap_use,
+                &command.origin,
+                valid_to,
+            )?;
             execution.private_authorization = None;
             execution.signed = Some(PublicSwapSigned {
                 delivery,
@@ -4863,6 +5050,7 @@ async fn advance_public_execution(
                 valid_to,
                 nonce,
                 batch,
+                permit,
             });
             Ok(PublicExecutionResult::Ready(execution))
         }

@@ -39,6 +39,7 @@ mod gas;
 mod observation;
 mod order;
 mod public_order;
+mod public_permit;
 mod public_settlement;
 mod public_source;
 mod public_tracking;
@@ -69,6 +70,8 @@ pub use public_order::{
     PublicSwapReviewRequest, PublicSwapUnavailable, new_public_swap_batch_nonce,
     public_swap_batch_terms,
 };
+pub(super) use public_permit::PermitSupport;
+pub use public_permit::{PublicSwapApprovalPlan, PublicSwapPermitPlan, PublicSwapPermitTerms};
 pub use public_settlement::{PublicSwapOrderState, public_swap_order_state};
 pub use public_source::{
     PublicSwapDelivery, PublicSwapDeliveryQuote, PublicSwapDeliverySigning, PublicSwapUseClaim,
@@ -77,8 +80,8 @@ pub use public_tracking::{PublicSwapProgress, PublicSwapTracking};
 pub use public_transactions::{
     AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
     PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS,
-    PublicSwapGasPlan, PublicSwapSource, PublicSwapTransactionOutcome, PublicSwapWithdrawalReview,
-    public_swap_approvals, public_swap_gas_plan,
+    PublicSwapApprovalsOutcome, PublicSwapGasPlan, PublicSwapSource, PublicSwapTransactionOutcome,
+    PublicSwapWithdrawalReview, public_swap_gas_plan,
 };
 pub(super) use recovery::swap_recovery_call_bound;
 #[cfg(test)]

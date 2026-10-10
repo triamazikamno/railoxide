@@ -3,6 +3,9 @@
 //! Tests using it are `#[ignore]`d and read `ETH_FORK_RPC_URL`. Tests that also
 //! fork the destination chain of a private Bridge delivery read that chain's RPC
 //! from `DESTINATION_FORK_RPC_URL`, or from `BNB_FORK_RPC_URL` when that chain is BNB Chain.
+//! Tests whose order settles on Base or Arbitrum One read that chain's RPC from
+//! `BASE_FORK_RPC_URL` or `ARBITRUM_FORK_RPC_URL`. The `CoW` contracts named here are at the
+//! same addresses on all three chains.
 //! Set `ANVIL_BIN` when `anvil` is not on `PATH`. Railgun accepts any proof when
 //! `tx.origin == 0x…dEaD` (its `VERIFICATION_BYPASS`); verification still runs,
 //! so gas matches real proofs. Every transaction here is sent from that address,
@@ -28,6 +31,8 @@ use url::Url;
 pub(crate) const FORK_RPC_URL_ENV: &str = "ETH_FORK_RPC_URL";
 pub(crate) const DESTINATION_FORK_RPC_URL_ENV: &str = "DESTINATION_FORK_RPC_URL";
 pub(crate) const BNB_FORK_RPC_URL_ENV: &str = "BNB_FORK_RPC_URL";
+pub(crate) const BASE_FORK_RPC_URL_ENV: &str = "BASE_FORK_RPC_URL";
+pub(crate) const ARBITRUM_FORK_RPC_URL_ENV: &str = "ARBITRUM_FORK_RPC_URL";
 /// Railgun's `VERIFICATION_BYPASS` origin, used as sender and solver.
 pub(crate) const VERIFICATION_BYPASS: Address =
     address!("000000000000000000000000000000000000dEaD");
@@ -110,7 +115,12 @@ impl Drop for ForkChain {
 impl ForkChain {
     /// Spawn the mainnet fork, impersonate the bypass origin, and allow it as a solver.
     pub(crate) async fn start() -> Self {
-        let fork = Self::spawn(FORK_RPC_URL_ENV, 1).await;
+        Self::start_origin(FORK_RPC_URL_ENV, 1).await
+    }
+
+    /// [`Self::start`] for the chain `chain_id`, forked from the RPC that `url_env` names.
+    pub(crate) async fn start_origin(url_env: &str, chain_id: u64) -> Self {
+        let fork = Self::spawn(url_env, chain_id).await;
         let manager = fork
             .call(
                 SOLVER_AUTHENTICATION,
@@ -236,6 +246,11 @@ impl ForkChain {
         self.provider.get_balance(holder).await.unwrap()
     }
 
+    /// How many transactions `holder` has sent.
+    pub(crate) async fn transaction_count(&self, holder: Address) -> u64 {
+        self.provider.get_transaction_count(holder).await.unwrap()
+    }
+
     pub(crate) async fn mine(&self, blocks: u64) {
         self.raw("anvil_mine", (U256::from(blocks),)).await;
     }
@@ -275,6 +290,11 @@ impl ForkChain {
             .await
             .unwrap()
             .expect("transaction receipt")
+    }
+
+    /// Replace `account`'s code.
+    pub(crate) async fn set_code(&self, account: Address, code: Bytes) {
+        self.raw("anvil_setCode", (account, code)).await;
     }
 
     pub(crate) async fn storage_at(&self, account: Address, slot: U256) -> U256 {

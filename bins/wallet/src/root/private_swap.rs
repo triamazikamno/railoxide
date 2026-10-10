@@ -365,6 +365,8 @@ pub(super) struct PrivateSwapsView {
     public_synced: BTreeSet<u64>,
     /// Background status checks of a Public account swap that failed in a row.
     public_tracking_failures: BTreeMap<(ExecutorOperationId, SwapUseId), u32>,
+    /// The open orders whose signed approval the latest status check found used up.
+    public_permit_used_up: BTreeSet<(ExecutorOperationId, SwapUseId)>,
     public_authorization: Option<Arc<PublicSwapAuthorization>>,
     public_execution: Option<form::public_source::PublicSwapExecution>,
     public_job: Option<Task<()>>,
@@ -528,6 +530,7 @@ impl WalletRoot {
                 view.public_tracking.clear();
                 view.public_destination_balances.clear();
                 view.public_tracking_failures.clear();
+                view.public_permit_used_up.clear();
                 view.public_authorization = None;
                 view.public_execution = None;
                 view.public_job = None;
@@ -817,6 +820,7 @@ impl PrivateSwapsView {
             public_railgun: BTreeMap::new(),
             public_synced: BTreeSet::new(),
             public_tracking_failures: BTreeMap::new(),
+            public_permit_used_up: BTreeSet::new(),
             public_authorization: None,
             public_execution: None,
             public_job: None,

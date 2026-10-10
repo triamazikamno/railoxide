@@ -13,21 +13,24 @@ use super::super::public_order::{
     price_public_order, public_order, public_order_app_data_len, public_order_hooks,
     public_swap_batch_terms,
 };
+use super::super::public_permit::permit_pre_hook;
 use super::*;
 use crate::bridge::{AcrossFeeQuote, BridgeDestination, NearAssets, OneClickDryQuote};
 use crate::cow::{
     DeliveryAllowanceRate, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
-    public_deposit_hook_gas,
+    PUBLIC_PERMIT_HOOK_GAS, public_deposit_hook_gas,
 };
 use crate::hardware_typed_data::{HardwareEip712Model, HardwareEip712Type, HardwareEip712Value};
 use crate::settings::{BridgeReceiverRejection, PublicSwapProfile};
 use crate::vault::{
     AcrossOrderTerms, BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation,
+    PublicSwapPermit,
 };
 use broadcaster_core::contracts::cow_shed::{
     COWShedFactory, decode_deposit_hook_calls, execute_hooks_calldata, execute_hooks_digest,
     proxy_address,
 };
+use broadcaster_core::contracts::erc20_permit::{Permit, decode_permit_calldata, permit_calldata};
 
 const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
@@ -1597,6 +1600,7 @@ fn a_public_order_pays_its_proxy_and_runs_the_signed_batch_as_its_only_hook() {
         proxy,
         hook.clone(),
         gas_limit,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1642,11 +1646,84 @@ fn a_public_order_pays_its_proxy_and_runs_the_signed_batch_as_its_only_hook() {
             PUBLIC_DESTINATION_TOKEN,
             shield_multicall,
             gas_limit,
+            None,
         )
     };
     assert_eq!(
-        measured(delivery.shield_multicall).unwrap(),
+        measured(delivery.shield_multicall.clone()).unwrap(),
         app_data.document.len()
+    );
+
+    // An order with a signed permit carries it as its pre-hook: the sold token's own `permit`
+    // call. The order commits to it, and the size check measures it too.
+    let permit = Permit {
+        owner: source,
+        spender: profile.vault_relayer(),
+        value: sell_amount,
+        nonce: U256::from(3),
+        deadline: U256::from(PUBLIC_VALID_TO),
+    };
+    let permit_signature = signer.sign_hash_sync(&B256::repeat_byte(0x22)).unwrap();
+    let permit_gas_limit = hook_gas_limit(PUBLIC_PERMIT_HOOK_GAS);
+    let pre_hook = permit_pre_hook(
+        WETH,
+        source,
+        profile.vault_relayer(),
+        &PublicSwapPermit::new(
+            permit.nonce,
+            PUBLIC_VALID_TO,
+            sell_amount,
+            permit_signature.as_bytes(),
+        ),
+        permit_gas_limit,
+    )
+    .unwrap();
+    let (permitted, permit_app_data) = public_order(
+        &profile,
+        WETH,
+        USDC,
+        sell_amount,
+        buy_amount,
+        PUBLIC_VALID_TO,
+        proxy,
+        hook,
+        gas_limit,
+        Some(pre_hook),
+    )
+    .unwrap();
+    assert_ne!(permitted.appData, order.appData);
+    let document: AppData = serde_json::from_str(&permit_app_data.document).unwrap();
+    let [pre] = document.metadata.hooks.pre.as_slice() else {
+        panic!("the order has one pre-hook");
+    };
+    assert_eq!(
+        (pre.target, pre.gas_limit, &pre.call_data),
+        (
+            WETH,
+            permit_gas_limit,
+            &permit_calldata(&permit, &permit_signature)
+        )
+    );
+    assert_eq!(
+        decode_permit_calldata(&pre.call_data),
+        Some((
+            source,
+            profile.vault_relayer(),
+            sell_amount,
+            U256::from(PUBLIC_VALID_TO)
+        ))
+    );
+    assert_eq!(document.metadata.hooks.post.len(), 1);
+    assert_eq!(
+        public_order_app_data_len(
+            &profile,
+            PUBLIC_DESTINATION_TOKEN,
+            delivery.shield_multicall,
+            gas_limit,
+            Some(permit_gas_limit),
+        )
+        .unwrap(),
+        permit_app_data.document.len()
     );
     let oversized = Bytes::from(vec![0; profile.app_data_byte_budget()]);
     assert!(
@@ -1767,6 +1844,7 @@ fn a_public_orders_typed_data_hashes_to_the_digests_its_contracts_verify() {
         proxy,
         Bytes::from_static(b"signed batch"),
         517_000,
+        None,
     )
     .unwrap();
     let settlement = profile.settlement();

@@ -39,6 +39,9 @@ pub struct PublicSwapProgress {
     /// verified.
     pub refresh_public_balances: bool,
     pub finished: bool,
+    /// The open order's signed permit was used up while the allowance is short, so the order
+    /// can't currently fill. A warning: the order stays open and keeps its reservations.
+    pub permit_used_up: bool,
     /// The destination token's confirmed balance, read only by an explicit check of a
     /// held-on-destination outcome.
     pub destination_balance: Option<(U256, BlockNumHash)>,
@@ -54,6 +57,8 @@ impl ExecutorOwner {
     /// hand-off. With a hand-off the bridge is polled, as an explicit status check when
     /// `tracking.explicit`, and a refunding deposit's refund to the Public account is verified.
     /// A step with nothing to do is skipped, and the first step that fails returns its error.
+    /// Last, an order that is still open with a signed permit has that permit's nonce, the
+    /// allowance and the settlement's fill of the order read, which changes no record.
     ///
     /// Nothing here takes a `WalletSession`, a signer or the origin chain's owner: every step
     /// reads the record on this owner and the origin chain through `tracking.origin`. A swap
@@ -134,11 +139,15 @@ impl ExecutorOwner {
         })?;
         let withdrawn =
             before.observations().withdrawn.is_none() && after.observations().withdrawn.is_some();
+        let permit_changed =
+            Box::pin(self.observe_public_swap_permit(swap_use, origin, claimed.source, after, now))
+                .await?;
         self.ensure_active()?;
         Ok(PublicSwapProgress {
-            changed: after != before,
+            changed: after != before || permit_changed,
             refresh_public_balances: refunded || withdrawn,
             finished: after.is_finished(after_use.is_stopped(), now),
+            permit_used_up: self.public_swap_permit_used_up(swap_use),
             destination_balance,
         })
     }

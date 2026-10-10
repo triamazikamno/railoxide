@@ -676,6 +676,17 @@ pub(super) fn public_swap_steps(
             .in_block(block(tx.inclusion.map(|inclusion| inclusion.observation))),
         );
     }
+    // A permit is the approval as a signature the order carries, so it has no transaction.
+    if swap.order().is_some_and(|order| order.permit().is_some()) {
+        steps.push(SwapStep::new(
+            format!(
+                "{} approval signed by {}",
+                labels.sell_symbol, labels.source
+            ),
+            "",
+            Done,
+        ));
+    }
     if swap.intent().order {
         let (title, status) = if observed.traded.is_some() {
             ("Order filled", Done)

@@ -552,6 +552,12 @@ impl PrivateSwapsView {
             });
         }
         let note = public_swap_note(swap, stage, &actions, &labels, now_unix());
+        // A warning on an order that stays open: the note under it gives what cancelling and
+        // waiting cost.
+        let permit_used_up = actions.contains(&PublicSwapAction::CancelOrder)
+            && self
+                .public_permit_used_up
+                .contains(&(identity.operation, identity.swap_use));
         let body = div()
             .flex()
             .flex_col()
@@ -568,6 +574,17 @@ impl PrivateSwapsView {
                     .border_color(cx.theme().border)
                     .children(facts),
             )
+            .children(permit_used_up.then(|| {
+                Alert::warning(
+                    "public-swap-permit-used-up",
+                    format!(
+                        "The approval {} signed for this order was used up by another signature, so the order can't fill. Cancel the order or wait for it to expire.",
+                        labels.source
+                    ),
+                )
+                .small()
+                .min_w_0()
+            }))
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
             // One failed check is retried on the next pass and says nothing. Several in a row
             // explain why the steps above have stopped moving.

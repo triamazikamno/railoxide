@@ -14,6 +14,15 @@
 //! Chain forks that chain from `BNB_FORK_RPC_URL`. Mainnet has no `SwapMath` yet, so a scenario
 //! with an order deploys it on the Ethereum fork first, as its release will.
 //!
+//! The `swap_fork_public_permit` scenarios sell USDC through an order from a Public account
+//! that holds no native balance, on Ethereum, Base and Arbitrum One. Each forks the chain it
+//! pays on from `ETH_FORK_RPC_URL`, `BASE_FORK_RPC_URL` or `ARBITRUM_FORK_RPC_URL`, and Polygon,
+//! where it delivers, from `DESTINATION_FORK_RPC_URL`:
+//!
+//! `BASE_FORK_RPC_URL=<Base RPC> DESTINATION_FORK_RPC_URL=<Polygon RPC> cargo test -p wallet-ops swap_fork_public_permit_order_on_base -- --ignored --nocapture`
+//!
+//! Each prints the gas its permit pre-hook used in the settlement to stderr.
+//!
 //! Settlements are sent by an impersonated allow-listed solver. The harness adds
 //! `0xdEaD` to the `GPv2` solver allow list through the authenticator's manager,
 //! because Railgun accepts a synthetic proof only when `tx.origin` is that
@@ -30,8 +39,9 @@ use crate::cow::{CowOrderbookClient, CowQuote};
 use crate::public_wallet::VaultedPublicSigner;
 use crate::signer::SoftwareEvmSigner;
 use crate::tests::cow_fork::{
-    BNB_FORK_RPC_URL_ENV, DESTINATION_FORK_RPC_URL_ENV, ForkChain, MULTICALL3, RAILGUN,
-    RailgunTree, VERIFICATION_BYPASS, synthetic_transaction, unshield_to,
+    ARBITRUM_FORK_RPC_URL_ENV, BASE_FORK_RPC_URL_ENV, BNB_FORK_RPC_URL_ENV,
+    DESTINATION_FORK_RPC_URL_ENV, FORK_RPC_URL_ENV, ForkChain, HOOKS_TRAMPOLINE, MULTICALL3,
+    RAILGUN, RailgunTree, SETTLEMENT, VERIFICATION_BYPASS, synthetic_transaction, unshield_to,
 };
 use crate::vault::{
     PublicAccountScope, PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent,
@@ -43,11 +53,11 @@ use crate::{
     DelegatedSwapExecutor, ExecutorRecoveryExecution, ExecutorRecoveryFunding,
     IssuedExecutorTransaction, OperationHttpClient, OperationNetworkIsolation,
     PreparedExecutorOperation, PreparedExecutorRecovery, PublicActionGasFeeSelection,
-    PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapGasPlan, PublicSwapOrderOutcome,
-    PublicSwapOrderState, PublicSwapTransactionOutcome, PublicSwapUseClaim, SwapAmountPlan,
-    SwapAmountRequest, SwapInputPlan, SwapOrderOutcome, SwapOrderState, SwapPairPreparation,
-    SwapPairSide, SwapPrice, SwapSetupStatus, WalletNetworkMode, new_public_swap_batch_nonce,
-    prepare_swap_pair, public_swap_order_state, swap_order_state,
+    PublicSwapApprovalsOutcome, PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapGasPlan,
+    PublicSwapOrderOutcome, PublicSwapOrderState, PublicSwapTransactionOutcome, PublicSwapUseClaim,
+    SwapAmountPlan, SwapAmountRequest, SwapInputPlan, SwapOrderOutcome, SwapOrderState,
+    SwapPairPreparation, SwapPairSide, SwapPrice, SwapSetupStatus, WalletNetworkMode,
+    new_public_swap_batch_nonce, prepare_swap_pair, public_swap_order_state, swap_order_state,
 };
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use broadcaster_core::contracts::across::{
@@ -198,6 +208,11 @@ impl crate::SwapShieldNotes for AcceptedShieldNotes {
 
 impl Wallet {
     fn open(fork: &ForkChain) -> Self {
+        Self::open_on(fork, 1)
+    }
+
+    /// The wallet on the chain `chain_id`, over `fork`.
+    fn open_on(fork: &ForkChain, chain_id: u64) -> Self {
         let (root, db, vault) = desktop_store_with_vault();
         let view = Arc::new(import_wallet_with_metadata(
             &vault,
@@ -208,8 +223,9 @@ impl Wallet {
             &crate::settings::WalletSettings::default(),
         )
         .unwrap();
-        let mut chain = chains.get(1).cloned().unwrap();
-        chain.rpc_route = crate::RpcChainRoute::new(1, vec![fork.url()]).with_multicall(MULTICALL3);
+        let mut chain = chains.get(chain_id).cloned().unwrap();
+        chain.rpc_route =
+            crate::RpcChainRoute::new(chain_id, vec![fork.url()]).with_multicall(MULTICALL3);
         let owner = ExecutorOwner::new(
             0,
             db.clone(),
@@ -3596,8 +3612,8 @@ async fn across_deposit_stub(
     (across_client(url), reply, task)
 }
 
-/// An orderbook stub on Ethereum for a Public account's order at `settlement`.
-async fn spawn_public_orderbook(settlement: Address) -> PublicOrderbook {
+/// An orderbook stub on the chain `chain_id` for a Public account's order at `settlement`.
+async fn spawn_public_orderbook(chain_id: u64, settlement: Address) -> PublicOrderbook {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mainnet", listener.local_addr().unwrap())
         .parse()
@@ -3623,7 +3639,7 @@ async fn spawn_public_orderbook(settlement: Address) -> PublicOrderbook {
                 ("200 OK", trades.to_string())
             } else {
                 let owner = body["from"].as_str().unwrap().parse().unwrap();
-                let uid = order_uid(&submitted_order(&body), 1, settlement, owner);
+                let uid = order_uid(&submitted_order(&body), chain_id, settlement, owner);
                 recorded.lock().unwrap().push(body);
                 ("201 Created", json!(uid.0).to_string())
             };
@@ -3640,7 +3656,7 @@ async fn spawn_public_orderbook(settlement: Address) -> PublicOrderbook {
             OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
         ),
         url,
-        1,
+        chain_id,
     )
     .unwrap();
     PublicOrderbook {
@@ -3738,15 +3754,26 @@ impl Wallet {
             ExecutorOperationId::random().unwrap(),
             SwapUseId::random().unwrap(),
         );
-        owner
-            .claim_public_swap(public_claim(
-                id,
-                operation,
-                source,
-                terms,
-                plan.max_gas_cost,
-            ))
-            .unwrap();
+        let claim = public_claim(id, operation, source, terms, plan.max_gas_cost);
+        self.claimed_public_swap(destination_fork, operation, claim, terms, plan)
+            .await
+    }
+
+    /// Claim a swap with `terms` for the new destination stealth account `operation` with
+    /// `claim`, whose approval was priced with `plan`, deliver that account's delegation-only
+    /// setup on `destination_fork`, and confirm it delegated there.
+    async fn claimed_public_swap(
+        &self,
+        destination_fork: &ForkChain,
+        operation: ExecutorOperationId,
+        claim: PublicSwapUseClaim,
+        terms: PublicTerms,
+        plan: PublicSwapGasPlan,
+    ) -> PublicSwap {
+        let destination = self.destination.as_ref().unwrap();
+        let owner = &destination.owner;
+        let (id, source) = (claim.id, claim.source);
+        owner.claim_public_swap(claim).unwrap();
 
         let authorization = password();
         let delegate = destination
@@ -4467,7 +4494,7 @@ async fn place_public_order(
     let quoted = fork.timestamp().await + quote_ahead;
     let valid_to = valid_until(PUBLIC_VALID_SECS);
     let signed = wallet.sign_public_delivery(&swap, quoted, valid_to).await;
-    let orderbook = spawn_public_orderbook(profile.settlement()).await;
+    let orderbook = spawn_public_orderbook(origin.chain_id, profile.settlement()).await;
     let outcome = owner
         .submit_public_swap_order_with_signer(
             swap.operation,
@@ -5101,6 +5128,438 @@ async fn swap_fork_public_order_scales_its_output_to_an_18_decimal_token() {
         token: BNB_USDC,
         minimum: 14_900_000_000_000_000_000,
         every_outcome: false,
+    }))
+    .await;
+}
+
+const BASE: u64 = 8453;
+const BASE_USDC: Address = alloy::primitives::address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+/// What the permit order sells, in USDC base units.
+const PERMIT_SELL_AMOUNT: u64 = 1_000_000_000;
+/// What `CoW`'s stub quotes for that sale, in wei of the chain's wrapped native token.
+const PERMIT_QUOTED_BUY: u64 = 300_000_000_000_000_000;
+/// What Across's stub previews for the order's buy amount, in wei of Polygon's WETH.
+const PERMIT_PREVIEW_OUTPUT: u64 = 250_000_000_000_000_000;
+/// Nitro's `ArbGasInfo` precompile, which an order's review on Arbitrum One reads.
+const ARB_GAS_INFO: Address =
+    alloy::primitives::address!("000000000000000000000000000000000000006C");
+
+/// Where the permit order's Public account pays.
+#[derive(Clone, Copy)]
+struct PermitOrigin {
+    chain_id: u64,
+    /// The environment variable that names the RPC the chain is forked from.
+    rpc_env: &'static str,
+    /// The chain's USDC, which has an EIP-2612 permit.
+    usdc: Address,
+}
+
+/// A Public account on `route`'s chain that holds USDC and no native balance sells it for the
+/// chain's wrapped native token, delivered to Polygon. The review plans a permit and no gas
+/// from the account, the approvals step sends nothing, and the order carries the signed permit
+/// as its pre-hook. The solver's settlement runs that hook through the trampoline, takes the
+/// USDC, and runs the post-hook's deposit, which the wallet reads as the swap's hand-off. The
+/// account sends no transaction at any point.
+async fn public_permit_order_scenario(route: PermitOrigin) {
+    use broadcaster_core::contracts::erc20_permit::IERC20Permit;
+
+    let fork = ForkChain::start_origin(route.rpc_env, route.chain_id).await;
+    let destination_fork = ForkChain::start_destination(DESTINATION_CHAIN).await;
+    let wallet = Wallet::open_on(&fork, route.chain_id).with_destination(&destination_fork);
+    let origin = &wallet.chain;
+    let destination = wallet.destination.as_ref().unwrap();
+    let owner = &destination.owner;
+    let profile = origin.public_swap_profile().unwrap();
+    let (factory, vault_relayer) = (profile.cow_shed_factory(), profile.vault_relayer());
+    let spoke_pool = origin.bridge_origin_profile().unwrap().spoke_pool();
+    let bridge = destination.chain.bridge_profile().unwrap();
+    let usdc = route.usdc;
+    let weth = crate::amounts::wrapped_native_token_for_chain(route.chain_id).unwrap();
+    let sell_amount = U256::from(PERMIT_SELL_AMOUNT);
+    // The harness settles at the mainnet addresses, which this chain must share.
+    assert_eq!(profile.settlement(), SETTLEMENT);
+    assert!(
+        !fork.code(HOOKS_TRAMPOLINE).await.is_empty(),
+        "chain {} has the hooks trampoline",
+        route.chain_id
+    );
+    // anvil runs no Nitro precompile. This one answers every call with an L1 base fee of
+    // 0.1 gwei, which only enters the order's gas estimate.
+    if route.chain_id == ARBITRUM_ONE {
+        fork.set_code(
+            ARB_GAS_INFO,
+            alloy::primitives::bytes!("6305f5e1005f5260205ff3"),
+        )
+        .await;
+    }
+    deploy_swap_math(&fork).await;
+
+    // The account holds the USDC it sells and nothing else: no native balance, no allowance
+    // to the vault relayer, and no transaction sent.
+    let signer = public_signer("permit");
+    let source = signer.address();
+    let proxy = proxy_address(factory, profile.cow_shed_implementation(), source);
+    fork.add_erc20(usdc, source, sell_amount).await;
+    let allowance = || ForkAllowance::allowanceCall {
+        owner: source,
+        spender: vault_relayer,
+    };
+    let permit_nonce = || IERC20Permit::noncesCall { owner: source };
+    assert_eq!(fork.erc20_balance(usdc, source).await, sell_amount);
+    assert_eq!(fork.native_balance(source).await, U256::ZERO);
+    assert_eq!(fork.call(usdc, allowance()).await, U256::ZERO);
+    assert_eq!(fork.transaction_count(source).await, 0);
+    let nonce = fork.call(usdc, permit_nonce()).await;
+
+    // The review reads the token's permit on the fork. `CoW`'s quote and Across's preview
+    // come from local stubs.
+    let (quote_url, _, quote_stub) = spawn_bridge_stub(move |_| {
+        json!({
+            "quote": {
+                "sellToken": usdc, "buyToken": weth,
+                "sellAmount": sell_amount.to_string(),
+                "buyAmount": PERMIT_QUOTED_BUY.to_string(), "validTo": 1,
+                "feeAmount": "0", "gasAmount": "150000", "gasPrice": "1000000000",
+                "sellTokenPrice": "300000000", "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        })
+        .to_string()
+    })
+    .await;
+    let quote_client = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        ),
+        quote_url,
+        route.chain_id,
+    )
+    .unwrap();
+    let (destination_spoke_pool, previewed) = (bridge.spoke_pool(), fork.timestamp().await);
+    let (preview_url, _, preview_stub) = spawn_bridge_stub(move |_| {
+        across_quote_at(
+            spoke_pool,
+            destination_spoke_pool,
+            U256::from(PERMIT_PREVIEW_OUTPUT),
+            previewed,
+        )
+    })
+    .await;
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let target = crate::bridge::PublicBridgeDestination {
+        destination: crate::bridge::BridgeDestination {
+            destination_token: POLYGON_WETH,
+            intermediate: weth,
+            symbol: "WETH".into(),
+            same_asset: true,
+            near: None,
+        },
+        path: crate::bridge::PublicBridgePath::Order,
+    };
+    let review = owner
+        .review_public_swap(crate::PublicSwapReviewRequest {
+            origin,
+            source,
+            sell: crate::bridge::PublicSellAsset::Erc20(usdc),
+            sell_amount,
+            destination: &target,
+            slippage_bps: 50,
+            gas_share_bps: 5_000,
+            on_shield_failure: BridgeShieldFailure::RefundOnOrigin,
+            orderbook: Some(&quote_client),
+            across: &across_client(preview_url),
+            anchor_cache: None,
+            token_registry: &registry,
+            max_fee_per_gas: PUBLIC_MAX_FEE_PER_GAS,
+            max_priority_fee_per_gas: PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+        })
+        .await
+        .unwrap();
+    quote_stub.abort();
+    preview_stub.abort();
+    assert!(
+        review.signs_permit(),
+        "the review plans a permit for USDC's short allowance"
+    );
+    let plan = review.gas_plan().clone();
+    assert!(plan.approval_gas_limits.is_empty());
+    assert_eq!(
+        (plan.deposit_gas_limit, plan.max_gas_cost),
+        (None, U256::ZERO)
+    );
+
+    // The swap is claimed with the review's own approval, which prices the permit pre-hook.
+    // No anchor checked the stub's price, so the approval acknowledges it.
+    let approval = review
+        .approval(
+            SwapApprovedAccount {
+                address: None,
+                setup: true,
+            },
+            Some(U256::from(1_000)),
+            true,
+        )
+        .unwrap();
+    let permit_gas_limit = approval.bounds.pre_hook_gas_limit;
+    assert_eq!(
+        permit_gas_limit,
+        crate::cow::hook_gas_limit(crate::cow::PUBLIC_PERMIT_HOOK_GAS)
+    );
+    let terms = PublicTerms {
+        sell_token: usdc,
+        sell_amount,
+        bridged_token: weth,
+        bridged_amount: review.buy_amount().unwrap(),
+        destination_token: POLYGON_WETH,
+        destination_minimum: review.bridge().destination_minimum,
+        hook_gas_limit: review.hook_gas_limit(),
+    };
+    let (operation, id) = (
+        ExecutorOperationId::random().unwrap(),
+        SwapUseId::random().unwrap(),
+    );
+    let claim = PublicSwapUseClaim {
+        id,
+        origin_chain: route.chain_id,
+        source,
+        source_scope: PublicAccountScope::PrivateWallet {
+            wallet_uuid: TEST_WALLET_ID.to_owned(),
+        },
+        account: SwapAccountChoice::New(operation),
+        destination_token: POLYGON_WETH,
+        intent: review.intent(),
+        approval,
+    };
+    let swap = wallet
+        .claimed_public_swap(&destination_fork, operation, claim, terms, plan)
+        .await;
+
+    // The approvals step has nothing to send.
+    let outcome = owner
+        .submit_public_swap_approvals_with_signer(
+            swap.operation,
+            swap.id,
+            origin,
+            &signer,
+            PUBLIC_GAS_FEE,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, PublicSwapApprovalsOutcome::Ready);
+    assert!(
+        public_swap_record(&wallet, &swap)
+            .0
+            .transactions()
+            .is_empty()
+    );
+
+    // The order signs the permit under the account's current nonce until the order's
+    // `validTo`, proves it on the token, and carries it as its one pre-hook.
+    fork.mine(1).await;
+    let quoted = fork.timestamp().await;
+    let valid_to = valid_until(PUBLIC_VALID_SECS);
+    let signed = wallet.sign_public_delivery(&swap, quoted, valid_to).await;
+    let orderbook = spawn_public_orderbook(route.chain_id, profile.settlement()).await;
+    let outcome = owner
+        .submit_public_swap_order_with_signer(
+            swap.operation,
+            swap.id,
+            origin,
+            &signer,
+            &orderbook.client,
+            &signed.delivery,
+            &signed.terms,
+            valid_to,
+            new_public_swap_batch_nonce().unwrap(),
+            review.quote_id(),
+            false,
+        )
+        .await
+        .unwrap();
+    let PublicSwapOrderOutcome::Submitted { uid } = outcome else {
+        panic!("the order is submitted: {outcome:?}");
+    };
+    let body = orderbook.orders.lock().unwrap().last().cloned().unwrap();
+    let hooks = serde_json::from_str::<AppData>(body["appData"].as_str().unwrap())
+        .unwrap()
+        .metadata
+        .hooks;
+    let ([pre], [post]) = (hooks.pre.as_slice(), hooks.post.as_slice()) else {
+        panic!("the order has one pre-hook and one post-hook");
+    };
+    assert_eq!((pre.target, pre.gas_limit), (usdc, permit_gas_limit));
+    let permit = IERC20Permit::permitCall::abi_decode(&pre.call_data).unwrap();
+    assert_eq!(
+        (permit.owner, permit.spender, permit.value, permit.deadline),
+        (source, vault_relayer, sell_amount, U256::from(valid_to))
+    );
+    assert_eq!(
+        (post.target, Some(post.gas_limit)),
+        (factory, terms.hook_gas_limit)
+    );
+    let order = submitted_order(&body);
+    assert_eq!(
+        (order.sellToken, order.buyToken, order.receiver),
+        (usdc, weth, proxy)
+    );
+    assert_eq!(
+        (order.sellAmount, order.buyAmount, order.validTo),
+        (sell_amount, terms.bridged_amount, valid_to)
+    );
+    let recorded = public_swap_record(&wallet, &swap).0;
+    assert_eq!(
+        recorded
+            .order()
+            .and_then(|order| order.permit())
+            .map(|permit| (permit.nonce(), permit.value(), permit.deadline())),
+        Some((nonce, sell_amount, valid_to))
+    );
+    // Signing and proving the permit changed nothing on chain.
+    assert_eq!(fork.call(usdc, permit_nonce()).await, nonce);
+    assert_eq!(fork.call(usdc, allowance()).await, U256::ZERO);
+    assert_eq!(fork.transaction_count(source).await, 0);
+    let placed = PlacedOrder {
+        hook: post.clone(),
+        signature: body["signature"].as_str().unwrap().parse().unwrap(),
+        swap,
+        signed,
+        orderbook,
+        order,
+        uid,
+        proxy,
+        valid_to,
+    };
+
+    // The solver settles with both hooks. The settlement takes the USDC only if the permit
+    // ran first: nothing else gave the vault relayer an allowance.
+    let receipt = fork
+        .settle(
+            &placed.order,
+            placed.signature.clone(),
+            &hooks.pre,
+            std::slice::from_ref(&placed.hook),
+        )
+        .await;
+    assert!(
+        receipt.status(),
+        "the solver settles with the permit as its pre-hook and the batch as its post-hook"
+    );
+    assert_eq!(fork.call(usdc, permit_nonce()).await, nonce + U256::ONE);
+    assert_eq!(fork.erc20_balance(usdc, source).await, U256::ZERO);
+    assert_eq!(fork.call(usdc, allowance()).await, U256::ZERO);
+    let settled = deposits(&receipt, spoke_pool);
+    let [deposit] = settled.as_slice() else {
+        panic!("the post-hook deposits once within its gas limit");
+    };
+    assert_eq!(
+        (deposit.inputAmount, deposit.outputAmount),
+        (terms.bridged_amount, terms.destination_minimum)
+    );
+    assert_eq!(
+        (deposit.depositor, deposit.recipient),
+        (
+            address_to_bytes32(source),
+            address_to_bytes32(bridge.multicall_handler())
+        )
+    );
+    assert_eq!(deposit.message, placed.signed.message);
+    assert_eq!(
+        (
+            deposit.inputToken,
+            deposit.outputToken,
+            deposit.destinationChainId
+        ),
+        (
+            address_to_bytes32(weth),
+            address_to_bytes32(POLYGON_WETH),
+            U256::from(DESTINATION_CHAIN)
+        )
+    );
+    // The trampoline's call of the token, from the settlement's trace.
+    match fork
+        .call_gas(receipt.transaction_hash, usdc, &pre.call_data)
+        .await
+    {
+        Some(used) => {
+            assert!(
+                used <= pre.gas_limit,
+                "the permit used {used} gas of its limit of {}",
+                pre.gas_limit
+            );
+            eprintln!(
+                "MEASURE public_permit_hook_gas chain={} used={used} limit={}",
+                route.chain_id, pre.gas_limit
+            );
+        }
+        None => eprintln!(
+            "MEASURE public_permit_hook_gas chain={} unavailable: no permit call was traced",
+            route.chain_id
+        ),
+    }
+
+    // The wallet reads the trade and the hand-off from the final settlement.
+    let observed =
+        observe_public_settlement(&wallet, &fork, &placed, &receipt, terms.bridged_amount).await;
+    assert_eq!(
+        observed.bridge_handoff,
+        Some(SwapBridgeHandoff {
+            observation: observed.traded.unwrap(),
+            deposit_id: Some(deposit.depositId),
+        })
+    );
+    assert_eq!(
+        observed.deposited,
+        Some(PublicSwapDeposited {
+            input_amount: terms.bridged_amount,
+            output_amount: terms.destination_minimum,
+        })
+    );
+    assert_eq!(observed.held_by_proxy, None);
+    assert_eq!(
+        public_order_state(&wallet, &placed.swap),
+        Some(PublicSwapOrderState::Bridged)
+    );
+    // From the review to the hand-off the account sent nothing and held no native balance.
+    assert_eq!(fork.transaction_count(source).await, 0);
+    assert_eq!(fork.native_balance(source).await, U256::ZERO);
+    drop(placed);
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_permit_order_on_ethereum_sends_nothing_from_the_account() {
+    Box::pin(public_permit_order_scenario(PermitOrigin {
+        chain_id: 1,
+        rpc_env: FORK_RPC_URL_ENV,
+        usdc: USDC,
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs BASE_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_permit_order_on_base_sends_nothing_from_the_account() {
+    Box::pin(public_permit_order_scenario(PermitOrigin {
+        chain_id: BASE,
+        rpc_env: BASE_FORK_RPC_URL_ENV,
+        usdc: BASE_USDC,
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs ARBITRUM_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
+async fn swap_fork_public_permit_order_on_arbitrum_sends_nothing_from_the_account() {
+    Box::pin(public_permit_order_scenario(PermitOrigin {
+        chain_id: ARBITRUM_ONE,
+        rpc_env: ARBITRUM_FORK_RPC_URL_ENV,
+        usdc: ARBITRUM_USDC,
     }))
     .await;
 }

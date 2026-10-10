@@ -4183,19 +4183,28 @@ impl StoredPublicSwap {
 }
 
 const PUBLIC_SWAP_BATCH_CALLDATA: &[u8] = b"signed cow-shed hook batch";
+const PUBLIC_SWAP_PERMIT_SIGNATURE: [u8; 65] = [8; 65];
 
 fn public_swap_order_path() -> PublicSwapPath {
-    PublicSwapPath::Order(Box::new(PublicSwapOrder::new(
-        OrderUid::new(B256::repeat_byte(30), Address::repeat_byte(0x50), 1_000),
-        Address::repeat_byte(6),
-        Address::repeat_byte(0x51),
-        PublicSwapHookBatch::new(
-            Bytes::from_static(PUBLIC_SWAP_BATCH_CALLDATA),
-            B256::repeat_byte(33),
+    PublicSwapPath::Order(Box::new(
+        PublicSwapOrder::new(
+            OrderUid::new(B256::repeat_byte(30), Address::repeat_byte(0x50), 1_000),
+            Address::repeat_byte(6),
+            Address::repeat_byte(0x51),
+            PublicSwapHookBatch::new(
+                Bytes::from_static(PUBLIC_SWAP_BATCH_CALLDATA),
+                B256::repeat_byte(33),
+                1_000,
+            ),
+            SwapSubmission::new([9; 65], Some(42)),
+        )
+        .with_permit(Some(PublicSwapPermit::new(
+            U256::from(4),
             1_000,
-        ),
-        SwapSubmission::new([9; 65], Some(42)),
-    )))
+            U256::from(100),
+            PUBLIC_SWAP_PERMIT_SIGNATURE,
+        ))),
+    ))
 }
 
 /// What the user approved for a Public-paid swap that sells `sell` and delivers to `destination`.
@@ -4593,11 +4602,16 @@ fn public_swap_records_hold_only_their_known_fields_and_hide_the_signed_batch() 
         [
             "batch",
             "buy_token",
+            "permit",
             "proxy",
             "submission",
             "submission_status",
             "uid"
         ]
+    );
+    assert_eq!(
+        keys(&order["permit"]),
+        ["deadline", "nonce", "signature", "value"]
     );
     assert_eq!(keys(&order["batch"]), ["calldata", "deadline", "nonce"]);
     assert_eq!(keys(&order["submission"]), ["quote_id", "signature"]);
@@ -4633,6 +4647,19 @@ fn public_swap_records_hold_only_their_known_fields_and_hide_the_signed_batch() 
     assert_eq!(&batch.calldata()[..], PUBLIC_SWAP_BATCH_CALLDATA);
     assert!(!format!("{batch:?}").contains(&calldata));
     assert!(!format!("{swap:?}").contains(&calldata));
+
+    // Neither does it show the permit's signature. An order recorded before permits has no
+    // such field, and decodes as an order without one.
+    let signature = alloy::hex::encode(PUBLIC_SWAP_PERMIT_SIGNATURE);
+    let permit = swap.order().unwrap().permit().unwrap();
+    assert_eq!(permit.signature(), &PUBLIC_SWAP_PERMIT_SIGNATURE);
+    assert!(!format!("{permit:?}").contains(&signature));
+    assert!(!format!("{swap:?}").contains(&signature));
+    let mut earlier = order.clone();
+    earlier.as_object_mut().unwrap().remove("permit").unwrap();
+    let earlier: PublicSwapOrder = serde_json::from_value(earlier).unwrap();
+    assert!(earlier.permit().is_none());
+    assert_eq!(earlier.batch(), batch);
 }
 
 #[test]

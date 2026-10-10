@@ -45,15 +45,17 @@ use super::order::{
     order_limit_or_tight, placeholder_destination_shield_multicall, swap_gas_pricing, swap_order,
     swap_order_limit, swap_submission_outcome, swap_submission_status, valid_to_after,
 };
+use super::public_permit::{PublicSwapApprovalPlan, permit_pre_hook, placeholder_permit_pre_hook};
 use super::public_source::PublicSwapDeliveryQuote;
 use super::public_transactions::{
     AuthorizedPublicSwapSource, ClaimedPublicSwap, PublicSwapGasPlan, proxy_deployed,
-    require_public_swap_source,
+    public_swap_gas_plan, require_public_swap_source,
 };
 use crate::bridge::{AcrossClient, PublicBridgeDestination, PublicBridgePath, PublicSellAsset};
 use crate::cow::{
     CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters, CowSellQuoteRequest,
-    OrderLimit, OrderLimitError, hook_gas_limit, public_deposit_hook_gas, quote_protocol_fee,
+    OrderLimit, OrderLimitError, PUBLIC_PERMIT_HOOK_GAS, hook_gas_limit, public_deposit_hook_gas,
+    quote_protocol_fee,
 };
 use crate::desktop::executor_observation::trace_step;
 use crate::desktop::{gas_price_from_rpc_pool_with_policy, query_rpc_pool_with_http_client};
@@ -68,7 +70,7 @@ use crate::vault::{
 use crate::{ExecutorOwner, TokenAnchorRateCache, check_quote_against_anchor};
 
 const ORDER_DATA_TOO_LARGE: &str = "the swap's order data is too large for CoW's orderbook";
-const NO_PUBLIC_SWAPS: &str = "swaps aren't available from this network";
+pub(super) const NO_PUBLIC_SWAPS: &str = "swaps aren't available from this network";
 /// How long before its `validTo` a signed order is no longer resent: at least one request
 /// timeout, for the orderbook to accept it.
 pub(super) const RESUBMISSION_MARGIN: Duration = Duration::from_mins(1);
@@ -139,6 +141,8 @@ pub struct PublicSwapReview {
     /// The previewed delivery. Its receiver is a placeholder.
     delivery: BridgeDelivery,
     bridge: SwapBridgeQuote,
+    /// How the Public account lets the swap take what it sells, as read for this review.
+    approval_plan: PublicSwapApprovalPlan,
     gas_plan: PublicSwapGasPlan,
     price: SwapPrice,
     /// `None` for a direct deposit.
@@ -152,10 +156,11 @@ pub(super) struct PublicOrderReview {
     quote: CowQuoteParameters,
     /// `CoW`'s protocol fee in bought-token units, when the quote states it.
     cow_fee: Option<U256>,
-    limit: OrderLimit,
+    pub(super) limit: OrderLimit,
     /// The quote-time gas inputs, kept so that another gas share reprices without I/O.
     gas: SwapGasPricing,
-    /// The conservative gas estimate of the order's post-hook, which the limit prices.
+    /// The conservative gas estimate of the order's hooks, which the limit prices: its
+    /// post-hook, and its permit pre-hook when it was reviewed with one.
     hook_gas: u64,
     /// The share the limit was priced at, the Tight preset when the requested one left no
     /// positive minimum.
@@ -332,6 +337,7 @@ impl PublicSwapReview {
                 private: Some(BridgePrivateDelivery { on_shield_failure }),
             },
             bridge,
+            approval_plan: PublicSwapApprovalPlan::None,
             gas_plan: PublicSwapGasPlan {
                 approval_gas_limits: Vec::new(),
                 deposit_gas_limit: None,
@@ -343,11 +349,34 @@ impl PublicSwapReview {
             order,
         }
     }
+    /// This order's review as one read for a token with a permit: the account signs its
+    /// approval, sends nothing, and the order binds the permit pre-hook's gas limit.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn signing_permit_for_tests(mut self) -> Self {
+        self.approval_plan =
+            PublicSwapApprovalPlan::Permit(super::public_permit::PublicSwapPermitPlan::for_tests());
+        self.gas_plan.approval_gas_limits.clear();
+        self.gas_plan.max_gas_cost = U256::ZERO;
+        self
+    }
     /// The Public account's own transactions: its approvals, and the deposit on the direct
     /// path.
     #[must_use]
     pub const fn gas_plan(&self) -> &PublicSwapGasPlan {
         &self.gas_plan
+    }
+    /// How the Public account lets the swap take what it sells: nothing more, a permit it
+    /// signs, or the approvals [`Self::gas_plan`] prices.
+    #[must_use]
+    pub const fn approval_plan(&self) -> &PublicSwapApprovalPlan {
+        &self.approval_plan
+    }
+    /// Whether the Public account signs its approval as a permit the order carries, in place
+    /// of sending one.
+    #[must_use]
+    pub const fn signs_permit(&self) -> bool {
+        self.approval_plan.signs_permit()
     }
     /// The cow-shed proxy of the Public account, for an order.
     #[must_use]
@@ -424,7 +453,13 @@ impl PublicSwapReview {
                 private_minimum: self.bridge.received_minimum(),
                 shield_fee_bps: U256::ZERO,
                 slippage_bps: self.slippage_bps,
-                pre_hook_gas_limit: 0,
+                // Nonzero exactly while the approval plan signs a permit, which only an
+                // order's does: this is what authorizes the permit pre-hook.
+                pre_hook_gas_limit: if self.approval_plan.signs_permit() {
+                    hook_gas_limit(PUBLIC_PERMIT_HOOK_GAS)
+                } else {
+                    0
+                },
                 post_hook_gas_limit: order.map(|order| order.hook_gas_limit),
                 hook_cost: order.map(|order| order.limit.gas_estimate),
                 anchors: match &self.price {
@@ -496,6 +531,20 @@ pub(super) fn price_public_order(
     })
 }
 
+/// The conservative gas estimate an order's limit prices for its hooks: the post-hook's, and
+/// the permit pre-hook's when `plan` signs one.
+pub(super) const fn public_order_hook_gas(
+    proxy_deployed: bool,
+    plan: &PublicSwapApprovalPlan,
+) -> u64 {
+    let permit = if plan.signs_permit() {
+        PUBLIC_PERMIT_HOOK_GAS
+    } else {
+        0
+    };
+    public_deposit_hook_gas(proxy_deployed, GasEstimateMode::UpperBound).saturating_add(permit)
+}
+
 /// The amount the signed `terms` of a swap approved with `bounds` deposit: an order's buy
 /// amount, or what a direct deposit sells. An order's is the approved buy amount, raised by at
 /// most the approval's cushion when the bridge quote fell short while signing. A direct
@@ -565,7 +614,8 @@ pub(crate) fn public_order_hooks(
 
 /// The fill-or-kill sell order of a swap paid from a Public account and its app data: it pays
 /// `proxy`, and its one post-hook is `hook_calldata`, the signed `executeHooks` call on the
-/// cow-shed factory. An app data document beyond the profile's byte budget is an error.
+/// cow-shed factory. `permit_hook` is its pre-hook, for an order that carries a signed permit.
+/// An app data document beyond the profile's byte budget is an error.
 pub(crate) fn public_order(
     profile: &PublicSwapProfile,
     sell_token: Address,
@@ -576,8 +626,9 @@ pub(crate) fn public_order(
     proxy: Address,
     hook_calldata: Bytes,
     hook_gas_limit: u64,
+    permit_hook: Option<AppDataHook>,
 ) -> Result<(Order, EncodedAppData)> {
-    let app_data = public_order_app_data(profile, hook_calldata, hook_gas_limit)?;
+    let app_data = public_order_app_data(profile, permit_hook, hook_calldata, hook_gas_limit)?;
     let order = swap_order(
         sell_token,
         buy_token,
@@ -590,15 +641,17 @@ pub(crate) fn public_order(
     Ok((order, app_data))
 }
 
-/// App data with `hook_calldata` on the cow-shed factory as its only hook, a post-hook.
+/// App data with `hook_calldata` on the cow-shed factory as its one post-hook, and
+/// `permit_hook` as its pre-hook when the order carries a signed permit.
 fn public_order_app_data(
     profile: &PublicSwapProfile,
+    permit_hook: Option<AppDataHook>,
     hook_calldata: Bytes,
     hook_gas_limit: u64,
 ) -> Result<EncodedAppData> {
     let app_data = AppData::hooks(
         profile.app_code().to_owned(),
-        Vec::new(),
+        permit_hook.into_iter().collect(),
         vec![AppDataHook {
             call_data: hook_calldata,
             gas_limit: hook_gas_limit,
@@ -615,12 +668,14 @@ fn public_order_app_data(
 /// The length of the app data of an order whose delivery shields `destination_token` with
 /// `shield_multicall`, or an error when it is beyond the profile's byte budget. Every other
 /// argument of the hook is a static ABI word and the signature is 65 bytes, so placeholders
-/// give the signed hook's length. Nothing here names an account or a signed payload.
+/// give the signed hook's length. With `permit_hook_gas_limit` the order also carries a permit
+/// pre-hook declared with that limit. Nothing here names an account or a signed payload.
 pub(crate) fn public_order_app_data_len(
     profile: &PublicSwapProfile,
     destination_token: Address,
     shield_multicall: Bytes,
     hook_gas_limit: u64,
+    permit_hook_gas_limit: Option<u64>,
 ) -> Result<usize> {
     let deposit = BalanceDeposit {
         proxy: Address::ZERO,
@@ -651,9 +706,14 @@ pub(crate) fn public_order_app_data_len(
         signature: Bytes::from_static(&[0; 65]),
     }
     .abi_encode();
-    Ok(public_order_app_data(profile, hook.into(), hook_gas_limit)?
-        .document
-        .len())
+    Ok(public_order_app_data(
+        profile,
+        permit_hook_gas_limit.map(placeholder_permit_pre_hook),
+        hook.into(),
+        hook_gas_limit,
+    )?
+    .document
+    .len())
 }
 
 /// A fresh nonce for an order's hook batch, from the system's random source. The caller draws
@@ -715,7 +775,7 @@ pub fn public_swap_batch_terms(
 /// The EIP-712 payload of `message`, a value of the struct `S`, in `domain`. The pinned
 /// `TypedData::from_struct` needs `S: Serialize`, which the shared contract structs don't
 /// derive, so the types come from `S` and the caller supplies the message's JSON.
-fn typed_data<S: SolStruct>(domain: Eip712Domain, message: Value) -> Result<Value> {
+pub(super) fn typed_data<S: SolStruct>(domain: Eip712Domain, message: Value) -> Result<Value> {
     let mut resolver = Resolver::from_struct::<S>();
     resolver.ingest_string(domain.encode_type())?;
     Ok(serde_json::to_value(TypedData {
@@ -910,7 +970,7 @@ impl ExecutorOwner {
             PublicSellAsset::Native { wrapped } => (Address::ZERO, wrapped),
         };
 
-        let (order, price, spender) = match path {
+        let (order, price, approval_plan) = match path {
             PublicBridgePath::Deposit => {
                 if deposited != bridged_token {
                     return Err(eyre!(
@@ -935,7 +995,17 @@ impl ExecutorOwner {
                         rate,
                         observations: Vec::new(),
                     });
-                (None, price, spoke_pool)
+                let plan = self
+                    .public_swap_approval_plan(
+                        origin,
+                        source,
+                        sell_token,
+                        spoke_pool,
+                        sell_amount,
+                        false,
+                    )
+                    .await?;
+                (None, price, plan)
             }
             PublicBridgePath::Order => {
                 let profile = origin
@@ -965,8 +1035,26 @@ impl ExecutorOwner {
                     query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
                 // The first batch of an account deploys its proxy, which costs the hook more.
                 let deployed = proxy_deployed(&pool, proxy).await?;
-                let hook_gas = public_deposit_hook_gas(deployed, GasEstimateMode::UpperBound);
-                let hook_gas_limit = hook_gas_limit(hook_gas);
+                // A permit travels in the order as a pre-hook, so the plan is read before the
+                // order is priced: the limit prices that hook's gas too.
+                let plan = self
+                    .public_swap_approval_plan(
+                        origin,
+                        source,
+                        sell_token,
+                        profile.vault_relayer(),
+                        sell_amount,
+                        true,
+                    )
+                    .await?;
+                let permit_hook_gas_limit = plan
+                    .signs_permit()
+                    .then(|| hook_gas_limit(PUBLIC_PERMIT_HOOK_GAS));
+                let hook_gas = public_order_hook_gas(deployed, &plan);
+                let hook_gas_limit = hook_gas_limit(public_deposit_hook_gas(
+                    deployed,
+                    GasEstimateMode::UpperBound,
+                ));
                 // An order whose app data can't fit is refused here, before anything is
                 // approved or signed.
                 let app_data_len = public_order_app_data_len(
@@ -974,6 +1062,7 @@ impl ExecutorOwner {
                     destination_token,
                     placeholder_destination_shield_multicall(delivery)?,
                     hook_gas_limit,
+                    permit_hook_gas_limit,
                 )?;
                 let quote = async {
                     orderbook
@@ -1029,7 +1118,7 @@ impl ExecutorOwner {
                     hook_gas_limit,
                     valid_for_secs,
                 )?;
-                (Some(order), price, profile.vault_relayer())
+                (Some(order), price, plan)
             }
         };
 
@@ -1051,18 +1140,14 @@ impl ExecutorOwner {
             token_registry,
         )
         .await?;
-        let gas_plan = self
-            .plan_public_swap_gas(
-                origin,
-                source,
-                sell_token,
-                spender,
-                sell_amount,
-                order.is_none(),
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-            )
-            .await?;
+        // A permit and a covered allowance take no transaction, and so no gas from the account.
+        let gas_plan = public_swap_gas_plan(
+            origin,
+            approval_plan.transactions().len(),
+            order.is_none(),
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        )?;
         Ok(PublicSwapReview {
             path,
             sell_token,
@@ -1074,15 +1159,87 @@ impl ExecutorOwner {
             spoke_pool,
             delivery,
             bridge,
+            approval_plan,
             gas_plan,
             price,
             order,
         })
     }
 
-    /// Review the actual delivery costs that stopped signing, with only the Public account's
-    /// remaining transactions priced at its originally reviewed fee rates. Approval already
-    /// paid on-chain must not be charged again. No bridge preview or order quote is requested.
+    /// `review`'s approval plan read again, with only the transactions that remain priced at
+    /// its originally reviewed fee rates. An order's review priced its hooks, so a permit it
+    /// didn't plan for needs a fresh review.
+    async fn requote_public_swap_plan(
+        &self,
+        review: &PublicSwapReview,
+        origin: &EffectiveChainConfig,
+        source: Address,
+    ) -> Result<(PublicSwapApprovalPlan, PublicSwapGasPlan)> {
+        let spender = if review.order.is_some() {
+            origin
+                .public_swap_profile()
+                .ok_or_else(|| eyre!(NO_PUBLIC_SWAPS))?
+                .vault_relayer()
+        } else {
+            review.spoke_pool
+        };
+        let plan = self
+            .public_swap_approval_plan(
+                origin,
+                source,
+                review.sell_token,
+                spender,
+                review.sell_amount,
+                review.order.is_some(),
+            )
+            .await?;
+        if plan.signs_permit() && !review.signs_permit() {
+            return Err(eyre!(
+                "the Public account's approval can now be signed instead of sent; review the swap again"
+            ));
+        }
+        let gas_plan = public_swap_gas_plan(
+            origin,
+            plan.transactions().len(),
+            review.order.is_none(),
+            review.gas_plan.max_fee_per_gas,
+            review.gas_plan.max_priority_fee_per_gas,
+        )?;
+        Ok((plan, gas_plan))
+    }
+
+    /// Review the approval transactions signing found the Public account must now send, where
+    /// `review` planned a permit or none: the same review with its approval plan read again
+    /// and only the remaining transactions priced at its originally reviewed fee rates. This
+    /// changes no saved approval, and nothing is quoted.
+    pub async fn requote_public_swap_approvals(
+        &self,
+        review: &PublicSwapReview,
+        origin: &EffectiveChainConfig,
+        source: Address,
+    ) -> Result<PublicSwapReview> {
+        self.while_active(Box::pin(async {
+            if origin.chain_id != review.origin_chain
+                || review.delivery.destination_chain != self.chain.chain_id
+            {
+                return Err(eyre!("the reviewed swap belongs to another network"));
+            }
+            let (approval_plan, gas_plan) = self
+                .requote_public_swap_plan(review, origin, source)
+                .await?;
+            Ok(PublicSwapReview {
+                approval_plan,
+                gas_plan,
+                ..review.clone()
+            })
+        }))
+        .await
+    }
+
+    /// Review the actual delivery costs that stopped signing, with the approval plan read
+    /// again and only the Public account's remaining transactions priced at its originally
+    /// reviewed fee rates. Approval already paid on-chain must not be charged again, and a
+    /// permit still costs the account no gas. No bridge preview or order quote is requested.
     pub async fn requote_public_swap_delivery(
         &self,
         review: &PublicSwapReview,
@@ -1097,25 +1254,8 @@ impl ExecutorOwner {
                 return Err(eyre!("the reviewed swap belongs to another network"));
             }
             let mut corrected = review.with_delivery_quote(quote)?;
-            let spender = if review.order.is_some() {
-                origin
-                    .public_swap_profile()
-                    .ok_or_else(|| eyre!(NO_PUBLIC_SWAPS))?
-                    .vault_relayer()
-            } else {
-                review.spoke_pool
-            };
-            corrected.gas_plan = self
-                .plan_public_swap_gas(
-                    origin,
-                    source,
-                    review.sell_token,
-                    spender,
-                    review.sell_amount,
-                    review.order.is_none(),
-                    review.gas_plan.max_fee_per_gas,
-                    review.gas_plan.max_priority_fee_per_gas,
-                )
+            (corrected.approval_plan, corrected.gas_plan) = self
+                .requote_public_swap_plan(review, origin, source)
                 .await?;
             Ok(corrected)
         }))
@@ -1259,9 +1399,11 @@ impl ExecutorOwner {
     /// [`Self::submit_public_swap_order`] with the Public account's signer.
     ///
     /// Nothing is signed while the proxy holds the bought token, or unless the batch decodes
-    /// back to the approved terms. The batch and the order are in the record before the
-    /// orderbook request. The same request for an order that is already recorded resends it
-    /// without a new signature, whatever `batch_nonce` it carries.
+    /// back to the approved terms. An order approved with a permit signs it before the batch,
+    /// and signs nothing more unless the signed permit executes on the token. The batch, the
+    /// permit and the order are in the record before the orderbook request. The same request
+    /// for an order that is already recorded resends it without a new signature, whatever
+    /// `batch_nonce` it carries.
     pub(crate) async fn submit_public_swap_order_with_signer(
         &self,
         operation: ExecutorOperationId,
@@ -1435,6 +1577,36 @@ impl ExecutorOwner {
             ));
         }
 
+        // An order approved with a permit signs it first, and proves it on the token before
+        // the batch or the order is signed. An allowance that covers the sale by now needs
+        // none.
+        let permit = if approval.bounds.pre_hook_gas_limit == 0 {
+            None
+        } else {
+            Box::pin(self.sign_public_swap_permit(
+                origin,
+                signer,
+                sell_token,
+                profile.vault_relayer(),
+                approval.bounds.sell_amount,
+                valid_to,
+                hash_fallback_confirmed,
+            ))
+            .await?
+        };
+        let permit_hook = permit
+            .as_ref()
+            .map(|permit| {
+                permit_pre_hook(
+                    sell_token,
+                    source,
+                    profile.vault_relayer(),
+                    permit,
+                    approval.bounds.pre_hook_gas_limit,
+                )
+            })
+            .transpose()?;
+
         let chain_id = origin.chain_id;
         let batch_signature = self
             .while_active(sign_public_swap_typed_data(
@@ -1462,6 +1634,7 @@ impl ExecutorOwner {
             proxy,
             hook_calldata.clone(),
             hook_gas_limit,
+            permit_hook,
         )?;
         let settlement = profile.settlement();
         let digest = order_digest(&order, chain_id, settlement);
@@ -1482,13 +1655,16 @@ impl ExecutorOwner {
         self.store.record_public_swap_path(
             operation,
             swap_use,
-            PublicSwapPath::Order(Box::new(PublicSwapOrder::new(
-                uid,
-                terms.input_token,
-                proxy,
-                PublicSwapHookBatch::new(hook_calldata, batch_nonce, valid_to),
-                SwapSubmission::new(signature, quote_id),
-            ))),
+            PublicSwapPath::Order(Box::new(
+                PublicSwapOrder::new(
+                    uid,
+                    terms.input_token,
+                    proxy,
+                    PublicSwapHookBatch::new(hook_calldata, batch_nonce, valid_to),
+                    SwapSubmission::new(signature, quote_id),
+                )
+                .with_permit(permit),
+            )),
             *terms,
         )?;
         self.notify_change();
@@ -1512,8 +1688,9 @@ impl ExecutorOwner {
 
     /// Resend the persisted signed order without a new signature, after a restart or a lost
     /// response. The order is rebuilt from the record alone: the approval's sold token and
-    /// amount and its hook gas limit, and the recorded buy token, signed buy amount, proxy,
-    /// `validTo`, signed batch and order signature. An order that doesn't rebuild to its recorded UID isn't sent.
+    /// amount and its hook gas limits, and the recorded buy token, signed buy amount, proxy,
+    /// `validTo`, signed batch, signed permit and order signature. An order that doesn't
+    /// rebuild to its recorded UID isn't sent.
     pub async fn resubmit_public_swap_order(
         &self,
         operation: ExecutorOperationId,
@@ -1573,6 +1750,18 @@ impl ExecutorOwner {
             saved.proxy(),
             saved.batch().calldata().clone(),
             hook_gas_limit,
+            saved
+                .permit()
+                .map(|permit| {
+                    permit_pre_hook(
+                        approval.sell_token,
+                        claimed.source,
+                        profile.vault_relayer(),
+                        permit,
+                        approval.bounds.pre_hook_gas_limit,
+                    )
+                })
+                .transpose()?,
         )?;
         let uid = order_uid(
             &order,
