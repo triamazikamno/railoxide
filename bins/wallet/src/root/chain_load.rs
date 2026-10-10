@@ -1536,7 +1536,7 @@ impl WalletRoot {
         self.blocked_shield_rescue_lookup_generation =
             self.blocked_shield_rescue_lookup_generation.wrapping_add(1);
         self.pending_ppoi_validation_toast = None;
-        self.active_wallet_tab = WalletTab::default();
+        self.active_wallet_tab = self.default_wallet_tab();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }

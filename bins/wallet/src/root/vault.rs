@@ -41,7 +41,7 @@ use zeroize::Zeroizing;
 
 use super::wallet_header::WalletSelectItem;
 use super::{
-    BroadcasterActivityTab, ChainUtxoState, WalletRoot, WalletTab, dialog_max_height,
+    BroadcasterActivityTab, ChainUtxoState, WalletRoot, dialog_max_height,
     secondary_dialog_content_width,
 };
 

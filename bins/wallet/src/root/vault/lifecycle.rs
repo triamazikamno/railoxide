@@ -13,7 +13,7 @@ use super::{
     Arc, BroadcasterActivityTab, ChainUtxoState, Context, DesktopViewSession, ParentElement,
     PendingSoftwareProfileOpen, RememberedWalletKind, SearchableVec, Styled, VaultError,
     VaultState, ViewUnlock, WalletMetadataBundle, WalletOption, WalletRoot, WalletSetupMode,
-    WalletTab, Window, WindowExt, Zeroizing, app_strong_text, default_wallet_label_for_metadata,
+    Window, WindowExt, Zeroizing, app_strong_text, default_wallet_label_for_metadata,
     dialog_max_height, hardware_device_kind_from_wallet_select_value, px,
     secondary_dialog_content_width, vault_error_kind, vault_error_message, visible_wallet_metadata,
     wallet_options_from_metadata, wallet_select_items_from_metadata,
@@ -1277,7 +1277,7 @@ impl WalletRoot {
         self.reset_public_wallet_state(window, cx);
         self.private_action_form = None;
         self.broadcaster_picker = None;
-        self.active_wallet_tab = WalletTab::default();
+        self.active_wallet_tab = self.default_wallet_tab();
         self.setup_password = None;
         self.add_wallet_device_auth_password = None;
         self.vault_view_unlock = None;
