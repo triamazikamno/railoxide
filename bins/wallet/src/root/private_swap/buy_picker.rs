@@ -1352,6 +1352,7 @@ fn network_pane(view: &Entity<PrivateSwapsView>, content: &BuyPickerContent) -> 
     // Each segment says how many networks its delivery kind lists.
     let switch = |id: &'static str, tab: WalletTab, hint: &'static str, receive_to: ReceiveTo| {
         let view = view.clone();
+        let networks = content.network_list.clone();
         let selected = content.receive_to == receive_to;
         let count = if receive_to == ReceiveTo::PrivateBalance {
             private
@@ -1378,6 +1379,10 @@ fn network_pane(view: &Entity<PrivateSwapsView>, content: &BuyPickerContent) -> 
         .debug_selector(move || id.into())
         .on_click(move |_, window, cx| {
             view.update(cx, |view, cx| view.set_receive_to(receive_to, window, cx));
+            // A Public address is chosen by network first, so its search takes the focus.
+            if receive_to == ReceiveTo::PublicAddress {
+                networks.update(cx, |list, cx| list.focus(window, cx));
+            }
         })
     };
     div()

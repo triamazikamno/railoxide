@@ -6276,6 +6276,17 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
                 "a Public address needs only RPC endpoints"
             );
         });
+        cx.update(|window, cx| {
+            let picker = &swaps.read(cx).form.as_ref().unwrap().picker;
+            assert!(
+                picker
+                    .networks
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "the Public switch moves the focus to the network search"
+            );
+        });
 
         // Pick USDT on Polygon: the network and the token arrive together.
         click("swap-buy-picker-network-137", cx);
