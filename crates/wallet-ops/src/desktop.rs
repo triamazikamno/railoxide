@@ -1,5 +1,6 @@
 use super::*;
 
+mod blocked_shield_rescue;
 mod executor_discovery;
 mod executor_observation;
 pub(crate) mod executors;
@@ -41,6 +42,7 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     );
 }
 
+pub use blocked_shield_rescue::*;
 pub use executor_discovery::*;
 pub use executors::*;
 pub use local_cache::*;
@@ -54,6 +56,7 @@ pub use requests::*;
 pub use self_broadcast::SelfBroadcastResolvedGasFee;
 pub(crate) use self_broadcast::*;
 pub use self_broadcast::{
+    DesktopSelfBroadcastResult, DesktopSponsoredSelfBroadcastResult, SelfBroadcastTxOutcome,
     SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastCommandSender,
     SponsoredSelfBroadcastSessionOutcome, SponsoredSelfBroadcastSessionRequest,
     SponsoredSelfBroadcastStopReason, run_sponsored_self_broadcast_session,

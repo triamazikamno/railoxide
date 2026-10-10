@@ -5,6 +5,93 @@ use eyre::eyre;
 use crate::block_observer::BlockObserver;
 use crate::public_wallet::PublicTransactionObservationGuard;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSponsoredSelfBroadcastResult {
+    pub prepared: PreparedSponsoredCall,
+    pub outcome: SponsoredSelfBroadcastSessionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfBroadcastTxOutcome {
+    Receipt(TxReceiptOutput),
+    /// The receipt of a transaction the wallet sent for a stealth account, with whether
+    /// the account's nonce was read past the payload's afterwards.
+    ExecutorReceipt {
+        receipt: TxReceiptOutput,
+        state: vault::ExecutorPayloadState,
+    },
+    InclusionUnobserved {
+        tx_hash: String,
+    },
+}
+
+impl SelfBroadcastTxOutcome {
+    #[must_use]
+    pub const fn receipt(&self) -> Option<&TxReceiptOutput> {
+        match self {
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => Some(receipt),
+            Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    /// A stealth account's receipt tells a revert at the time. Its success establishes
+    /// completion only once the account's nonce is read past the payload's.
+    #[must_use]
+    pub const fn execution_status(&self) -> Option<bool> {
+        match self {
+            Self::Receipt(receipt) => Some(receipt.status),
+            Self::ExecutorReceipt { receipt, state } => match (receipt.status, state) {
+                (false, _) => Some(false),
+                (true, vault::ExecutorPayloadState::Resolved) => Some(true),
+                (true, vault::ExecutorPayloadState::Pending) => None,
+            },
+            Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn tx_hash(&self) -> &str {
+        match self {
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => &receipt.tx_hash,
+            Self::InclusionUnobserved { tx_hash } => tx_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSelfBroadcastResult {
+    pub chain_id: u64,
+    pub public_account_uuid: String,
+    pub gas_payer: Address,
+    pub gas_limit: u64,
+    pub rpc_gas_price: u128,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub estimated_native_gas_cost: U256,
+    pub live_native_balance: U256,
+    pub tx: SelfBroadcastTxOutcome,
+    pub attempts: Vec<SelfBroadcastAttemptInfo>,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
+}
+
+pub(super) struct SelfBroadcastPreflight {
+    pub(super) tx_req: TransactionRequest,
+    pub(super) nonce: u64,
+    pub(super) gas_limit: u64,
+    pub(super) rpc_gas_price: u128,
+    pub(super) max_fee_per_gas: u128,
+    pub(super) max_priority_fee_per_gas: u128,
+    pub(super) estimated_native_gas_cost: U256,
+    pub(super) live_native_balance: U256,
+}
+
+pub(super) struct SubmittedSelfBroadcastAttempt {
+    pub(super) info: SelfBroadcastAttemptInfo,
+    pub(super) rpc_gas_price: u128,
+    pub(super) estimated_native_gas_cost: U256,
+    pub(super) live_native_balance: U256,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelfBroadcastWinnerOutput {
     gas_limit: u64,

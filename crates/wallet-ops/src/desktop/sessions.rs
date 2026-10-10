@@ -6,6 +6,199 @@ use super::*;
 
 const WALLET_SYNC_TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletSyncTip {
+    pub last_scanned_block: Option<u64>,
+    pub head_block: Option<u64>,
+    pub safe_head_block: Option<u64>,
+    pub head_last_advanced_at_unix_secs: Option<u64>,
+    pub indexed_catch_up: Option<WalletIndexedCatchUpStatus>,
+}
+
+#[derive(Clone)]
+pub struct WalletSessionObservation {
+    pub snapshot: Arc<ListUtxosOutput>,
+    pub readiness: WalletReadiness,
+    pub ppoi_workflow_status: WalletPpoiWorkflowStatus,
+}
+
+pub struct WalletSession {
+    pub chain_id: u64,
+    pub poi_read_source: PoiReadSource,
+    pub cache_key: String,
+    pub start_block: u64,
+    pub observation_rx: watch::Receiver<WalletSessionObservation>,
+    pub sync_tip_rx: watch::Receiver<WalletSyncTip>,
+    pub poi_refreshing_rx: watch::Receiver<bool>,
+    pub poi_artifact_cache_progress_rx:
+        Option<watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>>,
+    pub(crate) db: Arc<DbStore>,
+    pub(crate) sync_manager: Arc<SyncManager>,
+    pub(crate) chain_key: ChainKey,
+    pub(crate) handle: WalletHandle,
+    pub(crate) public_data_plane: PublicDataPlaneHandle,
+    pub(super) projection_cancel_tx: watch::Sender<bool>,
+    pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(super) executor_owner: Option<Arc<ExecutorOwner>>,
+}
+
+pub struct WalletPoiArtifactCacheRetry {
+    retry: CorePoiArtifactCacheRetry,
+    handle: WalletHandle,
+}
+
+impl WalletPoiArtifactCacheRetry {
+    #[must_use]
+    pub const fn attempt_id(&self) -> PoiArtifactCacheAttemptId {
+        self.retry.attempt_id()
+    }
+
+    pub async fn wait(self) -> Result<bool> {
+        self.retry
+            .wait()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(self.handle.refresh_poi_statuses().await)
+    }
+}
+
+impl WalletSession {
+    #[must_use]
+    pub fn executor_owner(&self) -> Option<Arc<ExecutorOwner>> {
+        self.executor_owner.clone()
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        if let Some(owner) = &self.executor_owner {
+            owner.shutdown().await;
+        }
+        let result = self
+            .sync_manager
+            .remove_wallet_session(&self.handle)
+            .await
+            .wrap_err("remove wallet sync worker");
+        if result.is_err() {
+            let _ = self.projection_cancel_tx.send(true);
+        }
+        let projection_join = match self.projection_join.lock() {
+            Ok(mut projection_join) => projection_join.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(projection_join) = projection_join {
+            projection_join
+                .await
+                .wrap_err("join wallet session observation projection")?;
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn unspent_utxos(&self) -> Vec<Utxo> {
+        let Some(snapshot) = self.handle.current_snapshot() else {
+            return Vec::new();
+        };
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        if let Some(owner) = &self.executor_owner {
+            return owner.available_inputs(inputs).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "executor input reservations are unavailable; private spending remains blocked"
+                );
+                Vec::new()
+            });
+        }
+        inputs
+    }
+
+    /// Spendable notes for this prepared operation, including its own durable reservation.
+    pub fn unspent_utxos_for_executor(
+        &self,
+        prepared: &PreparedExecutorOperation,
+    ) -> Result<Vec<Utxo>> {
+        let snapshot = self
+            .handle
+            .current_snapshot()
+            .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
+        // Retain ordinary actor/chain pending-spend and POI admission. Only this
+        // operation's additional durable executor reservation may be reused.
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        self.executor_owner
+            .as_ref()
+            .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?
+            .inputs_for_preparation(inputs, prepared)
+    }
+
+    pub(crate) async fn mark_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: Option<FixedBytes<32>>,
+    ) {
+        match self.handle.mark_pending_spent_utxos(utxos, tx_hash).await {
+            Ok(
+                WalletPendingSpentMarkOutcome::Marked
+                | WalletPendingSpentMarkOutcome::AlreadyProtected,
+            ) => {}
+            Err(error) => {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend update");
+            }
+        }
+    }
+
+    pub(crate) async fn renew_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: FixedBytes<32>,
+    ) -> Result<()> {
+        self.handle
+            .mark_pending_spent_utxos(utxos, Some(tx_hash))
+            .await
+            .map(|_| ())
+            .map_err(Report::new)
+            .wrap_err("renew local pending-spend protection")
+    }
+
+    pub async fn clear_local_pending_spent(&self) -> bool {
+        self.handle
+            .clear_all_local_pending_spent()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
+                false
+            })
+    }
+
+    pub async fn refresh_poi_statuses(&self) -> bool {
+        self.handle.refresh_poi_statuses().await
+    }
+
+    pub async fn retry_poi_artifact_cache(&self) -> Result<WalletPoiArtifactCacheRetry> {
+        let retry = self
+            .public_data_plane
+            .retry_poi_artifact_cache()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(WalletPoiArtifactCacheRetry {
+            retry,
+            handle: self.handle.clone(),
+        })
+    }
+}
+
+impl Drop for WalletSession {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.executor_owner {
+            owner.close();
+        }
+        let _ = self.projection_cancel_tx.send(true);
+        if let Ok(projection_join) = self.projection_join.get_mut()
+            && let Some(projection_join) = projection_join.take()
+        {
+            projection_join.abort();
+        }
+    }
+}
+
 pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
