@@ -312,6 +312,9 @@ struct SwapTracking {
     /// wallet checks the approved terms again and asks to place the order without waiting
     /// for the user to return. Cleared after the first attempt, so failures don't repeat.
     auto_place: bool,
+    /// The delivery allowance earlier signing quotes of this swap showed its previews to lack,
+    /// added to each later review until an order is submitted.
+    delivery_shortfall: Option<U256>,
 }
 
 /// A swap's name, after the token its receiver gets on a Bridge swap's destination network.

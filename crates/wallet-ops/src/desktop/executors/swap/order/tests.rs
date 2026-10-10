@@ -1144,6 +1144,27 @@ fn a_private_deliverys_destination_terms_need_a_new_review() {
             current: U256::from(25),
         })
     );
+
+    // A shortfall that earlier signing quotes showed moves from the destination minimum to the
+    // delivery allowance. One that leaves no minimum changes nothing.
+    assert_eq!(
+        delivery_shortfall_allowance(U256::from(1_000), U256::from(900)),
+        U256::from(125)
+    );
+    assert!(reviewed.with_delivery_shortfall(U256::from(900)).is_none());
+    let allowance = reviewed.bridge.unwrap().private.unwrap().delivery_allowance;
+    let bridge = reviewed
+        .with_delivery_shortfall(U256::from(125))
+        .unwrap()
+        .bridge
+        .unwrap();
+    assert_eq!(
+        (
+            bridge.destination_minimum,
+            bridge.private.unwrap().delivery_allowance
+        ),
+        (U256::from(775), allowance + U256::from(125))
+    );
 }
 
 // A requote after setup that falls short of the approved minimums by at most a fifth of the

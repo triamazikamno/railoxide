@@ -8,7 +8,7 @@
 //! confirm-only step places the order; otherwise the review opens again. Retries and changed
 //! terms use the form without a setup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -60,7 +60,7 @@ use wallet_ops::{
         CowOrderbookClient, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
         OrderLimitError,
     },
-    default_public_broadcaster_fee_limit, prepare_swap_pair,
+    default_public_broadcaster_fee_limit, delivery_shortfall_allowance, prepare_swap_pair,
     settings::{
         BridgeDestinationProfile, BridgeProfile, BridgeReceiverRejection, EffectiveChainConfig,
         EffectiveTokenRegistry, SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
@@ -91,7 +91,8 @@ use super::model::{
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-    SwapAction, SwapJobKind, swap_delivery, swap_private_delivery, swap_sell_amount, swap_tokens,
+    SwapAction, SwapJobKind, SwapTracking, swap_delivery, swap_private_delivery, swap_sell_amount,
+    swap_tokens,
 };
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 use crate::root::broadcaster_picker::{
@@ -6447,11 +6448,28 @@ impl PrivateSwapsView {
                 // The destination terms changed, so consent to the old ones doesn't carry over.
                 form.price_acknowledged = false;
                 form.high_costs_acknowledged = false;
-                form.quote = QuoteState::Ready(Arc::new(review));
+                form.quote = QuoteState::Ready(Arc::new(Self::with_tracked_delivery(
+                    &self.tracking,
+                    operation,
+                    review,
+                )));
             }
             Err(error) => form.bridge_quote_error = Some(error.into()),
         }
         self.quote_installed(operation, window, cx);
+    }
+
+    /// `review` with the delivery allowance this swap's signing quotes showed its preview to
+    /// lack. It takes the tracking alone, so the caller may hold the form.
+    fn with_tracked_delivery(
+        tracking: &BTreeMap<ExecutorOperationId, SwapTracking>,
+        operation: Option<ExecutorOperationId>,
+        review: SwapReview,
+    ) -> SwapReview {
+        operation
+            .and_then(|operation| tracking.get(&operation)?.delivery_shortfall)
+            .and_then(|extra| review.with_delivery_shortfall(extra))
+            .unwrap_or(review)
     }
 
     fn apply_quote(
@@ -6501,7 +6519,11 @@ impl PrivateSwapsView {
                     _ => review,
                 };
                 // The quote names no receiver, so it takes the form's as it is now.
-                QuoteState::Ready(Arc::new(review.with_receiver(form.quote_receiver())))
+                QuoteState::Ready(Arc::new(Self::with_tracked_delivery(
+                    &self.tracking,
+                    operation,
+                    review.with_receiver(form.quote_receiver()),
+                )))
             }
             Ok(QuoteOutcome::PriceBlocked(block)) => QuoteState::PriceBlocked(block),
             Err(error) => QuoteState::Failed(error),
@@ -7653,6 +7675,14 @@ impl PrivateSwapsView {
             self.tracking.entry(operation).or_default().auto_place = true;
             return;
         }
+        // An approval made from a preview without the shortfall is a change now, not after
+        // another signing round.
+        let outcome = match outcome {
+            QuoteOutcome::Review(review) => QuoteOutcome::Review(Box::new(
+                Self::with_tracked_delivery(&self.tracking, Some(operation), *review),
+            )),
+            outcome => outcome,
+        };
         let change = match outcome {
             QuoteOutcome::Review(review) => match review.approved_order_minimum(approval) {
                 // The approved minimum, or a Bridge deposit raised to keep the approved
@@ -8023,12 +8053,31 @@ impl PrivateSwapsView {
             tracking.cursor = None;
             tracking.error = None;
             tracking.auto_place = false;
+            tracking.delivery_shortfall = None;
             // The swap's own form or detail moves on to the detail; another dialog stays.
             if !window.has_active_dialog(cx) || shown {
                 self.show_detail(operation, window, cx);
             }
             cx.notify();
             return;
+        }
+        // A signing quote below the approved destination minimum shows what the preview's
+        // delivery allowance lacks. Record it before the swap's next review is quoted.
+        if let SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+            approved,
+            current,
+        }) = outcome
+        {
+            let shortfall = &mut self
+                .tracking
+                .entry(operation)
+                .or_default()
+                .delivery_shortfall;
+            *shortfall = Some(
+                shortfall
+                    .unwrap_or_default()
+                    .saturating_add(delivery_shortfall_allowance(approved, current)),
+            );
         }
         if window.has_active_dialog(cx)
             && !shown

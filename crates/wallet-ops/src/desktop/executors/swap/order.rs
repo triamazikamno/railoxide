@@ -106,7 +106,8 @@ const SWAP_SPEND_OPERATION: &str = "private swap pre-hook";
 /// Divisor of the approved allowed gas that gives a first order's cushion: a fifth, 20%. A
 /// requote after setup that falls short of the approved minimums by at most this much, in
 /// buy-token base units, is signed at those minimums without a new review. The order then
-/// leaves solvers that much less for gas.
+/// leaves solvers that much less for gas. An Across quote that falls short of the approved
+/// destination minimum while signing raises the deposit within the same cushion.
 const APPROVAL_CUSHION_DIVISOR: u64 = 5;
 
 /// Margin added to a Bridge deposit scaled up to the approved destination minimum, in basis
@@ -131,6 +132,16 @@ pub(super) fn scaled_bridge_deposit(deposit: U256, approved: U256, quoted: U256)
         .checked_mul(U256::from(BRIDGE_DEPOSIT_MARGIN_BPS))?
         .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
     scaled.checked_add(margin)
+}
+
+/// What a signing quote that delivered `current`, below the approved destination minimum
+/// `approved`, adds to the delivery allowance of the swap's later reviews, in destination-token
+/// base units: the shortfall and a quarter of it, the cushion the gas estimates take, rounded
+/// up. The preview estimates the destination shield's gas, and Across prices the real message.
+#[must_use]
+pub fn delivery_shortfall_allowance(approved: U256, current: U256) -> U256 {
+    let shortfall = approved.saturating_sub(current);
+    shortfall.saturating_add(shortfall.div_ceil(U256::from(4)))
 }
 
 const DESTINATION_ACCOUNT_MISMATCH: &str = "a private Bridge delivery needs its destination stealth account, and no other delivery takes one";
@@ -456,6 +467,30 @@ impl SwapReview {
         review
     }
 
+    /// This review with `extra` more delivery allowance, in destination-token base units: what
+    /// earlier signing quotes of this swap showed the preview's estimate to lack. The destination
+    /// minimum and expected output fall by it. `None` unless this is an Across private delivery
+    /// that leaves a positive minimum.
+    #[must_use]
+    pub fn with_delivery_shortfall(&self, extra: U256) -> Option<Self> {
+        self.plan.delivery.private_bridge()?;
+        let mut bridge = self
+            .bridge
+            .filter(|bridge| bridge.provider == BridgeProvider::Across)?;
+        let mut private = bridge.private?;
+        bridge.destination_minimum = bridge
+            .destination_minimum
+            .checked_sub(extra)
+            .filter(|minimum| !minimum.is_zero())?;
+        bridge.expected_output = bridge.expected_output.saturating_sub(extra);
+        private.delivery_allowance = private.delivery_allowance.saturating_add(extra);
+        bridge.private = Some(private);
+        Some(Self {
+            bridge: Some(bridge),
+            ..self.clone()
+        })
+    }
+
     /// Shield fee for a `CoW` payout. Across shields only what remains after its fixed deposit.
     #[must_use]
     pub fn shield_fee_on_output(&self, amount: U256) -> U256 {
@@ -769,12 +804,35 @@ impl SwapReview {
         } else {
             approved.private_minimum
         };
-        let shortfall = self
-            .buy_amount_for(minimum)
-            .ok()?
-            .saturating_sub(quoted_buy_amount);
-        let cushion = approval_cushion(approved_allowance);
-        (shortfall <= cushion && shortfall <= self.gas_allowance()).then_some(minimum)
+        self.within_cushion(minimum, approved_allowance)
+            .then_some(minimum)
+    }
+
+    /// Whether an order signed at `minimum` stays within the cushion: its buy amount exceeds
+    /// this review's by at most a fifth of `approved_allowance`, and by at most this review's
+    /// allowed gas.
+    fn within_cushion(&self, minimum: U256, approved_allowance: U256) -> bool {
+        let Ok(buy_amount) = self.buy_amount_for(minimum) else {
+            return false;
+        };
+        let shortfall = buy_amount.saturating_sub(self.limit.buy_amount);
+        shortfall <= approval_cushion(approved_allowance) && shortfall <= self.gas_allowance()
+    }
+
+    /// The deposit to sign when the signing quote for `deposit` delivers `quoted`, below the
+    /// approved `destination_minimum`: [`scaled_bridge_deposit`], at least `deposit`, when it
+    /// stays within the cushion. Bridge orders carry no shield, so the deposit is the private
+    /// minimum.
+    fn raised_deposit(
+        &self,
+        deposit: U256,
+        destination_minimum: U256,
+        quoted: U256,
+        approved_allowance: U256,
+    ) -> Option<U256> {
+        let raised = scaled_bridge_deposit(deposit, destination_minimum, quoted)?.max(deposit);
+        self.within_cushion(raised, approved_allowance)
+            .then_some(raised)
     }
 
     /// The validity in whole seconds, as the approval records it.
@@ -1933,7 +1991,9 @@ impl ExecutorOwner {
     /// receiver must pass [`SwapProfile::check_receiver`], and a public Bridge receiver the
     /// destination chain's [`crate::settings::BridgeDestinationProfile::check_receiver`]. A
     /// Bridge order's provider is quoted again before anything is signed: Across for the
-    /// deposit's terms, NEAR Intents for a verified deposit address that the order pays. Persist
+    /// deposit's terms, NEAR Intents for a verified deposit address that the order pays. An
+    /// Across quote below the approved destination minimum is taken once more for a deposit
+    /// raised within the approval's cushion, which the order then signs. Persist
     /// them with the input reservation and the provider's terms, then submit. Nothing signed
     /// leaves the wallet before the write succeeds.
     ///
@@ -2144,7 +2204,7 @@ impl ExecutorOwner {
         let valid_to = valid_to_after(SystemTime::now(), review.valid_for)?;
         // The provider quotes the approved order before anything is signed. A 1Click quote
         // names the receiver, so it follows every check above.
-        let (bridge_terms, private_delivery) = match bridge {
+        let (bridge_terms, private_delivery, raised) = match bridge {
             Some((delivery, route)) => {
                 let destination_minimum = destination_minimum
                     .ok_or_else(|| eyre!("a bridge swap needs its approved destination minimum"))?;
@@ -2204,7 +2264,7 @@ impl ExecutorOwner {
                             handler: private.handler,
                             message,
                         });
-                let signing = trace_step(
+                let mut signing = trace_step(
                     "order_bridge_quote",
                     self.while_active(self.bridge_signing_terms(
                         review,
@@ -2220,14 +2280,78 @@ impl ExecutorOwner {
                     )),
                 )
                 .await?;
+                // An Across quote that fell short within the approval's cushion is taken again
+                // for the deposit that delivers the approved minimum. The destination shield
+                // stays the one signed for that minimum. A NEAR Intents quote creates a deposit
+                // address, so it is never requested twice.
+                let mut raised = None;
+                if let BridgeSigning::Changed(SwapReviewChange::DestinationMinimum {
+                    current, ..
+                }) = signing
+                    && delivery.provider == BridgeProvider::Across
+                {
+                    // The allowed gas of the approval that binds a first order, else the
+                    // review's own.
+                    let approved_allowance = record
+                        .swap_approval()
+                        .filter(|_| record.swap().is_none())
+                        .and_then(|approval| approval.bounds.gas_allowance)
+                        .unwrap_or_else(|| review.gas_allowance());
+                    let deposit = review.raised_deposit(
+                        buy_amount,
+                        destination_minimum,
+                        current,
+                        approved_allowance,
+                    );
+                    tracing::debug!(target: "executor_observation", step = "order_bridge_quote",
+                        approved = %destination_minimum, current = %current,
+                        within_cushion = deposit.is_some(), "below the approved minimum");
+                    if let Some(deposit) = deposit
+                        && let Ok(raised_buy) = review.require_approval(
+                            deposit,
+                            Some(destination_minimum),
+                            price_acknowledged,
+                        )
+                    {
+                        let raised_signing = trace_step(
+                            "order_bridge_quote",
+                            self.while_active(self.bridge_signing_terms(
+                                review,
+                                route,
+                                delivery,
+                                raised_buy,
+                                destination_minimum,
+                                valid_to,
+                                handler_message,
+                                &profile,
+                                anchor_cache,
+                                token_registry,
+                            )),
+                        )
+                        .await?;
+                        // A still-short quote for the raised deposit can't replace the review
+                        // at its reviewed deposit. Keep that first change.
+                        if matches!(raised_signing, BridgeSigning::Terms(_)) {
+                            signing = raised_signing;
+                            raised = Some((deposit, raised_buy));
+                        }
+                    }
+                }
                 match signing {
-                    BridgeSigning::Terms(terms) => (Some(terms), private_delivery),
+                    BridgeSigning::Terms(terms) => (Some(terms), private_delivery, raised),
                     BridgeSigning::Changed(change) => {
                         return Ok(SwapOrderOutcome::ReviewRequired(change));
                     }
                 }
             }
-            None => (None, None),
+            None => (None, None, None),
+        };
+        // A raised deposit is the order's minimum and buy amount from here on.
+        let (private_minimum, buy_amount, gas_allowance) = match raised {
+            Some((deposit, raised_buy)) => {
+                (deposit, raised_buy, review.gas_allowance_for(deposit)?)
+            }
+            None => (private_minimum, buy_amount, gas_allowance),
         };
         // The destination session is needed until the order is signed. One that ended during
         // the quote stops the order before anything of this account is signed.

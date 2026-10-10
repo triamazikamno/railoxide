@@ -58,7 +58,7 @@ pub(super) use order::invalidates_order;
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,
     SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
-    swap_submission_outcome,
+    delivery_shortfall_allowance, swap_submission_outcome,
 };
 #[cfg(test)]
 pub(crate) use order::{

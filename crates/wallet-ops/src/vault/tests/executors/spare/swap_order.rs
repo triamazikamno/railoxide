@@ -3038,6 +3038,9 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         // still signed nothing.
         let quoted = Arc::new(Mutex::new((U256::from(1_005), false)));
         let answer = quoted.clone();
+        // An output that answers the next quote only.
+        let quoted_once = Arc::new(Mutex::new(None::<U256>));
+        let answer_once = quoted_once.clone();
         let durable = Arc::new(Mutex::new(Vec::new()));
         let observed = durable.clone();
         // A destination owner that the stub closes while it answers the quote.
@@ -3078,6 +3081,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 owner.close();
             }
             let (output, simulation_fails) = *answer.lock().unwrap();
+            let output = answer_once.lock().unwrap().take().unwrap_or(output);
             if simulation_fails {
                 let error = json!({
                     "type": "AcrossApiError", "code": "SIMULATION_ERROR", "status": 400,
@@ -3295,12 +3299,40 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         );
         fixture.assert_unsigned(&store, &submissions);
 
-        let SwapOrderOutcome::Submitted { uid } = issue().await.unwrap() else {
+        // The review allows gas of about 3% of the quote. Its signing quote is one unit short
+        // of the approved minimum, and the deposit that delivers 1,000 again costs less than a
+        // fifth of that gas, so Across is asked once more for the raised deposit and the order
+        // is signed without a review.
+        let plan = review.plan().clone();
+        let gas_price_wei = 100_000_000_000_000_000 / u128::from(plan.hook_gas_estimate());
+        let mut cushioned = BridgeOrderFixture::review_at(
+            plan,
+            &swap_profile,
+            BridgeProvider::Across,
+            gas_price_wei,
+            1_000,
+        );
+        cushioned.set_bridge_for_tests(review.bridge().unwrap());
+        let reviewed_minimum = cushioned.suggested_private_minimum();
+        let reviewed_buy = cushioned.buy_amount_for(reviewed_minimum).unwrap();
+        *quoted_once.lock().unwrap() = Some(U256::from(999));
+        let outcome = fixture
+            .issue_with(
+                &owner,
+                &orderbook,
+                route,
+                &cushioned,
+                reviewed_minimum,
+                Some(destination),
+            )
+            .await
+            .unwrap();
+        let SwapOrderOutcome::Submitted { uid } = outcome else {
             panic!("the order is submitted");
         };
         assert_eq!(
             *durable.lock().unwrap(),
-            [(true, true); 4],
+            [(true, true); 5],
             "each message's shield payload is durable before the request, and nothing of the swap's own account is signed yet"
         );
 
@@ -3350,6 +3382,9 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         };
         assert_eq!(sent("recipient").parse::<Address>().unwrap(), handler);
         assert_eq!(sent("message").parse::<Bytes>().unwrap(), message);
+        // It asked for the raised deposit, which the order signs for the approved minimum.
+        let raised_buy = sent("amount").parse::<U256>().unwrap();
+        assert!(raised_buy > reviewed_buy);
 
         // The destination account's record holds that payload at its current nonce: the guard
         // for the approved destination minimum, then a full-balance shield of the token.
@@ -3429,6 +3464,14 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         let Some(BridgeOrderTerms::Across(terms)) = saved.bridge().cloned() else {
             panic!("an Across order keeps its deposit terms");
         };
+        assert_eq!(
+            (
+                terms.input_amount,
+                saved.bounds().buy_amount,
+                saved.bounds().destination_minimum
+            ),
+            (raised_buy, raised_buy, Some(U256::from(1_000)))
+        );
         assert_eq!(
             (terms.recipient, terms.message_hash),
             (Some(handler), Some(alloy::primitives::keccak256(&message)))

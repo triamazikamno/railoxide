@@ -63,8 +63,8 @@ pub use swap::{
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
     SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
     SwapPrivateBridgeQuote, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
-    SwapSetupStatus, SwapUseClaim, is_swap_record, swap_order_state, swap_setup_recorded_executed,
-    swap_setup_status, swap_submission_outcome,
+    SwapSetupStatus, SwapUseClaim, delivery_shortfall_allowance, is_swap_record, swap_order_state,
+    swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
 };
 pub use swap::{
     PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
