@@ -1,4 +1,166 @@
 use super::helpers::*;
+use crate::BlockedShieldRescueBlocker;
+use crate::desktop::executors::Transfer;
+use alloy::rpc::types::Log;
+use alloy::sol_types::SolEvent as _;
+
+const TOKEN: u8 = 0x11;
+const RAILGUN: u8 = 0x22;
+const RELAY_ADAPT: u8 = 0x33;
+const HISTORICAL_RELAY_ADAPT: u8 = 0x34;
+
+fn transfer_log(token: Address, from: Address, to: Address, value: u64) -> Log {
+    Log {
+        inner: alloy::primitives::Log {
+            address: token,
+            data: Transfer {
+                from,
+                to,
+                value: U256::from(value),
+            }
+            .encode_log_data(),
+        },
+        ..Log::default()
+    }
+}
+
+/// The funding account of a Shield of 5 `TOKEN` in a receipt holding `logs`.
+fn funding_account(logs: &[Log], from: Address) -> Option<Address> {
+    crate::shield_funding_account(
+        logs,
+        address(TOKEN),
+        uint!(5_U256),
+        address(RAILGUN),
+        &[address(RELAY_ADAPT), address(HISTORICAL_RELAY_ADAPT)],
+        from,
+    )
+}
+
+#[test]
+fn shield_funding_account_is_the_sender_for_an_own_account_shield() {
+    let sender = address(0xaa);
+    let logs = [transfer_log(address(TOKEN), sender, address(RAILGUN), 5)];
+
+    assert_eq!(funding_account(&logs, sender), Some(sender));
+}
+
+#[test]
+fn shield_funding_account_is_the_delegated_account_not_the_sender() {
+    let solver = address(0xaa);
+    let stealth = address(0xbb);
+    let logs = [
+        // Transfers of another token, or to another recipient, do not fund this Shield.
+        transfer_log(address(0x12), solver, address(RAILGUN), 5),
+        transfer_log(address(TOKEN), solver, stealth, 5),
+        transfer_log(address(TOKEN), stealth, address(RAILGUN), 5),
+    ];
+
+    assert_eq!(funding_account(&logs, solver), Some(stealth));
+}
+
+#[test]
+fn shield_funding_account_is_the_sender_through_a_shared_relay_adapt() {
+    let sender = address(0xaa);
+
+    for relay_adapt in [address(RELAY_ADAPT), address(HISTORICAL_RELAY_ADAPT)] {
+        let logs = [transfer_log(
+            address(TOKEN),
+            relay_adapt,
+            address(RAILGUN),
+            5,
+        )];
+
+        assert_eq!(funding_account(&logs, sender), Some(sender));
+    }
+}
+
+#[test]
+fn shield_funding_account_is_the_sender_without_a_matching_transfer() {
+    let sender = address(0xaa);
+    let logs = [transfer_log(address(TOKEN), sender, address(0xcc), 5)];
+
+    assert_eq!(funding_account(&logs, sender), Some(sender));
+}
+
+#[test]
+fn shield_funding_account_separates_two_funders_by_value() {
+    let sender = address(0xaa);
+    let funder = address(0xbb);
+    let logs = [
+        transfer_log(address(TOKEN), address(0xcc), address(RAILGUN), 7),
+        transfer_log(address(TOKEN), funder, address(RAILGUN), 5),
+    ];
+
+    assert_eq!(funding_account(&logs, sender), Some(funder));
+}
+
+#[test]
+fn shield_funding_account_is_unresolved_for_two_funders_of_equal_value() {
+    let logs = [
+        transfer_log(address(TOKEN), address(0xcc), address(RAILGUN), 5),
+        transfer_log(address(TOKEN), address(0xbb), address(RAILGUN), 5),
+    ];
+
+    assert_eq!(funding_account(&logs, address(0xaa)), None);
+}
+
+#[test]
+fn blocked_shield_rescue_eligibility_names_a_stealth_origin_outside_public() {
+    let origin = address(0xaa);
+    let operation = crate::vault::ExecutorOperationId::random().expect("operation id");
+    let stealth_accounts = [(origin, operation, 7)];
+
+    let eligibility = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
+        &[],
+        &stealth_accounts,
+    );
+
+    assert!(!eligibility.eligible);
+    assert_eq!(eligibility.origin_address, Some(origin));
+    assert_eq!(
+        eligibility.blocker,
+        Some(BlockedShieldRescueBlocker::OriginStealth {
+            operation,
+            index: 7
+        })
+    );
+
+    // An inactive Public account at the same address is the blocker, not the stealth record.
+    let inactive = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
+        &[public_account(
+            "pub-1",
+            origin,
+            crate::vault::PublicAccountStatus::Inactive,
+        )],
+        &stealth_accounts,
+    );
+
+    assert!(matches!(
+        inactive.blocker,
+        Some(BlockedShieldRescueBlocker::OriginInactive { .. })
+    ));
+}
+
+#[test]
+fn blocked_shield_rescue_eligibility_accepts_a_stealth_origin_added_to_public() {
+    let origin = address(0xaa);
+    let operation = crate::vault::ExecutorOperationId::random().expect("operation id");
+
+    let eligibility = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
+        &[public_account(
+            "pub-1",
+            origin,
+            crate::vault::PublicAccountStatus::Active,
+        )],
+        &[(origin, operation, 7)],
+    );
+
+    assert!(eligibility.eligible);
+    assert_eq!(eligibility.public_account_uuid.as_deref(), Some("pub-1"));
+}
 
 #[test]
 fn blocked_shield_rescue_eligibility_accepts_matched_origin_account() {
@@ -30,24 +192,28 @@ fn blocked_shield_rescue_eligibility_accepts_matched_origin_account() {
 #[test]
 fn blocked_shield_rescue_eligibility_requires_origin_account() {
     let origin = address(0xaa);
+    let account = public_account("pub-1", origin, crate::vault::PublicAccountStatus::Inactive);
 
     let missing = crate::blocked_shield_rescue_eligibility_for_origin(Some(origin), &[]);
     let inactive = crate::blocked_shield_rescue_eligibility_for_origin(
         Some(origin),
-        &[public_account(
-            "pub-1",
-            origin,
-            crate::vault::PublicAccountStatus::Inactive,
-        )],
+        std::slice::from_ref(&account),
     );
 
     assert!(!missing.eligible);
     assert_eq!(missing.origin_address, Some(origin));
     assert_eq!(
-        missing.disabled_reason.as_deref(),
-        Some("The Shield origin Public account must be added or activated before refund.")
+        missing.blocker,
+        Some(BlockedShieldRescueBlocker::OriginUnknown)
     );
     assert!(!inactive.eligible);
+    assert_eq!(
+        inactive.blocker,
+        Some(BlockedShieldRescueBlocker::OriginInactive {
+            public_account_uuid: account.public_account_uuid,
+            label: account.label,
+        })
+    );
 }
 
 #[test]
@@ -56,12 +222,7 @@ fn blocked_shield_rescue_eligibility_reports_unresolved_origin() {
 
     assert!(!eligibility.eligible);
     assert_eq!(eligibility.origin_address, None);
-    assert_eq!(
-        eligibility.disabled_reason.as_deref(),
-        Some(
-            "Source transaction origin could not be resolved. Retry after checking RPC connectivity."
-        )
-    );
+    assert!(eligibility.blocker.is_none());
 }
 
 #[test]

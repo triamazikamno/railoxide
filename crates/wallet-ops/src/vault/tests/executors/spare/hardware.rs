@@ -1,7 +1,15 @@
+use super::swap_order::delegate_setup;
+use super::swap_setup::{
+    DESTINATION_CHAIN, DESTINATION_TOKEN, broadcaster, destination_chain_config,
+    private_bridge_approval,
+};
 use super::*;
 use crate::public_wallet::{WalletConnectPersonalSignRequest, walletconnect_sign_personal_message};
 use crate::signer::EvmTransactionSigner as _;
-use crate::{DesktopPrivateSpendAuthorization, HardwareExecutorAction};
+use crate::{
+    DesktopPrivateSpendAuthorization, HardwareExecutorAction, SwapPairPreparation, SwapPairSide,
+    prepare_swap_pair,
+};
 
 pub(in crate::vault::tests::executors) fn hardware_view(
     vault: &DesktopVaultStore,
@@ -630,6 +638,385 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
     assert!(fresh.signer(&vault, &view, "recovery private fee").is_ok());
     owner.shutdown().await;
     drop(owner);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let descriptor = test_hardware_descriptor(1);
+    let view = hardware_view(&vault, &descriptor);
+    let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+    let candidate = broadcaster(origin_chain.accepted_executor_profile().unwrap().delegate());
+    let destination_profile = destination_chain.accepted_executor_profile().unwrap();
+    let mut destination_candidate = broadcaster(destination_profile.delegate());
+    destination_candidate.chain_id = DESTINATION_CHAIN;
+    let [origin, destination] = [origin_chain, destination_chain.clone()].map(|chain| {
+        Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
+        )
+    });
+    let (operation, destination_operation) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    let request = |owner: &Arc<ExecutorOwner>, operation| {
+        owner
+            .hardware_authorization_request(
+                view.clone(),
+                HardwareExecutorAction::Execute(operation),
+            )
+            .unwrap()
+    };
+    // One device session completes two requests only for two chains.
+    assert!(
+        request(&origin, operation)
+            .complete_with_destination(
+                request(&origin, destination_operation),
+                &descriptor,
+                &[42; 32]
+            )
+            .is_err()
+    );
+    let (authorization, destination_authorization) = request(&origin, operation)
+        .complete_with_destination(
+            request(&destination, destination_operation),
+            &descriptor,
+            &[42; 32],
+        )
+        .unwrap();
+    let authorization = DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(authorization));
+    let destination_authorization =
+        DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(destination_authorization));
+    // Each authorization is bound to its own chain's owner, also for the same action.
+    for (owner, operation, candidate, authorization) in [
+        (
+            &destination,
+            operation,
+            destination_candidate.clone(),
+            &authorization,
+        ),
+        (
+            &origin,
+            destination_operation,
+            candidate.clone(),
+            &destination_authorization,
+        ),
+    ] {
+        let delivery = ExecutorDelivery::PublicBroadcaster(Box::new(candidate));
+        assert!(
+            owner
+                .prepare_operation(operation, delivery, authorization, &[], None)
+                .await
+                .is_err()
+        );
+        assert!(owner.records().unwrap().is_empty());
+    }
+
+    let prepared = prepare_swap_pair(
+        &origin,
+        Some(&destination),
+        SwapPairPreparation {
+            use_id: SwapUseId::first(operation),
+            source: SwapAccountChoice::New(operation),
+            destination: Some(SwapAccountChoice::New(destination_operation)),
+            candidate: Some(candidate.clone()),
+            destination_candidate: Some(destination_candidate.clone()),
+            approval: private_bridge_approval(),
+            authorization: &authorization,
+            destination_authorization: Some(&destination_authorization),
+        },
+    )
+    .await
+    .unwrap();
+    let (SwapPairSide::Setup(origin_setup), Some(SwapPairSide::Setup(destination_setup))) =
+        (&prepared.origin, &prepared.destination)
+    else {
+        panic!("both fresh accounts need setup");
+    };
+    // Each account is the software derivation from the device's seed for its own chain.
+    let (seed, _) = vault
+        .hardware_seed_and_signer_for_session(&view, &descriptor, &[42; 32])
+        .unwrap();
+    for (owner, operation, chain_id, prepared) in [
+        (&origin, operation, 1, origin_setup),
+        (
+            &destination,
+            destination_operation,
+            DESTINATION_CHAIN,
+            destination_setup,
+        ),
+    ] {
+        let index = owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+            .index();
+        let expected = railgun_wallet::keys::derive_executor_signer(
+            &seed,
+            view.derivation_index(),
+            chain_id,
+            index,
+        )
+        .unwrap();
+        assert_eq!(prepared.context().executor, expected.address());
+    }
+    assert_ne!(
+        origin_setup.context().executor,
+        destination_setup.context().executor
+    );
+    // The destination account signs its shield and is then registered in Public. Its
+    // hardware-authorized gas signer, which a refund of a blocked shield needs, is refused
+    // while that shield can still execute at its nonce.
+    let destination_store =
+        ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
+    let observed = ExecutorNonceObservation::new(
+        BlockNumHash::new(9, B256::repeat_byte(9)),
+        destination_setup.context().execution_nonce,
+    );
+    destination_store
+        .record_account_read(destination_operation, observed)
+        .unwrap();
+    destination_store
+        .record_swap_destination_shield(
+            destination_operation,
+            crate::vault::SwapUseId::first(operation),
+            IssuedExecutorPayload::new(
+                observed.nonce(),
+                destination_setup.context().delegate,
+                B256::repeat_byte(8),
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                ExecutorPayloadContext::new(Bytes::from_static(b"shield"), observed, Vec::new()),
+            ),
+        )
+        .unwrap();
+    let account = destination
+        .register_public_account(
+            destination_operation,
+            &authorize(
+                &destination,
+                &view,
+                &descriptor,
+                HardwareExecutorAction::Register(destination_operation),
+            ),
+        )
+        .await
+        .unwrap();
+    let gas = authorize(
+        &destination,
+        &view,
+        &descriptor,
+        HardwareExecutorAction::GasPayment {
+            account: account.public_account_uuid.clone(),
+            operation: destination_operation,
+        },
+    );
+    let Err(error) = destination
+        .admit_authorized_gas_signer(&view, &account, &gas)
+        .await
+    else {
+        panic!("an executable destination shield refuses the hardware gas signer");
+    };
+    assert!(
+        format!("{error:#}").contains("earlier signed operation"),
+        "{error:#}"
+    );
+
+    // A later swap reuses a set-up destination account. Skipping its setup doesn't skip its
+    // authorization: the pair is prepared, and the account signs, only with a hardware approval
+    // for that owner, that account and this wallet session.
+    let reused = ExecutorOperationId::random().unwrap();
+    let reused_executor = destination
+        .prepare_operation(
+            reused,
+            ExecutorDelivery::PublicBroadcaster(Box::new(destination_candidate)),
+            &authorize(
+                &destination,
+                &view,
+                &descriptor,
+                HardwareExecutorAction::Execute(reused),
+            ),
+            &[],
+            Some("Private swap"),
+        )
+        .await
+        .unwrap()
+        .context()
+        .executor;
+    let delegated = delegate_setup(&destination_store, reused, destination_profile);
+    let reused_record = || {
+        destination
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == reused)
+            .unwrap()
+    };
+    let source = ExecutorOperationId::random().unwrap();
+    let use_id = crate::vault::SwapUseId::random().unwrap();
+    let mut approval = private_bridge_approval();
+    approval.bounds.destination_setup_fee = None;
+    let source_authorization = authorize(
+        &origin,
+        &view,
+        &descriptor,
+        HardwareExecutorAction::Execute(source),
+    );
+    // The same wallet opened again is another wallet session, with its own owner.
+    let reopened = Arc::new(load_test_hardware_view_session(
+        &vault,
+        TEST_WALLET_ID,
+        &descriptor,
+    ));
+    assert!(
+        destination
+            .hardware_authorization_request(
+                reopened.clone(),
+                HardwareExecutorAction::Execute(reused)
+            )
+            .is_err()
+    );
+    let other_session = Arc::new(
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            reopened.clone(),
+            destination_chain,
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap(),
+    );
+    let refused = [
+        // Approved in another wallet session, for the same account.
+        authorize(
+            &other_session,
+            &reopened,
+            &descriptor,
+            HardwareExecutorAction::Execute(reused),
+        ),
+        // Approved for another account of this owner.
+        authorize(
+            &destination,
+            &view,
+            &descriptor,
+            HardwareExecutorAction::Execute(destination_operation),
+        ),
+        // Approved for the other chain's owner.
+        authorize(
+            &origin,
+            &view,
+            &descriptor,
+            HardwareExecutorAction::Execute(reused),
+        ),
+    ];
+    let approved = authorize(
+        &destination,
+        &view,
+        &descriptor,
+        HardwareExecutorAction::Execute(reused),
+    );
+    let mismatch = |error: eyre::Report| {
+        assert!(
+            format!("{error:#}").contains("another action or wallet session"),
+            "{error:#}"
+        );
+    };
+    let preparation = |destination_authorization| SwapPairPreparation {
+        use_id,
+        source: SwapAccountChoice::New(source),
+        destination: Some(SwapAccountChoice::Existing(reused)),
+        approval: approval.clone(),
+        candidate: Some(candidate.clone()),
+        destination_candidate: None,
+        authorization: &source_authorization,
+        destination_authorization: Some(destination_authorization),
+    };
+    let before = (origin.records().unwrap(), destination.records().unwrap());
+    for authorization in &refused {
+        mismatch(
+            prepare_swap_pair(&origin, Some(&destination), preparation(authorization))
+                .await
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(
+            (origin.records().unwrap(), destination.records().unwrap()),
+            before
+        );
+    }
+    let pair = prepare_swap_pair(&origin, Some(&destination), preparation(&approved))
+        .await
+        .unwrap();
+    let Some(SwapPairSide::Existing { executor, .. }) = pair.destination else {
+        panic!("the reused destination takes no setup");
+    };
+    assert!(pair.origin.requires_setup());
+    // The reused account is the derivation for its recorded index on its own chain.
+    let derived = railgun_wallet::keys::derive_executor_signer(
+        &seed,
+        view.derivation_index(),
+        DESTINATION_CHAIN,
+        reused_record().index(),
+    )
+    .unwrap();
+    assert_eq!((executor, reused_executor), (derived.address(), executor));
+
+    // Its shield is signed only with that approval, by the key derived for that index. The
+    // chain holds the account's delegation and nonce for the balance read before the shield.
+    rpc.set_delegated_account(
+        executor,
+        destination_profile.delegate(),
+        delegated.observed().nonce(),
+    );
+    let issued = reused_record().issued().len();
+    let sign = |authorization| {
+        destination.issue_swap_destination_shield(
+            delegated,
+            use_id,
+            DESTINATION_TOKEN,
+            U256::from(1_000),
+            authorization,
+            None,
+        )
+    };
+    for authorization in &refused {
+        mismatch(sign(authorization).await.unwrap_err());
+        assert_eq!(reused_record().issued().len(), issued);
+    }
+    let shield = sign(&approved).await.unwrap();
+    let record = reused_record();
+    let payload = record.issued().last().unwrap();
+    assert_eq!(
+        (
+            payload.purpose(),
+            payload.nonce(),
+            payload.context().calldata()
+        ),
+        (
+            ExecutorPayloadPurpose::SwapDestinationShield,
+            delegated.observed().nonce(),
+            &shield
+        )
+    );
+    other_session.shutdown().await;
+    drop(other_session);
+    drop(destination_store);
+    origin.shutdown().await;
+    destination.shutdown().await;
+    drop((origin, destination));
     drop(view);
     drop(vault);
     drop(db);

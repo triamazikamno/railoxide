@@ -5387,7 +5387,8 @@ fn proposal_decoded_preview(
             .map(|usd| format!("≈ {}", railgun_ui::format_usd_micro_value(usd)));
         ProposalDecodedHero {
             rounded: format_native_token_amount_for_display(chain_id, amount),
-            icon: railgun_ui::chain_icon_asset_path(chain_id).map(WalletIconSource::embedded),
+            icon: railgun_ui::native_currency_icon_asset_path(chain_id)
+                .map(WalletIconSource::embedded),
             context: combine_context(usd_context, context),
             amount_copy_value: None,
             context_copy_value: None,

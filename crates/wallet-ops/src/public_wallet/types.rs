@@ -5,12 +5,12 @@ use std::time::{Instant, SystemTime};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::RpcRead;
-use crate::TxReceiptOutput;
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
@@ -19,6 +19,25 @@ use crate::vault::{
 use crate::walletconnect::WalletConnectDecodedTransaction;
 
 pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TxReceiptOutput {
+    pub tx_hash: String,
+    pub status: bool,
+    pub block_number: u64,
+    pub gas_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ShieldSendOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap: Option<TxReceiptOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approve: Option<TxReceiptOutput>,
+    pub shield: TxReceiptOutput,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvmFeeModel {

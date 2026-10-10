@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Allocation, EXECUTOR_RECORD_LOCK, ExecutorDerivationScheme, ExecutorOperationId,
     ExecutorRecord, ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck,
-    RecordKind, VERSION, ordinary_index,
+    LEGACY_VERSION, RecordKind, ordinary_index,
 };
 
 /// A durably allocated account that has not yet been claimed by an operation.
@@ -108,7 +108,7 @@ impl ExecutorStore {
             return Ok(());
         };
         let record = ExecutorRecord {
-            version: VERSION,
+            version: LEGACY_VERSION,
             derivation: spare.derivation,
             origin: ExecutorRecordOrigin::Discovered,
             operation: ExecutorOperationId::random()?,
@@ -124,13 +124,14 @@ impl ExecutorStore {
             use_check: ExecutorUseCheck::default(),
             issued: Vec::new(),
             nonce_observation: None,
-            recovery_transactions: Vec::new(),
-            recovery_observation: None,
+            nonce_watermark: None,
+            settled_nonce: None,
             public_account_uuid: None,
             swap: None,
-            swap_approval: None,
             swap_setup_stopped: false,
             released_payloads: Vec::new(),
+            swap_uses: Vec::new(),
+            active_swap_use: None,
         };
         updates.push(self.seal(
             RecordKind::ExecutorOperation,

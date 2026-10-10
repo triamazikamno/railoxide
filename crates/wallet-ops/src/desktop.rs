@@ -1,9 +1,14 @@
 use super::*;
 
+mod blocked_shield_rescue;
+mod chain_rpc;
 mod executor_discovery;
 mod executor_observation;
 pub(crate) mod executors;
+mod fee_mode;
+mod generation_progress;
 mod local_cache;
+mod private_plan;
 mod private_tx;
 mod prover_cache;
 mod public_broadcaster;
@@ -41,9 +46,14 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     );
 }
 
+pub use blocked_shield_rescue::*;
+pub(crate) use chain_rpc::*;
 pub use executor_discovery::*;
 pub use executors::*;
+pub use fee_mode::*;
+pub use generation_progress::*;
 pub use local_cache::*;
+pub use private_plan::*;
 pub use private_tx::*;
 pub use prover_cache::*;
 #[cfg(test)]
@@ -54,6 +64,7 @@ pub use requests::*;
 pub use self_broadcast::SelfBroadcastResolvedGasFee;
 pub(crate) use self_broadcast::*;
 pub use self_broadcast::{
+    DesktopSelfBroadcastResult, DesktopSponsoredSelfBroadcastResult, SelfBroadcastTxOutcome,
     SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastCommandSender,
     SponsoredSelfBroadcastSessionOutcome, SponsoredSelfBroadcastSessionRequest,
     SponsoredSelfBroadcastStopReason, run_sponsored_self_broadcast_session,

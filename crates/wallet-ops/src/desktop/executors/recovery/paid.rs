@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,6 +100,20 @@ pub struct ExecutorPrivateFeeLimitExceeded {
 }
 
 impl ExecutorPrivateFeeLimitExceeded {
+    pub(in crate::desktop::executors) const fn new(
+        purpose: PaidExecutionPurpose,
+        fee_token: Address,
+        maximum: U256,
+        required: U256,
+    ) -> Self {
+        Self {
+            purpose: purpose.label(),
+            fee_token,
+            maximum,
+            required,
+        }
+    }
+
     #[must_use]
     pub const fn fee_token(&self) -> Address {
         self.fee_token
@@ -300,7 +315,9 @@ impl ExecutorOwner {
 
     /// Prove, issue, and hand one executor `execute` to its selected broadcaster.
     /// The only private output is the broadcaster fee; `calls` run as its actions.
-    pub(in crate::desktop::executors) async fn submit_paid_execution(
+    pub(in crate::desktop::executors) async fn submit_paid_execution<
+        A: Borrow<DesktopPrivateSpendAuthorization> + Send,
+    >(
         &self,
         purpose: PaidExecutionPurpose,
         preparation: &PreparedExecutorOperation,
@@ -309,7 +326,7 @@ impl ExecutorOwner {
         budget_gas: u64,
         maximum_private_fee: U256,
         session: &WalletSession,
-        authorization: DesktopPrivateSpendAuthorization,
+        authorization: A,
         waku: &Arc<WakuClient>,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
@@ -340,7 +357,7 @@ impl ExecutorOwner {
         .await
     }
 
-    async fn submit_paid_execution_active(
+    async fn submit_paid_execution_active<A: Borrow<DesktopPrivateSpendAuthorization> + Send>(
         &self,
         purpose: PaidExecutionPurpose,
         preparation: &PreparedExecutorOperation,
@@ -349,7 +366,7 @@ impl ExecutorOwner {
         budget_gas: u64,
         maximum_private_fee: U256,
         session: &WalletSession,
-        authorization: DesktopPrivateSpendAuthorization,
+        authorization: A,
         waku: &Arc<WakuClient>,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
@@ -409,7 +426,10 @@ impl ExecutorOwner {
         })
         .await?;
         forest.compute_roots();
-        let signer = authorization.signer(&self.vault, &self.view, purpose.signer_operation())?;
+        let signer =
+            authorization
+                .borrow()
+                .signer(&self.vault, &self.view, purpose.signer_operation())?;
         // Repriced rounds may reuse the first round's chain evidence. Dropped
         // before submission so a lost broadcaster response cannot enable reuse.
         let mut issue_retry = IssueRetry::default();
@@ -457,7 +477,7 @@ impl ExecutorOwner {
                     preparation,
                     &plan.call,
                     &inputs,
-                    &authorization,
+                    authorization.borrow(),
                     &mut issue_retry,
                 ),
             )
@@ -495,7 +515,8 @@ impl ExecutorOwner {
                 )?;
                 continue;
             }
-            // Keep approval through fee retries, then release it before POI and submission.
+            // Keep approval through fee retries. Owned authorization is released before POI
+            // and submission; a borrowed one remains with its caller.
             drop(issue_retry);
             drop(signer);
             drop(authorization);
@@ -685,20 +706,14 @@ fn bounded_private_fee(
     bounded_public_broadcaster_fee(required, Some(maximum))
 }
 
-fn require_private_fee_limit(
+pub(in crate::desktop::executors) fn require_private_fee_limit(
     fee_token: Address,
     fee: U256,
     maximum: U256,
     purpose: PaidExecutionPurpose,
 ) -> Result<()> {
     if fee > maximum {
-        return Err(ExecutorPrivateFeeLimitExceeded {
-            purpose: purpose.label(),
-            fee_token,
-            maximum,
-            required: fee,
-        }
-        .into());
+        return Err(ExecutorPrivateFeeLimitExceeded::new(purpose, fee_token, maximum, fee).into());
     }
     Ok(())
 }

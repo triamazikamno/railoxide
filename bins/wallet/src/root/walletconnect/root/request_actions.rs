@@ -204,7 +204,7 @@ impl WalletRoot {
         self.publish_gateway_summaries(self.gateway_request_summaries());
         self.load_gateway_asset_metadata(cx);
         self.ensure_walletconnect_pending_request_expiry_timer(cx);
-        self.sync_walletconnect_attention();
+        self.sync_platform_attention();
         cx.notify();
     }
 
@@ -952,7 +952,7 @@ impl WalletRoot {
                 root.walletconnect.request_actions.remove(&request_key);
                 if native_control.as_ref().is_some_and(|control| control.ensure_current().is_err()) {
                     root.walletconnect.remove_pending_request(&request_key);
-                    root.sync_walletconnect_attention();
+                    root.sync_platform_attention();
                     cx.notify();
                     return;
                 }
@@ -1060,7 +1060,7 @@ impl WalletRoot {
                     }
                 }
                 root.refresh_walletconnect_gas_fee_quote(Arc::from(request_key.as_str()), cx);
-                root.sync_walletconnect_attention();
+                root.sync_platform_attention();
                 cx.notify();
             });
         })
@@ -1418,7 +1418,7 @@ impl WalletRoot {
                         "Request was removed locally, but relay error response failed: {error}"
                     )));
                 }
-                root.sync_walletconnect_attention();
+                root.sync_platform_attention();
                 cx.notify();
             });
         })
@@ -1522,7 +1522,7 @@ impl WalletRoot {
                         )));
                     }
                 }
-                root.sync_walletconnect_attention();
+                root.sync_platform_attention();
                 cx.notify();
             });
         })

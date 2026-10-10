@@ -1,13 +1,14 @@
 use super::*;
 use crate::root::auto_lock::AutoLockTimestamp;
 use crate::root::chain_load::{
-    ChainProgressProjection, InstalledObserverProjection, WalletReadinessDisposition,
-    WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
-    chain_load_start_is_allowed, chain_progress_update_is_current,
-    destructive_cache_reset_admission_is_allowed, installed_observer_is_exact_current,
-    installed_observer_terminal_transition, ppoi_validation_completion_is_current,
-    ppoi_validation_toast_scope_is_current, retain_auxiliary_stream, wallet_readiness_disposition,
-    wallet_sync_maintenance_allows_start, wallet_sync_start_is_admitted,
+    ChainProgressProjection, ChainSyncProgress, InstalledObserverProjection,
+    WalletReadinessDisposition, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask,
+    WalletSyncLifecycleCleanupWaitGroup, chain_load_start_is_allowed,
+    chain_progress_update_is_current, destructive_cache_reset_admission_is_allowed,
+    installed_observer_is_exact_current, installed_observer_terminal_transition,
+    ppoi_validation_completion_is_current, ppoi_validation_toast_scope_is_current,
+    retain_auxiliary_stream, wallet_readiness_disposition, wallet_sync_maintenance_allows_start,
+    wallet_sync_start_is_admitted,
 };
 use crate::root::maintenance::{PublicSyncResetCompletion, public_sync_reset_restart_is_safe};
 use crate::root::shell::{
@@ -482,7 +483,9 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
     assert_eq!(observation_rx.borrow().snapshot.utxo_count, 0);
     drop(session);
 
-    let loading = ChainUtxoState::Loading { progress: None };
+    let loading = ChainUtxoState::Loading {
+        progress: ChainSyncProgress::default(),
+    };
     assert!(loading.poi_refresh_session().is_none());
     let reset_store = lifecycle
         .public_sync_cache_reset_cell()
@@ -1272,9 +1275,51 @@ fn syncing_status_retains_wallet_indexing_progress() {
     );
 }
 
+/// A sync's stages each report from zero, and a commitment update can arrive after indexing
+/// started. The chain's one percent covers the stages and never falls.
+#[test]
+fn chain_sync_percent_covers_the_stages_and_never_falls() {
+    let commitments = SyncProgressStage::SynchronizingCommitments;
+    let indexing = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 300);
+    let mut progress = ChainSyncProgress::default();
+    assert_eq!(progress.percent(), None);
+
+    // A cold sync's updates in order.
+    let mut reached = 0;
+    for update in [
+        SyncProgressUpdate::artifact_preparation(commitments, 5, 100),
+        SyncProgressUpdate::artifact_applied(commitments),
+        SyncProgressUpdate::commitment_tail(200, 225, 300),
+        SyncProgressUpdate::artifact_preparation(SyncProgressStage::PreparingUtxoIndex, 5, 100),
+        SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 100, 300),
+        indexing,
+    ] {
+        progress.observe(Some(update));
+        let percent = progress.percent().unwrap();
+        assert!(
+            percent >= reached,
+            "{update:?} lowered {reached}% to {percent}%"
+        );
+        reached = percent;
+    }
+    assert_eq!(progress.latest(), Some(indexing));
+
+    // A commitment update that arrives late doesn't take the sync back.
+    progress.observe(Some(SyncProgressUpdate::new(commitments, 100, 150, 300)));
+    assert_eq!(progress.percent(), Some(reached));
+
+    progress.observe(None);
+    assert_eq!(
+        (progress.latest(), progress.percent()),
+        (None, Some(reached))
+    );
+}
+
 #[test]
 fn loading_chain_state_keeps_utxo_table_available() {
-    let state = ChainUtxoState::Loading { progress: None };
+    let state = ChainUtxoState::Loading {
+        progress: ChainSyncProgress::default(),
+    };
 
     assert!(state.renders_table());
     assert!(state.is_syncing());

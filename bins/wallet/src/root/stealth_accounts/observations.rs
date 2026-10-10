@@ -51,7 +51,7 @@ impl AccountObservations {
         self.inspection = Some(inspection.clone());
     }
 
-    fn merge(
+    pub(super) fn merge(
         &mut self,
         asset: ExecutorAsset,
         amount: Option<U256>,

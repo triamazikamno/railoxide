@@ -152,6 +152,15 @@ impl WalletRoot {
         self.public_form.list_focus.focus(window, cx);
         let root = cx.entity();
         let shield = self.selected_chain_has_railgun();
+        let bridge = self
+            .effective_chain_configs
+            .get(self.selected_chain)
+            .is_some_and(|chain| chain.bridge_origin_profile().is_some())
+            && !matches!(
+                account.source,
+                wallet_ops::vault::PublicAccountSource::ExecutorDerived(_)
+            );
+        let bridge_disabled = account.is_global();
         let focus = self.public_form.list_focus.clone();
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
             let mut menu = menu.action_context(focus);
@@ -179,6 +188,31 @@ impl WalletRoot {
                         });
                     },
                 ));
+            }
+            if bridge {
+                menu = menu.item(
+                    PopupMenuItem::new("Shield on another network…")
+                        .icon(Icon::new(IconName::ArrowRight))
+                        .disabled(bridge_disabled)
+                        .on_click(move |_, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.public_form.asset_menu = None;
+                                root.public_form.list_focus.focus(window, cx);
+                                root.open_public_swap_form(
+                                    uuid.as_ref(),
+                                    Some(asset.token_address().unwrap_or_default()),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+                // A shared account can't pay for a swap, as Pay from says of it.
+                if bridge_disabled {
+                    menu = menu.item(PopupMenuItem::label(
+                        crate::root::private_swap::SHARED_ACCOUNT_REASON,
+                    ));
+                }
             }
             menu
         });

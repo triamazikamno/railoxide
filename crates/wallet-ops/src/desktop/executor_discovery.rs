@@ -253,7 +253,7 @@ async fn inspect_at_with<T>(
     )
 }
 
-async fn asset_balance(
+pub(super) async fn asset_balance(
     provider: &DynProvider,
     address: Address,
     asset: ExecutorAsset,
@@ -340,7 +340,7 @@ pub(super) async fn inspect_for_signing(
     assets: &[ExecutorAsset],
 ) -> Result<(ExecutorInspection, crate::vault::ExecutorNonceObservation)> {
     let (inspection, observed) = Box::pin(inspect_for_recovery_signing(
-        chain, http, address, assets, true, None,
+        chain, http, address, assets, true,
     ))
     .await?;
     Ok((
@@ -349,7 +349,7 @@ pub(super) async fn inspect_for_signing(
     ))
 }
 
-/// Ordinary recovery may originate from an EIP-7702 account with another delegate.
+/// Public signing may originate from an EIP-7702 account with another delegate.
 /// Its owner separately requires a known execution nonce when issued payloads exist.
 pub(super) async fn inspect_for_recovery_signing(
     chain: &EffectiveChainConfig,
@@ -357,21 +357,11 @@ pub(super) async fn inspect_for_recovery_signing(
     address: Address,
     assets: &[ExecutorAsset],
     require_execution_nonce: bool,
-    replacement_nonce: Option<u64>,
 ) -> Result<(
     ExecutorInspection,
     Option<crate::vault::ExecutorNonceObservation>,
 )> {
-    inspect_signing_state(
-        chain,
-        http,
-        address,
-        assets,
-        require_execution_nonce,
-        replacement_nonce,
-        false,
-    )
-    .await
+    inspect_signing_state(chain, http, address, assets, require_execution_nonce, false).await
 }
 
 pub(super) async fn inspect_for_recovery_batch(
@@ -379,10 +369,9 @@ pub(super) async fn inspect_for_recovery_batch(
     http: &HttpContext,
     address: Address,
     assets: &[ExecutorAsset],
-    replacement_nonce: Option<u64>,
 ) -> Result<(ExecutorInspection, crate::vault::ExecutorNonceObservation)> {
     let (inspection, observed) =
-        inspect_signing_state(chain, http, address, assets, true, replacement_nonce, true).await?;
+        inspect_signing_state(chain, http, address, assets, true, true).await?;
     Ok((
         inspection,
         observed.ok_or_else(|| eyre!("recovery execution nonce is unknown"))?,
@@ -395,7 +384,6 @@ async fn inspect_signing_state(
     address: Address,
     assets: &[ExecutorAsset],
     require_execution_nonce: bool,
-    replacement_nonce: Option<u64>,
     recovery: bool,
 ) -> Result<(
     ExecutorInspection,
@@ -487,8 +475,9 @@ async fn inspect_signing_state(
         let Ok(pending_nonce) = provider.get_transaction_count(address).pending().await else {
             continue;
         };
-        if current.account_nonce() != Some(pending_nonce)
-            && replacement_nonce != current.account_nonce()
+        if current
+            .account_nonce()
+            .is_some_and(|nonce| nonce != pending_nonce)
         {
             return Err(eyre!(
                 "executor account has an unconfirmed transaction or authorization"

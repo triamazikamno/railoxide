@@ -104,17 +104,15 @@ impl ExecutorRecoveryApproval {
     }
 
     /// Whether a freshly validated plan fits the terms already presented to the user.
-    /// New delegation or replacement consequences always need an explicit review.
+    /// New delegation consequences always need an explicit review.
     #[must_use]
     pub fn covers(&self, prepared: &PreparedExecutorRecovery, record: &ExecutorRecord) -> bool {
-        let competing = match prepared.execution {
-            ExecutorRecoveryExecution::Ordinary => return false,
-            ExecutorRecoveryExecution::SignedMulticall { nonce }
-            | ExecutorRecoveryExecution::PaidExecute { nonce } => record
-                .issued()
-                .iter()
-                .any(|issued| record.is_outstanding_at(issued, nonce)),
-        };
+        let (ExecutorRecoveryExecution::SignedMulticall { nonce }
+        | ExecutorRecoveryExecution::PaidExecute { nonce }) = prepared.execution;
+        let competing = record
+            .issued()
+            .iter()
+            .any(|issued| record.is_outstanding_at(issued, nonce));
         record.operation() == self.operation
             && self.covers_terms(prepared)
             && (!competing || self.competing_payloads)
@@ -126,7 +124,6 @@ impl ExecutorRecoveryApproval {
             || self.recipient != prepared.recipient
             || self.asset != prepared.asset
             || prepared.changes_delegation()
-            || prepared.replacement_nonce.is_some()
             || prepared.maximum_native_fee > self.maximum_native_fee
         {
             return false;
@@ -237,13 +234,13 @@ mod tests {
         let prepared = PreparedExecutorRecovery {
             operation: approval.operation,
             recovery: ExecutorOperationId::random().unwrap(),
+            expected_active_use: None,
             generation: 0,
             owner: tokio::sync::watch::channel(false).0,
             source: approval.source,
             delegate,
             current_delegate: Some(delegate),
             account_nonce: 1,
-            replacement_nonce: None,
             recipient: approval.recipient.clone(),
             asset: approval.asset,
             amount: approval.amount,
@@ -390,9 +387,6 @@ mod tests {
         prepared.current_delegate = Some(Address::repeat_byte(9));
         assert!(!approval.covers(&prepared, &record));
         prepared.current_delegate = Some(prepared.delegate);
-        prepared.replacement_nonce = Some(1);
-        assert!(!approval.covers(&prepared, &record));
-        prepared.replacement_nonce = None;
         let mut saved = serde_json::to_value(record).unwrap();
         saved["issued"] = serde_json::to_value(vec![IssuedExecutorPayload::new(
             U256::ZERO,

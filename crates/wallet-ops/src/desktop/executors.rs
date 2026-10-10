@@ -1,23 +1,29 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::ops::Range;
 use std::panic::Location;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use alloy::eips::BlockNumHash;
-use alloy::primitives::{B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes};
 use eyre::{Result, eyre};
 use sync_service::WalletHandle;
 use tokio::sync::{Mutex, MutexGuard, watch};
 
-use super::executor_observation::trace_step;
+use super::executor_observation::{ExecutorAccountRead, read_executor_account, trace_step};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    DesktopVaultStore, DesktopViewSession, ExecutorOperationId, ExecutorRecord, ExecutorStore,
+    DesktopVaultStore, DesktopViewSession, ExecutorNonceObservation, ExecutorOperationId,
+    ExecutorRecord, ExecutorStore, SwapUseId,
 };
 use crate::{ExecutorAsset, ExecutorInspection, HttpContext, WalletSyncTip, inspect_executor};
 
+mod attribution;
+pub use attribution::{
+    ExecutorAttributedAction, ExecutorAttribution, ExecutorAttributionEvidence,
+    ExecutorPayloadOutcome, ExecutorSignedAction, InvalidatedSwapOrders, attributed_action,
+    payload_outcome, signed_actions,
+};
 mod authorization;
 pub use authorization::{
     HardwareExecutorAction, HardwareExecutorAuthorization, HardwareExecutorAuthorizationRequest,
@@ -41,23 +47,58 @@ pub use observation::ExecutorTransactionIdentity;
 pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;
 pub use status::{ExecutorAccountOutcome, ExecutorAccountStatus};
+pub(crate) use swap::Transfer;
+pub use swap::is_swap_destination_record;
+#[cfg(test)]
+pub(crate) use swap::submit_swap_pair_setups_with;
 pub use swap::{
-    DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapExecutor,
-    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice, SwapReview,
-    SwapReviewChange, SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, is_swap_record,
-    swap_order_state, swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
+    AuthorizedPublicSwapSource, PUBLIC_ACROSS_DEPOSIT_GAS_UNITS,
+    PUBLIC_PROXY_DEPLOYING_WITHDRAWAL_GAS_UNITS, PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS,
+    PublicSwapApprovalPlan, PublicSwapApprovalsOutcome, PublicSwapGasPlan, PublicSwapPermitPlan,
+    PublicSwapPermitTerms, PublicSwapSource, PublicSwapTransactionOutcome,
+    PublicSwapWithdrawalReview, public_swap_gas_plan,
 };
+pub use swap::{
+    BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
+    SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
+    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
+    SwapPrivateBridgeQuote, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
+    SwapSetupStatus, SwapUseClaim, delivery_shortfall_allowance, is_swap_record, swap_order_state,
+    swap_setup_recorded_executed, swap_setup_status, swap_submission_outcome,
+};
+pub use swap::{
+    PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
+    submit_swap_pair_setups,
+};
+pub use swap::{
+    PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,
+    PublicSwapReviewRequest, PublicSwapUnavailable, new_public_swap_batch_nonce,
+    public_swap_batch_terms,
+};
+pub use swap::{
+    PublicSwapDelivery, PublicSwapDeliveryQuote, PublicSwapDeliverySigning, PublicSwapUseClaim,
+    SwapShieldNotes,
+};
+pub use swap::{PublicSwapOrderState, public_swap_order_state};
+pub use swap::{PublicSwapProgress, PublicSwapTracking};
 #[cfg(test)]
 pub(crate) use swap::{
-    SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs, price_swap_review, reusable_swap_proof,
-    swap_cancellation_admitted, swap_invalidation, swap_recovery_calls,
+    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, notes_of_shield, plan_swap_inputs,
+    price_swap_review, reusable_swap_proof, swap_cancellation_admitted, swap_invalidation,
+    swap_recovery_calls,
 };
 
 pub struct ExecutorReconciliationReport {
     record: ExecutorRecord,
-    /// The executor's code and the canonical block it was read at, if the history read it.
-    code: Option<(BlockNumHash, Bytes)>,
+    /// The executor's code and the confirmed canonical block it was read at.
+    code: (BlockNumHash, Bytes),
 }
+
+/// The account changed while work used an earlier snapshot. Background observers may
+/// discard the result and read again; signing and other explicit actions still fail.
+#[derive(Debug, thiserror::Error)]
+#[error("The stealth account changed during preparation. Review the operation again.")]
+pub struct ExecutorRecordChanged;
 
 impl ExecutorReconciliationReport {
     #[must_use]
@@ -78,11 +119,17 @@ pub struct ExecutorOwner {
     endpoints: super::executor_observation::ObservationEndpoints,
     closed: watch::Sender<bool>,
     activity: Arc<Mutex<()>>,
-    history_coverage: StdMutex<BTreeMap<ExecutorOperationId, status::HistoryCoverage>>,
+    /// The latest confirmed read of each account's execution nonce applied in this session.
+    account_reads: StdMutex<BTreeMap<ExecutorOperationId, ExecutorNonceObservation>>,
     submission_blocks: StdMutex<BTreeMap<ExecutorOperationId, BTreeMap<B256, Option<u64>>>>,
+    /// What this session found of each sold token's permit, by chain and token: its typed-data
+    /// domain, or that it has none. A read that failed is not kept.
+    permit_support: StdMutex<BTreeMap<(u64, Address), swap::PermitSupport>>,
+    /// The swaps whose open order's signed permit was used up while the allowance is short.
+    permit_used_up: StdMutex<BTreeSet<SwapUseId>>,
     tip_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     confirmation_observation_join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Confirmation observer inputs, reused by foreground history reads until close.
+    /// Confirmation observer inputs, reused by foreground account reads until close.
     synced_observation: StdMutex<Option<(WalletHandle, watch::Receiver<WalletSyncTip>)>>,
     unused: StdMutex<spare::UnusedInspections>,
     changes: watch::Sender<u64>,
@@ -119,6 +166,11 @@ impl ExecutorOwner {
         http: HttpContext,
     ) -> Result<Self> {
         let store = ExecutorStore::new(db.clone(), view.clone(), chain.chain_id)?;
+        // Settle destination accounts and retire orphaned reservations before admitting work.
+        // A failure leaves orphan cleanup for the next load.
+        if store.reconcile_swap_destinations_on_load().is_err() {
+            tracing::debug!(target: "executor_observation", step = "swap_destinations", "failed");
+        }
         Ok(Self {
             generation,
             view,
@@ -129,8 +181,10 @@ impl ExecutorOwner {
             http,
             closed: watch::channel(false).0,
             activity: Arc::new(Mutex::new(())),
-            history_coverage: StdMutex::new(BTreeMap::new()),
+            account_reads: StdMutex::new(BTreeMap::new()),
             submission_blocks: StdMutex::new(BTreeMap::new()),
+            permit_support: StdMutex::new(BTreeMap::new()),
+            permit_used_up: StdMutex::new(BTreeSet::new()),
             tip_observation_join: StdMutex::new(None),
             confirmation_observation_join: StdMutex::new(None),
             synced_observation: StdMutex::new(None),
@@ -143,6 +197,13 @@ impl ExecutorOwner {
 
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Configure reads of a recorded account for its delegate's nonce layout.
+    fn chain_for_delegate(&self, delegate: Address) -> Option<EffectiveChainConfig> {
+        let mut chain = self.chain.clone();
+        chain.railgun.as_mut()?.deployment.relay_adapt_7702_contract = delegate;
+        Some(chain)
     }
 
     /// Also releases the observation endpoints, so their background admission stops.
@@ -213,6 +274,18 @@ impl ExecutorOwner {
         Ok(self.store.records()?)
     }
 
+    /// Called on the destination chain's owner. Records what became of each account's shield
+    /// payload from its origin swap, preserving unlinked reservations still being prepared.
+    /// Returns whether any record changed.
+    pub fn reconcile_swap_destinations(&self) -> Result<bool> {
+        self.ensure_active()?;
+        let changed = self.store.reconcile_swap_destinations()?;
+        if changed {
+            self.notify_change();
+        }
+        Ok(changed)
+    }
+
     pub fn set_hidden(&self, operation: ExecutorOperationId, hidden: bool) -> Result<()> {
         self.ensure_active()?;
         self.store.set_hidden(operation, hidden)?;
@@ -253,32 +326,36 @@ impl ExecutorOwner {
         Ok(inputs)
     }
 
-    /// Inputs this operation may spend: its own reservation stays available.
+    /// Inputs this operation may spend: the reservation of its own pending payloads stays
+    /// available.
     pub(crate) fn inputs_for_record(
         &self,
         mut inputs: Vec<railgun_wallet::Utxo>,
         record: &ExecutorRecord,
     ) -> Result<Vec<railgun_wallet::Utxo>> {
-        // A later preparation must not reuse inputs spent by an earlier winner
-        // during the interval before private sync publishes its nullifiers.
+        // Whatever ran at a resolved nonce may have spent its inputs before private sync
+        // publishes their nullifiers, so a later preparation leaves the inputs of every
+        // payload at that nonce alone until the nonce is settled.
         inputs.retain(|input| {
             !record.issued().iter().any(|payload| {
-                let executed = record.payload_status(payload.hash())
-                    == Some(crate::vault::ExecutorPayloadStatus::Executed)
-                    // Hooks inside settlements have no direct-call receipt.
-                    || record.swap().is_some_and(|swap| {
+                let held = if record.nonce_resolved(payload.nonce()) {
+                    !record.nonce_settled(payload.nonce())
+                } else {
+                    // A hook runs inside a settlement, which the swap can observe before
+                    // any account read resolves the hook's nonce.
+                    record.swap().is_some_and(|swap| {
                         swap.orders().iter().any(|order| {
                             order.pre_hook().payload() == payload.hash()
                                 && (order.observations().pre_hook_executed.is_some()
                                     || order.observations().delivered.is_some())
                         })
-                    });
-                executed
-                    && payload
-                        .context()
-                        .inputs()
-                        .iter()
-                        .any(|spent| spent.matches(input))
+                    })
+                };
+                held && payload
+                    .context()
+                    .inputs()
+                    .iter()
+                    .any(|spent| spent.matches(input))
             })
         });
         self.filter_reserved_inputs(inputs, Some(record.operation()))
@@ -299,18 +376,23 @@ impl ExecutorOwner {
         Ok(inputs)
     }
 
-    /// Reconcile an explicit block page and revalidate any previously observed
-    /// inclusions. Partial coverage does not imply that every payload was resolved.
-    pub async fn reconcile_history(
+    /// Read the account's code and execution nonce at the confirmed tip and apply the nonce
+    /// to its record, so every outcome that follows from it is current. No block contents,
+    /// receipts or logs are read. A failed read is an error and leaves the record without
+    /// a nonce observation, so nothing is admitted on an earlier one. Only a user action or
+    /// an active operation calls this.
+    ///
+    /// The read is a fact about the chain, so it is applied to the record as it is by then.
+    /// A caller that decides from the returned record checks it unchanged under activity.
+    pub async fn reconcile_account(
         &self,
         operation: ExecutorOperationId,
-        range: Range<u64>,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
-        // A synced location can record an inclusion from one block before the page
-        // read below. Only owner closure is fatal; the page read reloads the record.
+        // Private sync can resolve a payload with no chain read. Only owner closure is
+        // fatal here.
         if trace_step(
-            "history_synced_location",
+            "account_synced_location",
             self.confirm_synced_operation(operation),
         )
         .await
@@ -318,28 +400,15 @@ impl ExecutorOwner {
         {
             self.ensure_active()?;
         }
-        let guard = self.lock_activity().await;
-        self.ensure_active()?;
-        let (previous, pending) = trace_step("history_load", async {
-            let previous = self.begin_history_reconciliation(operation)?;
-            let pending = self
-                .store
-                .records()?
-                .into_iter()
-                .find(|record| record.operation() == operation)
-                .ok_or_else(|| eyre!("executor operation is unavailable"))?;
-            Ok::<_, eyre::Report>((previous, pending))
-        })
-        .await?;
-        drop(guard);
-        let observed =
-            trace_step("history_read", self.read_history(&previous, range.clone())).await?;
+        let previous = {
+            let _guard = self.lock_activity().await;
+            self.ensure_active()?;
+            self.begin_account_reconciliation(operation)?
+        };
+        let read = trace_step("account_read", self.read_account_state(&previous, None)).await?;
         let _guard = self.lock_activity().await;
-        self.require_record_unchanged(&pending)?;
-        trace_step("history_apply", async {
-            self.apply_history_reconciliation(operation, range, &observed)
-        })
-        .await
+        self.ensure_active()?;
+        self.apply_account_state(operation, read)
     }
 
     /// Network/proof work uses a snapshot. Call under activity before applying its result.
@@ -352,33 +421,25 @@ impl ExecutorOwner {
             .find(|record| record.operation() == previous.operation())
             != Some(previous)
         {
-            return Err(eyre!(
-                "The stealth account changed during preparation. Review the operation again."
-            ));
+            return Err(ExecutorRecordChanged.into());
         }
         Ok(())
     }
 
-    async fn reconcile_history_admitted(
+    /// [`Self::reconcile_account`] for a caller that holds activity through its signing
+    /// guard.
+    async fn reconcile_account_admitted(
         &self,
         operation: ExecutorOperationId,
-        range: Range<u64>,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
-        let previous = trace_step("history_load", async {
-            self.begin_history_reconciliation(operation)
-        })
-        .await?;
-        let observed =
-            trace_step("history_read", self.read_history(&previous, range.clone())).await?;
-        trace_step("history_apply", async {
-            self.apply_history_reconciliation(operation, range, &observed)
-        })
-        .await
+        let previous = self.begin_account_reconciliation(operation)?;
+        let read = trace_step("account_read", self.read_account_state(&previous, None)).await?;
+        self.apply_account_state(operation, read)
     }
 
     // Callers hold activity while invalidating or applying local projections.
-    fn begin_history_reconciliation(
+    fn begin_account_reconciliation(
         &self,
         operation: ExecutorOperationId,
     ) -> Result<ExecutorRecord> {
@@ -392,46 +453,97 @@ impl ExecutorOwner {
         Ok(previous)
     }
 
-    async fn read_history(
+    /// One read of `record`'s account at `requested`, or at the confirmed tip, under its
+    /// delegate's nonce layout.
+    async fn read_account_state(
         &self,
-        previous: &ExecutorRecord,
-        range: Range<u64>,
-    ) -> Result<super::executor_observation::ExecutorHistoryObservation> {
-        let mut historical_chain = self.chain.clone();
-        historical_chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = previous.delegate();
-        historical_chain.enabled = true;
-        self.while_active(super::executor_observation::observe_executor_history(
+        record: &ExecutorRecord,
+        requested: Option<u64>,
+    ) -> Result<ExecutorAccountRead> {
+        let address = record
+            .address()
+            .ok_or_else(|| eyre!("executor address is unavailable"))?;
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
+        chain.enabled = true;
+        self.while_active(read_executor_account(
             &self.endpoints,
-            &historical_chain,
-            previous,
-            range,
-            None,
+            &chain,
+            address,
+            requested,
         ))
         .await
     }
 
-    fn apply_history_reconciliation(
+    /// Callers hold activity. Code the execution nonce is not read under leaves the record
+    /// without a nonce observation.
+    fn apply_account_state(
         &self,
         operation: ExecutorOperationId,
-        range: Range<u64>,
-        observed: &super::executor_observation::ExecutorHistoryObservation,
+        read: ExecutorAccountRead,
     ) -> Result<ExecutorReconciliationReport> {
-        if let Some(nonce) = observed.nonce {
+        let record = if let Some(observed) = read.nonce {
+            self.apply_account_read(operation, observed)?
+        } else {
+            self.date_submissions(operation, read.block.number)?;
+            self.notify_change();
             self.store
-                .reconcile(operation, nonce, &observed.inclusions)?;
+                .records()?
+                .into_iter()
+                .find(|record| record.operation() == operation)
+                .ok_or_else(|| eyre!("executor operation is unavailable"))?
+        };
+        Ok(ExecutorReconciliationReport {
+            record,
+            code: (read.block, read.code),
+        })
+    }
+
+    /// Signing admission's account state, for a caller that holds activity. `observed` is
+    /// the execution nonce the signing inspection read at its confirmed block. A record
+    /// with no issued payload reuses it with no further read. Otherwise the account's code
+    /// and nonce are read at that block, and the inspection's nonce stands only while the
+    /// block is still canonical there. No block contents are read. A failed read admits
+    /// nothing and leaves the record without a nonce observation.
+    async fn admit_signing_read(
+        &self,
+        record: &ExecutorRecord,
+        chain: &EffectiveChainConfig,
+        observed: ExecutorNonceObservation,
+    ) -> Result<ExecutorRecord> {
+        let operation = record.operation();
+        self.store.invalidate_observation(operation)?;
+        if !record.issued().is_empty() {
+            let address = record
+                .address()
+                .ok_or_else(|| eyre!("executor address is unavailable"))?;
+            let read = self
+                .while_active(read_executor_account(
+                    &self.endpoints,
+                    chain,
+                    address,
+                    Some(observed.block().number),
+                ))
+                .await?;
+            if read.block != observed.block() {
+                return Err(eyre!("executor signing block is no longer canonical"));
+            }
+            // Recovery reads the stored nonce of an account under another delegation, a
+            // layout this read leaves undecoded. The inspection's nonce stands then.
+            if read.nonce.is_some_and(|read| read != observed) {
+                return Err(eyre!(
+                    "executor chain observation changed; retry preparation"
+                ));
+            }
         }
-        let record = self.store.reconcile_recovery(
-            operation,
-            observed.block,
-            &observed.recovery_inclusions,
-        )?;
-        // Date an observed submission from the first canonical head read after
-        // handoff. Prefetch and stale session-tip heights cannot make it overdue.
+        self.apply_account_read(operation, observed)
+    }
+
+    /// Date an observed submission from the first canonical head read after handoff,
+    /// `confirmed` being the confirmed block of that read. Prefetch and stale session-tip
+    /// heights cannot make it overdue.
+    fn date_submissions(&self, operation: ExecutorOperationId, confirmed: u64) -> Result<()> {
         if let Some(submissions) = self
             .submission_blocks
             .lock()
@@ -439,39 +551,87 @@ impl ExecutorOwner {
             .get_mut(&operation)
         {
             for submitted in submissions.values_mut() {
-                submitted.get_or_insert(
-                    observed
-                        .block
-                        .number
-                        .saturating_add(self.chain.finality_depth),
-                );
+                submitted.get_or_insert(confirmed.saturating_add(self.chain.finality_depth));
             }
         }
-        let mut coverage = self
-            .history_coverage
+        Ok(())
+    }
+
+    /// Remember a confirmed read of an account's execution nonce that this session applied
+    /// to its record. Account status reads it to say whether the account was read this
+    /// session and whether a submission is overdue. A read older than the one held is left
+    /// out.
+    fn note_account_read(
+        &self,
+        operation: ExecutorOperationId,
+        observed: ExecutorNonceObservation,
+    ) -> Result<()> {
+        let mut reads = self
+            .account_reads
             .lock()
             .map_err(|_| eyre!("executor observations are unavailable"))?;
-        let start = coverage
+        if reads
             .get(&operation)
-            .filter(|previous| {
-                previous.range.end >= range.start
-                    && previous.range.start <= range.start
-                    && previous.observed.number <= observed.block.number
-            })
-            .map_or(range.start, |previous| previous.range.start);
-        coverage.insert(
-            operation,
-            status::HistoryCoverage {
-                range: start..range.end,
-                observed: observed.block,
-            },
-        );
-        drop(coverage);
+            .is_none_or(|held| held.block().number <= observed.block().number)
+        {
+            reads.insert(operation, observed);
+        }
+        Ok(())
+    }
+
+    /// Apply a confirmed read of an account's execution nonce to its record, date the
+    /// submissions that waited for one, and keep the read for this session's status. Callers
+    /// hold activity.
+    fn apply_account_read(
+        &self,
+        operation: ExecutorOperationId,
+        observed: ExecutorNonceObservation,
+    ) -> Result<ExecutorRecord> {
+        let record = self.store.record_account_read(operation, observed)?;
+        self.date_submissions(operation, observed.block().number)?;
+        self.note_account_read(operation, observed)?;
         self.notify_change();
-        Ok(ExecutorReconciliationReport {
-            record,
-            code: observed.code.clone().map(|code| (observed.block, code)),
-        })
+        Ok(record)
+    }
+
+    /// One read of an account's code and execution nonce at the confirmed tip, applied to
+    /// its record as it is by then, so every outcome that follows from the nonce is current.
+    /// No block, receipt or log is read. Only a user action or an active operation calls
+    /// this. Code the execution nonce is not read under leaves the record as it is.
+    pub(super) async fn read_account(
+        &self,
+        operation: ExecutorOperationId,
+    ) -> Result<ExecutorRecord> {
+        self.ensure_active()?;
+        let record = self
+            .store
+            .records()?
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .ok_or_else(|| eyre!("stealth account is unavailable"))?;
+        let read = trace_step("account_read", self.read_account_state(&record, None)).await?;
+        let Some(observed) = read.nonce else {
+            return Ok(record);
+        };
+        let _guard = self.lock_activity().await;
+        self.ensure_active()?;
+        self.apply_account_read(operation, observed)
+    }
+
+    /// Check balance, the account's status action: the balances of
+    /// [`Self::inspect_record`], and one read of the account's execution nonce at the
+    /// confirmed block, which updates the outcomes of everything signed for the account. A
+    /// failed nonce read leaves those outcomes as they were and the balances stand.
+    pub async fn check_record(
+        &self,
+        operation: ExecutorOperationId,
+        assets: &[ExecutorAsset],
+    ) -> Result<ExecutorInspection> {
+        let inspection = self.inspect_record(operation, assets).await?;
+        if self.read_account(operation).await.is_err() {
+            self.ensure_active()?;
+        }
+        Ok(inspection)
     }
 
     /// Persisted addresses can be inspected with view access, without another key derivation.
@@ -492,13 +652,9 @@ impl ExecutorOwner {
         let address = record.address().ok_or_else(|| {
             eyre!("executor address is unavailable; authorize its derivation first")
         })?;
-        let mut historical_chain = self.chain.clone();
-        historical_chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        let mut historical_chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         historical_chain.enabled = true;
         self.while_active(inspect_executor(
             &historical_chain,

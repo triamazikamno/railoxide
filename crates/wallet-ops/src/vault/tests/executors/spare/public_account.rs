@@ -3,7 +3,6 @@ use crate::DesktopPrivateSpendAuthorization;
 use crate::public_wallet::{
     WalletConnectPersonalSignRequest, admitted_public_signer, walletconnect_sign_personal_message,
 };
-use alloy::network::TransactionBuilder as _;
 
 #[tokio::test]
 async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_public_work() {
@@ -109,7 +108,7 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
 }
 
 #[tokio::test]
-async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery() {
+async fn public_signing_reconciles_issued_payloads() {
     let rpc = Rpc::start().await;
     let (root, db, vault) = desktop_store_with_vault();
     let vault = Arc::new(vault);
@@ -141,7 +140,7 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
     store.bind_address(operation, address).unwrap();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(9, B256::repeat_byte(9)), U256::ZERO);
-    store.reconcile(operation, observed, &[]).unwrap();
+    store.record_account_read(operation, observed).unwrap();
     let payload = IssuedExecutorPayload::new(
         U256::ZERO,
         record.delegate(),
@@ -149,7 +148,7 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
         ExecutorPayloadPurpose::Operation,
         ExecutorPayloadContext::new(Bytes::from_static(b"issued"), observed, Vec::new()),
     );
-    store.record_issued(operation, payload.clone()).unwrap();
+    store.record_issued(operation, payload).unwrap();
     let owner = Arc::new(
         ExecutorOwner::new(
             0,
@@ -189,29 +188,44 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("earlier signed operation"));
-    // Advancing the account/execution nonce without a canonical winner is not resolution.
+    // A confirmed read past the payload's nonce resolves it, with no action named. It reads
+    // the account's delegation and nonce and no block history.
     rpc.state.used.lock().unwrap().insert(address);
+    let before = rpc.state.requests.lock().unwrap().len();
+    assert!(
+        walletconnect_sign_personal_message(request(&account))
+            .await
+            .is_ok()
+    );
+    assert!(!store.records().unwrap()[0].has_unresolved_issued_work());
+    {
+        let seen = rpc.state.requests.lock().unwrap();
+        let round = &seen[before..];
+        assert!(
+            round
+                .iter()
+                .any(|request| request["method"] == "eth_getCode"
+                    && request["params"][0] == json!(address))
+        );
+        assert!(
+            round
+                .iter()
+                .all(|request| request["method"] != "eth_getLogs"
+                    && (request["method"] != "eth_getBlockByNumber"
+                        || request["params"][1] != json!(true)))
+        );
+    }
+    // State that can't be read admits nothing, also while the record reads as resolved.
+    rpc.set_delegated_account(address, record.delegate(), U256::ONE);
+    rpc.state.calls.lock().unwrap().insert(address, None);
     assert!(
         walletconnect_sign_personal_message(request(&account))
             .await
             .is_err()
     );
-    // A saved successful inclusion must be revalidated, including in the same owner.
-    store
-        .reconcile(
-            operation,
-            ExecutorNonceObservation::new(observed.block(), U256::ONE),
-            &[(
-                payload.hash(),
-                ExecutorPayloadInclusion::new(
-                    observed.block(),
-                    B256::repeat_byte(5),
-                    ExecutorExecutionResult::Executed,
-                ),
-            )],
-        )
-        .unwrap();
-    assert!(!store.records().unwrap()[0].has_unresolved_issued_work());
+    rpc.state.codes.lock().unwrap().remove(&address);
+    rpc.state.calls.lock().unwrap().remove(&address);
+    // A saved resolution must be revalidated, including in the same owner.
     rpc.state.used.lock().unwrap().remove(&address);
     assert!(
         walletconnect_sign_personal_message(request(&account))
@@ -244,57 +258,73 @@ async fn public_signing_reconciles_issued_payloads_and_reorged_ordinary_recovery
             .await
             .is_ok()
     );
-    let tx_hash = B256::repeat_byte(6);
-    let tx = alloy::rpc::types::TransactionRequest::default()
-        .from(address)
-        .to(Address::repeat_byte(7))
-        .with_chain_id(1)
-        .nonce(1)
-        .with_gas_limit(65_000)
-        .max_fee_per_gas(2)
-        .max_priority_fee_per_gas(1);
+    // A private Bridge swap's destination account that is registered in Public can't pay a
+    // refund's gas while the shield it signed can still execute at its nonce.
+    let (origin, destination) = (
+        ExecutorOperationId::random().unwrap(),
+        ExecutorOperationId::random().unwrap(),
+    );
+    let reserved = store
+        .reserve_swap_destination(
+            destination,
+            record.delegate(),
+            crate::vault::SwapDestinationRecord {
+                origin_chain: 137,
+                origin_operation: origin,
+                destination_token: Address::repeat_byte(10),
+                outcome: None,
+            },
+        )
+        .unwrap();
+    ExecutorStore::new(db.clone(), view.clone(), 137)
+        .unwrap()
+        .reserve_with_swap_approval(
+            origin,
+            record.delegate(),
+            Some("Private swap"),
+            &[],
+            None,
+            Some(destination),
+        )
+        .unwrap();
+    let (_, derived) = vault
+        .executor_spend_signers_for_session(
+            &mut vault.create_spend_grant(TEST_PASSWORD).unwrap(),
+            &view,
+            None,
+            1,
+            reserved.index(),
+        )
+        .unwrap();
+    store.bind_address(destination, derived.address()).unwrap();
+    store.record_account_read(destination, observed).unwrap();
     store
-        .record_recovery_transaction(
-            operation,
-            IssuedExecutorRecoveryTransaction::new(
-                ExecutorOperationId::random().unwrap(),
-                0,
-                ExecutorRecoveryStepKind::Shield,
-                tx,
-                tx_hash,
-                observed.block(),
+        .record_issued(
+            destination,
+            IssuedExecutorPayload::new(
+                U256::ZERO,
+                record.delegate(),
+                B256::repeat_byte(8),
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                ExecutorPayloadContext::new(Bytes::from_static(b"shield"), observed, Vec::new()),
             ),
         )
         .unwrap();
-    store
-        .reconcile_recovery(
-            operation,
-            observed.block(),
-            &[(
-                tx_hash,
-                ExecutorPayloadInclusion::new(
-                    observed.block(),
-                    tx_hash,
-                    ExecutorExecutionResult::Executed,
-                ),
-            )],
-        )
+    let authorization =
+        DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()));
+    let account = owner
+        .register_public_account(destination, &authorization)
+        .await
         .unwrap();
-    // The local success was reorganized away: empty canonical blocks cannot authorize signing.
+    let Err(error) = owner
+        .admit_authorized_gas_signer(&view, &account, &authorization)
+        .await
+    else {
+        panic!("an executable destination shield refuses the gas signer");
+    };
     assert!(
-        walletconnect_sign_personal_message(request(&account))
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        store
-            .records()
-            .unwrap()
-            .iter()
-            .find(|item| item.operation() == operation)
-            .unwrap()
-            .recovery_transaction_status(tx_hash),
-        Some(ExecutorPayloadStatus::Uncertain)
+        format!("{error:#}").contains("earlier signed operation"),
+        "{error:#}"
     );
     owner.shutdown().await;
     drop((owner, store, view, vault, db));

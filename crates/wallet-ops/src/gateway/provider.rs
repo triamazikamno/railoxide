@@ -176,7 +176,7 @@ impl GatewayWalletState {
             && self.same_accounts(other)
             && same_http(self.http.as_ref(), other.http.as_ref())
             && match (&self.view, &other.view) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (Some(left), Some(right)) => left.is_same_wallet_session(right),
                 (None, None) => true,
                 _ => false,
             }

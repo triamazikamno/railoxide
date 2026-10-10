@@ -436,7 +436,7 @@ impl WalletConnectUiState {
         request
     }
 
-    fn attention_count(&self) -> usize {
+    pub(in crate::root) fn attention_count(&self) -> usize {
         walletconnect_attention_count(self.pending_proposal.is_some(), self.pending_requests.len())
     }
 

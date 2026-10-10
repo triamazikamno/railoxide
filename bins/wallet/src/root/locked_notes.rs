@@ -212,7 +212,7 @@ impl LockedNotesView {
             .join(", ")
     }
 
-    /// Reconcile one operation at the confirmed block. This is the only chain read here.
+    /// Read one operation's account at the confirmed block. This is the only chain read here.
     fn check(&mut self, operation: ExecutorOperationId, cx: &mut Context<'_, Self>) {
         let Some(confirmed) = self.confirmed_block(cx) else {
             return;
@@ -305,7 +305,7 @@ impl LockedNotesView {
         let id = operation.opaque_id();
         let checking = self.checking.contains(&operation);
         let confirming = self.releasing == Some(operation);
-        // The check reads the account's own history, so it needs its address.
+        // The check reads the account's own state, so it needs its address.
         let can_check = lock.address().is_some() && self.confirmed_block(cx).is_some();
         let account = lock.address().map_or_else(
             || "address not derived".to_owned(),
@@ -565,6 +565,8 @@ fn reason_label(reason: ExecutorInputLockReason) -> String {
                 )
             }
         }
-        ExecutorInputLockReason::SpentAwaitingSync => "Spent, waiting for private sync".into(),
+        ExecutorInputLockReason::ResolvedAwaitingSync => {
+            "Nonce used, waiting for private sync".into()
+        }
     }
 }

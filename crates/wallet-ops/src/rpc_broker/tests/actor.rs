@@ -833,7 +833,7 @@ async fn queued_duplicate_reads_expire_without_dispatch() {
     drop(broker);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn duplicate_submissions_attach_to_an_in_flight_execution() {
     let selected_endpoints = Arc::new(std::sync::Mutex::new(Vec::new()));
     let executions = Arc::new(AtomicUsize::new(0));
@@ -925,6 +925,8 @@ async fn duplicate_submissions_attach_to_an_in_flight_execution() {
         let broker = broker.clone();
         async move { broker.submit(equivalent_submission).await }
     });
+    // Paused time lets the broker's earlier flush finish before this sleep ends,
+    // so the duplicate attaches before the first execution is released.
     time::sleep(Duration::from_millis(10)).await;
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     gate.notify_one();

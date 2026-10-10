@@ -255,6 +255,15 @@ pub(crate) fn open_wallet_window(
 }
 
 impl WalletRoot {
+    /// The tab a wallet opens on: Private, or Public where the selected chain has no Railgun.
+    pub(super) fn default_wallet_tab(&self) -> WalletTab {
+        if self.selected_chain_has_railgun() {
+            WalletTab::default()
+        } else {
+            WalletTab::Public
+        }
+    }
+
     pub(super) fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
         if tab != WalletTab::Public && !self.selected_chain_has_railgun() {
             return;
@@ -355,7 +364,7 @@ impl Render for WalletRoot {
             );
         }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
-        self.sync_walletconnect_attention_for_window(window);
+        self.sync_platform_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
         self.ensure_stealth_accounts(window, cx);
         self.ensure_private_swaps(window, cx);

@@ -12,8 +12,9 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    dialog::DialogFooter,
     input::InputState,
     spinner::Spinner,
     table::{Column, DataTable, TableDelegate, TableState},
@@ -22,16 +23,19 @@ use gpui_component::{
 };
 use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_asset_path};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+};
 use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::{
-    BlockedShieldRescueEligibilityRequest, BlockedShieldRescueInfo,
+    BlockedShieldRescueBlocker, BlockedShieldRescueEligibilityRequest, BlockedShieldRescueInfo,
     BlockedShieldRescueSelfBroadcastRequest, BlockedShieldRescueUtxoId,
     DesktopPrivateSpendAuthorization, ListUtxosOutput, SelfBroadcastGasFeeSelection,
     SelfBroadcastSessionEvent, UtxoOutput, UtxoPpoiState, WalletPpoiWorkflowStatus,
+    vault::{ExecutorOperationId, PublicAccountStatus},
 };
 
 use super::actions::{UtxoEnd, UtxoHome, UtxoPageDown, UtxoPageUp};
@@ -42,7 +46,8 @@ use super::spend_authorization::{
     HardwareSpendAuthorizationCompletion, SpendAuthorizationIntent, SpendAuthorizationSummary,
     SpendAuthorizationSummaryRow,
 };
-use super::tokens::parse_address;
+use super::stealth_accounts::StealthAccountTarget;
+use super::tokens::{native_wrapped_output_labels, parse_address};
 use super::{
     SECONDS_PER_HOUR, SECONDS_PER_MINUTE, WalletRoot, centered_message, dialog_max_height,
     rgb_with_alpha, secondary_dialog_content_width, token_label_row,
@@ -69,6 +74,8 @@ const BLOCKED_SHIELD_REFUND_SUBMITTED_REASON: &str =
 #[derive(Clone)]
 pub(super) struct BlockedShieldRescueRowState {
     info: BlockedShieldRescueInfo,
+    /// What keeps the origin from refunding, when a lookup found that to be the reason.
+    blocker: Option<BlockedShieldRescueBlocker>,
     lookup_generation: Option<u64>,
 }
 
@@ -82,6 +89,7 @@ impl BlockedShieldRescueRowState {
                 public_account_uuid: None,
                 public_account_label: None,
             },
+            blocker: None,
             lookup_generation: Some(lookup_generation),
         }
     }
@@ -89,6 +97,19 @@ impl BlockedShieldRescueRowState {
     pub(super) const fn from_info(info: BlockedShieldRescueInfo) -> Self {
         Self {
             info,
+            blocker: None,
+            lookup_generation: None,
+        }
+    }
+
+    /// The result of an origin lookup: its info, and the `blocker` it found.
+    pub(super) const fn from_lookup(
+        info: BlockedShieldRescueInfo,
+        blocker: Option<BlockedShieldRescueBlocker>,
+    ) -> Self {
+        Self {
+            info,
+            blocker,
             lookup_generation: None,
         }
     }
@@ -104,6 +125,36 @@ impl BlockedShieldRescueRowState {
     pub(super) const fn info(&self) -> &BlockedShieldRescueInfo {
         &self.info
     }
+}
+
+/// What the refund dialog of a blocked Shield shows. It is derived from the row's state on
+/// every frame, so the open dialog follows the origin lookup.
+pub(super) enum BlockedShieldRefundDialogState {
+    /// The origin lookup is running.
+    Checking,
+    /// The origin can refund.
+    Available(BlockedShieldRescueInfo),
+    /// The Shield can't be refunded now. A `blocker` says what keeps its origin from refunding.
+    Unavailable {
+        info: BlockedShieldRescueInfo,
+        blocker: Option<BlockedShieldRescueBlocker>,
+    },
+}
+
+/// Where the action button of the refund dialog leads when the refund is unavailable.
+#[derive(Clone, Copy)]
+enum BlockedShieldRefundAction {
+    OpenStealthAccounts,
+    ShowStealthAccount(ExecutorOperationId),
+    OpenPublic,
+}
+
+/// What the refund dialog adds to the reason a refund is unavailable: its title, how to make
+/// the refund possible, and the label and target of the action that leads there.
+struct BlockedShieldRefundGuidance {
+    title: &'static str,
+    fix: Option<SharedString>,
+    action: Option<(&'static str, BlockedShieldRefundAction)>,
 }
 
 impl WalletRoot {
@@ -259,7 +310,9 @@ impl WalletRoot {
         };
         if !rescue.eligible {
             if can_start_blocked_shield_origin_resolution(row, rescue) {
-                self.resolve_blocked_shield_refund_authorization(utxo_id, window, cx);
+                // The dialog opens inside the click and shows the lookup until it answers.
+                self.resolve_blocked_shield_refund_authorization(utxo_id, cx);
+                Self::open_blocked_shield_refund_dialog(utxo_id, window, cx);
             }
             return;
         }
@@ -278,13 +331,50 @@ impl WalletRoot {
         let Some(origin_address) = rescue.origin_address.clone() else {
             return;
         };
-        let summary = blocked_shield_refund_authorization_summary(row, rescue, &origin_address);
-        let intent = if self.selected_wallet_source().is_hardware_derived() {
+        let intent = self.blocked_shield_refund_authorization_intent(utxo_id);
+        let device_only = self.selected_wallet_source().is_hardware_derived()
+            && matches!(intent, SpendAuthorizationIntent::BlockedShieldRefund(_));
+        let summary =
+            blocked_shield_refund_authorization_summary(row, rescue, &origin_address, device_only);
+        self.request_spend_authorization(intent, summary, window, cx);
+    }
+
+    /// The gas approval for a refund whose matched origin is a stealth account in Public.
+    /// A hardware wallet derives that account's signer on the device, so no vault password
+    /// can stand in for it.
+    pub(super) fn blocked_shield_refund_executor_gas_payment(
+        &self,
+        utxo_id: BlockedShieldRescueUtxoId,
+    ) -> Option<wallet_ops::HardwareExecutorAction> {
+        let rescue = self
+            .blocked_shield_rescue_rows
+            .get(&utxo_id)
+            .map(BlockedShieldRescueRowState::info)
+            .filter(|rescue| rescue.eligible)?;
+        let account =
+            self.selected_self_broadcast_gas_payer_account(rescue.public_account_uuid.as_deref())?;
+        let wallet_ops::vault::PublicAccountSource::ExecutorDerived(source) = account.source else {
+            return None;
+        };
+        Some(wallet_ops::HardwareExecutorAction::GasPayment {
+            account: account.public_account_uuid.clone(),
+            operation: source.operation(),
+        })
+    }
+
+    pub(super) fn blocked_shield_refund_authorization_intent(
+        &self,
+        utxo_id: BlockedShieldRescueUtxoId,
+    ) -> SpendAuthorizationIntent {
+        if self.selected_wallet_source().is_hardware_derived()
+            && self
+                .blocked_shield_refund_executor_gas_payment(utxo_id)
+                .is_none()
+        {
             SpendAuthorizationIntent::BlockedShieldRefundGasPassword(utxo_id)
         } else {
             SpendAuthorizationIntent::BlockedShieldRefund(utxo_id)
-        };
-        self.request_spend_authorization(intent, summary, window, cx);
+        }
     }
 
     pub(super) fn request_blocked_shield_refund_hardware_authorization(
@@ -311,7 +401,8 @@ impl WalletRoot {
             tracing::warn!("blocked Shield hardware refund requested without origin address");
             return;
         };
-        let summary = blocked_shield_refund_authorization_summary(&row, rescue, &origin_address);
+        let summary =
+            blocked_shield_refund_authorization_summary(&row, rescue, &origin_address, false);
         self.open_hardware_spend_authorization_dialog(
             HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
                 utxo_id,
@@ -323,10 +414,11 @@ impl WalletRoot {
         );
     }
 
+    /// Look up the origin of a blocked Shield. The result is stored as the row's state, which
+    /// the table and the open refund dialog draw. It opens nothing.
     fn resolve_blocked_shield_refund_authorization(
         &mut self,
         utxo_id: BlockedShieldRescueUtxoId,
-        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self
@@ -378,13 +470,19 @@ impl WalletRoot {
         let resolve = self.runtime.spawn(async move {
             wallet_ops::resolve_blocked_shield_rescue_eligibility(request, &http).await
         });
-        cx.spawn_in(window, async move |this, cx| {
-            let info = match resolve.await {
-                Ok(Ok(eligibility)) => blocked_shield_rescue_info_from_eligibility(eligibility),
-                Ok(Err(error)) => blocked_shield_rescue_error_info(error.to_string()),
-                Err(error) => blocked_shield_rescue_error_info(error.to_string()),
+        cx.spawn(async move |this, cx| {
+            let (info, blocker) = match resolve.await {
+                Ok(Ok(mut eligibility)) => {
+                    let blocker = eligibility.blocker.take();
+                    (
+                        blocked_shield_rescue_info_from_eligibility(eligibility),
+                        blocker,
+                    )
+                }
+                Ok(Err(error)) => (blocked_shield_rescue_error_info(error.to_string()), None),
+                Err(error) => (blocked_shield_rescue_error_info(error.to_string()), None),
             };
-            let _ = this.update_in(cx, |root, window, cx| {
+            let _ = this.update(cx, |root, cx| {
                 let accepts_result = root
                     .blocked_shield_rescue_rows
                     .get(&utxo_id)
@@ -394,20 +492,202 @@ impl WalletRoot {
                 }
                 root.blocked_shield_rescue_rows.insert(
                     utxo_id,
-                    BlockedShieldRescueRowState::from_info(info.clone()),
+                    BlockedShieldRescueRowState::from_lookup(info, blocker),
                 );
                 root.sync_utxo_table(cx);
-                if info.eligible
-                    && !root.blocked_shield_refunds_in_flight.contains(&utxo_id)
-                    && let Some(row) = root.active_blocked_shield_rescue_display_row(utxo_id)
-                {
-                    root.open_blocked_shield_refund_authorization(utxo_id, &row, &info, window, cx);
-                }
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// What the refund dialog of the blocked Shield `utxo_id` shows now. A Shield whose row
+    /// state was invalidated or pruned shows its row's own rescue info.
+    fn blocked_shield_refund_dialog_state(
+        &self,
+        utxo_id: BlockedShieldRescueUtxoId,
+    ) -> BlockedShieldRefundDialogState {
+        // The debug UI fixture answers for its synthesized Shield. No release build has one.
+        if let Some(state) = super::private_swap::ui_fixture_refund_dialog_state(utxo_id) {
+            return state;
+        }
+        let Some(state) = self.blocked_shield_rescue_rows.get(&utxo_id) else {
+            let info = self
+                .active_blocked_shield_rescue_display_row(utxo_id)
+                .and_then(|row| row.blocked_shield_rescue)
+                .unwrap_or(BlockedShieldRescueInfo {
+                    eligible: false,
+                    disabled_reason: None,
+                    origin_address: None,
+                    public_account_uuid: None,
+                    public_account_label: None,
+                });
+            return BlockedShieldRefundDialogState::Unavailable {
+                info,
+                blocker: None,
+            };
+        };
+        if state.is_resolving() {
+            BlockedShieldRefundDialogState::Checking
+        } else if state.info.eligible {
+            BlockedShieldRefundDialogState::Available(state.info.clone())
+        } else {
+            BlockedShieldRefundDialogState::Unavailable {
+                info: state.info.clone(),
+                blocker: state.blocker.clone(),
+            }
+        }
+    }
+
+    /// Open the refund dialog of the blocked Shield `utxo_id`. Its builder reads the
+    /// Shield's state on every frame, so the dialog shows the origin check while it runs,
+    /// then the refund it found or why there is none.
+    pub(super) fn open_blocked_shield_refund_dialog(
+        utxo_id: BlockedShieldRescueUtxoId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let root = cx.entity();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            // The dialog layer is drawn outside the root's lease, so the root can be read.
+            let wallet = root.read(cx);
+            let state = wallet.blocked_shield_refund_dialog_state(utxo_id);
+            let (title, content, footer) = match state {
+                BlockedShieldRefundDialogState::Checking => (
+                    "Checking origin",
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(rgb(theme::TEXT_MUTED).into())
+                                .with_size(px(14.0)),
+                        )
+                        .child(
+                            app_text(
+                                "Reading the Shield transaction to find the account that made it.",
+                            )
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal(),
+                        ),
+                    blocked_shield_refund_close_button().into_any_element(),
+                ),
+                BlockedShieldRefundDialogState::Available(info) => {
+                    let message = if let Some(label) = &info.public_account_label {
+                        format!("The refund goes back to \"{label}\", which pays the gas.")
+                    } else {
+                        "The refund goes back to the account that made the Shield, which pays \
+                         the gas."
+                            .to_owned()
+                    };
+                    (
+                        "Refund available",
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(app_text(message).whitespace_normal())
+                            .when_some(info.origin_address, |this, address| {
+                                this.child(blocked_shield_refund_origin_row(address))
+                            }),
+                        blocked_shield_refund_available_footer(&root, utxo_id),
+                    )
+                }
+                BlockedShieldRefundDialogState::Unavailable { info, blocker } => {
+                    let BlockedShieldRefundGuidance { title, fix, action } =
+                        blocked_shield_refund_guidance(
+                            blocker.as_ref(),
+                            wallet.stealth_session().is_some(),
+                            native_wrapped_output_labels(wallet.selected_chain)
+                                .map(|(native, _)| native),
+                        );
+                    let message = info
+                        .disabled_reason
+                        .unwrap_or_else(|| "Blocked Shield refund is unavailable.".to_owned());
+                    (
+                        title,
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(app_text(message).whitespace_normal())
+                            .when_some(fix, |this, fix| {
+                                this.child(app_text(fix).whitespace_normal())
+                            })
+                            .when_some(info.origin_address, |this, address| {
+                                this.child(blocked_shield_refund_origin_row(address))
+                            }),
+                        blocked_shield_refund_unavailable_footer(&root, action, cx),
+                    )
+                }
+            };
+            dialog
+                .w((window.viewport_size().width * 0.92).min(window.rem_size() * 30.0))
+                .max_h(dialog_max_height(window))
+                .title(app_strong_text(title))
+                .child(content)
+                .footer(footer)
+        });
+    }
+
+    /// Whether `action` of the refund dialog can be followed now. A stealth account can't be
+    /// shown while Stealth accounts is busy.
+    fn can_follow_blocked_shield_refund_action(
+        &self,
+        action: BlockedShieldRefundAction,
+        cx: &App,
+    ) -> bool {
+        match action {
+            BlockedShieldRefundAction::OpenStealthAccounts
+            | BlockedShieldRefundAction::OpenPublic => true,
+            BlockedShieldRefundAction::ShowStealthAccount(operation) => {
+                self.stealth_session().is_some_and(|session| {
+                    let target = StealthAccountTarget::new(&session, operation);
+                    self.can_open_stealth_account(&target, cx)
+                })
+            }
+        }
+    }
+
+    /// Go where `action` of the refund dialog leads. The dialog has closed.
+    fn follow_blocked_shield_refund_action(
+        &mut self,
+        action: BlockedShieldRefundAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match action {
+            BlockedShieldRefundAction::OpenStealthAccounts => {
+                self.select_wallet_tab(WalletTab::Public, cx);
+                // Stealth accounts owns focus, rather than the ordinary account search.
+                self.focus_public_account_search_on_render = false;
+                self.open_stealth_accounts(window, cx);
+            }
+            BlockedShieldRefundAction::ShowStealthAccount(operation) => {
+                if let Some(session) = self.stealth_session() {
+                    let target = StealthAccountTarget::new(&session, operation);
+                    self.open_stealth_account(&target, window, cx);
+                }
+            }
+            BlockedShieldRefundAction::OpenPublic => {
+                self.select_wallet_tab(WalletTab::Public, cx);
+                // Put the inactive origin in sight. Stealth accounts may be open in place of
+                // the account list, a kept search may filter the origin out, and the list
+                // opens on its Active section.
+                self.close_stealth_accounts(cx);
+                self.public_form
+                    .search_input
+                    .update(cx, |input, cx| input.replace_all("", window, cx));
+                self.set_public_account_section_open(PublicAccountStatus::Inactive, window, cx);
+            }
+        }
     }
 
     pub(super) fn submit_blocked_shield_refund_authorized(
@@ -424,29 +704,6 @@ impl WalletRoot {
             .cloned()
         else {
             return;
-        };
-        let password = if let Some(password) = vault_password {
-            password
-        } else {
-            let password = match &spend_authorization {
-                DesktopPrivateSpendAuthorization::VaultPassword(password)
-                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
-                    password
-                }
-                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
-                | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
-                | DesktopPrivateSpendAuthorization::HardwarePublic => {
-                    tracing::warn!(
-                        "blocked Shield refund self-broadcast requested without gas-payer password"
-                    );
-                    self.set_vault_error(
-                    "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
-                    cx,
-                );
-                    return;
-                }
-            };
-            password.clone()
         };
         let protected_seed_session = spend_authorization.protected_seed_session();
         let Some(session) = self.selected_chain_session() else {
@@ -477,6 +734,34 @@ impl WalletRoot {
         let Some(public_account_uuid) = rescue.public_account_uuid.clone() else {
             tracing::warn!("blocked Shield refund requested without origin public account");
             return;
+        };
+        let password = if let Some(password) = vault_password {
+            Some(password)
+        } else {
+            match &spend_authorization {
+                DesktopPrivateSpendAuthorization::VaultPassword(password)
+                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
+                    Some(password.clone())
+                }
+                // Only the device approval scoped to the origin account signs its gas.
+                DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)
+                    if hardware.is_gas_payment_for(&public_account_uuid) =>
+                {
+                    None
+                }
+                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
+                | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
+                | DesktopPrivateSpendAuthorization::HardwarePublic => {
+                    tracing::warn!(
+                        "blocked Shield refund self-broadcast requested without gas-payer password"
+                    );
+                    self.set_vault_error(
+                    "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
+                    cx,
+                );
+                    return;
+                }
+            }
         };
         let transaction_tracking = match self
             .public_transaction_tracking_context(self.selected_chain, &public_account_uuid)
@@ -735,16 +1020,24 @@ impl WalletRoot {
         self.blocked_shield_rescue_lookup_generation
     }
 
+    /// The display row of the active blocked Shield `utxo_id`, with its row state and an
+    /// in-flight refund applied, as the table shows it.
     fn active_blocked_shield_rescue_display_row(
         &self,
         utxo_id: BlockedShieldRescueUtxoId,
     ) -> Option<UtxoDisplayRow> {
         let snapshot = self.chain_states.get(&self.selected_chain)?.snapshot()?;
-        snapshot
+        let mut row = snapshot
             .utxos
             .iter()
             .find(|row| active_blocked_shield_rescue_utxo_id_from_output(row) == Some(utxo_id))
-            .map(|row| display_row_from_utxo(snapshot.chain_id, row))
+            .map(|row| display_row_from_utxo(snapshot.chain_id, row))?;
+        apply_blocked_shield_rescue_rows(
+            std::slice::from_mut(&mut row),
+            &self.blocked_shield_rescue_rows,
+            &self.blocked_shield_refunds_in_flight,
+        );
+        Some(row)
     }
 
     pub(super) fn focus_utxo_table_if_requested(
@@ -1803,6 +2096,7 @@ fn blocked_shield_refund_action(
     )))
     .xsmall()
     .danger()
+    .loading(blocked_shield_refund_origin_resolving(row))
     .child("Refund");
     if rescue.eligible || can_start_blocked_shield_origin_resolution(row, rescue) {
         let row = row.clone();
@@ -1814,7 +2108,12 @@ fn blocked_shield_refund_action(
             });
         });
         if !rescue.eligible {
-            button = button.tooltip("Check source transaction origin before refund");
+            button = button.tooltip(
+                rescue
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "Check source transaction origin before refund".to_owned()),
+            );
         }
     } else {
         let reason = rescue
@@ -1830,6 +2129,7 @@ fn blocked_shield_refund_authorization_summary(
     row: &UtxoDisplayRow,
     rescue: &BlockedShieldRescueInfo,
     origin_address: &str,
+    device_only: bool,
 ) -> SpendAuthorizationSummary {
     let gas_payer = rescue
         .public_account_label
@@ -1837,7 +2137,11 @@ fn blocked_shield_refund_authorization_summary(
         .map_or_else(|| origin_address.to_string(), std::clone::Clone::clone);
     SpendAuthorizationSummary::new(
         "Blocked Shield refund",
-        "Enter your vault password to authorize this refund.",
+        if device_only {
+            "Approve this refund on your hardware wallet."
+        } else {
+            "Enter your vault password to authorize this refund."
+        },
         vec![
             SpendAuthorizationSummaryRow::new("Amount", format!("{} {}", row.amount, row.token))
                 .with_icon(row.token_icon_path.clone()),
@@ -2174,7 +2478,6 @@ fn can_start_blocked_shield_origin_resolution(
 ) -> bool {
     accepts_blocked_shield_rescue_overlay(row)
         && !rescue.eligible
-        && rescue.origin_address.is_none()
         && rescue.disabled_reason.as_deref() != Some(BLOCKED_SHIELD_RESCUE_RESOLVING_REASON)
         && rescue.disabled_reason.as_deref() != Some(BLOCKED_SHIELD_REFUND_IN_FLIGHT_REASON)
         && rescue.disabled_reason.as_deref() != Some(BLOCKED_SHIELD_REFUND_SUBMITTED_REASON)
@@ -2197,6 +2500,168 @@ fn blocked_shield_rescue_info_from_eligibility(
         public_account_uuid: eligibility.public_account_uuid,
         public_account_label: eligibility.public_account_label,
     }
+}
+
+/// The title, fix and action the refund dialog shows for the `blocker` of an unavailable
+/// refund. `stealth_accounts` says whether the selected chain has Stealth accounts to open, and
+/// `native` is the symbol of its native currency.
+fn blocked_shield_refund_guidance(
+    blocker: Option<&BlockedShieldRescueBlocker>,
+    stealth_accounts: bool,
+    native: Option<&str>,
+) -> BlockedShieldRefundGuidance {
+    match blocker {
+        None => BlockedShieldRefundGuidance {
+            title: "Refund unavailable",
+            fix: None,
+            action: None,
+        },
+        Some(BlockedShieldRescueBlocker::OriginUnknown) if stealth_accounts => {
+            BlockedShieldRefundGuidance {
+                title: "Origin account missing",
+                fix: Some(
+                    "A blocked Shield is refunded to the account that made it, and that account \
+                     pays the gas. If it was one of your stealth accounts, restore it in Stealth \
+                     accounts. Otherwise add it to Public."
+                        .into(),
+                ),
+                action: Some((
+                    "Open Stealth accounts",
+                    BlockedShieldRefundAction::OpenStealthAccounts,
+                )),
+            }
+        }
+        Some(BlockedShieldRescueBlocker::OriginUnknown) => BlockedShieldRefundGuidance {
+            title: "Origin account missing",
+            fix: Some(
+                "A blocked Shield is refunded to the account that made it, and that account pays \
+                 the gas. Add it to Public, then refund."
+                    .into(),
+            ),
+            action: None,
+        },
+        Some(BlockedShieldRescueBlocker::OriginStealth { operation, .. }) => {
+            BlockedShieldRefundGuidance {
+                title: "Stealth account not in Public",
+                fix: Some(
+                    format!(
+                        "Add it to Public, send it {} for gas, then refund.",
+                        native.unwrap_or("native currency")
+                    )
+                    .into(),
+                ),
+                action: Some((
+                    "Show stealth account",
+                    BlockedShieldRefundAction::ShowStealthAccount(*operation),
+                )),
+            }
+        }
+        Some(BlockedShieldRescueBlocker::OriginInactive { .. }) => BlockedShieldRefundGuidance {
+            title: "Origin account inactive",
+            fix: Some("Activate it, then refund.".into()),
+            action: Some(("Open Public", BlockedShieldRefundAction::OpenPublic)),
+        },
+    }
+}
+
+/// The Close button of the refund dialog.
+fn blocked_shield_refund_close_button() -> Button {
+    app_button("wallet-blocked-shield-refund-unavailable-close", "Close")
+        .on_click(|_, window, cx| window.close_dialog(cx))
+}
+
+/// The "Origin account" row of the refund dialog: the address beside its copy button.
+fn blocked_shield_refund_origin_row(address: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text("Origin account"))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    app_text(address.clone())
+                        .font_family(APP_MONO_FONT_FAMILY)
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                )
+                .child(
+                    clipboard_with_toast("wallet-blocked-shield-refund-origin-copy", address)
+                        .tooltip("Copy origin account address"),
+                ),
+        )
+}
+
+/// The footer of the refund dialog for an available refund: Close beside the button that
+/// goes on to the refund's authorization.
+fn blocked_shield_refund_available_footer(
+    root: &Entity<WalletRoot>,
+    utxo_id: BlockedShieldRescueUtxoId,
+) -> gpui::AnyElement {
+    let root = root.clone();
+    DialogFooter::new()
+        .child(blocked_shield_refund_close_button().ghost())
+        .child(
+            app_button("wallet-blocked-shield-refund-continue", "Refund…")
+                .primary()
+                .debug_selector(|| "wallet-blocked-shield-refund-continue".into())
+                .on_click(move |_, window, cx| {
+                    root.update(cx, |root, cx| {
+                        window.close_dialog(cx);
+                        // The row is read again, so the refund goes on only while the row
+                        // still offers it.
+                        if let Some(row) = root.active_blocked_shield_rescue_display_row(utxo_id) {
+                            root.begin_blocked_shield_refund(&row, window, cx);
+                        }
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
+/// The footer of the refund dialog for an unavailable refund: Close alone, or Close beside
+/// the `action` that leads to the fix. The action is disabled while it can't be followed.
+fn blocked_shield_refund_unavailable_footer(
+    root: &Entity<WalletRoot>,
+    action: Option<(&'static str, BlockedShieldRefundAction)>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let close = blocked_shield_refund_close_button();
+    let Some((label, action)) = action else {
+        return close.into_any_element();
+    };
+    let available = root
+        .read(cx)
+        .can_follow_blocked_shield_refund_action(action, cx);
+    let root = root.clone();
+    DialogFooter::new()
+        .child(close.ghost())
+        .child(
+            app_button("wallet-blocked-shield-refund-unavailable-action", label)
+                .primary()
+                .disabled(!available)
+                .debug_selector(|| "wallet-blocked-shield-refund-unavailable-action".into())
+                .on_click(move |_, window, cx| {
+                    root.update(cx, |root, cx| {
+                        // The dialog stays open while the action can't be followed, so its
+                        // guidance isn't lost.
+                        if !root.can_follow_blocked_shield_refund_action(action, cx) {
+                            return;
+                        }
+                        // Close every dialog, so nothing opens underneath one. This dialog
+                        // opened inside a Refund click, over nothing or over "Private asset
+                        // status". A dialog opened since covers this button until it is
+                        // dismissed, so no other dialog is open now.
+                        window.close_all_dialogs(cx);
+                        root.follow_blocked_shield_refund_action(action, window, cx);
+                    });
+                }),
+        )
+        .into_any_element()
 }
 
 const fn blocked_shield_rescue_error_info(error: String) -> BlockedShieldRescueInfo {

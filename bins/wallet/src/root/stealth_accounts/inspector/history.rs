@@ -1,39 +1,42 @@
-use std::collections::BTreeMap;
-
 use alloy::eips::BlockNumHash;
 use wallet_ops::{
-    PublicActionProgressStep, executor_payload_recovery_steps,
-    vault::{
-        ExecutorExecutionResult, ExecutorPayloadPurpose, ExecutorRecord, ExecutorRecoveryStepKind,
-        IssuedExecutorPayload,
-    },
+    ExecutorAttributionEvidence, ExecutorPayloadOutcome, ExecutorRecoveryCompletion,
+    ExecutorSignedAction, PublicActionProgressStep, executor_payload_recovery_steps,
+    executor_recovery_completion,
+    vault::{ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload},
 };
 
-pub(super) fn payload_rows(record: &ExecutorRecord) -> Vec<&IssuedExecutorPayload> {
-    let mut nonces = BTreeMap::new();
-    for payload in record.issued() {
-        let rank = |payload: &IssuedExecutorPayload| {
-            payload.inclusion().map_or((false, false, 0), |inclusion| {
-                (
-                    inclusion.result() == ExecutorExecutionResult::Executed,
-                    true,
-                    inclusion.block().number,
-                )
-            })
-        };
-        let current = nonces.entry(payload.nonce()).or_insert(payload);
-        // Successful execution consumes the nonce. Otherwise prefer the latest
-        // mined attempt, or the most recently signed payload if none was mined.
-        if rank(payload) >= rank(current) {
-            *current = payload;
-        }
-    }
-    nonces.into_values().collect()
+/// The payload a signed action's row shows: its fee round with the latest submitted
+/// transaction, or the last one signed when none was submitted.
+pub(super) fn action_payload<'a>(
+    record: &'a ExecutorRecord,
+    action: &ExecutorSignedAction,
+) -> Option<&'a IssuedExecutorPayload> {
+    let latest_first = action
+        .payloads()
+        .iter()
+        .rev()
+        .filter_map(|hash| {
+            record
+                .issued()
+                .iter()
+                .find(|payload| payload.hash() == *hash)
+        })
+        .collect::<Vec<_>>();
+    latest_first
+        .iter()
+        .find(|payload| !payload.transaction_hashes().is_empty())
+        .or_else(|| latest_first.first())
+        .copied()
 }
 
 pub(super) fn payload_purpose(payload: &IssuedExecutorPayload) -> String {
-    if payload.purpose() == ExecutorPayloadPurpose::Operation {
-        return "Operation".into();
+    match payload.purpose() {
+        ExecutorPayloadPurpose::Operation => return "Operation".into(),
+        ExecutorPayloadPurpose::SwapPreHook => return "Swap pre-hook".into(),
+        ExecutorPayloadPurpose::SwapPostHook => return "Swap post-hook".into(),
+        ExecutorPayloadPurpose::SwapDestinationShield => return "Swap shield".into(),
+        ExecutorPayloadPurpose::Recovery => {}
     }
     let steps = executor_payload_recovery_steps(payload);
     let mut label = "Recovery".to_owned();
@@ -60,136 +63,108 @@ pub(super) fn block_label(number: u64) -> String {
     label
 }
 
-pub(super) fn status_as_of(record: &ExecutorRecord, rechecked: Option<BlockNumHash>) -> String {
-    let block = rechecked.map(|block| block.number).or_else(|| {
+/// The block the recorded results stand at: this session's account read, or the block
+/// that last resolved a nonce for an account not read since the wallet started.
+pub(super) fn status_as_of(record: &ExecutorRecord, read: Option<BlockNumHash>) -> String {
+    let block = read.map(|block| block.number).or_else(|| {
         record
-            .issued()
-            .iter()
-            .filter_map(IssuedExecutorPayload::inclusion)
-            .chain(
-                record
-                    .recovery_transactions()
-                    .iter()
-                    .filter_map(wallet_ops::vault::IssuedExecutorRecoveryTransaction::inclusion),
-            )
-            .map(|inclusion| inclusion.block().number)
-            .max()
+            .nonce_watermark()
+            .map(wallet_ops::vault::ExecutorNonceWatermark::block)
     });
     let mut label = block.map_or_else(
-        || "Status not yet confirmed".into(),
-        |block| format!("Status as of #{}", block_label(block)),
+        || "No account read is recorded".into(),
+        |block| format!("Result as of #{}", block_label(block)),
     );
-    if rechecked.is_none() {
-        label.push_str(" · not rechecked since restart");
+    if read.is_none() {
+        label.push_str(" · account not read since restart");
     }
     label
 }
 
-pub(super) fn recorded_outcomes(record: &ExecutorRecord) -> Vec<String> {
+/// What became of each operation and recovery signed for the account. Swap hooks are left
+/// to the swap's own status.
+pub(super) fn recorded_outcomes(
+    record: &ExecutorRecord,
+    actions: &[ExecutorSignedAction],
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> Vec<String> {
     let mut outcomes = Vec::new();
-    for purpose in [
-        ExecutorPayloadPurpose::Operation,
-        ExecutorPayloadPurpose::Recovery,
-    ] {
-        for result in [
-            ExecutorExecutionResult::Executed,
-            ExecutorExecutionResult::Reverted,
-            ExecutorExecutionResult::MissingEffects,
-        ] {
-            let mut transactions = BTreeMap::new();
-            for payload in record
-                .issued()
-                .iter()
-                .filter(|payload| payload.purpose() == purpose)
-            {
-                if let Some(inclusion) = payload
-                    .inclusion()
-                    .filter(|inclusion| inclusion.result() == result)
-                {
-                    let shield = purpose == ExecutorPayloadPurpose::Recovery
-                        && executor_payload_recovery_steps(payload)
-                            .contains(&PublicActionProgressStep::Shield);
-                    transactions.insert(
-                        inclusion.transaction_hash(),
-                        (inclusion.block().number, shield),
-                    );
-                }
+    for action in actions {
+        let subject = match action.purpose() {
+            ExecutorPayloadPurpose::Operation => "operation",
+            ExecutorPayloadPurpose::Recovery => "recovery",
+            ExecutorPayloadPurpose::SwapPreHook
+            | ExecutorPayloadPurpose::SwapPostHook
+            | ExecutorPayloadPurpose::SwapDestinationShield => continue,
+        };
+        let recovery = action.purpose() == ExecutorPayloadPurpose::Recovery;
+        let outcome = match action.outcome() {
+            ExecutorPayloadOutcome::Pending => {
+                format!("The signed {subject} is not confirmed and can still execute.")
             }
-            if purpose == ExecutorPayloadPurpose::Recovery {
-                for tx in record.recovery_transactions() {
-                    if let Some(inclusion) = tx
-                        .inclusion()
-                        .filter(|inclusion| inclusion.result() == result)
-                    {
-                        transactions.insert(
-                            inclusion.transaction_hash(),
-                            (
-                                inclusion.block().number,
-                                tx.kind() == ExecutorRecoveryStepKind::Shield,
-                            ),
-                        );
-                    }
-                }
+            ExecutorPayloadOutcome::Superseded => {
+                format!("Another signed action ran at the {subject}'s nonce.")
             }
-            let Some(last) = transactions.values().map(|(block, _)| *block).max() else {
-                continue;
-            };
-            let recovered = transactions
-                .values()
-                .any(|(block, shield)| *block == last && *shield);
-            let label = match (purpose, result) {
-                (ExecutorPayloadPurpose::Operation, ExecutorExecutionResult::Executed) => {
-                    "Executed"
-                }
-                (ExecutorPayloadPurpose::Operation, ExecutorExecutionResult::Reverted) => {
-                    "Operation reverted"
-                }
-                (ExecutorPayloadPurpose::Operation, ExecutorExecutionResult::MissingEffects) => {
-                    "Operation effects missing"
-                }
-                (ExecutorPayloadPurpose::Recovery, ExecutorExecutionResult::Executed)
-                    if recovered =>
-                {
-                    "Leftover balance recovered to your private balance"
-                }
-                (ExecutorPayloadPurpose::Recovery, ExecutorExecutionResult::Executed) => {
-                    "Recovery steps executed"
-                }
-                (ExecutorPayloadPurpose::Recovery, ExecutorExecutionResult::Reverted) => {
-                    "Recovery reverted"
-                }
-                (ExecutorPayloadPurpose::Recovery, ExecutorExecutionResult::MissingEffects) => {
-                    "Recovery effects missing"
-                }
-                // Not iterated above; swap hook outcomes are not summarized here yet.
-                (ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook, _) => {
-                    continue;
-                }
-            };
-            outcomes.push(if transactions.len() == 1 {
-                format!("{label} in block #{}.", block_label(last))
-            } else {
-                format!(
-                    "{label} in {} transactions, the last in block #{}.",
-                    transactions.len(),
-                    block_label(last)
-                )
-            });
+            ExecutorPayloadOutcome::Resolved => format!(
+                "Nonce {} was used, and nothing recorded shows which signed action ran.",
+                action.nonce()
+            ),
+            ExecutorPayloadOutcome::Executed if recovery => {
+                recovery_outcome(record, action, evidence).to_owned()
+            }
+            ExecutorPayloadOutcome::Executed => "Executed.".to_owned(),
+        };
+        let outcome = match action.spend_block() {
+            Some(block) => format!(
+                "{outcome} Private sync shows its spend in block #{}.",
+                block_label(block)
+            ),
+            None => outcome,
+        };
+        if !outcomes.contains(&outcome) {
+            outcomes.push(outcome);
         }
     }
     outcomes
+}
+
+/// A recovery that ran is complete once private sync shows every shield it requested.
+fn recovery_outcome(
+    record: &ExecutorRecord,
+    action: &ExecutorSignedAction,
+    evidence: &ExecutorAttributionEvidence<'_>,
+) -> &'static str {
+    // Fee rounds share their calls, so any payload of the action tells.
+    let shields = action_payload(record, action).is_some_and(|payload| {
+        executor_payload_recovery_steps(payload).contains(&PublicActionProgressStep::Shield)
+    });
+    let completion = action
+        .payloads()
+        .first()
+        .and_then(|hash| executor_recovery_completion(record, *hash, evidence));
+    match completion {
+        Some(ExecutorRecoveryCompletion::Complete) if shields => {
+            "Leftover balance recovered to your private balance."
+        }
+        Some(ExecutorRecoveryCompletion::Complete) => "Recovery executed.",
+        _ => "Recovery executed. Its shield has not reached your private balance yet.",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, Bytes, U256};
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::RelayAdapt7702;
+    use wallet_ops::signed_actions;
     use wallet_ops::vault::{
-        ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
-        ExecutorPayloadInclusion,
+        ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId,
+        ExecutorPayloadContext,
     };
 
-    fn payload(nonce: u64, hash: u8, result: Option<ExecutorExecutionResult>) -> serde_json::Value {
+    /// An operation payload. Calldata that does not decode makes it an action of its own.
+    fn payload(nonce: u64, hash: u8, calldata: Bytes, submitted: bool) -> serde_json::Value {
         let block = BlockNumHash::new(25_990_899, B256::repeat_byte(10));
         let mut value = serde_json::to_value(IssuedExecutorPayload::new(
             U256::from(nonce),
@@ -197,86 +172,72 @@ mod tests {
             B256::repeat_byte(hash),
             ExecutorPayloadPurpose::Operation,
             ExecutorPayloadContext::new(
-                Bytes::new(),
+                calldata,
                 ExecutorNonceObservation::new(block, U256::ZERO),
                 Vec::new(),
             ),
         ))
         .unwrap();
-        value["inclusion"] =
-            serde_json::to_value(result.map(|result| {
-                ExecutorPayloadInclusion::new(block, B256::repeat_byte(hash), result)
-            }))
-            .unwrap();
+        if submitted {
+            value["transaction_hashes"] = serde_json::json!([B256::repeat_byte(20)]);
+        }
         value
     }
 
-    fn record(payloads: &[serde_json::Value], recovery: &[serde_json::Value]) -> ExecutorRecord {
+    /// One fee round of an action with no calls. Rounds differ only in their signature.
+    fn fee_round(signature: u8) -> Bytes {
+        RelayAdapt7702::multicallCall {
+            _requireSuccess: true,
+            _calls: Vec::new(),
+            _nonce: U256::ZERO,
+            _signature: Bytes::from(vec![signature]),
+        }
+        .abi_encode()
+        .into()
+    }
+
+    fn record(payloads: &[serde_json::Value], consumed: u64) -> ExecutorRecord {
         serde_json::from_value(serde_json::json!({
             "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
             "operation": ExecutorOperationId::random().unwrap(), "index": 0,
             "address": Address::ZERO, "delegate": Address::ZERO, "retired": true,
-            "issued": payloads, "recovery_transactions": recovery,
+            "issued": payloads,
+            "nonce_watermark": ExecutorNonceWatermark::new(U256::from(consumed), 25_990_900),
         }))
         .unwrap()
     }
 
     #[test]
-    fn nonce_rows_prefer_execution_then_latest_mined_or_signed_attempt() {
-        use ExecutorExecutionResult::{Executed, Reverted};
+    fn each_signed_action_has_a_row_with_its_recorded_result() {
+        use ExecutorPayloadOutcome::{Executed, Pending, Resolved};
+        // Nonce 0 holds one action signed in two fee rounds, of which only the first was
+        // submitted. Nonce 1 holds two actions that nothing tells apart, and nonce 2 is not
+        // consumed.
         let record = record(
             &[
-                payload(0, 1, None),
-                payload(0, 2, Some(Reverted)),
-                payload(0, 3, Some(Executed)),
-                payload(0, 4, None),
-                payload(1, 5, Some(Reverted)),
-                payload(1, 6, None),
-                payload(2, 7, None),
-                payload(2, 8, None),
+                payload(0, 1, fee_round(1), true),
+                payload(0, 2, fee_round(2), false),
+                payload(1, 3, Bytes::new(), false),
+                payload(1, 4, Bytes::new(), false),
+                payload(2, 5, Bytes::new(), false),
             ],
-            &[],
+            2,
         );
-        let hashes = payload_rows(&record)
-            .into_iter()
-            .map(IssuedExecutorPayload::hash)
-            .collect::<Vec<_>>();
-        assert_eq!(hashes, [3, 5, 8].map(B256::repeat_byte));
-    }
-
-    #[test]
-    fn recovery_summary_requires_a_completed_shield_and_counts_transactions_once() {
-        use ExecutorExecutionResult::Executed;
-        let recovery = ExecutorOperationId::random().unwrap();
-        let steps = [
-            ExecutorRecoveryStepKind::Wrap,
-            ExecutorRecoveryStepKind::ApproveErc20,
-            ExecutorRecoveryStepKind::Shield,
-        ];
-        let mut transactions = Vec::new();
-        for (step, kind) in steps.into_iter().enumerate() {
-            let block = BlockNumHash::new(25_999_879 + step as u64, B256::repeat_byte(20));
-            let hash = B256::repeat_byte(20 + step as u8);
-            transactions.push(serde_json::json!({
-                "recovery": recovery, "step": step, "kind": kind, "hash": hash,
-                "observed": block, "transaction": { "nonce": format!("0x{step:x}") },
-                "inclusion": ExecutorPayloadInclusion::new(block, hash, Executed),
-            }));
-        }
-        let partial = record(&[payload(0, 1, Some(Executed))], &transactions[..2]);
-        assert!(
-            !recorded_outcomes(&partial)
+        let evidence = ExecutorAttributionEvidence::record_only();
+        let actions = signed_actions(&record, &evidence);
+        // The first row shows the submitted round over the one signed after it.
+        assert_eq!(
+            actions
                 .iter()
-                .any(|outcome| outcome.contains("recovered to"))
+                .map(|action| (
+                    action_payload(&record, action).unwrap().hash(),
+                    action.outcome()
+                ))
+                .collect::<Vec<_>>(),
+            [(1, Executed), (3, Resolved), (4, Resolved), (5, Pending)]
+                .map(|(hash, outcome)| (B256::repeat_byte(hash), outcome))
         );
-        let complete = record(
-            &[payload(0, 1, Some(Executed)), payload(0, 2, None)],
-            &transactions,
-        );
-        let outcomes = recorded_outcomes(&complete);
-        assert_eq!(outcomes.len(), 2);
-        assert!(outcomes[0].contains("25,990,899"));
-        assert!(outcomes[1].contains("recovered to your private balance in 3 transactions"));
-        assert!(outcomes[1].contains("25,999,881"));
+        // Both actions at nonce 1 read the same, and are told once.
+        assert_eq!(recorded_outcomes(&record, &actions, &evidence).len(), 3);
     }
 }

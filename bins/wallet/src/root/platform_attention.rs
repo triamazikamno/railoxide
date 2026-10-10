@@ -1,3 +1,36 @@
+use super::WalletRoot;
+use super::walletconnect::walletconnect_attention_transition;
+
+impl WalletRoot {
+    /// Pending `WalletConnect` items plus open spend authorization dialogs.
+    pub(super) fn sync_platform_attention(&mut self) {
+        self.spend_authorization_attention
+            .retain(|open| open.strong_count() > 0);
+        let next_count =
+            self.walletconnect.attention_count() + self.spend_authorization_attention.len();
+        let transition = walletconnect_attention_transition(
+            self.platform_attention_count,
+            next_count,
+            self.platform_attention_window_active,
+        );
+        if transition.sync_badge_count {
+            self.platform_attention.sync_badge_count(next_count);
+        }
+        if transition.request_attention {
+            self.platform_attention.request_attention();
+        }
+        if transition.clear_attention {
+            self.platform_attention.clear_attention();
+        }
+        self.platform_attention_count = next_count;
+    }
+
+    pub(super) fn sync_platform_attention_for_window(&mut self, window: &gpui::Window) {
+        self.platform_attention_window_active = window.is_window_active();
+        self.sync_platform_attention();
+    }
+}
+
 pub(super) struct PlatformAttentionState {
     native: imp::NativePlatformAttentionState,
 }

@@ -5,6 +5,93 @@ use eyre::eyre;
 use crate::block_observer::BlockObserver;
 use crate::public_wallet::PublicTransactionObservationGuard;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSponsoredSelfBroadcastResult {
+    pub prepared: PreparedSponsoredCall,
+    pub outcome: SponsoredSelfBroadcastSessionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfBroadcastTxOutcome {
+    Receipt(TxReceiptOutput),
+    /// The receipt of a transaction the wallet sent for a stealth account, with whether
+    /// the account's nonce was read past the payload's afterwards.
+    ExecutorReceipt {
+        receipt: TxReceiptOutput,
+        state: vault::ExecutorPayloadState,
+    },
+    InclusionUnobserved {
+        tx_hash: String,
+    },
+}
+
+impl SelfBroadcastTxOutcome {
+    #[must_use]
+    pub const fn receipt(&self) -> Option<&TxReceiptOutput> {
+        match self {
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => Some(receipt),
+            Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    /// A stealth account's receipt tells a revert at the time. Its success establishes
+    /// completion only once the account's nonce is read past the payload's.
+    #[must_use]
+    pub const fn execution_status(&self) -> Option<bool> {
+        match self {
+            Self::Receipt(receipt) => Some(receipt.status),
+            Self::ExecutorReceipt { receipt, state } => match (receipt.status, state) {
+                (false, _) => Some(false),
+                (true, vault::ExecutorPayloadState::Resolved) => Some(true),
+                (true, vault::ExecutorPayloadState::Pending) => None,
+            },
+            Self::InclusionUnobserved { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn tx_hash(&self) -> &str {
+        match self {
+            Self::Receipt(receipt) | Self::ExecutorReceipt { receipt, .. } => &receipt.tx_hash,
+            Self::InclusionUnobserved { tx_hash } => tx_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSelfBroadcastResult {
+    pub chain_id: u64,
+    pub public_account_uuid: String,
+    pub gas_payer: Address,
+    pub gas_limit: u64,
+    pub rpc_gas_price: u128,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub estimated_native_gas_cost: U256,
+    pub live_native_balance: U256,
+    pub tx: SelfBroadcastTxOutcome,
+    pub attempts: Vec<SelfBroadcastAttemptInfo>,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
+}
+
+pub(super) struct SelfBroadcastPreflight {
+    pub(super) tx_req: TransactionRequest,
+    pub(super) nonce: u64,
+    pub(super) gas_limit: u64,
+    pub(super) rpc_gas_price: u128,
+    pub(super) max_fee_per_gas: u128,
+    pub(super) max_priority_fee_per_gas: u128,
+    pub(super) estimated_native_gas_cost: U256,
+    pub(super) live_native_balance: U256,
+}
+
+pub(super) struct SubmittedSelfBroadcastAttempt {
+    pub(super) info: SelfBroadcastAttemptInfo,
+    pub(super) rpc_gas_price: u128,
+    pub(super) estimated_native_gas_cost: U256,
+    pub(super) live_native_balance: U256,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelfBroadcastWinnerOutput {
     gas_limit: u64,
@@ -247,8 +334,8 @@ pub(super) async fn submit_self_broadcast_plan(
         );
 
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(3)) => {
+            match wait_for_self_broadcast_poll_or_command(&mut command_rx).await {
+                None => {
                     let observation = observer
                         .as_mut()
                         .expect("self-broadcast observer established")
@@ -269,16 +356,15 @@ pub(super) async fn submit_self_broadcast_plan(
                         if let Some((owner, identity)) = &executor
                             && let SelfBroadcastTxOutcome::Receipt(receipt) = tx
                         {
-                            let range = receipt.block_number..receipt.block_number.saturating_add(1);
                             let reconciliation = match &signer {
-                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_history(owner, identity.operation(), range).await,
-                                _ => owner.reconcile_history(identity.operation(), range).await,
+                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_account(owner, identity.operation()).await,
+                                _ => owner.reconcile_account(identity.operation()).await,
                             };
-                            let status = reconciliation
+                            let state = reconciliation
                                 .ok()
-                                .and_then(|report| report.record().payload_status(identity.payload()))
-                                .unwrap_or(vault::ExecutorPayloadStatus::Uncertain);
-                            tx = SelfBroadcastTxOutcome::ExecutorReceipt { receipt, status };
+                                .and_then(|report| report.record().payload_state(identity.payload()))
+                                .unwrap_or(vault::ExecutorPayloadState::Pending);
+                            tx = SelfBroadcastTxOutcome::ExecutorReceipt { receipt, state };
                         }
                         return Ok(DesktopSelfBroadcastResult {
                             chain_id,
@@ -299,10 +385,7 @@ pub(super) async fn submit_self_broadcast_plan(
                         });
                     }
                 }
-                command = recv_self_broadcast_command(&mut command_rx) => {
-                    let Some(command) = command else {
-                        continue;
-                    };
+                Some(command) => {
                     let Some(nonce) = nonce else {
                         next_gas_fee = command.gas_fee;
                         break;
@@ -452,6 +535,25 @@ pub(super) async fn recv_self_broadcast_command(
 ) -> Option<SelfBroadcastCommand> {
     let command_rx = command_rx.as_mut()?;
     command_rx.recv().await
+}
+
+/// `None` requests the next receipt poll; a closed command stream is not a poll tick.
+async fn wait_for_self_broadcast_poll_or_command(
+    command_rx: &mut Option<SelfBroadcastCommandReceiver>,
+) -> Option<SelfBroadcastCommand> {
+    let poll = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(poll);
+    loop {
+        tokio::select! {
+            () = &mut poll => return None,
+            command = recv_self_broadcast_command(command_rx), if command_rx.is_some() => {
+                if command.is_some() {
+                    return command;
+                }
+                *command_rx = None;
+            }
+        }
+    }
 }
 
 pub(super) async fn submit_self_broadcast_attempt(
@@ -2382,6 +2484,44 @@ mod tests {
 
     use super::*;
     use serde_json::{Value, json};
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_polling_survives_absent_or_closed_self_broadcast_commands() {
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_tx);
+        for mut command_rx in [None, Some(closed_rx)] {
+            let started = tokio::time::Instant::now();
+            assert!(
+                wait_for_self_broadcast_poll_or_command(&mut command_rx)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(3));
+        }
+
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let mut command_rx = Some(command_rx);
+        let replacement = SelfBroadcastCommand {
+            kind: SelfBroadcastCommandKind::Replacement,
+            gas_fee: SelfBroadcastGasFeeSelection::Auto,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            command_tx.send(replacement).expect("queue replacement");
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_self_broadcast_poll_or_command(&mut command_rx).await,
+            Some(replacement),
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(
+            wait_for_self_broadcast_poll_or_command(&mut command_rx)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
 
     #[test]
     fn self_broadcast_observation_preserves_unknown_hash_and_canonical_winner() {

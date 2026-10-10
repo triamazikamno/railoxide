@@ -130,6 +130,19 @@ impl PreparedExecutorOperation {
     }
 }
 
+/// What a prepared operation's reservation stores beside its account.
+pub(super) enum OperationReservation<'a> {
+    /// An ordinary reservation, or a new swap's, whose record is created holding
+    /// `swap_approval` and the link to its destination stealth account.
+    Operation {
+        purpose_summary: Option<&'a str>,
+        swap_approval: Option<&'a crate::vault::SwapApproval>,
+        destination_operation: Option<ExecutorOperationId>,
+    },
+    /// A private Bridge swap's destination stealth account on this chain.
+    SwapDestination(crate::vault::SwapDestinationRecord),
+}
+
 /// Returning this value is signed-data handoff: its payload is already durable.
 pub struct IssuedExecutorTransaction {
     operation: ExecutorOperationId,
@@ -173,13 +186,12 @@ impl IssueRetry {
     ) -> Option<Arc<super::spare::CheckedExecutor>> {
         let seed = self.seed.as_ref()?;
         (prepared.recovery.is_none()
-            && record.recovery_transactions().is_empty()
             && seed.operation == prepared.operation
             && seed.execution_nonce == prepared.context.execution_nonce
             && record.issued().iter().all(|payload| {
                 seed.issued.contains(&payload.hash())
                     && payload.transaction_hashes().is_empty()
-                    && payload.inclusion().is_none()
+                    && !record.nonce_resolved(payload.nonce())
             })
             && seed.checked.ensure_valid().is_ok()
             && record.nonce_observation() == Some(seed.checked.observed))
@@ -188,9 +200,11 @@ impl IssueRetry {
 }
 
 fn require_unfinished_operation(record: &crate::vault::ExecutorRecord) -> Result<()> {
-    if record.issued().iter().any(|payload| {
-        record.payload_status(payload.hash()) == Some(crate::vault::ExecutorPayloadStatus::Executed)
-    }) {
+    if record
+        .issued()
+        .iter()
+        .any(|payload| record.nonce_resolved(payload.nonce()))
+    {
         return Err(eyre!(
             "this executor operation has already completed; start a new action"
         ));
@@ -331,27 +345,55 @@ impl ExecutorOwner {
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
     ) -> Result<PreparedExecutorOperation> {
-        self.prepare_operation_with_swap_approval(
+        self.prepare_reserved_operation(
             operation,
             delivery,
             authorization,
             assets,
-            purpose_summary,
-            None,
+            OperationReservation::Operation {
+                purpose_summary,
+                swap_approval: None,
+                destination_operation: None,
+            },
         )
         .await
     }
 
-    /// [`Self::prepare_operation`] for a new swap, whose record is created holding
-    /// `swap_approval`. A reservation that already exists keeps its own approval.
-    pub(super) async fn prepare_operation_with_swap_approval(
+    fn reserve_operation(
+        &self,
+        operation: ExecutorOperationId,
+        delegate: Address,
+        assets: &[ExecutorAsset],
+        reservation: &OperationReservation<'_>,
+    ) -> Result<crate::vault::ExecutorRecord> {
+        Ok(match reservation {
+            OperationReservation::Operation {
+                purpose_summary,
+                swap_approval,
+                destination_operation,
+            } => self.store.reserve_with_swap_approval(
+                operation,
+                delegate,
+                *purpose_summary,
+                assets,
+                swap_approval.cloned(),
+                *destination_operation,
+            )?,
+            OperationReservation::SwapDestination(destination) => self
+                .store
+                .reserve_swap_destination(operation, delegate, *destination)?,
+        })
+    }
+
+    /// [`Self::prepare_operation`] with the reservation `reservation` describes. A reservation
+    /// that already exists keeps its own approval.
+    pub(super) async fn prepare_reserved_operation(
         &self,
         operation: ExecutorOperationId,
         delivery: ExecutorDelivery,
         authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
-        purpose_summary: Option<&str>,
-        swap_approval: Option<crate::vault::SwapApproval>,
+        reservation: OperationReservation<'_>,
     ) -> Result<PreparedExecutorOperation> {
         self.require_executor_authorization(
             authorization,
@@ -395,13 +437,7 @@ impl ExecutorOwner {
         }
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "reserve_and_derive", "started");
-        let record = self.store.reserve_with_swap_approval(
-            operation,
-            profile.delegate(),
-            purpose_summary,
-            assets,
-            swap_approval.clone(),
-        )?;
+        let record = self.reserve_operation(operation, profile.delegate(), assets, &reservation)?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(
@@ -441,7 +477,7 @@ impl ExecutorOwner {
         drop(guard);
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "chain_inspection", "started");
-        let result = if record.issued().is_empty() && record.recovery_transactions().is_empty() {
+        let result = if record.issued().is_empty() {
             self.unused_inspection(record.index(), address, assets)
                 .await
         } else {
@@ -473,13 +509,7 @@ impl ExecutorOwner {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let record = self.store.reserve_with_swap_approval(
-            operation,
-            profile.delegate(),
-            purpose_summary,
-            assets,
-            swap_approval,
-        )?;
+        let record = self.reserve_operation(operation, profile.delegate(), assets, &reservation)?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
             return Err(eyre!(
@@ -551,16 +581,16 @@ impl ExecutorOwner {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         let record = self.validate_preparation(prepared)?;
-        let mut chain = Box::new(self.chain.clone());
-        if prepared.recovery.is_some() {
-            chain
-                .railgun
-                .as_mut()
-                .ok_or_else(|| eyre!("chain does not support Railgun"))?
-                .deployment
-                .relay_adapt_7702_contract = record.delegate();
+        let chain = if prepared.recovery.is_some() {
+            let mut chain = self
+                .chain_for_delegate(record.delegate())
+                .ok_or_else(|| eyre!("chain does not support Railgun"))?;
             chain.enabled = true;
-        }
+            chain
+        } else {
+            self.chain.clone()
+        };
+        let chain = Box::new(chain);
         let profile = chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
@@ -616,9 +646,7 @@ impl ExecutorOwner {
                 "private inputs are reserved by another executor operation"
             ));
         }
-        let initially_unissued = prepared.recovery.is_none()
-            && record.issued().is_empty()
-            && record.recovery_transactions().is_empty();
+        let initially_unissued = prepared.recovery.is_none() && record.issued().is_empty();
         let reused = match retry.as_deref_mut() {
             Some(retry) if !initially_unissued => {
                 let reused = retry.reusable(prepared, &record);
@@ -649,7 +677,6 @@ impl ExecutorOwner {
                         &self.http,
                         prepared.context.executor,
                         &[recovery.asset()],
-                        recovery.replacement_nonce(),
                     ),
                 ))
                 .await?
@@ -695,30 +722,11 @@ impl ExecutorOwner {
             )?;
             recovery.validate_inspection(inspection)?;
         }
-        // Recheck known inclusions even when the latest page does not cover all
-        // issued history. Unknown older winners keep future-nonce signing blocked.
-        // A reused round keeps the durable observation its evidence matched.
+        // A retry with issued payloads reads the account again at the inspection's block.
+        // An unresolved earlier nonce keeps future-nonce signing blocked. A reused round
+        // keeps the durable observation its evidence matched.
         if reused.is_none() {
-            self.store.invalidate_observation(prepared.operation)?;
-            let history = self
-                .while_active(
-                    crate::desktop::executor_observation::observe_executor_history(
-                        &self.endpoints,
-                        &chain,
-                        &record,
-                        observed.block().number..observed.block().number + 1,
-                        Some(observed),
-                    ),
-                )
-                .await?;
-            if history.nonce != Some(observed) {
-                return Err(eyre!(
-                    "executor chain observation changed; retry preparation"
-                ));
-            }
-            let reconciled =
-                self.store
-                    .reconcile(prepared.operation, observed, &history.inclusions)?;
+            let reconciled = self.admit_signing_read(&record, &chain, observed).await?;
             if prepared.recovery.is_none() {
                 require_unfinished_operation(&reconciled)?;
             }
@@ -759,7 +767,7 @@ impl ExecutorOwner {
         )?;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let mut payload_context = ExecutorPayloadContext::new(
+        let payload_context = ExecutorPayloadContext::new(
             signed_call.data,
             observed,
             inputs
@@ -767,28 +775,26 @@ impl ExecutorOwner {
                 .map(ExecutorInputIdentity::from_utxo)
                 .collect(),
         );
-        if checked.revision.is_some() {
-            let history_start = self
-                .unused
-                .lock()
-                .map_err(|_| eyre!("executor preparation is unavailable"))?
-                .history_start(observed, self.chain.finality_depth);
-            payload_context = payload_context.with_history_start(history_start);
+        let payload = IssuedExecutorPayload::new(
+            observed.nonce(),
+            profile.delegate(),
+            hash,
+            if prepared.recovery.is_some() {
+                ExecutorPayloadPurpose::Recovery
+            } else {
+                ExecutorPayloadPurpose::Operation
+            },
+            payload_context,
+        );
+        if let Some(recovery) = &prepared.recovery {
+            self.store.record_recovery_issued(
+                prepared.operation,
+                recovery.expected_active_use,
+                payload,
+            )?;
+        } else {
+            self.store.record_issued(prepared.operation, payload)?;
         }
-        self.store.record_issued(
-            prepared.operation,
-            IssuedExecutorPayload::new(
-                observed.nonce(),
-                profile.delegate(),
-                hash,
-                if prepared.recovery.is_some() {
-                    ExecutorPayloadPurpose::Recovery
-                } else {
-                    ExecutorPayloadPurpose::Operation
-                },
-                payload_context,
-            ),
-        )?;
         self.unused
             .lock()
             .map_err(|_| eyre!("executor preparation is unavailable"))?

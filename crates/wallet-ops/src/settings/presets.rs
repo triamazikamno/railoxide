@@ -70,8 +70,8 @@ impl EvmPreset {
             137 => Some(Self {
                 name: "Polygon",
                 native_currency: NativeCurrency {
-                    name: "Matic".into(),
-                    symbol: "MATIC".into(),
+                    name: "POL".into(),
+                    symbol: "POL".into(),
                     decimals: 18,
                 },
                 rpc_endpoints: [

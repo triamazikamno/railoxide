@@ -481,3 +481,34 @@ fn poi_statuses_for_output(
         .map(|(list_key, status)| (hex::encode(list_key), poi_status_label(status).to_string()))
         .collect()
 }
+
+pub(crate) fn poi_verified_unspent_utxos_from_records(
+    utxos: &[WalletUtxo],
+    pending_overlay: &WalletPendingOverlay,
+) -> Vec<Utxo> {
+    let active_poi_list_keys = default_active_poi_list_keys();
+    let chain_pending_spent_keys = chain_pending_spent_keys(pending_overlay);
+    utxos
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .filter(|entry| {
+            !chain_pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position))
+                && !pending_overlay
+                    .local_pending_spent
+                    .iter()
+                    .any(|spent| spent.matches_local_utxo(entry))
+        })
+        .filter(|entry| entry.utxo.poi.is_valid_for_lists(&active_poi_list_keys))
+        .map(|entry| entry.utxo.clone())
+        .collect()
+}
+
+pub(crate) fn chain_pending_spent_keys(
+    pending_overlay: &WalletPendingOverlay,
+) -> HashSet<(u32, u64)> {
+    pending_overlay
+        .pending_spent
+        .iter()
+        .map(WalletPendingSpent::key)
+        .collect()
+}

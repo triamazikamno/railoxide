@@ -136,14 +136,16 @@ impl WalletRoot {
             state.is_some_and(ChainUtxoState::private_action_generation_ready);
         let sync_labels = match state {
             Some(ChainUtxoState::Loading { progress }) => {
+                let progress = progress.latest();
                 presentation.state = GatewayPrivateChainState::Loading;
-                presentation.message = Some(loading_summary(*progress));
-                Some(sync_status_labels(SyncStatusContext::Loading, *progress))
+                presentation.message = Some(loading_summary(progress));
+                Some(sync_status_labels(SyncStatusContext::Loading, progress))
             }
             Some(ChainUtxoState::Syncing { progress, .. }) => {
+                let progress = progress.latest();
                 presentation.state = GatewayPrivateChainState::Syncing;
-                presentation.message = Some(loading_summary(*progress));
-                Some(sync_status_labels(SyncStatusContext::Syncing, *progress))
+                presentation.message = Some(loading_summary(progress));
+                Some(sync_status_labels(SyncStatusContext::Syncing, progress))
             }
             Some(ChainUtxoState::Ready { .. }) => {
                 presentation.state = GatewayPrivateChainState::Ready;

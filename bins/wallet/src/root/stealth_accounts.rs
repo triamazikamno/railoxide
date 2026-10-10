@@ -79,10 +79,6 @@ impl StealthAuthorization {
                 HardwareExecutorAction::Register(*operation)
             }
             StealthAction::Recover(recovery) => match recovery {
-                RecoveryAuthorization::Retry { prepared } => HardwareExecutorAction::Retry {
-                    operation: prepared.operation(),
-                    transaction: prepared.original().hash(),
-                },
                 RecoveryAuthorization::Prepare { approval } => {
                     HardwareExecutorAction::Recover(approval.operation())
                 }
@@ -210,12 +206,14 @@ impl WalletRoot {
     }
 
     /// Reveal `target` and open its recovery for `asset`, as the account menu's Recover… does.
-    /// With `return_focus`, the caller's dialog keeps focus if recovery doesn't open and gets it
-    /// back when recovery closes.
+    /// `checked` is the caller's own balance check of `asset` and its block, which recovery
+    /// offers like one made here. With `return_focus`, the caller's dialog keeps focus if
+    /// recovery doesn't open and gets it back when recovery closes.
     pub(super) fn open_stealth_account_recovery(
         &mut self,
         target: &StealthAccountTarget,
         asset: ExecutorAsset,
+        checked: Option<(U256, alloy::eips::BlockNumHash)>,
         return_focus: Option<gpui::FocusHandle>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -235,11 +233,38 @@ impl WalletRoot {
                 }
                 view.update(cx, |view, cx| {
                     if view.session_is_current(cx) {
+                        if let Some((amount, block)) = checked {
+                            view.note_checked_balance(operation, asset, amount, block, cx);
+                        }
                         view.open_recovery(operation, Some(asset), return_focus, window, cx);
                     }
                 });
             });
         }
+    }
+
+    /// Switch to `chain_id` and open recovery of its stealth account `operation` for `asset`,
+    /// as [`Self::open_stealth_account_recovery`] does. A private Bridge swap on another
+    /// network uses this for proceeds its destination stealth account holds. The switch
+    /// closes every dialog, so recovery keeps the focus it takes. Nothing happens while
+    /// `chain_id`'s session isn't loaded.
+    pub(super) fn open_stealth_account_recovery_on(
+        &mut self,
+        chain_id: u64,
+        operation: ExecutorOperationId,
+        asset: ExecutorAsset,
+        checked: Option<(U256, alloy::eips::BlockNumHash)>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. }) =
+            self.chain_states.get(&chain_id)
+        else {
+            return;
+        };
+        let target = StealthAccountTarget::new(session, operation);
+        self.select_chain(chain_id, window, cx);
+        self.open_stealth_account_recovery(&target, asset, checked, None, window, cx);
     }
 
     pub(super) fn render_stealth_accounts_button(
@@ -336,7 +361,18 @@ impl WalletRoot {
         }
     }
 
-    fn open_stealth_accounts(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn open_stealth_accounts(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // Debug UI fixture: a `refund:` mode opens its dialog in place of the first opening.
+        #[cfg(debug_assertions)]
+        {
+            if Self::open_ui_fixture_refund_dialog(window, cx) {
+                return;
+            }
+        }
         self.ensure_stealth_accounts(window, cx);
         if let Some(panel) = &mut self.stealth_accounts {
             panel.open = true;
@@ -366,6 +402,22 @@ impl WalletRoot {
         }
         cx.notify();
     }
+
+    /// Show the Public account list in place of Stealth accounts, as the breadcrumb does.
+    /// The view is kept, so opening it again restores what it showed.
+    pub(super) fn close_stealth_accounts(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(panel) = &mut self.stealth_accounts {
+            panel.open = false;
+        }
+        self.focus_public_account_search_on_render = true;
+        cx.notify();
+    }
+}
+
+/// The wallet's stealth account records, or the debug UI fixture's own in its `accounts`
+/// and `refund:stealth` modes, which no release build has.
+fn load_records(owner: &ExecutorOwner) -> eyre::Result<Vec<ExecutorRecord>> {
+    super::private_swap::ui_fixture_stealth_accounts().map_or_else(|| owner.records(), Ok)
 }
 
 impl StealthAccountsView {
@@ -410,7 +462,7 @@ impl StealthAccountsView {
             })
             .detach();
         }
-        let (records, records_error) = match owner.records() {
+        let (records, records_error) = match load_records(&owner) {
             Ok(records) => (records, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -476,7 +528,7 @@ impl StealthAccountsView {
     }
 
     fn reload_records(&mut self) {
-        match self.owner.records() {
+        match load_records(&self.owner) {
             Ok(records) => {
                 self.records = records;
                 self.records_error = None;
@@ -520,6 +572,8 @@ impl StealthAccountsView {
                 .is_some_and(|root| root.read(cx).stealth_session_is_current(&self.session))
     }
 
+    /// Check balances: the account's balances, and its execution nonce at the confirmed
+    /// block, which updates the recorded results. Only this user action reads the account.
     fn check_record(
         &mut self,
         operation: ExecutorOperationId,
@@ -539,7 +593,7 @@ impl StealthAccountsView {
             .begin(&assets);
         let owner = Arc::clone(&self.owner);
         self.start_job(
-            async move { Ok((owner.inspect_record(operation, &assets).await, assets)) },
+            async move { Ok((owner.check_record(operation, &assets).await, assets)) },
             move |this, (result, assets)| {
                 let observations = this.observations.entry(operation).or_default();
                 match result {
@@ -554,6 +608,27 @@ impl StealthAccountsView {
             },
             cx,
         );
+    }
+
+    /// Keep a balance of `asset` that another view checked, unless this view read a later one.
+    fn note_checked_balance(
+        &mut self,
+        operation: ExecutorOperationId,
+        asset: ExecutorAsset,
+        amount: U256,
+        block: alloy::eips::BlockNumHash,
+        cx: &gpui::App,
+    ) {
+        let observations = self.observations.entry(operation).or_default();
+        if observations
+            .assets
+            .get(&asset)
+            .and_then(|balance| balance.value)
+            .is_none_or(|value| value.block.number <= block.number)
+        {
+            observations.merge(asset, Some(amount), block, std::time::SystemTime::now());
+            self.refresh_visible(cx);
+        }
     }
 
     fn request_discovery(

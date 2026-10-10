@@ -1,15 +1,209 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use super::*;
 
 const WALLET_SYNC_TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletSyncTip {
+    pub last_scanned_block: Option<u64>,
+    pub head_block: Option<u64>,
+    pub safe_head_block: Option<u64>,
+    pub head_last_advanced_at_unix_secs: Option<u64>,
+    pub indexed_catch_up: Option<WalletIndexedCatchUpStatus>,
+}
+
+#[derive(Clone)]
+pub struct WalletSessionObservation {
+    pub snapshot: Arc<ListUtxosOutput>,
+    pub readiness: WalletReadiness,
+    pub ppoi_workflow_status: WalletPpoiWorkflowStatus,
+}
+
+pub struct WalletSession {
+    pub chain_id: u64,
+    pub poi_read_source: PoiReadSource,
+    pub cache_key: String,
+    pub start_block: u64,
+    pub observation_rx: watch::Receiver<WalletSessionObservation>,
+    pub sync_tip_rx: watch::Receiver<WalletSyncTip>,
+    pub poi_refreshing_rx: watch::Receiver<bool>,
+    pub poi_artifact_cache_progress_rx:
+        Option<watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>>,
+    pub(crate) db: Arc<DbStore>,
+    pub(crate) sync_manager: Arc<SyncManager>,
+    pub(crate) chain_key: ChainKey,
+    pub(crate) handle: WalletHandle,
+    pub(crate) public_data_plane: PublicDataPlaneHandle,
+    pub(super) projection_cancel_tx: watch::Sender<bool>,
+    pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(super) executor_owner: Option<Arc<ExecutorOwner>>,
+}
+
+pub struct WalletPoiArtifactCacheRetry {
+    retry: CorePoiArtifactCacheRetry,
+    handle: WalletHandle,
+}
+
+impl WalletPoiArtifactCacheRetry {
+    #[must_use]
+    pub const fn attempt_id(&self) -> PoiArtifactCacheAttemptId {
+        self.retry.attempt_id()
+    }
+
+    pub async fn wait(self) -> Result<bool> {
+        self.retry
+            .wait()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(self.handle.refresh_poi_statuses().await)
+    }
+}
+
+impl WalletSession {
+    #[must_use]
+    pub fn executor_owner(&self) -> Option<Arc<ExecutorOwner>> {
+        self.executor_owner.clone()
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        if let Some(owner) = &self.executor_owner {
+            owner.shutdown().await;
+        }
+        let result = self
+            .sync_manager
+            .remove_wallet_session(&self.handle)
+            .await
+            .wrap_err("remove wallet sync worker");
+        if result.is_err() {
+            let _ = self.projection_cancel_tx.send(true);
+        }
+        let projection_join = match self.projection_join.lock() {
+            Ok(mut projection_join) => projection_join.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(projection_join) = projection_join {
+            projection_join
+                .await
+                .wrap_err("join wallet session observation projection")?;
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn unspent_utxos(&self) -> Vec<Utxo> {
+        let Some(snapshot) = self.handle.current_snapshot() else {
+            return Vec::new();
+        };
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        if let Some(owner) = &self.executor_owner {
+            return owner.available_inputs(inputs).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "executor input reservations are unavailable; private spending remains blocked"
+                );
+                Vec::new()
+            });
+        }
+        inputs
+    }
+
+    /// Spendable notes for this prepared operation, including its own durable reservation.
+    pub fn unspent_utxos_for_executor(
+        &self,
+        prepared: &PreparedExecutorOperation,
+    ) -> Result<Vec<Utxo>> {
+        let snapshot = self
+            .handle
+            .current_snapshot()
+            .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
+        // Retain ordinary actor/chain pending-spend and POI admission. Only this
+        // operation's additional durable executor reservation may be reused.
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        self.executor_owner
+            .as_ref()
+            .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?
+            .inputs_for_preparation(inputs, prepared)
+    }
+
+    pub(crate) async fn mark_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: Option<FixedBytes<32>>,
+    ) {
+        match self.handle.mark_pending_spent_utxos(utxos, tx_hash).await {
+            Ok(
+                WalletPendingSpentMarkOutcome::Marked
+                | WalletPendingSpentMarkOutcome::AlreadyProtected,
+            ) => {}
+            Err(error) => {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend update");
+            }
+        }
+    }
+
+    pub(crate) async fn renew_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: FixedBytes<32>,
+    ) -> Result<()> {
+        self.handle
+            .mark_pending_spent_utxos(utxos, Some(tx_hash))
+            .await
+            .map(|_| ())
+            .map_err(Report::new)
+            .wrap_err("renew local pending-spend protection")
+    }
+
+    pub async fn clear_local_pending_spent(&self) -> bool {
+        self.handle
+            .clear_all_local_pending_spent()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
+                false
+            })
+    }
+
+    pub async fn refresh_poi_statuses(&self) -> bool {
+        self.handle.refresh_poi_statuses().await
+    }
+
+    pub async fn retry_poi_artifact_cache(&self) -> Result<WalletPoiArtifactCacheRetry> {
+        let retry = self
+            .public_data_plane
+            .retry_poi_artifact_cache()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(WalletPoiArtifactCacheRetry {
+            retry,
+            handle: self.handle.clone(),
+        })
+    }
+}
+
+impl Drop for WalletSession {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.executor_owner {
+            owner.close();
+        }
+        let _ = self.projection_cancel_tx.send(true);
+        if let Ok(projection_join) = self.projection_join.get_mut()
+            && let Some(projection_join) = projection_join.take()
+        {
+            projection_join.abort();
+        }
+    }
+}
+
 pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     active_wallet_scope: AsyncMutex<ActiveWalletScope>,
+    wallet_startups: AsyncRwLock<()>,
     executor_owners: Mutex<ExecutorOwners>,
 }
 
@@ -130,6 +324,7 @@ impl WalletSessionStore {
             db,
             sync_manager,
             active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
+            wallet_startups: AsyncRwLock::new(()),
             executor_owners: Mutex::new(ExecutorOwners::default()),
         })
     }
@@ -172,12 +367,18 @@ impl WalletSessionStore {
         let wallet_id = request.view_session.wallet_id().to_owned();
         let mut active_scope = self.active_wallet_scope.lock().await;
         if active_scope.requires_replacement(request.wallet_scope_generation, &wallet_id)? {
+            // Replacement must not remove actors while an admitted startup still creates them.
+            let _exclusive_startups = self.wallet_startups.write().await;
             self.invalidate_executor_owners(request.wallet_scope_generation);
             self.shutdown_superseded_executor_owners(request.wallet_scope_generation)
                 .await;
             self.sync_manager.remove_all_wallets().await;
             active_scope.replace(request.wallet_scope_generation, wallet_id);
         }
+        // Admit this startup while the scope is locked, then let other chains in the same
+        // scope start concurrently. The shared guard prevents replacement until it finishes.
+        let _startup = self.wallet_startups.read().await;
+        drop(active_scope);
 
         let chain_id = request.chain_id;
         let executor_view = Arc::clone(&request.view_session);
@@ -648,6 +849,141 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn chain_startups_overlap_but_wallet_replacement_waits_for_them() {
+        use futures_util::poll;
+        use tokio::net::TcpListener;
+
+        let root_dir = std::env::temp_dir().join(format!(
+            "concurrent-chain-startup-{}",
+            vault::generate_opaque_id().unwrap()
+        ));
+        let vault = vault::DesktopVaultStore::open(root_dir.clone()).unwrap();
+        let password = "synthetic startup concurrency password";
+        vault
+            .create_vault_with_params(password, vault::KdfParams::new(1024, 1, 1))
+            .unwrap();
+        let wallet_id = vault::generate_opaque_id().unwrap();
+        let metadata = vault
+            .new_wallet_metadata(
+                password,
+                &wallet_id,
+                0,
+                vault::WalletSource::Imported,
+                "Test",
+            )
+            .unwrap();
+        vault.import_wallet_mnemonic_with_metadata(
+            password, &wallet_id, 0, "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", &metadata,
+        ).unwrap();
+        let view = Arc::new(vault.load_view_session(password, &wallet_id).unwrap());
+        let poi = PoiReadSource::PoiProxy {
+            rpc_url: Url::parse("http://127.0.0.1:1").unwrap().into(),
+        };
+        let sessions = Arc::new(WalletSessionStore::from_db(vault.db(), poi.clone()).unwrap());
+        let http = HttpContext::direct_for_tests();
+        let chains =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default()).unwrap();
+        let owner = sessions
+            .create_executor_owner(
+                1,
+                view.clone(),
+                chains.get(1).unwrap().clone(),
+                http.clone(),
+            )
+            .unwrap();
+        let request = |chain_id, generation, listener: &TcpListener| {
+            let mut chain = chains.get(chain_id).unwrap().clone();
+            chain.rpc_route = crate::RpcChainRoute::new(
+                chain_id,
+                vec![Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()],
+            );
+            let private = chain.railgun.as_mut().unwrap();
+            private.archive_rpc_url = None;
+            private.sync.quick_sync_endpoint = None;
+            private.sync.indexed_artifact_source = None;
+            ViewWalletChainSessionRequest {
+                view_session: view.clone(),
+                wallet_scope_generation: generation,
+                chain_id,
+                effective_chain: chain,
+                sync_start_policy: DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                init_block_number: Some(0),
+                sync_to_block: Some(0),
+                use_indexed_wallet_catch_up: false,
+                poi_read_source: poi.clone(),
+                rewind_wallet_cache: false,
+                progress_tx: None,
+            }
+        };
+        let start = |request| {
+            let sessions = Arc::clone(&sessions);
+            let http = http.clone();
+            tokio::spawn(async move {
+                Box::pin(sessions.start_view_wallet_session_immediate(request, &http)).await
+            })
+        };
+
+        let polygon = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let first = start(request(137, 1, &polygon));
+        let held_polygon = tokio::time::timeout(Duration::from_secs(2), polygon.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        // Polygon never answers. Arbitrum must still reach its own RPC independently.
+        let arbitrum = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let second = start(request(42161, 1, &arbitrum));
+        let held_arbitrum = tokio::time::timeout(Duration::from_secs(2), arbitrum.accept())
+            .await
+            .expect("a stalled chain must not block another chain's startup")
+            .unwrap();
+        assert!(!first.is_finished() && !second.is_finished());
+        second.abort();
+        assert!(matches!(second.await, Err(error) if error.is_cancelled()));
+        drop(held_arbitrum);
+
+        // A new wallet generation must wait for the old startup before retiring its owners.
+        let replacement_rpc = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut replacement = Box::pin(
+            sessions.start_view_wallet_session_immediate(request(56, 2, &replacement_rpc), &http),
+        );
+        assert!(poll!(replacement.as_mut()).is_pending());
+        assert!(
+            owner.records().is_ok(),
+            "replacement must wait for the old startup"
+        );
+        first.abort();
+        assert!(matches!(first.await, Err(error) if error.is_cancelled()));
+        drop(held_polygon);
+        let held_replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut replacement => panic!("replacement RPC should still be pending"),
+                connection = replacement_rpc.accept() => connection.unwrap(),
+            }
+        })
+        .await
+        .expect("cancelling the old startup must unblock replacement");
+        assert!(
+            owner.records().is_err(),
+            "the old owner is retired before replacement starts"
+        );
+        drop(replacement);
+        drop(held_replacement);
+        sessions.shutdown().await;
+        drop(owner);
+        drop(sessions);
+        drop(view);
+        drop(vault);
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn executor_lifecycle_cancels_reads_and_rejects_stale_owners_without_losing_records() {
         let root_dir = std::env::temp_dir().join(format!(
             "executor-lifecycle-{}",
@@ -740,7 +1076,7 @@ mod tests {
             U256::from(3),
         );
         records
-            .reconcile(record.operation(), observed, &[])
+            .record_account_read(record.operation(), observed)
             .unwrap();
         let payload_hash = FixedBytes::repeat_byte(4);
         records
@@ -760,20 +1096,12 @@ mod tests {
             )
             .unwrap();
         records
-            .reconcile(
+            .record_account_read(
                 record.operation(),
                 vault::ExecutorNonceObservation::new(
                     alloy::eips::BlockNumHash::new(12, FixedBytes::repeat_byte(12)),
                     U256::from(4),
                 ),
-                &[(
-                    payload_hash,
-                    vault::ExecutorPayloadInclusion::new(
-                        alloy::eips::BlockNumHash::new(11, FixedBytes::repeat_byte(11)),
-                        FixedBytes::repeat_byte(5),
-                        vault::ExecutorExecutionResult::Executed,
-                    ),
-                )],
             )
             .unwrap();
         let reading_owner = owner.clone();
@@ -794,8 +1122,8 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            records.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            records.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(2), reading)
@@ -810,12 +1138,12 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.records().unwrap().len(), 1);
         assert_eq!(
-            replacement.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            replacement.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert_eq!(
-            records.records().unwrap()[0].payload_status(payload_hash),
-            Some(vault::ExecutorPayloadStatus::Executed)
+            records.records().unwrap()[0].payload_state(payload_hash),
+            Some(vault::ExecutorPayloadState::Resolved)
         );
         assert_eq!(records.next_index().unwrap(), 8);
         sessions.shutdown().await;

@@ -225,6 +225,24 @@ impl DesktopPrivateSpendAuthorization {
         }
     }
 
+    /// The same software authorization for the destination chain's setup of a private Bridge
+    /// swap, which consumes its own value. A hardware approval is bound to one owner and
+    /// action; pair two with `HardwareExecutorAuthorizationRequest::complete_with_destination`.
+    pub fn for_destination(&self) -> Result<Self> {
+        match self {
+            Self::VaultPassword(password) => Ok(Self::VaultPassword(password.clone())),
+            Self::ProtectedSoftwareSeed { password, session } => Ok(Self::ProtectedSoftwareSeed {
+                password: password.clone(),
+                session: Arc::clone(session),
+            }),
+            Self::PreauthorizedSigner(_) | Self::HardwareExecutor(_) | Self::HardwarePublic => {
+                Err(eyre!(
+                    "this authorization covers one network; authorize the destination network's setup separately"
+                ))
+            }
+        }
+    }
+
     #[must_use]
     pub fn protected_seed_session(&self) -> Option<Arc<vault::ProtectedSoftwareSeedSession>> {
         match self {
@@ -631,10 +649,29 @@ pub struct BlockedShieldRescueUtxoId {
     pub blinded_commitment: FixedBytes<32>,
 }
 
+/// Why the origin account of a blocked Shield can't refund it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedShieldRescueBlocker {
+    /// The origin is neither a Public account nor a recorded stealth account of this wallet.
+    OriginUnknown,
+    /// The origin is a recorded stealth account that is not an active Public account.
+    OriginStealth {
+        operation: vault::ExecutorOperationId,
+        index: u32,
+    },
+    /// The origin is a Public account that is inactive.
+    OriginInactive {
+        public_account_uuid: String,
+        label: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedShieldRescueEligibility {
     pub eligible: bool,
     pub disabled_reason: Option<String>,
+    /// `None` when eligible, and when the reason is not the origin account.
+    pub blocker: Option<BlockedShieldRescueBlocker>,
     pub origin_address: Option<Address>,
     pub public_account_uuid: Option<String>,
     pub public_account_label: Option<String>,
@@ -678,7 +715,7 @@ pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
-    pub vault_password: Zeroizing<String>,
+    pub vault_password: Option<Zeroizing<String>>,
     pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub utxo_id: BlockedShieldRescueUtxoId,

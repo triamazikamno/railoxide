@@ -32,11 +32,11 @@ use super::{
 pub(super) enum ChainUtxoState {
     Idle,
     Loading {
-        progress: Option<SyncProgressUpdate>,
+        progress: ChainSyncProgress,
     },
     Syncing {
         snapshot: Arc<ListUtxosOutput>,
-        progress: Option<SyncProgressUpdate>,
+        progress: ChainSyncProgress,
         session: Arc<wallet_ops::WalletSession>,
         observer_token: InstalledObserverToken,
         sync_tip: WalletSyncTip,
@@ -56,6 +56,51 @@ pub(super) enum ChainUtxoState {
         start_block: Option<u64>,
         ppoi_workflow_status: WalletPpoiWorkflowStatus,
     },
+}
+
+/// A chain sync's progress: its stage's latest update, and how far the whole sync has come.
+/// Each stage reports its progress from zero, and updates of different stages can arrive out
+/// of order, so `percent` puts the stages on one scale and keeps the furthest point reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ChainSyncProgress {
+    latest: Option<SyncProgressUpdate>,
+    percent: Option<u8>,
+}
+
+impl ChainSyncProgress {
+    /// Take the sync's next update, or `None` while its stage has none to show. The percent
+    /// rises to the update's and never falls.
+    pub(super) fn observe(&mut self, update: Option<SyncProgressUpdate>) {
+        self.latest = update;
+        if let Some(update) = update {
+            self.percent = self.percent.max(Some(overall_sync_percent(update)));
+        }
+    }
+
+    pub(super) const fn latest(self) -> Option<SyncProgressUpdate> {
+        self.latest
+    }
+
+    /// How far the whole sync has come, in percent. `None` until an update was observed.
+    pub(super) const fn percent(self) -> Option<u8> {
+        self.percent
+    }
+}
+
+/// Where `update` stands in a whole chain sync, in percent: its own percent within its
+/// stage's share of the sync.
+pub(super) fn overall_sync_percent(update: SyncProgressUpdate) -> u8 {
+    // Estimates of each stage's share of a cold sync, as the percent it starts and ends at.
+    let (start, end) = match (update.stage, update.unit) {
+        (SyncProgressStage::SynchronizingCommitments, SyncProgressUnit::CommitmentTail) => {
+            (45_u16, 50)
+        }
+        (SyncProgressStage::SynchronizingCommitments, _) => (0, 45),
+        (SyncProgressStage::PreparingUtxoIndex, _) => (50, 80),
+        (SyncProgressStage::IndexingUtxos, _) => (80, 100),
+    };
+    let scaled = start + (end - start) * u16::from(update.percent()) / 100;
+    u8::try_from(scaled).unwrap_or(100)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,7 +799,16 @@ impl ChainUtxoState {
 
     pub(super) const fn progress(&self) -> Option<SyncProgressUpdate> {
         match self {
-            Self::Loading { progress } | Self::Syncing { progress, .. } => *progress,
+            Self::Loading { progress } | Self::Syncing { progress, .. } => progress.latest(),
+            Self::Idle | Self::Ready { .. } | Self::Error { .. } => None,
+        }
+    }
+
+    /// How far the chain's whole sync has come, in percent, while it is under way and an
+    /// update has arrived.
+    pub(super) const fn sync_percent(&self) -> Option<u8> {
+        match self {
+            Self::Loading { progress } | Self::Syncing { progress, .. } => progress.percent(),
             Self::Idle | Self::Ready { .. } | Self::Error { .. } => None,
         }
     }
@@ -1536,7 +1590,7 @@ impl WalletRoot {
         self.blocked_shield_rescue_lookup_generation =
             self.blocked_shield_rescue_lookup_generation.wrapping_add(1);
         self.pending_ppoi_validation_toast = None;
-        self.active_wallet_tab = WalletTab::default();
+        self.active_wallet_tab = self.default_wallet_tab();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }
@@ -1981,8 +2035,12 @@ impl WalletRoot {
             None
         };
 
-        self.chain_states
-            .insert(chain_id, ChainUtxoState::Loading { progress: None });
+        self.chain_states.insert(
+            chain_id,
+            ChainUtxoState::Loading {
+                progress: ChainSyncProgress::default(),
+            },
+        );
         self.handle_initial_sync_observation(
             self.active_wallet_generation,
             chain_id,
@@ -2123,7 +2181,7 @@ impl WalletRoot {
                     }
                     let fingerprint = match root.chain_states.get_mut(&chain_id) {
                         Some(ChainUtxoState::Loading { progress: state }) => {
-                            *state = progress;
+                            state.observe(progress);
                             Some(InitialCatchUpFingerprint::new(progress, None))
                         }
                         Some(ChainUtxoState::Syncing {
@@ -2131,8 +2189,14 @@ impl WalletRoot {
                             sync_tip,
                             ..
                         }) => {
-                            *state = syncing_progress(progress);
-                            Some(InitialCatchUpFingerprint::new(*state, Some(*sync_tip)))
+                            // Once the session is installed, a commitment update can describe
+                            // the forest's own live catch-up instead of this sync's remaining
+                            // work, so the percent leaves it out as the stage display does. A
+                            // chain that was synced a moment ago then doesn't read as half done.
+                            // The percent can lag until the next wallet update because of it.
+                            let progress = syncing_progress(progress);
+                            state.observe(progress);
+                            Some(InitialCatchUpFingerprint::new(progress, Some(*sync_tip)))
                         }
                         Some(ChainUtxoState::Ready { .. }) => None,
                         Some(ChainUtxoState::Idle | ChainUtxoState::Error { .. }) | None => {
@@ -2312,11 +2376,20 @@ impl WalletRoot {
                     lifecycle_generation,
                     chain_load_task_id,
                 );
-                let progress = root
-                    .chain_states
-                    .get(&chain_id)
-                    .and_then(ChainUtxoState::progress);
-                let progress = syncing_progress(progress);
+                // The sync's percent carries over from the startup.
+                let mut progress = match root.chain_states.get(&chain_id) {
+                    Some(
+                        ChainUtxoState::Loading { progress }
+                        | ChainUtxoState::Syncing { progress, .. },
+                    ) => *progress,
+                    Some(
+                        ChainUtxoState::Idle
+                        | ChainUtxoState::Ready { .. }
+                        | ChainUtxoState::Error { .. },
+                    )
+                    | None => ChainSyncProgress::default(),
+                };
+                progress.observe(syncing_progress(progress.latest()));
                 let state = match initial_readiness.clone() {
                     WalletReadinessDisposition::Ready => ChainUtxoState::Ready {
                         snapshot: initial_snapshot.clone(),
@@ -2346,7 +2419,10 @@ impl WalletRoot {
                 let initial_sync_fingerprint = match &state {
                     ChainUtxoState::Syncing {
                         progress, sync_tip, ..
-                    } => Some(InitialCatchUpFingerprint::new(*progress, Some(*sync_tip))),
+                    } => Some(InitialCatchUpFingerprint::new(
+                        progress.latest(),
+                        Some(*sync_tip),
+                    )),
                     ChainUtxoState::Idle
                     | ChainUtxoState::Loading { .. }
                     | ChainUtxoState::Ready { .. }
@@ -2599,7 +2675,7 @@ impl WalletRoot {
                                     ..
                                 } => ChainUtxoState::Syncing {
                                     snapshot: snapshot.clone(),
-                                    progress: None,
+                                    progress: ChainSyncProgress::default(),
                                     session,
                                     observer_token,
                                     sync_tip,
@@ -2631,6 +2707,7 @@ impl WalletRoot {
                                 ));
                             }
                             root.refresh_open_form_assets_for_snapshot(&snapshot, cx);
+                            root.refresh_private_swap_assets(chain_id, cx);
                             if became_ready {
                                 root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
                             }

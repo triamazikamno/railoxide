@@ -1,11 +1,9 @@
 //! The swap dialog. One dialog shows the swap form, My orders, or one swap's order detail, and a
-//! back button moves between them. Escape and × close it. Only the broadcaster picker, the spend
-//! authorization review, stealth-account recovery and confirmations open on top of it.
+//! back button moves between them. Escape and × close it. The asset and broadcaster pickers,
+//! spend authorization review, stealth-account recovery and confirmations open on top of it.
 //!
 //! Background work may change the dialog only while it has focus and shows the swap the work
 //! belongs to, so a quote or order result never replaces or interrupts another dialog.
-
-use std::ops::Range;
 
 use alloy::primitives::Address;
 use gpui::{
@@ -30,8 +28,9 @@ use wallet_ops::{
 };
 
 use super::model::{
-    SwapLabels, SwapOrderGroup, SwapStage, record_swap_ranges, swap_delivery, swap_order_group,
-    swap_order_stage, swap_order_status, swap_private_minimum,
+    RecordSwap, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount,
+    provider_name, record_swaps, swap_delivery, swap_order_group, swap_order_stage,
+    swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -50,10 +49,15 @@ const ORDERS_VISIBLE_ROWS: usize = 6;
 pub(super) enum SwapDialogView {
     Form,
     Orders,
+    /// A Public-paid swap, identified by the destination account and its durable use.
+    PublicDetail(SwapIdentity),
     /// The account's latest swap, which owns the live stage and every action.
     Detail(ExecutorOperationId),
-    /// An earlier swap on a reused stealth account, by the index of its first order. Read only.
-    PastDetail(ExecutorOperationId, usize),
+    /// An earlier swap on a reused stealth account, by its swap use. Read only. The index is
+    /// its first order's, which tells apart the swaps of one use from before swap uses.
+    PastDetail(SwapIdentity, usize),
+    /// A stopped preparation with no order UID, retained across account reuse.
+    CancelledPreparation(SwapIdentity),
 }
 
 pub(super) struct SwapDialog {
@@ -201,7 +205,13 @@ impl PrivateSwapsView {
                 .form
                 .as_ref()
                 .is_some_and(|form| form.operation() == Some(operation)),
-            Some(SwapDialogView::Orders | SwapDialogView::PastDetail(..)) | None => false,
+            Some(
+                SwapDialogView::Orders
+                | SwapDialogView::PastDetail(..)
+                | SwapDialogView::CancelledPreparation(_)
+                | SwapDialogView::PublicDetail(_),
+            )
+            | None => false,
         };
         shown && self.swap_dialog_active(window, cx)
     }
@@ -239,6 +249,14 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // The detail of the Public account swap at work continues what its form started.
+        let continues = matches!(
+            view,
+            SwapDialogView::PublicDetail(swap) if self.public_swap_at_work() == Some(swap)
+        );
+        if !continues && self.dialog.as_ref().map(|dialog| dialog.view) != Some(view) {
+            self.dismiss_public_preparation();
+        }
         let Some(dialog) = self.dialog.as_mut() else {
             self.open_swap_dialog(view, window, cx);
             return;
@@ -247,14 +265,42 @@ impl PrivateSwapsView {
             dialog.view = view;
             dialog.outcome_fees_open = false;
             dialog.outcome_details_open = false;
+            // A cancelled preparation is reported until the dialog shows something else.
+            self.cancelled = None;
         }
         self.close_setup_settings(cx);
-        if let SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) = view {
+        if let SwapDialogView::Detail(_)
+        | SwapDialogView::PastDetail(..)
+        | SwapDialogView::CancelledPreparation(_)
+        | SwapDialogView::PublicDetail(_) = view
+        {
             self.form = None;
             self.error = None;
         }
+        self.load_detail_destination(view, cx);
         self.focus_view(view, window, cx);
         cx.notify();
+    }
+
+    /// A private Bridge swap's detail tells about its destination stealth account, which only
+    /// the destination network's session knows. Opening the detail starts loading that network
+    /// and reads the account again.
+    fn load_detail_destination(&mut self, view: SwapDialogView, cx: &mut Context<'_, Self>) {
+        let delivery = match view {
+            SwapDialogView::Detail(operation) => self
+                .record(operation)
+                .and_then(|record| self.shown_private_delivery(record)),
+            SwapDialogView::CancelledPreparation(swap) => self
+                .record(swap.operation)
+                .and_then(|record| super::model::swap_use_destination(record, swap.swap_use))
+                .map(|(delivery, _)| delivery),
+            _ => None,
+        };
+        let Some(delivery) = delivery else {
+            return;
+        };
+        self.ensure_destination_load(delivery.destination_chain, cx);
+        self.reload_destinations(cx);
     }
 
     fn open_swap_dialog(
@@ -263,11 +309,16 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.dismiss_public_preparation();
         window.close_all_dialogs(cx);
+        self.cancelled = None;
         match view {
             SwapDialogView::Form => {}
             SwapDialogView::Orders => self.form = None,
-            SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) => {
+            SwapDialogView::Detail(_)
+            | SwapDialogView::PastDetail(..)
+            | SwapDialogView::CancelledPreparation(_)
+            | SwapDialogView::PublicDetail(_) => {
                 self.form = None;
                 self.error = None;
             }
@@ -308,6 +359,7 @@ impl PrivateSwapsView {
             outcome_fees_open: false,
             outcome_details_open: false,
         });
+        self.load_detail_destination(view, cx);
         self.focus_view(view, window, cx);
         cx.notify();
     }
@@ -326,7 +378,10 @@ impl PrivateSwapsView {
                 let list = self.orders_list(window, cx);
                 list.update(cx, |list, cx| list.focus(window, cx));
             }
-            SwapDialogView::Detail(_) | SwapDialogView::PastDetail(..) => {
+            SwapDialogView::Detail(_)
+            | SwapDialogView::PastDetail(..)
+            | SwapDialogView::CancelledPreparation(_)
+            | SwapDialogView::PublicDetail(_) => {
                 if let Some(focus) = self.swap_dialog_focus() {
                     focus.focus(window, cx);
                 }
@@ -360,9 +415,11 @@ impl PrivateSwapsView {
     }
 
     fn dialog_closed(&mut self, cx: &mut Context<'_, Self>) {
+        self.dismiss_public_preparation();
         self.dialog = None;
         self.form = None;
         self.reapproval = None;
+        self.cancelled = None;
         cx.notify();
     }
 
@@ -410,37 +467,66 @@ impl PrivateSwapsView {
     /// setups.
     fn order_entries(&self, cx: &App) -> Vec<OrderEntry<'_>> {
         let mut entries = Vec::new();
-        for record in self
-            .records
-            .iter()
-            .filter(|record| is_swap_record(record) || self.pending_order(record).is_some())
-        {
-            let ranges = record_swap_ranges(record);
+        for record in self.records.iter().filter(|record| {
+            is_swap_record(record)
+                || self.pending_order(record).is_some()
+                || super::model::cancelled_swap_uses(record).next().is_some()
+        }) {
+            let mut has_cancelled = false;
+            for claimed in super::model::cancelled_swap_uses(record) {
+                has_cancelled = true;
+                let swap = SwapIdentity {
+                    operation: record.operation(),
+                    swap_use: claimed.id(),
+                };
+                let attention = self
+                    .cancelled_use(swap, cx)
+                    .is_some_and(|cancelled| cancelled.needs_attention());
+                entries.push(OrderEntry {
+                    record,
+                    view: SwapDialogView::CancelledPreparation(swap),
+                    order: None,
+                    stage: SwapStage::SetupRetired,
+                    group: if attention {
+                        SwapOrderGroup::NeedsAttention
+                    } else {
+                        SwapOrderGroup::Ended
+                    },
+                    started: claimed.started_at().map(|at| ("Started", at)),
+                });
+            }
             let pending = self.pending_order(record);
             let orders = record
                 .swap()
                 .map_or(&[][..], wallet_ops::vault::SwapOperationRecord::orders);
-            let (latest, earlier) = match ranges.split_last() {
-                _ if pending.is_some_and(|pending| pending.starts_new_swap(record)) => {
-                    (None, ranges.as_slice())
-                }
-                Some((latest, earlier)) => (Some(latest), earlier),
-                None => (None, &[][..]),
-            };
-            for range in earlier {
-                let Some(order) = orders.get(range.end - 1) else {
+            let (earlier, latest) = self.record_history(record);
+            for swap in &earlier {
+                let Some(order) = orders.get(swap.orders.end - 1) else {
                     continue;
                 };
                 // An earlier swap ended before the next one could start.
-                let stage = swap_order_stage(record, order);
+                let stage = swap_order_stage(record, order, self.attribution(record));
                 entries.push(OrderEntry {
                     record,
-                    view: SwapDialogView::PastDetail(record.operation(), range.start),
+                    view: SwapDialogView::PastDetail(
+                        SwapIdentity {
+                            operation: record.operation(),
+                            swap_use: swap.swap_use,
+                        },
+                        swap.orders.start,
+                    ),
                     order: Some(order),
                     stage,
                     group: swap_order_group(stage, false, false),
-                    started: self.swap_started(record, Some(range), cx),
+                    started: self.swap_started(record, Some(swap), cx),
                 });
+            }
+            if has_cancelled
+                && orders.is_empty()
+                && pending.is_none()
+                && super::model::prepared_swap_use(record).is_none()
+            {
+                continue;
             }
             let stage = self.progress_stage(record);
             entries.push(OrderEntry {
@@ -454,9 +540,39 @@ impl PrivateSwapsView {
                     record.is_hidden() && pending.is_none(),
                 ),
                 started: pending
-                    .map(|pending| ("Started", pending.started_at))
-                    .or_else(|| self.swap_started(record, latest, cx)),
+                    .map(|pending| ("Started", pending.started(record)))
+                    .or_else(|| self.swap_started(record, latest.as_ref(), cx)),
             });
+        }
+        for (_, record) in self
+            .public_records
+            .iter()
+            .filter(|(chain, _)| *chain == self.origin_chain_id)
+        {
+            for claimed in record.swap_uses() {
+                let Some(stage) = super::model::public_swap_stage(
+                    record,
+                    claimed,
+                    None,
+                    super::now_unix(),
+                    self.attribution(record),
+                    self.public_destination_balance(record, claimed),
+                ) else {
+                    continue;
+                };
+                entries.push(OrderEntry {
+                    record,
+                    view: SwapDialogView::PublicDetail(SwapIdentity {
+                        operation: record.operation(),
+                        swap_use: claimed.id(),
+                    }),
+                    order: None,
+                    // Public entries use their own derived stage in the row renderer.
+                    stage: SwapStage::Ready,
+                    group: stage.group(),
+                    started: claimed.started_at().map(|at| ("Started", at)),
+                });
+            }
         }
         entries.sort_by_key(|entry| {
             std::cmp::Reverse((entry.started.map(|(_, at)| at), entry.record.index()))
@@ -464,19 +580,59 @@ impl PrivateSwapsView {
         entries
     }
 
-    /// When a swap started: its first order's `validTo` less the profile's order window, or for
-    /// a swap without orders, when its stealth account was reserved. Without a profile, the
-    /// first order's expiry, labeled as such.
+    /// How many swaps My orders lists as open.
+    pub(super) fn open_order_count(&self, cx: &App) -> usize {
+        self.order_entries(cx)
+            .iter()
+            .filter(|entry| entry.group == SwapOrderGroup::Open)
+            .count()
+    }
+
+    /// The record's swaps that have orders, oldest first, as the earlier ones and the latest,
+    /// which the record's own detail shows. While a draft prepares another swap on the
+    /// account, every swap with an order is an earlier one.
+    pub(super) fn record_history(
+        &self,
+        record: &ExecutorRecord,
+    ) -> (Vec<RecordSwap>, Option<RecordSwap>) {
+        let mut swaps = record_swaps(record);
+        let latest = if self
+            .pending_order(record)
+            .is_some_and(|pending| pending.starts_new_swap(record))
+        {
+            None
+        } else {
+            swaps.pop()
+        };
+        (swaps, latest)
+    }
+
+    /// When a swap started: for a swap that reused its stealth account, when its use claimed
+    /// the account. Otherwise its first order's `validTo` less the validity it was signed
+    /// with, or the profile's order window for records without one, or for a swap without
+    /// orders, when its stealth account was reserved. Without either validity, the first
+    /// order's expiry, labeled as such.
     pub(super) fn swap_started(
         &self,
         record: &ExecutorRecord,
-        range: Option<&Range<usize>>,
+        swap: Option<&RecordSwap>,
         cx: &App,
     ) -> Option<(&'static str, u64)> {
-        let Some(range) = range else {
+        let Some(swap) = swap else {
             return record.created_at().map(|at| ("Started", at));
         };
-        let valid_to = u64::from(record.swap()?.orders().get(range.start)?.valid_to());
+        if let Some(claimed) = record
+            .swap_use(swap.swap_use)
+            .filter(|swap_use| !swap_use.is_fresh())
+            .and_then(wallet_ops::vault::SwapUseRecord::started_at)
+        {
+            return Some(("Started", claimed));
+        }
+        let first = record.swap()?.orders().get(swap.orders.start)?;
+        let valid_to = u64::from(first.valid_to());
+        if let Some(valid_for) = first.bounds().valid_for_secs {
+            return Some(("Started", valid_to.saturating_sub(u64::from(valid_for))));
+        }
         Some(
             self.swap_profile(cx)
                 .map_or(("Order valid until", valid_to), |profile| {
@@ -488,26 +644,20 @@ impl PrivateSwapsView {
         )
     }
 
-    /// An earlier swap of `operation`'s record, by its first order: the record, the swap's
-    /// orders, and its last order.
+    /// The earlier swap `swap` of its stealth account's record, whose first order is `first`:
+    /// the record, the swap's orders, and its last order.
     pub(super) fn past_swap(
         &self,
-        operation: ExecutorOperationId,
+        swap: SwapIdentity,
         first: usize,
-    ) -> Option<(&ExecutorRecord, Range<usize>, &SwapOrderRecord)> {
-        let record = self.record(operation)?;
-        let ranges = record_swap_ranges(record);
-        let earlier = if self
-            .pending_order(record)
-            .is_some_and(|pending| pending.starts_new_swap(record))
-        {
-            ranges.as_slice()
-        } else {
-            ranges.split_last()?.1
-        };
-        let range = earlier.iter().find(|range| range.start == first)?.clone();
-        let order = record.swap()?.orders().get(range.end - 1)?;
-        Some((record, range, order))
+    ) -> Option<(&ExecutorRecord, RecordSwap, &SwapOrderRecord)> {
+        let record = self.record(swap.operation)?;
+        let (earlier, _) = self.record_history(record);
+        let past = earlier
+            .into_iter()
+            .find(|past| past.swap_use == swap.swap_use && past.orders.start == first)?;
+        let order = record.swap()?.orders().get(past.orders.end - 1)?;
+        Some((record, past, order))
     }
 
     /// Display strings for an earlier swap, from its own last order and terms.
@@ -519,6 +669,7 @@ impl PrivateSwapsView {
     ) -> SwapLabels {
         let tokens = order_tokens(record, order).unwrap_or_default();
         self.order_labels(
+            record,
             tokens,
             Some(order.bounds().spend_amount()),
             Some(order),
@@ -527,8 +678,8 @@ impl PrivateSwapsView {
         )
     }
 
-    fn past_title(&self, operation: ExecutorOperationId, first: usize, cx: &App) -> String {
-        self.past_swap(operation, first).map_or_else(
+    fn past_title(&self, swap: SwapIdentity, first: usize, cx: &App) -> String {
+        self.past_swap(swap, first).map_or_else(
             || "Swap".into(),
             |(record, _, order)| format!("Swap {}", self.past_labels(record, order, cx).pair),
         )
@@ -548,9 +699,20 @@ impl PrivateSwapsView {
                 Some(SwapDialogView::Orders),
                 self.progress_title(operation, cx),
             ),
-            Some(SwapDialogView::PastDetail(operation, first)) => (
+            Some(SwapDialogView::PublicDetail(swap)) => (
                 Some(SwapDialogView::Orders),
-                self.past_title(operation, first, cx),
+                self.public_progress_title(swap, cx),
+            ),
+            Some(SwapDialogView::PastDetail(swap, first)) => (
+                Some(SwapDialogView::Orders),
+                self.past_title(swap, first, cx),
+            ),
+            Some(SwapDialogView::CancelledPreparation(swap)) => (
+                Some(SwapDialogView::Orders),
+                self.cancelled_use(swap, cx).map_or_else(
+                    || "Swap preparation".to_owned(),
+                    |cancelled| cancelled.title,
+                ),
             ),
             None => (None, "Swap".to_owned()),
         };
@@ -558,9 +720,14 @@ impl PrivateSwapsView {
             Some(SwapDialogView::Detail(operation)) => self
                 .record(operation)
                 .map(|record| (self.progress_stage(record), swap_delivery(record))),
-            Some(SwapDialogView::PastDetail(operation, first)) => self
-                .past_swap(operation, first)
-                .map(|(record, _, order)| (swap_order_stage(record, order), order.delivery())),
+            Some(SwapDialogView::PastDetail(swap, first)) => {
+                self.past_swap(swap, first).map(|(record, _, order)| {
+                    (
+                        swap_order_stage(record, order, self.attribution(record)),
+                        order.delivery(),
+                    )
+                })
+            }
             _ => None,
         };
         let completed = stage.and_then(|(stage, delivery)| {
@@ -596,11 +763,13 @@ impl PrivateSwapsView {
                     .truncate(),
             )
             .when_some(completed, |row, delivery| {
-                // Completed means back in the private balance; a Public address swap was
-                // delivered to its receiver.
+                // Completed means back in the private balance, here or on a private Bridge
+                // swap's destination network; a Public address swap was delivered to its
+                // receiver.
                 let label = match delivery {
                     SwapDelivery::Reshield => "Completed",
-                    SwapDelivery::External { .. } => "Delivered",
+                    SwapDelivery::Bridge(bridge) if bridge.is_private() => "Completed",
+                    SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => "Delivered",
                 };
                 row.child(
                     app_text(label)
@@ -620,11 +789,7 @@ impl PrivateSwapsView {
 
     /// My orders, labeled with the count of open swaps.
     fn render_orders_button(&self, cx: &Context<'_, Self>) -> gpui_component::button::Button {
-        let open = self
-            .order_entries(cx)
-            .iter()
-            .filter(|entry| entry.group == SwapOrderGroup::Open)
-            .count();
+        let open = self.open_orders;
         app_button_base("swap-my-orders")
             .outline()
             .small()
@@ -659,9 +824,11 @@ impl PrivateSwapsView {
             Some(SwapDialogView::Form) => self.render_form(cx),
             Some(SwapDialogView::Orders) => self.render_orders(cx),
             Some(SwapDialogView::Detail(operation)) => self.render_detail(operation, cx),
-            Some(SwapDialogView::PastDetail(operation, first)) => {
-                self.render_past_detail(operation, first, cx)
+            Some(SwapDialogView::PublicDetail(swap)) => self.render_public_detail(swap, cx),
+            Some(SwapDialogView::PastDetail(swap, first)) => {
+                self.render_past_detail(swap, first, cx)
             }
+            Some(SwapDialogView::CancelledPreparation(swap)) => self.render_cancelled_use(swap, cx),
             None => (app_muted_text("Wallet session ended."), None),
         };
         (
@@ -675,9 +842,10 @@ impl PrivateSwapsView {
         let app: &App = cx;
         let entries = self.order_entries(app);
         let count = |group| entries.iter().filter(|entry| entry.group == group).count();
-        let (open, recovery) = (
+        let (open, recovery, attention) = (
             count(SwapOrderGroup::Open),
             count(SwapOrderGroup::NeedsRecovery),
+            count(SwapOrderGroup::NeedsAttention),
         );
         let filter = self.orders_filter;
         let rows = entries
@@ -700,9 +868,19 @@ impl PrivateSwapsView {
                         "recovery",
                         recovery,
                     ),
+                    (
+                        Some(SwapOrderGroup::NeedsAttention),
+                        "Needs attention",
+                        "attention",
+                        attention,
+                    ),
                     (Some(SwapOrderGroup::Ended), "Ended", "ended", 0),
                 ]
                 .into_iter()
+                // Only a bridge deposit needs attention, so its group shows while one does.
+                .filter(|&(group, _, _, count)| {
+                    group != Some(SwapOrderGroup::NeedsAttention) || count > 0 || filter == group
+                })
                 .map(|(group, label, id, count)| {
                     app_segment_button(
                         SharedString::from(format!("swap-orders-filter-{id}")),
@@ -765,6 +943,7 @@ impl PrivateSwapsView {
             let title = match filter {
                 Some(SwapOrderGroup::Open) => "No open swaps",
                 Some(SwapOrderGroup::NeedsRecovery) => "No swaps need recovery",
+                Some(SwapOrderGroup::NeedsAttention) => "No swaps need attention",
                 Some(SwapOrderGroup::Ended) => "No ended swaps",
                 None => "No swaps yet",
             };
@@ -796,6 +975,129 @@ impl PrivateSwapsView {
 
     fn order_row(&self, entry: &OrderEntry<'_>, cx: &App) -> SwapOrderRow {
         let record = entry.record;
+        if let SwapDialogView::PublicDetail(identity) = entry.view {
+            let Some((record, claimed, swap)) = self.public_swap_record(identity) else {
+                unreachable!("entry comes from its recorded public use");
+            };
+            let Some(labels) = self.public_labels(record, claimed, cx) else {
+                unreachable!("a public use has destination labels");
+            };
+            let stage = super::model::public_swap_stage(
+                record,
+                claimed,
+                None,
+                super::now_unix(),
+                self.attribution(record),
+                self.public_destination_balance(record, claimed),
+            )
+            .expect("public use");
+            let amount = match stage {
+                super::model::PublicSwapStage::HeldByProxy
+                | super::model::PublicSwapStage::HeldOnDestination => labels.held.clone(),
+                super::model::PublicSwapStage::DeliveredVerified
+                | super::model::PublicSwapStage::DeliveredReported => labels.received.clone(),
+                super::model::PublicSwapStage::Refunding
+                | super::model::PublicSwapStage::Refunded => labels.deposited.clone(),
+                super::model::PublicSwapStage::Bridging => {
+                    swap.observations().deposited.map(|deposit| {
+                        if let wallet_ops::vault::SwapUseRole::PublicSourceDestination {
+                            destination_token,
+                            ..
+                        } = claimed.role()
+                        {
+                            self.public_chain_amount(
+                                self.public_record_chain(record).expect("owning network"),
+                                *destination_token,
+                                super::model::private_delivery_credit(
+                                    deposit.output_amount,
+                                    &swap.approval().bounds,
+                                ),
+                                cx,
+                            )
+                        } else {
+                            String::new()
+                        }
+                    })
+                }
+                _ if entry.group == SwapOrderGroup::Open => Some(format!("≥ {}", labels.minimum)),
+                _ => None,
+            };
+            let icons = if let wallet_ops::vault::SwapUseRole::PublicSourceDestination {
+                origin_chain,
+                destination_token,
+                ..
+            } = claimed.role()
+            {
+                [
+                    self.chain_token_metadata(*origin_chain, swap.approval().sell_token, cx)
+                        .and_then(|metadata| metadata.icon_path),
+                    self.public_record_chain(record)
+                        .and_then(|chain| self.chain_token_metadata(chain, *destination_token, cx))
+                        .and_then(|metadata| metadata.icon_path),
+                ]
+            } else {
+                [None, None]
+            };
+            return SwapOrderRow {
+                view: entry.view,
+                title: format!("{} → {}", labels.sell, labels.buy_symbol),
+                amount: amount.map_or_else(
+                    || {
+                        if matches!(
+                            stage,
+                            super::model::PublicSwapStage::Cancelled
+                                | super::model::PublicSwapStage::Expired
+                                | super::model::PublicSwapStage::PreparationCancelled
+                        ) {
+                            OrderRowAmount::Muted("Nothing traded")
+                        } else {
+                            OrderRowAmount::None
+                        }
+                    },
+                    |value| OrderRowAmount::Value { value, note: None },
+                ),
+                meta: [
+                    entry.started.map(|(_, at)| local_date_time_label(at)),
+                    Some(format!("from {} on {}", labels.source, labels.origin)),
+                    Some(format!("to private balance on {}", labels.destination)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+                status: stage.label().to_owned(),
+                attention: matches!(
+                    entry.group,
+                    SwapOrderGroup::NeedsRecovery | SwapOrderGroup::NeedsAttention
+                ),
+                icons,
+            };
+        }
+        if let SwapDialogView::CancelledPreparation(swap) = entry.view {
+            let cancelled = self.cancelled_use(swap, cx);
+            let attention = cancelled
+                .as_ref()
+                .is_some_and(super::progress::CancelledPreparation::needs_attention);
+            return SwapOrderRow {
+                view: entry.view,
+                title: cancelled.map_or_else(
+                    || "Swap preparation".to_owned(),
+                    |cancelled| cancelled.title,
+                ),
+                amount: OrderRowAmount::Muted("Nothing traded"),
+                meta: entry
+                    .started
+                    .map_or_else(String::new, |(_, at)| local_date_time_label(at)),
+                status: if attention {
+                    "Cancelled · check signed work"
+                } else {
+                    "Preparation cancelled"
+                }
+                .to_owned(),
+                attention,
+                icons: [None, None],
+            };
+        }
         let latest = matches!(entry.view, SwapDialogView::Detail(_));
         let pending = latest.then(|| self.pending_order(record)).flatten();
         let tokens = pending
@@ -811,27 +1113,54 @@ impl PrivateSwapsView {
             _ => self.labels(record, cx),
         };
         let amount = match entry.group {
-            SwapOrderGroup::Open => tokens
-                .zip(entry.order.map_or_else(
-                    || {
-                        pending
-                            .map(|pending| pending.private_minimum)
-                            .or_else(|| swap_private_minimum(record))
-                    },
-                    |order| Some(order.bounds().private_minimum),
-                ))
-                .map_or(OrderRowAmount::None, |((_, buy), minimum)| {
-                    OrderRowAmount::Value {
-                        value: format!("≥ {}", self.token_amount(buy, minimum, cx)),
-                        note: None,
-                    }
-                }),
-            SwapOrderGroup::NeedsRecovery => tokens
-                .zip(entry.order)
-                .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
+            SwapOrderGroup::Open => match &labels.bridge {
+                // A Bridge swap's minimum is on its destination network.
+                Some(bridge) => bridge.minimum.clone(),
+                None => tokens
+                    .zip(entry.order.map_or_else(
+                        || {
+                            pending
+                                .map(|pending| pending.private_minimum)
+                                .or_else(|| swap_private_minimum(record))
+                        },
+                        |order| Some(order.bounds().private_minimum),
+                    ))
+                    .map(|((_, buy), minimum)| self.token_amount(buy, minimum, cx)),
+            }
+            .map_or(OrderRowAmount::None, |minimum| OrderRowAmount::Value {
+                value: format!("≥ {minimum}"),
+                note: None,
+            }),
+            SwapOrderGroup::NeedsRecovery => labels
+                .bridge
+                .as_ref()
+                .filter(|_| entry.stage.is_held_on_destination())
+                // What the destination stealth account holds.
+                .and_then(|bridge| bridge.private.as_ref()?.held.clone())
+                .or_else(|| {
+                    tokens
+                        .zip(entry.order)
+                        .filter(|_| !entry.stage.is_held_on_destination())
+                        .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
+                })
                 .map_or(OrderRowAmount::None, |value| OrderRowAmount::Value {
                     value,
-                    note: Some("in stealth account"),
+                    note: Some(
+                        if entry.stage == SwapStage::Order(SwapOrderState::Refunding) {
+                            "refunding"
+                        } else {
+                            "in stealth account"
+                        },
+                    ),
+                }),
+            // What the provider holds.
+            SwapOrderGroup::NeedsAttention => tokens
+                .zip(entry.order.and_then(bridge_sent_amount))
+                .map_or(OrderRowAmount::None, |((_, buy), sent)| {
+                    OrderRowAmount::Value {
+                        value: self.token_amount(buy, sent, cx),
+                        note: Some("deposit failed"),
+                    }
                 }),
             SwapOrderGroup::Ended => match labels.received.clone() {
                 Some(value) if entry.stage == SwapStage::Order(SwapOrderState::Done) => {
@@ -849,11 +1178,20 @@ impl PrivateSwapsView {
                 _ => OrderRowAmount::None,
             },
         };
-        let title = if labels.buy_symbol.is_empty() {
+        // A Bridge swap is named after the token its receiver gets.
+        let bought = labels
+            .bridge
+            .as_ref()
+            .map_or(&labels.buy_symbol, |bridge| &bridge.token);
+        let title = if bought.is_empty() {
             labels.sell.clone()
         } else {
-            format!("{} → {}", labels.sell, labels.buy_symbol)
+            format!("{} → {bought}", labels.sell)
         };
+        let delivery = pending
+            .map(|pending| pending.delivery)
+            .or_else(|| entry.order.map(SwapOrderRecord::delivery))
+            .unwrap_or_else(|| swap_delivery(record));
         let started = entry.started.map(|(label, at)| {
             if label == "Started" {
                 local_date_time_label(at)
@@ -861,7 +1199,9 @@ impl PrivateSwapsView {
                 format!("valid until {}", local_date_time_label(at))
             }
         });
-        // A Public address swap names its receiver; Private swaps return to the private balance.
+        // A Public address swap names its receiver, and a Bridge swap also its network and
+        // provider. Private swaps return to the private balance, which a private Bridge swap
+        // names on its destination network.
         let meta = [
             started,
             Some(format!("#{}", record.index())),
@@ -869,6 +1209,18 @@ impl PrivateSwapsView {
                 .receiver
                 .as_ref()
                 .map(|receiver| format!("to {receiver}")),
+            labels.bridge.as_ref().map(|bridge| {
+                format!(
+                    "to {} on {} · {}",
+                    if bridge.private.is_some() {
+                        "private balance"
+                    } else {
+                        bridge.receiver.as_str()
+                    },
+                    bridge.network,
+                    provider_name(bridge.provider)
+                )
+            }),
         ]
         .into_iter()
         .flatten()
@@ -881,9 +1233,24 @@ impl PrivateSwapsView {
             amount,
             meta,
             status: swap_order_status(entry.stage, stopped, &labels),
-            attention: entry.group == SwapOrderGroup::NeedsRecovery,
+            attention: matches!(
+                entry.group,
+                SwapOrderGroup::NeedsRecovery | SwapOrderGroup::NeedsAttention
+            ),
             icons: tokens.map_or([None, None], |(sell, buy)| {
-                [self.token_icon(sell, cx), self.token_icon(buy, cx)]
+                [
+                    self.token_icon(sell, cx),
+                    match delivery {
+                        SwapDelivery::Bridge(bridge) => self
+                            .chain_token_metadata(
+                                bridge.destination_chain,
+                                self.delivered_token(bridge, cx),
+                                cx,
+                            )
+                            .and_then(|metadata| metadata.icon_path),
+                        _ => self.token_icon(buy, cx),
+                    },
+                ]
             }),
         }
     }
@@ -901,7 +1268,8 @@ impl PrivateSwapsView {
     }
 
     /// What waits in the stealth account after `order`: the unshielded sell amount before a
-    /// trade, the traded buy amount after one. The symbol alone when the amount wasn't recorded.
+    /// trade, the traded buy amount after one, and what a bridge refunds. The symbol alone when
+    /// the amount wasn't recorded.
     fn stranded_amount(
         &self,
         (sell, buy): (Address, Address),
@@ -917,6 +1285,7 @@ impl PrivateSwapsView {
                     .trade_amounts
                     .map(|trade| trade.buy_amount),
             ),
+            SwapStage::Order(SwapOrderState::Refunding) => (buy, bridge_sent_amount(order)),
             _ => (sell, Some(order.bounds().sell_amount)),
         };
         amount.map_or_else(
@@ -935,9 +1304,25 @@ fn order_tokens(record: &ExecutorRecord, order: &SwapOrderRecord) -> Option<(Add
 /// A stable key for a row's element and debug selector.
 fn row_key(view: SwapDialogView) -> String {
     match view {
-        SwapDialogView::PastDetail(operation, first) => {
-            format!("{}-{first}", operation.opaque_id())
+        // One use holds one swap, except orders from before swap uses, which the first
+        // order tells apart.
+        SwapDialogView::PastDetail(swap, first) => {
+            format!(
+                "{}-{}-{first}",
+                swap.operation.opaque_id(),
+                swap.swap_use.opaque_id()
+            )
         }
+        SwapDialogView::CancelledPreparation(swap) => format!(
+            "{}-{}-cancelled",
+            swap.operation.opaque_id(),
+            swap.swap_use.opaque_id()
+        ),
+        SwapDialogView::PublicDetail(swap) => format!(
+            "{}-{}-public",
+            swap.operation.opaque_id(),
+            swap.swap_use.opaque_id()
+        ),
         SwapDialogView::Detail(operation) => operation.opaque_id(),
         SwapDialogView::Form | SwapDialogView::Orders => String::new(),
     }

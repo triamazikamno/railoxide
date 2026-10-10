@@ -114,13 +114,13 @@ const BNB_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOr
     oracle_decimals: 8,
     is_inversed: false,
 }];
-const MATIC_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+const POL_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
     addr: POLYGON_POL_USD_FEED,
     token_decimals: 6,
     oracle_decimals: 8,
     is_inversed: false,
 }];
-const MATIC_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+const POL_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
     addr: POLYGON_POL_USD_FEED,
     token_decimals: 18,
     oracle_decimals: 8,
@@ -449,11 +449,11 @@ const TOKENS: &[TokenRow] = &[
     (56, address!("0xBf5140A22578168FD562DCcF235E5D43A02ce9B1"), "UNI", 18, &[feed(BSC_UNI_BNB_FEED, 18, 18, true)], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (56, address!("0xfb6115445Bff7b52FeB98650C87f44907E58f802"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(BSC_BNB_USD_FEED, 8, 18, false), feed(BSC_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
     // Polygon (137)
-    (137, address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), "WMATIC", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
-    (137, address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"), "USDT", 6, MATIC_USD_6_ANCHOR, TokenIcon::Own),
-    (137, address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"), "USDC.e", 6, MATIC_USD_6_ANCHOR, TokenIcon::Own),
-    (137, address!("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), "USDC", 6, MATIC_USD_6_ANCHOR, TokenIcon::Own),
-    (137, address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"), "DAI", 18, MATIC_USD_18_ANCHOR, TokenIcon::Own),
+    (137, address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), "WPOL", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
+    (137, address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"), "USDT", 6, POL_USD_6_ANCHOR, TokenIcon::Own),
+    (137, address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"), "USDC.e", 6, POL_USD_6_ANCHOR, TokenIcon::Own),
+    (137, address!("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), "USDC", 6, POL_USD_6_ANCHOR, TokenIcon::Own),
+    (137, address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"), "DAI", 18, POL_USD_18_ANCHOR, TokenIcon::Own),
     (137, address!("0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"), "WBTC", 8, NO_ANCHORS, TokenIcon::Own),
     (137, address!("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), "WETH", 18, NO_ANCHORS, TokenIcon::Own),
     (137, address!("0x99aF3EeA856556646C98c8B9b2548Fe815240750"), "PYUSD", 6, &[feed(POLYGON_POL_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0x6c3ea9036406852006290770bedfcaba0e23a0e8.png")),
@@ -462,9 +462,8 @@ const TOKENS: &[TokenRow] = &[
     (137, address!("0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"), "LINK", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_LINK_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (137, address!("0xb33EaAd8d922B1083446DC23f610c2567fB5180f"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (137, address!("0xD6DF932A45C0f255f85145f286eA0b292B21C90B"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(POLYGON_POL_USD_FEED, 8, 18, false), feed(POLYGON_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
-    (137, address!("0x0000000000000000000000000000000000001010"), "POL", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("137-0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270.png")),
     // Arbitrum (42161)
-    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
+    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (42161, address!("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"), "USDT", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
     (42161, address!("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"), "USDC.e", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
     (42161, address!("0xaf88d065e77c8cc2239327c5edb3a432268e5831"), "USDC", 6, ARB_ETH_USD_6_ANCHOR, TokenIcon::Own),
@@ -493,6 +492,7 @@ const TOKENS: &[TokenRow] = &[
     (43114, address!("0x8eBAf22B6F053dFFeaf46f4Dd9eFA95D89ba8580"), "UNI.e", 18, &[TokenAnchorSource::Product { sources: &[feed(AVAX_AVAX_USD_FEED, 8, 18, false), feed(AVAX_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (43114, address!("0x63a72806098Bd3D9520cC43356dD78afe5D386D9"), "AAVE.e", 18, &[TokenAnchorSource::Product { sources: &[feed(AVAX_AVAX_USD_FEED, 8, 18, false), feed(AVAX_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
     // Base (8453)
+    (8453, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (8453, address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), "USDC", 6, &[feed(BASE_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
     (8453, address!("0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"), "USDS", 18, &[feed(BASE_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0xdc035d45d973e3ec169d2276ddab16f1e407384f.png")),
     (8453, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(BASE_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
@@ -506,6 +506,7 @@ const TOKENS: &[TokenRow] = &[
     (8453, address!("0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842"), "MORPHO", 18, &[TokenAnchorSource::Product { sources: &[feed(BASE_ETH_USD_FEED, 8, 18, false), feed(BASE_MORPHO_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
     (8453, address!("0x940181a94A35A4569E4529A3CDfB74e38FD98631"), "AERO", 18, &[TokenAnchorSource::Product { sources: &[feed(BASE_ETH_USD_FEED, 8, 18, false), feed(BASE_AERO_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
     // Optimism (10)
+    (10, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (10, address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"), "USDC", 6, &[feed(OP_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
     (10, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(OP_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (10, address!("0x01bFF41798a0BcF287b996046Ca68b395DbC1071"), "USDT0", 6, &[feed(OP_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
@@ -516,7 +517,7 @@ const TOKENS: &[TokenRow] = &[
     (10, address!("0x350a791Bfc2C21F9Ed5d10980Dad2e2638ffa7f6"), "LINK", 18, &[feed(OP_LINK_ETH_FEED, 18, 18, true)], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (10, address!("0x6fd9d7AD17242c41f7131d257212c54A0e816691"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_UNI_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     (10, address!("0x76FB31fb4af56892A25e32cFC43De717950c9278"), "AAVE", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_AAVE_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
-    (10, address!("0x4200000000000000000000000000000000000042"), "OP", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_OP_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::None),
+    (10, address!("0x4200000000000000000000000000000000000042"), "OP", 18, &[TokenAnchorSource::Product { sources: &[feed(OP_ETH_USD_FEED, 8, 18, false), feed(OP_OP_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Own),
     // Gnosis (100)
     (100, address!("0xfc421aD3C883Bf9E7C4f42dE845C4e4405799e73"), "GHO", 18, &[feed(GNOSIS_XDAI_USD_FEED, 8, 18, false)], TokenIcon::None),
     (100, address!("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"), "WXDAI", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::None),
@@ -547,6 +548,7 @@ const TOKENS: &[TokenRow] = &[
     (146, address!("0x71052BAe71C25C78E37fD12E5ff1101A71d9018F"), "LINK", 18, &[TokenAnchorSource::Product { sources: &[feed(SONIC_S_USD_FEED, 8, 18, false), feed(SONIC_LINK_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (146, address!("0xf1eF7d2D4C0c881cd634481e0586ed5d2871A74B"), "PENDLE", 18, NO_ANCHORS, TokenIcon::None),
     // Unichain (130)
+    (130, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (130, address!("0x078D782b760474a361dDA0AF3839290b0EF57AD6"), "USDC", 6, &[feed(UNICHAIN_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
     (130, address!("0x9151434b16b9763660705744891fA906F660EcC5"), "USDT0", 6, &[feed(UNICHAIN_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
     (130, address!("0x80Eede496655FB9047dd39d9f418d5483ED600df"), "frxUSD", 18, &[feed(UNICHAIN_ETH_USD_FEED, 8, 18, false)], TokenIcon::None),
@@ -556,6 +558,7 @@ const TOKENS: &[TokenRow] = &[
     (130, address!("0xEF66491eab4bbB582c57b14778afd8dFb70D8A1A"), "LINK", 18, &[TokenAnchorSource::Product { sources: &[feed(UNICHAIN_ETH_USD_FEED, 8, 18, false), feed(UNICHAIN_LINK_USD_FEED, 18, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (130, address!("0x8f187aA05619a017077f5308904739877ce9eA21"), "UNI", 18, &[TokenAnchorSource::Product { sources: &[feed(UNICHAIN_ETH_USD_FEED, 8, 18, false), feed(UNICHAIN_UNI_USD_FEED, 18, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("42161-0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0.png")),
     // Ink (57073)
+    (57073, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (57073, address!("0x2D270e6886d130D724215A266106e6832161EAEd"), "USDC", 6, &[feed(INK_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
     (57073, address!("0x0200C29006150606B650577BBE7B6248F58470c1"), "USDT0", 6, &[feed(INK_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
     (57073, address!("0x142cdc44890978B506e745bB3Bd11607B7f7faEf"), "PYUSD", 6, &[feed(INK_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0x6c3ea9036406852006290770bedfcaba0e23a0e8.png")),
@@ -569,6 +572,7 @@ const TOKENS: &[TokenRow] = &[
     (252, address!("0x58538e6A46E07434d7E7375Bc268D3cb839C0133"), "ENA", 18, NO_ANCHORS, TokenIcon::None),
     (252, address!("0xFc00000000000000000000000000000000000002"), "WFRAX", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0x853d955acef822db058eb8505911ed77f175b99e.png")),
     // Blast (81457)
+    (81457, address!("0x4300000000000000000000000000000000000004"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (81457, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(BLAST_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (81457, address!("0x80Eede496655FB9047dd39d9f418d5483ED600df"), "frxUSD", 18, &[feed(BLAST_ETH_USD_FEED, 8, 18, false)], TokenIcon::None),
     (81457, address!("0x4300000000000000000000000000000000000003"), "USDB", 18, &[feed(BLAST_ETH_USD_FEED, 8, 18, false)], TokenIcon::None),
@@ -577,6 +581,7 @@ const TOKENS: &[TokenRow] = &[
     (81457, address!("0x58538e6A46E07434d7E7375Bc268D3cb839C0133"), "ENA", 18, NO_ANCHORS, TokenIcon::None),
     (81457, address!("0xb1a5700fA2358173Fe465e6eA4Ff52E36e88E2ad"), "BLAST", 18, NO_ANCHORS, TokenIcon::None),
     // Linea (59144)
+    (59144, address!("0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (59144, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(LINEA_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (59144, address!("0xC7346783f5e645aa998B106Ef9E7f499528673D8"), "frxUSD", 18, &[feed(LINEA_ETH_USD_FEED, 8, 18, false)], TokenIcon::None),
     (59144, address!("0x176211869cA2b568f2A7D4EE941E073a821EE1ff"), "USDC", 6, &[feed(LINEA_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
@@ -612,6 +617,7 @@ const TOKENS: &[TokenRow] = &[
     (25, address!("0x8c80A01F461f297Df7F9DA3A4f740D7297C8Ac85"), "LINK", 18, NO_ANCHORS, TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (25, address!("0x2D03bECE6747ADC00E1a131BBA1469C15fD11e03"), "VVS", 18, NO_ANCHORS, TokenIcon::None),
     // MegaETH (4326)
+    (4326, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (4326, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(MEGAETH_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (4326, address!("0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb"), "USDT0", 6, &[feed(MEGAETH_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
     (4326, address!("0xB0F70C0bD6FD87dbEb7C10dC692a2a6106817072"), "BTC.b", 8, &[TokenAnchorSource::Product { sources: &[feed(MEGAETH_ETH_USD_FEED, 8, 8, false), feed(MEGAETH_BTC_USD_FEED, 8, 8, true)], scale_decimals: 8 }], TokenIcon::None),
@@ -629,6 +635,7 @@ const TOKENS: &[TokenRow] = &[
     (80094, address!("0x71052BAe71C25C78E37fD12E5ff1101A71d9018F"), "LINK", 18, NO_ANCHORS, TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),
     (80094, address!("0xFf9c599D51C407A45D631c6e89cB047Efb88AeF6"), "PENDLE", 18, NO_ANCHORS, TokenIcon::None),
     // World Chain (480)
+    (480, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (480, address!("0x79A02482A880bCE3F13e09Da970dC34db4CD24d1"), "USDC", 6, &[feed(WORLDCHAIN_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
     (480, address!("0x1C60ba0A0eD1019e8Eb035E6daF4155A5cE2380B"), "EURC", 6, NO_ANCHORS, TokenIcon::Shared("1-0x1abaea1f7c830bd89acc67ec4af516284b1bc33c.png")),
     (480, address!("0x102d758f688a4C1C5a80b116bD945d4455460282"), "USDT0", 6, &[feed(WORLDCHAIN_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
@@ -673,6 +680,7 @@ const TOKENS: &[TokenRow] = &[
     (143, address!("0x5E49E1f85813F2B65858860A3FA231b4186f2e0E"), "PENDLE", 18, NO_ANCHORS, TokenIcon::None),
     (143, address!("0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A"), "WMON", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::None),
     // Robinhood Chain (4663)
+    (4663, address!("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (4663, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(ROBINHOOD_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (4663, address!("0xCEC185eB182c47d1bA1EFc84e6959e18cd620Be4"), "cbBTC", 8, &[TokenAnchorSource::Product { sources: &[feed(ROBINHOOD_ETH_USD_FEED, 8, 8, false), feed(ROBINHOOD_CBBTC_USD_FEED, 8, 8, true)], scale_decimals: 8 }], TokenIcon::None),
     (4663, address!("0x492641F648a4986844848E0beFE66D14817bCE34"), "LINK", 18, &[TokenAnchorSource::Product { sources: &[feed(ROBINHOOD_ETH_USD_FEED, 8, 18, false), feed(ROBINHOOD_LINK_USD_FEED, 8, 18, true)], scale_decimals: 18 }], TokenIcon::Shared("1-0x514910771af9ca656af840dff83e8264ecf986ca.png")),

@@ -74,8 +74,8 @@ impl ExecutorOwner {
         self.ensure_active()?;
         self.store
             .record_submission(identity.operation, identity.payload, transaction)?;
-        // A handoff establishes issuance; the next successful history check
-        // supplies its conservative head bound without additional RPC.
+        // A handoff establishes issuance; the next account read supplies its
+        // conservative head bound without additional RPC.
         self.submission_blocks
             .lock()
             .map_err(|_| eyre!("executor observations are unavailable"))?

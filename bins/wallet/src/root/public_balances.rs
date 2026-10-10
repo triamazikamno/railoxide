@@ -3,8 +3,8 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use gpui::{Context, Window};
 use railgun_ui::{
-    chain_icon_asset_path, format_scaled_amount, format_token_amount, format_usd_micro_value,
-    short_address,
+    format_scaled_amount, format_token_amount, format_usd_micro_value,
+    native_currency_icon_asset_path, short_address,
 };
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceRefreshTicket,
@@ -51,7 +51,9 @@ pub(super) fn public_asset_icon_path(
     registry: Option<&EffectiveTokenRegistry>,
 ) -> Option<WalletIconSource> {
     match asset {
-        PublicAssetId::Native => chain_icon_asset_path(chain_id).map(WalletIconSource::embedded),
+        PublicAssetId::Native => {
+            native_currency_icon_asset_path(chain_id).map(WalletIconSource::embedded)
+        }
         PublicAssetId::Erc20(token) => {
             token_display_metadata(registry, chain_id, &token).and_then(|info| info.icon_path)
         }
@@ -238,6 +240,25 @@ pub(super) fn public_balance_entry_for_chain(
         .iter()
         .find(|entry| entry.asset.id == asset)
         .cloned()
+}
+
+/// Every balance the snapshot read for the account on `chain_id`, zero and unreadable ones
+/// included. `None` while the snapshot doesn't hold the account there.
+pub(super) fn public_account_balances_for_chain<'a>(
+    snapshot: Option<&'a PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    status: PublicAccountStatus,
+) -> Option<&'a [PublicBalanceEntry]> {
+    snapshot
+        .filter(|snapshot| snapshot.chain_id == chain_id)?
+        .accounts
+        .iter()
+        .find(|account| {
+            account.account.public_account_uuid.as_str() == public_account_uuid
+                && account.account.status == status
+        })
+        .map(|account| account.balances.as_slice())
 }
 
 pub(super) fn public_account_visible_balances_for_chain(

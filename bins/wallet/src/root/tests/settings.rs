@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::chain_load::ChainSyncProgress;
 use crate::root::maintenance::{
     PublicSyncResetCompletion, WalletMaintenanceReset, WalletMaintenanceStateMachine,
     public_sync_reset_restart_is_safe,
@@ -99,7 +100,9 @@ fn maintenance_reset_state_machine_ignores_stale_completion() {
 
 #[test]
 fn utxo_table_focus_is_activity_scoped() {
-    let state = ChainUtxoState::Loading { progress: None };
+    let state = ChainUtxoState::Loading {
+        progress: ChainSyncProgress::default(),
+    };
 
     assert!(!should_focus_utxo_table(
         Activity::Wallet,

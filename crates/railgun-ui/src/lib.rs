@@ -6,7 +6,7 @@ pub mod tokens;
 
 pub use chains::{
     DEFAULT_CHAINS, NativeCurrency, PUBLIC_CHAINS, built_in_chain_ids, chain_icon_asset_path,
-    chain_icon_path, chain_name, is_built_in_chain,
+    chain_icon_path, chain_name, is_built_in_chain, native_currency_icon_asset_path,
 };
 pub use governance::{
     GovernanceContracts, GovernanceRewardToken, governance_contracts, governance_treasury,

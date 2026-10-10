@@ -12,7 +12,6 @@ use gpui_component::{
     dialog::{Cancel, Confirm, Dialog, DialogFooter},
     input::InputState,
 };
-use wallet_ops::vault::ExecutorPayloadStatus;
 
 impl StealthAccountsView {
     pub(super) fn open_add_token(
@@ -188,16 +187,7 @@ impl StealthAccountsView {
         if record.address().is_none() {
             return Some("Restore this account's address before recovering funds.");
         }
-        let pending_retry = record.recovery_transactions().iter().any(|transaction| {
-            record
-                .recovery_transaction_status(transaction.hash())
-                .unwrap_or(ExecutorPayloadStatus::Uncertain)
-                == ExecutorPayloadStatus::Uncertain
-        });
-        if self.holding(record.operation())
-            || pending_retry
-            || super::view::swap_holds_funds(record)
-        {
+        if self.holding(record.operation()) || super::view::swap_holds_funds(&self.owner, record) {
             return None;
         }
         let checked = self

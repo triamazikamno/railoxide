@@ -809,6 +809,132 @@ fn in_flight_blocked_shield_refund_disables_cached_action() {
 }
 
 #[test]
+fn blocked_shield_refund_with_blocked_origin_can_be_checked_again() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
+    blocked_shield.poi_spendable = false;
+    blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
+        eligible: false,
+        disabled_reason: Some("origin is not in Public".to_string()),
+        origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+        public_account_uuid: None,
+        public_account_label: None,
+    });
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let rows = display_rows_from_output(&output, "", false);
+
+    // An origin that was resolved but can't refund yet can be checked again.
+    assert!(should_show_blocked_shield_refund_action(&rows[0]));
+    assert!(blocked_shield_refund_action_available(&rows[0]));
+}
+
+#[gpui::test]
+fn hardware_blocked_shield_refund_approves_stealth_origin_gas_on_the_device(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::root::spend_authorization::SpendAuthorizationIntent;
+
+    let path = temp_wallet_db_root("blocked-shield-refund-route");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = super::public_accounts::fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        gpui_component::Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    let operation = wallet_ops::vault::ExecutorOperationId::random().unwrap();
+    let utxo_id = |position| BlockedShieldRescueUtxoId {
+        tree: 0,
+        position,
+        commitment: alloy::primitives::FixedBytes::repeat_byte(1),
+        blinded_commitment: alloy::primitives::FixedBytes::repeat_byte(2),
+    };
+    let (stealth_origin, software_origin) = (utxo_id(1), utxo_id(2));
+    root.update(cx, |root, _| {
+        root.wallet_options = vec![WalletOption {
+            wallet_id: Arc::from("preview"),
+            source: WalletSource::LedgerDerived,
+        }];
+        let mut stealth = root.public_accounts[0].clone();
+        stealth.public_account_uuid = "stealth".to_string();
+        stealth.source = PublicAccountSource::ExecutorDerived(
+            serde_json::from_value(serde_json::json!({
+                "chain_id": 1,
+                "index": 5,
+                "operation": operation,
+            }))
+            .unwrap(),
+        );
+        root.public_accounts.push(stealth);
+        for (utxo_id, uuid) in [(stealth_origin, "stealth"), (software_origin, "account-0")] {
+            root.blocked_shield_rescue_rows.insert(
+                utxo_id,
+                BlockedShieldRescueRowState::from_info(BlockedShieldRescueInfo {
+                    eligible: true,
+                    disabled_reason: None,
+                    origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+                    public_account_uuid: Some(uuid.to_string()),
+                    public_account_label: None,
+                }),
+            );
+        }
+
+        // A stealth origin has no vault key on a hardware wallet, so the device approves
+        // its gas payment and no password step runs.
+        let intent = root.blocked_shield_refund_authorization_intent(stealth_origin);
+        assert!(matches!(
+            intent,
+            SpendAuthorizationIntent::BlockedShieldRefund(id) if id == stealth_origin
+        ));
+        assert!(matches!(
+            intent.hardware_executor_action(root),
+            Some(wallet_ops::HardwareExecutorAction::GasPayment { account, operation: approved })
+                if account == "stealth" && approved == operation
+        ));
+
+        let intent = root.blocked_shield_refund_authorization_intent(software_origin);
+        assert!(matches!(
+            intent,
+            SpendAuthorizationIntent::BlockedShieldRefundGasPassword(id) if id == software_origin
+        ));
+        assert!(
+            SpendAuthorizationIntent::BlockedShieldRefund(software_origin)
+                .hardware_executor_action(root)
+                .is_none()
+        );
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    drop(entered);
+    drop(runtime);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn display_rows_keep_local_pending_spent_visible_when_spent_toggle_off() {
     let mut local_pending = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
     local_pending.local_pending_spent = true;

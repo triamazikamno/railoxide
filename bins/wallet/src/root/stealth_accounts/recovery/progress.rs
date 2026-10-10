@@ -21,14 +21,13 @@ pub(super) enum RecoveryProgressSource {
     Preparation,
     Native(watch::Receiver<Option<PublicActionProgressUpdate>>),
     Broadcaster(watch::Receiver<TransactionGenerationStage>),
-    Retry(watch::Receiver<Option<PublicActionProgressUpdate>>),
 }
 
 impl RecoveryProgressSource {
     async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         match self {
             Self::Preparation => unreachable!("preparation has no stage updates"),
-            Self::Native(receiver) | Self::Retry(receiver) => receiver.changed().await,
+            Self::Native(receiver) => receiver.changed().await,
             Self::Broadcaster(receiver) => receiver.changed().await,
         }
     }
@@ -56,8 +55,6 @@ impl RecoveryProgress {
                 status: PublicActionStepStatus::Pending,
                 message: "Preparing recovery".into(),
             })
-        } else if matches!(source, RecoveryProgressSource::Retry(_)) {
-            None
         } else {
             previous
                 .filter(|previous| matches!(previous.source, RecoveryProgressSource::Preparation))
@@ -67,7 +64,7 @@ impl RecoveryProgress {
         let steps = match &source {
             RecoveryProgressSource::Preparation => Vec::new(),
             RecoveryProgressSource::Broadcaster(_) => private_broadcaster_progress_steps(),
-            RecoveryProgressSource::Native(_) | RecoveryProgressSource::Retry(_) => [
+            RecoveryProgressSource::Native(_) => [
                 TransactionGenerationStage::SigningSelfBroadcast,
                 TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
             ]
@@ -100,7 +97,7 @@ impl RecoveryProgress {
             RecoveryProgressSource::Broadcaster(receiver) => {
                 apply_private_broadcaster_progress_stage(&mut self.steps, *receiver.borrow());
             }
-            RecoveryProgressSource::Native(receiver) | RecoveryProgressSource::Retry(receiver) => {
+            RecoveryProgressSource::Native(receiver) => {
                 if let Some(update) = receiver.borrow().as_ref() {
                     if let Some(tx_hash) = &update.tx_hash {
                         self.tx_hash = Some(tx_hash.clone());
@@ -112,8 +109,8 @@ impl RecoveryProgress {
                     };
                     apply_private_broadcaster_progress_stage(&mut self.steps, stage);
                     if let Some(step) = self.steps.iter_mut().find(|step| step.stage == stage) {
-                        // Receipt observation alone is not recovery completion. The owner
-                        // still has to validate the canonical recovery effects.
+                        // A receipt alone is not recovery completion. The recovery must be
+                        // the action that ran at its nonce, with its shield received.
                         if update.status == PublicActionProgressStatus::Error {
                             step.status = PublicActionStepStatus::Error;
                         }
@@ -160,13 +157,13 @@ impl RecoveryProgress {
         let (message, status) = match result {
             PublicBroadcasterResultKind::Submitted { tx_hash } => {
                 self.tx_hash = Some(tx_hash);
-                ("Broadcaster submitted the transaction. Waiting for canonical recovery effects and private receipt.".to_owned(), PublicActionStepStatus::Done)
+                ("Broadcaster submitted the transaction. Waiting for the recovery to confirm and for its shield to reach your private balance.".to_owned(), PublicActionStepStatus::Done)
             }
             PublicBroadcasterResultKind::Failed { error } => {
                 (format!("Broadcaster reported: {error}"), PublicActionStepStatus::Error)
             }
             PublicBroadcasterResultKind::TimedOut => {
-                ("No broadcaster response yet. The issued payload remains tracked; inspect its status before retrying.".to_owned(), PublicActionStepStatus::Warning)
+                ("No broadcaster response yet. The signed recovery remains tracked. Check balances on this account before retrying.".to_owned(), PublicActionStepStatus::Warning)
             }
         };
         self.finish(status, message);
@@ -402,12 +399,7 @@ impl StealthAccountsView {
                 .justify_end(),
             );
         }
-        if self
-            .recovery
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| self.next_recovery_step(prepared).is_some())
-        {
+        if self.recovery.prepared.is_some() {
             content = content.child(
                 app_button("stealth-recovery-progress-review", "Review recovery…")
                     .primary()
@@ -449,18 +441,6 @@ impl StealthAccountsView {
         self.reload_records();
         self.refresh_visible(cx);
         cx.notify();
-    }
-}
-
-pub(super) const fn recovery_execution_status(
-    status: ExecutorPayloadStatus,
-) -> PublicActionStepStatus {
-    match status {
-        ExecutorPayloadStatus::Executed => PublicActionStepStatus::Done,
-        ExecutorPayloadStatus::Uncertain => PublicActionStepStatus::Warning,
-        ExecutorPayloadStatus::Reverted
-        | ExecutorPayloadStatus::MissingEffects
-        | ExecutorPayloadStatus::Invalidated { .. } => PublicActionStepStatus::Error,
     }
 }
 

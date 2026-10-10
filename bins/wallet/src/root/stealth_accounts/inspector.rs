@@ -6,16 +6,16 @@ use super::{
 use gpui::{InteractiveElement as _, prelude::FluentBuilder as _};
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::{
-    ActiveTheme as _, ChildElement as _,
+    ActiveTheme as _,
     description_list::{DescriptionItem, DescriptionList},
     separator::Separator,
     table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow},
     tag::Tag,
 };
-use wallet_ops::vault::{ExecutorPayloadStatus, IssuedExecutorPayload};
+use wallet_ops::{ExecutorAttributionEvidence, ExecutorPayloadOutcome, ExecutorSignedAction};
 
 mod history;
-use history::{block_label, payload_purpose, payload_rows, recorded_outcomes, status_as_of};
+use history::{action_payload, block_label, payload_purpose, recorded_outcomes, status_as_of};
 
 impl StealthAccountsView {
     pub(super) fn render_inspector(
@@ -43,21 +43,17 @@ impl StealthAccountsView {
                     cx,
                 )
             }));
-        let outcomes = recorded_outcomes(record);
-        if local_history && outcomes.is_empty() {
-            content = content.child(inspector_text("No confirmed result is recorded."));
-        }
+        let attribution = self.owner.attribution(record);
+        let evidence = match &attribution {
+            Some(attribution) => attribution.evidence(),
+            None => ExecutorAttributionEvidence::record_only(),
+        };
+        let actions = wallet_ops::signed_actions(record, &evidence);
         content = content.children(
-            outcomes
+            self.outcome_lines(record, &actions, &evidence)
                 .into_iter()
-                .map(|outcome| inspector_text(outcome).whitespace_normal()),
+                .map(|line| inspector_text(line).whitespace_normal()),
         );
-        if !record.issued().is_empty() || !record.recovery_transactions().is_empty() {
-            content = content.child(
-                inspector_text(status_as_of(record, self.status(record).rechecked()))
-                    .whitespace_normal(),
-            );
-        }
         let body = div()
             .w_full()
             .min_w_0()
@@ -69,7 +65,7 @@ impl StealthAccountsView {
                 Some(self.render_balances(record, cx)),
             ))
             .when_some(
-                self.render_account_details(record, cx),
+                self.render_account_details(record, &actions, cx),
                 |content, details| content.child(Separator::horizontal()).child(details),
             )
             .when(self.holding(operation), |inspector| {
@@ -95,6 +91,39 @@ impl StealthAccountsView {
             .child(body)
     }
 
+    /// The recorded result of each signed action, the block those results stand at, and for
+    /// unconfirmed work whether an account read tells that it is late.
+    fn outcome_lines(
+        &self,
+        record: &ExecutorRecord,
+        actions: &[ExecutorSignedAction],
+        evidence: &ExecutorAttributionEvidence<'_>,
+    ) -> Vec<String> {
+        let mut lines = recorded_outcomes(record, actions, evidence);
+        if lines.is_empty() && has_local_history(record) {
+            lines.push("No result is recorded.".into());
+        }
+        if record.issued().is_empty() {
+            return lines;
+        }
+        let status = self.status(record);
+        lines.push(status_as_of(record, status.read_this_session()));
+        let pending = actions
+            .iter()
+            .any(|action| action.outcome() == ExecutorPayloadOutcome::Pending);
+        // Lateness is asserted only from an account read past the submission.
+        if pending {
+            lines.push(match status.read_this_session() {
+                Some(read) if status.overdue() => format!(
+                    "An account read at #{}, after the submission, still shows it unconfirmed.",
+                    block_label(read.number)
+                ),
+                _ => "Not read since the submission, so nothing tells whether it is late. Check balances reads the account.".into(),
+            });
+        }
+        lines
+    }
+
     fn render_balances(&self, record: &ExecutorRecord, cx: &Context<'_, Self>) -> gpui::Div {
         let operation = record.operation();
         let busy = self.job.is_some();
@@ -110,7 +139,7 @@ impl StealthAccountsView {
             };
             let icon = address.map_or_else(
                 || {
-                    railgun_ui::chain_icon_asset_path(self.session.chain_id)
+                    railgun_ui::native_currency_icon_asset_path(self.session.chain_id)
                         .map(crate::assets::WalletIconSource::embedded)
                 },
                 |address| {
@@ -210,7 +239,7 @@ impl StealthAccountsView {
                             .debug_selector(|| "stealth-check-balances".into())
                             .outline()
                             .small()
-                            .tooltip("Each check includes native balance, nonces and account code")
+                            .tooltip("Each check reads the native balance, account code and nonces, and updates the recorded results")
                             .disabled(busy || record.address().is_none())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(record) = this
@@ -249,6 +278,7 @@ impl StealthAccountsView {
     fn render_account_details(
         &self,
         record: &ExecutorRecord,
+        actions: &[ExecutorSignedAction],
         cx: &Context<'_, Self>,
     ) -> Option<gpui::Div> {
         let operation = record.operation();
@@ -306,69 +336,17 @@ impl StealthAccountsView {
             .flex_col()
             .gap_3();
         if !record.issued().is_empty() {
-            let rows = payload_rows(record);
             history = history.child(app_strong_text("Signed payloads")).child(
                 inspector_table("Signed payloads", cx)
                     .child(payload_header("Nonce", true))
                     .child(
                         TableBody::new().children(
-                            rows.iter()
-                                .map(|payload| Self::payload_row(record, payload, cx)),
+                            actions
+                                .iter()
+                                .filter_map(|action| Self::payload_row(record, action, cx)),
                         ),
                     ),
             );
-        }
-        if !record.recovery_transactions().is_empty() {
-            let rows = record.recovery_transactions().iter().map(|transaction| {
-                TableRow::new()
-                    .child(
-                        TableCell::new()
-                            .w(gpui::rems(4.))
-                            .min_w_0()
-                            .flex_none()
-                            .child(inspector_text((transaction.step() + 1).to_string())),
-                    )
-                    .child(
-                        TableCell::new().flex_1().min_w_0().child(
-                            Self::copyable_identifier(
-                                format!("stealth-recovery-{}", transaction.hash()).into(),
-                                transaction.hash().to_string(),
-                                crate::root::utxo::short_hash(&transaction.hash().to_string()),
-                                "Copy transaction hash",
-                                cx,
-                            )
-                            .text_color(cx.theme().foreground),
-                        ),
-                    )
-                    .child(
-                        TableCell::new()
-                            .w(gpui::rems(7.))
-                            .min_w_0()
-                            .flex_none()
-                            .child(inspector_text(transaction.inclusion().map_or_else(
-                                || "Not seen".into(),
-                                |inclusion| format!("#{}", block_label(inclusion.block().number)),
-                            ))),
-                    )
-                    .child(
-                        TableCell::new()
-                            .w(gpui::rems(9.))
-                            .min_w_0()
-                            .flex_none()
-                            .child(payload_result(
-                                record.recorded_recovery_transaction_status(transaction.hash()),
-                                cx,
-                            )),
-                    )
-            });
-            history = history
-                .child(app_strong_text("Recovery transactions"))
-                .child(
-                    inspector_table("Recovery transactions", cx)
-                        .with_ix(1)
-                        .child(payload_header("Step", false))
-                        .child(TableBody::new().children(rows)),
-                );
         }
         Some(inspector_columns(
             div()
@@ -380,21 +358,18 @@ impl StealthAccountsView {
                 .gap_2()
                 .child(app_strong_text("Account details"))
                 .child(metadata),
-            (!record.issued().is_empty() || !record.recovery_transactions().is_empty())
-                .then_some(history),
+            (!record.issued().is_empty()).then_some(history),
         ))
     }
+    /// One signed action: its fee rounds share a row, a result and a submitted transaction.
     fn payload_row(
         record: &ExecutorRecord,
-        payload: &IssuedExecutorPayload,
+        action: &ExecutorSignedAction,
         cx: &Context<'_, Self>,
-    ) -> TableRow {
-        let transaction = payload
-            .inclusion()
-            .map(wallet_ops::vault::ExecutorPayloadInclusion::transaction_hash)
-            .or_else(|| payload.transaction_hashes().last().copied());
+    ) -> Option<TableRow> {
+        let payload = action_payload(record, action)?;
         let mut identifier = div().flex().flex_wrap().items_center().gap_1();
-        if let Some(transaction) = transaction {
+        if let Some(transaction) = payload.transaction_hashes().last().copied() {
             identifier = identifier.child(
                 Self::copyable_identifier(
                     format!("stealth-transaction-{}-{transaction}", payload.hash()).into(),
@@ -408,39 +383,42 @@ impl StealthAccountsView {
         } else {
             identifier = identifier.child(inspector_text("Not submitted"));
         }
-        TableRow::new()
-            .child(
-                TableCell::new()
-                    .w(gpui::rems(4.))
-                    .min_w_0()
-                    .flex_none()
-                    .child(inspector_text(payload.nonce().to_string())),
-            )
-            .child(
-                TableCell::new()
-                    .w(gpui::rems(10.))
-                    .min_w_0()
-                    .flex_none()
-                    .child(inspector_text(payload_purpose(payload)).whitespace_normal()),
-            )
-            .child(TableCell::new().flex_1().min_w_0().child(identifier))
-            .child(
-                TableCell::new()
-                    .w(gpui::rems(7.))
-                    .min_w_0()
-                    .flex_none()
-                    .child(inspector_text(payload.inclusion().map_or_else(
-                        || "Not seen".into(),
-                        |inclusion| format!("#{}", block_label(inclusion.block().number)),
-                    ))),
-            )
-            .child(
-                TableCell::new()
-                    .w(gpui::rems(9.))
-                    .min_w_0()
-                    .flex_none()
-                    .child(payload_result(issued_payload_status(record, payload), cx)),
-            )
+        Some(
+            TableRow::new()
+                .child(
+                    TableCell::new()
+                        .w(gpui::rems(4.))
+                        .min_w_0()
+                        .flex_none()
+                        .child(inspector_text(action.nonce().to_string())),
+                )
+                .child(
+                    TableCell::new()
+                        .w(gpui::rems(10.))
+                        .min_w_0()
+                        .flex_none()
+                        .child(inspector_text(payload_purpose(payload)).whitespace_normal()),
+                )
+                .child(TableCell::new().flex_1().min_w_0().child(identifier))
+                .child(
+                    TableCell::new()
+                        .w(gpui::rems(7.))
+                        .min_w_0()
+                        .flex_none()
+                        .children(
+                            action
+                                .spend_block()
+                                .map(|block| inspector_text(format!("#{}", block_label(block)))),
+                        ),
+                )
+                .child(
+                    TableCell::new()
+                        .w(gpui::rems(9.))
+                        .min_w_0()
+                        .flex_none()
+                        .child(payload_result(action.outcome(), cx)),
+                ),
+        )
     }
 }
 
@@ -513,7 +491,7 @@ fn payload_header(first: &'static str, purpose: bool) -> TableHeader {
                     .w(gpui::rems(7.))
                     .min_w_0()
                     .flex_none()
-                    .child(account_caption("Included")),
+                    .child(account_caption("Spent in")),
             )
             .child(
                 TableHead::new()
@@ -525,36 +503,14 @@ fn payload_header(first: &'static str, purpose: bool) -> TableHeader {
     )
 }
 
-/// Swap hooks run inside settlements and never get a direct-call inclusion. Once recorded
-/// swap observations show a hook took the nonce, that hook executed and every other
-/// payload at the nonce, such as an early cancellation, lost.
-fn issued_payload_status(
-    record: &ExecutorRecord,
-    payload: &IssuedExecutorPayload,
-) -> Option<ExecutorPayloadStatus> {
-    let status = record.recorded_payload_status(payload.hash());
-    if !matches!(status, Some(ExecutorPayloadStatus::Uncertain) | None) {
-        return status;
-    }
-    record
-        .swap_hook_winner(payload.nonce())
-        .map_or(status, |winner| {
-            Some(if winner == payload.hash() {
-                ExecutorPayloadStatus::Executed
-            } else {
-                ExecutorPayloadStatus::Invalidated { winner }
-            })
-        })
-}
-
-fn payload_result(status: Option<ExecutorPayloadStatus>, cx: &gpui::App) -> gpui::Div {
-    let (tag, label) = match status {
-        Some(ExecutorPayloadStatus::Executed) => (Tag::success(), "Executed"),
-        Some(ExecutorPayloadStatus::Reverted) => (Tag::danger(), "Reverted"),
-        Some(ExecutorPayloadStatus::MissingEffects) => (Tag::warning(), "Effects missing"),
-        Some(ExecutorPayloadStatus::Invalidated { .. }) => (Tag::secondary(), "Superseded"),
-        Some(ExecutorPayloadStatus::Uncertain) | None => (Tag::secondary(), "Unconfirmed"),
+fn payload_result(outcome: ExecutorPayloadOutcome, cx: &gpui::App) -> gpui::Div {
+    let (tag, label) = match outcome {
+        ExecutorPayloadOutcome::Executed => (Tag::success(), "Executed"),
+        ExecutorPayloadOutcome::Superseded => (Tag::secondary(), "Superseded"),
+        ExecutorPayloadOutcome::Resolved => (Tag::secondary(), "Nonce used"),
+        ExecutorPayloadOutcome::Pending => (Tag::secondary(), "Unconfirmed"),
     };
+    let pending = outcome == ExecutorPayloadOutcome::Pending;
     div()
         .flex()
         .flex_col()
@@ -565,20 +521,12 @@ fn payload_result(status: Option<ExecutorPayloadStatus>, cx: &gpui::App) -> gpui
                 .small()
                 .rounded_full()
                 .line_height(gpui::relative(ui::theme::APP_TEXT_LINE_HEIGHT))
-                .when(
-                    matches!(
-                        status,
-                        Some(
-                            ExecutorPayloadStatus::Uncertain
-                                | ExecutorPayloadStatus::Invalidated { .. }
-                        ) | None
-                    ),
-                    |tag| tag.text_color(cx.theme().foreground),
-                )
+                .when(outcome != ExecutorPayloadOutcome::Executed, |tag| {
+                    tag.text_color(cx.theme().foreground)
+                })
                 .child(label),
         )
-        .when(
-            matches!(status, Some(ExecutorPayloadStatus::Uncertain) | None),
-            |cell| cell.child(inspector_text("No result recorded")),
-        )
+        .when(pending, |cell| {
+            cell.child(inspector_text("No result recorded"))
+        })
 }

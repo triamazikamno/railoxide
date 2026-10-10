@@ -515,8 +515,9 @@ pub(crate) struct WalletRoot {
     repair_cache_block_input: Entity<InputState>,
     tx_search_input: Entity<InputState>,
     tx_search_query: Arc<str>,
-    walletconnect_attention_count: usize,
-    walletconnect_window_active: bool,
+    platform_attention_count: usize,
+    platform_attention_window_active: bool,
+    spend_authorization_attention: Vec<std::rc::Weak<()>>,
     platform_attention: platform_attention::PlatformAttentionState,
     walletconnect: walletconnect::WalletConnectUiState,
     show_spent_utxos: bool,
@@ -1578,8 +1579,9 @@ impl WalletRoot {
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
-            walletconnect_attention_count: 0,
-            walletconnect_window_active: window.is_window_active(),
+            platform_attention_count: 0,
+            platform_attention_window_active: window.is_window_active(),
+            spend_authorization_attention: Vec::new(),
             platform_attention,
             walletconnect,
             show_spent_utxos: false,
@@ -1620,7 +1622,7 @@ impl WalletRoot {
                 root.refresh_device_auth_status();
                 cx.notify();
             }
-            root.sync_walletconnect_attention_for_window(window);
+            root.sync_platform_attention_for_window(window);
         })
         .detach();
         cx.on_focus_lost(window, |root, window, cx| {

@@ -2452,8 +2452,86 @@ async fn waiting_approval_requires_explicit_usable_unlock_completion() {
 }
 
 #[tokio::test]
+async fn hardware_session_refresh_preserves_approval_and_signature_delivery() {
+    use crate::hardware::HardwareDeviceKind;
+    use crate::vault::{HardwareProfileBinding, HardwareProfileSession};
+
+    let (path, mut provider, view) = fixture();
+    let mut profile = HardwareProfileSession::matched(
+        HardwareDeviceKind::Trezor,
+        "gateway-profile",
+        HardwareProfileBinding::evm_address_fingerprint("gateway-binding"),
+        Some(vec![1, 2, 3]),
+    );
+    let view = Arc::new(view.clone_with_hardware_profile_session(profile.clone()));
+    authorize(
+        &mut provider,
+        &view,
+        url::Url::parse("http://127.0.0.1:1").unwrap(),
+    );
+    personal_approval(&mut provider, "sign", Instant::now());
+    let ready = provider.approval_updates.borrow()[0].clone();
+    provider.begin_approval(&ready.id).unwrap();
+
+    profile.trezor_session_id = Some(vec![4, 5, 6]);
+    let refreshed = Arc::new(view.clone_with_hardware_profile_session(profile.clone()));
+    let mut wallet = provider.wallet.clone();
+    wallet.view = Some(Arc::clone(&refreshed));
+    provider.update_wallet(wallet, provider.generation);
+    assert!(ready.control.ensure_current().is_ok());
+    provider
+        .complete_approval(&ready.id, Ok(json!("synthetic-signature")))
+        .unwrap();
+    let mut delivery = provider
+        .drain()
+        .into_iter()
+        .find(|(_, delivery)| {
+            matches!(
+                delivery.message,
+                GatewayServerMessage::ProviderResponse { .. }
+            )
+        })
+        .unwrap()
+        .1;
+
+    profile.trezor_session_id = Some(vec![7, 8, 9]);
+    let mut wallet = provider.wallet.clone();
+    wallet.view = Some(Arc::new(
+        refreshed.clone_with_hardware_profile_session(profile.clone()),
+    ));
+    provider.update_wallet(wallet, provider.generation);
+    assert!(provider.delivery(1, &mut delivery) == DeliveryStatus::Current);
+    assert_eq!(
+        serde_json::to_value(&delivery.message).unwrap()["result"],
+        "synthetic-signature"
+    );
+
+    personal_approval(&mut provider, "other-sign", Instant::now());
+    let pending = provider.approval_updates.borrow()[0].clone();
+    profile.binding = HardwareProfileBinding::evm_address_fingerprint("other-binding");
+    let mut wallet = provider.wallet.clone();
+    wallet.view = Some(Arc::new(
+        refreshed.clone_with_hardware_profile_session(profile),
+    ));
+    provider.update_wallet(wallet, provider.generation);
+    assert!(pending.control.ensure_current().is_err());
+    assert!(provider.approval_updates.borrow().is_empty());
+    assert!(provider.delivery(1, &mut delivery) != DeliveryStatus::Current);
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
 async fn native_approval_decisions_and_delivery_remain_bound_to_original_authority() {
-    for invalidation in ["document", "revoke", "wallet", "network", "immediate"] {
+    for invalidation in [
+        "document",
+        "revoke",
+        "wallet",
+        "reopen",
+        "network",
+        "immediate",
+    ] {
         let (path, mut provider, view) = fixture();
         authorize(
             &mut provider,
@@ -2496,6 +2574,16 @@ async fn native_approval_decisions_and_delivery_remain_bound_to_original_authori
                 let mut wallet = provider.wallet.clone();
                 wallet.active_wallet_generation += 1;
                 provider.update_wallet(wallet, 3);
+            }
+            "reopen" => {
+                let mut wallet = provider.wallet.clone();
+                wallet.view = Some(Arc::new(
+                    provider
+                        .store
+                        .load_view_session(PASSWORD, view.wallet_id())
+                        .unwrap(),
+                ));
+                provider.update_wallet(wallet, provider.generation);
             }
             "network" => {
                 let mut wallet = provider.wallet.clone();
