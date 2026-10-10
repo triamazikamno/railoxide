@@ -12,6 +12,9 @@
 //!   the review signs a permit when the Sell token has one and the account's allowance is
 //!   short, as USDC's is on Ethereum, Base and Arbitrum. Such an order asks the account for
 //!   no gas, so an account without native balance can review it.
+//! - `fee:checking` and `fee:failed` do what `form` does, except that the Buy picker holds
+//!   every other private network at its setup-fee check: still running, or failed and being
+//!   tried again. A new destination account can't be reviewed there.
 //! - `flow:<stage>` does what `form` does, and after the review is approved shows the
 //!   detail of the reviewed swap, as a synthesized record, and holds it at `setup-sending`,
 //!   `setup-waiting`, `finishing`, `placing` or `error`. `changed` ends on the form again,
@@ -69,9 +72,17 @@ const BEAT: Duration = Duration::from_secs(2);
 enum Mode {
     Form,
     RouteError,
+    Fee(Fee),
     Flow(Flow),
     Detail(Detail),
     Accounts,
+}
+
+/// Where the Buy picker holds a network's setup-fee check.
+#[derive(Clone, Copy, Debug)]
+enum Fee {
+    Checking,
+    Failed,
 }
 
 /// Where a reviewed swap is held.
@@ -114,6 +125,13 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "accounts" {
         return Some(Mode::Accounts);
+    }
+    if let Some(state) = value.strip_prefix("fee:") {
+        return Some(Mode::Fee(match state {
+            "checking" => Fee::Checking,
+            "failed" => Fee::Failed,
+            _ => return None,
+        }));
     }
     if let Some(stage) = value.strip_prefix("flow:") {
         return Some(Mode::Flow(match stage {
@@ -171,6 +189,15 @@ pub(super) fn route_error() -> bool {
 /// without private funds, and its jobs are scripted.
 pub(super) fn active() -> bool {
     mode().is_some()
+}
+
+/// Whether the Buy picker holds a network's setup-fee check, and whether that check failed.
+/// `None` in a mode that holds none, where a network takes a new account.
+pub(super) fn setup_fee_check_failed() -> Option<bool> {
+    match mode()? {
+        Mode::Fee(fee) => Some(matches!(fee, Fee::Failed)),
+        _ => None,
+    }
 }
 
 /// Whether the Public account swap records are the fixture's own, which nothing reads again,
@@ -231,7 +258,10 @@ pub(super) enum Step {
 pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
     use Flow::{Changed, Error, Finishing, Placing, SetupWaiting, Signatures};
     Some(match (mode()?, phase) {
-        (Mode::Form | Mode::RouteError | Mode::Detail(_) | Mode::Accounts, Phase::Approved) => (
+        (
+            Mode::Form | Mode::RouteError | Mode::Fee(_) | Mode::Detail(_) | Mode::Accounts,
+            Phase::Approved,
+        ) => (
             Duration::ZERO,
             Step::Fail("Fixture: this mode stops at the review. Nothing was sent."),
         ),

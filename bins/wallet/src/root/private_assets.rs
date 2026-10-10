@@ -738,7 +738,7 @@ impl WalletRoot {
                 .render_chain_error_body(root, message.as_ref())
                 .into_any_element(),
             Some(ChainUtxoState::Loading { progress }) => {
-                ui::private_assets::private_message(loading_summary(*progress), None)
+                ui::private_assets::private_message(loading_summary(progress.latest()), None)
                     .into_any_element()
             }
             Some(
@@ -750,7 +750,7 @@ impl WalletRoot {
                 snapshot,
                 state.private_action_forms_available(),
                 true,
-                *progress,
+                progress.latest(),
                 cx,
             ),
             Some(state @ ChainUtxoState::Ready { snapshot, .. }) => self

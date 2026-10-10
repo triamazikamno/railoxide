@@ -50,8 +50,8 @@ use wallet_ops::{
     PublicBroadcasterSelection, QuoteDeviationError, SwapAccountCandidate, SwapAmountPlan,
     SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext,
     SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPairPreparation, SwapPairSide, SwapPrice,
-    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest, SyncProgressUpdate,
-    TokenAnchorRateCache, TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest, TokenAnchorRateCache,
+    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
     bridge::{
         BridgeApiError, BridgeDestination, PublicBridgePath, across_destination_tokens,
         near_destination_tokens,
@@ -79,7 +79,7 @@ pub(super) mod public_source;
 
 use self::buy_picker::{
     BuyNetwork, BuyPicker, NetworkAvailability, NetworkSync, NetworkUnavailable,
-    PrivateNetworkFacts, ensure_buy_picker_bindings, private_network_availability,
+    PrivateNetworkFacts, SetupFunds, ensure_buy_picker_bindings, private_network_availability,
     public_network_availability,
 };
 use self::public_source::{PublicSwapForm, public_strip};
@@ -3328,9 +3328,9 @@ impl PrivateSwapsView {
 
     /// The networks `receive_to` can deliver on: this one first, then the other swap chains and
     /// every other chain enabled with RPC endpoints, in the network selector's order. One that
-    /// fails a condition of the delivery kind is listed with the reason and can't be picked.
-    /// Private balance leaves out the chains without a private balance, and the count of them
-    /// is returned with the list.
+    /// fails a condition of the delivery kind is listed with the reason and can't be picked,
+    /// unless its sync or setup-fee check is still under way. Private balance leaves out the
+    /// chains without a private balance, and the count of them is returned with the list.
     fn network_list(&self, receive_to: ReceiveTo, cx: &App) -> (Vec<BuyNetwork>, (usize, usize)) {
         let own = self.origin_chain_id;
         let public = self.form.as_ref().is_some_and(|form| form.public.is_some());
@@ -3343,6 +3343,7 @@ impl PrivateSwapsView {
             } else {
                 NetworkAvailability::Available
             },
+            reusable: false,
         }];
         let Some(root) = self.root.upgrade() else {
             return (items, (1, 1));
@@ -3391,6 +3392,7 @@ impl PrivateSwapsView {
                     this_network: false,
                     availability: self
                         .checked_destination_availability(root, receive_to, chain, cx),
+                    reusable: self.destination_reusable(chain.chain_id),
                 }),
         );
         // Both delivery kinds list the other networks in the network selector's order.
@@ -3436,9 +3438,9 @@ impl PrivateSwapsView {
         match destination_availability(root, receive_to, chain, reusable) {
             NetworkAvailability::Available if receive_to == ReceiveTo::PrivateBalance => {
                 match self.network_setup_availability(chain.chain_id, cx) {
-                    NetworkAvailability::Available => NetworkAvailability::Available,
-                    // Setup funding and estimates don't gate an already set-up account.
-                    availability if reusable && availability.admits_existing_account() => {
+                    // The estimate shows that setup can't be funded, which leaves a set-up
+                    // account there to select.
+                    NetworkAvailability::Unavailable(NetworkUnavailable::Unfunded) if reusable => {
                         NetworkAvailability::ReuseOnly
                     }
                     availability => availability,
@@ -12160,6 +12162,8 @@ pub(super) use crate::root::ui_helpers::network_name;
 /// address needs only its RPC endpoints. Private balance also needs an accepted swap
 /// profile, the wallet's private sync ready in this session, and either private funds for the
 /// destination stealth account's setup or, with `reusable`, a set-up account there to select.
+/// While it isn't known whether the funds held there can pay for the setup, the setup fee
+/// reads as being checked.
 fn destination_availability(
     root: &WalletRoot,
     receive_to: ReceiveTo,
@@ -12174,7 +12178,11 @@ fn destination_availability(
             swap_profile: chain.swap_profile().is_some(),
             sync: network_sync(root.chain_states.get(&chain.chain_id)),
             // Debug UI fixture: a wallet without private funds there picks the network too.
-            funded: destination_setup_funded(root, chain) || super::ui_fixture::active(),
+            funds: if super::ui_fixture::active() {
+                SetupFunds::Funded
+            } else {
+                destination_setup_funds(root, chain)
+            },
             reusable,
         }),
     }
@@ -12182,11 +12190,11 @@ fn destination_availability(
 
 /// Where the wallet's private sync of a chain stands. A chain without a session yet reads as
 /// loading: opening the Buy picker starts it.
-fn network_sync(state: Option<&ChainUtxoState>) -> NetworkSync {
+const fn network_sync(state: Option<&ChainUtxoState>) -> NetworkSync {
     match state {
         Some(ChainUtxoState::Ready { .. }) => NetworkSync::Ready,
         Some(ChainUtxoState::Error { .. }) => NetworkSync::Failed,
-        Some(state) => NetworkSync::Loading(state.progress().map(SyncProgressUpdate::percent)),
+        Some(state) => NetworkSync::Loading(state.sync_percent()),
         None => NetworkSync::Loading(None),
     }
 }
@@ -12195,21 +12203,23 @@ fn network_sync(state: Option<&ChainUtxoState>) -> NetworkSync {
 /// POI-verified, spendable private balance there is in a token that a broadcaster compatible
 /// with the chain's executor profile accepts, under the fee policy and trust filter a new
 /// setup route starts with. The picker then checks that balance against the setup estimate.
-fn destination_setup_funded(root: &WalletRoot, chain: &EffectiveChainConfig) -> bool {
+/// Without such a balance, notes held there leave it unknown while their POI status is being
+/// refreshed, or while no broadcaster offer on the chain has arrived.
+fn destination_setup_funds(root: &WalletRoot, chain: &EffectiveChainConfig) -> SetupFunds {
     let chain_id = chain.chain_id;
     let Some(profile) = chain.accepted_executor_profile() else {
-        return false;
+        return SetupFunds::Unfunded;
     };
-    let Some(snapshot) = root
-        .chain_states
-        .get(&chain_id)
-        .and_then(ChainUtxoState::snapshot)
-    else {
-        return false;
+    let Some(state) = root.chain_states.get(&chain_id) else {
+        return SetupFunds::Unfunded;
     };
-    public_broadcaster_fee_token_options_from_snapshot(
+    let Some(snapshot) = state.snapshot() else {
+        return SetupFunds::Unfunded;
+    };
+    let rows = root.monitor_fee_rows();
+    let funded = public_broadcaster_fee_token_options_from_snapshot(
         snapshot,
-        &root.monitor_fee_rows(),
+        &rows,
         None,
         Some(profile),
         root.public_broadcaster_fee_policy(false),
@@ -12221,7 +12231,16 @@ fn destination_setup_funded(root: &WalletRoot, chain: &EffectiveChainConfig) -> 
         },
     )
     .iter()
-    .any(|option| option.eligible_broadcaster_count > 0)
+    .any(|option| option.eligible_broadcaster_count > 0);
+    // A POI refresh or a first offer on the chain can still make the held notes pay for it.
+    let pending = state.poi_refreshing() || !rows.iter().any(|row| row.chain_id == chain_id);
+    if funded {
+        SetupFunds::Funded
+    } else if snapshot.unspent_count > 0 && pending {
+        SetupFunds::Unknown
+    } else {
+        SetupFunds::Unfunded
+    }
 }
 
 /// The token a Bridge review delivers on its network. Only a Bridge review has one.

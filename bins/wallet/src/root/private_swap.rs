@@ -53,6 +53,10 @@ mod ui_fixture {
         false
     }
 
+    pub(super) const fn setup_fee_check_failed() -> Option<bool> {
+        None
+    }
+
     pub(super) const fn holds_records() -> bool {
         false
     }

@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use crate::root::chain_load::{ChainUtxoState, WalletSyncLifecycle};
+use crate::root::chain_load::{ChainSyncProgress, ChainUtxoState, WalletSyncLifecycle};
 use alloy::primitives::B256;
 use broadcaster_core::contracts::swap_math::{SWAP_MATH_ADDRESS, SWAP_MATH_CREATION_CODE};
 use gpui::{IntoElement, ParentElement, Render, Styled, TestAppContext, div};
@@ -3820,8 +3820,12 @@ fn across_weth_to_arbitrum_is_listed_and_bridged_as_eth(cx: &mut TestAppContext)
         // session is still loading here, so nothing starts one.
         cx.update(|window, cx| {
             root.update(cx, |root, _| {
-                root.chain_states
-                    .insert(42161, ChainUtxoState::Loading { progress: None });
+                root.chain_states.insert(
+                    42161,
+                    ChainUtxoState::Loading {
+                        progress: ChainSyncProgress::default(),
+                    },
+                );
             });
             swaps.update(cx, |swaps, cx| {
                 swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
@@ -3908,15 +3912,17 @@ fn across_lists_the_configured_wrapped_native_token_as_the_native_asset(cx: &mut
 /// Private balance can deliver on another network only when it is enabled with RPC endpoints,
 /// has an accepted swap profile, is synced in this session, and holds private funds a setup
 /// broadcaster accepts or a set-up account to deliver to. The first condition that fails is
-/// the reason the picker shows. A network with such an account and no setup funds can be
-/// picked, and says that an existing account is needed.
+/// the reason the picker shows. While it isn't known whether the funds there can pay for a
+/// setup, the setup fee reads as being checked. A network that is syncing or checking can be
+/// picked ahead of it, and one with a set-up account says that an existing account is needed
+/// only once setup is known to be unfunded.
 #[test]
 fn private_balance_needs_a_synced_and_funded_network() {
     let funded = PrivateNetworkFacts {
         rpc: true,
         swap_profile: true,
         sync: NetworkSync::Ready,
-        funded: true,
+        funds: SetupFunds::Funded,
         reusable: false,
     };
     let unavailable = NetworkAvailability::Unavailable;
@@ -3924,24 +3930,40 @@ fn private_balance_needs_a_synced_and_funded_network() {
         (funded, NetworkAvailability::Available),
         (
             PrivateNetworkFacts {
-                funded: false,
+                funds: SetupFunds::Unfunded,
                 ..funded
             },
             unavailable(NetworkUnavailable::Unfunded),
         ),
         (
             PrivateNetworkFacts {
-                funded: false,
+                funds: SetupFunds::Unfunded,
                 reusable: true,
                 ..funded
             },
             NetworkAvailability::ReuseOnly,
         ),
+        (
+            PrivateNetworkFacts {
+                funds: SetupFunds::Unknown,
+                ..funded
+            },
+            NetworkAvailability::CheckingFee,
+        ),
+        // A set-up account doesn't settle what the funds there can pay.
+        (
+            PrivateNetworkFacts {
+                funds: SetupFunds::Unknown,
+                reusable: true,
+                ..funded
+            },
+            NetworkAvailability::CheckingFee,
+        ),
         // A set-up account doesn't stand in for the sync, which reads it.
         (
             PrivateNetworkFacts {
                 sync: NetworkSync::Loading(None),
-                funded: false,
+                funds: SetupFunds::Unfunded,
                 reusable: true,
                 ..funded
             },
@@ -3951,7 +3973,7 @@ fn private_balance_needs_a_synced_and_funded_network() {
         (
             PrivateNetworkFacts {
                 sync: NetworkSync::Loading(Some(62)),
-                funded: false,
+                funds: SetupFunds::Unfunded,
                 ..funded
             },
             NetworkAvailability::Syncing(Some(62)),
@@ -3982,8 +4004,18 @@ fn private_balance_needs_a_synced_and_funded_network() {
         assert_eq!(private_network_availability(facts), availability);
     }
     let reuse = NetworkAvailability::ReuseOnly;
-    assert!(reuse.is_available(), "its routes stay selectable");
-    assert!(!unavailable(NetworkUnavailable::Unfunded).is_available());
+    let checking = NetworkAvailability::CheckingFee;
+    assert!(reuse.is_pickable(), "its routes stay selectable");
+    assert!(
+        NetworkAvailability::Syncing(None).is_pickable(),
+        "the form waits for the sync"
+    );
+    assert!(!unavailable(NetworkUnavailable::Unfunded).is_pickable());
+    // The row of a network with a set-up account has no note until setup is known to be
+    // unfunded.
+    assert!(checking.list_reason("Polygon", true).is_none());
+    assert!(checking.list_reason("Polygon", false).is_some());
+    assert!(reuse.list_reason("Polygon", true).is_some());
 }
 
 /// The picker lists every other chain enabled with RPC endpoints, built in or added by the
@@ -4499,10 +4531,12 @@ fn confirm_account(
 /// Private balance on another network chooses a stealth account on each network by itself.
 /// Polygon holds no private funds and no broadcaster offers, only a set-up account: its routes
 /// stay selectable, a new account there leaves Review unavailable with the setup-funding
-/// reason, and nothing selects the existing one. Choosing it needs no setup there. A refused
-/// choice stays with its reason, a token change keeps the choice and checks it again, a
-/// network change returns the destination to a new account and keeps the source, and a new
-/// session's form has neither choice. Any other delivery has one selector.
+/// reason, and nothing selects the existing one. Once it holds funds, the picker says that the
+/// setup fee is being checked, and then that it couldn't be, instead of asking for an existing
+/// account. Choosing that account needs no setup there. A refused choice stays with its
+/// reason, a token change keeps the choice and checks it again, a network change returns the
+/// destination to a new account and keeps the source, and a new session's form has neither
+/// choice. Any other delivery has one selector.
 #[gpui::test]
 fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
@@ -4594,6 +4628,15 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                         poi_verified_total: "100000000".into(),
                     }],
                 });
+            });
+            // Funds are held there, and no broadcaster offer on the chain has arrived yet.
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx),
+                    Some(NetworkAvailability::CheckingFee)
+                );
+            });
+            root.update(cx, |root, _| {
                 root.monitor_state.write().upsert_fee(offer);
             });
             stubs.set_failing(&["/rpc"]);
@@ -4605,7 +4648,7 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                         NetworkAvailability::CheckingFee
                     );
                     swaps.open_buy_picker(window, cx);
-                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
+                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::CheckingFee);
                     swaps.show_buy_picker_network(1, window, cx);
                     swaps.show_buy_picker_network(137, window, cx);
                     assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
@@ -4635,7 +4678,10 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     assert_eq!(chosen(swaps), (None, None));
                     assert!(swaps.form.as_ref().unwrap().quote_delivery().is_none());
                     swaps.open_buy_picker(window, cx);
-                    assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
+                    assert_eq!(
+                        picker_polygon(swaps, cx),
+                        NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee)
+                    );
                     swaps.show_buy_picker_network(1, window, cx);
                     swaps.show_buy_picker_network(137, window, cx);
                     assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
@@ -6176,8 +6222,8 @@ fn a_shielded_delivery_reads_its_destination_account_which_is_then_offered_again
 }
 
 /// A new swap of 1 USDC with the stub providers on its route and Polygon enabled with the
-/// stub's RPC. Polygon's session is still loading, at 62%, so opening the picker for Private
-/// balance starts no session.
+/// stub's RPC. Polygon's session is still loading, at 62% of indexing its UTXOs and 92% of the
+/// whole sync, so opening the picker for Private balance starts no session.
 fn open_form_beside_syncing_polygon(
     root: &Entity<WalletRoot>,
     swaps: &Entity<PrivateSwapsView>,
@@ -6193,17 +6239,15 @@ fn open_form_beside_syncing_polygon(
             )
             .unwrap();
             enable_stub_chain(root, stubs, 137);
-            root.chain_states.insert(
-                137,
-                ChainUtxoState::Loading {
-                    progress: Some(SyncProgressUpdate::new(
-                        wallet_ops::SyncProgressStage::IndexingUtxos,
-                        0,
-                        62,
-                        100,
-                    )),
-                },
-            );
+            let mut progress = ChainSyncProgress::default();
+            progress.observe(Some(wallet_ops::SyncProgressUpdate::new(
+                wallet_ops::SyncProgressStage::IndexingUtxos,
+                0,
+                62,
+                100,
+            )));
+            root.chain_states
+                .insert(137, ChainUtxoState::Loading { progress });
         });
         swaps.update(cx, |swaps, cx| {
             swaps
@@ -6241,8 +6285,8 @@ fn picker_polygon(swaps: &PrivateSwapsView, cx: &App) -> NetworkAvailability {
 
 /// The picker's switch and the form's Receive to are one setting, and it decides which
 /// networks can be picked. Switching the form to Private balance keeps a network picked for a
-/// Public address: the form says under Receive to why it can't quote, and the picker falls
-/// back to the swap's own network without changing the form's.
+/// Public address: the form says under Receive to why it can't quote, and the picker still
+/// shows that network while its sync is under way.
 #[gpui::test]
 fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
@@ -6259,7 +6303,7 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
             assert!(swaps.form.as_ref().unwrap().picker.open);
             assert_eq!(
                 picker_polygon(swaps, cx),
-                NetworkAvailability::Syncing(Some(62)),
+                NetworkAvailability::Syncing(Some(92)),
                 "Private balance waits for Polygon's sync"
             );
         });
@@ -6330,17 +6374,17 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
         });
         assert!(cx.debug_bounds("swap-receive-to-problem").is_some());
 
-        // The picker follows the form's Receive to, and lists the swap's own network.
+        // The picker follows the form's Receive to, and shows the form's network.
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.open_buy_picker(window, cx);
                 let form = swaps.form.as_ref().unwrap();
                 let content = swaps.buy_picker_content(form, cx);
                 assert_eq!(content.receive_to, ReceiveTo::PrivateBalance);
-                assert_eq!((content.network, form.network), (1, Some(137)));
+                assert_eq!((content.network, form.network), (137, Some(137)));
                 assert_eq!(
                     picker_polygon(swaps, cx),
-                    NetworkAvailability::Syncing(Some(62))
+                    NetworkAvailability::Syncing(Some(92))
                 );
             });
         });
@@ -6673,8 +6717,12 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
             cx.update(|window, cx| {
                 // Polygon's session is still loading, so Private balance starts none.
                 root.update(cx, |root, _| {
-                    root.chain_states
-                        .insert(137, ChainUtxoState::Loading { progress: None });
+                    root.chain_states.insert(
+                        137,
+                        ChainUtxoState::Loading {
+                            progress: ChainSyncProgress::default(),
+                        },
+                    );
                 });
                 swaps.update(cx, |swaps, cx| {
                     swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);

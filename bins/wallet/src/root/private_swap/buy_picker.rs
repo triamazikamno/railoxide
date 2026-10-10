@@ -21,6 +21,7 @@ use gpui_component::{
     button::ButtonGroup,
     list::{List, ListDelegate, ListItem, ListState},
     select::SelectItem as _,
+    shimmer::ShimmerText,
     spinner::Spinner,
     tag::Tag,
     tooltip::Tooltip,
@@ -81,12 +82,12 @@ pub(super) enum NetworkUnavailable {
     NoBridge,
 }
 
-/// Whether a network can be picked for the selected delivery kind.
+/// Whether the selected delivery kind can deliver on a network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NetworkAvailability {
     Available,
-    /// Setup isn't available, but the network can be picked with an existing stealth account,
-    /// which the user selects in the form.
+    /// Setup can't be funded there, as the balance or the setup estimate shows, but the network
+    /// can be picked with an existing stealth account, which the user selects in the form.
     ReuseOnly,
     /// The wallet's private sync there isn't ready yet, with its progress in percent once
     /// known.
@@ -96,10 +97,18 @@ pub(super) enum NetworkAvailability {
 }
 
 impl NetworkAvailability {
-    /// The network can be picked: with a new stealth account there, or only with an existing
-    /// one.
-    pub(super) const fn is_available(self) -> bool {
-        matches!(self, Self::Available | Self::ReuseOnly)
+    /// The picker can show the network's tokens and pick one. A network whose sync or
+    /// setup-fee check is still under way can be picked ahead of it, and the form then waits
+    /// for it under Receive to.
+    pub(super) const fn is_pickable(self) -> bool {
+        matches!(
+            self,
+            Self::Available
+                | Self::ReuseOnly
+                | Self::Syncing(_)
+                | Self::CheckingFee
+                | Self::Unavailable(NetworkUnavailable::SetupFee)
+        )
     }
 
     /// Everything but the setup's funding holds, which is all a delivery to an existing
@@ -114,11 +123,13 @@ impl NetworkAvailability {
         )
     }
 
-    /// The line under `network` in the picker's list while it can't be picked, or can be only
-    /// with an existing stealth account.
-    fn list_reason(self, network: &str) -> Option<String> {
+    /// The line under `network` in the picker's list: why it can't be picked, what it still
+    /// waits for, or that it takes an existing stealth account only. With `reusable`, a set-up
+    /// account there to select, a setup-fee check that is running or couldn't run has no line.
+    pub(super) fn list_reason(self, network: &str, reusable: bool) -> Option<String> {
         match self {
             Self::Available => None,
+            Self::CheckingFee | Self::Unavailable(NetworkUnavailable::SetupFee) if reusable => None,
             Self::ReuseOnly => Some("Existing account only".to_owned()),
             Self::Syncing(None) => Some("Syncing…".to_owned()),
             Self::Syncing(Some(percent)) => Some(format!("Syncing… {percent}%")),
@@ -199,6 +210,17 @@ pub(super) enum NetworkSync {
     Failed,
 }
 
+/// Whether the wallet's private funds on a network could pay a setup broadcaster there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetupFunds {
+    /// A spendable private balance there is in a token a compatible broadcaster accepts.
+    Funded,
+    /// Nothing held there can pay one.
+    Unfunded,
+    /// Notes are held there, and what would settle it hasn't arrived yet.
+    Unknown,
+}
+
 /// What decides whether Private balance can deliver on another network a bridge reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PrivateNetworkFacts {
@@ -207,8 +229,7 @@ pub(super) struct PrivateNetworkFacts {
     /// The chain has an accepted swap profile.
     pub(super) swap_profile: bool,
     pub(super) sync: NetworkSync,
-    /// A spendable private balance there is in a token a compatible broadcaster accepts.
-    pub(super) funded: bool,
+    pub(super) funds: SetupFunds,
     /// A set-up stealth account there is locally eligible as a destination.
     pub(super) reusable: bool,
 }
@@ -227,11 +248,12 @@ pub(super) const fn private_network_availability(
     match facts.sync {
         NetworkSync::Loading(percent) => NetworkAvailability::Syncing(percent),
         NetworkSync::Failed => NetworkAvailability::Unavailable(NetworkUnavailable::SyncFailed),
-        NetworkSync::Ready if !facts.funded && facts.reusable => NetworkAvailability::ReuseOnly,
-        NetworkSync::Ready if !facts.funded => {
-            NetworkAvailability::Unavailable(NetworkUnavailable::Unfunded)
-        }
-        NetworkSync::Ready => NetworkAvailability::Available,
+        NetworkSync::Ready => match facts.funds {
+            SetupFunds::Funded => NetworkAvailability::Available,
+            SetupFunds::Unknown => NetworkAvailability::CheckingFee,
+            SetupFunds::Unfunded if facts.reusable => NetworkAvailability::ReuseOnly,
+            SetupFunds::Unfunded => NetworkAvailability::Unavailable(NetworkUnavailable::Unfunded),
+        },
     }
 }
 
@@ -254,6 +276,8 @@ pub(super) struct BuyNetwork {
     pub(super) label: SharedString,
     pub(super) this_network: bool,
     pub(super) availability: NetworkAvailability,
+    /// A set-up stealth account there can be selected.
+    pub(super) reusable: bool,
 }
 
 /// The Buy picker's state.
@@ -434,9 +458,14 @@ impl PrivateSwapsView {
     }
 
     pub(super) fn network_setup_availability(&self, network: u64, cx: &App) -> NetworkAvailability {
-        // Debug UI fixture: a wallet without private funds there picks the network too.
+        // Debug UI fixture: a wallet without private funds there picks the network too, or is
+        // held at its setup-fee check.
         if crate::root::private_swap::ui_fixture::active() {
-            return NetworkAvailability::Available;
+            return match crate::root::private_swap::ui_fixture::setup_fee_check_failed() {
+                None => NetworkAvailability::Available,
+                Some(false) => NetworkAvailability::CheckingFee,
+                Some(true) => NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee),
+            };
         }
         let Some(inputs) = self.network_funding_inputs(network, cx) else {
             return NetworkAvailability::CheckingFee;
@@ -462,7 +491,7 @@ impl PrivateSwapsView {
             .into_iter()
             .filter(|network| {
                 !network.this_network
-                    && network.availability.is_available()
+                    && network.availability.is_pickable()
                     && (form.picker.open || form.network == Some(network.chain_id))
             })
             .map(|network| network.chain_id)
@@ -800,7 +829,7 @@ impl ListDelegate for BuyTokensDelegate {
 }
 
 /// The network list's rows: the networks the search matches, by name or by the start of the
-/// chain id. One the delivery kind can't deliver on is disabled with the reason.
+/// chain id. One that can't be picked is disabled with the reason.
 pub(super) struct BuyNetworksDelegate {
     view: WeakEntity<PrivateSwapsView>,
     /// The network whose tokens the picker shows, which its row marks.
@@ -872,12 +901,21 @@ impl ListDelegate for BuyNetworksDelegate {
     ) -> Option<Self::Item> {
         let network = self.row(ix.row)?;
         let chain_id = network.chain_id;
-        let available = network.availability.is_available();
+        let available = network.availability.is_pickable();
+        // The sync or the setup-fee check is still under way.
+        let waiting = matches!(
+            network.availability,
+            NetworkAvailability::Syncing(_)
+                | NetworkAvailability::CheckingFee
+                | NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee)
+        );
         let shown = self.shown == chain_id;
         let note = if network.this_network {
             Some("Current network".to_owned())
         } else {
-            network.availability.list_reason(&network.label)
+            network
+                .availability
+                .list_reason(&network.label, network.reusable)
         };
         // The reason is cut to the row's one line, so the pointer shows it whole.
         let tooltip = note.clone().filter(|_| !network.this_network);
@@ -934,8 +972,26 @@ impl ListDelegate for BuyNetworksDelegate {
                                 )
                             }),
                     )
-                    // Under the label, past the icon and the row's gap.
-                    .children(note.map(|note| app_muted_text(note).text_xs().pl_6().truncate())),
+                    // Under the label, past the icon and the row's gap. A wait under way shimmers.
+                    .children(note.map(|note| {
+                        if waiting {
+                            // The id keeps one animation as the note's text changes.
+                            ShimmerText::new(note)
+                                .id("waiting")
+                                .text_xs()
+                                .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .pl_6()
+                                .truncate()
+                                .into_any_element()
+                        } else {
+                            app_muted_text(note)
+                                .text_xs()
+                                .pl_6()
+                                .truncate()
+                                .into_any_element()
+                        }
+                    })),
             ),
         )
     }
@@ -960,7 +1016,7 @@ impl ListDelegate for BuyNetworksDelegate {
         self.selected = ix;
     }
 
-    /// Enter or a click shows the network's tokens, when the delivery kind can deliver there.
+    /// Enter or a click shows the network's tokens, when it can be picked.
     fn confirm(
         &mut self,
         _secondary: bool,
@@ -1048,9 +1104,10 @@ impl PrivateSwapsView {
     }
 
     /// The picker opened, or Receive to changed while it is open: its lists follow the delivery
-    /// kind, with the shown network and the first token selected. A shown network the kind
-    /// can't take gives way to the swap's own, which only changes what the picker lists. For
-    /// Private balance, the networks that aren't loaded start loading.
+    /// kind, with the shown network and the first token selected. A shown network that can't
+    /// be picked for the kind gives way to the swap's own, which only changes what the picker
+    /// lists. One whose sync or setup-fee check is still under way stays shown. For Private
+    /// balance, the networks that aren't loaded start loading.
     pub(super) fn settle_buy_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let own = self.origin_chain_id;
         // A network without setup funds can be picked for an existing account there.
@@ -1063,7 +1120,7 @@ impl PrivateSwapsView {
         let selectable = self
             .network_items(receive_to, cx)
             .iter()
-            .any(|network| network.chain_id == shown && network.availability.is_available());
+            .any(|network| network.chain_id == shown && network.availability.is_pickable());
         let Some(form) = self.form.as_mut() else {
             return;
         };
@@ -1093,7 +1150,7 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// List `chain_id`'s tokens, when the delivery kind can deliver there.
+    /// List `chain_id`'s tokens, when it can be picked for the delivery kind.
     pub(super) fn show_buy_picker_network(
         &mut self,
         chain_id: u64,
@@ -1106,7 +1163,7 @@ impl PrivateSwapsView {
         if !self
             .network_items(form.receive_to, cx)
             .iter()
-            .any(|network| network.chain_id == chain_id && network.availability.is_available())
+            .any(|network| network.chain_id == chain_id && network.availability.is_pickable())
         {
             return;
         }
