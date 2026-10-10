@@ -1521,6 +1521,7 @@ impl PrivateSwapsView {
                 receiver: None,
                 minimum: None,
                 uncovered_gas: None,
+                order: None,
                 bridge: None,
             };
         };
@@ -1669,6 +1670,7 @@ impl PrivateSwapsView {
                 })
                 .filter(|rest| !rest.is_zero())
                 .map(|rest| self.money(buy, rest, cx)),
+            order: order.map(SwapOrderRecord::uid),
             bridge,
         }
     }

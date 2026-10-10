@@ -564,8 +564,8 @@ impl PrivateSwapsView {
         (body, Some(footer))
     }
 
-    /// The order ID, who settles it, a Public address swap's receiver, the minimum while it can
-    /// fill, and when the swap started.
+    /// Who settles the order, a Public address swap's receiver, the minimum while it can fill,
+    /// and when the swap started. The order step shows the order ID.
     fn render_facts(
         &self,
         order: Option<&SwapOrderRecord>,
@@ -575,10 +575,7 @@ impl PrivateSwapsView {
         cx: &App,
     ) -> Option<gpui::Div> {
         let mut rows = Vec::new();
-        if let Some(order) = order {
-            let order_id = order.uid().0.to_string();
-            let copy_id = SharedString::from(format!("swap-order-{order_id}-copy"));
-            rows.push(hash_row("Order ID", order_id, copy_id, "Copy order ID"));
+        if order.is_some() {
             rows.push(fact_row("Settled by", settled_by_cow()));
         }
         if let SwapDelivery::External { receiver } = delivery {
@@ -932,12 +929,10 @@ impl PrivateSwapsView {
                 rows.extend(settlement);
                 rows.extend(started);
             }
-            // Before the trade: the order, and what the receiver gets on the destination network.
+            // Before the trade: who settles the order, and what the receiver gets on the
+            // destination network.
             _ => {
-                if let Some(order) = order {
-                    let order_id = order.uid().0.to_string();
-                    let copy_id = SharedString::from(format!("swap-order-{order_id}-copy"));
-                    rows.push(hash_row("Order ID", order_id, copy_id, "Copy order ID"));
+                if order.is_some() {
                     rows.push(fact_row("Settled by", settled_by_cow()));
                 }
                 rows.extend(receiver);
@@ -2852,7 +2847,8 @@ fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>)
 
 /// A swap step and its sub-steps for the shared stepper. A sub-step names its network and its
 /// stealth account, with a control that copies the account's address, and ends with its block
-/// or what it waits for. A step that carries its own block ends with it.
+/// or what it waits for. A step that carries its own block ends with it. The order step shows
+/// its order ID under its detail, with a control that copies it in full.
 pub(super) fn progress_group(
     step: &SwapStep,
     detail: String,
@@ -2878,8 +2874,24 @@ pub(super) fn progress_group(
             }
         })
         .collect();
+    let order = step.order.map(|order| {
+        let order_id = order.0.to_string();
+        let copy_id = SharedString::from(format!("{id}-order-copy"));
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .debug_selector(|| "swap-step-order".into())
+            .child(app_muted_text("Order ID").flex_none())
+            .child(app_muted_text(short_hash(&order_id)).font_family(theme::APP_MONO_FONT_FAMILY))
+            .child(clipboard_with_toast(copy_id, order_id).tooltip("Copy order ID"))
+            .into_any_element()
+    });
     SubmissionProgressGroup {
-        step: progress_step(step, detail, id),
+        step: SubmissionProgressStep {
+            action: order,
+            ..progress_step(step, detail, id)
+        },
         outcome: step.block.map_or_else(String::new, block_label),
         substeps,
     }

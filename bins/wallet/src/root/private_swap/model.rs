@@ -6,7 +6,9 @@
 
 use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
-    ExecutorAttribution, SwapOrderState, SwapSetupStatus, swap_order_state,
+    ExecutorAttribution, SwapOrderState, SwapSetupStatus,
+    cow::OrderUid,
+    swap_order_state,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
         ExecutorPayloadPurpose, ExecutorPayloadState, ExecutorRecord, SwapApprovedBounds,
@@ -715,7 +717,11 @@ pub(super) fn public_swap_steps(
             }
             .unwrap_or_default()
         };
-        steps.push(SwapStep::new(title, detail, status).in_block(block(observed.traded)));
+        steps.push(
+            SwapStep::new(title, detail, status)
+                .in_block(block(observed.traded))
+                .with_order(swap.order().map(wallet_ops::vault::PublicSwapOrder::uid)),
+        );
     }
     let proxy = matches!(
         stage,
@@ -1093,6 +1099,8 @@ pub(in crate::root) struct SwapLabels {
     /// covered if it expired unfilled. `None` without a recorded gas share or when the share
     /// covered all of it.
     pub(in crate::root) uncovered_gas: Option<String>,
+    /// The latest order's `CoW` order ID, which the order step shows.
+    pub(in crate::root) order: Option<OrderUid>,
     /// A Bridge swap's destination. `None` for delivery on the swap's own network.
     pub(in crate::root) bridge: Option<SwapBridgeLabels>,
 }
@@ -1621,6 +1629,8 @@ pub(in crate::root) struct SwapStep {
     pub(in crate::root) children: Vec<Self>,
     /// A sub-step's stealth account. `None` for every other step.
     pub(in crate::root) account: Option<SwapStepAccount>,
+    /// The `CoW` order ID of the order step, once the swap has an order.
+    pub(in crate::root) order: Option<OrderUid>,
     /// The block the step completed in, shown at its trailing edge. Only a Public-paid swap's
     /// steps carry one.
     pub(in crate::root) block: Option<u64>,
@@ -1638,12 +1648,18 @@ impl SwapStep {
             status,
             children: Vec::new(),
             account: None,
+            order: None,
             block: None,
         }
     }
 
     const fn in_block(mut self, block: Option<u64>) -> Self {
         self.block = block;
+        self
+    }
+
+    const fn with_order(mut self, order: Option<OrderUid>) -> Self {
+        self.order = order;
         self
     }
 }
@@ -1672,20 +1688,31 @@ const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 /// attempt that ended, or stranded funds before a trade, ends the list at the order step. A
 /// fill the orderbook reports shows the trade confirming until observation records it. A Public
 /// address swap has no private-balance step, as [`external_steps`] describes, and a Bridge swap
-/// hands off to its bridge instead, as [`bridge_steps`] describes.
+/// hands off to its bridge instead, as [`bridge_steps`] describes. Once the swap has an order,
+/// the order step carries its ID.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
-    if let Some(bridge) = &labels.bridge {
+    let mut steps = if let Some(bridge) = &labels.bridge {
         let mut steps = bridge_steps(stage, labels, bridge);
         if let (Some(private), Some(setup)) = (&bridge.private, steps.first_mut()) {
             *setup = private_setup_step(stage, private, setup);
         }
-        return steps;
+        steps
+    } else {
+        let steps = reshield_steps(stage, labels);
+        match &labels.receiver {
+            Some(receiver) => external_steps(steps, receiver, labels),
+            None => steps,
+        }
+    };
+    // The order step follows the setup in every stage that has an order.
+    if matches!(
+        stage,
+        SwapStage::SubmissionPending | SwapStage::SubmissionRejected | SwapStage::Order(_)
+    ) && let Some(step) = steps.get_mut(1)
+    {
+        step.order = labels.order;
     }
-    let steps = reshield_steps(stage, labels);
-    match &labels.receiver {
-        Some(receiver) => external_steps(steps, receiver, labels),
-        None => steps,
-    }
+    steps
 }
 
 fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
@@ -2633,6 +2660,7 @@ pub(super) mod tests {
             receiver: None,
             minimum: None,
             uncovered_gas: None,
+            order: None,
             bridge: None,
         }
     }
@@ -2674,6 +2702,52 @@ pub(super) mod tests {
                 .map(|cause| SwapStage::Order(SwapOrderState::AttemptEnded(cause))),
         );
         stages
+    }
+
+    #[test]
+    fn only_the_order_step_carries_the_order_id() {
+        let uid = OrderUid([7; 56].into());
+        let private = SwapLabels {
+            order: Some(uid),
+            ..labels()
+        };
+        let external = SwapLabels {
+            receiver: Some("Treasury".into()),
+            ..private.clone()
+        };
+        let bridged = SwapLabels {
+            bridge: Some(SwapBridgeLabels {
+                provider: BridgeProvider::Across,
+                network: "Polygon".into(),
+                token: "USDC".into(),
+                origin: "Arbitrum One".into(),
+                receiver: "Treasury".into(),
+                sent: None,
+                minimum: None,
+                private: None,
+                reported: false,
+            }),
+            ..private.clone()
+        };
+        for stage in every_stage() {
+            let has_order = matches!(
+                stage,
+                SwapStage::SubmissionPending | SwapStage::SubmissionRejected | SwapStage::Order(_)
+            );
+            for labels in [&private, &external, &bridged] {
+                let carried = swap_steps(stage, labels)
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, step)| Some((index, step.order?)))
+                    .collect::<Vec<_>>();
+                let expected = if has_order {
+                    vec![(1, uid)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(carried, expected, "{stage:?}");
+            }
+        }
     }
 
     #[test]
@@ -4159,6 +4233,18 @@ pub(super) mod tests {
                     .map(|step| (step.label.as_str(), step.detail.as_str(), step.block))
                     .collect::<Vec<_>>(),
                 steps,
+                "{stage:?}"
+            );
+            // The order step, and no other, carries the order ID.
+            assert_eq!(
+                shown
+                    .iter()
+                    .filter_map(|step| step.order)
+                    .collect::<Vec<_>>(),
+                swap.order()
+                    .map(wallet_ops::vault::PublicSwapOrder::uid)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
                 "{stage:?}"
             );
             assert_eq!(public_swap_facts(stage), facts, "{stage:?}");
