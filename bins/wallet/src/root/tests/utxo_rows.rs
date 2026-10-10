@@ -809,7 +809,7 @@ fn in_flight_blocked_shield_refund_disables_cached_action() {
 }
 
 #[test]
-fn blocked_shield_refund_with_unmatched_origin_is_not_actionable() {
+fn blocked_shield_refund_with_blocked_origin_can_be_checked_again() {
     let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
     blocked_shield.commitment_kind = "Shield".to_string();
     blocked_shield.activity_classification = "Blocked Shield".to_string();
@@ -839,9 +839,9 @@ fn blocked_shield_refund_with_unmatched_origin_is_not_actionable() {
 
     let rows = display_rows_from_output(&output, "", false);
 
-    // A resolved origin keeps the disabled reason instead of offering another resolution.
+    // An origin that was resolved but can't refund yet can be checked again.
     assert!(should_show_blocked_shield_refund_action(&rows[0]));
-    assert!(!blocked_shield_refund_action_available(&rows[0]));
+    assert!(blocked_shield_refund_action_available(&rows[0]));
 }
 
 #[gpui::test]

@@ -3,16 +3,21 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use broadcaster_monitor_waku::WakuMonitorConfig;
 use gpui::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    TestAppContext, WeakEntity, Window, div,
+    TestAppContext, VisualTestContext, WeakEntity, Window, div,
 };
 use gpui_component::{Root, WindowExt};
 use wallet_ops::{
+    BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
     BroadcasterFeePolicy, DesktopWalletSyncStartPolicy, PoiReadSource, PublicTransactionTracker,
-    TokenAnchorRateCache, ViewWalletChainSessionRequest, WalletSessionStore,
+    TokenAnchorRateCache, ViewWalletChainSessionRequest, WalletSession, WalletSessionStore,
     settings::{
         EffectiveTokenRegistry, WalletSettings, WalletUiState, build_effective_chain_configs,
     },
-    vault::{DesktopVaultStore, ExecutorStore, KdfParams, WalletSource},
+    vault::{
+        DesktopVaultStore, DesktopViewSession, ExecutorOperationId, ExecutorStore, KdfParams,
+        PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
+        WalletSource,
+    },
 };
 use zeroize::Zeroizing;
 
@@ -20,6 +25,7 @@ use crate::root::{
     ChainUtxoState, SpendAuthorizationLifetime, VaultState, WalletAppOptions,
     WalletMaintenanceController, WalletRoot, WalletTab,
     spend_authorization::SpendAuthorizationIntent, startup::render_wallet_overlay_layers,
+    stealth_accounts::StealthAccountsView, utxo::BlockedShieldRescueRowState,
 };
 
 const PASSWORD: &str = "public registration test password";
@@ -38,8 +44,30 @@ impl Render for WalletTestWindow {
     }
 }
 
-#[gpui::test]
-fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext) {
+/// What the tests here work on: a view-unlocked wallet on chain 1 with two stealth accounts,
+/// in a window that draws the real overlay layers, with Stealth accounts open on its Public
+/// tab.
+struct StealthAccountsFixture {
+    path: std::path::PathBuf,
+    vault: Arc<DesktopVaultStore>,
+    view_session: Arc<DesktopViewSession>,
+    sessions: WalletSessionStore,
+    session: Arc<WalletSession>,
+    records: ExecutorStore,
+    operations: [ExecutorOperationId; 2],
+    recipient: alloy::primitives::Address,
+    delegate: alloy::primitives::Address,
+    host: Entity<Root>,
+    root: Entity<WalletRoot>,
+    panel: Entity<StealthAccountsView>,
+}
+
+/// Build the fixture's wallet and open its window. `runtime` is the test's Tokio runtime,
+/// which the test has entered and shuts down after [`StealthAccountsFixture::close`].
+fn stealth_accounts_fixture<'a>(
+    runtime: &tokio::runtime::Runtime,
+    cx: &'a mut TestAppContext,
+) -> (StealthAccountsFixture, &'a mut VisualTestContext) {
     // Password verification wakes GPUI from Tokio's blocking pool.
     cx.executor().allow_parking();
     let path = std::env::temp_dir().join(format!(
@@ -48,11 +76,6 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             .unwrap()
             .opaque_id()
     ));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let entered = runtime.enter();
     let vault = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
     vault
         .create_vault_with_params(PASSWORD, KdfParams::new(1024, 1, 1))
@@ -244,6 +267,67 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
     let panel = root.read_with(cx, |root, _| {
         root.stealth_accounts.as_ref().unwrap().view.clone()
     });
+    (
+        StealthAccountsFixture {
+            path,
+            vault,
+            view_session,
+            sessions,
+            session,
+            records,
+            operations,
+            recipient,
+            delegate,
+            host,
+            root,
+            panel,
+        },
+        cx,
+    )
+}
+
+impl StealthAccountsFixture {
+    /// Close the window and stop the wallet session. Returns the vault directory, which the
+    /// test removes once it has shut `runtime` down.
+    fn close(
+        self,
+        runtime: &tokio::runtime::Runtime,
+        cx: &mut VisualTestContext,
+    ) -> std::path::PathBuf {
+        cx.update(|window, cx| {
+            self.root.update(cx, WalletRoot::clear_stealth_accounts);
+            window.remove_window();
+        });
+        runtime.block_on(async {
+            self.session.stop().await.unwrap();
+            self.sessions.shutdown().await;
+        });
+        drop((
+            self.host,
+            self.root,
+            self.panel,
+            self.records,
+            self.session,
+            self.sessions,
+            self.view_session,
+            self.vault,
+        ));
+        cx.run_until_parked();
+        self.path
+    }
+}
+
+#[gpui::test]
+fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let (fixture, cx) = stealth_accounts_fixture(&runtime, cx);
+    let (root, panel, records) = (&fixture.root, &fixture.panel, &fixture.records);
+    let (operations, recipient, delegate) =
+        (fixture.operations, fixture.recipient, fixture.delegate);
     cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
     cx.update(|window, cx| {
         panel.update(cx, |panel, cx| {
@@ -1283,25 +1367,268 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             .is_none()
     );
 
+    let path = fixture.close(&runtime, cx);
+    drop(entered);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The blocked Shield whose refund dialog the tests here open. The wallet holds no such UTXO.
+const REFUND_UTXO: BlockedShieldRescueUtxoId = BlockedShieldRescueUtxoId {
+    tree: 0,
+    position: 0,
+    commitment: alloy::primitives::B256::ZERO,
+    blinded_commitment: alloy::primitives::B256::ZERO,
+};
+
+/// The rescue info of a blocked Shield that says only whether it can be refunded.
+const fn refund_info(eligible: bool) -> BlockedShieldRescueInfo {
+    BlockedShieldRescueInfo {
+        eligible,
+        disabled_reason: None,
+        origin_address: None,
+        public_account_uuid: None,
+        public_account_label: None,
+    }
+}
+
+/// The row state of a blocked Shield whose origin lookup found `blocker`.
+const fn blocked_refund(blocker: BlockedShieldRescueBlocker) -> BlockedShieldRescueRowState {
+    BlockedShieldRescueRowState::from_lookup(refund_info(false), Some(blocker))
+}
+
+/// Give the blocked Shield the row state `state`, as its origin lookup does, and draw.
+fn set_refund_row_state(
+    root: &Entity<WalletRoot>,
+    state: BlockedShieldRescueRowState,
+    cx: &mut VisualTestContext,
+) {
     cx.update(|window, cx| {
-        root.update(cx, WalletRoot::clear_stealth_accounts);
-        window.remove_window();
+        root.update(cx, |root, cx| {
+            root.blocked_shield_rescue_rows.insert(REFUND_UTXO, state);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
     });
-    runtime.block_on(async {
-        session.stop().await.unwrap();
-        sessions.shutdown().await;
+}
+
+/// Open the refund dialog of the blocked Shield in the row state `state`, and draw it.
+fn open_refund_dialog(
+    root: &Entity<WalletRoot>,
+    state: BlockedShieldRescueRowState,
+    cx: &mut VisualTestContext,
+) {
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.blocked_shield_rescue_rows.insert(REFUND_UTXO, state);
+            WalletRoot::open_blocked_shield_refund_dialog(REFUND_UTXO, window, cx);
+        });
+        window.draw(cx).clear(cx);
     });
-    drop((
-        host,
-        root,
-        panel,
-        records,
-        session,
-        sessions,
-        view_session,
-        vault,
-    ));
+}
+
+/// Click the action of an unavailable refund in the refund dialog, where it was last drawn.
+fn click_refund_action(cx: &mut VisualTestContext) {
+    let action = cx
+        .debug_bounds("wallet-blocked-shield-refund-unavailable-action")
+        .expect("the dialog offers its action");
+    cx.simulate_click(action.center(), gpui::Modifiers::none());
     cx.run_until_parked();
+}
+
+/// Open Public must end on the account list with the inactive origin in sight, whatever the
+/// Public tab and the dialog stack held when it was clicked.
+#[gpui::test]
+fn refund_open_public_shows_the_inactive_origin(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let (fixture, cx) = stealth_accounts_fixture(&runtime, cx);
+    let (root, panel) = (&fixture.root, &fixture.panel);
+    cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+    // Stealth accounts covers a Public list whose search keeps only the active account.
+    let account = |label: &str, status, order: u8| PublicAccountMetadata {
+        public_account_uuid: label.into(),
+        address: alloy::primitives::Address::repeat_byte(order),
+        label: Some(label.into()),
+        source: PublicAccountSource::Derived,
+        scope: PublicAccountScope::PrivateWallet {
+            wallet_uuid: WALLET_ID.into(),
+        },
+        derivation_index: Some(order.into()),
+        hardware_descriptor: None,
+        status,
+        display_order: order.into(),
+    };
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.public_accounts = vec![
+                account("spending", PublicAccountStatus::Active, 1),
+                account("savings", PublicAccountStatus::Inactive, 2),
+            ];
+            root.public_form
+                .search_input
+                .update(cx, |input, cx| input.replace_all("spending", window, cx));
+        });
+    });
+    assert!(
+        root.read_with(cx, |root, _| root.public_list_accounts().1.is_empty()),
+        "the search must hide the inactive account"
+    );
+    // Refund is also offered inside this dialog, so the refund dialog stacks on it.
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.open_private_pending_status_dialog(window, cx);
+        });
+    });
+    open_refund_dialog(
+        root,
+        blocked_refund(BlockedShieldRescueBlocker::OriginInactive {
+            public_account_uuid: "savings".into(),
+            label: Some("savings".into()),
+        }),
+        cx,
+    );
+
+    click_refund_action(cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        !cx.update(WindowExt::has_active_dialog),
+        "the action must not leave a dialog over the account list"
+    );
+    root.read_with(cx, |root, _| {
+        assert!(root.stealth_accounts_body().is_none());
+        assert!(
+            root.stealth_accounts
+                .as_ref()
+                .is_some_and(|kept| kept.view == *panel),
+            "leaving Stealth accounts must keep its view"
+        );
+    });
+    assert!(
+        cx.debug_bounds("public-row-savings").is_some(),
+        "the Inactive section must be open and list the origin"
+    );
+
+    let path = fixture.close(&runtime, cx);
+    drop(entered);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The refund dialog must follow the origin lookup of its Shield: it opens on the check, and
+/// shows each result the lookup stores without another dialog opening.
+#[gpui::test]
+fn refund_dialog_follows_the_origin_lookup(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let (fixture, cx) = stealth_accounts_fixture(&runtime, cx);
+    let root = &fixture.root;
+    cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+
+    open_refund_dialog(root, BlockedShieldRescueRowState::resolving(1), cx);
+    assert!(
+        cx.debug_bounds("wallet-blocked-shield-refund-unavailable-action")
+            .is_none(),
+        "the origin check must not offer the action of an unavailable refund"
+    );
+    assert!(
+        cx.debug_bounds("wallet-blocked-shield-refund-continue")
+            .is_none(),
+        "the origin check must not offer the refund"
+    );
+
+    // The lookup finds an origin that can't refund yet.
+    set_refund_row_state(
+        root,
+        blocked_refund(BlockedShieldRescueBlocker::OriginInactive {
+            public_account_uuid: "savings".into(),
+            label: Some("savings".into()),
+        }),
+        cx,
+    );
+    assert!(
+        cx.debug_bounds("wallet-blocked-shield-refund-unavailable-action")
+            .is_some(),
+        "the open dialog must offer the action that leads to the fix"
+    );
+
+    // Another lookup finds the origin able to refund.
+    set_refund_row_state(
+        root,
+        BlockedShieldRescueRowState::from_info(refund_info(true)),
+        cx,
+    );
+    assert!(
+        cx.debug_bounds("wallet-blocked-shield-refund-continue")
+            .is_some(),
+        "the open dialog must offer the refund"
+    );
+    assert!(
+        cx.debug_bounds("wallet-blocked-shield-refund-unavailable-action")
+            .is_none(),
+        "an available refund has no fix to lead to"
+    );
+
+    let path = fixture.close(&runtime, cx);
+    drop(entered);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// Show stealth account must keep the dialog while Stealth accounts is busy, and lead to the
+/// account once it is idle.
+#[gpui::test]
+fn refund_show_stealth_account_waits_for_stealth_accounts(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let (fixture, cx) = stealth_accounts_fixture(&runtime, cx);
+    let (root, panel) = (&fixture.root, &fixture.panel);
+    let operation = fixture.operations[1];
+    cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+    // The account list is showing, and Stealth accounts has a job running.
+    root.update(cx, WalletRoot::close_stealth_accounts);
+    panel.update(cx, |panel, cx| {
+        panel.job = Some(runtime.spawn(std::future::pending::<()>()).abort_handle());
+        cx.notify();
+    });
+    open_refund_dialog(
+        root,
+        blocked_refund(BlockedShieldRescueBlocker::OriginStealth {
+            operation,
+            index: 1,
+        }),
+        cx,
+    );
+
+    click_refund_action(cx);
+    assert!(
+        cx.update(WindowExt::has_active_dialog),
+        "the dialog must stay while its action can't be followed"
+    );
+    assert!(root.read_with(cx, |root, _| root.stealth_accounts_body().is_none()));
+    assert!(panel.read_with(cx, |panel, _| panel.expanded.is_none()));
+
+    // The job ends, and the next draw enables the action.
+    panel.update(cx, StealthAccountsView::stop_work);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    click_refund_action(cx);
+    assert!(!cx.update(WindowExt::has_active_dialog));
+    assert!(root.read_with(cx, |root, _| root.stealth_accounts_body().is_some()));
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.expanded),
+        Some(operation)
+    );
+
+    let path = fixture.close(&runtime, cx);
     drop(entered);
     runtime.shutdown_timeout(Duration::from_secs(1));
     std::fs::remove_dir_all(path).unwrap();

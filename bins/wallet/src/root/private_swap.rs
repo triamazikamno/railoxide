@@ -41,11 +41,18 @@ mod progress;
 mod public_progress;
 #[cfg(debug_assertions)]
 mod ui_fixture;
+pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::stealth_accounts as ui_fixture_stealth_accounts;
 /// The debug UI fixture's queries in a release build, which has no fixture.
 #[cfg(not(debug_assertions))]
 mod ui_fixture {
     pub(in crate::root) const fn stealth_accounts() -> Option<Vec<super::ExecutorRecord>> {
+        None
+    }
+
+    pub(in crate::root) const fn refund_dialog_state(
+        _utxo_id: wallet_ops::BlockedShieldRescueUtxoId,
+    ) -> Option<crate::root::utxo::BlockedShieldRefundDialogState> {
         None
     }
 

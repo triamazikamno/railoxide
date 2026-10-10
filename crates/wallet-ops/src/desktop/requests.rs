@@ -649,10 +649,29 @@ pub struct BlockedShieldRescueUtxoId {
     pub blinded_commitment: FixedBytes<32>,
 }
 
+/// Why the origin account of a blocked Shield can't refund it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedShieldRescueBlocker {
+    /// The origin is neither a Public account nor a recorded stealth account of this wallet.
+    OriginUnknown,
+    /// The origin is a recorded stealth account that is not an active Public account.
+    OriginStealth {
+        operation: vault::ExecutorOperationId,
+        index: u32,
+    },
+    /// The origin is a Public account that is inactive.
+    OriginInactive {
+        public_account_uuid: String,
+        label: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedShieldRescueEligibility {
     pub eligible: bool,
     pub disabled_reason: Option<String>,
+    /// `None` when eligible, and when the reason is not the origin account.
+    pub blocker: Option<BlockedShieldRescueBlocker>,
     pub origin_address: Option<Address>,
     pub public_account_uuid: Option<String>,
     pub public_account_label: Option<String>,

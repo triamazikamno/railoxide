@@ -994,28 +994,29 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
         Err(error) => {
             tracing::warn!(error = %format_args!("{error:#}"), "resolve blocked Shield source origin failed");
             return Ok(blocked_shield_rescue_disabled(
-                "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
+                "Couldn't read the Shield transaction. Check the connection and try again.",
                 None,
             ));
         }
     };
 
+    // Inactive accounts are listed too, so an inactive origin is named as such.
     let accounts = request
         .vault_store
-        .list_active_public_accounts_for_session(&request.view_session)
-        .wrap_err("load active public accounts")?;
+        .list_public_accounts_for_session(&request.view_session, true)
+        .wrap_err("load public accounts")?;
     let eligibility = blocked_shield_rescue_eligibility_for_origin(Some(origin), &accounts);
     if eligibility.eligible {
         return Ok(eligibility);
     }
-    let stealth_accounts: Vec<Address> = match request
+    let stealth_accounts: Vec<(Address, vault::ExecutorOperationId, u32)> = match request
         .session
         .executor_owner()
         .map(|owner| owner.records())
     {
         Some(Ok(records)) => records
             .iter()
-            .filter_map(vault::ExecutorRecord::address)
+            .filter_map(|record| Some((record.address()?, record.operation(), record.index())))
             .collect(),
         Some(Err(_)) => {
             tracing::warn!("read stealth accounts for blocked Shield origin failed");
@@ -1141,53 +1142,96 @@ pub(super) fn blocked_shield_rescue_utxo_matches(
         && utxo.poi.blinded_commitment == utxo_id.blinded_commitment
 }
 
+/// Eligibility against the wallet's Public accounts, active and inactive. An active account
+/// at `origin` is eligible, an inactive one is named as the blocker, and any other origin
+/// is unknown here.
 pub(crate) fn blocked_shield_rescue_eligibility_for_origin(
     origin: Option<Address>,
-    active_public_accounts: &[vault::PublicAccountMetadata],
+    public_accounts: &[vault::PublicAccountMetadata],
 ) -> BlockedShieldRescueEligibility {
     let Some(origin) = origin else {
         return blocked_shield_rescue_disabled(
-            "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
+            "Couldn't read the Shield transaction. Check the connection and try again.",
             None,
         );
     };
-    let Some(account) = active_public_accounts.iter().find(|account| {
-        account.address == origin && account.status == vault::PublicAccountStatus::Active
-    }) else {
-        return blocked_shield_rescue_disabled(
-            "The Shield origin Public account must be added or activated before refund.",
-            Some(origin),
+    let account_with = |status: vault::PublicAccountStatus| {
+        public_accounts
+            .iter()
+            .find(|account| account.address == origin && account.status == status)
+    };
+    let Some(account) = account_with(vault::PublicAccountStatus::Active) else {
+        let blocker = account_with(vault::PublicAccountStatus::Inactive).map_or(
+            BlockedShieldRescueBlocker::OriginUnknown,
+            |account| BlockedShieldRescueBlocker::OriginInactive {
+                public_account_uuid: account.public_account_uuid.clone(),
+                label: account.label.clone(),
+            },
         );
+        return blocked_shield_rescue_blocked(blocker, origin);
     };
 
     BlockedShieldRescueEligibility {
         eligible: true,
         disabled_reason: None,
+        blocker: None,
         origin_address: Some(origin),
         public_account_uuid: Some(account.public_account_uuid.clone()),
         public_account_label: account.label.clone(),
     }
 }
 
-/// Eligibility for a resolved origin. An unmatched origin that is one of the wallet's
-/// stealth accounts gets a reason that points to Add to Public.
+/// Eligibility for a resolved origin. An origin that is not a Public account but is one of
+/// the wallet's recorded stealth accounts, each given as its address, operation and index,
+/// is blocked as that stealth account. An inactive Public account at the same address
+/// stays the blocker.
 pub(crate) fn blocked_shield_rescue_eligibility_for_resolved_origin(
     origin: Address,
-    active_public_accounts: &[vault::PublicAccountMetadata],
-    stealth_accounts: &[Address],
+    public_accounts: &[vault::PublicAccountMetadata],
+    stealth_accounts: &[(Address, vault::ExecutorOperationId, u32)],
 ) -> BlockedShieldRescueEligibility {
-    let eligibility =
-        blocked_shield_rescue_eligibility_for_origin(Some(origin), active_public_accounts);
-    if eligibility.eligible || !stealth_accounts.contains(&origin) {
+    let eligibility = blocked_shield_rescue_eligibility_for_origin(Some(origin), public_accounts);
+    if eligibility.blocker != Some(BlockedShieldRescueBlocker::OriginUnknown) {
         return eligibility;
     }
-    blocked_shield_rescue_disabled(
-        &format!(
-            "The Shield came from stealth account {}. Add it to Public from Stealth accounts and send it native currency for gas, then refund.",
-            origin.to_checksum(None)
-        ),
-        Some(origin),
+    let Some(&(_, operation, index)) = stealth_accounts
+        .iter()
+        .find(|(address, ..)| *address == origin)
+    else {
+        return eligibility;
+    };
+    blocked_shield_rescue_blocked(
+        BlockedShieldRescueBlocker::OriginStealth { operation, index },
+        origin,
     )
+}
+
+/// A refund that `blocker` holds back for the account at `origin`, with the sentence that
+/// says so.
+fn blocked_shield_rescue_blocked(
+    blocker: BlockedShieldRescueBlocker,
+    origin: Address,
+) -> BlockedShieldRescueEligibility {
+    let reason = match &blocker {
+        BlockedShieldRescueBlocker::OriginUnknown => {
+            "The Shield came from an account that isn't in this wallet.".to_owned()
+        }
+        BlockedShieldRescueBlocker::OriginStealth { index, .. } => {
+            format!("The Shield came from stealth account #{index}, which isn't in Public.")
+        }
+        BlockedShieldRescueBlocker::OriginInactive {
+            label: Some(label), ..
+        } => {
+            format!("The Shield came from Public account \"{label}\", which is inactive.")
+        }
+        BlockedShieldRescueBlocker::OriginInactive { label: None, .. } => {
+            "The Shield came from a Public account that is inactive.".to_owned()
+        }
+    };
+    BlockedShieldRescueEligibility {
+        blocker: Some(blocker),
+        ..blocked_shield_rescue_disabled(&reason, Some(origin))
+    }
 }
 
 pub(super) fn blocked_shield_rescue_disabled(
@@ -1197,6 +1241,7 @@ pub(super) fn blocked_shield_rescue_disabled(
     BlockedShieldRescueEligibility {
         eligible: false,
         disabled_reason: Some(reason.to_string()),
+        blocker: None,
         origin_address,
         public_account_uuid: None,
         public_account_label: None,

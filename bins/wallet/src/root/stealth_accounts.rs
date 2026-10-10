@@ -361,7 +361,18 @@ impl WalletRoot {
         }
     }
 
-    fn open_stealth_accounts(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn open_stealth_accounts(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // Debug UI fixture: a `refund:` mode opens its dialog in place of the first opening.
+        #[cfg(debug_assertions)]
+        {
+            if Self::open_ui_fixture_refund_dialog(window, cx) {
+                return;
+            }
+        }
         self.ensure_stealth_accounts(window, cx);
         if let Some(panel) = &mut self.stealth_accounts {
             panel.open = true;
@@ -391,10 +402,20 @@ impl WalletRoot {
         }
         cx.notify();
     }
+
+    /// Show the Public account list in place of Stealth accounts, as the breadcrumb does.
+    /// The view is kept, so opening it again restores what it showed.
+    pub(super) fn close_stealth_accounts(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(panel) = &mut self.stealth_accounts {
+            panel.open = false;
+        }
+        self.focus_public_account_search_on_render = true;
+        cx.notify();
+    }
 }
 
 /// The wallet's stealth account records, or the debug UI fixture's own in its `accounts`
-/// mode, which no release build has.
+/// and `refund:stealth` modes, which no release build has.
 fn load_records(owner: &ExecutorOwner) -> eyre::Result<Vec<ExecutorRecord>> {
     super::private_swap::ui_fixture_stealth_accounts().map_or_else(|| owner.records(), Ok)
 }

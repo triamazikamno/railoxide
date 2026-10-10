@@ -1,7 +1,7 @@
-//! A debug-only fixture for looking at the Public account swap screens and at the Stealth
-//! accounts inspector: it opens them on a scratch wallet without private funds and holds a
-//! chosen state on screen. It is compiled only with `debug_assertions`, and does nothing
-//! unless `RAILOXIDE_UI_FIXTURE` is set.
+//! A debug-only fixture for looking at the Public account swap screens, at the Stealth
+//! accounts inspector and at the refund dialog of a blocked Shield: it opens them on a
+//! scratch wallet without private funds and holds a chosen state on screen. It is compiled
+//! only with `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
@@ -39,18 +39,27 @@
 //!   a consumed nonce that names neither of two recoveries, and an unconfirmed recovery.
 //!   Account #8 holds one executed operation. The wallet holds neither account, so Check
 //!   balances and the other actions fail.
+//! - `refund:<case>` opens the refund dialog of a synthesized blocked Shield in place of
+//!   Stealth accounts, the first time they are opened. Later openings show Stealth accounts,
+//!   so the dialog's own actions lead there. `checking` holds the dialog on its origin
+//!   check. `available` is a refund that goes back to a Public account labelled Savings, and
+//!   its Refund… only closes the dialog. The other cases can't be refunded: the origin of
+//!   `unknown` is an account the wallet doesn't hold, that of `stealth` is account #7 of the
+//!   `accounts` mode, whose two accounts Stealth accounts then shows, and that of `inactive`
+//!   is an inactive Public account labelled Savings. `unresolved` is a Shield transaction
+//!   that couldn't be read, which has no origin.
 //!
 //! In every mode the jobs of a swap paid from a Public account are scripted: nothing is
 //! claimed, signed, paid or sent, and no record is written. The synthesized records live in
 //! memory only.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use gpui::{App, Context, Window};
-use wallet_ops::SwapReviewChange;
 use wallet_ops::vault::{
     BridgeShieldFailure, ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId,
     ExecutorPayloadContext, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
@@ -59,14 +68,27 @@ use wallet_ops::vault::{
     SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapProof,
     SwapRecipient, SwapTerms, SwapUseId,
 };
+use wallet_ops::{
+    BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
+    SwapReviewChange,
+};
 
 use super::dialog::SwapDialogView;
 use super::model::SwapIdentity;
 use super::{PrivateSwapsView, now_unix};
+use crate::root::WalletRoot;
+use crate::root::utxo::BlockedShieldRefundDialogState;
 
 const VARIABLE: &str = "RAILOXIDE_UI_FIXTURE";
 /// How long a scripted job takes before it answers.
 const BEAT: Duration = Duration::from_secs(2);
+/// The blocked Shield a `refund:` mode opens its dialog for. No wallet holds it.
+const REFUND_UTXO: BlockedShieldRescueUtxoId = BlockedShieldRescueUtxoId {
+    tree: u32::MAX,
+    position: u64::MAX,
+    commitment: B256::ZERO,
+    blinded_commitment: B256::ZERO,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -76,6 +98,7 @@ enum Mode {
     Flow(Flow),
     Detail(Detail),
     Accounts,
+    Refund(Refund),
 }
 
 /// Where the Buy picker holds a network's setup-fee check.
@@ -83,6 +106,18 @@ enum Mode {
 enum Fee {
     Checking,
     Failed,
+}
+
+/// What the refund dialog of a `refund:` mode shows: the origin check, an available refund,
+/// or why the blocked Shield can't be refunded.
+#[derive(Clone, Copy, Debug)]
+enum Refund {
+    Checking,
+    Available,
+    Unknown,
+    Stealth,
+    Inactive,
+    Unresolved,
 }
 
 /// Where a reviewed swap is held.
@@ -130,6 +165,17 @@ fn parse(value: &str) -> Option<Mode> {
         return Some(Mode::Fee(match state {
             "checking" => Fee::Checking,
             "failed" => Fee::Failed,
+            _ => return None,
+        }));
+    }
+    if let Some(case) = value.strip_prefix("refund:") {
+        return Some(Mode::Refund(match case {
+            "checking" => Refund::Checking,
+            "available" => Refund::Available,
+            "unknown" => Refund::Unknown,
+            "stealth" => Refund::Stealth,
+            "inactive" => Refund::Inactive,
+            "unresolved" => Refund::Unresolved,
             _ => return None,
         }));
     }
@@ -259,7 +305,12 @@ pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
     use Flow::{Changed, Error, Finishing, Placing, SetupWaiting, Signatures};
     Some(match (mode()?, phase) {
         (
-            Mode::Form | Mode::RouteError | Mode::Fee(_) | Mode::Detail(_) | Mode::Accounts,
+            Mode::Form
+            | Mode::RouteError
+            | Mode::Fee(_)
+            | Mode::Detail(_)
+            | Mode::Accounts
+            | Mode::Refund(_),
             Phase::Approved,
         ) => (
             Duration::ZERO,
@@ -588,11 +639,11 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     .ok()
 }
 
-/// The stealth accounts an `accounts` mode shows in place of the wallet's own, synthesized
-/// once. `None` in every other mode.
+/// The stealth accounts an `accounts` or `refund:stealth` mode shows in place of the
+/// wallet's own, synthesized once. `None` in every other mode.
 pub(in crate::root) fn stealth_accounts() -> Option<Vec<ExecutorRecord>> {
     static ACCOUNTS: OnceLock<Vec<ExecutorRecord>> = OnceLock::new();
-    matches!(mode(), Some(Mode::Accounts)).then(|| {
+    matches!(mode(), Some(Mode::Accounts | Mode::Refund(Refund::Stealth))).then(|| {
         ACCOUNTS
             .get_or_init(|| {
                 let accounts = staged_accounts();
@@ -721,4 +772,93 @@ fn staged_accounts() -> Vec<ExecutorRecord> {
         .flatten()
         .filter_map(|account| serde_json::from_value(account).ok())
         .collect()
+}
+
+/// What the refund dialog shows for the blocked Shield of a `refund:` mode. `None` for any
+/// other Shield, in every other mode, and in `refund:stealth` without its staged accounts.
+pub(in crate::root) fn refund_dialog_state(
+    utxo_id: BlockedShieldRescueUtxoId,
+) -> Option<BlockedShieldRefundDialogState> {
+    let Mode::Refund(refund) = mode()? else {
+        return None;
+    };
+    if utxo_id != REFUND_UTXO {
+        return None;
+    }
+    let unheld = Some(Address::repeat_byte(0x4e));
+    // Each reason repeats the sentence wallet-ops gives that case.
+    let (reason, blocker, origin) = match refund {
+        Refund::Checking => return Some(BlockedShieldRefundDialogState::Checking),
+        Refund::Available => {
+            return Some(BlockedShieldRefundDialogState::Available(
+                BlockedShieldRescueInfo {
+                    eligible: true,
+                    disabled_reason: None,
+                    origin_address: unheld.map(|origin| origin.to_checksum(None)),
+                    public_account_uuid: Some("ui-fixture".to_owned()),
+                    public_account_label: Some("Savings".to_owned()),
+                },
+            ));
+        }
+        Refund::Unknown => (
+            "The Shield came from an account that isn't in this wallet.".to_owned(),
+            Some(BlockedShieldRescueBlocker::OriginUnknown),
+            unheld,
+        ),
+        Refund::Stealth => {
+            // The first account Stealth accounts shows, so the dialog's action finds its row.
+            let accounts = stealth_accounts().unwrap_or_default();
+            let account = accounts.first()?;
+            let index = account.index();
+            (
+                format!("The Shield came from stealth account #{index}, which isn't in Public."),
+                Some(BlockedShieldRescueBlocker::OriginStealth {
+                    operation: account.operation(),
+                    index,
+                }),
+                account.address(),
+            )
+        }
+        Refund::Inactive => (
+            "The Shield came from Public account \"Savings\", which is inactive.".to_owned(),
+            Some(BlockedShieldRescueBlocker::OriginInactive {
+                public_account_uuid: "ui-fixture".to_owned(),
+                label: Some("Savings".to_owned()),
+            }),
+            unheld,
+        ),
+        Refund::Unresolved => (
+            "Couldn't read the Shield transaction. Check the connection and try again.".to_owned(),
+            None,
+            None,
+        ),
+    };
+    Some(BlockedShieldRefundDialogState::Unavailable {
+        info: BlockedShieldRescueInfo {
+            eligible: false,
+            disabled_reason: Some(reason),
+            origin_address: origin.map(|origin| origin.to_checksum(None)),
+            public_account_uuid: None,
+            public_account_label: None,
+        },
+        blocker,
+    })
+}
+
+impl WalletRoot {
+    /// In a `refund:` mode, open the refund dialog of its blocked Shield in place of Stealth
+    /// accounts, the first time they are opened. `true` when the dialog opened.
+    pub(in crate::root) fn open_ui_fixture_refund_dialog(
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        static OPENED: AtomicBool = AtomicBool::new(false);
+        // Without a state there is no dialog to open: another mode, or `refund:stealth`
+        // without its staged accounts.
+        if refund_dialog_state(REFUND_UTXO).is_none() || OPENED.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        Self::open_blocked_shield_refund_dialog(REFUND_UTXO, window, cx);
+        true
+    }
 }

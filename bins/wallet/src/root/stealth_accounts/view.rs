@@ -622,13 +622,7 @@ impl StealthAccountsView {
     }
 
     fn return_to_public(&self, cx: &mut App) {
-        let _ = self.root.update(cx, |root, cx| {
-            if let Some(panel) = &mut root.stealth_accounts {
-                panel.open = false;
-            }
-            root.focus_public_account_search_on_render = true;
-            cx.notify();
-        });
+        let _ = self.root.update(cx, WalletRoot::close_stealth_accounts);
     }
 
     fn account_menu(

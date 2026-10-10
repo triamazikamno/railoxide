@@ -1,4 +1,5 @@
 use super::helpers::*;
+use crate::BlockedShieldRescueBlocker;
 use crate::desktop::executors::Transfer;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent as _;
@@ -106,24 +107,46 @@ fn shield_funding_account_is_unresolved_for_two_funders_of_equal_value() {
 #[test]
 fn blocked_shield_rescue_eligibility_names_a_stealth_origin_outside_public() {
     let origin = address(0xaa);
+    let operation = crate::vault::ExecutorOperationId::random().expect("operation id");
+    let stealth_accounts = [(origin, operation, 7)];
 
-    let eligibility =
-        crate::blocked_shield_rescue_eligibility_for_resolved_origin(origin, &[], &[origin]);
+    let eligibility = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
+        &[],
+        &stealth_accounts,
+    );
 
     assert!(!eligibility.eligible);
     assert_eq!(eligibility.origin_address, Some(origin));
     assert_eq!(
-        eligibility.disabled_reason,
-        Some(format!(
-            "The Shield came from stealth account {}. Add it to Public from Stealth accounts and send it native currency for gas, then refund.",
-            origin.to_checksum(None)
-        ))
+        eligibility.blocker,
+        Some(BlockedShieldRescueBlocker::OriginStealth {
+            operation,
+            index: 7
+        })
     );
+
+    // An inactive Public account at the same address is the blocker, not the stealth record.
+    let inactive = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
+        origin,
+        &[public_account(
+            "pub-1",
+            origin,
+            crate::vault::PublicAccountStatus::Inactive,
+        )],
+        &stealth_accounts,
+    );
+
+    assert!(matches!(
+        inactive.blocker,
+        Some(BlockedShieldRescueBlocker::OriginInactive { .. })
+    ));
 }
 
 #[test]
 fn blocked_shield_rescue_eligibility_accepts_a_stealth_origin_added_to_public() {
     let origin = address(0xaa);
+    let operation = crate::vault::ExecutorOperationId::random().expect("operation id");
 
     let eligibility = crate::blocked_shield_rescue_eligibility_for_resolved_origin(
         origin,
@@ -132,7 +155,7 @@ fn blocked_shield_rescue_eligibility_accepts_a_stealth_origin_added_to_public() 
             origin,
             crate::vault::PublicAccountStatus::Active,
         )],
-        &[origin],
+        &[(origin, operation, 7)],
     );
 
     assert!(eligibility.eligible);
@@ -169,24 +192,28 @@ fn blocked_shield_rescue_eligibility_accepts_matched_origin_account() {
 #[test]
 fn blocked_shield_rescue_eligibility_requires_origin_account() {
     let origin = address(0xaa);
+    let account = public_account("pub-1", origin, crate::vault::PublicAccountStatus::Inactive);
 
     let missing = crate::blocked_shield_rescue_eligibility_for_origin(Some(origin), &[]);
     let inactive = crate::blocked_shield_rescue_eligibility_for_origin(
         Some(origin),
-        &[public_account(
-            "pub-1",
-            origin,
-            crate::vault::PublicAccountStatus::Inactive,
-        )],
+        std::slice::from_ref(&account),
     );
 
     assert!(!missing.eligible);
     assert_eq!(missing.origin_address, Some(origin));
     assert_eq!(
-        missing.disabled_reason.as_deref(),
-        Some("The Shield origin Public account must be added or activated before refund.")
+        missing.blocker,
+        Some(BlockedShieldRescueBlocker::OriginUnknown)
     );
     assert!(!inactive.eligible);
+    assert_eq!(
+        inactive.blocker,
+        Some(BlockedShieldRescueBlocker::OriginInactive {
+            public_account_uuid: account.public_account_uuid,
+            label: account.label,
+        })
+    );
 }
 
 #[test]
@@ -195,12 +222,7 @@ fn blocked_shield_rescue_eligibility_reports_unresolved_origin() {
 
     assert!(!eligibility.eligible);
     assert_eq!(eligibility.origin_address, None);
-    assert_eq!(
-        eligibility.disabled_reason.as_deref(),
-        Some(
-            "Source transaction origin could not be resolved. Retry after checking RPC connectivity."
-        )
-    );
+    assert!(eligibility.blocker.is_none());
 }
 
 #[test]
