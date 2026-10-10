@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -229,7 +229,7 @@ pub use public_wallet::{
     PublicBalanceScope, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
     PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent,
     PublicTransactionLookup, PublicTransactionTracker, PublicTransactionTrackingContext,
-    WalletConnectHardwareTypedDataCapabilityRequest,
+    ShieldSendOutput, TxReceiptOutput, WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectReviewedFee, WalletConnectReviewedTransaction,
@@ -276,11 +276,14 @@ pub use staking::{
     reward_staking_interval, snapshot_hint, validate_deployment, validate_deployment_relationships,
     validate_governance_deployment,
 };
-use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,
     UtxoPpoiState, max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
     max_unshield_amount_from_outputs,
+};
+use utxos::{
+    apply_pending_overlay_to_outputs, chain_pending_spent_keys,
+    poi_verified_unspent_utxos_from_records,
 };
 pub use walletconnect::{
     WALLETCONNECT_DEFAULT_PROJECT_ID, WALLETCONNECT_EIP155_NAMESPACE,

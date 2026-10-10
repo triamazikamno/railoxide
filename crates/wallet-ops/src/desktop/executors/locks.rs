@@ -215,7 +215,7 @@ impl WalletSession {
             .current_snapshot()
             .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
         let overlay = &snapshot.pending_overlay;
-        let chain_pending = super::super::public_broadcaster::chain_pending_spent_keys(overlay);
+        let chain_pending = crate::utxos::chain_pending_spent_keys(overlay);
         let poi_lists = poi::poi::default_active_poi_list_keys();
         let mut local_pending = Vec::new();
         let mut chain_pending_notes = Vec::new();
