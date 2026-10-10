@@ -407,7 +407,7 @@ impl WalletRoot {
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         self.walletconnect.clear_runtime();
-        self.sync_walletconnect_attention();
+        self.sync_platform_attention();
         self.public_form.adding_account = false;
         self.public_form.hardware_derivation_status = HardwarePublicAccountDerivationStatus::Idle;
         self.public_form.hardware_confirmation_address = None;

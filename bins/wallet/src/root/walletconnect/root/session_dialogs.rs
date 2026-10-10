@@ -397,7 +397,7 @@ impl WalletRoot {
             self.walletconnect.session_expiry_deadline = None;
             self.walletconnect.relay_reconnecting = false;
             self.stop_walletconnect_relay_workers_except(&BTreeSet::new());
-            self.sync_walletconnect_attention();
+            self.sync_platform_attention();
             return;
         };
         match store.list_walletconnect_sessions(view_session.as_ref()) {
@@ -456,7 +456,7 @@ impl WalletRoot {
                 )));
             }
         }
-        self.sync_walletconnect_attention();
+        self.sync_platform_attention();
         cx.notify();
     }
 

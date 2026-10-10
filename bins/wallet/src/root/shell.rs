@@ -364,7 +364,7 @@ impl Render for WalletRoot {
             );
         }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
-        self.sync_walletconnect_attention_for_window(window);
+        self.sync_platform_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
         self.ensure_stealth_accounts(window, cx);
         self.ensure_private_swaps(window, cx);

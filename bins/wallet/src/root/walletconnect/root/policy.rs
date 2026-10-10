@@ -279,7 +279,7 @@ impl WalletRoot {
                 {
                     root.select_chain(chain_id, window, cx);
                 }
-                root.sync_walletconnect_attention();
+                root.sync_platform_attention();
                 cx.notify();
             });
         })

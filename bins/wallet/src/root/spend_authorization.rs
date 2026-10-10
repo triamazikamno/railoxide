@@ -3436,6 +3436,18 @@ impl WalletRoot {
         self.open_spend_authorization_dialog(intent, summary, window, cx);
     }
 
+    /// Counts a spend authorization dialog toward platform attention for as long as the
+    /// returned lease lives. The dialog builder holds it, so any way of closing releases it.
+    fn spend_authorization_attention_lease(window: &Window, cx: &mut Context<'_, Self>) -> Rc<()> {
+        let lease = Rc::new(());
+        let open = Rc::downgrade(&lease);
+        cx.defer_in(window, move |root, window, _cx| {
+            root.spend_authorization_attention.push(open);
+            root.sync_platform_attention_for_window(window);
+        });
+        lease
+    }
+
     fn open_spend_authorization_dialog(
         &self,
         intent: SpendAuthorizationIntent,
@@ -3482,6 +3494,7 @@ impl WalletRoot {
         let device_auth = self.device_auth_prompt_cached();
         let lease = Rc::new(Cell::new(true));
         let identity = Rc::downgrade(&lease);
+        let attention = Self::spend_authorization_attention_lease(window, cx);
         let content = cx.new(|cx| {
             let mut content = SpendAuthorizationDialogContent::new(
                 root,
@@ -3504,6 +3517,7 @@ impl WalletRoot {
             let content_width = secondary_dialog_content_width(dialog_width);
             let close_content = dialog_content.clone();
             let identity = Rc::downgrade(&lease);
+            let _ = &attention;
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
@@ -3558,10 +3572,12 @@ impl WalletRoot {
             })
         });
         let handed_off = Rc::new(Cell::new(false));
+        let attention = Self::spend_authorization_attention_lease(window, cx);
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
+            let _ = &attention;
             let close_root = root.clone();
             let submit_root = root.clone();
             let close_intent = intent.clone();
@@ -3778,10 +3794,12 @@ impl WalletRoot {
                 device_label,
             )
         });
+        let attention = Self::spend_authorization_attention_lease(window, cx);
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
+            let _ = &attention;
             let close_content = content.clone();
             let close_root = root.clone();
             dialog
@@ -4756,6 +4774,11 @@ mod tests {
                     )
                 })
             });
+            assert_eq!(
+                root.read_with(cx, |root, _| root.platform_attention_count),
+                1,
+                "an open review counts toward platform attention"
+            );
             cx.update(|window, cx| {
                 let prompt = root.update(cx, |root, _| {
                     // Show the action without enrolling or opening a native device_auth prompt.
@@ -4850,6 +4873,13 @@ mod tests {
                 assert!(root.read(cx).spend_authorization_cache.is_none());
                 assert!(window.has_active_dialog(cx));
                 window.close_all_dialogs(cx);
+                root.update(cx, |root, _| {
+                    root.sync_platform_attention_for_window(window);
+                    assert_eq!(
+                        root.platform_attention_count, 0,
+                        "a closed review releases its platform attention"
+                    );
+                });
             });
         }
         cx.update(|window, _| window.remove_window());

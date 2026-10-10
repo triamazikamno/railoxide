@@ -48,7 +48,6 @@ use super::helpers::walletconnect_proposal_requests_hardware_typed_data;
 #[cfg(feature = "hardware")]
 use super::render::walletconnect_trezor_app_passphrase_input;
 
-mod attention;
 mod connection;
 mod pairing;
 mod policy;
