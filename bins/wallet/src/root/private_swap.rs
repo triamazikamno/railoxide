@@ -68,6 +68,10 @@ mod ui_fixture {
         false
     }
 
+    pub(super) const fn holds_swaps() -> bool {
+        false
+    }
+
     pub(super) const fn setup_fee(_decimals: u8) -> Option<alloy::primitives::U256> {
         None
     }
@@ -899,6 +903,10 @@ impl PrivateSwapsView {
     }
 
     fn reload_records(&mut self) {
+        // Debug UI fixture: its synthesized records aren't read over.
+        if ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(owner) = self.owner.as_ref() else {
             return;
         };
@@ -1604,7 +1612,7 @@ impl PrivateSwapsView {
     }
 
     /// Display strings for one swap of `record`: `amount` of `sell` for `buy`, with `order`
-    /// its latest order when it has one.
+    /// its latest order when it has one. The order's expiry, minimum and ID are its own.
     fn order_labels(
         &self,
         record: &ExecutorRecord,
@@ -1617,7 +1625,11 @@ impl PrivateSwapsView {
         let sell_symbol = self.token_symbol(sell, cx);
         let buy_symbol = self.token_symbol(buy, cx);
         let sell_label = amount.map_or(sell_symbol, |amount| self.token_amount(sell, amount, cx));
-        let received = order.and_then(|order| {
+        // What was delivered, and a Bridge swap's hand-off and destination terms, come from
+        // the attempt that delivered, which a retry's trade can leave to an earlier attempt.
+        let evidence =
+            order.map(|order| model::SwapAttempts::ending_at(record, order).bridge_evidence());
+        let received = evidence.and_then(|order| {
             let observed = order.observations();
             let amount = match order.delivery() {
                 SwapDelivery::Reshield => observed.shielded.map(|shield| shield.private_amount),
@@ -1658,7 +1670,7 @@ impl PrivateSwapsView {
             amount.map(|amount| self.token_amount(buy, amount, cx))
         });
         let valid_to = order.map(|order| u64::from(order.valid_to()));
-        let bridge = order.and_then(|order| {
+        let bridge = evidence.and_then(|order| {
             self.bridge_labels(record, order.delivery(), buy, Some(order), None, cx)
         });
         SwapLabels {
@@ -1921,7 +1933,8 @@ impl PrivateSwapsView {
         Arc<ExecutorOwner>,
         Vec<ObservationPage>,
     )> {
-        if self.session.is_none() || !self.session_is_current(cx) {
+        // Debug UI fixture: a synthesized record has nothing to observe.
+        if ui_fixture::holds_swaps() || self.session.is_none() || !self.session_is_current(cx) {
             return None;
         }
         let confirmed = self.confirmed_block(cx)?;
@@ -2060,7 +2073,8 @@ impl PrivateSwapsView {
         &self,
         cx: &gpui::App,
     ) -> Option<(tokio::runtime::Handle, Arc<ExecutorOwner>, Vec<HintRequest>)> {
-        if self.session.is_none() || !self.session_is_current(cx) {
+        // Debug UI fixture: no provider is asked about a synthesized order.
+        if ui_fixture::holds_swaps() || self.session.is_none() || !self.session_is_current(cx) {
             return None;
         }
         let root = self.root.upgrade();
@@ -2301,7 +2315,8 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.job.is_some() || !self.session_is_current(cx) {
+        // Debug UI fixture: a synthesized record has nothing to act on.
+        if ui_fixture::holds_swaps() || self.job.is_some() || !self.session_is_current(cx) {
             return;
         }
         self.error = None;
@@ -2502,6 +2517,13 @@ impl PrivateSwapsView {
                 .upgrade()
                 .is_some_and(|root| command.sessions_are_current(root.read(cx)))
         {
+            return;
+        }
+        // Debug UI fixture: a synthesized review places nothing.
+        #[cfg(debug_assertions)]
+        if let Some(refusal) = ui_fixture::review_refusal() {
+            self.fail(command.action.operation(), refusal.to_owned());
+            cx.notify();
             return;
         }
         let destination = match (destination, command.destination) {

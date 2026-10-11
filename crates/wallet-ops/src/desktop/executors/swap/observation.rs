@@ -39,10 +39,10 @@ use crate::desktop::executor_observation::{
 use crate::public_wallet::PublicErc20;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
-    SwapBridgeHandoff, SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations,
-    SwapOrderRecord, SwapPreHookDeath, SwapPreHookDeathCause, SwapShieldObservation,
-    SwapTradeAmounts,
+    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, ExecutorOperationId,
+    ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload, SwapBridgeHandoff,
+    SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapOrderRecord,
+    SwapPreHookDeath, SwapPreHookDeathCause, SwapShieldObservation, SwapTradeAmounts,
 };
 
 /// The most blocks one observation page, and so one of its log queries, spans.
@@ -105,15 +105,7 @@ pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
             (None, _) if observed.undelivered.is_some() => SwapOrderState::NotDelivered,
             (None, _) => SwapOrderState::Traded,
             // A Bridge order's delivery on this chain is its hand-off.
-            (Some(_), SwapDelivery::Bridge(_)) => match observed.bridge_outcome {
-                None => SwapOrderState::Bridging,
-                Some(outcome) if outcome.is_delivered() => SwapOrderState::Done,
-                Some(SwapBridgeOutcome::Refunding) => SwapOrderState::Refunding,
-                Some(SwapBridgeOutcome::HeldOnDestination { .. }) => {
-                    SwapOrderState::HeldOnDestination
-                }
-                Some(_) => SwapOrderState::NeedsAttention,
-            },
+            (Some(_), SwapDelivery::Bridge(_)) => bridge_state(observed.bridge_outcome),
             (Some(_), SwapDelivery::Reshield | SwapDelivery::External { .. }) => {
                 SwapOrderState::Done
             }
@@ -129,6 +121,41 @@ pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
         .map_or(SwapOrderState::Open, |death| {
             SwapOrderState::AttemptEnded(death.cause)
         })
+}
+
+/// Where a handed-off Bridge order stands, from its outcome on the destination chain.
+const fn bridge_state(outcome: Option<SwapBridgeOutcome>) -> SwapOrderState {
+    match outcome {
+        None => SwapOrderState::Bridging,
+        Some(outcome) if outcome.is_delivered() => SwapOrderState::Done,
+        Some(SwapBridgeOutcome::Refunding) => SwapOrderState::Refunding,
+        Some(SwapBridgeOutcome::HeldOnDestination { .. }) => SwapOrderState::HeldOnDestination,
+        Some(_) => SwapOrderState::NeedsAttention,
+    }
+}
+
+/// Where `order` stands as an attempt of its swap use. Equal to [`swap_order_state`] except
+/// when the use's trade and delivery sit on different attempts: then the traded attempt and
+/// the attempt holding the hand-off both report the bridge's state, from the hand-off
+/// attempt's outcome.
+#[must_use]
+pub fn swap_attempt_state(record: &ExecutorRecord, order: &SwapOrderRecord) -> SwapOrderState {
+    let observed = order.observations();
+    let paired = record.swap().and_then(|swap| {
+        if observed.traded.is_some() {
+            if observed.delivered.is_some() {
+                return None;
+            }
+            swap.delivery_order(order)
+        } else {
+            observed.bridge_handoff?;
+            swap.trade_order(order).map(|_| order)
+        }
+    });
+    paired.map_or_else(
+        || swap_order_state(order),
+        |delivery| bridge_state(delivery.observations().bridge_outcome),
+    )
 }
 
 impl ExecutorOwner {
@@ -355,6 +382,9 @@ struct OrderFacts {
     /// This order's buy-token balance at the confirmed block. Read only for orders that pay the
     /// executor: Reshield and Across delivery.
     buy_balance: Option<U256>,
+    /// This order's trade is delivered by another attempt of its swap use, whose retained
+    /// hand-off is in the trade's receipt.
+    delivered_by_use: bool,
 }
 
 struct SwapFacts {
@@ -526,6 +556,34 @@ async fn read_swap_facts(
             ..OrderFacts::default()
         });
     }
+    // This mirrors `SwapOperationRecord::delivery_order` over retained observations instead
+    // of recorded ones, so a reorged trade or hand-off pairs nothing.
+    let delivered_by_use = swap
+        .orders()
+        .iter()
+        .zip(&orders)
+        .map(|(order, facts)| {
+            facts.retained.delivered.is_none()
+                && order.use_id().is_some()
+                && facts.retained.traded.is_some_and(|trade| {
+                    swap.orders()
+                        .iter()
+                        .zip(&orders)
+                        .any(|(other, other_facts)| {
+                            other.use_id() == order.use_id()
+                                && other_facts.retained.traded.is_none()
+                                && other_facts.retained.delivered.is_some()
+                                && other_facts
+                                    .retained
+                                    .bridge_handoff
+                                    .is_some_and(|handoff| handoff.observation == trade)
+                        })
+                })
+        })
+        .collect::<Vec<_>>();
+    for (facts, delivered) in orders.iter_mut().zip(delivered_by_use) {
+        facts.delivered_by_use = delivered;
+    }
 
     // State at the confirmed block decides first whether the page's logs can hold
     // anything new. When they can't, the page is covered without reading them.
@@ -627,11 +685,13 @@ async fn read_swap_facts(
         {
             facts.retained.shielded = Some(credit);
         }
-        // Likewise, a receipt's Across deposit is the post-hook's once its nonce passed there.
+        // Likewise, a receipt's Across deposit is the post-hook's once its nonce passed there,
+        // unless another post-hook at that nonce signed the same deposit.
         if facts.retained.post_hook_deposit.is_none()
             && let Some(handoff) = facts.retained.bridge_handoff
             && handoff.deposit_id.is_some()
             && let Some(post_hook) = order.post_hook()
+            && !deposit_signed_by_another_post_hook(swap.orders(), order)
             && nonce_passed_in(
                 provider,
                 chain,
@@ -741,6 +801,7 @@ async fn read_swap_facts(
         // nothing for them.
         if facts.retained.traded.or(facts.traded).is_some()
             && facts.retained.delivered.is_none()
+            && !facts.delivered_by_use
             && order.delivery().pays_executor()
         {
             facts.buy_balance = Some(
@@ -779,7 +840,10 @@ async fn read_swap_facts(
 /// hook whose nonce is unused, or that `evidence` attributes to another action signed at
 /// it, has nothing to find. A recorded trade still awaits its reshield, and a newly
 /// reached `validTo` is read once in full. Trades of unfilled orders are left to
-/// [`any_order_filled`].
+/// [`any_order_filled`]. In a swap use whose trade and delivery are retained and whose hook
+/// nonces are consumed, the page is not read only to learn which hook ran for an order that
+/// is itself complete or ended. An order of that use that still awaits its delivery, or
+/// whose pre-hook may have run, is still searched.
 fn page_may_hold_hook_evidence(
     record: &ExecutorRecord,
     orders: &[SwapOrderRecord],
@@ -800,9 +864,14 @@ fn page_may_hold_hook_evidence(
                     && facts.retained.post_hook_evidence())
         })
     };
-    orders.iter().zip(facts).any(|(order, facts)| {
-        let retained = &facts.retained;
-        let awaiting_delivery = retained.traded.is_some() && retained.delivered.is_none();
+    orders.iter().zip(facts).any(|(order, order_facts)| {
+        if use_source_resolved(orders, facts, order, nonce) && order_quiet(order_facts) {
+            return false;
+        }
+        let retained = &order_facts.retained;
+        let awaiting_delivery = retained.traded.is_some()
+            && retained.delivered.is_none()
+            && !order_facts.delivered_by_use;
         awaiting_delivery
             || (retained.pre_hook_executed.is_none()
                 && retained.pre_hook_dead.is_none()
@@ -814,6 +883,82 @@ fn page_may_hold_hook_evidence(
                 && retained.pre_hook_dead.is_none()
                 && retained.expired.is_none()
                 && timestamp > u64::from(order.valid_to()))
+    })
+}
+
+/// Whether the order's own retained observations leave nothing to find: it holds a trade and
+/// its delivery, or it holds no trade and its pre-hook is recorded dead and never executed.
+/// A traded and delivered order is quiet even when its pre-hook's execution was never
+/// observed, since receipts establish its outcome.
+const fn order_quiet(facts: &OrderFacts) -> bool {
+    let retained = &facts.retained;
+    if retained.traded.is_some() {
+        retained.delivered.is_some() || facts.delivered_by_use
+    } else {
+        retained.pre_hook_dead.is_some() && retained.pre_hook_executed.is_none()
+    }
+}
+
+/// Whether `order`'s swap use has a retained trade with its delivery, on the traded order or
+/// on another attempt of the use, and the confirmed nonce `nonce` is past every hook nonce
+/// the use's attempts signed. An order without a swap use is never resolved this way. This
+/// is the use-level question only: [`page_may_hold_hook_evidence`] skips an order of such a
+/// use only when the order is itself quiet, so one that still awaits its delivery or whose
+/// pre-hook may have run is still searched.
+fn use_source_resolved(
+    orders: &[SwapOrderRecord],
+    facts: &[OrderFacts],
+    order: &SwapOrderRecord,
+    nonce: U256,
+) -> bool {
+    let Some(use_id) = order.use_id() else {
+        return false;
+    };
+    let attempts = || {
+        orders
+            .iter()
+            .zip(facts)
+            .filter(move |(attempt, _)| attempt.use_id() == Some(use_id))
+    };
+    attempts().any(|(_, facts)| {
+        facts.retained.traded.is_some()
+            && (facts.retained.delivered.is_some() || facts.delivered_by_use)
+    }) && attempts().all(|(attempt, _)| {
+        nonce > attempt.pre_hook().nonce()
+            && attempt.post_hook().is_none_or(|hook| nonce > hook.nonce())
+    })
+}
+
+/// An order's Across delivery and the terms its post-hook's deposit signed.
+const fn across_terms(order: &SwapOrderRecord) -> Option<(BridgeDelivery, &AcrossOrderTerms)> {
+    match (order.delivery(), order.bridge()) {
+        (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
+            Some((delivery, terms))
+        }
+        _ => None,
+    }
+}
+
+/// Whether another order's post-hook holds `order`'s post-hook nonce and signed a deposit
+/// the `FundsDeposited` event can't tell apart from `order`'s. A deposit that several issued
+/// payloads signed names approved terms and no hook, so it doesn't show that `order`'s
+/// post-hook took the nonce.
+fn deposit_signed_by_another_post_hook(
+    orders: &[SwapOrderRecord],
+    order: &SwapOrderRecord,
+) -> bool {
+    let (Some(post_hook), Some((delivery, terms))) = (order.post_hook(), across_terms(order))
+    else {
+        return false;
+    };
+    orders.iter().any(|other| {
+        other.uid() != order.uid()
+            && other
+                .post_hook()
+                .is_some_and(|hook| hook.nonce() == post_hook.nonce())
+            && across_terms(other).is_some_and(|(other_delivery, other_terms)| {
+                terms.signs_same_deposit(delivery, other_terms, other_delivery)
+            })
     })
 }
 
@@ -934,8 +1079,10 @@ fn derive_swap_observations(
                 next.trade_amounts = observed.trade_amounts;
             }
             next.shielded = next.shielded.or(observed.shielded);
+            // A trade delivered by another attempt of its use keeps that attempt's delivery.
             if let Some(traded) = next.traded
                 && next.delivered.is_none()
+                && !observed.delivered_by_use
             {
                 match (order.delivery(), observed.buy_balance) {
                     // The order UID commits to the receiver, and the settlement pays it in the
@@ -1171,7 +1318,7 @@ async fn nullifiers_spent(
     Ok(true)
 }
 
-async fn call_at<C: SolCall>(
+pub(super) async fn call_at<C: SolCall>(
     provider: &DynProvider,
     to: Address,
     call: C,

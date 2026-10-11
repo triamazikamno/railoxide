@@ -28,9 +28,9 @@ use wallet_ops::{
 };
 
 use super::model::{
-    RecordSwap, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage, bridge_sent_amount,
-    provider_name, record_swaps, swap_delivery, swap_order_group, swap_order_stage,
-    swap_order_status, swap_private_minimum,
+    RecordSwap, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage,
+    bridge_sent_amount, provider_name, record_swaps, swap_delivery, swap_order_group,
+    swap_order_stage, swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -1112,6 +1112,10 @@ impl PrivateSwapsView {
             Some(order) if !latest => self.past_labels(record, order, cx),
             _ => self.labels(record, cx),
         };
+        // What a bridge holds or refunds follows the attempt that holds the hand-off.
+        let evidence = entry
+            .order
+            .map(|order| SwapAttempts::ending_at(record, order).bridge_evidence());
         let amount = match entry.group {
             SwapOrderGroup::Open => match &labels.bridge {
                 // A Bridge swap's minimum is on its destination network.
@@ -1139,7 +1143,7 @@ impl PrivateSwapsView {
                 .and_then(|bridge| bridge.private.as_ref()?.held.clone())
                 .or_else(|| {
                     tokens
-                        .zip(entry.order)
+                        .zip(evidence)
                         .filter(|_| !entry.stage.is_held_on_destination())
                         .map(|(tokens, order)| self.stranded_amount(tokens, order, entry.stage, cx))
                 })
@@ -1155,7 +1159,7 @@ impl PrivateSwapsView {
                 }),
             // What the provider holds.
             SwapOrderGroup::NeedsAttention => tokens
-                .zip(entry.order.and_then(bridge_sent_amount))
+                .zip(evidence.and_then(bridge_sent_amount))
                 .map_or(OrderRowAmount::None, |((_, buy), sent)| {
                     OrderRowAmount::Value {
                         value: self.token_amount(buy, sent, cx),

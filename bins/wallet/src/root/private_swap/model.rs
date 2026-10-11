@@ -8,7 +8,7 @@ use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
     ExecutorAttribution, SwapOrderState, SwapSetupStatus,
     cow::OrderUid,
-    swap_order_state,
+    swap_attempt_state,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
         ExecutorPayloadPurpose, ExecutorPayloadState, ExecutorRecord, SwapApprovedBounds,
@@ -279,7 +279,7 @@ pub(in crate::root) fn swap_order_stage(
     order: &SwapOrderRecord,
     attribution: Option<&ExecutorAttribution>,
 ) -> SwapStage {
-    let state = swap_order_state(order);
+    let state = swap_attempt_state(record, order);
     if state == SwapOrderState::Open {
         match order.submission_status() {
             SwapSubmissionStatus::Pending => return SwapStage::SubmissionPending,
@@ -291,9 +291,15 @@ pub(in crate::root) fn swap_order_stage(
     // Funds reach the stealth account when the pre-hook runs. A recovery whose shield arrived
     // after that returned them; a cancellation, which is also recovery, shields nothing. An
     // Across refund reaches it later, and surplus kept there can be recovered before, so only
-    // a recovery after the verified refund returned it. Without that refund, none did.
-    let stranded_since = match (state, order.bridge()) {
-        (SwapOrderState::Refunding, Some(BridgeOrderTerms::Across(_))) => observed
+    // a recovery after the verified refund returned it. Without that refund, none did. A trade
+    // delivered by another attempt of its use takes that attempt's refund.
+    let delivery = record
+        .swap()
+        .and_then(|swap| swap.delivery_order(order))
+        .unwrap_or(order);
+    let stranded_since = match (state, delivery.bridge()) {
+        (SwapOrderState::Refunding, Some(BridgeOrderTerms::Across(_))) => delivery
+            .observations()
             .bridge_refund
             .map(|refund| refund.block.number.saturating_add(1)),
         _ => observed
@@ -900,6 +906,84 @@ pub(in crate::root) fn record_swaps(record: &ExecutorRecord) -> Vec<RecordSwap> 
         start += attempts.len();
     }
     swaps
+}
+
+/// The attempts of one swap and the two that decide its outcome. A retry can hold the trade
+/// while an earlier attempt of the same swap use, whose signed terms the settlement's deposit
+/// matched, holds the bridge hand-off and everything that follows it.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::root) struct SwapAttempts<'a> {
+    /// Every attempt of the swap, oldest first.
+    pub(in crate::root) attempts: &'a [SwapOrderRecord],
+    /// The latest attempt, whose submission and open-order state the swap shows.
+    pub(in crate::root) latest: &'a SwapOrderRecord,
+    /// The attempt whose trade is verified.
+    pub(in crate::root) traded: Option<&'a SwapOrderRecord>,
+    /// The attempt holding the delivery evidence and the terms the delivery follows.
+    pub(in crate::root) delivery: Option<&'a SwapOrderRecord>,
+}
+
+impl<'a> SwapAttempts<'a> {
+    /// The swap of `record` whose last order is `latest`, as [`record_swaps`] groups the
+    /// record's orders. An order that ends none of those swaps is a swap of its own.
+    pub(in crate::root) fn ending_at(
+        record: &'a ExecutorRecord,
+        latest: &'a SwapOrderRecord,
+    ) -> Self {
+        let swap = record.swap();
+        let attempts = swap
+            .and_then(|swap| {
+                record_swaps(record).into_iter().find_map(|range| {
+                    let orders = swap.orders().get(range.orders)?;
+                    orders
+                        .last()
+                        .is_some_and(|last| last.uid() == latest.uid())
+                        .then_some(orders)
+                })
+            })
+            .unwrap_or_else(|| std::slice::from_ref(latest));
+        let traded = attempts
+            .iter()
+            .rev()
+            .find(|order| order.observations().traded.is_some());
+        let delivery = traded.and_then(|traded| swap?.delivery_order(traded));
+        Self {
+            attempts,
+            latest,
+            traded,
+            delivery,
+        }
+    }
+
+    /// The attempt whose bridge evidence and signed delivery terms the swap shows: the one
+    /// that delivered, or the latest while nothing is delivered.
+    pub(in crate::root) fn bridge_evidence(&self) -> &'a SwapOrderRecord {
+        self.delivery.unwrap_or(self.latest)
+    }
+
+    /// What `order` contributed to the swap's outcome: its trade, or the bridge deposit of a
+    /// trade another attempt holds. `None` for an attempt that contributed neither.
+    pub(in crate::root) fn role(&self, order: &SwapOrderRecord) -> Option<&'static str> {
+        let is =
+            |other: Option<&SwapOrderRecord>| other.is_some_and(|other| other.uid() == order.uid());
+        if is(self.traded) {
+            Some(TRADED)
+        } else if is(self.delivery) {
+            Some(BRIDGE_DEPOSIT)
+        } else {
+            None
+        }
+    }
+
+    /// The delivery attempt's approved destination minimum and the traded attempt's higher
+    /// one, in that order, when the trade was delivered under another attempt's terms. The
+    /// higher minimum did not bind the delivery.
+    pub(in crate::root) fn superseded_minimum(&self) -> Option<(U256, U256)> {
+        let (traded, delivery) = (self.traded?, self.delivery?);
+        let approved = delivery.bounds().destination_minimum?;
+        let unmet = traded.bounds().destination_minimum?;
+        (traded.uid() != delivery.uid() && unmet > approved).then_some((approved, unmet))
+    }
 }
 
 /// The swap use the record's own progress is about: its latest order's, or before any order,
@@ -2057,9 +2141,10 @@ fn private_setup_step(
 /// A Bridge swap's steps: set up, order open, sent to the bridge once the hand-off is proven,
 /// then delivered on the destination network, labelled by the recorded outcome: verified, or
 /// reported by the provider. Refunding and Needs attention replace the delivered step. An Across
-/// post-hook that didn't run replaces both with the bought token held on the swap's network. A
-/// private Bridge swap's last step is its shield into the private balance there, and proceeds
-/// its destination stealth account holds replace that step.
+/// post-hook that didn't run replaces both with the bought token held on the swap's network,
+/// once an account read found it there. Until then an Across swap to a public receiver shows
+/// its deposit as unverified. A private Bridge swap's last step is its shield into the private
+/// balance there, and proceeds its destination stealth account holds replace that step.
 fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
     let step = |label: String, detail: String, status| SwapStep::new(label, detail, status);
@@ -2096,6 +2181,24 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
     };
     let mut steps = reshield_steps(stage, labels);
     let outcome = match stage {
+        // An Across settlement that deposits shows the deposit with the trade, so a trade
+        // without one leaves the hand-off unverified. Only an account read tells where the
+        // bought token is.
+        SwapStage::Order(SwapOrderState::Traded)
+            if bridge.provider == BridgeProvider::Across && private.is_none() =>
+        {
+            vec![
+                step(
+                    "Bridge deposit unverified".into(),
+                    format!(
+                        "The trade is verified, but its settlement didn't show this swap's bridge deposit. Check status to see whether the bought {} is in the stealth account.",
+                        labels.buy_symbol
+                    ),
+                    Pending,
+                ),
+                step(delivered, expected, NotStarted),
+            ]
+        }
         SwapStage::Order(SwapOrderState::Traded) => vec![
             step(
                 BRIDGE_DEPOSIT.into(),
@@ -3160,6 +3263,26 @@ pub(super) mod tests {
                 vec![
                     ("Order open", Pending),
                     ("Bridge deposit", NotStarted),
+                    ("Delivered on Polygon", NotStarted),
+                ],
+            ),
+            // An Across trade to a public receiver without its deposit leaves the hand-off
+            // unverified. Every other Bridge order still waits for its settlement to be read.
+            (
+                order(SwapOrderState::Traded),
+                &across,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit unverified", Pending),
+                    ("Delivered on Polygon", NotStarted),
+                ],
+            ),
+            (
+                order(SwapOrderState::Traded),
+                &near,
+                vec![
+                    ("Order open", Done),
+                    ("Bridge deposit", Pending),
                     ("Delivered on Polygon", NotStarted),
                 ],
             ),

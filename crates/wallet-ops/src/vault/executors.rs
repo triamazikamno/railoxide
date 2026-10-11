@@ -64,6 +64,10 @@ pub enum ExecutorStoreError {
     InputReserved,
     #[error("a previous swap attempt's pre-hook can still execute")]
     SwapAttemptOutstanding,
+    #[error(
+        "this swap's earlier attempts were approved for other tokens or delivery terms; start a new swap to change them"
+    )]
+    SwapUseTermsChanged,
     #[error("this account is reserved by another swap")]
     SwapUseActive,
     #[error("a Public account shared between Private wallets can't pay for a swap")]

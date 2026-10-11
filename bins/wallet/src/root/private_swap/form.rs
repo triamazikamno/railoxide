@@ -682,6 +682,9 @@ pub(super) struct OrderApproval {
     /// The approved minimum on a Bridge delivery's destination network: the review's, or the
     /// one approved with the setup.
     destination_minimum: Option<U256>,
+    /// The lower destination minimum an earlier order of the swap can still deliver, which the
+    /// user accepted with this review. `None` when the review disclosed none.
+    continuing_minimum: Option<U256>,
     /// Approved in a full review rather than the confirm-only step. Only a full review replaces
     /// the approval saved with the setup, which binds the swap's first order.
     full_review: bool,
@@ -717,6 +720,55 @@ impl QuotedBridge {
             destination: &self.destination,
             destination_chain: &self.destination_chain,
         }
+    }
+}
+
+/// What a retry's review says about an earlier order of the same swap whose approved bridge
+/// deposit can still run: the amounts are of the token received on the destination network.
+struct ContinuingDelivery {
+    /// The earlier order's approved minimum.
+    lower: String,
+    /// The reviewed order's minimum.
+    new: String,
+    /// The destination network's name.
+    network: String,
+    surplus: BridgeSurplus,
+}
+
+impl ContinuingDelivery {
+    /// The earlier minimum with its network, such as "90 USDC on Arbitrum".
+    fn lower_there(&self) -> String {
+        format!("{} on {}", self.lower, self.network)
+    }
+
+    fn headline(&self) -> String {
+        format!(
+            "An earlier order of this swap can still deliver {}.",
+            self.lower_there()
+        )
+    }
+
+    /// What follows the headline. `source` names the swap's own network, where the rest of
+    /// what the order buys is handled as the delivery's surplus choice says.
+    fn details(&self, source: &str) -> String {
+        let rest = match self.surplus {
+            BridgeSurplus::Reshield => "is returned privately",
+            BridgeSurplus::KeepInAccount => "stays in the stealth account",
+            BridgeSurplus::BridgedByProvider => "is returned separately",
+        };
+        format!(
+            "If this order trades, that earlier approved deposit may run in its place, and you receive {} there instead of at least {}. Anything left on {source} {rest} and doesn't add to it.",
+            self.lower, self.new
+        )
+    }
+
+    /// The review's warning.
+    fn warning(&self) -> String {
+        format!(
+            "This swap may deliver {} instead of {}.",
+            self.lower_there(),
+            self.new
+        )
     }
 }
 
@@ -1146,6 +1198,9 @@ pub(super) struct SwapForm {
     price_acknowledged: bool,
     /// Applies only to the current form quote; editing or retrying clears it.
     high_costs_acknowledged: bool,
+    /// Acceptance of the lower delivery an earlier order of the swap can still make. Applies
+    /// only to the current form quote, like `high_costs_acknowledged`.
+    continuing_acknowledged: bool,
     error: Option<String>,
     /// The order detail this form continues or retries, which Back returns to.
     back_to_detail: Option<ExecutorOperationId>,
@@ -1350,6 +1405,9 @@ impl SwapForm {
             }
             Ok(_) if authorized_high_cost(review).is_some() && !self.high_costs_acknowledged => {
                 Some("Confirm Swap anyway to accept the high swap costs.".into())
+            }
+            Ok(_) if review.continuing_minimum().is_some() && !self.continuing_acknowledged => {
+                Some("Accept the earlier order's delivery before you review the swap.".into())
             }
             Ok(_) => None,
         }
@@ -2608,7 +2666,8 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.session_is_current(cx) || self.busy() {
+        // Debug UI fixture: a synthesized record has no swap to continue or retry.
+        if super::ui_fixture::holds_swaps() || !self.session_is_current(cx) || self.busy() {
             return;
         }
         let Some(record) = self.record(operation) else {
@@ -2722,6 +2781,11 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) || self.busy() {
             return;
         }
+        // Debug UI fixture: a `retry-review` or `split:` mode shows its private swap instead.
+        #[cfg(debug_assertions)]
+        if self.open_ui_fixture_swap(window, cx) {
+            return;
+        }
         #[cfg(debug_assertions)]
         let source = account.address;
         self.open_form_with_source(
@@ -2740,6 +2804,121 @@ impl PrivateSwapsView {
         self.open_ui_fixture_detail(source, sell, window, cx);
         #[cfg(debug_assertions)]
         self.stage_public_route_error_for_fixture(window, cx);
+    }
+
+    /// Debug UI fixture: in a `retry-review` mode, open the private form of the synthesized
+    /// swap's retry and hold it on the synthesized review. The orderbook client a review is
+    /// approved with takes a route of its own, which is opened first and never asked anything.
+    #[cfg(debug_assertions)]
+    pub(super) fn open_ui_fixture_retry_review(&self, window: &Window, cx: &Context<'_, Self>) {
+        let profile = self.root.upgrade().and_then(|root| {
+            root.read(cx)
+                .effective_chain_configs
+                .get(self.origin_chain_id)
+                .and_then(EffectiveChainConfig::swap_profile)
+        });
+        let (Some(owner), Some(profile)) = (self.private_owner().cloned(), profile) else {
+            tracing::warn!("the debug UI fixture's review needs the network's private session");
+            return;
+        };
+        let runtime = self.runtime.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let orderbook = runtime
+                .spawn(async move { Box::pin(owner.swap_orderbook_client()).await })
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                if let Ok(Ok(orderbook)) = orderbook {
+                    view.stage_ui_fixture_retry_review(&profile, orderbook, window, cx);
+                } else {
+                    tracing::warn!("the debug UI fixture couldn't open its orderbook route");
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Debug UI fixture: open the form of [`Self::open_ui_fixture_retry_review`]. The fixture
+    /// holds back the form's own quote and routes, so the synthesized ones stand in for them.
+    #[cfg(debug_assertions)]
+    fn stage_ui_fixture_retry_review(
+        &mut self,
+        profile: &wallet_ops::settings::SwapProfile,
+        orderbook: CowOrderbookClient,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.session_is_current(cx) || self.busy() {
+            return;
+        }
+        let Some((record, review)) =
+            super::ui_fixture::retry_review(profile, orderbook.isolation())
+        else {
+            tracing::warn!("the debug UI fixture couldn't synthesize its retry");
+            return;
+        };
+        let plan = review.plan();
+        let SwapDelivery::Bridge(delivery) = plan.delivery() else {
+            return;
+        };
+        let (sell, intermediate, amount) = (plan.sell_token(), plan.buy_token(), plan.amount());
+        let operation = record.operation();
+        self.records = vec![record];
+        self.open_form(
+            Some(operation),
+            sell,
+            None,
+            Some(amount),
+            None,
+            SwapDelivery::Bridge(delivery),
+            window,
+            cx,
+        );
+        // The wallet holds none of the sell token, so the form lists none.
+        let sell_item = PrivateActionAssetSelectItem {
+            token: sell,
+            label: Arc::from(self.token_symbol(sell, cx).as_str()),
+            icon_path: self.token_icon(sell, cx),
+        };
+        let sell_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(vec![sell_item]),
+                Some(gpui_component::IndexPath::default()),
+                window,
+                cx,
+            )
+        });
+        let symbol =
+            self.network_token_symbol(delivery.destination_chain, delivery.destination_token, cx);
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        form.sell_select = sell_select;
+        form.bridge.routes.insert(
+            (sell, delivery.destination_chain),
+            Ok(BridgeRoutes {
+                across: vec![BridgeDestination {
+                    destination_token: delivery.destination_token,
+                    intermediate,
+                    symbol,
+                    same_asset: true,
+                    near: None,
+                }],
+                near: Vec::new(),
+                same_asset: Vec::new(),
+                across_native: None,
+                unavailable: None,
+                served: true,
+            }),
+        );
+        form.set_orderbook(Some(orderbook), None);
+        form.quote = QuoteState::Ready(Arc::new(review));
+        // Only the earlier approval is left to accept.
+        form.price_acknowledged = true;
+        form.high_costs_acknowledged = true;
+        self.refresh_provider_select(window, cx);
+        self.refresh_form_delivery(cx);
+        self.sync_gas_controls(window, cx);
+        cx.notify();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3054,6 +3233,7 @@ impl PrivateSwapsView {
             quoted_bridge: None,
             price_acknowledged: false,
             high_costs_acknowledged: false,
+            continuing_acknowledged: false,
             error: None,
             back_to_detail: None,
             details_open: false,
@@ -3562,6 +3742,10 @@ impl PrivateSwapsView {
             self.load_public_network_routes(network, window, cx);
             return;
         }
+        // Debug UI fixture: its form's routes are synthesized, and no provider is asked.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(form) = self.form.as_ref() else {
             return;
         };
@@ -3685,6 +3869,7 @@ impl PrivateSwapsView {
             form.bridge_quote_error = None;
             form.price_acknowledged = false;
             form.high_costs_acknowledged = false;
+            form.continuing_acknowledged = false;
             public.route_errors.clear();
             public.route_tasks.clear();
             self.load_bridge_routes(window, cx);
@@ -4217,6 +4402,7 @@ impl PrivateSwapsView {
         }
         form.price_acknowledged = false;
         form.high_costs_acknowledged = false;
+        form.continuing_acknowledged = false;
         let moved = match &form.quote {
             QuoteState::Ready(review) => {
                 let moved = review.with_receiver(form.quote_receiver());
@@ -4585,6 +4771,7 @@ impl PrivateSwapsView {
             form.gas_share_bps = share_bps;
             form.gas_custom = custom;
             form.high_costs_acknowledged = false;
+            form.continuing_acknowledged = false;
             form.error = None;
         }
         // A swap paid from a Public account is priced by its own review.
@@ -4833,6 +5020,10 @@ impl PrivateSwapsView {
     // Setup route
 
     fn start_setup_route_updates(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        // Debug UI fixture: its form sets nothing up, so no anchor or fee is read for it.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         if let Some(root) = self.root.upgrade() {
             root.update(cx, |root, _| root.public_broadcaster_anchor_refresh.wake());
         }
@@ -6193,9 +6384,14 @@ impl PrivateSwapsView {
             self.schedule_public_quote(window, cx);
             return;
         }
+        // Debug UI fixture: its form holds a synthesized quote, which no request replaces.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         if let Some(form) = self.form.as_mut() {
             form.price_acknowledged = false;
             form.high_costs_acknowledged = false;
+            form.continuing_acknowledged = false;
             // A ready quote's task is its bridge refresh, which a full quote supersedes.
             if matches!(form.quote, QuoteState::Ready(_)) {
                 form.quote_task = None;
@@ -6309,6 +6505,10 @@ impl PrivateSwapsView {
     /// debounce. The ready quote stays in view, and the orderbook isn't asked. A share back at
     /// the quoted one has nothing to refresh, which also ends a refresh still under way.
     fn schedule_bridge_quote(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        // Debug UI fixture: its synthesized quote has no bridge to ask again.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(form) = self.form.as_ref() else {
             return;
         };
@@ -6352,6 +6552,7 @@ impl PrivateSwapsView {
         }
         form.price_acknowledged = false;
         form.high_costs_acknowledged = false;
+        form.continuing_acknowledged = false;
         let (Some(bridge), Some((anchor_cache, tokens))) = (bridge, registries) else {
             form.bridge_quote_error =
                 Some("The swap's bridge route isn't ready. Retry the quote.".into());
@@ -6450,6 +6651,7 @@ impl PrivateSwapsView {
                 // The destination terms changed, so consent to the old ones doesn't carry over.
                 form.price_acknowledged = false;
                 form.high_costs_acknowledged = false;
+                form.continuing_acknowledged = false;
                 form.quote = QuoteState::Ready(Arc::new(Self::with_tracked_delivery(
                     &self.tracking,
                     operation,
@@ -6490,6 +6692,7 @@ impl PrivateSwapsView {
         }
         form.quote_task = None;
         form.high_costs_acknowledged = false;
+        form.continuing_acknowledged = false;
         let Some(result) = result else {
             form.quote =
                 QuoteState::Failed(eyre::eyre!("Quoting stopped unexpectedly. Try again."));
@@ -6626,6 +6829,8 @@ impl PrivateSwapsView {
             orderbook,
             bridge: form.quoted_bridge.clone(),
             destination_minimum: review.bridge().map(|bridge| bridge.destination_minimum),
+            // The review opens only once `review_problem` has this accepted.
+            continuing_minimum: review.continuing_minimum(),
             full_review: true,
             swap_use: form.reuse_use.filter(|_| form.reuse_account),
             // A reused account's order to an existing destination account claims both first.
@@ -6829,6 +7034,20 @@ impl PrivateSwapsView {
         if let Some(delivery) = private {
             rows.push(self.shield_failure_row(delivery, buy, cx));
         }
+        // An earlier order's lower minimum, on the destination network like the Receive card's.
+        let continuing = self.continuing_delivery(review, cx);
+        if let Some(continuing) = &continuing {
+            rows.push(
+                SpendAuthorizationSummaryRow::new("Earlier approval", continuing.lower_there())
+                    .with_hint(SpendAuthorizationHint::new(
+                        "Earlier approval",
+                        [
+                            "An earlier order of this swap approved this minimum, and its bridge deposit can still run if this order trades. Then this is what the swap delivers."
+                                .to_owned(),
+                        ],
+                    )),
+            );
+        }
         // A private Bridge swap names both of its stealth accounts. Any other swap names its
         // own only when it reuses one.
         let accounts = self.review_accounts(plan.operation(), review);
@@ -7010,6 +7229,9 @@ impl PrivateSwapsView {
             warnings.push(Arc::from(
                 self.authorized_cost_warning(review, bps, cx).message(),
             ));
+        }
+        if let Some(continuing) = &continuing {
+            warnings.push(Arc::from(continuing.warning()));
         }
         if bridge.is_some_and(|delivery| delivery.provider == BridgeProvider::NearIntents) {
             warnings.push(Arc::from(NEAR_INTENTS_DISCLAIMER));
@@ -7701,6 +7923,9 @@ impl PrivateSwapsView {
                         orderbook,
                         bridge: result.bridge,
                         destination_minimum: approval.bounds.destination_minimum,
+                        // A first order has no earlier one. If signing finds one, it asks for
+                        // a full review.
+                        continuing_minimum: None,
                         full_review: false,
                         // The use whose saved approval this step confirms.
                         swap_use: Some(swap_use),
@@ -8002,6 +8227,7 @@ impl PrivateSwapsView {
                     bridge: approval.bridge.as_ref().map(QuotedBridge::route),
                     destination_minimum: approval.destination_minimum,
                     destination,
+                    continuing_minimum: approval.continuing_minimum,
                     verify_proof: true,
                 }))
                 .await
@@ -8637,6 +8863,28 @@ impl PrivateSwapsView {
         )
     }
 
+    /// The lower delivery an earlier order of `review`'s swap can still make, beside the
+    /// reviewed one. `None` when no earlier approval can deliver less.
+    fn continuing_delivery(&self, review: &SwapReview, cx: &App) -> Option<ContinuingDelivery> {
+        let lower = review.continuing_minimum()?;
+        let SwapDelivery::Bridge(delivery) = review.plan().delivery() else {
+            return None;
+        };
+        let network = delivery.destination_chain;
+        let token = self.bridge_received_token(delivery, cx);
+        Some(ContinuingDelivery {
+            lower: self.network_token_amount(network, token, lower, cx),
+            new: self.network_token_amount(
+                network,
+                token,
+                review.bridge()?.destination_minimum,
+                cx,
+            ),
+            network: network_name(network),
+            surplus: delivery.surplus,
+        })
+    }
+
     pub(super) fn network_token_symbol(&self, network: u64, token: Address, cx: &App) -> String {
         self.chain_token_metadata(network, token, cx).map_or_else(
             || railgun_ui::short_address(&token),
@@ -8835,6 +9083,7 @@ impl PrivateSwapsView {
                     ),
             )
             .children(self.render_price_acknowledgement(form, cx))
+            .children(self.render_continuing_acknowledgement(form, editable, cx))
             .child(self.render_delivery(form, editable, cx))
             .child(self.render_account_row(form, mode, editable, cx))
             .children(review.map(|review| {
@@ -10418,6 +10667,68 @@ impl PrivateSwapsView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The warning that an earlier order's approved deposit can deliver less than this quote,
+    /// with its consent checkbox inside the warning frame.
+    fn render_continuing_acknowledgement(
+        &self,
+        form: &SwapForm,
+        editable: bool,
+        cx: &Context<'_, Self>,
+    ) -> Option<gpui::Div> {
+        let QuoteState::Ready(review) = &form.quote else {
+            return None;
+        };
+        let continuing = self.continuing_delivery(review, cx)?;
+        let warning_color = cx.theme().warning;
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(warning_color.mix_oklab(gpui::transparent_white(), 0.3))
+                .bg(warning_color.mix_oklab(gpui::transparent_white(), 0.04))
+                .debug_selector(|| "swap-continuing-approval".into())
+                .child(
+                    Alert::warning("swap-continuing-approval", continuing.headline())
+                        .small()
+                        .min_w_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .p_0()
+                        .border_0()
+                        .bg(gpui::transparent_black()),
+                )
+                .child(
+                    app_muted_text(continuing.details(&self.chain_label()))
+                        .min_w_0()
+                        .whitespace_normal(),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "swap-continuing-acknowledged".into())
+                        .child(
+                            Checkbox::new("swap-continuing-acknowledged")
+                                .label(format!("Accept a delivery of {}", continuing.lower_there()))
+                                .checked(form.continuing_acknowledged)
+                                .small()
+                                .disabled(!editable)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    if let Some(form) = this.form.as_mut() {
+                                        form.continuing_acknowledged = *checked;
+                                        form.error = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
     }
 
     /// The wrapping warning on high authorized costs, with Swap anyway inside it.
@@ -13336,6 +13647,9 @@ const fn review_change_label(change: SwapReviewChange) -> &'static str {
         }
         SwapReviewChange::Accounts => "the stealth accounts or their setup changed",
         SwapReviewChange::ApprovalPlan => "the token approval the swap needs changed",
+        SwapReviewChange::ContinuingApproval { .. } => {
+            "an earlier order of this swap can still deliver less on the destination network"
+        }
     }
 }
 

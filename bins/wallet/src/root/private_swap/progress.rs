@@ -25,6 +25,7 @@ use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorPaidRecoveryRequest,
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
     SwapOrderState, WakuDeliveryClient,
+    cow::OrderUid,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
         ExecutorPayloadState, ExecutorRecord, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
@@ -39,11 +40,11 @@ use super::form::{
     swap_steps as review_steps, swap_steps_hint,
 };
 use super::model::{
-    SwapActions, SwapIdentity, SwapOrderGroup, SwapSetupProgress, SwapStage, SwapStep,
-    SwapStepAccount, bridge_sent_amount, card_line, needs_executed_fee, prepared_swap_use,
-    private_delivery_credit, provider_name, record_swaps, swap_actions, swap_order_group,
-    swap_order_stage, swap_outcome, swap_private_delivery, swap_private_minimum, swap_steps,
-    swap_use_destination, swap_valid_to,
+    SwapActions, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapSetupProgress,
+    SwapStage, SwapStep, SwapStepAccount, bridge_sent_amount, card_line, needs_executed_fee,
+    prepared_swap_use, private_delivery_credit, provider_name, record_swaps, swap_actions,
+    swap_order_group, swap_order_stage, swap_order_status, swap_outcome, swap_private_delivery,
+    swap_private_minimum, swap_steps, swap_use_destination, swap_valid_to,
 };
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -448,6 +449,7 @@ impl PrivateSwapsView {
         let outcome =
             order.and_then(|order| self.render_outcome(record, order, stage, started, cx));
         let not_filled = order.and_then(|order| self.render_not_filled(record, order, stage, cx));
+        let attempts = order.map(|order| SwapAttempts::ending_at(record, order));
         let facts = match delivery {
             SwapDelivery::Bridge(bridge) => {
                 Some(self.render_bridge_facts(record, order, bridge, stage, started, cx))
@@ -467,9 +469,16 @@ impl PrivateSwapsView {
             .children(not_filled)
             .children(facts)
             .children(outcome)
+            .children(attempts.and_then(|attempts| self.render_attempts(record, &attempts, cx)))
             .children(
                 latest
-                    .and_then(|swap| earlier_attempts_note(record, swap.orders))
+                    .and_then(|swap| {
+                        earlier_attempts_note(
+                            record,
+                            swap.orders,
+                            attempts.and_then(|attempts| attempts.delivery),
+                        )
+                    })
                     .map(|note| app_muted_text(note).whitespace_normal()),
             )
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
@@ -536,6 +545,7 @@ impl PrivateSwapsView {
         let started = self.swap_started(record, Some(&past), cx);
         let outcome = self.render_outcome(record, order, stage, started, cx);
         let not_filled = self.render_not_filled(record, order, stage, cx);
+        let attempts = SwapAttempts::ending_at(record, order);
         let facts = match order.delivery() {
             SwapDelivery::Bridge(bridge) => {
                 Some(self.render_bridge_facts(record, Some(order), bridge, stage, started, cx))
@@ -556,8 +566,9 @@ impl PrivateSwapsView {
             .children(not_filled)
             .children(facts)
             .children(outcome)
+            .children(self.render_attempts(record, &attempts, cx))
             .children(
-                earlier_attempts_note(record, past.orders)
+                earlier_attempts_note(record, past.orders, attempts.delivery)
                     .map(|note| app_muted_text(note).whitespace_normal()),
             )
             .children(recovery.map(|note| app_muted_text(note).whitespace_normal()));
@@ -631,7 +642,10 @@ impl PrivateSwapsView {
     /// needs, from the provider's deposit and the destination outcome to the settlement on this
     /// network. A deposit that needs attention shows its address in full. A private delivery
     /// has no receiver: its destination is the private balance on the destination network, and
-    /// held proceeds name the destination stealth account.
+    /// held proceeds name the destination stealth account. `order` is the swap's latest. The
+    /// deposit, the destination outcome, the minimum a delivery is held to, a refund and the
+    /// surplus come from the attempt that delivered, and the settlement from the one that
+    /// traded.
     fn render_bridge_facts(
         &self,
         record: &ExecutorRecord,
@@ -656,14 +670,18 @@ impl PrivateSwapsView {
         let buy = order
             .and_then(|order| Some(record.swap()?.order_terms(order).buy_token()))
             .or_else(|| swap_tokens(record).map(|(_, buy)| buy));
-        let observed = order.map(SwapOrderRecord::observations).unwrap_or_default();
-        let terms = order.and_then(SwapOrderRecord::bridge);
+        let attempts = order.map(|order| SwapAttempts::ending_at(record, order));
+        let evidence = attempts.map(|attempts| attempts.bridge_evidence());
+        let observed = evidence
+            .map(SwapOrderRecord::observations)
+            .unwrap_or_default();
+        let terms = evidence.and_then(SwapOrderRecord::bridge);
         let (across, near) = match terms {
             Some(BridgeOrderTerms::Across(across)) => (Some(across), None),
             Some(BridgeOrderTerms::NearIntents(near)) => (None, Some(near)),
             None => (None, None),
         };
-        let bounds = order
+        let bounds = evidence
             .map(SwapOrderRecord::bounds)
             .or_else(|| record.swap_approval().map(|approval| &approval.bounds));
         // The private balance gets the minimum less the destination network's shield fee.
@@ -702,9 +720,9 @@ impl PrivateSwapsView {
                     )
                 })
             });
-        let settlement = observed
-            .traded
-            .and_then(|traded| traded.transaction_hash)
+        let settlement = attempts
+            .and_then(|attempts| attempts.traded)
+            .and_then(|traded| traded.observations().traded?.transaction_hash)
             .map(|hash| {
                 let hash = hash.to_string();
                 let copy_id = SharedString::from(format!("swap-settlement-{hash}-copy"));
@@ -731,6 +749,9 @@ impl PrivateSwapsView {
                     app_text(self.token_amount(buy, balance, cx)),
                 )
             });
+        let earlier_minimum = attempts
+            .filter(|_| stage == SwapStage::Order(SwapOrderState::Done))
+            .and_then(|attempts| self.earlier_minimum_note(&attempts, delivery, cx));
         let mut rows = Vec::new();
         let mut note = None;
         match stage {
@@ -862,7 +883,7 @@ impl PrivateSwapsView {
             SwapStage::Order(SwapOrderState::NeedsAttention) => {
                 rows.extend(near.map(|near| deposit_address_box(near.deposit_address)));
                 rows.extend(
-                    buy.zip(order.and_then(bridge_sent_amount))
+                    buy.zip(evidence.and_then(bridge_sent_amount))
                         .map(|(buy, sent)| {
                             fact_row("Amount sent", app_text(self.token_amount(buy, sent, cx)))
                         }),
@@ -963,7 +984,141 @@ impl PrivateSwapsView {
             .gap_3()
             .debug_selector(|| "swap-bridge-facts".into())
             .child(div().w_full().flex().flex_col().gap_2().children(rows))
+            .children(earlier_minimum.map(|note| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .debug_selector(|| "swap-bridge-earlier-minimum".into())
+                    .child(app_muted_text(note).whitespace_normal())
+            }))
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
+    }
+
+    /// What a delivery under another attempt's lower approved minimum says of both minimums,
+    /// as amounts on `delivery`'s network. `None` unless the trade and its delivery are on
+    /// different attempts and the traded one approved more.
+    pub(super) fn earlier_minimum_note(
+        &self,
+        attempts: &SwapAttempts<'_>,
+        delivery: BridgeDelivery,
+        cx: &App,
+    ) -> Option<String> {
+        let (approved, unmet) = attempts.superseded_minimum()?;
+        let amount = |amount| {
+            self.network_token_amount(
+                delivery.destination_chain,
+                self.delivered_token(delivery, cx),
+                amount,
+                cx,
+            )
+        };
+        Some(format!(
+            "Delivered under an earlier order's approved minimum of {}. This order's minimum of {} did not apply.",
+            amount(approved),
+            amount(unmet)
+        ))
+    }
+
+    /// Every attempt of a swap that has more than one, oldest first: what it contributed or
+    /// how it ended, its own approved minimum and its expiry. A Bridge order's minimum is on
+    /// its destination network. A swap with one attempt has no rows.
+    pub(super) fn attempt_rows(
+        &self,
+        record: &ExecutorRecord,
+        attempts: &SwapAttempts<'_>,
+        cx: &App,
+    ) -> Vec<SwapAttemptRow> {
+        if attempts.attempts.len() < 2 {
+            return Vec::new();
+        }
+        attempts
+            .attempts
+            .iter()
+            .enumerate()
+            .map(|(index, order)| {
+                let role = attempts.role(order).map_or_else(
+                    || {
+                        swap_order_status(
+                            swap_order_stage(record, order, self.attribution(record)),
+                            false,
+                            &SwapLabels::default(),
+                        )
+                    },
+                    str::to_owned,
+                );
+                let bounds = order.bounds();
+                let minimum = match order.delivery() {
+                    SwapDelivery::Bridge(bridge) => bounds.destination_minimum.map(|minimum| {
+                        self.network_token_amount(
+                            bridge.destination_chain,
+                            self.delivered_token(bridge, cx),
+                            if bridge.is_private() {
+                                private_delivery_credit(minimum, bounds)
+                            } else {
+                                minimum
+                            },
+                            cx,
+                        )
+                    }),
+                    _ => record.swap().map(|swap| {
+                        self.token_amount(
+                            swap.order_terms(order).buy_token(),
+                            bounds.private_minimum,
+                            cx,
+                        )
+                    }),
+                };
+                SwapAttemptRow {
+                    label: format!("Order {} · {role}", index + 1),
+                    order: order.uid(),
+                    detail: [
+                        minimum.map(|minimum| format!("Minimum {minimum}")),
+                        Some(format!(
+                            "valid until {}",
+                            local_date_time_label(u64::from(order.valid_to()))
+                        )),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                }
+            })
+            .collect()
+    }
+
+    /// The Orders section of a swap with more than one attempt: each attempt's
+    /// [`SwapAttemptRow`], laid out like [`hash_row`] with a control that copies its order ID
+    /// in full.
+    fn render_attempts(
+        &self,
+        record: &ExecutorRecord,
+        attempts: &SwapAttempts<'_>,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let rows = self.attempt_rows(record, attempts, cx);
+        (!rows.is_empty()).then(|| {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .debug_selector(|| "swap-attempts".into())
+                .child(app_strong_text("Orders"))
+                .children(rows.into_iter().map(|row| {
+                    let order_id = row.order.0.to_string();
+                    let copy_id = SharedString::from(format!("swap-attempt-{order_id}-copy"));
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(hash_row(row.label, order_id, copy_id, "Copy order ID"))
+                        .child(app_muted_text(row.detail).text_xs().whitespace_normal())
+                }))
+        })
     }
 
     /// What a traded order sold and delivered, from its approved bounds and canonical
@@ -1487,7 +1642,7 @@ impl PrivateSwapsView {
             {
                 _ if across_refund
                     && record
-                        .and_then(|record| record.swap()?.orders().last())
+                        .and_then(latest_bridge_evidence)
                         .is_none_or(|order| order.observations().bridge_refund.is_none()) =>
                 {
                     Some("Check status to confirm Across's refund to the stealth account.")
@@ -2041,6 +2196,10 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a synthesized record has nothing to check.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(confirmed) = self.confirmed_block(cx) else {
             self.fail(
                 operation,
@@ -2130,9 +2289,9 @@ impl PrivateSwapsView {
     }
 
     /// A Bridge swap's explicit check. A deposit that needs attention, or whose delivery Across
-    /// only reported, is asked about again on the swap's own route, with the destination
-    /// network's settings; a refund, then or already recorded, and a deposit that wasn't sent
-    /// are looked for in the stealth account.
+    /// only reported, is asked about again on a fresh route of the swap's own, with the
+    /// destination network's settings; a refund, then or already recorded, and a deposit that
+    /// wasn't sent are looked for in the stealth account.
     fn check_bridge_status(
         &mut self,
         operation: ExecutorOperationId,
@@ -2153,7 +2312,10 @@ impl PrivateSwapsView {
             stage == SwapStage::Order(SwapOrderState::Refunding) && refunds_across_deposit(record);
         let across_reported =
             stage == SwapStage::Order(SwapOrderState::Done) && reported_by_across(record);
-        let uid = order.uid();
+        // The provider is asked about the attempt that holds the hand-off.
+        let uid = SwapAttempts::ending_at(record, order)
+            .bridge_evidence()
+            .uid();
         let buy = record
             .swap()
             .map(|swap| swap.order_terms(order).buy_token());
@@ -2184,14 +2346,15 @@ impl PrivateSwapsView {
                     });
                     let ask = async {
                         let destination = destination?;
-                        let client = match client {
-                            Some(client) => client,
-                            None => owner.swap_orderbook_client().await?,
-                        };
-                        let clients = match clients {
-                            Some(clients) => clients,
-                            None => owner.swap_bridge_clients(&client)?,
-                        };
+                        // An explicit check leaves the route the provider may have rejected.
+                        let (client, clients) =
+                            if let (Some(client), Some(clients)) = (client, clients) {
+                                owner.swap_clients_on_fresh_route(&client, &clients).await?
+                            } else {
+                                let client = owner.swap_orderbook_client().await?;
+                                let clients = owner.swap_bridge_clients(&client)?;
+                                (client, clients)
+                            };
                         let outcome = Box::pin(owner.check_swap_bridge(
                             operation,
                             uid,
@@ -2241,12 +2404,8 @@ impl PrivateSwapsView {
             move |this, (route, balance, problem), _, _| {
                 let tracking = this.tracking.entry(operation).or_default();
                 if let Some((client, clients)) = route {
-                    if tracking.orderbook.is_none() {
-                        tracking.orderbook = Some(client);
-                    }
-                    if tracking.bridge_clients.is_none() {
-                        tracking.bridge_clients = Some(clients);
-                    }
+                    tracking.orderbook = Some(client);
+                    tracking.bridge_clients = Some(clients);
                 }
                 if balance.is_some() {
                     tracking.stealth_balance = balance;
@@ -2518,6 +2677,10 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: no wallet holds a synthesized record's account.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(record) = self.record(operation) else {
             return;
         };
@@ -2662,6 +2825,10 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a synthesized record isn't stored, so it can't be hidden.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let Some(origin) = self.private_owner() else {
             return;
         };
@@ -2678,28 +2845,39 @@ impl PrivateSwapsView {
     }
 }
 
-/// Whether the record's latest order is an Across Bridge order, whose refund an explicit check
+/// The attempt of the record's latest swap that holds its bridge evidence: the one that
+/// delivered its trade, or its latest order while nothing is delivered.
+fn latest_bridge_evidence(record: &ExecutorRecord) -> Option<&SwapOrderRecord> {
+    let latest = record.swap()?.orders().last()?;
+    Some(SwapAttempts::ending_at(record, latest).bridge_evidence())
+}
+
+/// Whether the record's latest swap bridges with Across, whose refund an explicit check
 /// verifies on this network.
 fn refunds_across_deposit(record: &ExecutorRecord) -> bool {
-    record
-        .swap()
-        .and_then(|swap| swap.orders().last())
+    latest_bridge_evidence(record)
         .is_some_and(|order| matches!(order.bridge(), Some(BridgeOrderTerms::Across(_))))
 }
 
-/// Whether the record's latest order is an Across Bridge order whose delivery only Across
-/// reported, which an explicit check asks Across about again.
+/// Whether the record's latest swap bridges with Across and only Across reported its
+/// delivery, which an explicit check asks Across about again.
 fn reported_by_across(record: &ExecutorRecord) -> bool {
     refunds_across_deposit(record)
-        && record
-            .swap()
-            .and_then(|swap| swap.orders().last())
-            .is_some_and(|order| {
-                matches!(
-                    order.observations().bridge_outcome,
-                    Some(SwapBridgeOutcome::DeliveredReported { .. })
-                )
-            })
+        && latest_bridge_evidence(record).is_some_and(|order| {
+            matches!(
+                order.observations().bridge_outcome,
+                Some(SwapBridgeOutcome::DeliveredReported { .. })
+            )
+        })
+}
+
+/// One attempt of a swap, as the detail's Orders section lists it.
+pub(super) struct SwapAttemptRow {
+    /// "Order 1 · Bridge deposit", or the attempt's own state after its number.
+    pub(super) label: String,
+    pub(super) order: OrderUid,
+    /// "Minimum 248.71 USDC · valid until Today 14:32".
+    pub(super) detail: String,
 }
 
 /// A hash, shortened, with a control that copies it in full.
@@ -2816,10 +2994,19 @@ pub(super) fn fact_row(label: impl Into<SharedString>, value: impl gpui::IntoEle
 }
 
 /// Earlier attempts of this pair on the swap's stealth account that ended without a fill.
-fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>) -> Option<String> {
+/// `delivery`, the attempt whose bridge deposit delivered a later attempt's trade, isn't one.
+fn earlier_attempts_note(
+    record: &ExecutorRecord,
+    range: std::ops::Range<usize>,
+    delivery: Option<&SwapOrderRecord>,
+) -> Option<String> {
     let orders = record.swap()?.orders().get(range)?;
     // Only a swap's last order can trade, so its earlier orders all ended without a fill.
     let (_, earlier) = orders.split_last()?;
+    let earlier = earlier
+        .iter()
+        .filter(|order| delivery.is_none_or(|delivery| delivery.uid() != order.uid()))
+        .collect::<Vec<_>>();
     let expired = |order: &SwapOrderRecord| {
         let observed = order.observations();
         observed.expired.is_some()
@@ -2827,14 +3014,14 @@ fn earlier_attempts_note(record: &ExecutorRecord, range: std::ops::Range<usize>)
                 .pre_hook_dead
                 .is_some_and(|death| death.cause == SwapPreHookDeathCause::Expired)
     };
-    match earlier {
+    match earlier.as_slice() {
         [] => None,
         [order] if expired(order) => Some(format!(
             "1 earlier attempt expired at {} without a fill.",
             local_time_label(u64::from(order.valid_to()))
         )),
         [_] => Some("1 earlier attempt ended without a fill.".into()),
-        orders if orders.iter().all(expired) => Some(format!(
+        orders if orders.iter().all(|order| expired(order)) => Some(format!(
             "{} earlier attempts expired without a fill.",
             orders.len()
         )),

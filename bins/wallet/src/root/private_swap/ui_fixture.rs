@@ -1,7 +1,8 @@
-//! A debug-only fixture for looking at the Public account swap screens, at the Stealth
-//! accounts inspector and at the refund dialog of a blocked Shield: it opens them on a
-//! scratch wallet without private funds and holds a chosen state on screen. It is compiled
-//! only with `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
+//! A debug-only fixture for looking at the Public account swap screens, at a private swap's
+//! retry review and split outcome, at the Stealth accounts inspector and at the refund dialog
+//! of a blocked Shield: it opens them on a scratch wallet without private funds and holds a
+//! chosen state on screen. It is compiled only with `debug_assertions`, and does nothing
+//! unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
@@ -48,28 +49,50 @@
 //!   `accounts` mode, whose two accounts Stealth accounts then shows, and that of `inactive`
 //!   is an inactive Public account labelled Savings. `unresolved` is a Shield transaction
 //!   that couldn't be read, which has no origin.
+//! - `retry-review` opens the private swap form in place of a Public account's, on Ethereum
+//!   with its private session started: the retry of a synthesized swap that sells 0.05 WETH
+//!   for USDC delivered by Across to a public receiver on Arbitrum One. Its first order
+//!   expired with an approved delivery of 90 USDC, and the form holds a synthesized quote that
+//!   delivers 100, so it shows the earlier order's warning with its checkbox. Ticking it
+//!   enables Review…, which opens the review with its Earlier approval row and warning.
+//!   Approving the review takes the vault password and ends in an error on the form. The form
+//!   asks for no quote and no routes, so another gas share leaves Review… waiting for a bridge
+//!   quote until the share is set back.
+//! - `split:<stage>` opens the swap dialog, in place of a Public account's form, on the detail
+//!   of that swap once its retry traded and the settlement made the expired first order's
+//!   deposit: `bridging` has the hand-off and no outcome, `delivered` a verified delivery of 90
+//!   USDC under the first order's minimum while the retry approved 100, `refunding` Across's
+//!   report of a refund that isn't verified, and `refund-verified` the verified refund with
+//!   the deposit found in the stealth account, where Recover… is offered. `unverified` is one
+//!   order whose verified trade showed no deposit, for comparison. Copy buttons work, and the
+//!   detail's other actions do nothing.
 //!
-//! In every mode the jobs of a swap paid from a Public account are scripted: nothing is
-//! claimed, signed, paid or sent, and no record is written. The synthesized records live in
-//! memory only.
+//! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
+//! signed, paid or sent, and no record is written. The synthesized records live in memory
+//! only, and nothing reads, tracks or acts on them. A `retry-review` mode opens the route its
+//! orderbook client would use, and sends nothing on it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alloy::eips::BlockNumHash;
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use gpui::{App, Context, Window};
+use wallet_ops::cow::OrderUid;
+use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
-    BridgeShieldFailure, ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId,
+    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeShieldFailure,
+    BridgeSurplus, ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId,
     ExecutorPayloadContext, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
     PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent, PublicSwapObservations,
     PublicSwapRecord, SwapApprovedAccount, SwapApprovedBounds, SwapBridgeHandoff,
-    SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapProof,
-    SwapRecipient, SwapTerms, SwapUseId,
+    SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapPreHookDeath,
+    SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapTerms, SwapTradeAmounts, SwapUseId,
 };
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
+    OperationNetworkIsolation, PairAnchorRate, SwapContinuingApproval, SwapReview,
     SwapReviewChange,
 };
 
@@ -99,6 +122,20 @@ enum Mode {
     Detail(Detail),
     Accounts,
     Refund(Refund),
+    RetryReview,
+    Split(Split),
+}
+
+/// What the detail of a `split:` mode's private swap shows of its Across deposit, which the
+/// expired first order holds while the retry holds the trade. `Unverified` is one order whose
+/// trade showed no deposit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Split {
+    Bridging,
+    Delivered,
+    Refunding,
+    RefundVerified,
+    Unverified,
 }
 
 /// Where the Buy picker holds a network's setup-fee check.
@@ -160,6 +197,19 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "accounts" {
         return Some(Mode::Accounts);
+    }
+    if value == "retry-review" {
+        return Some(Mode::RetryReview);
+    }
+    if let Some(stage) = value.strip_prefix("split:") {
+        return Some(Mode::Split(match stage {
+            "bridging" => Split::Bridging,
+            "delivered" => Split::Delivered,
+            "refunding" => Split::Refunding,
+            "refund-verified" => Split::RefundVerified,
+            "unverified" => Split::Unverified,
+            _ => return None,
+        }));
     }
     if let Some(state) = value.strip_prefix("fee:") {
         return Some(Mode::Fee(match state {
@@ -252,6 +302,19 @@ pub(super) fn holds_records() -> bool {
     matches!(mode(), Some(Mode::Detail(_) | Mode::Flow(_)))
 }
 
+/// Whether the private swap records are the fixture's own, which nothing reads again, quotes,
+/// tracks or acts on. A `retry-review` mode has none until its form is opened.
+pub(super) fn holds_swaps() -> bool {
+    matches!(mode(), Some(Mode::RetryReview | Mode::Split(_)))
+}
+
+/// What approving the review of a `retry-review` mode ends in, in place of placing its order.
+/// `None` in every other mode.
+pub(super) fn review_refusal() -> Option<&'static str> {
+    matches!(mode(), Some(Mode::RetryReview))
+        .then_some("Fixture: this mode stops at the review. Nothing was sent.")
+}
+
 /// The setup fee that stands in for a new destination account's estimate, in a token of
 /// `decimals`. `None` unless a fixture mode is on.
 pub(super) fn setup_fee(decimals: u8) -> Option<U256> {
@@ -310,7 +373,9 @@ pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
             | Mode::Fee(_)
             | Mode::Detail(_)
             | Mode::Accounts
-            | Mode::Refund(_),
+            | Mode::Refund(_)
+            | Mode::RetryReview
+            | Mode::Split(_),
             Phase::Approved,
         ) => (
             Duration::ZERO,
@@ -637,6 +702,284 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
         }]
     }))
     .ok()
+}
+
+/// The network the private swap of a `retry-review` or `split:` mode sells on.
+const SWAP_ORIGIN: u64 = 1;
+const WETH: Address = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+/// The swap's stealth account. No wallet holds it.
+const SWAP_ACCOUNT: Address = address!("b41d7e0c95a23f6841c7d02e9a5b63f18c4e7a2d");
+/// Across delivers the swap's USDC on Arbitrum One to a public receiver no wallet holds.
+const SWAP_DELIVERY: BridgeDelivery = BridgeDelivery {
+    provider: BridgeProvider::Across,
+    destination_chain: 42_161,
+    receiver: address!("7f2c9d3a41b8e65c0d9a4b17e3f8a6c25d1b09e4"),
+    destination_token: address!("af88d065e77c8cc2239327c5edb3a432268e5831"),
+    surplus: BridgeSurplus::Reshield,
+    private: None,
+};
+/// The private spend, 0.05 WETH, and what Railgun's unshield fee leaves of it to sell.
+const SWAP_SPEND: u64 = 50_000_000_000_000_000;
+const SWAP_SELL: u64 = 49_875_000_000_000_000;
+/// The USDC each order deposits with Across and the USDC that deposit delivers: 90 for the
+/// first order, and 100 for its retry.
+const FIRST_ORDER: (u64, u64) = (90_420_000, 90_000_000);
+const RETRY: (u64, u64) = (100_460_000, 100_000_000);
+/// What the trade bought, 101.31 USDC.
+const SWAP_BOUGHT: u64 = 101_312_480;
+
+/// Order `attempt` of the synthesized private swap, as its record stores it: signed at `signed`
+/// for 20 minutes, with a deposit that Across has four hours to fill. `hash` tells its ID and
+/// its hooks, at nonces 1 and 2, apart from another order's.
+fn staged_order(
+    attempt: u32,
+    signed: u64,
+    (deposit, minimum): (u64, u64),
+    hash: u8,
+    observations: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let quoted = u32::try_from(signed).ok()?;
+    let uid = OrderUid::new(keccak256([hash]), SWAP_ACCOUNT, quoted.checked_add(1_200)?);
+    Some(serde_json::json!({
+        "attempt": attempt, "uid": uid.0, "delivery": SwapDelivery::Bridge(SWAP_DELIVERY),
+        "bounds": {
+            "sell_amount": U256::from(SWAP_SELL), "unshield_amount": U256::from(SWAP_SPEND),
+            "unshield_fee_bps": U256::from(25_u8), "buy_amount": U256::from(deposit),
+            "private_minimum": U256::from(deposit), "shield_fee_bps": U256::ZERO,
+            "slippage_bps": 50, "pre_hook_gas_limit": 1_045_000, "post_hook_gas_limit": 396_000,
+            "anchors": [], "destination_minimum": U256::from(minimum), "gas_share_bps": 2_500,
+            "gas_estimate": U256::from(492_000_u32), "gas_allowance": U256::from(123_000_u32),
+            "gas_price_wei": 120_000_000, "valid_for_secs": 1_200
+        },
+        "pre_hook": { "nonce": U256::ONE, "payload": B256::repeat_byte(hash) },
+        "post_hook": { "nonce": U256::from(2_u8), "payload": B256::repeat_byte(hash + 1) },
+        "invalidates": null, "observations": observations, "submission_status": "Accepted",
+        "bridge": BridgeOrderTerms::Across(AcrossOrderTerms {
+            spoke_pool: address!("5c7bcd6e7de5423a257d81b442095a1a6ced35c5"),
+            input_token: USDC,
+            output_token: SWAP_DELIVERY.destination_token,
+            input_amount: U256::from(deposit),
+            output_amount: U256::from(minimum),
+            quote_timestamp: quoted,
+            fill_deadline: quoted.checked_add(14_400)?,
+            exclusive_relayer: Address::ZERO,
+            exclusivity_parameter: 0,
+            recipient: None,
+            message_hash: None,
+        }),
+    }))
+}
+
+/// The record of the synthesized private swap, decoded from the JSON a stored record has.
+/// Without `split`, its first order expired and nothing ran. With it, the retry traded and its
+/// settlement made the first order's deposit, whose outcome the stage names. `Unverified` is
+/// one order instead, whose trade showed no deposit.
+fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
+    use ExecutorPayloadPurpose::{Operation, SwapPostHook, SwapPreHook};
+    const ORIGIN_BLOCK: u64 = 24_612_480;
+    let now = now_unix();
+    // A refund follows the deposit's fill deadline.
+    let refunds = matches!(split, Some(Split::Refunding | Split::RefundVerified));
+    let signed = now.saturating_sub(if refunds { 18_000 } else { 3_000 });
+    let at = |block: u64, transaction: Option<&str>| SwapObservation {
+        block: BlockNumHash::new(ORIGIN_BLOCK + block, keccak256(block.to_be_bytes())),
+        transaction_hash: transaction.map(keccak256),
+    };
+    let value = |observed: SwapOrderObservations| serde_json::to_value(observed).ok();
+    // The first order's 20 minutes are 100 blocks, and the retry is signed 25 blocks later.
+    let expired = SwapPreHookDeath {
+        cause: SwapPreHookDeathCause::Expired,
+        observation: at(110, None),
+    };
+    let single = split == Some(Split::Unverified);
+    let settlement = at(if single { 40 } else { 160 }, Some("settlement"));
+    let traded = SwapOrderObservations {
+        traded: Some(settlement),
+        trade_amounts: Some(SwapTradeAmounts {
+            sell_amount: U256::from(SWAP_SELL),
+            buy_amount: U256::from(SWAP_BOUGHT),
+            fee_amount: U256::ZERO,
+            settlement_gas_used: Some(1_386_204),
+            settlement_effective_gas_price: Some(410_000_000),
+            executed_fee: Some(U256::from(11_400_000_000_000_u64)),
+            executed_fee_token: Some(WETH),
+        }),
+        ..Default::default()
+    };
+    // The orders, and the account's nonce once their hooks ran.
+    let (orders, nonce) = match split {
+        None => {
+            let ended = value(SwapOrderObservations {
+                pre_hook_dead: Some(expired),
+                expired: Some(expired.observation),
+                ..Default::default()
+            })?;
+            (
+                vec![staged_order(0, signed, FIRST_ORDER, 0xa1, &ended)?],
+                1_u8,
+            )
+        }
+        // The pre-hook ran and the post-hook, which deposits, didn't.
+        Some(Split::Unverified) => {
+            let traded = value(SwapOrderObservations {
+                pre_hook_executed: Some(settlement),
+                ..traded
+            })?;
+            (vec![staged_order(0, signed, RETRY, 0xa1, &traded)?], 2)
+        }
+        Some(split) => {
+            let outcome = match split {
+                Split::Delivered => Some(SwapBridgeOutcome::DeliveredVerified {
+                    block: BlockNumHash::new(402_118_977, keccak256("fill block")),
+                    transaction_hash: keccak256("fill"),
+                    output_amount: U256::from(FIRST_ORDER.1),
+                    shielded: false,
+                }),
+                Split::Refunding | Split::RefundVerified => Some(SwapBridgeOutcome::Refunding),
+                Split::Bridging | Split::Unverified => None,
+            };
+            let mut deposit = value(SwapOrderObservations {
+                pre_hook_dead: Some(expired),
+                delivered: Some(settlement),
+                bridge_handoff: Some(SwapBridgeHandoff {
+                    observation: settlement,
+                    deposit_id: Some(U256::from(3_481_207_u32)),
+                }),
+                bridge_outcome: outcome,
+                bridge_refund: (split == Split::RefundVerified).then(|| at(1_420, Some("refund"))),
+                ..Default::default()
+            })?;
+            // The settlement reshielded what the trade bought beyond the deposit, less the
+            // shield fee.
+            deposit["settlement_credit"] = serde_json::json!({
+                "observation": settlement,
+                "private_amount": U256::from(10_865_249_u32), "fee": U256::from(27_231_u32)
+            });
+            (
+                vec![
+                    staged_order(0, signed, FIRST_ORDER, 0xa1, &deposit)?,
+                    staged_order(1, signed + 1_500, RETRY, 0xb1, &value(traded)?)?,
+                ],
+                3,
+            )
+        }
+    };
+    let mut issued = vec![staged_payload(0, 0xa0, Operation, Some(0xc0))];
+    for hash in [0xa1, 0xb1].into_iter().take(orders.len()) {
+        issued.push(staged_payload(1, hash, SwapPreHook, None));
+        issued.push(staged_payload(2, hash + 1, SwapPostHook, None));
+    }
+    serde_json::from_value(serde_json::json!({
+        "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
+        "operation": ExecutorOperationId::random().ok()?, "index": 4,
+        "address": SWAP_ACCOUNT, "delegate": Address::repeat_byte(0x5d), "retired": false,
+        "created_at": signed.saturating_sub(300),
+        "issued": issued.into_iter().collect::<Option<Vec<_>>>()?,
+        "nonce_watermark": ExecutorNonceWatermark::new(U256::from(nonce), ORIGIN_BLOCK + 1_500),
+        "swap": {
+            "terms": SwapTerms::new(
+                WETH,
+                USDC,
+                SwapRecipient::new(U256::ONE, [0; 32]),
+                B256::repeat_byte(0xa0),
+            ),
+            "proof": SwapProof::new(keccak256("proof"), Vec::new()),
+            "orders": orders,
+        },
+    }))
+    .ok()
+}
+
+/// The record and the review a `retry-review` mode holds its form on: the swap's expired first
+/// order, and a quote for its retry that delivers 100 USDC while that order's approval of 90
+/// can still decide the delivery. `None` unless the mode is on.
+pub(super) fn retry_review(
+    profile: &SwapProfile,
+    isolation: OperationNetworkIsolation,
+) -> Option<(ExecutorRecord, SwapReview)> {
+    if !matches!(mode(), Some(Mode::RetryReview)) {
+        return None;
+    }
+    let record = staged_swap(None)?;
+    let first = record.swap()?.orders().first()?;
+    let BridgeOrderTerms::Across(deposit) = first.bridge()? else {
+        return None;
+    };
+    let earlier = SwapContinuingApproval {
+        uid: first.uid(),
+        attempt: first.attempt(),
+        destination_minimum: deposit.output_amount,
+        post_hook_nonce: first.post_hook()?.nonce(),
+        quote_timestamp: deposit.quote_timestamp,
+    };
+    let review = SwapReview::for_ui_fixture(
+        profile,
+        &record,
+        WETH,
+        USDC,
+        U256::from(SWAP_SPEND),
+        U256::from(101_180_000_u32),
+        // 2,030 USDC for one ETH, each in base units for one whole native token.
+        PairAnchorRate {
+            sell_rate: U256::from(1_000_000_000_000_000_000_u64),
+            buy_rate: U256::from(2_030_000_000_u32),
+        },
+        120_000_000,
+        SWAP_DELIVERY,
+        U256::from(RETRY.1),
+        U256::from(RETRY.1),
+        vec![earlier],
+        isolation,
+    );
+    match review {
+        Ok(review) => Some((record, review)),
+        Err(error) => {
+            tracing::warn!(%error, "the debug UI fixture couldn't synthesize its review");
+            None
+        }
+    }
+}
+
+impl PrivateSwapsView {
+    /// In a `retry-review` or `split:` mode, show the synthesized private swap in place of
+    /// the Public account form that was asked for. `true` when such a mode is on.
+    pub(super) fn open_ui_fixture_swap(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let split = match mode() {
+            Some(Mode::RetryReview) => None,
+            Some(Mode::Split(split)) => Some(split),
+            _ => return false,
+        };
+        if self.origin_chain_id != SWAP_ORIGIN {
+            tracing::warn!("the debug UI fixture's private swap is on Ethereum: select it first");
+            return true;
+        }
+        let Some(split) = split else {
+            self.open_ui_fixture_retry_review(window, cx);
+            return true;
+        };
+        let Some(record) = staged_swap(Some(split)) else {
+            tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
+            return true;
+        };
+        let operation = record.operation();
+        // What an explicit check found in the stealth account: the refunded deposit.
+        if let Some(refund) = record
+            .swap()
+            .and_then(|swap| swap.orders().first())
+            .and_then(|order| order.observations().bridge_refund)
+        {
+            self.tracking.entry(operation).or_default().stealth_balance =
+                Some((U256::from(FIRST_ORDER.0), refund.block));
+        }
+        self.records = vec![record];
+        self.show_detail(operation, window, cx);
+        true
+    }
 }
 
 /// The stealth accounts an `accounts` or `refund:stealth` mode shows in place of the

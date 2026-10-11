@@ -6676,6 +6676,7 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
                     bridge: None,
                     destination_minimum: Some(approved),
+                    continuing_minimum: None,
                     full_review: false,
                     swap_use: None,
                     pair_destination: None,
@@ -6696,6 +6697,149 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                         .row_hint_for_test("Bridge")
                         .is_some_and(|terms| terms.contains("surplus is reshielded on Ethereum"))
                 );
+            });
+        },
+    );
+}
+
+/// A retry whose earlier order approved a lower Across minimum says so before and in its
+/// review, asks for acceptance of that delivery for each quote, and binds the accepted minimum
+/// into the approval. A signing round that finds a lower one than was accepted places nothing.
+#[gpui::test]
+fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestAppContext) {
+    use broadcaster_core::contracts::cow::OrderUid;
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, operation, runtime, cx| {
+            open_bridge_form(root, swaps, &stubs, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
+                });
+            });
+            // The form's quote with an earlier order's approval at 90% of its minimum.
+            let quote_retry = |cx: &mut gpui::VisualTestContext| {
+                let quoted = refreshed_review(swaps, runtime, cx);
+                let minimum = quoted.bridge().unwrap().destination_minimum;
+                let lower = minimum * U256::from(9) / U256::from(10);
+                let review = Arc::new((*quoted).clone().with_continuing_for_tests(vec![
+                    wallet_ops::SwapContinuingApproval {
+                        uid: OrderUid::new(B256::repeat_byte(0x11), Address::repeat_byte(3), 20),
+                        attempt: 0,
+                        destination_minimum: lower,
+                        post_hook_nonce: U256::from(2),
+                        quote_timestamp: 1,
+                    },
+                ]));
+                assert_eq!(review.continuing_minimum(), Some(lower));
+                cx.update(|_, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        // Only the earlier approval is left to accept.
+                        let form = swaps.form.as_mut().unwrap();
+                        form.price_acknowledged = true;
+                        form.high_costs_acknowledged = true;
+                        form.quote = QuoteState::Ready(Arc::clone(&review));
+                        cx.notify();
+                    });
+                });
+                (review, minimum, lower)
+            };
+            let (review, minimum, lower) = quote_retry(cx);
+
+            // The review stays closed until the lower delivery is accepted in the form.
+            swaps.read_with(cx, |swaps, _| {
+                let form = swaps.form.as_ref().unwrap();
+                assert!(!form.continuing_acknowledged);
+                assert!(form.review_problem(&review).is_some());
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let checkbox = cx.debug_bounds("swap-continuing-acknowledged").unwrap();
+            cx.simulate_click(
+                gpui::point(checkbox.left() + gpui::px(8.), checkbox.center().y),
+                gpui::Modifiers::none(),
+            );
+            swaps.read_with(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().unwrap();
+                assert!(form.continuing_acknowledged);
+                assert_eq!(form.review_problem(&review), None);
+
+                // The review names both minimums on the destination network.
+                let amount =
+                    |amount| swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx);
+                let earlier = format!("{} on Polygon", amount(lower));
+                let summary = swaps.swap_summary(&review, None, None, None, cx);
+                assert!(
+                    summary
+                        .rows_for_test()
+                        .contains(&("Earlier approval".to_owned(), earlier.clone())),
+                    "{:?}",
+                    summary.rows_for_test()
+                );
+                assert_eq!(
+                    summary.receive_card_for_test().map(|(_, amount, _)| amount),
+                    Some(amount(minimum)),
+                    "the Receive card keeps this order's minimum"
+                );
+                let own = amount(minimum);
+                assert!(
+                    summary
+                        .warnings_for_test()
+                        .iter()
+                        .any(|warning| warning.contains(&earlier) && warning.contains(&own)),
+                    "{:?}",
+                    summary.warnings_for_test()
+                );
+            });
+
+            // Another quote asks again.
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_slippage(100, window, cx);
+                    assert!(
+                        !swaps.form.as_ref().unwrap().continuing_acknowledged,
+                        "acceptance of the previous quote cannot carry across changed terms"
+                    );
+                });
+            });
+            let (review, _, lower) = quote_retry(cx);
+
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // The order's review, as the swap's own form opens it.
+                    let form = swaps.form.as_mut().unwrap();
+                    form.operation = Some(operation);
+                    form.continuing_acknowledged = true;
+                    swaps.request_order_review(None, window, cx);
+                    let pending = swaps
+                        .pending_authorization
+                        .clone()
+                        .unwrap_or_else(|| panic!("{:?}", swaps.form.as_ref().unwrap().error));
+                    let SwapAction::Order(approval) = &pending.action else {
+                        panic!("the order's review");
+                    };
+                    assert!(Arc::ptr_eq(&approval.review, &review));
+                    assert_eq!(approval.continuing_minimum, Some(lower));
+
+                    // Signing found a lower minimum than the one accepted. Nothing is placed,
+                    // and the acceptance is asked for again.
+                    let change = SwapReviewChange::ContinuingApproval {
+                        approved: U256::ZERO,
+                        current: lower,
+                    };
+                    swaps.finish_order(
+                        operation,
+                        wallet_ops::SwapOrderOutcome::ReviewRequired(change),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(swaps.reapproval, Some((operation, change)));
+                    assert!(swaps.job.is_none(), "no order is placed");
+                    let form = swaps.form.as_ref().unwrap();
+                    assert_eq!(form.operation, Some(operation));
+                    assert!(!form.continuing_acknowledged);
+                });
             });
         },
     );
@@ -6927,6 +7071,7 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                         orderbook: form.orderbook.clone().unwrap(),
                         bridge: None,
                         destination_minimum: Some(approved),
+                        continuing_minimum: None,
                         full_review: false,
                         swap_use: None,
                         pair_destination: None,
@@ -6992,6 +7137,7 @@ fn private_bridge_approval_expires_when_the_destination_session_ends(cx: &mut Te
                         operation,
                         private_minimum: review.suggested_private_minimum(),
                         destination_minimum: Some(review.bridge().unwrap().destination_minimum),
+                        continuing_minimum: None,
                         review: Arc::clone(&review),
                         price_acknowledged: true,
                         orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
@@ -7130,6 +7276,7 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
                     orderbook: swaps.form.as_ref().unwrap().orderbook.clone().unwrap(),
                     bridge: None,
                     destination_minimum: Some(destination_minimum),
+                    continuing_minimum: None,
                     full_review: false,
                     swap_use: None,
                     pair_destination: None,
@@ -8194,11 +8341,13 @@ fn bridge_observations(
 
 /// An Across Bridge swap names its destination and provider from the hand-off through each
 /// outcome, and its detail shows the bridge's facts rather than a private-balance outcome.
-/// Recover… for a refund waits until a check verified the refund and finds funds in the
-/// stealth account, and recovery opens with that check's balance.
+/// A trade without its deposit leaves the hand-off unverified until an account read finds the
+/// bought token in the stealth account, which alone offers recovery. Recover… for a refund
+/// waits until a check verified the refund and finds funds in the stealth account, and
+/// recovery opens with that check's balance.
 #[gpui::test]
 fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContext) {
-    use crate::root::public_action::PublicActionStepStatus::{Done, Pending, Warning};
+    use crate::root::public_action::PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
     use alloy::eips::BlockNumHash;
     use alloy::primitives::B256;
     use wallet_ops::vault::{
@@ -8235,6 +8384,11 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
             undelivered: handed_off(None).traded,
             ..handed_off(None)
         };
+        // The settlement showed no deposit, and no account read has found the payout yet.
+        let unverified = SwapOrderObservations {
+            undelivered: None,
+            ..not_sent
+        };
         for (observations, state, last, status) in [
             (
                 handed_off(None),
@@ -8257,6 +8411,12 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
                 SwapOrderState::Done,
                 ("Delivered on Polygon · verified", Done),
                 "Delivered",
+            ),
+            (
+                unverified,
+                SwapOrderState::Traded,
+                ("Delivered on Polygon", NotStarted),
+                "Traded",
             ),
             (
                 not_sent,
@@ -8284,6 +8444,27 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
                     let steps = model::swap_steps(stage, &labels);
                     let shown = steps.last().unwrap();
                     assert_eq!((shown.label.as_str(), shown.status), last, "{state:?}");
+                    // A trade without its deposit reads as unverified. Only the account read
+                    // names the stealth account as holding the token and offers recovery.
+                    let step_shown = |label: &str, status| {
+                        steps
+                            .iter()
+                            .any(|step| step.label == label && step.status == status)
+                    };
+                    assert_eq!(
+                        (
+                            step_shown("Bridge deposit unverified", Pending),
+                            step_shown("Not sent to the bridge", Warning)
+                        ),
+                        (
+                            state == SwapOrderState::Traded,
+                            state == SwapOrderState::NotDelivered
+                        ),
+                        "{state:?}"
+                    );
+                    if state == SwapOrderState::Traded {
+                        assert!(!model::swap_actions(stage, false).recover);
+                    }
                     // The swap's destination is another network, never the private balance.
                     let card = model::swap_card_line(stage, &labels);
                     assert!(
@@ -8313,6 +8494,19 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
                 cx.debug_bounds("swap-detail-receiver").is_some(),
                 "{state:?}"
             );
+            // A swap with one order has no Orders section.
+            assert!(cx.debug_bounds("swap-attempts").is_none(), "{state:?}");
+            if matches!(state, SwapOrderState::Traded | SwapOrderState::NotDelivered) {
+                assert!(
+                    cx.debug_bounds("swap-progress-check").is_some(),
+                    "{state:?}"
+                );
+                assert_eq!(
+                    cx.debug_bounds("swap-progress-recover").is_some(),
+                    state == SwapOrderState::NotDelivered,
+                    "{state:?}"
+                );
+            }
         }
         // Delivered, the swap is labelled with the verified amount on Polygon.
         executors
@@ -8373,6 +8567,296 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
 /// swap once the deposit refunds; only a recovery after the verified refund does.
 #[gpui::test]
 fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestAppContext) {
+    across_refund_recovery(cx, false);
+}
+
+/// The same when a retry holds the trade and the expired first attempt, whose signed terms the
+/// deposit matched, holds the hand-off and its refund. The swap's stage is the retry's.
+#[gpui::test]
+fn a_refund_on_another_attempt_is_recovered_only_after_its_verified_refund(
+    cx: &mut TestAppContext,
+) {
+    across_refund_recovery(cx, true);
+}
+
+/// Expires the Bridge order `first` untraded with `expired`, then places a retry of its swap
+/// use at the same nonces, with `edit` applied to the retry's approved bounds, and records the
+/// trade on the retry. Returns the retry's UID.
+fn retried_and_traded(
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    first: broadcaster_core::contracts::cow::OrderUid,
+    observed: wallet_ops::vault::ExecutorNonceObservation,
+    expired: wallet_ops::vault::SwapPreHookDeath,
+    edit: impl FnOnce(&mut wallet_ops::vault::SwapApprovedBounds),
+) -> broadcaster_core::contracts::cow::OrderUid {
+    use alloy::primitives::{B256, Bytes};
+    use broadcaster_core::contracts::cow::OrderUid;
+    use wallet_ops::vault::{
+        ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAttempt,
+        SwapOrderObservations,
+    };
+
+    executors
+        .record_swap_observations(
+            operation,
+            first,
+            SwapOrderObservations {
+                pre_hook_dead: Some(expired),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let record = executors
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap();
+    let delegate = record.issued()[0].delegate();
+    let swap = record.swap().unwrap();
+    let order = &swap.orders()[0];
+    let inputs = swap.proof().inputs().to_vec();
+    let hook = |nonce: u64, hash, purpose, inputs| {
+        IssuedExecutorPayload::new(
+            U256::from(nonce),
+            delegate,
+            B256::repeat_byte(hash),
+            purpose,
+            ExecutorPayloadContext::new(Bytes::from_static(b"retry"), observed, inputs),
+        )
+    };
+    let retry = OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), 20);
+    let mut bounds = order.bounds().clone();
+    edit(&mut bounds);
+    executors
+        .record_swap_attempt(
+            operation,
+            SwapAttempt {
+                use_id: order.use_id().unwrap(),
+                terms: *swap.terms(),
+                proof: swap.proof().clone(),
+                uid: retry,
+                submission: None,
+                delivery: order.delivery(),
+                bounds,
+                invalidates: None,
+                pre_hook: hook(1, 0x21, ExecutorPayloadPurpose::SwapPreHook, inputs),
+                post_hook: Some(hook(
+                    2,
+                    0x22,
+                    ExecutorPayloadPurpose::SwapPostHook,
+                    Vec::new(),
+                )),
+                bridge: order.bridge().cloned(),
+            },
+        )
+        .unwrap();
+    let traded = bridge_observations(observed, None, None);
+    executors
+        .record_swap_observations(
+            operation,
+            retry,
+            SwapOrderObservations {
+                traded: traded.traded,
+                trade_amounts: traded.trade_amounts,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    retry
+}
+
+/// `handed_off`, a traded Bridge order's observations, as the attempt that expired untraded
+/// holds them once a later attempt's settlement made its deposit.
+fn deposit_of_a_later_trade(
+    handed_off: &wallet_ops::vault::SwapOrderObservations,
+    expired: wallet_ops::vault::SwapPreHookDeath,
+) -> wallet_ops::vault::SwapOrderObservations {
+    wallet_ops::vault::SwapOrderObservations {
+        pre_hook_executed: None,
+        traded: None,
+        trade_amounts: None,
+        pre_hook_dead: Some(expired),
+        ..*handed_off
+    }
+}
+
+/// A retry approved a higher destination minimum than the expired first attempt, traded, and
+/// its settlement made the first attempt's deposit. The swap is one entry that follows that
+/// deposit: its delivery is held to the first attempt's minimum, the retry's minimum is named
+/// as not applying, both orders are listed with their own terms, and a refund is recovered
+/// from the first attempt's verified refund.
+#[gpui::test]
+fn a_delivery_under_an_earlier_attempts_terms_keeps_each_attempts_minimum(cx: &mut TestAppContext) {
+    use crate::root::public_action::PublicActionStepStatus::{Done, Warning};
+    use alloy::eips::BlockNumHash;
+    use alloy::primitives::B256;
+    use wallet_ops::vault::{
+        BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome, SwapObservation,
+        SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
+    };
+
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let bridge = BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+            private: None,
+        };
+        let (uid, observed) = placed_swap(executors, operation, SwapDelivery::Bridge(bridge));
+        let higher = BRIDGE_MINIMUM + U256::from(10_000_000);
+        let expired = SwapPreHookDeath {
+            cause: SwapPreHookDeathCause::Expired,
+            observation: SwapObservation {
+                block: observed.block(),
+                transaction_hash: None,
+            },
+        };
+        let retry = retried_and_traded(executors, operation, uid, observed, expired, |bounds| {
+            bounds.destination_minimum = Some(higher);
+        });
+        let handed_off = |outcome| {
+            deposit_of_a_later_trade(
+                &bridge_observations(observed, Some(U256::from(7)), outcome),
+                expired,
+            )
+        };
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                handed_off(Some(SwapBridgeOutcome::DeliveredVerified {
+                    block: BlockNumHash::new(71_904_233, B256::repeat_byte(60)),
+                    transaction_hash: B256::repeat_byte(61),
+                    output_amount: BRIDGE_MINIMUM,
+                    shielded: false,
+                })),
+            )
+            .unwrap();
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                let stage = swaps.stage(record);
+                assert_eq!(stage, SwapStage::Order(SwapOrderState::Done));
+                let amount =
+                    |amount| swaps.network_token_amount(137, STUB_POLYGON_USDC, amount, cx);
+                let (approved, unmet) = (amount(BRIDGE_MINIMUM), amount(higher));
+                // The delivered amount and the minimum it is held to are the deposit's. The
+                // order step keeps the latest order's ID.
+                let labels = swaps.labels(record, cx);
+                assert_eq!(labels.received.as_ref(), Some(&approved));
+                assert_eq!(
+                    labels.bridge.as_ref().unwrap().minimum.as_ref(),
+                    Some(&approved)
+                );
+                assert_eq!(labels.order, Some(retry));
+                let steps = model::swap_steps(stage, &labels);
+                assert_eq!(
+                    steps[1..]
+                        .iter()
+                        .map(|step| (step.label.as_str(), step.status))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Order open", Done),
+                        ("Bridge deposit", Done),
+                        ("Delivered on Polygon · verified", Done),
+                    ]
+                );
+                let latest = record.swap().unwrap().orders().last().unwrap();
+                let attempts = model::SwapAttempts::ending_at(record, latest);
+                let note = swaps.earlier_minimum_note(&attempts, bridge, cx).unwrap();
+                assert!(note.contains(&approved) && note.contains(&unmet), "{note}");
+                // Nothing else names the retry's minimum, so nothing says it was met.
+                let card = model::swap_card_line(stage, &labels);
+                assert!(
+                    steps
+                        .iter()
+                        .flat_map(|step| [&step.label, &step.detail])
+                        .chain([&card.title, &card.detail])
+                        .all(|text| !text.contains(&unmet))
+                );
+                // Each order keeps its own minimum and its own ID to copy.
+                let rows = swaps.attempt_rows(record, &attempts, cx);
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| (row.label.as_str(), row.order))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Order 1 · Bridge deposit", uid),
+                        ("Order 2 · Traded", retry)
+                    ]
+                );
+                assert!(
+                    rows[0]
+                        .detail
+                        .starts_with(&format!("Minimum {approved} · "))
+                );
+                assert!(rows[1].detail.starts_with(&format!("Minimum {unmet} · ")));
+                // My orders lists the swap once.
+                assert_eq!(
+                    swaps
+                        .order_rows_for_test(cx)
+                        .iter()
+                        .filter(|(meta, _)| meta.ends_with(" on Polygon · Across"))
+                        .count(),
+                    1
+                );
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("swap-attempts").is_some());
+        assert!(cx.debug_bounds("swap-bridge-earlier-minimum").is_some());
+
+        // A refund of that deposit is the swap's too. Recover… waits for the refund verified
+        // on the attempt that holds the deposit.
+        let refunding = SwapStage::Order(SwapOrderState::Refunding);
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                handed_off(Some(SwapBridgeOutcome::Refunding)),
+            )
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.tracking.entry(operation).or_default().stealth_balance =
+                    Some((U256::from(99), observed.block()));
+                let record = swaps.record(operation).unwrap();
+                let steps = model::swap_steps(refunding, &swaps.labels(record, cx));
+                let shown = steps.last().unwrap();
+                assert_eq!(
+                    (shown.label.as_str(), shown.status),
+                    ("Refunding on Ethereum", Warning)
+                );
+            });
+        });
+        press_swap_recover(swaps, operation, refunding, cx);
+        assert!(cx.debug_bounds("stealth-recovery-form").is_none());
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                SwapOrderObservations {
+                    bridge_refund: Some(SwapObservation {
+                        block: observed.block(),
+                        transaction_hash: Some(B256::repeat_byte(62)),
+                    }),
+                    ..handed_off(Some(SwapBridgeOutcome::Refunding))
+                },
+            )
+            .unwrap();
+        press_swap_recover(swaps, operation, refunding, cx);
+        assert!(cx.debug_bounds("stealth-recovery-form").is_some());
+    });
+}
+
+fn across_refund_recovery(cx: &mut TestAppContext, split: bool) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
     use alloy::sol_types::SolCall;
@@ -8383,10 +8867,11 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
     use wallet_ops::vault::{
         BridgeDelivery, BridgeProvider, BridgeSurplus, ExecutorNonceObservation,
         ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload, SwapBridgeOutcome,
-        SwapObservation, SwapOrderObservations,
+        SwapObservation, SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
     };
 
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    let stubs = split.then(SwapStubs::start);
+    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             destination_chain: 137,
@@ -8462,10 +8947,28 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
                 .unwrap();
             (request, number)
         };
-        let handed_off = |outcome, bridge_refund| SwapOrderObservations {
-            bridge_refund,
-            ..bridge_observations(observed, Some(U256::from(7)), outcome)
+        // `uid` is the order that holds the hand-off, its outcome and its refund. Split, it
+        // expired untraded and a retry at the same nonce holds the trade.
+        let expired = split.then_some(SwapPreHookDeath {
+            cause: SwapPreHookDeathCause::Expired,
+            observation: SwapObservation {
+                block: observed.block(),
+                transaction_hash: None,
+            },
+        });
+        let handed_off = |outcome, bridge_refund| {
+            let whole = SwapOrderObservations {
+                bridge_refund,
+                ..bridge_observations(observed, Some(U256::from(7)), outcome)
+            };
+            match expired {
+                Some(expired) => deposit_of_a_later_trade(&whole, expired),
+                None => whole,
+            }
         };
+        if let Some(expired) = expired {
+            retried_and_traded(executors, operation, uid, observed, expired, |_| {});
+        }
         // This session doesn't sync, so the shields private sync would show stand in for it.
         let stage = |cx: &mut gpui::VisualTestContext, shields: &[(ShieldRequest, u64)]| {
             cx.update(|_, cx| {
@@ -8499,6 +9002,38 @@ fn an_across_refund_is_recovered_only_after_its_verified_refund(cx: &mut TestApp
             stage(cx, &shields),
             SwapStage::Order(SwapOrderState::Refunding)
         );
+        // Split, Check status asks Across about the expired attempt, which holds the deposit.
+        // The retry holds no hand-off, and a check of it would ask nothing.
+        if let Some(stubs) = &stubs {
+            let orderbook = stub_orderbook(stubs, runtime);
+            cx.update(|window, cx| {
+                root.update(cx, |root, _| enable_stub_chain(root, stubs, 137));
+                swaps.update(cx, |swaps, cx| {
+                    let tracking = swaps.tracking.entry(operation).or_default();
+                    tracking.bridge_clients = Some(stub_bridge_clients(stubs, &orderbook));
+                    tracking.orderbook = Some(orderbook);
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let check = cx.debug_bounds("swap-progress-check").unwrap();
+            cx.simulate_click(check.center(), gpui::Modifiers::none());
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+            });
+            assert!(
+                stubs
+                    .bridge_requests()
+                    .iter()
+                    .any(|path| path.starts_with("/across/deposit")),
+                "{:?}",
+                stubs.bridge_requests()
+            );
+            assert_eq!(
+                stage(cx, &shields),
+                SwapStage::Order(SwapOrderState::Refunding)
+            );
+        }
         // The refund arrives after that recovery.
         let refund = SwapObservation {
             block: at(41),

@@ -195,6 +195,15 @@ impl BridgeHttp {
         self.http.isolation()
     }
 
+    /// This API root on another network route.
+    fn on_route(&self, http: OperationHttpClient) -> Self {
+        Self {
+            api: self.api,
+            http,
+            base_url: self.base_url.clone(),
+        }
+    }
+
     fn endpoint(&self, segments: &[&str]) -> Url {
         let mut url = self.base_url.clone();
         // `new` rejected cannot-be-a-base URLs, so path segments are available.

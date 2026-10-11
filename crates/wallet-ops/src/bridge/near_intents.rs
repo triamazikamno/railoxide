@@ -209,6 +209,15 @@ impl NearIntentsClient {
         self.inner.isolation()
     }
 
+    /// This client on another network route, with the same quote key.
+    #[must_use]
+    pub fn on_route(&self, http: OperationHttpClient) -> Self {
+        Self {
+            inner: self.inner.on_route(http),
+            quote_key: self.quote_key,
+        }
+    }
+
     /// `GET /v0/tokens`.
     pub async fn tokens(&self) -> Result<Vec<OneClickToken>, BridgeApiError> {
         let request = self.inner.get(&["v0", "tokens"], &[]);

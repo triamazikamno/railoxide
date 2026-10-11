@@ -803,6 +803,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             bridge: None,
             destination_minimum: None,
             destination: None,
+            continuing_minimum: None,
         })
     };
     let first = || issue(vec![pre_hook_transaction.clone()], vec![change.clone()]);
@@ -836,6 +837,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             bridge: None,
             destination_minimum: None,
             destination: None,
+            continuing_minimum: None,
         });
         tokio::pin!(pending);
         tokio::select! {
@@ -1207,13 +1209,13 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
     .unwrap();
     // The fixture expires the retry immediately; a real expiry also advances the deadline.
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    let SwapOrderOutcome::Submitted { uid: new_uid } = owner
-        .issue_swap_order(crate::SwapOrderSigning {
+    let issue_new_pair = |swap_use| {
+        owner.issue_swap_order(crate::SwapOrderSigning {
             review: &new_review,
-            swap_use: crate::vault::SwapUseId::first(new_review.plan().operation().unwrap()),
+            swap_use,
             private_minimum: new_review.suggested_private_minimum(),
             price_acknowledged: true,
-            transactions: vec![pre_hook_transaction],
+            transactions: vec![pre_hook_transaction.clone()],
             inputs: std::slice::from_ref(&input),
             change_output_pois: Vec::new(),
             output_pois: &output_pois,
@@ -1224,9 +1226,36 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             bridge: None,
             destination_minimum: None,
             destination: None,
+            continuing_minimum: None,
         })
+    };
+    // Another pair is another swap. The retried use refuses it before anything is signed.
+    let refused = issue_new_pair(crate::vault::SwapUseId::first(operation))
         .await
-        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<crate::vault::ExecutorStoreError>(),
+            Some(crate::vault::ExecutorStoreError::SwapUseTermsChanged)
+        ),
+        "{refused:#}"
+    );
+    assert_eq!(submissions.lock().unwrap().len(), 3);
+    let new_use = crate::vault::SwapUseId::random().unwrap();
+    store
+        .claim_swap_pair(crate::vault::SwapPairClaim {
+            id: new_use,
+            source: crate::vault::SwapAccountChoice::Existing(operation),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: new_review
+                .approval(new_review.suggested_private_minimum(), true)
+                .unwrap(),
+            destination: None,
+        })
+        .unwrap();
+    let SwapOrderOutcome::Submitted { uid: new_uid } = issue_new_pair(new_use).await.unwrap()
     else {
         panic!("new pair submitted");
     };
@@ -1528,6 +1557,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             bridge: None,
             destination_minimum: None,
             destination: None,
+            continuing_minimum: None,
         })
         .await;
     assert!(signed.is_err());
@@ -1807,6 +1837,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
                     bridge: $bridge,
                     destination_minimum: $review.bridge().map(|bridge| bridge.destination_minimum),
                     destination: None,
+                    continuing_minimum: None,
                 })
                 .await
         };
@@ -2076,8 +2107,43 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     // The fixture expires the order immediately; a real expiry also advances the deadline.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let reshield = review(WETH, SwapDelivery::Reshield);
+    // Another pair and delivery is another swap, which claims the account for its own use.
+    let new_use = crate::vault::SwapUseId::random().unwrap();
+    store
+        .claim_swap_pair(crate::vault::SwapPairClaim {
+            id: new_use,
+            source: crate::vault::SwapAccountChoice::Existing(operation),
+            delegate: record().delegate(),
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: reshield
+                .approval(reshield.suggested_private_minimum(), true)
+                .unwrap(),
+            destination: None,
+        })
+        .unwrap();
     assert!(matches!(
-        issue!(&reshield).unwrap(),
+        owner
+            .issue_swap_order(crate::SwapOrderSigning {
+                review: &reshield,
+                swap_use: new_use,
+                private_minimum: reshield.suggested_private_minimum(),
+                price_acknowledged: true,
+                transactions: vec![transaction.clone()],
+                inputs: std::slice::from_ref(&input),
+                change_output_pois: Vec::new(),
+                output_pois: &output_pois,
+                authorization: &authorization,
+                orderbook: &orderbook,
+                anchor_cache: &anchors,
+                token_registry: &tokens,
+                bridge: None,
+                destination_minimum: None,
+                destination: None,
+                continuing_minimum: None,
+            })
+            .await
+            .unwrap(),
         SwapOrderOutcome::Submitted { .. }
     ));
     let body = submissions.lock().unwrap()[2].1.clone();
@@ -2411,6 +2477,7 @@ impl BridgeOrderFixture {
                 bridge: Some(route),
                 destination_minimum: Some(U256::from(1_000)),
                 destination,
+                continuing_minimum: None,
             })
             .await
     }
@@ -2798,6 +2865,119 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     let shield =
         broadcaster_core::contracts::railgun::shieldCall::abi_decode(&calls[3].data).unwrap();
     assert_eq!(shield._shieldRequests[0].preimage.token.tokenAddress, WETH);
+
+    // The order expires with its post-hook still signed at the nonce after the retry's
+    // pre-hook, so it can deposit for the retry's trade under its own minimum of 1,000. The
+    // retry's review discloses that minimum, and signing needs it accepted.
+    let observed = fixture.record(&store).nonce_observation().unwrap();
+    let expired = SwapOrderObservations {
+        pre_hook_dead: Some(SwapPreHookDeath {
+            cause: SwapPreHookDeathCause::Expired,
+            observation: SwapObservation {
+                block: observed.block(),
+                transaction_hash: None,
+            },
+        }),
+        ..SwapOrderObservations::default()
+    };
+    store
+        .record_swap_observations(fixture.operation, saved.uid(), expired)
+        .unwrap();
+    // The fixture expires the order immediately; a real expiry also advances the deadline.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    *quoted.lock().unwrap() = (U256::from(1_200), 3 * 60 * 60);
+    let (quote_url, _, quote_task) = spawn_quote_stub(
+        json!({
+            "quote": {
+                "sellToken": USDC, "buyToken": WETH, "sellAmount": "997500",
+                "buyAmount": "300000000000000000", "validTo": 1, "feeAmount": "0",
+                "gasAmount": "0", "gasPrice": "0", "sellTokenPrice": "1000000000000",
+                "kind": "sell", "partiallyFillable": false
+            },
+            "expiration": "", "id": 7, "verified": true
+        }),
+        None,
+    )
+    .await;
+    let tokens = crate::settings::EffectiveTokenRegistry {
+        tokens: std::collections::BTreeMap::new(),
+    };
+    let retry = owner
+        .review_swap(SwapReviewRequest {
+            plan: fixture.review.plan().clone(),
+            slippage_bps: 50,
+            gas_share_bps: GAS_SHARE_BALANCED_BPS,
+            valid_for: Duration::from_mins(30),
+            orderbook: &CowOrderbookClient::new(
+                OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+                quote_url,
+                1,
+            )
+            .unwrap(),
+            anchor_cache: None,
+            token_registry: &tokens,
+            bridge: Some(route),
+        })
+        .await
+        .unwrap();
+    quote_task.abort();
+    let retry_minimum = retry.bridge().unwrap().destination_minimum;
+    assert_eq!(retry_minimum, U256::from(1_200));
+    assert_eq!(retry.continuing_minimum(), Some(U256::from(1_000)));
+    let issued = fixture.record(&store).issued().len();
+    let output_pois = OutputPois::default();
+    let authorization = password();
+    let anchors = crate::TokenAnchorRateCache::new();
+    let sign_retry = |continuing_minimum| {
+        owner.issue_swap_order(crate::SwapOrderSigning {
+            review: &retry,
+            swap_use,
+            private_minimum: retry.suggested_private_minimum(),
+            price_acknowledged: true,
+            transactions: vec![fixture.transaction.clone()],
+            inputs: std::slice::from_ref(&fixture.input),
+            change_output_pois: Vec::new(),
+            output_pois: &output_pois,
+            authorization: &authorization,
+            orderbook: &orderbook,
+            anchor_cache: &anchors,
+            token_registry: &tokens,
+            bridge: Some(route),
+            destination_minimum: Some(retry_minimum),
+            destination: None,
+            continuing_minimum,
+        })
+    };
+    // Neither no acceptance nor a stale one, of a higher continuing minimum than the one that
+    // now applies, signs anything.
+    for (accepted, approved) in [(None, 0), (Some(U256::from(1_001)), 1_001)] {
+        assert_eq!(
+            sign_retry(accepted).await.unwrap(),
+            SwapOrderOutcome::ReviewRequired(SwapReviewChange::ContinuingApproval {
+                approved: U256::from(approved),
+                current: U256::from(1_000),
+            })
+        );
+        let unsigned = fixture.record(&store);
+        assert_eq!(unsigned.swap().unwrap().orders().len(), 1);
+        assert_eq!(unsigned.issued().len(), issued);
+        assert_eq!(submissions.lock().unwrap().len(), 2);
+    }
+    let SwapOrderOutcome::Submitted { uid: retried } =
+        sign_retry(Some(U256::from(1_000))).await.unwrap()
+    else {
+        panic!("the retry is submitted once the continuing minimum is accepted");
+    };
+    let record = fixture.record(&store);
+    let [_, retried_order] = record.swap().unwrap().orders() else {
+        panic!("the retry is the second attempt");
+    };
+    assert_eq!(retried_order.uid(), retried);
+    // The retry keeps its own higher minimum.
+    assert_eq!(
+        retried_order.bounds().destination_minimum,
+        Some(retry_minimum)
+    );
 
     across_task.abort();
     orderbook_task.abort();
@@ -3503,21 +3683,24 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             .record_swap_settlement(
                 operation,
                 uid,
-                traded,
-                crate::vault::SwapTradeAmounts {
-                    sell_amount: U256::from(997_500),
-                    buy_amount: U256::from(300_000_000_000_000_000_u64),
-                    fee_amount: U256::ZERO,
-                    settlement_gas_used: None,
-                    settlement_effective_gas_price: None,
-                    executed_fee: None,
-                    executed_fee_token: None,
+                &crate::vault::SwapSettlementEvidence {
+                    traded,
+                    amounts: crate::vault::SwapTradeAmounts {
+                        sell_amount: U256::from(997_500),
+                        buy_amount: U256::from(300_000_000_000_000_000_u64),
+                        fee_amount: U256::ZERO,
+                        settlement_gas_used: None,
+                        settlement_effective_gas_price: None,
+                        executed_fee: None,
+                        executed_fee_token: None,
+                    },
+                    credit: None,
+                    handoff: Some(crate::vault::SwapBridgeHandoff {
+                        observation: traded,
+                        deposit_id: Some(U256::from(77)),
+                    }),
+                    delivery: uid,
                 },
-                None,
-                Some(crate::vault::SwapBridgeHandoff {
-                    observation: traded,
-                    deposit_id: Some(U256::from(77)),
-                }),
             )
             .unwrap();
         store

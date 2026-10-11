@@ -132,6 +132,14 @@ impl AcrossClient {
         self.inner.isolation()
     }
 
+    /// This client on another network route.
+    #[must_use]
+    pub fn on_route(&self, http: OperationHttpClient) -> Self {
+        Self {
+            inner: self.inner.on_route(http),
+        }
+    }
+
     /// `GET /available-routes`. Native-asset entries are skipped: they are the `msg.value`
     /// form of an ERC-20 route, and the executor always deposits the ERC-20.
     pub async fn available_routes(

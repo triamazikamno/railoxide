@@ -34,6 +34,7 @@ use crate::{
 
 mod admission;
 mod bridge;
+mod continuing;
 mod destination;
 mod gas;
 mod observation;
@@ -53,7 +54,11 @@ pub(crate) use admission::notes_of_shield;
 pub use bridge::{
     BridgeLegPrice, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapPrivateBridgeQuote,
 };
-pub use observation::{SwapOrderState, swap_order_state};
+pub use continuing::{
+    SwapContinuingApproval, SwapContinuingApprovals, SwapQuoteAgeEvidence,
+    swap_continuing_approvals,
+};
+pub use observation::{SwapOrderState, swap_attempt_state, swap_order_state};
 pub(super) use order::invalidates_order;
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,

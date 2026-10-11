@@ -136,13 +136,82 @@ impl SwapOperationRecord {
     /// A new attempt may start once each earlier attempt has either ended before its pre-hook
     /// ran or traded and completed delivery, for a Bridge order delivery on the destination
     /// chain. Unrecovered executed pre-hooks block it, as do refunding and unresolved bridges.
+    /// A trade delivered by another attempt of its use completes with that attempt's
+    /// destination outcome, and the attempt holding the hand-off waits for the same outcome:
+    /// its ended pre-hook does not resolve its bridge.
     #[must_use]
     pub fn admits_attempt(&self) -> bool {
         self.orders.iter().all(|order| {
-            order.has_ended()
-                || order.observations.traded.is_some()
-                    && order.observations.delivered.is_some()
-                    && order.destination_delivered()
+            if order.observations.traded.is_some() {
+                order.has_ended()
+                    || self
+                        .delivery_order(order)
+                        .is_some_and(SwapOrderRecord::destination_delivered)
+            } else if order.observations.bridge_handoff.is_some() {
+                self.trade_order(order).is_some() && order.destination_delivered()
+            } else {
+                order.has_ended()
+            }
+        })
+    }
+
+    /// Whether `order` is part of a trade that completed at or below `cutoff`: the trade, its
+    /// delivery on the swap's chain and, for a Bridge order, a delivery on the destination
+    /// chain. The trade and the delivery may sit on different attempts of one use, and both
+    /// are then settled together. An attempt that holds neither is not a settled order.
+    fn order_settled_at(&self, order: &SwapOrderRecord, cutoff: u64) -> bool {
+        let within = |event: Option<SwapObservation>| {
+            event.is_some_and(|event| event.block.number <= cutoff)
+        };
+        let (traded, delivery) = if order.observations.traded.is_some() {
+            (Some(order), self.delivery_order(order))
+        } else if order.observations.bridge_handoff.is_some() {
+            (self.trade_order(order), Some(order))
+        } else {
+            return false;
+        };
+        traded.is_some_and(|traded| within(traded.observations.traded))
+            && delivery.is_some_and(|delivery| {
+                within(delivery.observations.delivered) && delivery.destination_delivered()
+            })
+    }
+
+    /// The attempt whose approved terms delivered the trade of `traded`: the order itself once
+    /// it holds its own `delivered`, or the untraded attempt of the same swap use whose
+    /// hand-off was read from that trade's receipt. Nothing from another use is paired.
+    #[must_use]
+    pub fn delivery_order<'a>(
+        &'a self,
+        traded: &'a SwapOrderRecord,
+    ) -> Option<&'a SwapOrderRecord> {
+        if traded.observations.delivered.is_some() {
+            return Some(traded);
+        }
+        let trade = traded.observations.traded?;
+        let use_id = traded.use_id?;
+        self.orders.iter().find(|order| {
+            order.use_id == Some(use_id)
+                && order.observations.traded.is_none()
+                && order
+                    .observations
+                    .bridge_handoff
+                    .is_some_and(|handoff| handoff.observation == trade)
+        })
+    }
+
+    /// The inverse of [`Self::delivery_order`]: the attempt whose trade `delivery` handed off.
+    /// An order holding both its trade and its `delivered` is its own trade order.
+    #[must_use]
+    pub fn trade_order<'a>(&'a self, delivery: &'a SwapOrderRecord) -> Option<&'a SwapOrderRecord> {
+        if delivery.observations.traded.is_some() {
+            return delivery.observations.delivered.map(|_| delivery);
+        }
+        let handoff = delivery.observations.bridge_handoff?;
+        let use_id = delivery.use_id?;
+        self.orders.iter().find(|order| {
+            order.use_id == Some(use_id)
+                && order.observations.traded == Some(handoff.observation)
+                && order.observations.delivered.is_none()
         })
     }
 
@@ -331,6 +400,31 @@ impl AcrossOrderTerms {
     #[must_use]
     pub fn deposit_message_hash(&self) -> B256 {
         self.message_hash.unwrap_or(B256::ZERO)
+    }
+    /// Whether a deposit matching these terms for `delivery` also matches `other` for
+    /// `other_delivery`. These are the fields the `FundsDeposited` event shows. The event
+    /// carries the resolved exclusivity deadline, not the signed parameter, so that is not
+    /// compared.
+    #[must_use]
+    pub fn signs_same_deposit(
+        &self,
+        delivery: BridgeDelivery,
+        other: &Self,
+        other_delivery: BridgeDelivery,
+    ) -> bool {
+        let recipient = self.deposit_recipient(delivery);
+        let other_recipient = other.deposit_recipient(other_delivery);
+        self.spoke_pool == other.spoke_pool
+            && recipient == other_recipient
+            && self.message_hash == other.message_hash
+            && delivery.destination_chain == other_delivery.destination_chain
+            && self.input_token == other.input_token
+            && self.output_token == other.output_token
+            && self.input_amount == other.input_amount
+            && self.output_amount == other.output_amount
+            && self.quote_timestamp == other.quote_timestamp
+            && self.fill_deadline == other.fill_deadline
+            && self.exclusive_relayer == other.exclusive_relayer
     }
 }
 
@@ -680,6 +774,24 @@ impl SwapOrderObservations {
         .map(|observation| observation.block)
     }
 
+    /// `amounts` for the trade being recorded. The same trade keeps what was read about it
+    /// since it was recorded: the orderbook's executed fee, and the settlement gas from an
+    /// earlier receipt.
+    fn kept_trade_amounts(&self, amounts: SwapTradeAmounts) -> SwapTradeAmounts {
+        match self.trade_amounts {
+            Some(known) if self.traded.is_some() => SwapTradeAmounts {
+                settlement_gas_used: known.settlement_gas_used.or(amounts.settlement_gas_used),
+                settlement_effective_gas_price: known
+                    .settlement_effective_gas_price
+                    .or(amounts.settlement_effective_gas_price),
+                executed_fee: known.executed_fee.or(amounts.executed_fee),
+                executed_fee_token: known.executed_fee_token.or(amounts.executed_fee_token),
+                ..amounts
+            },
+            _ => amounts,
+        }
+    }
+
     /// Canonical evidence that the order's post-hook ran: its shield, or its Across deposit.
     #[must_use]
     pub const fn post_hook_evidence(&self) -> bool {
@@ -899,20 +1011,9 @@ impl SwapOrderRecord {
         self.use_id
     }
 
-    fn settled_at(&self, cutoff: u64) -> bool {
-        self.observations
-            .traded
-            .is_some_and(|event| event.block.number <= cutoff)
-            && self
-                .observations
-                .delivered
-                .is_some_and(|event| event.block.number <= cutoff)
-            && self.destination_delivered()
-    }
-
     /// A Bridge order's outcome on the destination chain is a delivery. Other orders have no
     /// destination outcome to wait for.
-    fn destination_delivered(&self) -> bool {
+    pub(super) fn destination_delivered(&self) -> bool {
         !matches!(self.delivery, SwapDelivery::Bridge(_))
             || self
                 .observations
@@ -1035,7 +1136,11 @@ impl ExecutorRecord {
         self.nonce_observation
             .is_some_and(|observed| observed.block.number <= cutoff)
             && !(orders.is_empty() && delivered_shields.is_empty())
-            && orders.iter().all(|order| order.settled_at(cutoff))
+            && self.swap.as_ref().is_none_or(|swap| {
+                swap.orders
+                    .iter()
+                    .all(|order| swap.order_settled_at(order, cutoff))
+            })
             && self.issued.iter().all(|payload| match payload.purpose {
                 ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook => {
                     orders.iter().any(|order| {
@@ -1068,6 +1173,32 @@ impl ExecutorRecord {
                 matches!(order.delivery, SwapDelivery::Bridge(_))
                     && order.observations.bridge_handoff.is_some()
                     && order.observations.bridge_outcome.is_none()
+            })
+    }
+
+    /// Whether an attempt of the use `id` with these tokens and `delivery` keeps the fixed
+    /// terms of every earlier attempt of that use: the sell token, the buy token (a Bridge
+    /// order's intermediate token) and the whole delivery, which for Bridge holds the provider,
+    /// destination chain, receiver, destination token and surplus choice. Amounts, deadlines
+    /// and other quote-dependent terms may differ between attempts. A private Bridge attempt
+    /// is not judged here.
+    #[must_use]
+    pub fn swap_use_keeps_terms(
+        &self,
+        id: SwapUseId,
+        sell_token: Address,
+        buy_token: Address,
+        delivery: SwapDelivery,
+    ) -> bool {
+        let Some(swap) = &self.swap else {
+            return true;
+        };
+        delivery.private_bridge().is_some()
+            || self.swap_use_orders(id).all(|order| {
+                let terms = swap.order_terms(order);
+                terms.sell_token == sell_token
+                    && terms.buy_token == buy_token
+                    && order.delivery == delivery
             })
     }
 
@@ -1391,7 +1522,8 @@ impl ExecutorStore {
     /// Intents Bridge orders have none. No other payload may use a future nonce. A
     /// Bridge order carries its provider's terms. A retry is admitted only after every
     /// earlier attempt ended or completed delivery. The order belongs to the attempt's swap
-    /// use, and is refused once another use claims the account.
+    /// use, and is refused once another use claims the account. Unless it is a private Bridge
+    /// order, it keeps the tokens and delivery of the use's earlier attempts.
     pub fn record_swap_attempt(
         &self,
         operation: ExecutorOperationId,
@@ -1512,6 +1644,9 @@ impl ExecutorStore {
             {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
+            if !record.swap_use_keeps_terms(use_id, terms.sell_token, terms.buy_token, delivery) {
+                return Err(ExecutorStoreError::SwapUseTermsChanged);
+            }
             if !record
                 .swap
                 .as_ref()
@@ -1550,11 +1685,13 @@ impl ExecutorStore {
                         && !record.nonce_resolved(issued.nonce)
                         && !(issued.purpose == ExecutorPayloadPurpose::SwapPostHook
                             && (record.swap_post_hook_took_nonce(issued.nonce)
-                                || orders.iter().any(|order| {
-                                    order
-                                        .post_hook
-                                        .is_some_and(|hook| hook.payload == issued.hash)
-                                        && order.settled_at(observed.block.number)
+                                || record.swap.as_ref().is_some_and(|swap| {
+                                    swap.orders.iter().any(|order| {
+                                        order
+                                            .post_hook
+                                            .is_some_and(|hook| hook.payload == issued.hash)
+                                            && swap.order_settled_at(order, observed.block.number)
+                                    })
                                 })))
                         && !(issued.purpose == ExecutorPayloadPurpose::SwapDestinationShield
                             && record.swap_shield_delivered(issued.hash))
@@ -1764,16 +1901,28 @@ impl ExecutorStore {
     /// chain by its hand-off, in the trade's own transaction: for NEAR Intents the trade, for
     /// Across the deposit that names its id, optionally with the surplus credit of a post-hook
     /// that reshields it. Same-chain orders take no hand-off.
+    ///
+    /// `uid` is the traded order. Usually it is also the evidence's delivery order and takes
+    /// all of it. A public-receiver Across deposit may instead match another attempt of the
+    /// same swap use. The traded order then keeps the trade and its amounts, and that attempt
+    /// takes the hand-off, `delivered` and any surplus credit, in the same write.
     pub(crate) fn record_swap_settlement(
         &self,
         operation: ExecutorOperationId,
         uid: OrderUid,
-        traded: SwapObservation,
-        amounts: SwapTradeAmounts,
-        credit: Option<SwapShieldObservation>,
-        handoff: Option<SwapBridgeHandoff>,
+        evidence: &SwapSettlementEvidence,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        let SwapSettlementEvidence {
+            traded,
+            amounts,
+            credit,
+            handoff,
+            delivery,
+        } = *evidence;
         self.update(operation, |record| {
+            if delivery != uid {
+                return record_split_settlement(record.swap.as_mut(), uid, evidence);
+            }
             let order = record
                 .swap
                 .as_mut()
@@ -1819,20 +1968,7 @@ impl ExecutorStore {
             {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
-            // The same trade keeps what was read about it since it was recorded: the orderbook's
-            // executed fee, and the settlement gas from an earlier receipt.
-            let amounts = match order.observations.trade_amounts {
-                Some(known) if order.observations.traded.is_some() => SwapTradeAmounts {
-                    settlement_gas_used: known.settlement_gas_used.or(amounts.settlement_gas_used),
-                    settlement_effective_gas_price: known
-                        .settlement_effective_gas_price
-                        .or(amounts.settlement_effective_gas_price),
-                    executed_fee: known.executed_fee.or(amounts.executed_fee),
-                    executed_fee_token: known.executed_fee_token.or(amounts.executed_fee_token),
-                    ..amounts
-                },
-                _ => amounts,
-            };
+            let amounts = order.observations.kept_trade_amounts(amounts);
             order.observations.traded = Some(traded);
             order.observations.trade_amounts = Some(amounts);
             if let Some(credit) = credit {
@@ -1947,4 +2083,92 @@ impl ExecutorStore {
             Ok(())
         })
     }
+}
+
+/// Receipt evidence of one settlement, checked by the owner at head minus finality depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SwapSettlementEvidence {
+    pub traded: SwapObservation,
+    pub amounts: SwapTradeAmounts,
+    pub credit: Option<SwapShieldObservation>,
+    pub handoff: Option<SwapBridgeHandoff>,
+    /// The attempt whose approved terms the hand-off and credit match: the traded order, or
+    /// for a public-receiver Across deposit another attempt of the same use.
+    pub delivery: OrderUid,
+}
+
+/// Record a settlement whose Across deposit matches another attempt than the traded order
+/// `uid`. Both are public-receiver Across attempts of one swap use, and the hand-off is in the
+/// trade's own transaction. The delivery order takes no trade, and the traded order no
+/// hand-off, `delivered` or credit.
+fn record_split_settlement(
+    swap: Option<&mut SwapOperationRecord>,
+    uid: OrderUid,
+    evidence: &SwapSettlementEvidence,
+) -> Result<(), ExecutorStoreError> {
+    let SwapSettlementEvidence {
+        traded,
+        amounts,
+        credit,
+        handoff,
+        delivery,
+    } = *evidence;
+    let orders = &mut swap.ok_or(ExecutorStoreError::OperationMismatch)?.orders;
+    let position = |uid: OrderUid| orders.iter().position(|order| order.uid == uid.0);
+    let (Some(trade_index), Some(delivery_index)) = (position(uid), position(delivery)) else {
+        return Err(ExecutorStoreError::OperationMismatch);
+    };
+    let (trade_order, delivery_order) = (&orders[trade_index], &orders[delivery_index]);
+    let public_across = |order: &SwapOrderRecord| {
+        matches!(
+            order.delivery,
+            SwapDelivery::Bridge(bridge)
+                if bridge.provider == BridgeProvider::Across && !bridge.is_private()
+        ) && matches!(order.bridge, Some(BridgeOrderTerms::Across(_)))
+    };
+    // A split without a hand-off records nothing the traded order could not hold itself.
+    let Some(handoff) = handoff else {
+        return Err(ExecutorStoreError::InvalidRecord);
+    };
+    let credit_fits = credit.is_none_or(|credit| {
+        credit.observation == traded
+            && matches!(
+                delivery_order.delivery,
+                SwapDelivery::Bridge(bridge) if bridge.surplus == BridgeSurplus::Reshield
+            )
+    });
+    if trade_order.use_id.is_none()
+        || trade_order.use_id != delivery_order.use_id
+        || !public_across(trade_order)
+        || !public_across(delivery_order)
+        || traded.transaction_hash.is_none()
+        || handoff.deposit_id.is_none()
+        || handoff.observation != traded
+        || !credit_fits
+        || trade_order
+            .observations
+            .traded
+            .is_some_and(|known| known != traded)
+        || trade_order.observations.bridge_handoff.is_some()
+        || trade_order.observations.delivered.is_some()
+        || delivery_order.observations.traded.is_some()
+        || delivery_order
+            .observations
+            .bridge_handoff
+            .is_some_and(|known| known != handoff)
+    {
+        return Err(ExecutorStoreError::InvalidRecord);
+    }
+    let observed = &mut orders[trade_index].observations;
+    observed.trade_amounts = Some(observed.kept_trade_amounts(amounts));
+    observed.traded = Some(traded);
+    observed.undelivered = None;
+    let observed = &mut orders[delivery_index].observations;
+    observed.bridge_handoff = Some(handoff);
+    observed.delivered = Some(traded);
+    if let Some(credit) = credit {
+        observed.settlement_credit = Some(credit);
+    }
+    observed.undelivered = None;
+    Ok(())
 }

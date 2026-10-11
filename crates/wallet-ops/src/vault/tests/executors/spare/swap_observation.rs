@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::vault::{SwapAccountRefusal, SwapAccountRole, SwapAccountUse};
-use crate::{SwapOrderState, swap_order_state};
+use crate::{SwapOrderState, swap_attempt_state, swap_order_state};
 use alloy::consensus::Transaction as _;
 use alloy::consensus::transaction::Recovered;
 use alloy::consensus::{
@@ -107,6 +107,11 @@ pub(super) struct MockChain {
     pub(super) rpc_requests: Vec<Value>,
     pub(super) receipt_error: Option<i64>,
     reorg_on_receipts: bool,
+    /// The block from which the swap's pre-hook notes read as spent, as after a settlement
+    /// ran a pre-hook.
+    nullifiers_spent: Option<u64>,
+    /// What `depositQuoteTimeBuffer()` returns. `None` reverts the call.
+    pub(super) quote_time_buffer: Option<u32>,
 }
 
 impl MockChain {
@@ -128,6 +133,8 @@ impl MockChain {
             rpc_requests: Vec::new(),
             receipt_error: None,
             reorg_on_receipts: false,
+            nullifiers_spent: None,
+            quote_time_buffer: None,
         }
     }
 
@@ -407,8 +414,13 @@ impl MockChain {
                         number,
                     )
                 } else if input[..4] == keccak256("nullifiers(uint256,bytes32)")[..4] {
-                    // Nothing spends the swap's notes outside the logged settlements.
-                    U256::ZERO
+                    // Only a test that says so spends the swap's notes.
+                    U256::from(self.nullifiers_spent.is_some_and(|from| from <= number))
+                } else if input[..4] == keccak256("depositQuoteTimeBuffer()")[..4] {
+                    let Some(buffer) = self.quote_time_buffer else {
+                        return json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "execution reverted"}});
+                    };
+                    U256::from(buffer)
                 } else {
                     panic!("unexpected eth_call to {to}");
                 };
@@ -773,7 +785,11 @@ impl Fixture {
             .record_swap_attempt(
                 self.operation,
                 SwapAttempt {
-                    use_id: crate::vault::SwapUseId::first(self.operation),
+                    // The use that claims the account, or its first one with its first order.
+                    use_id: self
+                        .record()
+                        .active_swap_use()
+                        .unwrap_or_else(|| crate::vault::SwapUseId::first(self.operation)),
                     submission: None,
                     terms: SwapTerms::new(
                         SELL,
@@ -1158,6 +1174,29 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
         1,
         "checking setup and prior orders must share one account read"
     );
+    // Another pair is another swap use of the account.
+    fixture
+        .store
+        .claim_swap_pair(crate::vault::SwapPairClaim {
+            id: crate::vault::SwapUseId::random().unwrap(),
+            source: crate::vault::SwapAccountChoice::Existing(fixture.operation),
+            delegate: fixture.delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: SwapApproval {
+                bounds: swap_bounds(),
+                price_verified: None,
+                price_acknowledged: false,
+                delivery: SwapDelivery::Reshield,
+                tokens: Some(SwapApprovalTokens {
+                    sell: SELL,
+                    buy: OTHER_BUY,
+                }),
+                accounts: None,
+            },
+            destination: None,
+        })
+        .unwrap();
     fixture.record_pair_attempt(1, 100, OTHER_BUY);
     let refused = fixture
         .owner
@@ -1422,6 +1461,65 @@ async fn swap_delivery_tolerates_dust_retains_shield_evidence_and_reopens_on_reo
         Some(fixture.chain.lock().unwrap().block(50))
     );
     assert!(observed.delivered.is_none());
+    fixture.finish().await;
+}
+
+// A completed order must not hide a sibling of its swap use that still awaits its post-hook
+// shield: the page holding that shield is read even after every hook nonce of the use passed.
+#[tokio::test]
+async fn a_later_shield_completes_a_second_trade_of_the_same_swap_use() {
+    let fixture = Fixture::start().await;
+    fixture.record_attempt(0, 100);
+    // One settlement runs the first attempt's pre-hook, trades, and runs its post-hook.
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        let mut logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
+            .into_iter()
+            .map(|data| (fixture.railgun, data))
+            .collect::<Vec<_>>();
+        logs.push((fixture.settlement, trade_log(uid(0, 100))));
+        logs.push((fixture.railgun, post_hook_shield_log(0, 9_975)));
+        chain.add_logs(40, B256::repeat_byte(0x40), logs);
+        chain.nonces.push((40, 3));
+    }
+    let record = fixture.observe(46, 35).await;
+    assert_eq!(state(&record, 0), SwapOrderState::Done);
+
+    // A second attempt of the same use signs its hooks at the next nonces, 3 and 4.
+    fixture.record_attempt(1, 200);
+    let record = fixture.record();
+    let orders = record.swap().unwrap().orders();
+    assert!(orders[1].use_id().is_some() && orders[1].use_id() == orders[0].use_id());
+    // Its settlement runs the pre-hook and trades, but the post-hook does not run: the
+    // nonce stops at the post-hook's and the proceeds stay in the executor.
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        let mut logs = private_logs(PRE_HOOK_NULLIFIER, PRE_HOOK_COMMITMENT)
+            .into_iter()
+            .map(|data| (fixture.railgun, data))
+            .collect::<Vec<_>>();
+        logs.push((fixture.settlement, trade_log(uid(1, 200))));
+        chain.add_logs(50, B256::repeat_byte(0x50), logs);
+        chain.nonces.push((50, 4));
+        chain.buy_balance.push((50, BUY_AMOUNT));
+    }
+    let record = fixture.observe(56, 46).await;
+    assert_eq!(state(&record, 1), SwapOrderState::NotDelivered);
+
+    // The post-hook runs later on its own. Every hook nonce of the use is now consumed.
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        chain.add_logs(
+            60,
+            B256::repeat_byte(0x60),
+            vec![(fixture.railgun, post_hook_shield_log(1, 9_975))],
+        );
+        chain.nonces.push((60, 5));
+        chain.buy_balance.push((60, 1));
+    }
+    let record = fixture.observe(66, 56).await;
+    assert_eq!(state(&record, 1), SwapOrderState::Done);
+    assert_eq!(state(&record, 0), SwapOrderState::Done);
     fixture.finish().await;
 }
 
@@ -3034,6 +3132,779 @@ async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
     }
 }
 
+/// Record an Across attempt valid to block `valid_to` and expire it: `validTo` passes at the
+/// confirmed block while the nonce stays unused.
+async fn expired_across_attempt(
+    fixture: &Fixture,
+    attempt: u8,
+    valid_to: u64,
+    delivery: BridgeDelivery,
+    terms: AcrossOrderTerms,
+) {
+    fixture.record_delivery_attempt(
+        attempt,
+        valid_to,
+        BUY,
+        SwapDelivery::Bridge(delivery),
+        Some(BridgeOrderTerms::Across(terms)),
+    );
+    let record = fixture.observe(valid_to + 3, valid_to + 1).await;
+    assert_eq!(
+        state(&record, usize::from(attempt) - 1),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
+    );
+}
+
+// An expired attempt's Across approval stays for a retry at the same nonce until one finalized
+// block shows both the unused nonce and a timestamp past the signed quote's age limit, read
+// from the pool at that block. Without that evidence the approval stays.
+#[tokio::test]
+async fn continuing_approvals_read_the_quote_age_from_one_finalized_block() {
+    let fixture = Fixture::start().await;
+    let spoke_pool = fixture.config.bridge_profile().unwrap().spoke_pool();
+    let (delivery, older) = across_order(spoke_pool);
+    expired_across_attempt(&fixture, 1, 20, delivery, older).await;
+    let swap_use = fixture.record().swap().unwrap().orders()[0]
+        .use_id()
+        .unwrap();
+    // The lower minimum a retry approving 9,900 at `nonce` must disclose.
+    let (owner, operation) = (&fixture.owner, fixture.operation);
+    let continuing = move |nonce: u64| async move {
+        owner
+            .swap_continuing_approvals(
+                operation,
+                swap_use,
+                SwapDelivery::Bridge(delivery),
+                Some(U256::from(nonce)),
+            )
+            .await
+            .unwrap()
+            .lower_minimum(U256::from(9_900))
+    };
+
+    // The pool's limit can't be read.
+    assert_eq!(continuing(1).await, Some(older.output_amount));
+
+    // The finalized block is exactly at the limit, which still permits a deposit.
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        let boundary = timestamp(chain.head - 1) - u64::from(older.quote_timestamp);
+        chain.quote_time_buffer = Some(u32::try_from(boundary).unwrap());
+        chain.rpc_requests.clear();
+    }
+    assert_eq!(continuing(1).await, Some(older.output_amount));
+    {
+        let chain = fixture.chain.lock().unwrap();
+        let mut called = Vec::new();
+        for request in &chain.rpc_requests {
+            match request["method"].as_str().unwrap() {
+                "eth_blockNumber" | "eth_getBlockByNumber" | "eth_getCode" => {}
+                "eth_call" => called.push(
+                    serde_json::from_value::<Address>(request["params"][0]["to"].clone()).unwrap(),
+                ),
+                method => panic!("the quote-age read sent {method}"),
+            }
+        }
+        called.sort();
+        called.dedup();
+        let mut expected = vec![EXECUTOR, spoke_pool];
+        expected.sort();
+        assert_eq!(called, expected);
+    }
+
+    // One finalized block later the quote is too old, with the post-hook's nonce still unused.
+    fixture.chain.lock().unwrap().head += 1;
+    assert_eq!(continuing(1).await, None);
+
+    // A retry at the old post-hook's nonce passes it, which needs no evidence.
+    fixture.chain.lock().unwrap().rpc_requests.clear();
+    assert_eq!(continuing(2).await, None);
+    assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
+    fixture.finish().await;
+}
+
+/// The logs of a settlement that trades the order `retry` and then runs the post-hook of the
+/// expired attempt that signed `terms`: its `deposit` and its surplus shield.
+fn retry_settlement_logs(
+    fixture: &Fixture,
+    retry: OrderUid,
+    terms: &AcrossOrderTerms,
+    deposit: SpokePool::FundsDeposited,
+) -> Vec<(Address, LogData)> {
+    let mut logs = across_settlement_logs(fixture, terms, Some(deposit));
+    for (address, data) in &mut logs {
+        if *address == fixture.settlement {
+            *data = trade_log(retry);
+        }
+    }
+    logs
+}
+
+/// Put `logs` in `block` as one settlement and read it for the order `retry` from its receipts
+/// alone. Returns the trade's observation.
+async fn settle_retry(
+    fixture: &Fixture,
+    retry: OrderUid,
+    block: u64,
+    logs: Vec<(Address, LogData)>,
+) -> eyre::Result<SwapObservation> {
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        chain.head = block + 1;
+        chain.add_addressed_transaction(block, fixture.settlement, Bytes::new(), logs);
+        chain.rpc_requests.clear();
+    }
+    fixture
+        .owner
+        .observe_swap_settlement(fixture.operation, retry, block)
+        .await?;
+    let chain = fixture.chain.lock().unwrap();
+    let block = chain.block(block);
+    assert_block_only_requests(&chain.rpc_requests, block);
+    Ok(SwapObservation {
+        block,
+        transaction_hash: Some(chain.transactions.last().unwrap().0),
+    })
+}
+
+#[tokio::test]
+async fn a_retrys_settlement_hands_off_with_the_expired_attempts_across_deposit() {
+    // A retry signs its hooks at the expired attempt's nonces, so the expired attempt's
+    // post-hook can still run in the retry's settlement and deposit under its own terms. The
+    // trade is the retry's; the hand-off and the surplus belong to the expired attempt.
+    // 0: the expired attempt's deposit and surplus shield. 1: both attempts signed the same
+    // terms, so the traded order keeps the hand-off. 2: two expired attempts signed the
+    // deposit's terms, and the earliest takes the hand-off. 3: one deposit under each
+    // attempt's terms.
+    for scenario in 0..4 {
+        let fixture = Fixture::start().await;
+        let spoke_pool = fixture.config.bridge_profile().unwrap().spoke_pool();
+        let (delivery, older) = across_order(spoke_pool);
+        let newer = if scenario == 1 {
+            older
+        } else {
+            AcrossOrderTerms {
+                output_amount: U256::from(9_900),
+                quote_timestamp: older.quote_timestamp + 600,
+                fill_deadline: older.fill_deadline + 600,
+                ..older
+            }
+        };
+        expired_across_attempt(&fixture, 1, 20, delivery, older).await;
+        // The retry's attempt number and `validTo` block, and its settlement's block.
+        let (attempt, valid_to, block) = if scenario == 2 {
+            expired_across_attempt(&fixture, 2, 26, delivery, older).await;
+            (3, 60, 40)
+        } else {
+            (2, 40, 30)
+        };
+        let (retry_uid, retry_index) = (uid(attempt, valid_to), usize::from(attempt) - 1);
+        fixture.record_delivery_attempt(
+            attempt,
+            valid_to,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(newer)),
+        );
+        {
+            let record = fixture.record();
+            let orders = record.swap().unwrap().orders();
+            assert_eq!(
+                orders[0].pre_hook().nonce(),
+                orders[retry_index].pre_hook().nonce(),
+                "the expired attempt's post-hook stays executable"
+            );
+        }
+
+        // The retry's trade, then the expired attempt's deposit and surplus shield.
+        let deposit = signed_deposit(delivery, &older);
+        let mut logs = retry_settlement_logs(&fixture, retry_uid, &older, deposit);
+        if scenario == 3 {
+            let executor_payment = Transfer {
+                from: EXECUTOR,
+                to: older.spoke_pool,
+                value: older.input_amount,
+            }
+            .encode_log_data();
+            logs.extend([
+                (BUY, executor_payment),
+                (
+                    newer.spoke_pool,
+                    signed_deposit(delivery, &newer).encode_log_data(),
+                ),
+            ]);
+        }
+        let observed = settle_retry(&fixture, retry_uid, block, logs).await;
+        if scenario == 3 {
+            // Conflicting deposits stay unresolved, and the whole read is refused.
+            assert!(observed.is_err(), "scenario {scenario}");
+            let record = fixture.record();
+            assert!(
+                record.swap().unwrap().orders().iter().all(|order| {
+                    let observed = order.observations();
+                    observed.traded.is_none()
+                        && observed.bridge_handoff.is_none()
+                        && observed.delivered.is_none()
+                }),
+                "scenario {scenario}"
+            );
+            fixture.finish().await;
+            continue;
+        }
+        let traded = observed.unwrap();
+        let handoff = SwapBridgeHandoff {
+            observation: traded,
+            deposit_id: Some(U256::from(42)),
+        };
+
+        let record = fixture.record();
+        let orders = record.swap().unwrap().orders();
+        let (expired, retry) = (orders[0].observations(), orders[retry_index].observations());
+        assert_eq!(retry.traded, Some(traded), "the trade is the retry's");
+        assert!(
+            retry.trade_amounts.is_some(),
+            "the retry keeps its trade's amounts"
+        );
+        assert_eq!(
+            (expired.traded, expired.trade_amounts),
+            (None, None),
+            "no trade is invented for the expired attempt"
+        );
+        match scenario {
+            0 => {
+                assert_eq!(
+                    (
+                        retry.bridge_handoff,
+                        retry.delivered,
+                        retry.settlement_credit
+                    ),
+                    (None, None, None),
+                    "the retry's terms did not make this deposit"
+                );
+                assert_eq!(
+                    (expired.bridge_handoff, expired.delivered),
+                    (Some(handoff), Some(traded)),
+                    "the hand-off is the expired attempt's, whose payload made the deposit"
+                );
+                assert_eq!(
+                    expired
+                        .settlement_credit
+                        .map(|credit| credit.private_amount),
+                    Some(U256::from(74)),
+                    "surplus follows the matched payload's shield request"
+                );
+                assert_eq!(
+                    record
+                        .swap_bridges_to_track()
+                        .map(SwapOrderRecord::uid)
+                        .collect::<Vec<_>>(),
+                    vec![uid(1, 20)],
+                    "destination tracking follows the actual deposit"
+                );
+                let swap = record.swap().unwrap();
+                assert_eq!(
+                    (
+                        swap.trade_order(&orders[0]).map(SwapOrderRecord::uid),
+                        swap.delivery_order(&orders[retry_index])
+                            .map(SwapOrderRecord::uid)
+                    ),
+                    (Some(uid(2, 40)), Some(uid(1, 20)))
+                );
+                // Complete source evidence stops rereads of the settlement block.
+                fixture.chain.lock().unwrap().rpc_requests.clear();
+                fixture
+                    .owner
+                    .observe_swap_settlement(fixture.operation, uid(2, 40), 30)
+                    .await
+                    .unwrap();
+                assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
+                assert_eq!(fixture.record(), record);
+                // Check status once the nonce passed both hooks. The executor holds the buy
+                // amount again, which alone would read as an undelivered trade.
+                {
+                    let mut chain = fixture.chain.lock().unwrap();
+                    chain.nonces.push((30, 3));
+                    chain.nullifiers_spent = Some(30);
+                    chain.buy_balance.push((30, BUY_AMOUNT));
+                    chain.rpc_requests.clear();
+                }
+                let record = fixture.observe(33, 31).await;
+                let orders = record.swap().unwrap().orders();
+                let (expired, retry) = (orders[0].observations(), orders[1].observations());
+                assert_eq!(
+                    (expired.post_hook_deposit, retry.post_hook_deposit),
+                    (Some(traded), None),
+                    "only the expired attempt signed these terms, so the deposit names its hook"
+                );
+                assert_eq!(
+                    (retry.delivered, retry.undelivered),
+                    (None, None),
+                    "the use's delivery is the expired attempt's hand-off"
+                );
+                assert!(!reads_a_balance(
+                    &fixture.chain.lock().unwrap().rpc_requests
+                ));
+            }
+            1 => {
+                // The shield in the receipt is the expired attempt's request, so the traded
+                // order, which owns the terms, takes no credit from it.
+                assert_eq!(
+                    state(&record, 1),
+                    SwapOrderState::Bridging,
+                    "scenario {scenario}"
+                );
+                assert_eq!(
+                    (
+                        retry.bridge_handoff,
+                        retry.delivered,
+                        retry.settlement_credit
+                    ),
+                    (Some(handoff), Some(traded), None),
+                    "scenario {scenario}"
+                );
+                assert_eq!(
+                    (
+                        expired.bridge_handoff,
+                        expired.delivered,
+                        expired.settlement_credit
+                    ),
+                    (None, None, None),
+                    "scenario {scenario}"
+                );
+                // Check status once the nonce passed both hooks. Either attempt's post-hook
+                // could have made the deposit, so neither is named and no page is read to
+                // find out.
+                {
+                    let mut chain = fixture.chain.lock().unwrap();
+                    chain.nonces.push((30, 3));
+                    chain.nullifiers_spent = Some(30);
+                }
+                let log_queries = || fixture.chain.lock().unwrap().log_queries;
+                let before = log_queries();
+                let record = fixture.observe(33, 31).await;
+                for order in record.swap().unwrap().orders() {
+                    let observed = order.observations();
+                    assert_eq!(
+                        (
+                            observed.post_hook_deposit,
+                            observed.shielded,
+                            observed.settlement_credit
+                        ),
+                        (None, None, None),
+                        "the hook that ran is not named and no surplus is invented"
+                    );
+                }
+                assert_eq!(
+                    (state(&record, 0), state(&record, 1)),
+                    (
+                        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired),
+                        SwapOrderState::Bridging
+                    )
+                );
+                assert_eq!(
+                    (
+                        record.swap_hook_winner(U256::from(2)),
+                        record.resolved_swap_hook(U256::from(2))
+                    ),
+                    (None, None)
+                );
+                assert_eq!(
+                    log_queries(),
+                    before,
+                    "the source outcome is complete and both hook nonces are consumed"
+                );
+                let record = fixture.observe(34, 32).await;
+                assert_eq!(log_queries(), before, "the search is not repeated");
+                let observations = |record: &ExecutorRecord| {
+                    record
+                        .swap()
+                        .unwrap()
+                        .orders()
+                        .iter()
+                        .map(SwapOrderRecord::observations)
+                        .collect::<Vec<_>>()
+                };
+                let restarted = restarted_owner(&fixture);
+                let reopened = restarted
+                    .observe_swap(fixture.operation, 32..34)
+                    .await
+                    .unwrap()
+                    .record()
+                    .clone();
+                assert_eq!(log_queries(), before, "nor after a restart");
+                assert_eq!(observations(&reopened), observations(&record));
+                // The open bridge outcome keeps the account from another swap.
+                let reuse = || {
+                    restarted.reuse_swap_account(
+                        fixture.operation,
+                        33,
+                        SwapAccountRole::Source,
+                        SwapAccountUse::New,
+                    )
+                };
+                let refused = reuse().await.unwrap_err();
+                assert_eq!(
+                    refused.downcast_ref::<SwapAccountRefusal>(),
+                    Some(&SwapAccountRefusal::BridgeUndelivered),
+                    "{refused:#}"
+                );
+                fixture
+                    .store
+                    .record_swap_bridge_outcome(
+                        fixture.operation,
+                        uid(2, 40),
+                        SwapBridgeOutcome::DeliveredVerified {
+                            block: BlockNumHash::new(500, B256::repeat_byte(0x60)),
+                            transaction_hash: B256::repeat_byte(0x61),
+                            output_amount: older.output_amount,
+                            shielded: false,
+                        },
+                    )
+                    .unwrap();
+                let reused = reuse().await.unwrap();
+                assert_eq!(reused.expected_pre_hook_nonce(), U256::from(3));
+                for order in fixture.record().swap().unwrap().orders() {
+                    let observed = order.observations();
+                    assert_eq!(
+                        (observed.post_hook_deposit, observed.shielded),
+                        (None, None),
+                        "admission names no hook either"
+                    );
+                }
+                restarted.shutdown().await;
+            }
+            // Scenario 2; the conflicting deposits of scenario 3 returned above.
+            _ => {
+                assert_eq!(
+                    (expired.bridge_handoff, expired.delivered),
+                    (Some(handoff), Some(traded)),
+                    "scenario {scenario}"
+                );
+                for later in [orders[1].observations(), retry] {
+                    assert_eq!(
+                        (later.bridge_handoff, later.delivered),
+                        (None, None),
+                        "scenario {scenario}"
+                    );
+                }
+            }
+        }
+        fixture.finish().await;
+    }
+}
+
+/// Why `owner` refuses the fixture's account, confirmed at block `confirmed`, to a new swap.
+async fn reuse_refusal(
+    owner: &ExecutorOwner,
+    operation: ExecutorOperationId,
+    confirmed: u64,
+) -> SwapAccountRefusal {
+    let refused = owner
+        .reuse_swap_account(
+            operation,
+            confirmed,
+            SwapAccountRole::Source,
+            SwapAccountUse::New,
+        )
+        .await
+        .unwrap_err();
+    *refused
+        .downcast_ref::<SwapAccountRefusal>()
+        .unwrap_or_else(|| panic!("{refused:#}"))
+}
+
+// A retry traded while the expired attempt's Across post-hook made the deposit. The outcome on
+// the destination chain and the refund follow that deposit: both are checked against the
+// expired attempt's signed terms and recorded on it, and both attempts read as the bridge's
+// state. The account takes another swap only after the delivery.
+#[tokio::test]
+async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
+    // The expired attempt's state as an attempt of its use, then the retry's.
+    let states = |record: &ExecutorRecord| {
+        let orders = record.swap().unwrap().orders();
+        (
+            swap_attempt_state(record, &orders[0]),
+            swap_attempt_state(record, &orders[1]),
+        )
+    };
+    let outcomes = |record: &ExecutorRecord| {
+        let orders = record.swap().unwrap().orders();
+        (
+            orders[0].observations().bridge_outcome,
+            orders[1].observations().bridge_outcome,
+        )
+    };
+    for (surplus, refunds) in [
+        (BridgeSurplus::Reshield, false),
+        (BridgeSurplus::KeepInAccount, true),
+    ] {
+        let variant = format!("{surplus:?}, refunds: {refunds}");
+        let fixture = Fixture::start().await;
+        let (delivery, older) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        let delivery = BridgeDelivery {
+            surplus,
+            ..delivery
+        };
+        let newer = AcrossOrderTerms {
+            output_amount: U256::from(9_900),
+            quote_timestamp: older.quote_timestamp + 600,
+            fill_deadline: older.fill_deadline + 600,
+            ..older
+        };
+        expired_across_attempt(&fixture, 1, 20, delivery, older).await;
+        fixture.record_delivery_attempt(
+            2,
+            40,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(newer)),
+        );
+        let mut logs = retry_settlement_logs(
+            &fixture,
+            uid(2, 40),
+            &older,
+            signed_deposit(delivery, &older),
+        );
+        let keeps = surplus == BridgeSurplus::KeepInAccount;
+        if keeps {
+            // The post-hook keeps the surplus rather than shielding it.
+            logs.truncate(logs.len() - 3);
+        }
+        let traded = settle_retry(&fixture, uid(2, 40), 30, logs).await.unwrap();
+
+        let record = fixture.record();
+        let orders = record.swap().unwrap().orders();
+        let (expired, retry) = (orders[0].observations(), orders[1].observations());
+        assert_eq!(
+            (expired.bridge_handoff, expired.delivered, retry.traded),
+            (
+                Some(SwapBridgeHandoff {
+                    observation: traded,
+                    deposit_id: Some(U256::from(42)),
+                }),
+                Some(traded),
+                Some(traded)
+            ),
+            "{variant}"
+        );
+        assert_eq!(
+            (
+                expired
+                    .settlement_credit
+                    .map(|credit| credit.private_amount),
+                retry.settlement_credit
+            ),
+            ((!keeps).then_some(U256::from(74)), None),
+            "{variant}"
+        );
+        assert_eq!(
+            states(&record),
+            (SwapOrderState::Bridging, SwapOrderState::Bridging),
+            "{variant}"
+        );
+        assert_eq!(state(&record, 1), SwapOrderState::Traded, "{variant}");
+        let read_before_trade = record.nonce_observation();
+
+        // Check status once the nonce passed both hooks.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.nonces.push((30, 3));
+            chain.nullifiers_spent = Some(30);
+        }
+        let record = fixture.observe(33, 31).await;
+        assert_eq!(
+            states(&record),
+            (SwapOrderState::Bridging, SwapOrderState::Bridging),
+            "{variant}"
+        );
+        let (destination, config, server) = across_destination(42161).await;
+        let reloaded = || {
+            ExecutorStore::new(fixture.db.clone(), fixture.view.clone(), 1)
+                .unwrap()
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == fixture.operation)
+                .unwrap()
+        };
+
+        if refunds {
+            // Across refunds the expired attempt's deposit to the stealth account.
+            let refund = Transfer {
+                from: older.spoke_pool,
+                to: EXECUTOR,
+                value: older.input_amount,
+            };
+            let refund_tx = {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.add_addressed_transaction(
+                    34,
+                    older.spoke_pool,
+                    Bytes::new(),
+                    vec![(older.input_token, refund.encode_log_data())],
+                );
+                chain.head = 36;
+                chain.transactions.last().unwrap().0
+            };
+            let deposit = format!(
+                r#"{{"deposit":{{"status":"expired","depositRefundTxHash":"{refund_tx}","outputAmount":"1","recipient":"{}","destinationChainId":"42161"}}}}"#,
+                delivery.receiver,
+            );
+            let (url, _, stub) =
+                super::swap_order::spawn_bridge_stub(move |_| deposit.clone()).await;
+            let clients = bridge_clients(&fixture, &url);
+            assert_eq!(
+                observe_bridge(&fixture, &clients, &config).await,
+                Some(SwapBridgeOutcome::Refunding),
+                "{variant}"
+            );
+            let record = fixture.record();
+            assert_eq!(
+                outcomes(&record),
+                (Some(SwapBridgeOutcome::Refunding), None),
+                "{variant}"
+            );
+            assert_eq!(
+                states(&record),
+                (SwapOrderState::Refunding, SwapOrderState::Refunding),
+                "{variant}"
+            );
+            assert_eq!(
+                reuse_refusal(&fixture.owner, fixture.operation, 35).await,
+                SwapAccountRefusal::BridgeRefunding,
+                "{variant}"
+            );
+
+            // After a restart, an explicit check verifies the refund against the expired
+            // attempt's deposit and records it there.
+            let restarted = restarted_owner(&fixture);
+            assert_eq!(
+                restarted
+                    .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+                    .await
+                    .unwrap(),
+                Some(SwapBridgeOutcome::Refunding),
+                "{variant}"
+            );
+            let verified = SwapObservation {
+                block: fixture.chain.lock().unwrap().block(34),
+                transaction_hash: Some(refund_tx),
+            };
+            let record = reloaded();
+            let orders = record.swap().unwrap().orders();
+            assert_eq!(
+                (
+                    orders[0].observations().bridge_refund,
+                    orders[1].observations().bridge_refund
+                ),
+                (Some(verified), None),
+                "{variant}"
+            );
+            assert_eq!(
+                states(&record),
+                (SwapOrderState::Refunding, SwapOrderState::Refunding),
+                "{variant}"
+            );
+            assert_eq!(
+                reuse_refusal(&restarted, fixture.operation, 35).await,
+                SwapAccountRefusal::BridgeRefunding,
+                "{variant}"
+            );
+            restarted.shutdown().await;
+            stub.abort();
+        } else {
+            fixture.chain.lock().unwrap().head = 34;
+            assert_eq!(
+                reuse_refusal(&fixture.owner, fixture.operation, 33).await,
+                SwapAccountRefusal::BridgeUndelivered,
+                "{variant}"
+            );
+            // A relayer fills deposit 42 under the expired attempt's terms, which sign an
+            // output of 9,800. The retry signed 9,900, and no fill pays that.
+            let spoke_pool = config.bridge_profile().unwrap().spoke_pool();
+            let expected = {
+                let mut chain = destination.lock().unwrap();
+                chain.add_addressed_transaction(
+                    30,
+                    spoke_pool,
+                    Bytes::new(),
+                    vec![(
+                        spoke_pool,
+                        filled_relay(delivery, &older, 42).encode_log_data(),
+                    )],
+                );
+                chain.head = 31;
+                let (transaction_hash, transaction, _) = &chain.transactions[0];
+                SwapBridgeOutcome::DeliveredVerified {
+                    block: BlockNumHash::new(30, transaction.block_hash.unwrap()),
+                    transaction_hash: *transaction_hash,
+                    output_amount: U256::from(9_800),
+                    shielded: false,
+                }
+            };
+            let (url, lookups, stub) =
+                super::swap_order::spawn_bridge_stub(|_| across_report("filled", REPORTED_AMOUNT))
+                    .await;
+            let clients = bridge_clients(&fixture, &url);
+            assert_eq!(
+                observe_bridge(&fixture, &clients, &config).await,
+                Some(expected),
+                "{variant}"
+            );
+            assert!(
+                lookups
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(path, _)| path == "/api/deposit?originChainId=1&depositId=42")
+            );
+            let record = fixture.record();
+            assert_eq!(outcomes(&record), (Some(expected), None), "{variant}");
+            assert_eq!(
+                states(&record),
+                (SwapOrderState::Done, SwapOrderState::Done),
+                "{variant}"
+            );
+            // Both attempts are settled history once the account was read past the trade.
+            assert!(record.settled_swaps_at(33), "{variant}");
+            // The pair settles at the trade's block and no lower. The account read from
+            // before the trade stands in here, so the nonce does not set the cutoff.
+            let mut early = serde_json::to_value(&record).unwrap();
+            early["nonce_observation"] = serde_json::to_value(read_before_trade).unwrap();
+            let early: ExecutorRecord = serde_json::from_value(early).unwrap();
+            assert!(
+                !early.settled_swaps_at(29) && early.settled_swaps_at(30),
+                "{variant}"
+            );
+
+            // A restart keeps the outcome, and the account takes another swap at the nonce
+            // past both hooks.
+            let restarted = restarted_owner(&fixture);
+            let record = reloaded();
+            assert_eq!(outcomes(&record), (Some(expected), None), "{variant}");
+            assert_eq!(
+                states(&record),
+                (SwapOrderState::Done, SwapOrderState::Done),
+                "{variant}"
+            );
+            let reused = restarted
+                .reuse_swap_account(
+                    fixture.operation,
+                    33,
+                    SwapAccountRole::Source,
+                    SwapAccountUse::New,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reused.expected_pre_hook_nonce(), U256::from(3), "{variant}");
+            restarted.shutdown().await;
+            stub.abort();
+        }
+        server.abort();
+        fixture.finish().await;
+    }
+}
+
 /// Record a NEAR Intents order to BNB Chain and confirm its settlement in block 15, whose trade
 /// pays `deposit_address`. Returns the trade's observation.
 async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
@@ -4203,6 +5074,200 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
         stub.abort();
         fixture.finish().await;
     }
+}
+
+// Each NEAR Intents attempt signs its own deposit address. The trade is the expired attempt's,
+// so tracking and the outcome follow its address and signed quote, not the newer attempt's.
+#[tokio::test]
+async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
+    let destination_tx = B256::repeat_byte(2);
+    let bnb =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(56)
+            .cloned()
+            .unwrap();
+    let fixture = Fixture::start().await;
+    let delivery = SwapDelivery::Bridge(BridgeDelivery {
+        provider: BridgeProvider::NearIntents,
+        destination_chain: 56,
+        receiver: Address::repeat_byte(0x77),
+        destination_token: Address::ZERO,
+        surplus: BridgeSurplus::BridgedByProvider,
+        private: None,
+    });
+    let (older_address, newer_address) = (Address::repeat_byte(0x79), Address::repeat_byte(0x69));
+    let older = BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+        deposit_address: older_address,
+        min_amount_out: U256::from(15),
+        amount_out: U256::from(16),
+        deadline: "2026-09-30T01:00:00.000Z".into(),
+        signed_quote: r#"{"quote":"older"}"#.into(),
+    });
+    let newer = BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+        deposit_address: newer_address,
+        min_amount_out: U256::from(17),
+        amount_out: U256::from(18),
+        deadline: "2026-09-30T02:00:00.000Z".into(),
+        signed_quote: r#"{"quote":"newer"}"#.into(),
+    });
+    let (traded_uid, newer_uid) = (uid(1, 20), uid(2, 40));
+
+    // The first attempt expires unfilled, and the retry signs another deposit address.
+    fixture.record_delivery_attempt(1, 20, BUY, delivery, Some(older.clone()));
+    let record = fixture.observe(23, 21).await;
+    assert_eq!(
+        state(&record, 0),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
+    );
+    fixture.record_delivery_attempt(2, 40, BUY, delivery, Some(newer));
+
+    // A finalized settlement then holds the first attempt's trade, which pays its address.
+    let logs = vec![
+        (fixture.settlement, trade_log(traded_uid)),
+        (
+            BUY,
+            Transfer {
+                from: fixture.settlement,
+                to: older_address,
+                value: U256::from(BUY_AMOUNT),
+            }
+            .encode_log_data(),
+        ),
+    ];
+    let traded = settle_retry(&fixture, traded_uid, 30, logs).await.unwrap();
+
+    // The uids of the attempt that traded for the first attempt's delivery, and of the
+    // attempt that delivered its trade.
+    let pairing = |record: &ExecutorRecord| {
+        let swap = record.swap().unwrap();
+        let first = &swap.orders()[0];
+        (
+            swap.trade_order(first).map(SwapOrderRecord::uid),
+            swap.delivery_order(first).map(SwapOrderRecord::uid),
+        )
+    };
+    let outcomes = |record: &ExecutorRecord| {
+        let orders = record.swap().unwrap().orders();
+        (
+            orders[0].observations().bridge_outcome,
+            orders[1].observations().bridge_outcome,
+        )
+    };
+    let record = fixture.record();
+    let orders = record.swap().unwrap().orders();
+    let (first, retry) = (orders[0].observations(), orders[1].observations());
+    assert_eq!(
+        (first.traded, first.bridge_handoff, first.delivered),
+        (
+            Some(traded),
+            Some(SwapBridgeHandoff {
+                observation: traded,
+                deposit_id: None,
+            }),
+            Some(traded)
+        )
+    );
+    assert_eq!(
+        (retry.traded, retry.bridge_handoff, retry.delivered),
+        (None, None, None)
+    );
+    assert_eq!(pairing(&record), (Some(traded_uid), Some(traded_uid)));
+    let tracked = record.swap_bridges_to_track().collect::<Vec<_>>();
+    assert_eq!(
+        tracked.iter().map(|order| order.uid()).collect::<Vec<_>>(),
+        vec![traded_uid]
+    );
+    // The tracked order carries the first attempt's address and signed quote.
+    assert_eq!(tracked[0].bridge(), Some(&older));
+
+    // 1Click reports the first attempt's deposit delivered and the retry's address refunded.
+    let (asked_older, asked_newer) = (older_address.to_string(), newer_address.to_string());
+    let (answers_older, answers_newer) = (asked_older.clone(), asked_newer.clone());
+    let (url, requests, stub) = super::swap_order::spawn_bridge_stub_with(move |path, _| {
+        if path.contains(&answers_older) {
+            (
+                200,
+                format!(
+                    r#"{{"status":"SUCCESS","swapDetails":{{"amountOut":"16","destinationChainTxHashes":[{{"hash":"{destination_tx}","explorerUrl":"https://bscscan.com/tx/{destination_tx}"}}]}}}}"#
+                ),
+            )
+        } else if path.contains(&answers_newer) {
+            (200, r#"{"status":"REFUNDED"}"#.to_owned())
+        } else {
+            (400, "{}".to_owned())
+        }
+    })
+    .await;
+    let clients = bridge_clients(&fixture, &url);
+    let expected = Some(SwapBridgeOutcome::DeliveredReported {
+        amount_out: Some(U256::from(16)),
+        transaction_hash: Some(destination_tx),
+    });
+    assert_eq!(observe_bridge(&fixture, &clients, &bnb).await, expected);
+    assert_eq!(outcomes(&fixture.record()), (expected, None));
+    // Only the first attempt's address was asked about.
+    let only_older_asked = || {
+        let requests = requests.lock().unwrap();
+        requests.len() == 1
+            && requests
+                .iter()
+                .all(|(path, _)| path.contains(&asked_older) && !path.contains(&asked_newer))
+    };
+    assert!(only_older_asked());
+
+    // The retry holds no hand-off, so its status is neither recorded nor asked for.
+    assert!(matches!(
+        fixture.store.record_swap_bridge_outcome(
+            fixture.operation,
+            newer_uid,
+            SwapBridgeOutcome::Refunding
+        ),
+        Err(ExecutorStoreError::InvalidRecord)
+    ));
+    assert_eq!(
+        fixture
+            .owner
+            .observe_swap_bridge(fixture.operation, newer_uid, &clients, &bnb)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(only_older_asked());
+
+    // A restart keeps the pairing and the outcome, and asks 1Click nothing more.
+    let restarted = restarted_owner(&fixture);
+    let record = ExecutorStore::new(fixture.db.clone(), fixture.view.clone(), 1)
+        .unwrap()
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == fixture.operation)
+        .unwrap();
+    assert_eq!(pairing(&record), (Some(traded_uid), Some(traded_uid)));
+    assert_eq!(outcomes(&record), (expected, None));
+    assert_eq!(record.swap_bridges_to_track().count(), 0);
+    assert_eq!(
+        swap_attempt_state(&record, &record.swap().unwrap().orders()[0]),
+        SwapOrderState::Done
+    );
+    for attempt in [traded_uid, newer_uid] {
+        assert_eq!(
+            restarted
+                .observe_swap_bridge(fixture.operation, attempt, &clients, &bnb)
+                .await
+                .unwrap(),
+            if attempt == traded_uid {
+                expected
+            } else {
+                None
+            }
+        );
+    }
+    assert!(only_older_asked());
+    restarted.shutdown().await;
+    stub.abort();
+    fixture.finish().await;
 }
 
 #[tokio::test]

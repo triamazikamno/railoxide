@@ -266,6 +266,16 @@ impl CowOrderbookClient {
         &self.http
     }
 
+    /// This client on another network route.
+    #[must_use]
+    pub fn on_route(&self, http: OperationHttpClient) -> Self {
+        Self {
+            http,
+            base_url: self.base_url.clone(),
+            chain_id: self.chain_id,
+        }
+    }
+
     /// `POST /api/v1/quote` for a sell order, with hook-free app data.
     pub async fn quote_sell(&self, request: &CowSellQuoteRequest) -> Result<CowQuote, CowApiError> {
         let body = QuoteRequestBody {

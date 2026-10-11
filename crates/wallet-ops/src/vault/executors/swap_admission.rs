@@ -4,7 +4,7 @@
 
 use super::{
     Address, B256, ExecutorPayloadPurpose, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
-    SwapDestinationOutcome, SwapOrderRecord, SwapUseId, SwapUseRole, U256,
+    SwapDestinationOutcome, SwapOperationRecord, SwapOrderRecord, SwapUseId, SwapUseRole, U256,
 };
 use crate::settings::ExecutorProfile;
 
@@ -221,7 +221,7 @@ pub fn swap_account_refusal(
         return Some(
             swap.orders()
                 .iter()
-                .find_map(bridge_refusal)
+                .find_map(|order| bridge_refusal(swap, order))
                 .unwrap_or(Refusal::PreviousOrderLive),
         );
     }
@@ -404,11 +404,16 @@ fn has_executable_work(record: &ExecutorRecord, claimed: Option<SwapUseId>) -> b
 }
 
 /// Why a Bridge order keeps its account from another swap, when its bridge is the reason.
-const fn bridge_refusal(order: &SwapOrderRecord) -> Option<SwapAccountRefusal> {
+/// The order that holds the hand-off answers, whether it traded itself or handed off the
+/// trade of another attempt of its use.
+fn bridge_refusal(
+    swap: &SwapOperationRecord,
+    order: &SwapOrderRecord,
+) -> Option<SwapAccountRefusal> {
     let observed = order.observations();
-    if observed.traded.is_none()
-        || observed.delivered.is_none()
+    if observed.delivered.is_none()
         || !matches!(order.delivery(), SwapDelivery::Bridge(_))
+        || observed.traded.is_none() && swap.trade_order(order).is_none()
     {
         return None;
     }

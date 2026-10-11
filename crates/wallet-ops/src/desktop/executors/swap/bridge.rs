@@ -40,8 +40,9 @@ use crate::vault::{
     SwapDelivery,
 };
 use crate::{
-    ExecutorOwner, HttpContext, PairAnchorRate, QuoteDeviationError, RAILGUN_PROTOCOL_FEE_BPS,
-    TokenAnchorRateCache, check_quote_against_anchor, railgun_protocol_fee_amount,
+    ExecutorOwner, HttpContext, OperationHttpClient, PairAnchorRate, QuoteDeviationError,
+    RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache, check_quote_against_anchor,
+    railgun_protocol_fee_amount,
 };
 
 /// How long a 1Click quote outlives the order's validity.
@@ -61,6 +62,17 @@ const ACROSS_QUOTE_TIME_BUFFER_SECS: u64 = 3_600;
 pub struct SwapBridgeClients {
     pub across: AcrossClient,
     pub near: NearIntentsClient,
+}
+
+impl SwapBridgeClients {
+    /// These clients on another network route.
+    #[must_use]
+    pub fn on_route(&self, http: &OperationHttpClient) -> Self {
+        Self {
+            across: self.across.on_route(http.clone()),
+            near: self.near.on_route(http.clone()),
+        }
+    }
 }
 
 /// A Bridge delivery's route, from its provider's destination list, for the review to quote.

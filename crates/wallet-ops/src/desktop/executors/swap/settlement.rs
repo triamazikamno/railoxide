@@ -1,7 +1,8 @@
 //! Routine settlement confirmation sends only block identifiers to RPC. Private sync's
 //! spend location of the pre-hook inputs and the orderbook's trade block are hints; the
 //! receipt's trade establishes the outcome, together with its private credit for Reshield
-//! delivery, or its Across deposit for Bridge delivery.
+//! delivery, or its Across deposit for Bridge delivery. A public receiver's Across deposit may
+//! match the terms of another attempt of the same swap use, which then holds the hand-off.
 
 use alloy::network::{
     AnyRpcBlock, AnyTransactionReceipt, ReceiptResponse as _, primitives::HeaderResponse as _,
@@ -24,9 +25,9 @@ use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeSurplus, ExecutorOperationId,
-    ExecutorRecord, SwapBridgeHandoff, SwapDelivery, SwapObservation, SwapOrderRecord,
-    SwapShieldObservation, SwapTradeAmounts,
+    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeSurplus,
+    ExecutorOperationId, ExecutorRecord, SwapBridgeHandoff, SwapDelivery, SwapObservation,
+    SwapOrderRecord, SwapSettlementEvidence, SwapShieldObservation, SwapTradeAmounts,
 };
 
 // The pinned shared ERC20 bindings do not expose the Transfer event.
@@ -51,7 +52,11 @@ impl ExecutorOwner {
             .swap()
             .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
             .ok_or_else(|| eyre!("swap order is unavailable"))?;
-        if order.observations().delivered.is_some() {
+        // The trade's delivery is already recorded, on this attempt or another of its use.
+        if record
+            .swap()
+            .is_some_and(|swap| swap.delivery_order(order).is_some())
+        {
             return Ok(());
         }
         for endpoint in self.endpoints.providers().await {
@@ -76,10 +81,13 @@ impl ExecutorOwner {
                     self.store.record_swap_settlement(
                         operation,
                         uid,
-                        settlement.trade,
-                        settlement.amounts,
-                        settlement.credit,
-                        settlement.handoff,
+                        &SwapSettlementEvidence {
+                            traded: settlement.trade,
+                            amounts: settlement.amounts,
+                            credit: settlement.credit,
+                            handoff: settlement.handoff,
+                            delivery: settlement.delivery,
+                        },
                     )?;
                     self.notify_change();
                     return Ok(());
@@ -147,6 +155,9 @@ struct Settlement {
     /// A Bridge order's hand-off: the NEAR Intents trade, or the Across deposit that follows
     /// its payout. `None` while an Across post-hook's deposit is missing.
     handoff: Option<SwapBridgeHandoff>,
+    /// The attempt whose approved terms the hand-off and credit match. It is the traded order,
+    /// except when an Across deposit matches another attempt of the same use.
+    delivery: OrderUid,
 }
 
 async fn read_settlement(
@@ -193,17 +204,20 @@ async fn read_settlement(
     let terms = swap.order_terms(order);
     let buy_token = cow_buy_token(terms.buy_token());
     // An order without a post-hook has no post-hook shield to match.
-    let shields = match order.post_hook() {
-        Some(post_hook) => expected_shields(
-            executor,
-            railgun,
-            &RelayAdapt7702::multicallCall::abi_decode(
-                issued(record, post_hook.payload())?.context().calldata(),
-            )?
-            ._calls,
-        )?,
-        None => Vec::new(),
+    let hook_shields = |order: &SwapOrderRecord| -> Result<Vec<ShieldRequest>> {
+        match order.post_hook() {
+            Some(post_hook) => expected_shields(
+                executor,
+                railgun,
+                &RelayAdapt7702::multicallCall::abi_decode(
+                    issued(record, post_hook.payload())?.context().calldata(),
+                )?
+                ._calls,
+            ),
+            None => Ok(Vec::new()),
+        }
     };
+    let shields = hook_shields(order)?;
     let expected = ExpectedTrade {
         settlement,
         owner: executor,
@@ -248,15 +262,16 @@ async fn read_settlement(
                 executor,
                 trade.buyAmount,
             );
-            let credits = |start: usize| {
-                shield_credits(logs, start, &shields, terms.buy_token(), executor, railgun).map(
-                    move |(private_amount, fee)| SwapShieldObservation {
-                        observation,
-                        private_amount,
-                        fee,
-                    },
-                )
+            let credit = |(private_amount, fee)| SwapShieldObservation {
+                observation,
+                private_amount,
+                fee,
             };
+            let credits = |start: usize| {
+                shield_credits(logs, start, &shields, terms.buy_token(), executor, railgun)
+                    .map(credit)
+            };
+            let mut delivery_uid = order.uid();
             // The order UID commits to an External receiver or a NEAR Intents deposit address,
             // and the settlement pays it in the call that emits this Trade, so the trade alone
             // establishes External delivery and the NEAR Intents hand-off. Native buys emit no
@@ -278,33 +293,78 @@ async fn read_settlement(
                 ),
                 (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(across))) => {
                     let start = payout.map_or(logs.len(), |payout| payout + 1);
+                    // An earlier attempt's post-hook holds the same nonce as this order's, so a
+                    // public receiver's deposit may carry the terms of any attempt of the use.
+                    let candidates = if delivery.is_private() || order.use_id().is_none() {
+                        vec![(order, delivery, across)]
+                    } else {
+                        swap.orders()
+                            .iter()
+                            .filter(|candidate| candidate.use_id() == order.use_id())
+                            .filter_map(|candidate| {
+                                match (candidate.delivery(), candidate.bridge()) {
+                                    (
+                                        SwapDelivery::Bridge(delivery),
+                                        Some(BridgeOrderTerms::Across(across)),
+                                    ) if delivery.provider == BridgeProvider::Across
+                                        && !delivery.is_private() =>
+                                    {
+                                        Some((candidate, delivery, across))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    };
+                    // Each deposit after the payout that some attempt signed, with the attempt
+                    // whose terms it is recorded under: the traded order when it matches, and
+                    // otherwise the earliest matching attempt. This tie-break names approved
+                    // terms and does not show which hook ran.
                     let mut deposits = logs
                         .iter()
                         .enumerate()
                         .skip(start)
                         .filter(|(_, log)| spoke_pool == Some(log.address()))
                         .filter_map(|(index, log)| {
-                            Some((index, log.log_decode::<SpokePool::FundsDeposited>().ok()?))
-                        })
-                        .filter(|(index, log)| {
-                            signed_deposit(&log.inner.data, across, delivery, executor)
-                                && executor_funded(&logs[start..*index], across, executor)
+                            let deposit = log.log_decode::<SpokePool::FundsDeposited>().ok()?;
+                            let (owner, delivery, _) = candidates
+                                .iter()
+                                .filter(|(_, delivery, across)| {
+                                    signed_deposit(&deposit.inner.data, across, *delivery, executor)
+                                        && executor_funded(&logs[start..index], across, executor)
+                                })
+                                .min_by_key(|(candidate, ..)| {
+                                    (candidate.uid() != order.uid(), candidate.attempt())
+                                })?;
+                            Some((index, deposit.inner.data.depositId, *owner, *delivery))
                         });
                     match (deposits.next(), deposits.next()) {
                         (None, _) => (None, None),
-                        (Some((index, deposit)), None) => (
-                            // Reshielded surplus has no minimum and isn't needed for the
-                            // hand-off.
-                            if delivery.surplus == BridgeSurplus::Reshield {
-                                credits(index + 1).max_by_key(|credit| credit.private_amount)
-                            } else {
-                                None
-                            },
-                            Some(SwapBridgeHandoff {
-                                observation,
-                                deposit_id: Some(deposit.inner.data.depositId),
-                            }),
-                        ),
+                        (Some((index, deposit_id, owner, delivery)), None) => {
+                            delivery_uid = owner.uid();
+                            (
+                                // Reshielded surplus has no minimum and isn't needed for the
+                                // hand-off. It follows the shield requests the owner signed.
+                                if delivery.surplus == BridgeSurplus::Reshield {
+                                    shield_credits(
+                                        logs,
+                                        index + 1,
+                                        &hook_shields(owner)?,
+                                        terms.buy_token(),
+                                        executor,
+                                        railgun,
+                                    )
+                                    .map(credit)
+                                    .max_by_key(|credit| credit.private_amount)
+                                } else {
+                                    None
+                                },
+                                Some(SwapBridgeHandoff {
+                                    observation,
+                                    deposit_id: Some(deposit_id),
+                                }),
+                            )
+                        }
                         (Some(_), Some(_)) => {
                             return Err(eyre!("settlement contains ambiguous deposit evidence"));
                         }
@@ -325,6 +385,7 @@ async fn read_settlement(
                 amounts: trade_amounts(&trade, &receipt),
                 credit,
                 handoff,
+                delivery: delivery_uid,
             });
         }
     }

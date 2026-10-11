@@ -106,6 +106,12 @@ alloy::sol! {
         }
         function fillRelay(V3RelayData relayData, uint256 repaymentChainId, bytes32 repaymentAddress) external;
     }
+
+    // The pinned shared `SpokePool` binding declares neither getter.
+    interface ForkSpokePoolBuffers {
+        function depositQuoteTimeBuffer() external view returns (uint32);
+        function fillDeadlineBuffer() external view returns (uint32);
+    }
 }
 
 const SELL_AMOUNT: u64 = 10_000_000_000_000_000;
@@ -184,6 +190,29 @@ struct Wallet {
     /// The wallet's notes on the destination chain, which a reused destination account's
     /// earlier shields are judged from.
     destination_notes: Option<AcceptedShieldNotes>,
+}
+
+/// What a signing varies beyond its plan.
+#[derive(Clone, Copy)]
+struct Signing {
+    /// The approved minimum on the destination chain of a Bridge order, which its stubbed
+    /// quote also delivers.
+    destination_minimum: U256,
+    /// The lower continuing minimum accepted with the review.
+    continuing_minimum: Option<U256>,
+    /// How long the order stays valid, from the local clock.
+    valid_for: std::time::Duration,
+}
+
+impl Signing {
+    /// `DESTINATION_MINIMUM` for ten minutes, with no continuing minimum accepted.
+    fn standard() -> Self {
+        Self {
+            destination_minimum: U256::from(DESTINATION_MINIMUM),
+            continuing_minimum: None,
+            valid_for: std::time::Duration::from_mins(10),
+        }
+    }
 }
 
 /// The destination chain of private Across orders over its own fork, and the wallet's owner
@@ -719,6 +748,20 @@ impl Wallet {
         notes: &[Utxo],
         transactions: Option<Vec<Transaction>>,
     ) -> Swap {
+        self.sign_with(fork, plan, notes, transactions, Signing::standard())
+            .await
+            .unwrap_or_else(|outcome| panic!("the order is submitted, not {outcome:?}"))
+    }
+
+    /// [`Self::sign`] with `terms`, or the outcome of a signing that submitted nothing.
+    async fn sign_with(
+        &self,
+        fork: &ForkChain,
+        plan: SwapInputPlan,
+        notes: &[Utxo],
+        transactions: Option<Vec<Transaction>>,
+        terms: Signing,
+    ) -> Result<Swap, SwapOrderOutcome> {
         let authorization = password();
         let (operation, executor) = (plan.operation().unwrap(), plan.executor());
         let swap_profile = self.chain.swap_profile().unwrap();
@@ -748,7 +791,7 @@ impl Wallet {
             U256::from(25),
             50,
             crate::cow::GAS_SHARE_BALANCED_BPS,
-            std::time::Duration::from_mins(10),
+            terms.valid_for,
             1,
             U256::ZERO,
             isolation,
@@ -762,13 +805,13 @@ impl Wallet {
         if bridge.is_some() {
             review.set_bridge_for_tests(&crate::SwapBridgeQuote {
                 provider: BridgeProvider::Across,
-                destination_minimum: U256::from(DESTINATION_MINIMUM),
-                expected_output: U256::from(DESTINATION_MINIMUM),
+                destination_minimum: terms.destination_minimum,
+                expected_output: terms.destination_minimum,
                 fee: Some(U256::ZERO),
                 leg: crate::BridgeLegPrice::SameAsset,
                 fill_time_sec: None,
                 private: private.then_some(crate::SwapPrivateBridgeQuote {
-                    quoted_output: U256::from(DESTINATION_MINIMUM + DELIVERY_ALLOWANCE),
+                    quoted_output: terms.destination_minimum + U256::from(DELIVERY_ALLOWANCE),
                     delivery_allowance: U256::from(DELIVERY_ALLOWANCE),
                     destination_shield_fee_bps: crate::RAILGUN_PROTOCOL_FEE_BPS,
                     deposit_floor: None,
@@ -790,8 +833,13 @@ impl Wallet {
         .unwrap();
         let across = match bridge {
             Some(delivery) => Some(
-                self.across_stub(fork, &orderbook, delivery.destination_chain)
-                    .await,
+                self.across_stub(
+                    fork,
+                    &orderbook,
+                    delivery.destination_chain,
+                    terms.destination_minimum,
+                )
+                .await,
             ),
             None => None,
         };
@@ -852,8 +900,9 @@ impl Wallet {
                 anchor_cache: &crate::TokenAnchorRateCache::new(),
                 token_registry: &tokens,
                 bridge: route,
-                destination_minimum: bridge.map(|_| U256::from(DESTINATION_MINIMUM)),
+                destination_minimum: bridge.map(|_| terms.destination_minimum),
                 destination: destination_signing,
+                continuing_minimum: terms.continuing_minimum,
             })
             .await
             .unwrap();
@@ -862,12 +911,12 @@ impl Wallet {
             across_task.abort();
         }
         let SwapOrderOutcome::Submitted { uid } = outcome else {
-            panic!("the order is submitted");
+            return Err(outcome);
         };
         let (persisted, body) = submissions.lock().unwrap()[0].clone();
         assert!(persisted);
         let app_data = body["appData"].as_str().unwrap();
-        Swap {
+        Ok(Swap {
             operation,
             swap_use,
             executor,
@@ -881,20 +930,22 @@ impl Wallet {
                 .metadata
                 .hooks,
             app_data_len: app_data.len(),
-        }
+        })
     }
 
-    /// Across clients on `orderbook`'s route whose fee quotes come from a local stub, and the
-    /// destination chain `destination_chain`: the wallet's own over its fork, or else the
-    /// default one. The quote is dated at the fork's latest block, which the `SpokePool` checks
-    /// at the deposit, and its fill deadline is three hours later: past the order's expiry plus
-    /// the wallet's margin, and within the `SpokePool`'s buffer. The stub answers a private
-    /// order's signing-time request, which carries the handler and its message, the same way.
+    /// Across clients on `orderbook`'s route whose fee quotes of `output` come from a local
+    /// stub, and the destination chain `destination_chain`: the wallet's own over its fork, or
+    /// else the default one. The quote is dated at the fork's latest block, which the
+    /// `SpokePool` checks at the deposit, and its fill deadline is three hours later: past the
+    /// order's expiry plus the wallet's margin, and within the `SpokePool`'s buffer. The stub
+    /// answers a private order's signing-time request, which carries the handler and its
+    /// message, the same way.
     async fn across_stub(
         &self,
         fork: &ForkChain,
         orderbook: &CowOrderbookClient,
         destination_chain: u64,
+        output: U256,
     ) -> (
         crate::SwapBridgeClients,
         crate::settings::EffectiveChainConfig,
@@ -916,12 +967,7 @@ impl Wallet {
         };
         let destination_spoke_pool = destination.bridge_profile().unwrap().spoke_pool();
         let (url, _, task) = spawn_bridge_stub(move |_| {
-            across_quote_at(
-                spoke_pool,
-                destination_spoke_pool,
-                U256::from(DESTINATION_MINIMUM),
-                quoted,
-            )
+            across_quote_at(spoke_pool, destination_spoke_pool, output, quoted)
         })
         .await;
         let mut clients = self.owner.swap_bridge_clients(orderbook).unwrap();
@@ -2193,6 +2239,445 @@ async fn swap_fork_across_settlement_deposits_the_approved_terms() {
             SwapOrderState::Bridging
         );
     }
+    wallet.finish().await;
+}
+
+/// The Across deposit terms of `record`'s order `uid`.
+fn across_terms(record: &ExecutorRecord, uid: OrderUid) -> AcrossOrderTerms {
+    let Some(BridgeOrderTerms::Across(terms)) = order_of(record, uid).bridge().cloned() else {
+        panic!("an Across order keeps its deposit terms");
+    };
+    terms
+}
+
+/// The nonces of the pre-hook and the post-hook of `record`'s order `uid`.
+fn hook_nonces(record: &ExecutorRecord, uid: OrderUid) -> (U256, U256) {
+    let order = order_of(record, uid);
+    (order.pre_hook().nonce(), order.post_hook().unwrap().nonce())
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() {
+    // The retry is quoted a tenth more on the destination chain than the first attempt.
+    let lower = U256::from(DESTINATION_MINIMUM);
+    let higher = lower + lower / U256::from(10);
+    // Each choice gets its own fork, since the scenario moves the fork's clock.
+    for (surplus, label) in SURPLUS_CHOICES {
+        let fork = ForkChain::start().await;
+        let mut wallet = Wallet::open(&fork);
+        let spoke_pool = wallet.chain.bridge_profile().unwrap().spoke_pool();
+        let finality = wallet.chain.finality_depth;
+        let reshielded = surplus == BridgeSurplus::Reshield;
+        wallet.pair = (USDC, across_delivery(surplus));
+        let first = wallet.swap(&fork).await;
+        let (operation, executor, swap_use) = (first.operation, first.executor, first.swap_use);
+
+        // The first attempt expires with its pre-hook's nonce k unused.
+        mine_past(&fork, u64::from(first.order.validTo)).await;
+        fork.mine(finality + 1).await;
+        let confirmed = fork.block_number().await - finality;
+        let record = wallet.observe(operation, confirmed..confirmed + 1).await;
+        assert_eq!(
+            swap_order_state(order_of(&record, first.uid)),
+            SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired),
+            "{label}"
+        );
+        let (pre_nonce, post_nonce) = hook_nonces(&record, first.uid);
+        assert_eq!(post_nonce, pre_nonce + U256::ONE);
+        assert_eq!(execution_nonce(&fork, executor).await, pre_nonce);
+
+        // The retry keeps the pair and the delivery, and signs at k again. Its `validTo` comes
+        // from the local clock, which the fork's clock is now ahead of, so it is valid for ten
+        // minutes of the fork's clock.
+        let delegated = wallet.redelegate(operation).await;
+        let ahead = fork
+            .timestamp()
+            .await
+            .saturating_sub(u64::from(valid_until(0)));
+        let unaccepted = Signing {
+            destination_minimum: higher,
+            continuing_minimum: None,
+            valid_for: std::time::Duration::from_secs(ahead + 10 * 60),
+        };
+        let plan = || {
+            let SwapAmountPlan::Fits(plan) = wallet.plan(
+                delegated,
+                std::slice::from_ref(&first.note),
+                U256::from(SELL_AMOUNT),
+                None,
+            ) else {
+                panic!("one note fits one order");
+            };
+            plan
+        };
+        // The harness builds its review by hand, so the continuing approvals are read here as
+        // a review reads them. The first attempt's post-hook at k + 1 is above the retry's
+        // pre-hook nonce and its quote is still fresh.
+        let continuing = wallet
+            .owner
+            .swap_continuing_approvals(operation, swap_use, wallet.pair.1, Some(pre_nonce))
+            .await
+            .unwrap();
+        assert_eq!(
+            continuing
+                .approvals()
+                .iter()
+                .map(|approval| (
+                    approval.uid,
+                    approval.destination_minimum,
+                    approval.post_hook_nonce
+                ))
+                .collect::<Vec<_>>(),
+            vec![(first.uid, lower, post_nonce)],
+            "{label}"
+        );
+
+        // Signing refuses until the review accepted the first attempt's lower minimum.
+        let refused = wallet
+            .sign_with(
+                &fork,
+                plan(),
+                std::slice::from_ref(&first.note),
+                None,
+                unaccepted,
+            )
+            .await;
+        assert_eq!(
+            refused.err(),
+            Some(SwapOrderOutcome::ReviewRequired(
+                crate::SwapReviewChange::ContinuingApproval {
+                    approved: U256::ZERO,
+                    current: lower,
+                }
+            )),
+            "{label}"
+        );
+        assert_eq!(wallet.record(operation).swap().unwrap().orders().len(), 1);
+        let Ok(retry) = wallet
+            .sign_with(
+                &fork,
+                plan(),
+                std::slice::from_ref(&first.note),
+                None,
+                Signing {
+                    continuing_minimum: Some(lower),
+                    ..unaccepted
+                },
+            )
+            .await
+        else {
+            panic!("{label}: the retry is submitted with the continuing minimum accepted");
+        };
+        let record = wallet.record(operation);
+        let (expired_terms, retry_terms) = (
+            across_terms(&record, first.uid),
+            across_terms(&record, retry.uid),
+        );
+        assert_eq!(
+            (expired_terms.output_amount, retry_terms.output_amount),
+            (lower, higher)
+        );
+        assert!(retry_terms.quote_timestamp > expired_terms.quote_timestamp);
+        assert_eq!(hook_nonces(&record, retry.uid), (pre_nonce, post_nonce));
+
+        // One settlement runs the retry's pre-hook and pays its trade to the account, then
+        // runs the expired attempt's post-hook where the retry's would run.
+        let payout = retry.order.buyAmount + U256::from(SURPLUS);
+        let left = payout
+            .checked_sub(expired_terms.input_amount)
+            .expect("the payout covers the expired attempt's deposit");
+        assert!(!left.is_zero());
+        let receipt = fork
+            .settle_with_surplus(
+                &retry.order,
+                retry.signature.clone(),
+                &retry.hooks.pre,
+                &first.hooks.post,
+                U256::from(SURPLUS),
+            )
+            .await;
+        assert!(receipt.status(), "{label}: the solver settles the retry");
+
+        // The one deposit carries the expired attempt's signed terms, not the retry's.
+        let deposits = deposits(&receipt, spoke_pool);
+        let [deposit] = deposits.as_slice() else {
+            panic!("{label}: the expired attempt's post-hook deposits once");
+        };
+        assert_eq!(
+            (
+                deposit.depositor,
+                deposit.recipient,
+                deposit.destinationChainId
+            ),
+            (
+                address_to_bytes32(executor),
+                address_to_bytes32(BRIDGE_RECEIVER),
+                U256::from(ARBITRUM_ONE)
+            )
+        );
+        assert_eq!(
+            (deposit.inputAmount, deposit.outputAmount),
+            (expired_terms.input_amount, lower)
+        );
+        assert_eq!(
+            (deposit.quoteTimestamp, deposit.fillDeadline),
+            (expired_terms.quote_timestamp, expired_terms.fill_deadline)
+        );
+        // The post-hook shields what the deposit left to the wallet, or leaves it in the
+        // account.
+        let shields = shields_of(&receipt, RAILGUN, USDC);
+        let shield = if reshielded {
+            let [(credited, fee)] = shields.as_slice() else {
+                panic!("the post-hook shields the surplus once");
+            };
+            assert_eq!(*credited + *fee, left);
+            Some((*credited, Some(*fee)))
+        } else {
+            assert!(shields.is_empty());
+            None
+        };
+        assert_eq!(
+            fork.erc20_balance(USDC, executor).await,
+            if reshielded { U256::ZERO } else { left }
+        );
+        assert_eq!(
+            execution_nonce(&fork, executor).await,
+            post_nonce + U256::ONE
+        );
+
+        // The settlement is observed for the retry. The trade stays on the retry, and the
+        // hand-off, the delivery and the credit go to the attempt whose terms were deposited.
+        let settled = receipt.block_number.unwrap();
+        fork.mine(finality).await;
+        wallet
+            .owner
+            .observe_swap_settlement(operation, retry.uid, settled)
+            .await
+            .unwrap();
+        let record = wallet.record(operation);
+        let (expired_order, retry_order) =
+            (order_of(&record, first.uid), order_of(&record, retry.uid));
+        let (delivered, traded) = (expired_order.observations(), retry_order.observations());
+        let trade = traded.traded.expect("the retry traded");
+        assert_eq!(trade.transaction_hash, Some(receipt.transaction_hash));
+        assert_eq!(
+            traded.trade_amounts.map(|amounts| amounts.buy_amount),
+            Some(payout)
+        );
+        assert_eq!(
+            (
+                traded.bridge_handoff,
+                traded.delivered,
+                traded.settlement_credit
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            delivered.bridge_handoff,
+            Some(SwapBridgeHandoff {
+                observation: trade,
+                deposit_id: Some(deposit.depositId),
+            })
+        );
+        assert_eq!((delivered.delivered, delivered.traded), (Some(trade), None));
+        assert_eq!(
+            delivered
+                .settlement_credit
+                .map(|credit| (credit.private_amount, credit.fee)),
+            shield
+        );
+        assert_eq!(
+            record
+                .swap_bridges_to_track()
+                .map(SwapOrderRecord::uid)
+                .collect::<Vec<_>>(),
+            vec![first.uid]
+        );
+        let recorded = record.swap().unwrap();
+        assert_eq!(
+            (
+                recorded
+                    .trade_order(expired_order)
+                    .map(SwapOrderRecord::uid),
+                recorded
+                    .delivery_order(retry_order)
+                    .map(SwapOrderRecord::uid)
+            ),
+            (Some(retry.uid), Some(first.uid))
+        );
+        for order in [expired_order, retry_order] {
+            assert_eq!(
+                crate::swap_attempt_state(&record, order),
+                SwapOrderState::Bridging
+            );
+        }
+
+        // Reconciliation names the expired attempt's post-hook as the one that deposited: only
+        // its terms match. The retry is neither undelivered nor ended.
+        let record = wallet.observe(operation, settled..settled + 1).await;
+        let (delivered, traded) = (
+            order_of(&record, first.uid).observations(),
+            order_of(&record, retry.uid).observations(),
+        );
+        assert_eq!(delivered.post_hook_deposit, Some(trade));
+        assert_eq!((traded.post_hook_deposit, traded.undelivered), (None, None));
+        assert!(traded.pre_hook_dead.is_none());
+        wallet.finish().await;
+    }
+}
+
+/// The account that deposits into the `SpokePool` directly.
+const DEPOSITOR: Address = Address::repeat_byte(0xd0);
+
+/// The next block of `fork` is mined at exactly `timestamp`, Unix seconds.
+async fn set_next_block_time(fork: &ForkChain, timestamp: u64) {
+    use alloy::providers::{DynProvider, Provider as _, ProviderBuilder};
+    let provider: DynProvider = ProviderBuilder::default().connect_http(fork.url()).erased();
+    let _: serde_json::Value = provider
+        .raw_request("evm_setNextBlockTimestamp".into(), (U256::from(timestamp),))
+        .await
+        .unwrap_or_else(|error| panic!("evm_setNextBlockTimestamp: {error}"));
+}
+
+/// `DEPOSITOR`'s own `depositV3` of `terms` to `BRIDGE_RECEIVER` on Arbitrum One, with the
+/// quote dated `quote_timestamp` and `fill_deadline`, sent in a block mined at exactly `at`.
+async fn deposit_at(
+    fork: &ForkChain,
+    terms: &AcrossOrderTerms,
+    quote_timestamp: u64,
+    fill_deadline: u64,
+    at: u64,
+) -> TransactionReceipt {
+    let deposit = SpokePool::depositV3Call {
+        depositor: DEPOSITOR,
+        recipient: BRIDGE_RECEIVER,
+        inputToken: terms.input_token,
+        outputToken: terms.output_token,
+        inputAmount: terms.input_amount,
+        outputAmount: terms.output_amount,
+        destinationChainId: U256::from(ARBITRUM_ONE),
+        exclusiveRelayer: terms.exclusive_relayer,
+        quoteTimestamp: u32::try_from(quote_timestamp).unwrap(),
+        fillDeadline: u32::try_from(fill_deadline).unwrap(),
+        exclusivityParameter: terms.exclusivity_parameter,
+        message: Bytes::new(),
+    };
+    set_next_block_time(fork, at).await;
+    let receipt = fork
+        .send(
+            TransactionRequest::default()
+                .from(DEPOSITOR)
+                .to(terms.spoke_pool)
+                .input(deposit.abi_encode().into())
+                .gas_limit(1_000_000),
+        )
+        .await;
+    assert_eq!(fork.timestamp().await, at, "the deposit's block time");
+    receipt
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_spoke_pool_rejects_a_deposit_past_its_quote_age() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let spoke_pool = wallet.chain.bridge_profile().unwrap().spoke_pool();
+    let finality = wallet.chain.finality_depth;
+    let quote_buffer = u64::from(
+        fork.call(
+            spoke_pool,
+            ForkSpokePoolBuffers::depositQuoteTimeBufferCall {},
+        )
+        .await,
+    );
+    let fill_buffer = u64::from(
+        fork.call(spoke_pool, ForkSpokePoolBuffers::fillDeadlineBufferCall {})
+            .await,
+    );
+    assert!(quote_buffer > 0 && fill_buffer > 4);
+    eprintln!(
+        "SpokePool depositQuoteTimeBuffer: {quote_buffer} s, fillDeadlineBuffer: {fill_buffer} s"
+    );
+
+    // An Across attempt whose quote is dated at the fork's latest block. Its pre-hook never
+    // runs, so the account's nonce stays below its post-hook's.
+    let delivery = across_delivery(BridgeSurplus::KeepInAccount);
+    wallet.pair = (USDC, delivery);
+    let swap = wallet.swap(&fork).await;
+    let record = wallet.record(swap.operation);
+    let terms = across_terms(&record, swap.uid);
+    assert_eq!(terms.spoke_pool, spoke_pool);
+    let (pre_nonce, post_nonce) = hook_nonces(&record, swap.uid);
+    let quoted = u64::from(terms.quote_timestamp);
+    // The last block time at which the pool still takes that quote.
+    let boundary = quoted + quote_buffer;
+    // Not before any block below, and within the pool's fill deadline buffer of each.
+    let fill_deadline = boundary + fill_buffer / 2;
+
+    fork.impersonate(DEPOSITOR).await;
+    fork.add_erc20(USDC, DEPOSITOR, terms.input_amount * U256::from(3))
+        .await;
+    let approved = fork
+        .send(
+            TransactionRequest::default()
+                .from(DEPOSITOR)
+                .to(USDC)
+                .input(
+                    approveCall {
+                        spender: spoke_pool,
+                        amount: U256::MAX,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .gas_limit(200_000),
+        )
+        .await;
+    assert!(approved.status(), "the depositor approves the SpokePool");
+
+    // A quote exactly the buffer old is taken, and one second later it reverts.
+    let taken = deposit_at(&fork, &terms, quoted, fill_deadline, boundary).await;
+    assert!(taken.status(), "a quote exactly the buffer old is taken");
+    let deposits_taken = deposits(&taken, spoke_pool);
+    let [deposit] = deposits_taken.as_slice() else {
+        panic!("the pool takes one deposit");
+    };
+    assert_eq!(deposit.quoteTimestamp, terms.quote_timestamp);
+    let rejected = deposit_at(&fork, &terms, quoted, fill_deadline, boundary + 1).await;
+    assert!(!rejected.status(), "a quote past the buffer reverts");
+    assert!(deposits(&rejected, spoke_pool).is_empty());
+    // One block later still, a quote again exactly the buffer old is taken with every other
+    // argument unchanged. The fill deadline's lower bound only tightens with time and its
+    // upper bound only loosens, so both held in the rejected block between the two deposits
+    // that were taken. Only the quote's age rejected it.
+    let later = deposit_at(&fork, &terms, quoted + 2, fill_deadline, boundary + 2).await;
+    assert!(later.status(), "the later quote is taken a block later");
+    assert_eq!(deposits(&later, spoke_pool).len(), 1);
+
+    // The wallet's quote-age rule in `continuing.rs` reads the same boundary from one
+    // finalized block: the approval continues at the boundary block and is excluded at the
+    // next one, with the post-hook's nonce unused at both.
+    let boundary_block = taken.block_number.unwrap();
+    assert_eq!(rejected.block_number.unwrap(), boundary_block + 1);
+    assert_eq!(execution_nonce(&fork, swap.executor).await, pre_nonce);
+    assert!(pre_nonce < post_nonce);
+    let continuing = || async {
+        wallet
+            .owner
+            .swap_continuing_approvals(swap.operation, swap.swap_use, delivery, Some(pre_nonce))
+            .await
+            .unwrap()
+            .approvals()
+            .iter()
+            .map(|approval| approval.uid)
+            .collect::<Vec<_>>()
+    };
+    fork.mine(boundary_block + finality - fork.block_number().await)
+        .await;
+    assert_eq!(continuing().await, vec![swap.uid]);
+    fork.mine(1).await;
+    assert!(continuing().await.is_empty());
     wallet.finish().await;
 }
 
