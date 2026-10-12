@@ -248,7 +248,7 @@ pub(crate) fn open_wallet_window(
             )
         });
         register_wallet_shortcut_root(window, &root, cx);
-        cx.new(|cx| Root::new(root, window, cx).window_shadow_size(px(12.0)))
+        cx.new(|cx| Root::new(root, window, cx))
     }) {
         tracing::error!(%error, "failed to open wallet window");
     }

@@ -11,7 +11,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, IconName, Root, Sizable, WindowExt, button::ButtonVariants,
+    Disableable, IconName, Sizable, WindowExt, button::ButtonVariants,
     progress::Progress as UiProgress, spinner::Spinner,
 };
 use tokio::runtime::Handle;
@@ -1011,21 +1011,7 @@ impl Render for WalletStartupRoot {
             .size_full()
             .children(activity_observer)
             .child(render_wallet_window_frame(content, window, titlebar_color))
-            .children(render_wallet_overlay_layers(window, cx))
     }
-}
-
-pub(in crate::root) fn render_wallet_overlay_layers(
-    window: &mut Window,
-    cx: &mut App,
-) -> impl Iterator<Item = gpui::AnyElement> {
-    [
-        Root::render_sheet_layer(window, cx).map(IntoElement::into_any_element),
-        Root::render_dialog_layer(window, cx).map(IntoElement::into_any_element),
-        Root::render_notification_layer(window, cx).map(IntoElement::into_any_element),
-    ]
-    .into_iter()
-    .flatten()
 }
 
 fn is_retained_tor_context(http: &HttpContext) -> bool {

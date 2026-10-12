@@ -14,10 +14,8 @@ use wallet_ops::vault::ExecutorStore;
 struct WalletWindow(Entity<WalletRoot>);
 
 impl Render for WalletWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div().size_full().child(self.0.clone()).children(
-            crate::root::startup::render_wallet_overlay_layers(window, cx),
-        )
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
     }
 }
 

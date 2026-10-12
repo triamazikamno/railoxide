@@ -4,12 +4,8 @@ use gpui::TestAppContext;
 struct DialogWindow;
 
 impl Render for DialogWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .children(crate::root::startup::render_wallet_overlay_layers(
-                window, cx,
-            ))
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().size_full()
     }
 }
 
@@ -487,10 +483,12 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
 
     struct SettingsWindow(Entity<WalletSettingsEditor>);
     impl Render for SettingsWindow {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-            div().size_full().child(self.0.clone()).children(
-                crate::root::startup::render_wallet_overlay_layers(window, cx),
-            )
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
         }
     }
 

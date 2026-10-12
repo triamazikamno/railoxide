@@ -24,8 +24,8 @@ use zeroize::Zeroizing;
 use crate::root::{
     ChainUtxoState, SpendAuthorizationLifetime, VaultState, WalletAppOptions,
     WalletMaintenanceController, WalletRoot, WalletTab,
-    spend_authorization::SpendAuthorizationIntent, startup::render_wallet_overlay_layers,
-    stealth_accounts::StealthAccountsView, utxo::BlockedShieldRescueRowState,
+    spend_authorization::SpendAuthorizationIntent, stealth_accounts::StealthAccountsView,
+    utxo::BlockedShieldRescueRowState,
 };
 
 const PASSWORD: &str = "public registration test password";
@@ -36,11 +36,8 @@ const MNEMONIC: &str =
 struct WalletTestWindow(Entity<WalletRoot>);
 
 impl Render for WalletTestWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.0.clone())
-            .children(render_wallet_overlay_layers(window, cx))
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
     }
 }
 

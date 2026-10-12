@@ -291,9 +291,6 @@ impl WalletRoot {
             } else {
                 gpui::rgb(ui::theme::BORDER_SUBTLE).into()
             })
-            .when(!focused && !open, |button| {
-                button.hover(|style| style.border_color(cx.theme().border))
-            })
             .accessibility_label(format!("{} {} actions", entry.asset.symbol, amount))
             .child(
                 div()

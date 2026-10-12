@@ -1263,15 +1263,16 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     use railgun_ui::chain_editor::{ChainDraft, ChainEditorCommand, ChainField};
     use std::{cell::RefCell, rc::Rc};
 
-    /// The app root paints the dialog layer; the bare editor does not, so confirmations need a host.
+    /// Mounts the shared editor under `Root`, which hosts its confirmation dialogs.
     struct ChainEditorHost(Entity<ui::chain_editor::ChainEditor>);
 
     impl Render for ChainEditorHost {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .child(self.0.clone())
-                .children(gpui_component::Root::render_dialog_layer(window, cx))
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
         }
     }
 

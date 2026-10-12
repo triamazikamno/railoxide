@@ -4,12 +4,8 @@ use gpui::{AppContext as _, Render, TestAppContext};
 struct DialogWindow;
 
 impl Render for DialogWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .children(crate::root::startup::render_wallet_overlay_layers(
-                window, cx,
-            ))
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().size_full()
     }
 }
 

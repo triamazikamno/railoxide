@@ -1358,13 +1358,8 @@ struct GatewayWindow {
 }
 
 impl Render for GatewayWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .relative()
-            .size_full()
-            .child(self.gateway.clone())
-            .children(Root::render_sheet_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().relative().size_full().child(self.gateway.clone())
     }
 }
 

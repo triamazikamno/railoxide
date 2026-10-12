@@ -23,9 +23,6 @@ impl Render for PublicListWindow {
                     .read(cx)
                     .render_public_wallet_body(&self.0, window, cx),
             )
-            .children(crate::root::startup::render_wallet_overlay_layers(
-                window, cx,
-            ))
     }
 }
 
@@ -575,9 +572,6 @@ impl Render for WalletViewWindow {
         div()
             .size_full()
             .child(self.0.read(cx).render_wallet_view(&self.0, window, cx))
-            .children(crate::root::startup::render_wallet_overlay_layers(
-                window, cx,
-            ))
     }
 }
 
