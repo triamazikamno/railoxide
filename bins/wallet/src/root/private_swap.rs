@@ -19,7 +19,7 @@ use wallet_ops::cow::OrderUid;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareExecutorAction,
     PublicBroadcasterCandidate, SwapOrderState, SwapReviewChange, SwapSetupStatus,
-    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    SwapSpeedUpRefusal, TransactionGenerationStage, WakuDeliveryClient, WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
     is_swap_record,
     settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
@@ -224,6 +224,9 @@ struct PendingSwapOrder {
     /// new one a reused account's draft claims it for. Restored with the draft.
     swap_use: SwapUseId,
     started_at: u64,
+    /// The draft is a speed-up of `previous_order`, which stays open. It stands in for that
+    /// order only while its own order is being placed: see [`PrivateSwapsView::pending_order`].
+    speeds_up: bool,
 }
 
 impl PendingSwapOrder {
@@ -253,6 +256,7 @@ impl PendingSwapOrder {
             reuse_account: true,
             swap_use: swap_use.id(),
             started_at: swap_use.started_at().unwrap_or_default(),
+            speeds_up: false,
         })
     }
 
@@ -286,7 +290,8 @@ struct SwapTracking {
     cursor: Option<u64>,
     /// The last observation or submission problem, shown in the swap's progress.
     error: Option<String>,
-    /// The latest successful explicit status check, scoped to its order and completion time.
+    /// The latest successful explicit status check, scoped to the order the swap followed
+    /// then and its completion time.
     status_checked: Option<(OrderUid, u64)>,
     /// The sell amount entered before the first order records it.
     amount: Option<U256>,
@@ -297,8 +302,9 @@ struct SwapTracking {
     /// The swap's own orderbook route, kept for its quotes, its order submission, and its
     /// order reports.
     orderbook: Option<CowOrderbookClient>,
-    /// The orderbook's last report on the latest order. Display only; never an outcome.
-    order_hint: Option<SwapOrderHint>,
+    /// The orderbook's last report on each order asked about, by its UID, so a report on one
+    /// competing order never replaces another's. Display and location only; never an outcome.
+    order_hints: HashMap<OrderUid, SwapOrderHint>,
     /// The app-data budget after the orderbook rejected an order's size.
     byte_budget: Option<usize>,
     /// Routine bridge provider polls of handed-off orders without an outcome, which back off.
@@ -332,6 +338,19 @@ struct SwapTracking {
     delivery_shortfall: Option<U256>,
 }
 
+/// The summary `action` is authorized with. A speed-up signs a second order beside a live one,
+/// so it always takes its explicit review, which a remembered spend authorization can't skip,
+/// whatever its summary was built from.
+fn authorization_summary(
+    action: &SwapAction,
+    summary: SpendAuthorizationSummary,
+) -> SpendAuthorizationSummary {
+    match action {
+        SwapAction::Order(approval) if approval.speeds_up() => summary.requiring_explicit_review(),
+        _ => summary,
+    }
+}
+
 /// A swap's name, after the token its receiver gets on a Bridge swap's destination network.
 fn bridge_pair_label(labels: &SwapLabels, bridge: Option<&SwapBridgeLabels>) -> String {
     swap_pair_label(
@@ -359,7 +378,6 @@ fn bridge_poll_interval(attempts: u32) -> Duration {
 /// What the orderbook last reported about one order.
 #[derive(Clone, Copy)]
 struct SwapOrderHint {
-    uid: OrderUid,
     report: CowOrderStatusReport,
     /// The reported trade's block, read once the order is reported filled.
     trade_block: Option<u64>,
@@ -411,6 +429,12 @@ pub(super) struct PrivateSwapsView {
     /// Each loaded account's attribution evidence, from its own network's owner, as read when
     /// its record was last loaded. It decides whether a recovery returned stranded funds.
     attributions: BTreeMap<ExecutorOperationId, wallet_ops::ExecutorAttribution>,
+    /// The owner's answer on speeding up each account's latest order, for the orders that
+    /// hadn't locally expired when the records were last read. An order without an entry
+    /// can't be sped up.
+    speed_up_refusals: BTreeMap<ExecutorOperationId, (OrderUid, Option<SwapSpeedUpRefusal>)>,
+    /// The wait for the open detail's Speed up delay to end, and the unix time it ends at.
+    speed_up_reveal: Option<(u64, Task<()>)>,
     /// My orders' open swaps, counted again whenever the view changes rather than on every
     /// frame.
     open_orders: usize,
@@ -543,6 +567,7 @@ impl WalletRoot {
                 view.tracking.clear();
                 view.destinations.clear();
                 view.attributions.clear();
+                view.speed_up_refusals.clear();
                 view.records.clear();
                 view.public_records.clear();
                 view.public_tracking.clear();
@@ -745,6 +770,7 @@ impl PrivateSwapsView {
         cx.observe_self(|this, cx| {
             let open = this.open_order_count(cx);
             this.open_orders = open;
+            this.schedule_speed_up_reveal(cx);
         })
         .detach();
         let observation_wake = watch::channel(0).0;
@@ -852,6 +878,8 @@ impl PrivateSwapsView {
             tracking: BTreeMap::new(),
             destinations: BTreeMap::new(),
             attributions: BTreeMap::new(),
+            speed_up_refusals: BTreeMap::new(),
+            speed_up_reveal: None,
             open_orders: 0,
             dialog: None,
             orders_filter: None,
@@ -962,6 +990,22 @@ impl PrivateSwapsView {
                         Some((record.operation(), owner.attribution(record)?))
                     }),
                 );
+                // The owner's rule is the only one. It reads local records, and an expired
+                // order can't pass it, so only the others are asked about.
+                let now = now_unix();
+                self.speed_up_refusals = records
+                    .iter()
+                    .filter_map(|record| {
+                        let order = record.swap()?.orders().last()?;
+                        if u64::from(order.valid_to()) <= now {
+                            return None;
+                        }
+                        let refusal = owner
+                            .swap_speed_up_refusal(record.operation(), order.uid())
+                            .ok()?;
+                        Some((record.operation(), (order.uid(), refusal)))
+                    })
+                    .collect();
                 self.records = records;
             }
             // Keep the last records; the owner reports the same problem to every caller.
@@ -973,6 +1017,57 @@ impl PrivateSwapsView {
         self.records
             .iter()
             .find(|record| record.operation() == operation)
+    }
+
+    /// Why `record`'s latest order can't be sped up, as the owner's rule answered when the
+    /// records were last read. `None` offers the speed-up. Signing checks again.
+    fn speed_up_refusal(&self, record: &ExecutorRecord) -> Option<SwapSpeedUpRefusal> {
+        // Debug UI fixture: the owner holds no synthesized record to ask about.
+        #[cfg(debug_assertions)]
+        if let Some(refusal) = ui_fixture::speed_up_refusal() {
+            return refusal.err();
+        }
+        let order = record.swap().and_then(|swap| swap.orders().last());
+        match (order, self.speed_up_refusals.get(&record.operation())) {
+            (Some(order), Some((uid, refusal))) if order.uid() == *uid => *refusal,
+            _ => Some(SwapSpeedUpRefusal::Unavailable),
+        }
+    }
+
+    /// Render again when the Speed up delay of the open detail's latest order ends, so the
+    /// action appears by itself. Nothing waits once the delay has passed or another view shows.
+    fn schedule_speed_up_reveal(&mut self, cx: &Context<'_, Self>) {
+        let now = now_unix();
+        let shown_at = self
+            .dialog
+            .as_ref()
+            .and_then(|dialog| match dialog.view {
+                dialog::SwapDialogView::Detail(operation) => self.record(operation),
+                _ => None,
+            })
+            .and_then(|record| record.swap()?.orders().last())
+            .and_then(model::speed_up_shown_at)
+            .filter(|shown_at| *shown_at > now);
+        let Some(shown_at) = shown_at else {
+            self.speed_up_reveal = None;
+            return;
+        };
+        if self
+            .speed_up_reveal
+            .as_ref()
+            .is_some_and(|(scheduled, _)| *scheduled == shown_at)
+        {
+            return;
+        }
+        let wait = Duration::from_secs(shown_at - now);
+        let reveal = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                this.speed_up_reveal = None;
+                cx.notify();
+            });
+        });
+        self.speed_up_reveal = Some((shown_at, reveal));
     }
 
     /// The attribution evidence read with `record`, an account of any loaded network.
@@ -1313,14 +1408,24 @@ impl PrivateSwapsView {
     ///
     /// Without a draft of this session, a reused account's prepared swap gives one from its
     /// saved approval: see [`PendingSwapOrder::prepared`].
+    ///
+    /// A speed-up's draft counts only while its order is being placed. Its open order is still
+    /// live, so a speed-up that ends without an order shows that order again.
     fn pending_order(&self, record: &ExecutorRecord) -> Option<PendingSwapOrder> {
+        let operation = record.operation();
         self.tracking
-            .get(&record.operation())
+            .get(&operation)
             .and_then(|tracking| tracking.pending_order)
             .filter(|pending| {
                 pending.previous_order
                     == model::swap_use_last_order(record, pending.swap_use)
                         .map(SwapOrderRecord::uid)
+            })
+            .filter(|pending| {
+                !pending.speeds_up
+                    || self.job.as_ref().is_some_and(|job| {
+                        job.operation == operation && job.kind == SwapJobKind::Order
+                    })
             })
             .or_else(|| PendingSwapOrder::prepared(record))
             .map(|mut pending| {
@@ -1612,7 +1717,9 @@ impl PrivateSwapsView {
     }
 
     /// Display strings for one swap of `record`: `amount` of `sell` for `buy`, with `order`
-    /// its latest order when it has one. The order's expiry, minimum and ID are its own.
+    /// its latest order when it has one. The minimum, receiver, gas and ID are those of the
+    /// attempt the swap follows, which among competing orders is the one that traded. The
+    /// expiry is that attempt's, or the last of the orders that can still trade.
     fn order_labels(
         &self,
         record: &ExecutorRecord,
@@ -1627,8 +1734,9 @@ impl PrivateSwapsView {
         let sell_label = amount.map_or(sell_symbol, |amount| self.token_amount(sell, amount, cx));
         // What was delivered, and a Bridge swap's hand-off and destination terms, come from
         // the attempt that delivered, which a retry's trade can leave to an earlier attempt.
-        let evidence =
-            order.map(|order| model::SwapAttempts::ending_at(record, order).bridge_evidence());
+        let attempts = order.map(|order| model::SwapAttempts::ending_at(record, order));
+        let evidence = attempts.map(|attempts| attempts.bridge_evidence());
+        let order = attempts.map(|attempts| attempts.outcome);
         let received = evidence.and_then(|order| {
             let observed = order.observations();
             let amount = match order.delivery() {
@@ -1669,7 +1777,7 @@ impl PrivateSwapsView {
             };
             amount.map(|amount| self.token_amount(buy, amount, cx))
         });
-        let valid_to = order.map(|order| u64::from(order.valid_to()));
+        let valid_to = attempts.map(|attempts| attempts.valid_to());
         let bridge = evidence.and_then(|order| {
             self.bridge_labels(record, order.delivery(), buy, Some(order), None, cx)
         });
@@ -1870,8 +1978,8 @@ impl PrivateSwapsView {
         )
     }
 
-    /// The orderbook's report that the latest order filled, while canonical observation still
-    /// shows it open.
+    /// The orderbook's report that an order the swap still tracks filled, while canonical
+    /// observation still shows the swap open.
     fn fill_hint(&self, record: &ExecutorRecord, cx: &gpui::App) -> Option<SwapFillHint> {
         if !matches!(
             self.stage(record),
@@ -1879,14 +1987,11 @@ impl PrivateSwapsView {
         ) {
             return None;
         }
-        let order = record.swap()?.orders().last()?;
-        let hint = self
-            .tracking
-            .get(&record.operation())?
-            .order_hint
-            .filter(|hint| {
-                hint.uid == order.uid() && hint.report.status == CowOrderStatusHint::Fulfilled
-            })?;
+        let hints = &self.tracking.get(&record.operation())?.order_hints;
+        let hint = model::tracked_orders(record)
+            .into_iter()
+            .filter_map(|order| hints.get(&order.uid()))
+            .find(|hint| hint.report.status == CowOrderStatusHint::Fulfilled)?;
         let root = self.root.upgrade()?;
         let root = root.read(cx);
         let depth = root
@@ -1950,49 +2055,64 @@ impl PrivateSwapsView {
             // confirmed history across restart, even when hidden or lacking old evidence.
             // An explicit retry, recovery or lock check refreshes that one account.
             .filter(|record| self.stage(record).is_observed())
-            .filter_map(|record| {
+            .flat_map(|record| {
                 let tracking = self.tracking.get(&record.operation());
-                if let Some(order) = record.swap().and_then(|swap| swap.orders().last())
-                    && !tracking.is_some_and(|tracking| tracking.cancelling)
-                {
-                    // Private sync's spend of the pre-hook inputs locates a settlement the
-                    // orderbook hasn't reported. It comes last: anyone can run the public
-                    // pre-hook alone, and that block would never hold the trade.
-                    let block = tracking
-                        .and_then(|tracking| tracking.order_hint)
-                        .filter(|hint| hint.uid == order.uid())
-                        .and_then(|hint| hint.trade_block)
-                        .or_else(|| order.observations().traded.map(|trade| trade.block.number))
-                        .or_else(|| {
-                            self.private_owner()?
-                                .synced_settlement_block(record, order.uid())
-                        })?;
-                    return (block <= confirmed).then_some(ObservationPage {
-                        operation: record.operation(),
-                        settlement: Some((order.uid(), block)),
-                        // Settlement checks do not page through account history or catch up.
-                        range: Some(confirmed..confirmed.saturating_add(1)),
-                        destination: None,
-                    });
+                let orders = model::tracked_orders(record);
+                if !orders.is_empty() && !tracking.is_some_and(|tracking| tracking.cancelling) {
+                    // Each order the swap still tracks gets its own page once its settlement
+                    // is located, from its own report alone. Competing orders are both
+                    // tracked until one trade is verified, and then only the traded one.
+                    return orders
+                        .into_iter()
+                        .filter_map(|order| {
+                            // Private sync's spend of the pre-hook inputs locates a
+                            // settlement the orderbook hasn't reported. It comes last:
+                            // anyone can run the public pre-hook alone, and that block
+                            // would never hold the trade.
+                            let block = tracking
+                                .and_then(|tracking| tracking.order_hints.get(&order.uid()))
+                                .and_then(|hint| hint.trade_block)
+                                .or_else(|| {
+                                    order.observations().traded.map(|trade| trade.block.number)
+                                })
+                                .or_else(|| {
+                                    self.private_owner()?
+                                        .synced_settlement_block(record, order.uid())
+                                })?;
+                            (block <= confirmed).then_some(ObservationPage {
+                                operation: record.operation(),
+                                settlement: Some((order.uid(), block)),
+                                // Settlement checks do not page through account history or
+                                // catch up.
+                                range: Some(confirmed..confirmed.saturating_add(1)),
+                                destination: None,
+                            })
+                        })
+                        .collect::<Vec<_>>();
                 }
                 // A setup waits on one read of its account at the confirmed block each pass.
                 if record.swap().is_none() {
-                    return has_issued_setup(record).then_some(ObservationPage {
+                    return has_issued_setup(record)
+                        .then_some(ObservationPage {
+                            operation: record.operation(),
+                            settlement: None,
+                            range: None,
+                            destination: None,
+                        })
+                        .into_iter()
+                        .collect();
+                }
+                tracking
+                    .and_then(|tracking| tracking.cursor)
+                    .or_else(|| swap_observation_start(record))
+                    .map(|cursor| ObservationPage {
                         operation: record.operation(),
                         settlement: None,
-                        range: None,
+                        range: Some(swap_observation_range(cursor, confirmed)),
                         destination: None,
-                    });
-                }
-                let cursor = tracking
-                    .and_then(|tracking| tracking.cursor)
-                    .or_else(|| swap_observation_start(record))?;
-                Some(ObservationPage {
-                    operation: record.operation(),
-                    settlement: None,
-                    range: Some(swap_observation_range(cursor, confirmed)),
-                    destination: None,
-                })
+                    })
+                    .into_iter()
+                    .collect()
             })
             .chain(
                 self.records
@@ -2061,7 +2181,9 @@ impl PrivateSwapsView {
     }
 
     /// Orders to ask the orderbook about in this pass, at most one report each. An open order
-    /// is asked about until its settlement is verified, including fills while offline.
+    /// is asked about until its settlement is verified, including fills while offline. Two
+    /// orders that compete for one trade are both asked about, each through the swap's own
+    /// route, until one trade is verified; after that only the traded one is.
     /// These reports only locate evidence; they cannot change a persisted outcome. A traded
     /// order's executed fee is asked for once per session until it's recorded, also after
     /// verification ends the reports.
@@ -2087,8 +2209,8 @@ impl PrivateSwapsView {
             .records
             .iter()
             .filter(|record| Some(record.operation()) != busy)
-            .filter_map(|record| {
-                let order = record.swap()?.orders().last()?;
+            .flat_map(|record| {
+                let orders = model::tracked_orders(record);
                 let tracking = self.tracking.get(&record.operation());
                 // Until verification succeeds, keep refreshing the untrusted location,
                 // including after a reorg moves a reported trade to a different block.
@@ -2102,7 +2224,7 @@ impl PrivateSwapsView {
                                 | SwapOrderState::Traded,
                         )
                 );
-                let bridges = record
+                let mut bridges = record
                     .swap_bridges_to_track()
                     .filter(|order| {
                         tracking
@@ -2119,17 +2241,24 @@ impl PrivateSwapsView {
                         Some((order.uid(), chain.clone()))
                     })
                     .collect::<Vec<_>>();
-                // A verified trade ends routine hints, but its fee is asked for once.
-                let fee = model::needs_executed_fee(order)
-                    && tracking.is_none_or(|tracking| !tracking.fee_asked.contains(&order.uid()));
-                (wanted || fee || !bridges.is_empty()).then(|| HintRequest {
-                    operation: record.operation(),
-                    uid: order.uid(),
-                    hint: wanted,
-                    fee,
-                    client: tracking.and_then(|tracking| tracking.orderbook.clone()),
-                    bridges,
-                })
+                // Handed-off orders are polled once per pass, with the first request.
+                orders
+                    .into_iter()
+                    .filter_map(|order| {
+                        // A verified trade ends routine hints, but its fee is asked for once.
+                        let fee = model::needs_executed_fee(order)
+                            && tracking
+                                .is_none_or(|tracking| !tracking.fee_asked.contains(&order.uid()));
+                        (wanted || fee || !bridges.is_empty()).then(|| HintRequest {
+                            operation: record.operation(),
+                            uid: order.uid(),
+                            hint: wanted,
+                            fee,
+                            client: tracking.and_then(|tracking| tracking.orderbook.clone()),
+                            bridges: std::mem::take(&mut bridges),
+                        })
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let owner = self.private_owner().filter(|_| !requests.is_empty())?;
@@ -2172,19 +2301,23 @@ impl PrivateSwapsView {
             let Some((report, trade_block)) = result.report else {
                 continue;
             };
+            // Only the reported order's own entry changes, so a late report on an order that
+            // lost keeps the traded order's location.
             let known = tracking
-                .order_hint
-                .filter(|hint| hint.uid == result.uid)
+                .order_hints
+                .get(&result.uid)
                 .and_then(|hint| hint.trade_block);
-            tracking.order_hint = Some(SwapOrderHint {
-                uid: result.uid,
-                report,
-                trade_block: if report.status == CowOrderStatusHint::Fulfilled {
-                    trade_block.or(known)
-                } else {
-                    None
+            tracking.order_hints.insert(
+                result.uid,
+                SwapOrderHint {
+                    report,
+                    trade_block: if report.status == CowOrderStatusHint::Fulfilled {
+                        trade_block.or(known)
+                    } else {
+                        None
+                    },
                 },
-            });
+            );
         }
         for operation in settled {
             self.reconcile_destination(operation, cx);
@@ -2401,7 +2534,15 @@ impl PrivateSwapsView {
         {
             form.set_error(message.clone());
         }
-        self.tracking.entry(operation).or_default().error = Some(message.clone());
+        let tracking = self.tracking.entry(operation).or_default();
+        // A speed-up that failed placed no order, so the open one is the swap's order again.
+        if tracking
+            .pending_order
+            .is_some_and(|pending| pending.speeds_up)
+        {
+            tracking.pending_order = None;
+        }
+        tracking.error = Some(message.clone());
         self.error = Some(message);
     }
 
@@ -2441,6 +2582,7 @@ impl PrivateSwapsView {
             action,
             destination,
         });
+        let summary = authorization_summary(&command.action, summary);
         self.pending_authorization = Some(Arc::clone(&command));
         let view = cx.entity();
         // Reviews require explicit approval; the confirm-only step for an approved order

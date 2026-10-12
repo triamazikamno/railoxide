@@ -64,6 +64,8 @@ pub enum ExecutorStoreError {
     InputReserved,
     #[error("a previous swap attempt's pre-hook can still execute")]
     SwapAttemptOutstanding,
+    #[error("this order can no longer be sped up; review the swap again")]
+    SwapSpeedUpRefused,
     #[error(
         "this swap's earlier attempts were approved for other tokens or delivery terms; start a new swap to change them"
     )]

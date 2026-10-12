@@ -60,15 +60,17 @@ pub use continuing::{
 };
 pub use observation::{SwapOrderState, swap_attempt_state, swap_order_state};
 pub(super) use order::invalidates_order;
+#[cfg(test)]
+pub(crate) use order::{
+    SpeedUpBlock, SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs,
+    plan_swap_speed_up_inputs, price_swap_review, reusable_swap_proof, speed_up_block,
+    swap_invalidation,
+};
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,
     SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
-    delivery_shortfall_allowance, swap_submission_outcome,
-};
-#[cfg(test)]
-pub(crate) use order::{
-    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, plan_swap_inputs,
-    price_swap_review, reusable_swap_proof, swap_invalidation,
+    SwapSpeedUpRefusal, delivery_shortfall_allowance, swap_speed_up_relaxes,
+    swap_submission_outcome,
 };
 pub use public_order::{
     PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,

@@ -4,9 +4,11 @@
 //! observation, so the Private tab card and the Stealth accounts status survive a restart. The
 //! orderbook's order status never decides a stage; it only adds a [`SwapFillHint`] to the copy.
 
+use std::time::Duration;
+
 use alloy::primitives::{Address, B256, U256, U512};
 use wallet_ops::{
-    ExecutorAttribution, SwapOrderState, SwapSetupStatus,
+    ExecutorAttribution, SwapOrderState, SwapSetupStatus, SwapSpeedUpRefusal,
     cow::OrderUid,
     swap_attempt_state,
     vault::{
@@ -42,7 +44,7 @@ pub(in crate::root) enum SwapStage {
     SubmissionPending,
     /// The orderbook rejected the durable attempt; reservations await canonical expiry.
     SubmissionRejected,
-    /// The latest order's canonical state.
+    /// The canonical state of the order the swap follows, as [`swap_outcome_order`] picks it.
     Order(SwapOrderState),
     /// Recovery confirmed after the swap left funds in its stealth account.
     Recovered,
@@ -63,6 +65,7 @@ impl SwapStage {
                 | Self::Order(
                     SwapOrderState::Done
                         | SwapOrderState::AttemptEnded(_)
+                        | SwapOrderState::Superseded
                         | SwapOrderState::NotDelivered
                         | SwapOrderState::Refunding
                         | SwapOrderState::HeldOnDestination
@@ -77,7 +80,11 @@ impl SwapStage {
             self,
             Self::SetupRetired
                 | Self::Recovered
-                | Self::Order(SwapOrderState::Done | SwapOrderState::AttemptEnded(_))
+                | Self::Order(
+                    SwapOrderState::Done
+                        | SwapOrderState::AttemptEnded(_)
+                        | SwapOrderState::Superseded
+                )
         )
     }
 
@@ -180,7 +187,7 @@ pub(in crate::root) fn swap_stage(
     submitting: bool,
     attribution: Option<&ExecutorAttribution>,
 ) -> SwapStage {
-    if let Some(order) = record.swap().and_then(|swap| swap.orders().last()) {
+    if let Some(order) = record_outcome_order(record) {
         return swap_order_stage(record, order, attribution);
     }
     if record.is_retired() {
@@ -272,8 +279,97 @@ pub(super) fn swap_setup_confirmation(
     Some(SwapSetupConfirmation::Included(block))
 }
 
+/// What ties attempts to one funding: the swap use an order was signed for and its pre-hook
+/// nonce. Attempts with the same key compete: they share one proof and one exact sell
+/// allowance, so at most one of them trades, whichever was signed first.
+pub(in crate::root) type SwapFundingKey = (SwapUseId, U256);
+
+/// The funding key of `order`. `None` for an order from before swap uses, which competes
+/// with no other.
+pub(in crate::root) fn swap_funding_key(order: &SwapOrderRecord) -> Option<SwapFundingKey> {
+    order
+        .use_id()
+        .map(|use_id| (use_id, order.pre_hook().nonce()))
+}
+
+/// Whether `other` is `order` or competes with it for the same funding.
+fn competes(order: &SwapOrderRecord, other: &SwapOrderRecord) -> bool {
+    other.uid() == order.uid()
+        || swap_funding_key(order).is_some_and(|key| swap_funding_key(other) == Some(key))
+}
+
+/// The order a swap follows, among `orders` of its record and given the swap's last order
+/// `latest`. With one order at `latest`'s funding key that is `latest`. Among competing
+/// attempts it is the one whose trade is verified, whichever was signed first. While none
+/// traded it is the latest of them not recorded dead, whose submission and open-order state
+/// the swap shows, and once all are dead, `latest`. When the orderbook rejected that
+/// attempt, the swap follows the latest accepted attempt not recorded dead instead, if there
+/// is one, since that order can still fill.
+pub(in crate::root) fn swap_outcome_order<'a>(
+    orders: &'a [SwapOrderRecord],
+    latest: &'a SwapOrderRecord,
+) -> &'a SwapOrderRecord {
+    let competing = || {
+        orders
+            .iter()
+            .rev()
+            .filter(move |order| competes(latest, order))
+    };
+    let alive = || competing().filter(|order| order.observations().pre_hook_dead.is_none());
+    competing()
+        .find(|order| order.observations().traded.is_some())
+        .or_else(|| {
+            let followed = alive().next()?;
+            Some(match followed.submission_status() {
+                SwapSubmissionStatus::Rejected => alive()
+                    .find(|order| order.submission_status() == SwapSubmissionStatus::Accepted)
+                    .unwrap_or(followed),
+                SwapSubmissionStatus::Pending | SwapSubmissionStatus::Accepted => followed,
+            })
+        })
+        .unwrap_or(latest)
+}
+
+/// [`swap_outcome_order`] of the record's latest swap. `None` before any order.
+pub(in crate::root) fn record_outcome_order(record: &ExecutorRecord) -> Option<&SwapOrderRecord> {
+    let orders = record.swap()?.orders();
+    Some(swap_outcome_order(orders, orders.last()?))
+}
+
+/// The orders of the record's latest swap that routine tracking follows, oldest first: the
+/// order the swap follows and, while none of them traded, every attempt competing with it
+/// that can still be the one that trades, which is one without a recorded hand-off or death.
+/// Once one traded the others can't, and only it is followed. A swap with one order lists
+/// that order alone. Empty before any order.
+pub(in crate::root) fn tracked_orders(record: &ExecutorRecord) -> Vec<&SwapOrderRecord> {
+    record
+        .swap()
+        .and_then(|swap| Some((swap.orders(), swap.orders().last()?)))
+        .map_or_else(Vec::new, |(orders, latest)| tracked_among(orders, latest))
+}
+
+/// [`tracked_orders`] of the swap among `orders` whose last order is `latest`.
+fn tracked_among<'a>(
+    orders: &'a [SwapOrderRecord],
+    latest: &'a SwapOrderRecord,
+) -> Vec<&'a SwapOrderRecord> {
+    let outcome = swap_outcome_order(orders, latest);
+    if outcome.observations().traded.is_some() {
+        return vec![outcome];
+    }
+    orders
+        .iter()
+        .filter(|order| competes(latest, order))
+        .filter(|order| {
+            let observed = order.observations();
+            order.uid() == outcome.uid()
+                || (observed.bridge_handoff.is_none() && observed.pre_hook_dead.is_none())
+        })
+        .collect()
+}
+
 /// The stage of one of the record's orders, from its submission and canonical observations.
-/// The latest order's is the swap's stage; an earlier order's is where its own swap ended.
+/// The swap's stage is that of the order it follows; another attempt's is its own status.
 pub(in crate::root) fn swap_order_stage(
     record: &ExecutorRecord,
     order: &SwapOrderRecord,
@@ -288,7 +384,8 @@ pub(in crate::root) fn swap_order_stage(
         }
     }
     let observed = order.observations();
-    // Funds reach the stealth account when the pre-hook runs. A recovery whose shield arrived
+    // Funds reach the stealth account when the pre-hook runs, or when a pre-hook sharing its
+    // proof and nonce does, which the swap's funding records. A recovery whose shield arrived
     // after that returned them; a cancellation, which is also recovery, shields nothing. An
     // Across refund reaches it later, and surplus kept there can be recovered before, so only
     // a recovery after the verified refund returned it. Without that refund, none did. A trade
@@ -304,6 +401,7 @@ pub(in crate::root) fn swap_order_stage(
             .map(|refund| refund.block.number.saturating_add(1)),
         _ => observed
             .pre_hook_executed
+            .or_else(|| record.swap().and_then(|swap| swap.funding(order)))
             .or(observed.traded)
             .map(|observation| observation.block.number),
     };
@@ -321,30 +419,41 @@ pub(in crate::root) fn swap_order_stage(
     }
 }
 
-/// Splits a record's orders, given in order as their sell token, buy token, delivery, and
-/// whether each traded, into swaps. A retry keeps the pair and delivery after an attempt that
-/// ended without a trade; a different pair or delivery, or any order after a traded one,
-/// starts a new swap on the reused account.
+/// One order as [`swap_order_ranges`] reads it: its sell token, buy token and delivery,
+/// whether it traded, and its funding key.
+pub(in crate::root) type SwapRangeOrder =
+    (Address, Address, SwapDelivery, bool, Option<SwapFundingKey>);
+
+/// Splits a record's orders, given in order, into swaps. A retry keeps the pair and delivery
+/// while no attempt of the swap traded. An order with the funding key of the one before it
+/// competes with it for one trade and stays in its swap, whichever of them traded. A
+/// different pair or delivery, or any other order after the swap traded, starts a new swap on
+/// the reused account.
 pub(in crate::root) fn swap_order_ranges(
-    orders: impl IntoIterator<Item = (Address, Address, SwapDelivery, bool)>,
+    orders: impl IntoIterator<Item = SwapRangeOrder>,
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut previous: Option<(Address, Address, SwapDelivery, bool)> = None;
-    for (index, (sell, buy, delivery, traded)) in orders.into_iter().enumerate() {
-        let retry = previous.is_some_and(
-            |(previous_sell, previous_buy, previous_delivery, previous_traded)| {
-                !previous_traded
-                    && previous_sell == sell
-                    && previous_buy == buy
-                    && previous_delivery == delivery
+    let mut previous: Option<(Address, Address, SwapDelivery, Option<SwapFundingKey>)> = None;
+    // Whether an order of the current swap traded.
+    let mut swap_traded = false;
+    for (index, (sell, buy, delivery, traded, funding)) in orders.into_iter().enumerate() {
+        let joins = previous.is_some_and(
+            |(previous_sell, previous_buy, previous_delivery, previous_funding)| {
+                (funding.is_some() && previous_funding == funding)
+                    || (!swap_traded
+                        && previous_sell == sell
+                        && previous_buy == buy
+                        && previous_delivery == delivery)
             },
         );
-        if retry && let Some(range) = ranges.last_mut() {
+        if joins && let Some(range) = ranges.last_mut() {
             range.end = index + 1;
+            swap_traded |= traded;
         } else {
             ranges.push(index..index + 1);
+            swap_traded = traded;
         }
-        previous = Some((sell, buy, delivery, traded));
+        previous = Some((sell, buy, delivery, funding));
     }
     ranges
 }
@@ -897,6 +1006,7 @@ pub(in crate::root) fn record_swaps(record: &ExecutorRecord) -> Vec<RecordSwap> 
                 terms.buy_token(),
                 order.delivery(),
                 order.observations().traded.is_some(),
+                swap_funding_key(order),
             )
         }));
         swaps.extend(ranges.into_iter().map(|range| RecordSwap {
@@ -908,15 +1018,18 @@ pub(in crate::root) fn record_swaps(record: &ExecutorRecord) -> Vec<RecordSwap> 
     swaps
 }
 
-/// The attempts of one swap and the two that decide its outcome. A retry can hold the trade
+/// The attempts of one swap and those that decide its outcome. A retry can hold the trade
 /// while an earlier attempt of the same swap use, whose signed terms the settlement's deposit
-/// matched, holds the bridge hand-off and everything that follows it.
+/// matched, holds the bridge hand-off and everything that follows it. Of two orders that
+/// compete for one funding, either can hold the trade.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::root) struct SwapAttempts<'a> {
     /// Every attempt of the swap, oldest first.
     pub(in crate::root) attempts: &'a [SwapOrderRecord],
-    /// The latest attempt, whose submission and open-order state the swap shows.
-    pub(in crate::root) latest: &'a SwapOrderRecord,
+    /// The attempt the swap follows, as [`swap_outcome_order`] picks it: the traded one, or
+    /// while nothing traded, the one whose submission and open-order state the swap shows.
+    /// That is an accepted attempt that can still fill when the latest one was rejected.
+    pub(in crate::root) outcome: &'a SwapOrderRecord,
     /// The attempt whose trade is verified.
     pub(in crate::root) traded: Option<&'a SwapOrderRecord>,
     /// The attempt holding the delivery evidence and the terms the delivery follows.
@@ -949,16 +1062,48 @@ impl<'a> SwapAttempts<'a> {
         let delivery = traded.and_then(|traded| swap?.delivery_order(traded));
         Self {
             attempts,
-            latest,
+            outcome: swap_outcome_order(attempts, latest),
             traded,
             delivery,
         }
     }
 
     /// The attempt whose bridge evidence and signed delivery terms the swap shows: the one
-    /// that delivered, or the latest while nothing is delivered.
+    /// that delivered, or the one the swap follows while nothing is delivered.
     pub(in crate::root) fn bridge_evidence(&self) -> &'a SwapOrderRecord {
-        self.delivery.unwrap_or(self.latest)
+        self.delivery.unwrap_or(self.outcome)
+    }
+
+    /// When the swap's order expires, in Unix seconds: the expiry of the attempt it follows,
+    /// or while competing attempts can still trade, the last of theirs.
+    pub(in crate::root) fn valid_to(&self) -> u64 {
+        self.attempts
+            .last()
+            .into_iter()
+            .flat_map(|latest| tracked_among(self.attempts, latest))
+            .map(|order| u64::from(order.valid_to()))
+            .max()
+            .unwrap_or_else(|| u64::from(self.outcome.valid_to()))
+    }
+
+    /// The stage of the swap: that of the attempt it follows.
+    pub(in crate::root) fn stage(
+        &self,
+        record: &ExecutorRecord,
+        attribution: Option<&ExecutorAttribution>,
+    ) -> SwapStage {
+        swap_order_stage(record, self.outcome, attribution)
+    }
+
+    /// Whether `order` ended without contributing to the swap: it isn't the attempt the swap
+    /// follows, its trade or its delivery, and it no longer competes with the followed one.
+    /// An attempt that still competes, or that the trade superseded, has its own status.
+    pub(in crate::root) fn ended_earlier(&self, order: &SwapOrderRecord) -> bool {
+        let is = |other: &SwapOrderRecord| other.uid() == order.uid();
+        !(is(self.outcome)
+            || self.traded.is_some_and(is)
+            || self.delivery.is_some_and(is)
+            || competes(self.outcome, order) && order.observations().pre_hook_dead.is_none())
     }
 
     /// What `order` contributed to the swap's outcome: its trade, or the bridge deposit of a
@@ -1099,12 +1244,10 @@ pub(in crate::root) fn swap_sell_amount(record: &ExecutorRecord) -> Option<U256>
         })
 }
 
-/// The approved private minimum of the latest order, or before any order exists, the minimum
-/// approved with the setup.
+/// The approved private minimum of the order the latest swap follows, or before any order
+/// exists, the minimum approved with the setup.
 pub(in crate::root) fn swap_private_minimum(record: &ExecutorRecord) -> Option<U256> {
-    record
-        .swap()
-        .and_then(|swap| swap.orders().last())
+    record_outcome_order(record)
         .map(|order| order.bounds().private_minimum)
         .or_else(|| {
             record
@@ -1124,27 +1267,32 @@ pub(in crate::root) fn swap_delivery(record: &ExecutorRecord) -> SwapDelivery {
         .unwrap_or_default()
 }
 
-/// The latest order's expiry in Unix seconds.
+/// When the latest swap's order expires, in Unix seconds: the expiry of the order it
+/// follows, or while competing orders can still trade, the last of theirs.
 pub(in crate::root) fn swap_valid_to(record: &ExecutorRecord) -> Option<u64> {
-    record
-        .swap()
-        .and_then(|swap| swap.orders().last())
+    tracked_orders(record)
+        .into_iter()
         .map(|order| u64::from(order.valid_to()))
+        .max()
 }
 
 /// The first block the swap's evidence pages must cover to observe its current step: the
 /// block the step's payload was signed against.
 pub(in crate::root) fn swap_observation_start(record: &ExecutorRecord) -> Option<u64> {
-    let latest_pre_hook = record
-        .swap()
-        .and_then(|swap| swap.orders().last())
-        .map(|order| order.pre_hook().payload());
+    // Competing orders can each trade, so the pages start at the earliest of their pre-hooks.
+    let pre_hooks = tracked_orders(record)
+        .into_iter()
+        .map(|order| order.pre_hook().payload())
+        .collect::<Vec<_>>();
     record
         .issued()
         .iter()
-        .filter(|payload| match latest_pre_hook {
-            Some(pre_hook) => payload.hash() == pre_hook,
-            None => payload.purpose() == ExecutorPayloadPurpose::Operation,
+        .filter(|payload| {
+            if pre_hooks.is_empty() {
+                payload.purpose() == ExecutorPayloadPurpose::Operation
+            } else {
+                pre_hooks.contains(&payload.hash())
+            }
         })
         .map(|payload| payload.context().observed().block().number)
         .min()
@@ -1542,6 +1690,10 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
             }
             .into(),
             NOTHING_UNSHIELDED.into(),
+        ),
+        SwapStage::Order(SwapOrderState::Superseded) => line(
+            "Swap order not filled".into(),
+            "Another order of this swap filled.".into(),
         ),
         SwapStage::Order(SwapOrderState::PreHookOnly { expired: true }) => line(
             "Swap needs attention".into(),
@@ -1983,6 +2135,14 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
             | SwapOrderState::NeedsAttention
             | SwapOrderState::HeldOnDestination,
         ) => vec![setup(Done, ""), open(Done, String::new())],
+        SwapStage::Order(SwapOrderState::Superseded) => vec![
+            setup(Done, ""),
+            step(
+                "Not filled",
+                "Another order of this swap filled.".into(),
+                Warning,
+            ),
+        ],
         // An unfilled expiry is a normal result of a tight minimum, so it's a warning with
         // its likely reason, not an error.
         SwapStage::Order(SwapOrderState::AttemptEnded(cause)) => vec![
@@ -2432,6 +2592,9 @@ pub(in crate::root) type SwapActionAvailability = Option<Result<(), &'static str
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::root) struct SwapActions {
     pub(in crate::root) cancel: SwapActionAvailability,
+    /// Sign a second order with a lower minimum while the open one stays live. Set by
+    /// [`Self::with_speed_up`]; `swap_actions` offers none.
+    pub(in crate::root) speed_up: SwapActionAvailability,
     pub(in crate::root) retry: SwapActionAvailability,
     /// Set up again or continue to the review in the swap form, or place an approved order.
     pub(in crate::root) resume: SwapActionAvailability,
@@ -2441,11 +2604,62 @@ pub(in crate::root) struct SwapActions {
     pub(in crate::root) dismiss: bool,
 }
 
+/// Why Speed up is disabled while the swap's earlier order still counts as fillable. It names
+/// the limit only: the latest order may expire before the earlier one stops counting.
+const SPEED_UP_TWO_ORDERS: &str =
+    "Two orders of this swap can still fill, and a new order can replace only one.";
+
+/// How long after the latest order was signed the detail first shows Speed up. An early
+/// speed-up signs a lower minimum that either order can fill at, and uses up the one speed-up
+/// the two-order limit allows until an order drops out. The transaction Speed up actions have
+/// no delay.
+const SPEED_UP_AFTER: Duration = Duration::from_secs(30);
+
+/// The unix time from which the detail shows Speed up for the latest order `order`:
+/// [`SPEED_UP_AFTER`] past its signing, which is its expiry less its approved validity. `None`
+/// for an order with no recorded validity, which has no delay.
+pub(in crate::root) fn speed_up_shown_at(order: &SwapOrderRecord) -> Option<u64> {
+    let valid_for = order.bounds().valid_for_secs?;
+    Some(
+        u64::from(order.valid_to())
+            .saturating_sub(u64::from(valid_for))
+            .saturating_add(SPEED_UP_AFTER.as_secs()),
+    )
+}
+
+/// Whether the detail shows Speed up, enabled or disabled, for the latest order `order` at
+/// `now` in unix seconds.
+pub(in crate::root) fn speed_up_shown(order: &SwapOrderRecord, now: u64) -> bool {
+    speed_up_shown_at(order).is_none_or(|shown_at| now >= shown_at)
+}
+
+impl SwapActions {
+    /// These actions with Speed up as the executor owner's rule answered for the latest order:
+    /// `None` offers it, two fillable orders show it disabled with the reason, and an order
+    /// that can't be sped up has none. It is offered only beside an available Cancel order,
+    /// and only once `shown`, as [`speed_up_shown`] answers for that order.
+    pub(in crate::root) const fn with_speed_up(
+        mut self,
+        refusal: Option<SwapSpeedUpRefusal>,
+        shown: bool,
+    ) -> Self {
+        self.speed_up = match (self.cancel, refusal) {
+            (Some(Ok(())), None) if shown => Some(Ok(())),
+            (Some(Ok(())), Some(SwapSpeedUpRefusal::TwoOrdersFillable)) if shown => {
+                Some(Err(SPEED_UP_TWO_ORDERS))
+            }
+            _ => None,
+        };
+        self
+    }
+}
+
 /// What the progress dialog offers for `stage`. `past_valid_to` is local time past the latest
 /// order's expiry; canonical expiry still needs a finalized block.
 pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool) -> SwapActions {
     let none = SwapActions {
         cancel: None,
+        speed_up: None,
         retry: None,
         resume: None,
         recover: false,
@@ -2515,7 +2729,8 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
             SwapOrderState::Traded
             | SwapOrderState::Bridging
             | SwapOrderState::Done
-            | SwapOrderState::NeedsAttention,
+            | SwapOrderState::NeedsAttention
+            | SwapOrderState::Superseded,
         ) => none,
     }
 }
@@ -2552,6 +2767,7 @@ pub(in crate::root) const fn swap_account_status(stage: SwapStage) -> &'static s
             "Order cancelled"
         }
         SwapStage::Order(SwapOrderState::AttemptEnded(_)) => "Order ended",
+        SwapStage::Order(SwapOrderState::Superseded) => "Not filled",
         SwapStage::Recovered => "Recovered",
     }
 }
@@ -2658,6 +2874,7 @@ pub(in crate::root) fn swap_order_status(
             "Cancelled".into()
         }
         SwapStage::Order(SwapOrderState::AttemptEnded(_)) => "Ended".into(),
+        SwapStage::Order(SwapOrderState::Superseded) => "Not filled".into(),
         SwapStage::Recovered => "Recovered".into(),
     }
 }
@@ -3019,22 +3236,42 @@ pub(super) mod tests {
         let external = SwapDelivery::External {
             receiver: Address::repeat_byte(4),
         };
+        let swap_use = SwapUseId::random().unwrap();
+        // Each ordinary attempt has its own pre-hook nonce; a speed-up keeps the open order's.
+        let funding = |nonce: u64| Some((swap_use, U256::from(nonce)));
         // An order-less record has no ranges; it is one swap without orders.
         assert!(swap_order_ranges(std::iter::empty()).is_empty());
         assert_eq!(
             swap_order_ranges([
                 // Expired, then retried with the same pair: one swap.
-                (weth, usdc, reshield, false),
-                (weth, usdc, reshield, true),
+                (weth, usdc, reshield, false, funding(1)),
+                (weth, usdc, reshield, true, funding(2)),
                 // After the trade, the same pair on the reused account is a new swap.
-                (weth, usdc, reshield, false),
+                (weth, usdc, reshield, false, funding(3)),
                 // A different pair is a new swap even after an attempt without a trade.
-                (dai, usdc, reshield, false),
+                (dai, usdc, reshield, false, funding(4)),
                 // So is another delivery for the same pair.
-                (dai, usdc, external, false),
+                (dai, usdc, external, false, funding(5)),
             ]),
             [0..2, 2..3, 3..4, 4..5]
         );
+        // Two orders that compete for one funding are one swap whichever of them traded, and
+        // an order funded on its own after that trade is the next swap, also for the same use.
+        for (original, speed_up) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                swap_order_ranges([
+                    (weth, usdc, reshield, original, funding(1)),
+                    (weth, usdc, reshield, speed_up, funding(1)),
+                    (weth, usdc, reshield, false, funding(2)),
+                ]),
+                if original || speed_up {
+                    vec![0..2, 2..3]
+                } else {
+                    std::iter::once(0..3).collect()
+                },
+                "original traded: {original}, speed-up traded: {speed_up}"
+            );
+        }
     }
 
     #[test]

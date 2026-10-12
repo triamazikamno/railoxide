@@ -131,6 +131,8 @@ const DELIVERY_ALLOWANCE: u64 = 500_000;
 const RELAYER: Address = Address::repeat_byte(0x5e);
 /// Gas limit of a fill, above a handler fill that shields.
 const FILL_GAS: u64 = 3_000_000;
+/// How far below its review's suggested minimum a speed-up is approved, in USDC base units.
+const SPEED_UP_DISCOUNT: u64 = 100_000;
 
 /// Across delivery of bought USDC as Arbitrum One USDC, with `surplus` handled as chosen.
 const fn across_delivery(surplus: BridgeSurplus) -> SwapDelivery {
@@ -202,15 +204,20 @@ struct Signing {
     continuing_minimum: Option<U256>,
     /// How long the order stays valid, from the local clock.
     valid_for: std::time::Duration,
+    /// How far below the review's suggested minimum the order is approved, as the Minimum
+    /// field lowers it. The harness prices gas at 1 wei, so a gas share alone moves nothing.
+    minimum_discount: U256,
 }
 
 impl Signing {
-    /// `DESTINATION_MINIMUM` for ten minutes, with no continuing minimum accepted.
+    /// `DESTINATION_MINIMUM` for ten minutes at the review's suggested minimum, with no
+    /// continuing minimum accepted.
     fn standard() -> Self {
         Self {
             destination_minimum: U256::from(DESTINATION_MINIMUM),
             continuing_minimum: None,
             valid_for: std::time::Duration::from_mins(10),
+            minimum_discount: U256::ZERO,
         }
     }
 }
@@ -889,7 +896,7 @@ impl Wallet {
             .issue_swap_order(crate::SwapOrderSigning {
                 review: &review,
                 swap_use,
-                private_minimum: review.suggested_private_minimum(),
+                private_minimum: review.suggested_private_minimum() - terms.minimum_discount,
                 price_acknowledged: true,
                 transactions,
                 inputs: notes,
@@ -1194,6 +1201,94 @@ impl Wallet {
             .unwrap()
     }
 
+    /// Speed up `open`, the swap's open order, through the wallet's own planning and signing:
+    /// a second order at `open`'s pre-hook nonce that reuses the recorded proof and notes,
+    /// invalidates `open` in its pre-hook and is approved `SPEED_UP_DISCOUNT` below its
+    /// review's minimum.
+    async fn speed_up(&self, fork: &ForkChain, open: &Swap) -> Swap {
+        // The account is read again, as before any order. Its nonce is still the shared one.
+        let delegated = self.redelegate(open.operation).await;
+        let notes = std::slice::from_ref(&open.note);
+        let SwapAmountPlan::Fits(plan) = crate::plan_swap_speed_up_inputs(
+            &builder(),
+            &self.chain.swap_profile().unwrap(),
+            &self.record(open.operation),
+            delegated,
+            notes,
+            open.uid,
+            std::time::SystemTime::now(),
+        )
+        .unwrap() else {
+            panic!("the open order's amount fits one order");
+        };
+        assert_eq!(plan.invalidates(), Some(open.uid));
+        self.sign_with(
+            fork,
+            plan,
+            notes,
+            None,
+            Signing {
+                minimum_discount: U256::from(SPEED_UP_DISCOUNT),
+                ..Signing::standard()
+            },
+        )
+        .await
+        .unwrap_or_else(|outcome| panic!("the speed-up is submitted, not {outcome:?}"))
+    }
+
+    /// Sign an order from a fresh executor and speed it up while it is open. Returns the open
+    /// order and its speed-up: two orders of one swap use and stealth account whose pre-hooks
+    /// share a nonce and spend the same notes, selling the same amount for less.
+    async fn overlap(&self, fork: &ForkChain) -> (Swap, Swap) {
+        let open = self.swap(fork).await;
+        let speed_up = self.speed_up(fork, &open).await;
+        assert_eq!(speed_up.operation, open.operation);
+        assert_eq!(
+            (speed_up.executor, speed_up.swap_use),
+            (open.executor, open.swap_use)
+        );
+        let record = self.record(open.operation);
+        let [kept, replacement] = record.swap().unwrap().orders() else {
+            panic!("the speed-up is the swap's second order");
+        };
+        assert_eq!((kept.uid(), replacement.uid()), (open.uid, speed_up.uid));
+        assert_eq!(replacement.use_id(), kept.use_id());
+        assert_eq!(replacement.invalidates(), Some(open.uid));
+        assert_eq!(
+            hook_nonces(&record, speed_up.uid),
+            hook_nonces(&record, open.uid)
+        );
+        // Both published pre-hooks sign the shared nonce and spend the same nullifiers, so at
+        // most one of them can execute.
+        let pre_hook = |swap: &Swap| {
+            let call =
+                RelayAdapt7702::executeCall::abi_decode(&swap.hooks.pre[0].call_data).unwrap();
+            let nullifiers = call
+                ._transactions
+                .iter()
+                .map(|transaction| transaction.nullifiers.clone())
+                .collect::<Vec<_>>();
+            (call._nonce, nullifiers)
+        };
+        assert_eq!(pre_hook(&speed_up), pre_hook(&open));
+        assert_eq!(speed_up.order.sellAmount, open.order.sellAmount);
+        assert!(speed_up.order.buyAmount < open.order.buyAmount);
+        (open, speed_up)
+    }
+
+    /// Stop the wallet's owner and open another over the same store, as a restart does.
+    async fn restart(&mut self) {
+        self.owner.shutdown().await;
+        self.owner = ExecutorOwner::new(
+            1,
+            self.db.clone(),
+            self.view.clone(),
+            self.chain.clone(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap();
+    }
+
     async fn observe(
         &self,
         operation: ExecutorOperationId,
@@ -1339,7 +1434,10 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
             .and_then(|observation| observation.transaction_hash),
         settlement
     );
-    assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
+        SwapOrderState::Done
+    );
     assert!(record.reserved_inputs().contains(&swap.input));
 
     // A blocked reshield is refunded to the stealth account that funded it, not the solver.
@@ -1417,7 +1515,10 @@ async fn swap_fork_external_settlement_pays_the_receiver_and_completes_on_the_tr
             .into_iter()
             .find(|record| record.operation() == swap.operation)
             .unwrap();
-        assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
+        assert_eq!(
+            swap_order_state(record.swap().unwrap(), first_order(&record)),
+            SwapOrderState::Done
+        );
         assert_eq!(
             first_order(&record)
                 .observations()
@@ -1468,7 +1569,7 @@ async fn swap_fork_early_pre_hook_then_fill_completes() {
     fork.mine(wallet.chain.finality_depth).await;
     let record = wallet.observe(swap.operation, ran..ran + 1).await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::PreHookOnly { expired: false }
     );
 
@@ -1502,9 +1603,363 @@ async fn swap_fork_early_pre_hook_then_fill_completes() {
             .and_then(|observation| observation.transaction_hash),
         settlement
     );
-    assert_eq!(swap_order_state(first_order(&record)), SwapOrderState::Done);
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
+        SwapOrderState::Done
+    );
     assert!(record.reserved_inputs().contains(&swap.input));
     wallet.finish().await;
+}
+
+/// Run `swap`'s published pre-hook alone, as anyone can before a solver settles its order.
+async fn run_pre_hook(fork: &ForkChain, swap: &Swap) -> TransactionReceipt {
+    let pre_hook = &swap.hooks.pre[0];
+    fork.send_as_bypass(
+        swap.executor,
+        pre_hook.call_data.clone(),
+        pre_hook.gas_limit + 200_000,
+    )
+    .await
+}
+
+/// What `executor` lets the vault relayer of `wallet`'s chain take of the sell token.
+async fn relayer_allowance(fork: &ForkChain, wallet: &Wallet, executor: Address) -> U256 {
+    fork.call(
+        WETH,
+        ForkAllowance::allowanceCall {
+            owner: executor,
+            spender: wallet.chain.swap_profile().unwrap().vault_relayer(),
+        },
+    )
+    .await
+}
+
+/// The settlement's filled amount of `uid` on `wallet`'s chain: zero for an unfilled order,
+/// the sell amount once it traded, and the maximum once it is invalidated.
+async fn order_filled(fork: &ForkChain, wallet: &Wallet, uid: OrderUid) -> U256 {
+    fork.call(
+        wallet.chain.swap_profile().unwrap().settlement(),
+        ForkSwapSettlement::filledAmountCall {
+            orderUid: uid.0.to_vec().into(),
+        },
+    )
+    .await
+}
+
+/// `record` holds one verified funding, for the swap use and pre-hook nonce `orders` share,
+/// found in the transaction `funded`. Both pre-hooks were candidates in that block, so the
+/// record names neither as the one that ran. An order whose sibling traded with the funding
+/// no longer shares it.
+fn assert_shared_funding(record: &ExecutorRecord, orders: [&Swap; 2], funded: B256) {
+    let swap = record.swap().unwrap();
+    let [funding] = swap.fundings() else {
+        panic!("one funding per swap use and pre-hook nonce");
+    };
+    assert_eq!(
+        (
+            funding.use_id,
+            funding.pre_hook_nonce,
+            funding.observation.transaction_hash
+        ),
+        (orders[0].swap_use, pre_hook_nonce(record), Some(funded))
+    );
+    for order in orders {
+        let recorded = order_of(record, order.uid);
+        assert!(recorded.observations().pre_hook_executed.is_none());
+        assert_eq!(
+            swap.funding(recorded),
+            swap.traded_sibling(recorded)
+                .is_none()
+                .then_some(funding.observation)
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_early_pre_hook_then_speed_up_fill_completes() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let (first, second) = wallet.overlap(&fork).await;
+    let (operation, executor) = (first.operation, first.executor);
+    let sell_amount = first.order.sellAmount;
+
+    // Someone runs the open order's pre-hook alone, before any settlement.
+    let early = run_pre_hook(&fork, &first).await;
+    assert!(
+        early.status(),
+        "the earlier pre-hook runs before its deadline"
+    );
+    let ran = early.block_number.unwrap();
+    // The speed-up's pre-hook shares that nonce and proof, so it can no longer execute, and
+    // the open order it would invalidate stays fillable.
+    assert!(
+        !run_pre_hook(&fork, &second).await.status(),
+        "the shared nonce and proof fund the account once"
+    );
+    assert_eq!(fork.erc20_balance(WETH, executor).await, sell_amount);
+    assert_eq!(
+        relayer_allowance(&fork, &wallet, executor).await,
+        sell_amount
+    );
+    assert_eq!(order_filled(&fork, &wallet, first.uid).await, U256::ZERO);
+
+    // Without a trade the proof's effects show the funding and no hook. Both orders read as
+    // funded and can still fill.
+    fork.mine(wallet.chain.finality_depth).await;
+    let record = wallet.observe(operation, ran..ran + 1).await;
+    assert_shared_funding(&record, [&first, &second], early.transaction_hash);
+    for swap in [&first, &second] {
+        let order = order_of(&record, swap.uid);
+        assert!(order.observations().traded.is_none());
+        assert_eq!(
+            swap_order_state(record.swap().unwrap(), order),
+            SwapOrderState::PreHookOnly { expired: false }
+        );
+    }
+
+    // A solver settles the speed-up with its app-data hooks. Its pre-hook reverts inside the
+    // trampoline and the trade takes the funding the earlier pre-hook left.
+    let receipt = fork
+        .settle(
+            &second.order,
+            second.signature.clone(),
+            &second.hooks.pre,
+            &second.hooks.post,
+        )
+        .await;
+    assert!(receipt.status(), "the solver fills the speed-up");
+    assert_eq!(order_filled(&fork, &wallet, second.uid).await, sell_amount);
+    assert_eq!(fork.erc20_balance(USDC, executor).await, U256::ZERO);
+    // The trade used the whole exact allowance. The open order was never invalidated, and
+    // still can't fill: nothing is left for the vault relayer to take.
+    assert_eq!(fork.erc20_balance(WETH, executor).await, U256::ZERO);
+    assert_eq!(
+        relayer_allowance(&fork, &wallet, executor).await,
+        U256::ZERO
+    );
+    assert_eq!(order_filled(&fork, &wallet, first.uid).await, U256::ZERO);
+    let second_fill = fork
+        .settle(
+            &first.order,
+            first.signature.clone(),
+            &first.hooks.pre,
+            &first.hooks.post,
+        )
+        .await;
+    assert!(
+        !second_fill.status(),
+        "at most one of the two orders trades"
+    );
+    let settled = receipt.block_number.unwrap();
+    fork.mine(wallet.chain.finality_depth).await;
+
+    // The trade and the delivery are the speed-up's. Its pre-hook is not recorded as executed,
+    // and neither is the open order's: the funding still names no hook.
+    let record = wallet.observe(operation, settled..settled + 1).await;
+    let settlement = Some(receipt.transaction_hash);
+    let observed = order_of(&record, second.uid).observations();
+    assert_eq!(
+        observed
+            .traded
+            .and_then(|observation| observation.transaction_hash),
+        settlement
+    );
+    assert_eq!(
+        observed
+            .delivered
+            .and_then(|observation| observation.transaction_hash),
+        settlement
+    );
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), order_of(&record, second.uid)),
+        SwapOrderState::Done
+    );
+    assert!(order_of(&record, first.uid).observations().traded.is_none());
+    // The open order can't fill any more, and the delivered trade completes the use.
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), order_of(&record, first.uid)),
+        SwapOrderState::Superseded
+    );
+    assert!(record.swap().unwrap().admits_attempt());
+    assert_shared_funding(&record, [&first, &second], early.transaction_hash);
+    assert!(record.reserved_inputs().contains(&first.input));
+    wallet.finish().await;
+}
+
+/// One settlement fills one of two overlapping Reshield orders with that order's pre-hook: the
+/// speed-up when `speed_up_trades`, else the open order. Its post-hook slot runs the speed-up's
+/// post-hook when `speed_up_shields`, else the open order's. Either one shields the account's
+/// whole balance of the bought token to the wallet, at the nonce after the shared one.
+async fn speed_up_fill_scenario(speed_up_trades: bool, speed_up_shields: bool) {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let (first, second) = wallet.overlap(&fork).await;
+    let (operation, executor) = (first.operation, first.executor);
+    let shared_nonce = pre_hook_nonce(&wallet.record(operation));
+    let (traded, unfilled) = if speed_up_trades {
+        (&second, &first)
+    } else {
+        (&first, &second)
+    };
+    let post_hooks = if speed_up_shields {
+        &second.hooks.post
+    } else {
+        &first.hooks.post
+    };
+
+    let receipt = fork
+        .settle(
+            &traded.order,
+            traded.signature.clone(),
+            &traded.hooks.pre,
+            post_hooks,
+        )
+        .await;
+    assert!(receipt.status(), "the solver settles one of the two orders");
+    // The pre-hook funded the sell amount once, and the trade took all of it under the exact
+    // allowance.
+    assert_eq!(fork.erc20_balance(WETH, executor).await, U256::ZERO);
+    assert_eq!(
+        relayer_allowance(&fork, &wallet, executor).await,
+        U256::ZERO
+    );
+    assert_eq!(
+        order_filled(&fork, &wallet, traded.uid).await,
+        traded.order.sellAmount
+    );
+    // Only the speed-up's pre-hook invalidates. Where it ran, the open order reads as
+    // invalidated. Where the open order's ran, the speed-up reads as unfilled.
+    assert_eq!(
+        order_filled(&fork, &wallet, unfilled.uid).await,
+        if speed_up_trades {
+            U256::MAX
+        } else {
+            U256::ZERO
+        }
+    );
+    // The post-hook shielded the whole payout to the wallet and took the next nonce.
+    let shields = shields_of(&receipt, RAILGUN, USDC);
+    let [(credited, fee)] = shields.as_slice() else {
+        panic!("the post-hook shields the payout once");
+    };
+    let (credited, fee) = (*credited, *fee);
+    assert_eq!(credited + fee, traded.order.buyAmount);
+    assert_eq!(fork.erc20_balance(USDC, executor).await, U256::ZERO);
+    assert_eq!(
+        execution_nonce(&fork, executor).await,
+        shared_nonce + U256::from(2)
+    );
+
+    // The other order can neither fund the account again nor fill.
+    assert!(
+        !run_pre_hook(&fork, unfilled).await.status(),
+        "the shared nonce is consumed"
+    );
+    let second_fill = fork
+        .settle(
+            &unfilled.order,
+            unfilled.signature.clone(),
+            &unfilled.hooks.pre,
+            &unfilled.hooks.post,
+        )
+        .await;
+    assert!(
+        !second_fill.status(),
+        "at most one of the two orders trades"
+    );
+    assert_eq!(fork.erc20_balance(WETH, executor).await, U256::ZERO);
+
+    // Routine confirmation reads the settlement's receipts for the order that traded. The
+    // credit meets that order's approved minimum, whichever post-hook shielded it.
+    let settled = receipt.block_number.unwrap();
+    fork.mine(wallet.chain.finality_depth).await;
+    wallet
+        .owner
+        .observe_swap_settlement(operation, traded.uid, settled)
+        .await
+        .unwrap();
+    let record = wallet.record(operation);
+    let settlement = Some(receipt.transaction_hash);
+    let confirmed = order_of(&record, traded.uid).observations();
+    assert_eq!(
+        confirmed
+            .traded
+            .and_then(|observation| observation.transaction_hash),
+        settlement
+    );
+    assert!(
+        order_of(&record, unfilled.uid)
+            .observations()
+            .traded
+            .is_none()
+    );
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), order_of(&record, unfilled.uid)),
+        SwapOrderState::Superseded
+    );
+    assert!(credited >= order_of(&record, traded.uid).bounds().private_minimum);
+    if speed_up_trades == speed_up_shields {
+        // The traded order's own post-hook: the receipt alone establishes the delivery.
+        assert_eq!(
+            confirmed
+                .settlement_credit
+                .map(|credit| (credit.private_amount, credit.fee)),
+            Some((credited, Some(fee)))
+        );
+        assert_eq!(confirmed.delivered, confirmed.traded);
+    }
+
+    // Reconciliation completes the swap on the verified trade and the shield that followed
+    // it. The other order holds neither, and the shared proof's effects name no hook.
+    let record = wallet.observe(operation, settled..settled + 1).await;
+    let (won, lost) = (
+        order_of(&record, traded.uid),
+        order_of(&record, unfilled.uid),
+    );
+    assert_eq!(
+        won.observations()
+            .traded
+            .and_then(|observation| observation.transaction_hash),
+        settlement
+    );
+    assert_eq!(
+        won.observations()
+            .delivered
+            .and_then(|observation| observation.transaction_hash),
+        settlement
+    );
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), won),
+        SwapOrderState::Done
+    );
+    assert!(lost.observations().traded.is_none() && lost.observations().delivered.is_none());
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), lost),
+        SwapOrderState::Superseded
+    );
+    assert!(record.swap().unwrap().admits_attempt());
+    assert_shared_funding(&record, [&first, &second], receipt.transaction_hash);
+    assert!(record.reserved_inputs().contains(&first.input));
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_speed_up_fill_invalidates_the_open_order() {
+    Box::pin(speed_up_fill_scenario(true, true)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_open_order_fill_leaves_its_speed_up_unfilled() {
+    Box::pin(speed_up_fill_scenario(false, false)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_open_order_fill_is_shielded_by_its_speed_ups_post_hook() {
+    Box::pin(speed_up_fill_scenario(false, true)).await;
 }
 
 #[tokio::test]
@@ -1548,7 +2003,7 @@ async fn swap_fork_early_funded_post_hook_leaves_proceeds_for_recovery() {
         Some(receipt.transaction_hash)
     );
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::NotDelivered
     );
 
@@ -1584,7 +2039,8 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     let profile = wallet.chain.swap_profile().unwrap();
     let store = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1).unwrap();
     let state_of = |record: &ExecutorRecord, index: usize| {
-        swap_order_state(&record.swap().unwrap().orders()[index])
+        let swap = record.swap().unwrap();
+        swap_order_state(swap, &swap.orders()[index])
     };
     let filled = |uid: OrderUid| {
         fork.call(
@@ -1841,7 +2297,7 @@ async fn swap_fork_recovery_after_expiry_resets_the_approval_and_skips_dead_pre_
     let confirmed = fork.block_number().await - wallet.chain.finality_depth;
     let record = wallet.observe(early.operation, ran..confirmed + 1).await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::PreHookOnly { expired: true }
     );
     assert!(record.reserved_inputs().contains(&early.input));
@@ -1893,7 +2349,7 @@ async fn swap_fork_recovery_after_expiry_resets_the_approval_and_skips_dead_pre_
         .observe(unused.operation, confirmed..confirmed + 1)
         .await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
     );
     assert!(!record.reserved_inputs().contains(&unused.input));
@@ -1934,7 +2390,7 @@ async fn swap_fork_recovery_shields_the_buy_token_a_skipped_post_hook_left() {
     fork.mine(wallet.chain.finality_depth).await;
     let record = wallet.observe(swap.operation, settled..settled + 1).await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::NotDelivered
     );
 
@@ -2021,7 +2477,7 @@ async fn swap_fork_early_cancellation_wins_and_releases_the_inputs_at_finality()
         .observe(swap.operation, cancelled..cancelled + 1)
         .await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
     );
     assert_eq!(
@@ -2078,7 +2534,7 @@ async fn swap_fork_pre_hook_beats_the_cancellation_and_recovery_invalidates_the_
     fork.mine(wallet.chain.finality_depth).await;
     let record = wallet.observe(swap.operation, ran..lost + 1).await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::PreHookOnly { expired: false }
     );
     // The pre-hook's settlement evidence names what ran. The cancellation's nonce is
@@ -2139,6 +2595,184 @@ async fn swap_fork_pre_hook_beats_the_cancellation_and_recovery_invalidates_the_
         )
         .await;
     assert!(!receipt.status(), "the order can't fill after recovery");
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_speed_up_orders_expire_funded_and_recovery_shields_the_sell_token() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let profile = wallet.chain.swap_profile().unwrap();
+    let finality = wallet.chain.finality_depth;
+    let (first, second) = wallet.overlap(&fork).await;
+    let (operation, executor) = (first.operation, first.executor);
+
+    // The open order's pre-hook runs alone, and no solver fills either order.
+    let early = run_pre_hook(&fork, &first).await;
+    assert!(
+        early.status(),
+        "the earlier pre-hook runs before its deadline"
+    );
+    let ran = early.block_number.unwrap();
+    mine_past(
+        &fork,
+        u64::from(first.order.validTo.max(second.order.validTo)),
+    )
+    .await;
+    fork.mine(finality + 1).await;
+    let confirmed = fork.block_number().await - finality;
+
+    // Both orders expired at finalized depth with the funding in the account. Each needs
+    // recovery, and neither pre-hook is named as the one that ran.
+    let record = wallet.observe(operation, ran..confirmed + 1).await;
+    let assert_stranded = |record: &ExecutorRecord| {
+        assert_shared_funding(record, [&first, &second], early.transaction_hash);
+        for swap in [&first, &second] {
+            let order = order_of(record, swap.uid);
+            assert!(order.observations().traded.is_none());
+            assert_eq!(
+                swap_order_state(record.swap().unwrap(), order),
+                SwapOrderState::PreHookOnly { expired: true }
+            );
+        }
+        assert!(record.reserved_inputs().contains(&first.input));
+    };
+    assert_stranded(&record);
+
+    // A restart reads the same record, and observing again changes nothing in it.
+    wallet.restart().await;
+    assert_eq!(wallet.record(operation), record);
+    let record = wallet.observe(operation, confirmed..confirmed + 1).await;
+    assert_stranded(&record);
+
+    // Neither expired order can fill, so the batch resets the approval and shields the sell
+    // token, at the post-hooks' nonce k + 1, without an invalidation.
+    let held = fork.erc20_balance(WETH, executor).await;
+    assert_eq!(held, first.order.sellAmount);
+    let prepared = wallet.prepare_recovery(operation, Some(WETH), held).await;
+    assert_eq!(
+        prepared.execution(),
+        ExecutorRecoveryExecution::PaidExecute {
+            nonce: pre_hook_nonce(&record) + U256::ONE
+        }
+    );
+    let calls = prepared.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(resets_approval(&calls[0], WETH, profile.vault_relayer()));
+    assert!(shields(&calls[1], executor));
+    let issued = wallet.issue_recovery(&fork, prepared).await;
+    let receipt = deliver(&fork, &issued).await;
+    assert!(receipt.status(), "the recovery shields the sell token");
+    // The whole funding goes back to the wallet's private balance and the approval is reset.
+    let recovered = shields_of(&receipt, RAILGUN, WETH);
+    let [(credited, fee)] = recovered.as_slice() else {
+        panic!("the recovery shields the sell token once");
+    };
+    assert_eq!(*credited + *fee, held);
+    assert_eq!(fork.erc20_balance(WETH, executor).await, U256::ZERO);
+    assert_eq!(
+        relayer_allowance(&fork, &wallet, executor).await,
+        U256::ZERO
+    );
+
+    // The recovery's nonce resolves, and the record still names no executed pre-hook.
+    let recovered = receipt.block_number.unwrap();
+    fork.mine(finality).await;
+    let record = wallet.observe(operation, recovered..recovered + 1).await;
+    assert_eq!(
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
+    );
+    assert_shared_funding(&record, [&first, &second], early.transaction_hash);
+    for swap in [&first, &second] {
+        assert!(order_of(&record, swap.uid).observations().traded.is_none());
+    }
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_one_cancellation_invalidates_both_overlapping_orders() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let profile = wallet.chain.swap_profile().unwrap();
+    let (first, second) = wallet.overlap(&fork).await;
+    let (operation, executor) = (first.operation, first.executor);
+    let shared_nonce = pre_hook_nonce(&wallet.record(operation));
+
+    // One paid execute at the shared nonce k, whose only actions invalidate both orders.
+    let prepared = wallet.prepare_recovery(operation, None, U256::ZERO).await;
+    assert_eq!(
+        prepared.execution(),
+        ExecutorRecoveryExecution::PaidExecute {
+            nonce: shared_nonce
+        }
+    );
+    assert!(prepared.shield().is_none());
+    assert_eq!(prepared.calls().len(), 2);
+    for swap in [&first, &second] {
+        assert!(prepared.calls().iter().any(|call| invalidates(
+            call,
+            profile.settlement(),
+            swap.uid
+        )));
+    }
+    let issued = wallet.issue_recovery(&fork, prepared).await;
+    let receipt = deliver(&fork, &issued).await;
+    assert!(receipt.status(), "the cancellation wins nonce k");
+    let cancelled = receipt.block_number.unwrap();
+    for swap in [&first, &second] {
+        assert_eq!(order_filled(&fork, &wallet, swap.uid).await, U256::MAX);
+    }
+    assert_eq!(
+        execution_nonce(&fork, executor).await,
+        shared_nonce + U256::ONE
+    );
+    // The shared nonce is consumed, so neither pre-hook can fund the account afterwards.
+    for swap in [&first, &second] {
+        assert!(
+            !run_pre_hook(&fork, swap).await.status(),
+            "the cancellation took the pre-hooks' nonce"
+        );
+    }
+    assert_eq!(fork.erc20_balance(WETH, executor).await, U256::ZERO);
+    fork.mine(wallet.chain.finality_depth).await;
+
+    // Both orders read as invalidated while the shared notes are unspent, which names the
+    // cancellation for each. Nothing funded the account.
+    let record = wallet.observe(operation, cancelled..cancelled + 1).await;
+    for swap in [&first, &second] {
+        assert_eq!(
+            swap_order_state(record.swap().unwrap(), order_of(&record, swap.uid)),
+            SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
+        );
+    }
+    assert!(record.swap().unwrap().fundings().is_empty());
+    assert_eq!(
+        record.payload_state(issued.payload_hash()),
+        Some(ExecutorPayloadState::Resolved)
+    );
+    // Every payload at nonce k keeps the shared notes until private sync has scanned the block
+    // of that read.
+    assert!(record.reserved_inputs().contains(&first.input));
+    let resolved_at = record.nonce_watermark().unwrap().block();
+    let record = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1)
+        .unwrap()
+        .record_synced(operation, None, resolved_at)
+        .unwrap();
+    assert!(!record.reserved_inputs().contains(&first.input));
+    for swap in [&first, &second] {
+        let receipt = fork
+            .settle(
+                &swap.order,
+                swap.signature.clone(),
+                &swap.hooks.pre,
+                &swap.hooks.post,
+            )
+            .await;
+        assert!(!receipt.status(), "a cancelled order can't fill");
+    }
     wallet.finish().await;
 }
 
@@ -2235,7 +2869,7 @@ async fn swap_fork_across_settlement_deposits_the_approved_terms() {
             reshielded.then_some(U256::from(SURPLUS))
         );
         assert_eq!(
-            swap_order_state(first_order(&record)),
+            swap_order_state(record.swap().unwrap(), first_order(&record)),
             SwapOrderState::Bridging
         );
     }
@@ -2279,7 +2913,7 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
         let confirmed = fork.block_number().await - finality;
         let record = wallet.observe(operation, confirmed..confirmed + 1).await;
         assert_eq!(
-            swap_order_state(order_of(&record, first.uid)),
+            swap_order_state(record.swap().unwrap(), order_of(&record, first.uid)),
             SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired),
             "{label}"
         );
@@ -2299,6 +2933,7 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
             destination_minimum: higher,
             continuing_minimum: None,
             valid_for: std::time::Duration::from_secs(ahead + 10 * 60),
+            minimum_discount: U256::ZERO,
         };
         let plan = || {
             let SwapAmountPlan::Fits(plan) = wallet.plan(
@@ -2525,6 +3160,193 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
         assert!(traded.pre_hook_dead.is_none());
         wallet.finish().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_open_order_settlement_deposits_its_speed_ups_across_terms() {
+    let fork = ForkChain::start().await;
+    let mut wallet = Wallet::open(&fork);
+    let spoke_pool = wallet.chain.bridge_profile().unwrap().spoke_pool();
+    let finality = wallet.chain.finality_depth;
+    wallet.pair = (USDC, across_delivery(BridgeSurplus::Reshield));
+    let (first, second) = wallet.overlap(&fork).await;
+    let (operation, executor) = (first.operation, first.executor);
+
+    // Both attempts are live, at the same hook nonces. The speed-up deposits less for the same
+    // destination minimum, so its deposit can't be taken for the open order's.
+    let record = wallet.record(operation);
+    let (open_terms, speed_up_terms) = (
+        across_terms(&record, first.uid),
+        across_terms(&record, second.uid),
+    );
+    assert_eq!(
+        (open_terms.input_amount, speed_up_terms.input_amount),
+        (first.order.buyAmount, second.order.buyAmount)
+    );
+    assert_eq!(speed_up_terms.output_amount, open_terms.output_amount);
+    let (pre_nonce, post_nonce) = hook_nonces(&record, first.uid);
+    assert_eq!(execution_nonce(&fork, executor).await, pre_nonce);
+
+    // One settlement runs the open order's pre-hook and pays its trade to the account, then
+    // runs the speed-up's post-hook where the open order's would run.
+    let payout = first.order.buyAmount + U256::from(SURPLUS);
+    let left = payout
+        .checked_sub(speed_up_terms.input_amount)
+        .expect("the payout covers the speed-up's deposit");
+    let receipt = fork
+        .settle_with_surplus(
+            &first.order,
+            first.signature.clone(),
+            &first.hooks.pre,
+            &second.hooks.post,
+            U256::from(SURPLUS),
+        )
+        .await;
+    assert!(receipt.status(), "the solver settles the open order");
+    assert_eq!(
+        order_filled(&fork, &wallet, first.uid).await,
+        first.order.sellAmount
+    );
+    assert_eq!(order_filled(&fork, &wallet, second.uid).await, U256::ZERO);
+
+    // The one deposit carries the speed-up's signed terms, not the traded order's.
+    let deposits = deposits(&receipt, spoke_pool);
+    let [deposit] = deposits.as_slice() else {
+        panic!("the speed-up's post-hook deposits once");
+    };
+    assert_eq!(
+        (
+            deposit.depositor,
+            deposit.recipient,
+            deposit.destinationChainId
+        ),
+        (
+            address_to_bytes32(executor),
+            address_to_bytes32(BRIDGE_RECEIVER),
+            U256::from(ARBITRUM_ONE)
+        )
+    );
+    assert_eq!(
+        (deposit.inputAmount, deposit.outputAmount),
+        (speed_up_terms.input_amount, speed_up_terms.output_amount)
+    );
+    assert_eq!(
+        (deposit.quoteTimestamp, deposit.fillDeadline),
+        (speed_up_terms.quote_timestamp, speed_up_terms.fill_deadline)
+    );
+    // The post-hook shields what the deposit left to the wallet.
+    let shields = shields_of(&receipt, RAILGUN, USDC);
+    let [(credited, fee)] = shields.as_slice() else {
+        panic!("the post-hook shields the surplus once");
+    };
+    assert_eq!(*credited + *fee, left);
+    assert_eq!(fork.erc20_balance(USDC, executor).await, U256::ZERO);
+    assert_eq!(
+        execution_nonce(&fork, executor).await,
+        post_nonce + U256::ONE
+    );
+
+    // The settlement is confirmed from its receipts for the open order. The trade stays on
+    // it, and the hand-off, the delivery and the credit go to the speed-up, whose terms were
+    // deposited in that same receipt.
+    let settled = receipt.block_number.unwrap();
+    fork.mine(finality).await;
+    wallet
+        .owner
+        .observe_swap_settlement(operation, first.uid, settled)
+        .await
+        .unwrap();
+    let record = wallet.record(operation);
+    let assert_paired = |record: &ExecutorRecord| {
+        let (traded_order, delivery_order) =
+            (order_of(record, first.uid), order_of(record, second.uid));
+        let (traded, delivered) = (traded_order.observations(), delivery_order.observations());
+        let trade = traded.traded.expect("the open order traded");
+        assert_eq!(trade.transaction_hash, Some(receipt.transaction_hash));
+        assert_eq!(
+            traded.trade_amounts.map(|amounts| amounts.buy_amount),
+            Some(payout)
+        );
+        assert_eq!(
+            (
+                traded.bridge_handoff,
+                traded.delivered,
+                traded.settlement_credit
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            delivered.bridge_handoff,
+            Some(SwapBridgeHandoff {
+                observation: trade,
+                deposit_id: Some(deposit.depositId),
+            })
+        );
+        assert_eq!((delivered.delivered, delivered.traded), (Some(trade), None));
+        assert_eq!(
+            delivered
+                .settlement_credit
+                .map(|credit| (credit.private_amount, credit.fee)),
+            Some((*credited, Some(*fee)))
+        );
+        // The pairing stays within the one swap use both attempts belong to.
+        assert_eq!(
+            (traded_order.use_id(), delivery_order.use_id()),
+            (Some(first.swap_use), Some(first.swap_use))
+        );
+        let recorded = record.swap().unwrap();
+        assert_eq!(
+            (
+                recorded
+                    .delivery_order(traded_order)
+                    .map(SwapOrderRecord::uid),
+                recorded
+                    .trade_order(delivery_order)
+                    .map(SwapOrderRecord::uid)
+            ),
+            (Some(second.uid), Some(first.uid))
+        );
+        assert_eq!(
+            record
+                .swap_bridges_to_track()
+                .map(SwapOrderRecord::uid)
+                .collect::<Vec<_>>(),
+            vec![second.uid]
+        );
+        for order in [traded_order, delivery_order] {
+            assert_eq!(
+                crate::swap_attempt_state(record, order),
+                SwapOrderState::Bridging
+            );
+        }
+    };
+    assert_paired(&record);
+
+    // The pairing is read back from a reopened store and by a restarted owner.
+    let reopened = ExecutorStore::new(wallet.db.clone(), wallet.view.clone(), 1)
+        .unwrap()
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap();
+    assert_eq!(reopened, record);
+    wallet.restart().await;
+    assert_paired(&wallet.record(operation));
+
+    // Reconciliation keeps the pairing and names the speed-up's post-hook as the one that
+    // deposited: only its terms match. The traded order is neither undelivered nor ended.
+    let record = wallet.observe(operation, settled..settled + 1).await;
+    assert_paired(&record);
+    let (traded, delivered) = (
+        order_of(&record, first.uid).observations(),
+        order_of(&record, second.uid).observations(),
+    );
+    assert_eq!(delivered.post_hook_deposit, traded.traded);
+    assert_eq!((traded.post_hook_deposit, traded.undelivered), (None, None));
+    assert!(traded.pre_hook_dead.is_none());
+    wallet.finish().await;
 }
 
 /// The account that deposits into the `SpokePool` directly.
@@ -2856,7 +3678,7 @@ async fn swap_fork_refunded_across_deposit_is_recovered_to_the_wallet() {
         .record_swap_bridge_outcome(swap.operation, swap.uid, SwapBridgeOutcome::Refunding)
         .unwrap();
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::Refunding
     );
 
@@ -2864,7 +3686,7 @@ async fn swap_fork_refunded_across_deposit_is_recovered_to_the_wallet() {
     fork.mine(wallet.chain.finality_depth).await;
     let record = wallet.observe(swap.operation, settled..refunded + 1).await;
     assert_eq!(
-        swap_order_state(first_order(&record)),
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
         SwapOrderState::Refunding
     );
     let held = fork.erc20_balance(USDC, swap.executor).await;

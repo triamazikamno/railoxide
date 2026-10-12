@@ -357,18 +357,25 @@ fn payload_reason(
         return ExecutorInputLockReason::NeedsChainCheck;
     }
     // A reserving pre-hook's order has not ended; it runs inside a settlement, which the
-    // swap can observe before any account read resolves the hook's nonce.
+    // swap can observe before any account read resolves the hook's nonce. A pre-hook that
+    // shares a verified funding had its notes spent like one observed to run, and so had one
+    // whose sibling at the same nonce traded with that funding.
     let order = (payload.purpose() == ExecutorPayloadPurpose::SwapPreHook)
         .then(|| {
             record.swap().and_then(|swap| {
                 swap.orders()
                     .iter()
                     .find(|order| order.pre_hook().payload() == payload.hash())
+                    .map(|order| (swap, order))
             })
         })
         .flatten();
-    if let Some(order) = order {
-        return if order.observations().pre_hook_executed.is_some() {
+    if let Some((swap, order)) = order {
+        let observed = order.observations();
+        let spent = observed.pre_hook_executed.is_some()
+            || swap.funding(order).is_some()
+            || (observed.pre_hook_dead.is_none() && swap.traded_sibling(order).is_some());
+        return if spent {
             ExecutorInputLockReason::ResolvedAwaitingSync
         } else {
             ExecutorInputLockReason::OrderOpen {

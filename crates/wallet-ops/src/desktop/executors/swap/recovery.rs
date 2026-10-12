@@ -180,11 +180,11 @@ pub(crate) fn swap_cancellation_admitted(
     profile: &SwapProfile,
     now: SystemTime,
 ) -> Result<()> {
-    let order = record
+    let (swap, order) = record
         .swap()
-        .and_then(|swap| swap.orders().last())
+        .and_then(|swap| swap.orders().last().map(|order| (swap, order)))
         .ok_or_else(|| eyre!("this swap has no order to cancel"))?;
-    if swap_order_state(order) != SwapOrderState::Open || order.pre_hook().nonce() != nonce {
+    if swap_order_state(swap, order) != SwapOrderState::Open || order.pre_hook().nonce() != nonce {
         return Err(eyre!(
             "this swap's pre-hook already ran or can no longer run; refresh the swap and recover the executor's assets if it holds any"
         ));

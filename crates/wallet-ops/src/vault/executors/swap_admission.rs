@@ -2,6 +2,8 @@
 //! lists, quote previews and signing admission all judge an account here. Nothing is stored
 //! about the result: every rule reads the record.
 
+use broadcaster_core::contracts::cow::OrderUid;
+
 use super::{
     Address, B256, ExecutorPayloadPurpose, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
     SwapDestinationOutcome, SwapOperationRecord, SwapOrderRecord, SwapUseId, SwapUseRole, U256,
@@ -24,6 +26,21 @@ pub enum SwapAccountUse {
     New,
     /// The use that already claims the account: its first order or shield, or a retry.
     Claimed(SwapUseId),
+    /// A second order of the use that already claims the account, signed while the use's
+    /// latest order is still open, at that order's pre-hook nonce.
+    SpeedUp(SwapSpeedUp),
+}
+
+/// The open order a speed-up was reviewed against. Planning, review, signing and the store's
+/// write all name the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapSpeedUp {
+    /// The swap use both orders are attempts of.
+    pub swap_use: SwapUseId,
+    /// The open order, which the new order's pre-hook invalidates.
+    pub order: OrderUid,
+    /// The nonce the open order's pre-hook was signed at, which the new pre-hook shares.
+    pub pre_hook_nonce: U256,
 }
 
 /// What an account's work is judged from.
@@ -59,6 +76,18 @@ pub enum SwapAccountRefusal {
     UnfinishedWork,
     #[error("the previous order of this swap can still execute; retry once it has ended")]
     PreviousOrderLive,
+    /// The order named by a speed-up is not the swap's latest open order any more, or another
+    /// attempt at its nonce traded.
+    #[error("the order being sped up is no longer this swap's open order; review the swap again")]
+    SpeedUpOrderChanged,
+    /// A pre-hook at the shared nonce ran, or the account's nonce is not that nonce.
+    #[error(
+        "this swap's unshield already ran or its account changed, so its order can't be sped up"
+    )]
+    SpeedUpNonceUsed,
+    /// Only an order paid from the private balance without a private Bridge delivery is sped up.
+    #[error("this swap can't be sped up")]
+    SpeedUpUnsupported,
     #[error("the previous swap's bridge hasn't delivered yet; retry once it has")]
     BridgeUndelivered,
     #[error("the previous swap's bridge is refunding to this account; recover the funds instead")]
@@ -107,7 +136,8 @@ pub enum SwapAccountRefusal {
 
 impl SwapAccountRefusal {
     /// Whether observing the chain can lift the refusal. The others follow from the record's
-    /// identity, restrictions and claim, which no observation changes.
+    /// identity, restrictions and claim, which no observation changes. Nothing observed makes
+    /// an order open again for a speed-up either.
     #[must_use]
     pub const fn awaits_observation(self) -> bool {
         !matches!(
@@ -117,6 +147,9 @@ impl SwapAccountRefusal {
                 | Self::RecoveryOnly
                 | Self::RegisteredInPublic
                 | Self::ClaimedByAnotherSwap
+                | Self::SpeedUpOrderChanged
+                | Self::SpeedUpNonceUsed
+                | Self::SpeedUpUnsupported
         )
     }
 }
@@ -183,7 +216,7 @@ pub fn swap_account_refusal(
             }
             None
         }
-        SwapAccountUse::Claimed(id) => {
+        SwapAccountUse::Claimed(id) | SwapAccountUse::SpeedUp(SwapSpeedUp { swap_use: id, .. }) => {
             // An account reserved without swap links takes its first use with its first order.
             let first = record.swap_uses.is_empty() && id == SwapUseId::first(record.operation);
             let fits = record
@@ -217,13 +250,39 @@ pub fn swap_account_refusal(
     if !own_setup && !setup_executed(record) {
         return Some(Refusal::SetupUnconfirmed);
     }
-    if let Some(swap) = record.swap.as_ref().filter(|swap| !swap.admits_attempt()) {
-        return Some(
-            swap.orders()
-                .iter()
-                .find_map(|order| bridge_refusal(swap, order))
-                .unwrap_or(Refusal::PreviousOrderLive),
-        );
+    match swap_use {
+        SwapAccountUse::New | SwapAccountUse::Claimed(_) => {
+            if let Some(swap) = record.swap.as_ref().filter(|swap| !swap.admits_attempt()) {
+                return Some(
+                    swap.orders()
+                        .iter()
+                        .find_map(|order| bridge_refusal(swap, order))
+                        .unwrap_or(Refusal::PreviousOrderLive),
+                );
+            }
+        }
+        // A speed-up is judged against the one open order it names, not by the rule for a
+        // retry, which that order's being live would refuse.
+        SwapAccountUse::SpeedUp(speed_up) => {
+            if role != SwapAccountRole::Source {
+                return Some(Refusal::SpeedUpUnsupported);
+            }
+            let Some(swap) = &record.swap else {
+                return Some(Refusal::SpeedUpOrderChanged);
+            };
+            if let Some(refusal) = swap.speed_up_refusal(&speed_up) {
+                return Some(refusal);
+            }
+            // Another attempt's pre-hook can consume the shared nonce without this order's
+            // own pre-hook being recorded as executed. Fresh evidence always has the
+            // observation here.
+            if record
+                .nonce_observation
+                .is_some_and(|observed| observed.nonce != speed_up.pre_hook_nonce)
+            {
+                return Some(Refusal::SpeedUpNonceUsed);
+            }
+        }
     }
     // Earlier shields need a completed delivery or proven invalidation of an unplaced use.
     let unresolved_delivery = record

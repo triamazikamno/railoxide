@@ -1,8 +1,8 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
-//! retry review and split outcome, at the Stealth accounts inspector and at the refund dialog
-//! of a blocked Shield: it opens them on a scratch wallet without private funds and holds a
-//! chosen state on screen. It is compiled only with `debug_assertions`, and does nothing
-//! unless `RAILOXIDE_UI_FIXTURE` is set.
+//! retry review, speed-up and split outcome, at the Stealth accounts inspector and at the
+//! refund dialog of a blocked Shield: it opens them on a scratch wallet without private funds
+//! and holds a chosen state on screen. It is compiled only with `debug_assertions`, and does
+//! nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
@@ -66,11 +66,42 @@
 //!   the deposit found in the stealth account, where Recover… is offered. `unverified` is one
 //!   order whose verified trade showed no deposit, for comparison. Copy buttons work, and the
 //!   detail's other actions do nothing.
+//! - `speed-up-review` opens the private swap form as `retry-review` does, on the speed-up of
+//!   that swap's open retry: the first order expired with an approved delivery of 90 USDC, the
+//!   retry that delivers 100 is open, and the form holds a synthesized quote that delivers 95
+//!   for a lower deposit. Its terms are fixed, and under the Minimum controls it shows the open
+//!   order's signed minimum beside the new one. Ticking the earlier order's checkbox enables
+//!   Review…, which opens the speed-up's review with both signed minimums, its Earlier approval
+//!   row and its warning. Approving the review takes the vault password and ends in an error on
+//!   the form. As in `retry-review`, another gas share leaves Review… waiting for a bridge quote.
+//! - `speed-up:open` opens the swap dialog, in place of a Public account's form, on the detail
+//!   of that swap with its open retry, where Speed up… sits in the order step under the
+//!   order's ID and opens the form of `speed-up-review`. `speed-up:just-placed` is that detail
+//!   with the retry signed as the mode opens: it shows no Speed up… at first, and the action
+//!   appears by itself 30 seconds later. `speed-up:two-orders` is the detail of the swap once a
+//!   speed-up was placed and both orders can still fill, where Speed up… is disabled with its
+//!   reason and the Orders section lists both orders with their IDs, minimums and expiries.
+//!   `speed-up:rejected` is that detail when the orderbook rejected the speed-up: the swap
+//!   stays open on the original order, the Orders section reads Open and Rejected, and
+//!   Speed up… is disabled with the same reason.
+//!   The detail's other actions do nothing.
+//! - `speed-up:original-bridging`, `speed-up:original-delivered` and
+//!   `speed-up:replacement-delivered` are that swap once one of its two orders traded, as one
+//!   swap that follows the traded order: the original order, which approved 100 USDC, with its
+//!   own deposit on its way or delivered, or the speed-up, which approved 95, delivered. The
+//!   other order reads Not filled in the Orders section, and both IDs keep their copy buttons.
+//!   `speed-up:original-private` is the original order's trade for a swap that delivers to the
+//!   private balance on Ethereum instead, shielded by its own settlement.
+//!   Each opens on the detail. Its Back button opens My orders, which lists the swap once:
+//!   under Open while it is on its way, and under Ended once delivered. After the dialog is
+//!   closed, the Private tab on Ethereum shows the status card for `speed-up:two-orders`,
+//!   `speed-up:rejected` and `speed-up:original-bridging`. A delivered swap has ended and
+//!   leaves the card, as any does.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
-//! only, and nothing reads, tracks or acts on them. A `retry-review` mode opens the route its
-//! orderbook client would use, and sends nothing on it.
+//! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode opens the
+//! route its orderbook client would use, and sends nothing on it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +124,7 @@ use wallet_ops::vault::{
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
     OperationNetworkIsolation, PairAnchorRate, SwapContinuingApproval, SwapReview,
-    SwapReviewChange,
+    SwapReviewChange, SwapSpeedUpRefusal,
 };
 
 use super::dialog::SwapDialogView;
@@ -124,6 +155,29 @@ enum Mode {
     Refund(Refund),
     RetryReview,
     Split(Split),
+    SpeedUp(SpeedUp),
+}
+
+/// What a speed-up mode shows of the synthesized private swap: the speed-up's form, the detail
+/// of the swap with its open retry, the detail with two orders that can still fill, or the
+/// detail once one of those two traded and the other can't.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpeedUp {
+    Review,
+    Open,
+    /// The open retry was signed just now, so the detail doesn't offer Speed up yet.
+    JustPlaced,
+    TwoOrders,
+    /// Two orders that can still fill, the speed-up's submission rejected by the orderbook.
+    Rejected,
+    /// The original order traded and made its own deposit, which Across hasn't filled yet.
+    OriginalBridging,
+    /// The original order traded and its own deposit was delivered.
+    OriginalDelivered,
+    /// The original order of a swap to the private balance traded and was shielded.
+    OriginalPrivate,
+    /// The speed-up traded and its own deposit was delivered.
+    ReplacementDelivered,
 }
 
 /// What the detail of a `split:` mode's private swap shows of its Across deposit, which the
@@ -200,6 +254,22 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "retry-review" {
         return Some(Mode::RetryReview);
+    }
+    if value == "speed-up-review" {
+        return Some(Mode::SpeedUp(SpeedUp::Review));
+    }
+    if let Some(state) = value.strip_prefix("speed-up:") {
+        return Some(Mode::SpeedUp(match state {
+            "open" => SpeedUp::Open,
+            "just-placed" => SpeedUp::JustPlaced,
+            "two-orders" => SpeedUp::TwoOrders,
+            "rejected" => SpeedUp::Rejected,
+            "original-bridging" => SpeedUp::OriginalBridging,
+            "original-delivered" => SpeedUp::OriginalDelivered,
+            "original-private" => SpeedUp::OriginalPrivate,
+            "replacement-delivered" => SpeedUp::ReplacementDelivered,
+            _ => return None,
+        }));
     }
     if let Some(stage) = value.strip_prefix("split:") {
         return Some(Mode::Split(match stage {
@@ -303,16 +373,32 @@ pub(super) fn holds_records() -> bool {
 }
 
 /// Whether the private swap records are the fixture's own, which nothing reads again, quotes,
-/// tracks or acts on. A `retry-review` mode has none until its form is opened.
+/// tracks or acts on. A `retry-review` or `speed-up-review` mode has none until its form is
+/// opened.
 pub(super) fn holds_swaps() -> bool {
-    matches!(mode(), Some(Mode::RetryReview | Mode::Split(_)))
+    matches!(
+        mode(),
+        Some(Mode::RetryReview | Mode::Split(_) | Mode::SpeedUp(_))
+    )
 }
 
-/// What approving the review of a `retry-review` mode ends in, in place of placing its order.
-/// `None` in every other mode.
+/// What approving the review of a `retry-review` or speed-up mode ends in, in place of placing
+/// its order. `None` in every other mode.
 pub(super) fn review_refusal() -> Option<&'static str> {
-    matches!(mode(), Some(Mode::RetryReview))
+    matches!(mode(), Some(Mode::RetryReview | Mode::SpeedUp(_)))
         .then_some("Fixture: this mode stops at the review. Nothing was sent.")
+}
+
+/// What the owner's rule would answer about speeding up a speed-up mode's synthesized swap,
+/// which no owner holds: `Some(Ok(()))` offers the speed-up. `None` in every other mode.
+pub(super) fn speed_up_refusal() -> Option<Result<(), SwapSpeedUpRefusal>> {
+    match mode()? {
+        Mode::SpeedUp(SpeedUp::TwoOrders | SpeedUp::Rejected) => {
+            Some(Err(SwapSpeedUpRefusal::TwoOrdersFillable))
+        }
+        Mode::SpeedUp(SpeedUp::Review | SpeedUp::Open | SpeedUp::JustPlaced) => Some(Ok(())),
+        _ => None,
+    }
 }
 
 /// The setup fee that stands in for a new destination account's estimate, in a token of
@@ -704,8 +790,10 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     .ok()
 }
 
-/// The network the private swap of a `retry-review` or `split:` mode sells on.
+/// The network the private swap of a `retry-review`, `split:` or speed-up mode sells on.
 const SWAP_ORIGIN: u64 = 1;
+/// The block the synthesized private swap's observations count from.
+const SWAP_ORIGIN_BLOCK: u64 = 24_612_480;
 const WETH: Address = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
 const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 /// The swap's stealth account. No wallet holds it.
@@ -723,9 +811,10 @@ const SWAP_DELIVERY: BridgeDelivery = BridgeDelivery {
 const SWAP_SPEND: u64 = 50_000_000_000_000_000;
 const SWAP_SELL: u64 = 49_875_000_000_000_000;
 /// The USDC each order deposits with Across and the USDC that deposit delivers: 90 for the
-/// first order, and 100 for its retry.
+/// first order, 100 for its retry, and 95 for the retry's speed-up.
 const FIRST_ORDER: (u64, u64) = (90_420_000, 90_000_000);
 const RETRY: (u64, u64) = (100_460_000, 100_000_000);
+const SPED_UP: (u64, u64) = (95_440_000, 95_000_000);
 /// What the trade bought, 101.31 USDC.
 const SWAP_BOUGHT: u64 = 101_312_480;
 
@@ -774,16 +863,18 @@ fn staged_order(
 /// The record of the synthesized private swap, decoded from the JSON a stored record has.
 /// Without `split`, its first order expired and nothing ran. With it, the retry traded and its
 /// settlement made the first order's deposit, whose outcome the stage names. `Unverified` is
-/// one order instead, whose trade showed no deposit.
-fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
-    use ExecutorPayloadPurpose::{Operation, SwapPostHook, SwapPreHook};
-    const ORIGIN_BLOCK: u64 = 24_612_480;
+/// one order instead, whose trade showed no deposit. With `speed_up` and no `split`, the
+/// expired first order is followed by its open retry, or for `TwoOrders` the swap holds the
+/// retry and its speed-up, both open. `Rejected` is `TwoOrders` with the speed-up's submission
+/// rejected. The other speed-up stages hold those two orders once one of them traded, as
+/// [`staged_overlap`] stages them.
+fn staged_swap(split: Option<Split>, speed_up: Option<SpeedUp>) -> Option<ExecutorRecord> {
     let now = now_unix();
     // A refund follows the deposit's fill deadline.
     let refunds = matches!(split, Some(Split::Refunding | Split::RefundVerified));
     let signed = now.saturating_sub(if refunds { 18_000 } else { 3_000 });
     let at = |block: u64, transaction: Option<&str>| SwapObservation {
-        block: BlockNumHash::new(ORIGIN_BLOCK + block, keccak256(block.to_be_bytes())),
+        block: BlockNumHash::new(SWAP_ORIGIN_BLOCK + block, keccak256(block.to_be_bytes())),
         transaction_hash: transaction.map(keccak256),
     };
     let value = |observed: SwapOrderObservations| serde_json::to_value(observed).ok();
@@ -815,10 +906,33 @@ fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
                 expired: Some(expired.observation),
                 ..Default::default()
             })?;
-            (
-                vec![staged_order(0, signed, FIRST_ORDER, 0xa1, &ended)?],
-                1_u8,
-            )
+            let open = value(SwapOrderObservations::default())?;
+            // An open order was signed five minutes ago, and the one before it five earlier.
+            // A just-placed one is signed now.
+            let orders = match speed_up {
+                None => vec![staged_order(0, signed, FIRST_ORDER, 0xa1, &ended)?],
+                Some(SpeedUp::Review | SpeedUp::Open) => vec![
+                    staged_order(0, signed, FIRST_ORDER, 0xa1, &ended)?,
+                    staged_order(1, now.saturating_sub(300), RETRY, 0xb1, &open)?,
+                ],
+                Some(SpeedUp::JustPlaced) => vec![
+                    staged_order(0, signed, FIRST_ORDER, 0xa1, &ended)?,
+                    staged_order(1, now, RETRY, 0xb1, &open)?,
+                ],
+                Some(SpeedUp::TwoOrders | SpeedUp::Rejected) => {
+                    let mut placed =
+                        staged_order(1, now.saturating_sub(300), SPED_UP, 0xb1, &open)?;
+                    if speed_up == Some(SpeedUp::Rejected) {
+                        placed["submission_status"] = serde_json::json!("Rejected");
+                    }
+                    vec![
+                        staged_order(0, now.saturating_sub(600), RETRY, 0xa1, &open)?,
+                        placed,
+                    ]
+                }
+                Some(won) => return staged_overlap(won, settlement, &traded, now),
+            };
+            (orders, 1_u8)
         }
         // The pre-hook ran and the post-hook, which deposits, didn't.
         Some(Split::Unverified) => {
@@ -865,6 +979,84 @@ fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
             )
         }
     };
+    staged_swap_record(&orders, nonce, signed)
+}
+
+/// The synthesized swap's two competing orders once one of them traded, which `won` names:
+/// the original, signed ten minutes ago, and its speed-up, signed five minutes ago at the same
+/// pre-hook nonce. The traded order holds `traded` at `settlement` with its own delivery, and
+/// the other holds nothing, so it reads as not filled.
+fn staged_overlap(
+    won: SpeedUp,
+    settlement: SwapObservation,
+    traded: &SwapOrderObservations,
+    now: u64,
+) -> Option<ExecutorRecord> {
+    let private = won == SpeedUp::OriginalPrivate;
+    let (terms, delivers) = if won == SpeedUp::ReplacementDelivered {
+        (SPED_UP, true)
+    } else {
+        (RETRY, won == SpeedUp::OriginalDelivered)
+    };
+    let mut filled = serde_json::to_value(SwapOrderObservations {
+        pre_hook_executed: Some(settlement),
+        delivered: Some(settlement),
+        bridge_handoff: (!private).then_some(SwapBridgeHandoff {
+            observation: settlement,
+            deposit_id: Some(U256::from(3_481_207_u32)),
+        }),
+        bridge_outcome: delivers.then(|| SwapBridgeOutcome::DeliveredVerified {
+            block: BlockNumHash::new(402_118_977, keccak256("fill block")),
+            transaction_hash: keccak256("fill"),
+            output_amount: U256::from(terms.1),
+            shielded: false,
+        }),
+        ..*traded
+    })
+    .ok()?;
+    // The settlement shielded everything a private swap bought, and for a Bridge swap what
+    // the trade bought beyond the deposit, less the shield fee.
+    if private {
+        filled["shielded"] = serde_json::json!({
+            "observation": settlement,
+            "private_amount": U256::from(SWAP_BOUGHT), "fee": U256::ZERO
+        });
+    } else {
+        let surplus = SWAP_BOUGHT.checked_sub(terms.0)?;
+        let fee = surplus / 400;
+        filled["settlement_credit"] = serde_json::json!({
+            "observation": settlement,
+            "private_amount": U256::from(surplus - fee), "fee": U256::from(fee)
+        });
+    }
+    let unfilled = serde_json::to_value(SwapOrderObservations::default()).ok()?;
+    let (original, speed_up) = if won == SpeedUp::ReplacementDelivered {
+        (&unfilled, &filled)
+    } else {
+        (&filled, &unfilled)
+    };
+    let mut orders = vec![
+        staged_order(0, now.saturating_sub(600), RETRY, 0xa1, original)?,
+        staged_order(1, now.saturating_sub(300), SPED_UP, 0xb1, speed_up)?,
+    ];
+    if private {
+        for order in &mut orders {
+            order["delivery"] = serde_json::to_value(SwapDelivery::Reshield).ok()?;
+            order["bridge"] = serde_json::Value::Null;
+            order["bounds"]["destination_minimum"] = serde_json::Value::Null;
+        }
+    }
+    staged_swap_record(&orders, 3, now.saturating_sub(600))
+}
+
+/// The synthesized swap's record around `orders`, whose hooks left the account at `nonce`,
+/// reserved five minutes before `signed`.
+fn staged_swap_record(
+    orders: &[serde_json::Value],
+    nonce: u8,
+    signed: u64,
+) -> Option<ExecutorRecord> {
+    use ExecutorPayloadPurpose::{Operation, SwapPostHook, SwapPreHook};
     let mut issued = vec![staged_payload(0, 0xa0, Operation, Some(0xc0))];
     for hash in [0xa1, 0xb1].into_iter().take(orders.len()) {
         issued.push(staged_payload(1, hash, SwapPreHook, None));
@@ -876,7 +1068,10 @@ fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
         "address": SWAP_ACCOUNT, "delegate": Address::repeat_byte(0x5d), "retired": false,
         "created_at": signed.saturating_sub(300),
         "issued": issued.into_iter().collect::<Option<Vec<_>>>()?,
-        "nonce_watermark": ExecutorNonceWatermark::new(U256::from(nonce), ORIGIN_BLOCK + 1_500),
+        "nonce_watermark": ExecutorNonceWatermark::new(
+            U256::from(nonce),
+            SWAP_ORIGIN_BLOCK + 1_500,
+        ),
         "swap": {
             "terms": SwapTerms::new(
                 WETH,
@@ -893,15 +1088,31 @@ fn staged_swap(split: Option<Split>) -> Option<ExecutorRecord> {
 
 /// The record and the review a `retry-review` mode holds its form on: the swap's expired first
 /// order, and a quote for its retry that delivers 100 USDC while that order's approval of 90
-/// can still decide the delivery. `None` unless the mode is on.
+/// can still decide the delivery. A `speed-up-review`, `speed-up:open` or
+/// `speed-up:just-placed` mode holds the swap with that retry open instead, a quote that
+/// delivers 95 USDC for a lower deposit, and the retry's ID, the order the form speeds up.
+/// `None` in every other mode.
 pub(super) fn retry_review(
     profile: &SwapProfile,
     isolation: OperationNetworkIsolation,
-) -> Option<(ExecutorRecord, SwapReview)> {
-    if !matches!(mode(), Some(Mode::RetryReview)) {
-        return None;
-    }
-    let record = staged_swap(None)?;
+) -> Option<(ExecutorRecord, SwapReview, Option<OrderUid>)> {
+    let speed_up = match mode()? {
+        Mode::RetryReview => None,
+        Mode::SpeedUp(SpeedUp::Review | SpeedUp::Open | SpeedUp::JustPlaced) => {
+            Some(SpeedUp::Review)
+        }
+        _ => return None,
+    };
+    let record = staged_swap(None, speed_up)?;
+    let open = speed_up
+        .and_then(|_| record.swap()?.orders().last())
+        .map(wallet_ops::vault::SwapOrderRecord::uid);
+    // What the orderbook quotes, and what the bridge leg delivers of it.
+    let (bought, delivered) = if open.is_some() {
+        (96_140_000_u32, SPED_UP.1)
+    } else {
+        (101_180_000_u32, RETRY.1)
+    };
     let first = record.swap()?.orders().first()?;
     let BridgeOrderTerms::Across(deposit) = first.bridge()? else {
         return None;
@@ -919,7 +1130,7 @@ pub(super) fn retry_review(
         WETH,
         USDC,
         U256::from(SWAP_SPEND),
-        U256::from(101_180_000_u32),
+        U256::from(bought),
         // 2,030 USDC for one ETH, each in base units for one whole native token.
         PairAnchorRate {
             sell_rate: U256::from(1_000_000_000_000_000_000_u64),
@@ -927,13 +1138,13 @@ pub(super) fn retry_review(
         },
         120_000_000,
         SWAP_DELIVERY,
-        U256::from(RETRY.1),
-        U256::from(RETRY.1),
+        U256::from(delivered),
+        U256::from(delivered),
         vec![earlier],
         isolation,
     );
     match review {
-        Ok(review) => Some((record, review)),
+        Ok(review) => Some((record, review, open)),
         Err(error) => {
             tracing::warn!(%error, "the debug UI fixture couldn't synthesize its review");
             None
@@ -942,27 +1153,29 @@ pub(super) fn retry_review(
 }
 
 impl PrivateSwapsView {
-    /// In a `retry-review` or `split:` mode, show the synthesized private swap in place of
-    /// the Public account form that was asked for. `true` when such a mode is on.
+    /// In a `retry-review`, `split:` or speed-up mode, show the synthesized private swap in
+    /// place of the Public account form that was asked for. `true` when such a mode is on.
     pub(super) fn open_ui_fixture_swap(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        let split = match mode() {
-            Some(Mode::RetryReview) => None,
-            Some(Mode::Split(split)) => Some(split),
+        // The detail's stage, or none for a mode that opens the form.
+        let detail = match mode() {
+            Some(Mode::RetryReview | Mode::SpeedUp(SpeedUp::Review)) => None,
+            Some(Mode::Split(split)) => Some((Some(split), None)),
+            Some(Mode::SpeedUp(speed_up)) => Some((None, Some(speed_up))),
             _ => return false,
         };
         if self.origin_chain_id != SWAP_ORIGIN {
             tracing::warn!("the debug UI fixture's private swap is on Ethereum: select it first");
             return true;
         }
-        let Some(split) = split else {
+        let Some((split, speed_up)) = detail else {
             self.open_ui_fixture_retry_review(window, cx);
             return true;
         };
-        let Some(record) = staged_swap(Some(split)) else {
+        let Some(record) = staged_swap(split, speed_up) else {
             tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
             return true;
         };

@@ -30,7 +30,7 @@ use wallet_ops::{
 use super::model::{
     RecordSwap, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage,
     bridge_sent_amount, provider_name, record_swaps, swap_delivery, swap_order_group,
-    swap_order_stage, swap_order_status, swap_private_minimum,
+    swap_order_status, swap_private_minimum,
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
@@ -504,8 +504,10 @@ impl PrivateSwapsView {
                 let Some(order) = orders.get(swap.orders.end - 1) else {
                     continue;
                 };
-                // An earlier swap ended before the next one could start.
-                let stage = swap_order_stage(record, order, self.attribution(record));
+                // An earlier swap ended before the next one could start. Its stage is that of
+                // the attempt it follows, which among competing orders is the traded one.
+                let stage =
+                    SwapAttempts::ending_at(record, order).stage(record, self.attribution(record));
                 entries.push(OrderEntry {
                     record,
                     view: SwapDialogView::PastDetail(
@@ -723,7 +725,8 @@ impl PrivateSwapsView {
             Some(SwapDialogView::PastDetail(swap, first)) => {
                 self.past_swap(swap, first).map(|(record, _, order)| {
                     (
-                        swap_order_stage(record, order, self.attribution(record)),
+                        SwapAttempts::ending_at(record, order)
+                            .stage(record, self.attribution(record)),
                         order.delivery(),
                     )
                 })
@@ -1112,22 +1115,24 @@ impl PrivateSwapsView {
             Some(order) if !latest => self.past_labels(record, order, cx),
             _ => self.labels(record, cx),
         };
-        // What a bridge holds or refunds follows the attempt that holds the hand-off.
-        let evidence = entry
+        // What a bridge holds or refunds follows the attempt that holds the hand-off, and the
+        // minimum and the trade those of the attempt the swap follows.
+        let attempts = entry
             .order
-            .map(|order| SwapAttempts::ending_at(record, order).bridge_evidence());
+            .map(|order| SwapAttempts::ending_at(record, order));
+        let evidence = attempts.map(|attempts| attempts.bridge_evidence());
         let amount = match entry.group {
             SwapOrderGroup::Open => match &labels.bridge {
                 // A Bridge swap's minimum is on its destination network.
                 Some(bridge) => bridge.minimum.clone(),
                 None => tokens
-                    .zip(entry.order.map_or_else(
+                    .zip(attempts.map_or_else(
                         || {
                             pending
                                 .map(|pending| pending.private_minimum)
                                 .or_else(|| swap_private_minimum(record))
                         },
-                        |order| Some(order.bounds().private_minimum),
+                        |attempts| Some(attempts.outcome.bounds().private_minimum),
                     ))
                     .map(|((_, buy), minimum)| self.token_amount(buy, minimum, cx)),
             }
@@ -1173,10 +1178,7 @@ impl PrivateSwapsView {
                         note: Some("received"),
                     }
                 }
-                _ if entry
-                    .order
-                    .is_none_or(|order| order.observations().traded.is_none()) =>
-                {
+                _ if attempts.is_none_or(|attempts| attempts.traded.is_none()) => {
                     OrderRowAmount::Muted("Nothing traded")
                 }
                 _ => OrderRowAmount::None,

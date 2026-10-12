@@ -84,8 +84,9 @@ use crate::vault::{
     ExecutorPayloadPurpose, ExecutorRecord, ExecutorStoreError, IssuedExecutorPayload,
     SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
     SwapAnchorObservation, SwapApproval, SwapApprovalTokens, SwapApprovedBounds, SwapAttempt,
-    SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSubmission,
-    SwapSubmissionStatus, SwapTerms, SwapUseId, SwapUseRecord, SwapUseRole, swap_account_refusal,
+    SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSpeedUp,
+    SwapSubmission, SwapSubmissionStatus, SwapTerms, SwapUseId, SwapUseRecord, SwapUseRole,
+    swap_account_refusal,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
@@ -145,6 +146,13 @@ pub fn delivery_shortfall_allowance(approved: U256, current: U256) -> U256 {
     shortfall.saturating_add(shortfall.div_ceil(U256::from(4)))
 }
 
+const SPEED_UP_ORDER_CHANGED: &str =
+    "the order being sped up is no longer this swap's open order; review the swap again";
+const SPEED_UP_FUNDS_CHANGED: &str = "the funds of this swap changed; its order can't be sped up";
+const SPEED_UP_NONCE_CHANGED: &str =
+    "the swap executor's nonce changed; the order can't be sped up";
+const SPEED_UP_TERMS_CHANGED: &str = "this swap's fixed terms changed; review it again";
+
 const DESTINATION_ACCOUNT_MISMATCH: &str = "a private Bridge delivery needs its destination stealth account, and no other delivery takes one";
 
 /// An amount to plan for a swap, before or after its executor's setup.
@@ -177,6 +185,8 @@ pub struct SwapInputPlan {
     gas_model: &'static RailgunGasModel,
     /// Estimated post-hook gas, `None` for an order without a post-hook.
     post_hook_gas: Option<u64>,
+    /// The open order this plan speeds up. `None` for a first order or an ordinary retry.
+    speed_up: Option<SwapSpeedUp>,
 }
 
 impl SwapInputPlan {
@@ -231,6 +241,11 @@ impl SwapInputPlan {
     #[must_use]
     pub const fn invalidates(&self) -> Option<OrderUid> {
         self.invalidates
+    }
+    /// The open order a plan from [`ExecutorOwner::plan_swap_speed_up`] speeds up.
+    #[must_use]
+    pub const fn speed_up(&self) -> Option<SwapSpeedUp> {
+        self.speed_up
     }
     /// Gas limit the order declares for the pre-hook.
     #[must_use]
@@ -1169,6 +1184,41 @@ pub enum SwapReviewChange {
         approved: U256,
         current: U256,
     },
+    /// The order a speed-up would sign doesn't ask for less than the open order's buy amount,
+    /// `open`. Nothing was signed.
+    SpeedUpBuyAmount {
+        open: U256,
+        current: U256,
+    },
+}
+
+/// Why an open order can't be sped up now, for the action that offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapSpeedUpRefusal {
+    /// Two orders of the swap can still fill, and a pre-hook invalidates only one.
+    TwoOrdersFillable,
+    /// The order isn't the swap's open order any more, has expired, or its swap takes no
+    /// speed-up.
+    Unavailable,
+}
+
+/// Whether an order with `buy_amount` speeds up the open order approved at `open`. The two
+/// orders' signed `CoW` buy amounts are compared for the unchanged sell amount, since solvers
+/// fill against that limit. Destination minimums are not compared.
+#[must_use]
+pub fn swap_speed_up_relaxes(open: &SwapApprovedBounds, buy_amount: U256) -> bool {
+    buy_amount < open.buy_amount
+}
+
+/// The review change for a speed-up whose order wouldn't relax the open order's `open`.
+fn speed_up_buy_amount_change(
+    open: &SwapApprovedBounds,
+    buy_amount: U256,
+) -> Option<SwapReviewChange> {
+    (!swap_speed_up_relaxes(open, buy_amount)).then_some(SwapReviewChange::SpeedUpBuyAmount {
+        open: open.buy_amount,
+        current: buy_amount,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1311,6 +1361,7 @@ pub(crate) fn plan_swap_inputs(
         size,
         gas_model,
         post_hook_gas,
+        speed_up: None,
     };
     Ok(match check {
         SwapAmountCheck::Fits(size) => SwapAmountPlan::Fits(plan(size)),
@@ -1669,6 +1720,67 @@ impl ExecutorOwner {
         )
     }
 
+    /// Plan a second order for the open order `order` of the swap `operation`, from local
+    /// records only. Nothing is proved or signed. The plan keeps the open order's tokens,
+    /// private spend and delivery, spends exactly the notes of the recorded proof, invalidates
+    /// the open order and names it, so review and signing stay bound to it. Like a recorded
+    /// preview it can't be signed until execution preparation confirms the account at the open
+    /// order's pre-hook nonce.
+    pub fn plan_swap_speed_up(
+        &self,
+        session: &WalletSession,
+        operation: ExecutorOperationId,
+        order: OrderUid,
+    ) -> Result<SwapAmountPlan> {
+        self.require_swap_session(session)?;
+        let profile = self.swap_order_profile()?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let (_, speed_up) =
+            swap_speed_up_binding(&record, order).ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+        let executor =
+            recorded_swap_executor(&record, self.chain.chain_id, speed_up.pre_hook_nonce, false)?;
+        let utxos = self.swap_inputs(session, &record)?;
+        let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
+        let builder = TransactionBuilder {
+            chain_type: 0,
+            chain_id: self.chain.chain_id,
+            railgun_contract: chain.railgun_contract,
+            relay_adapt_contract: chain.relay_adapt_contract,
+        };
+        plan_swap_speed_up_inputs(
+            &builder,
+            &profile,
+            &record,
+            executor,
+            &utxos,
+            order,
+            SystemTime::now(),
+        )
+    }
+
+    /// Why the order `order` of the swap `operation` can't be sped up now, judged from the
+    /// record alone and without a network request. `None` is provisional: it offers the
+    /// action, and planning and signing check the order again.
+    pub fn swap_speed_up_refusal(
+        &self,
+        operation: ExecutorOperationId,
+        order: OrderUid,
+    ) -> Result<Option<SwapSpeedUpRefusal>> {
+        let profile = self.swap_order_profile()?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let chain_id = self.chain.chain_id;
+        let admitted = speed_up_block(&record, &profile, chain_id, order, SystemTime::now());
+        Ok(match admitted {
+            Ok(_) => None,
+            Err(SpeedUpBlock::TwoOrdersFillable) => Some(SwapSpeedUpRefusal::TwoOrdersFillable),
+            Err(_) => Some(SwapSpeedUpRefusal::Unavailable),
+        })
+    }
+
     /// Quote using the shared protocol fee and background anchor rates, without hooks, and
     /// price the order limit. Signing rechecks the fees and anchors before using these terms.
     pub async fn review_swap(&self, request: SwapReviewRequest<'_>) -> Result<SwapReview> {
@@ -1824,20 +1936,30 @@ impl ExecutorOwner {
         }
         // A retry of a public Across swap can settle with an earlier attempt's deposit. An
         // explicitly reused account starts a new use, whose attempts are compared with nothing.
+        // A speed-up names its use.
+        let speed_up = review.plan.speed_up;
         if is_public_across(review.plan.delivery)
             && !review.plan.executor.is_reused()
             && let Some(operation) = review.plan.operation()
-            && let Some(swap_use) = self
-                .swap_account_record(operation)?
-                .and_then(|record| record.active_swap_use())
+            && let Some(swap_use) = match speed_up {
+                Some(speed_up) => Some(speed_up.swap_use),
+                None => self
+                    .swap_account_record(operation)?
+                    .and_then(|record| record.active_swap_use()),
+            }
         {
-            // Only a plan made for the confirmed delegation names the nonce its pre-hook signs.
-            let nonce = review
-                .plan
-                .executor
-                .delegated()
-                .is_some()
-                .then_some(review.plan.context.execution_nonce);
+            // Only a plan made for the confirmed delegation names the nonce its pre-hook signs,
+            // and a speed-up signs at its open order's.
+            let nonce = speed_up
+                .map(|speed_up| speed_up.pre_hook_nonce)
+                .or_else(|| {
+                    review
+                        .plan
+                        .executor
+                        .delegated()
+                        .is_some()
+                        .then_some(review.plan.context.execution_nonce)
+                });
             review.continuing = self
                 .swap_continuing_approvals(operation, swap_use, review.plan.delivery, nonce)
                 .await?;
@@ -1927,6 +2049,7 @@ impl ExecutorOwner {
         if review.plan.delivery.private_bridge().is_some() != destination.is_some() {
             return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH));
         }
+        let account_use = order_account_use(&review.plan, swap_use)?;
         // The use claims its account before the account is read or anything is proved.
         self.admit_swap_use(review, swap_use, private_minimum, price_acknowledged)?;
         let confirmed = session
@@ -1967,7 +2090,7 @@ impl ExecutorOwner {
         let (source, destination) = tokio::join!(
             trace_step(
                 "order_account_refresh",
-                self.refresh_swap_executor(&mut review, confirmed, swap_use),
+                self.refresh_swap_executor(&mut review, confirmed, account_use),
             ),
             async {
                 let Some((context, destination_operation, confirmed, receiver)) =
@@ -2011,7 +2134,7 @@ impl ExecutorOwner {
             &record,
             self.chain.chain_id,
             SwapAccountRole::Source,
-            SwapAccountUse::Claimed(swap_use),
+            account_use,
             SwapAdmissionEvidence::Fresh,
         )?;
         require_swap_use_terms(&record, swap_use, plan)?;
@@ -2021,6 +2144,9 @@ impl ExecutorOwner {
         {
             tracing::debug!(target: "executor_observation", step = "order_proof", reused = true);
             (transactions, inputs, Vec::new())
+        } else if plan.speed_up.is_some() {
+            // A speed-up funds from the recorded proof alone, so nothing is proved for it.
+            return Err(eyre!(SPEED_UP_FUNDS_CHANGED));
         } else {
             trace_step(
                 "order_proof",
@@ -2057,7 +2183,7 @@ impl ExecutorOwner {
 
     /// Bind the order to its swap use before any preparation. An explicitly reused account
     /// that doesn't hold `swap_use` yet is claimed for it, with the approval these terms make.
-    /// Any other account must already be claimed by that use.
+    /// Any other account must already be claimed by that use. A speed-up never claims one.
     fn admit_swap_use(
         &self,
         review: &SwapReview,
@@ -2072,7 +2198,10 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if review.plan.executor.is_reused() && record.swap_use(swap_use).is_none() {
+        if review.plan.speed_up.is_none()
+            && review.plan.executor.is_reused()
+            && record.swap_use(swap_use).is_none()
+        {
             self.claim_swap_use(
                 None,
                 SwapUseClaim {
@@ -2244,7 +2373,7 @@ impl ExecutorOwner {
             &record,
             self.chain.chain_id,
             SwapAccountRole::Source,
-            SwapAccountUse::Claimed(swap_use),
+            order_account_use(plan, swap_use)?,
             SwapAdmissionEvidence::Fresh,
         )?;
         require_swap_use_terms(&record, swap_use, plan)?;
@@ -2257,6 +2386,43 @@ impl ExecutorOwner {
         if record.address() != Some(executor) || record.delegate() != delegated.delegate() {
             return Err(eyre!("the swap executor changed; plan the swap again"));
         }
+        // A speed-up is signed only against the open order it was reviewed for, at that order's
+        // nonce and fixed terms, and only for a lower buy amount.
+        let speed_up_open = match plan.speed_up {
+            Some(speed_up) => {
+                let (open, _) = swap_speed_up_binding(&record, speed_up.order)
+                    .ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+                require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+                if observed.nonce() != speed_up.pre_hook_nonce {
+                    return Err(eyre!(SPEED_UP_NONCE_CHANGED));
+                }
+                let bounds = open.bounds();
+                if plan.invalidates != Some(speed_up.order)
+                    || review.sell_amount != bounds.sell_amount
+                    || plan.amount() != bounds.spend_amount()
+                    || plan.delivery != open.delivery()
+                    || review.slippage_bps != bounds.slippage_bps
+                {
+                    return Err(eyre!(SPEED_UP_TERMS_CHANGED));
+                }
+                let current = review.valid_for_secs()?;
+                if let Some(approved) = bounds.valid_for_secs
+                    && approved != current
+                {
+                    return Ok(SwapOrderOutcome::ReviewRequired(
+                        SwapReviewChange::Validity {
+                            approved: u64::from(approved),
+                            current: u64::from(current),
+                        },
+                    ));
+                }
+                if let Some(change) = speed_up_buy_amount_change(bounds, buy_amount) {
+                    return Ok(SwapOrderOutcome::ReviewRequired(change));
+                }
+                Some(bounds)
+            }
+            None => None,
+        };
         // A private delivery's receiver is the stealth account this swap's record links to on
         // the destination chain, confirmed there for the same wallet.
         if let (Some(delivery), Some(destination)) = (plan.delivery.private_bridge(), destination)
@@ -2554,6 +2720,12 @@ impl ExecutorOwner {
             }
             None => (private_minimum, buy_amount, gas_allowance),
         };
+        // A raised deposit can take back the reduction a speed-up was reviewed for.
+        if let Some(change) =
+            speed_up_open.and_then(|open| speed_up_buy_amount_change(open, buy_amount))
+        {
+            return Ok(SwapOrderOutcome::ReviewRequired(change));
+        }
         // An earlier attempt's post-hook above the nonce this pre-hook signs at can still
         // deposit under its own lower minimum. The user must have accepted that minimum.
         if is_public_across(plan.delivery)
@@ -2584,6 +2756,11 @@ impl ExecutorOwner {
         // the quote stops the order before anything of this account is signed.
         if let Some(destination) = destination {
             destination.owner.ensure_active()?;
+        }
+        // The open order may have expired while a quote was awaited. A new order can't relax
+        // one that solvers no longer fill.
+        if let Some(speed_up) = plan.speed_up {
+            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
         }
         // Resolved before anything is signed.
         let receiver = order_receiver(executor, plan.delivery, bridge_terms.as_ref())?;
@@ -2747,6 +2924,11 @@ impl ExecutorOwner {
         }
         let guard = self.lock_activity().await;
         self.require_record_unchanged(&record)?;
+        // The open order may have expired while the lock was awaited. A new order can't relax
+        // one that solvers no longer fill.
+        if let Some(speed_up) = plan.speed_up {
+            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+        }
         trace_step("order_persist", async {
             self.store.record_swap_attempt(
                 operation,
@@ -2812,6 +2994,7 @@ impl ExecutorOwner {
                         )
                     }),
                     bridge: bridge_terms,
+                    speed_up: plan.speed_up.map(|speed_up| speed_up.order),
                 },
             )
         })
@@ -3002,7 +3185,7 @@ impl ExecutorOwner {
             ));
         }
         if !matches!(
-            super::observation::swap_order_state(saved),
+            super::observation::swap_order_state(swap, saved),
             super::observation::SwapOrderState::Open
                 | super::observation::SwapOrderState::PreHookOnly { expired: false }
         ) {
@@ -3322,31 +3505,27 @@ impl ExecutorOwner {
             return Err(eyre!("this swap's setup is not confirmed"));
         }
         self.swap_order_profile()?;
-        ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
-            .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
-        Ok(SwapExecutor {
-            operation: Some(operation),
-            executor: record
-                .address()
-                .ok_or_else(|| eyre!("stealth account is unavailable"))?,
-            delegate: record.delegate(),
-            // The nonce is a fixed ABI word and does not affect the quote's gas or byte
-            // estimate. Preparation replaces this hint before proving or signing.
-            expected_pre_hook_nonce: record
+        // The nonce is a fixed ABI word and does not affect the quote's gas or byte estimate.
+        // Preparation replaces this hint before proving or signing.
+        recorded_swap_executor(
+            &record,
+            self.chain.chain_id,
+            record
                 .nonce_observation()
                 .map_or(U256::ZERO, ExecutorNonceObservation::nonce),
-            setup: SwapExecutorSetup::Recorded,
-            reused: reuse,
-        })
+            reuse,
+        )
     }
 
     /// Refresh mutable account state before proving. The executor nonce is not a priced
     /// term, but an additional order invalidation changes the hook estimate and needs review.
+    /// A speed-up keeps the use, open order and pre-hook nonce it was reviewed for, and is
+    /// refused when the refreshed account no longer matches them.
     pub(crate) async fn refresh_swap_executor(
         &self,
         review: &mut SwapReview,
         confirmed: u64,
-        swap_use: SwapUseId,
+        swap_use: SwapAccountUse,
     ) -> Result<Option<SwapReviewChange>> {
         let plan = &review.plan;
         if plan.executor.requires_setup() {
@@ -3358,12 +3537,7 @@ impl ExecutorOwner {
             .operation()
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         let mut executor = self
-            .reuse_swap_account(
-                operation,
-                confirmed,
-                SwapAccountRole::Source,
-                SwapAccountUse::Claimed(swap_use),
-            )
+            .reuse_swap_account(operation, confirmed, SwapAccountRole::Source, swap_use)
             .await?;
         if executor.executor() != plan.executor() || executor.delegate() != plan.context.delegate {
             return Err(eyre!("the swap executor changed; plan the swap again"));
@@ -3371,7 +3545,18 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if swap_invalidation(&record, &self.swap_order_profile()?, SystemTime::now())?
+        let profile = self.swap_order_profile()?;
+        if let SwapAccountUse::SpeedUp(speed_up) = swap_use {
+            // The refreshed nonce is not adopted: at any other nonce the order would be a
+            // retry, which was not what the user reviewed.
+            if executor.expected_pre_hook_nonce() != speed_up.pre_hook_nonce {
+                return Err(eyre!(SPEED_UP_NONCE_CHANGED));
+            }
+            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+            if plan.invalidates != Some(speed_up.order) {
+                return Err(eyre!(SPEED_UP_TERMS_CHANGED));
+            }
+        } else if swap_invalidation(&record, &profile, SystemTime::now())?
             .is_some_and(|live| plan.invalidates != Some(live))
         {
             return Ok(Some(SwapReviewChange::HookCost));
@@ -3625,6 +3810,192 @@ fn previewed_swap_use(record: &ExecutorRecord, reused: bool) -> SwapAccountUse {
             }) && !record.has_swap_use_order(*id)
         })
         .map_or(SwapAccountUse::New, SwapAccountUse::Claimed)
+}
+
+/// The account of `record` as a recorded preview, which can be quoted but not signed for, with
+/// the nonce hint `expected_pre_hook_nonce`.
+fn recorded_swap_executor(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    expected_pre_hook_nonce: U256,
+    reused: bool,
+) -> Result<SwapExecutor> {
+    ExecutorProfile::accepted(chain_id, record.delegate())
+        .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
+    Ok(SwapExecutor {
+        operation: Some(record.operation()),
+        executor: record
+            .address()
+            .ok_or_else(|| eyre!("stealth account is unavailable"))?,
+        delegate: record.delegate(),
+        expected_pre_hook_nonce,
+        setup: SwapExecutorSetup::Recorded,
+        reused,
+    })
+}
+
+/// The use an order of `plan` is admitted for. A speed-up is admitted only for the use it
+/// was reviewed for, and never as that use's retry.
+fn order_account_use(plan: &SwapInputPlan, swap_use: SwapUseId) -> Result<SwapAccountUse> {
+    match plan.speed_up {
+        None => Ok(SwapAccountUse::Claimed(swap_use)),
+        Some(speed_up) if speed_up.swap_use == swap_use => Ok(SwapAccountUse::SpeedUp(speed_up)),
+        Some(_) => Err(eyre!(
+            "this speed-up was reviewed for another swap; review it again"
+        )),
+    }
+}
+
+/// The order `order` of `record` and what a speed-up of it binds: its use, its UID and its
+/// pre-hook nonce. `None` when the record holds no such order of a swap use.
+fn swap_speed_up_binding(
+    record: &ExecutorRecord,
+    order: OrderUid,
+) -> Option<(&SwapOrderRecord, SwapSpeedUp)> {
+    let open = record
+        .swap()?
+        .orders()
+        .iter()
+        .find(|open| open.uid() == order)?;
+    let speed_up = SwapSpeedUp {
+        swap_use: open.use_id()?,
+        order,
+        pre_hook_nonce: open.pre_hook().nonce(),
+    };
+    Some((open, speed_up))
+}
+
+/// The plan [`ExecutorOwner::plan_swap_speed_up`] makes, without its session: a second order
+/// for the open order `order` of `record` at `now`, for the account `executor`, from the
+/// candidate notes `utxos`. Only the notes of the recorded proof are offered to the selection,
+/// and the plan is refused when `utxos` lacks one of them.
+pub(crate) fn plan_swap_speed_up_inputs(
+    builder: &TransactionBuilder,
+    profile: &SwapProfile,
+    record: &ExecutorRecord,
+    executor: impl Into<SwapExecutor>,
+    utxos: &[Utxo],
+    order: OrderUid,
+    now: SystemTime,
+) -> Result<SwapAmountPlan> {
+    let (open, speed_up) =
+        swap_speed_up_binding(record, order).ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+    // The account rule on recorded evidence is part of the window.
+    require_speed_up_window(record, profile, &speed_up, now)?;
+    let swap = record.swap().ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+    let terms = swap.order_terms(open);
+    let request = SwapAmountRequest {
+        sell_token: terms.sell_token(),
+        buy_token: terms.buy_token(),
+        amount: open.bounds().spend_amount(),
+        delivery: open.delivery(),
+        byte_budget: None,
+    };
+    if profile.pair_eligibility(request.sell_token, request.buy_token, request.delivery)
+        != SwapTokenEligibility::Eligible
+    {
+        return Err(eyre!("this token pair is not eligible for private swaps"));
+    }
+    // Both orders fund from the recorded proof, so no other note may be selected.
+    let inputs = swap
+        .proof()
+        .inputs()
+        .iter()
+        .map(|input| utxos.iter().find(|utxo| input.matches(utxo)).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| eyre!(SPEED_UP_FUNDS_CHANGED))?;
+    match plan_swap_inputs(
+        builder,
+        profile,
+        executor,
+        &inputs,
+        &request,
+        profile.app_data_byte_budget(),
+        Some(order),
+    )? {
+        SwapAmountPlan::Fits(mut plan) => {
+            // Signing reuses the recorded proof and proves nothing, so a plan that selects
+            // other notes than the proof spends is refused here.
+            if reusable_swap_proof(record, &plan, &inputs).is_none() {
+                return Err(eyre!(SPEED_UP_FUNDS_CHANGED));
+            }
+            plan.speed_up = Some(speed_up);
+            Ok(SwapAmountPlan::Fits(plan))
+        }
+        // The amount is the open order's, so a smaller one can't be offered instead.
+        SwapAmountPlan::TooLarge { .. } => {
+            Err(eyre!("this swap's order can't be sped up at its amount"))
+        }
+    }
+}
+
+/// Why an order can't be sped up at the moment it is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpeedUpBlock {
+    /// The shared account rule refuses the speed-up on recorded evidence.
+    Account(SwapAccountRefusal),
+    /// The record holds no such order, or it is not the one order that can still fill.
+    NotOpen,
+    /// Local time reached the order's `validTo`.
+    Expired,
+    TwoOrdersFillable,
+}
+
+/// The one rule for whether `order` of `record` can be sped up at `now`, from the record alone,
+/// with what the speed-up binds. The shared account rule must admit it on recorded evidence,
+/// which leaves `order` as the latest order. It must be unexpired by local time, since a new
+/// order can't relax one that solvers no longer fill. And it must be the only order that can
+/// still fill, because a pre-hook invalidates one order: an earlier order counts until
+/// [`fillable_swap_orders`] drops it, which its local expiry alone does not do.
+pub(crate) fn speed_up_block(
+    record: &ExecutorRecord,
+    profile: &SwapProfile,
+    chain_id: u64,
+    order: OrderUid,
+    now: SystemTime,
+) -> Result<SwapSpeedUp, SpeedUpBlock> {
+    let (open, speed_up) = swap_speed_up_binding(record, order).ok_or(SpeedUpBlock::NotOpen)?;
+    if let Some(refusal) = swap_account_refusal(
+        record,
+        chain_id,
+        SwapAccountRole::Source,
+        SwapAccountUse::SpeedUp(speed_up),
+        SwapAdmissionEvidence::Recorded,
+    ) {
+        return Err(SpeedUpBlock::Account(refusal));
+    }
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if u64::from(open.valid_to()) <= now_secs {
+        return Err(SpeedUpBlock::Expired);
+    }
+    match fillable_swap_orders(record, profile, now).as_slice() {
+        [fillable] if *fillable == order => Ok(speed_up),
+        [_, _, ..] => Err(SpeedUpBlock::TwoOrdersFillable),
+        _ => Err(SpeedUpBlock::NotOpen),
+    }
+}
+
+/// Refuse a speed-up bound to `speed_up` unless [`speed_up_block`] admits its order at `now`
+/// with the same binding.
+fn require_speed_up_window(
+    record: &ExecutorRecord,
+    profile: &SwapProfile,
+    speed_up: &SwapSpeedUp,
+    now: SystemTime,
+) -> Result<()> {
+    match speed_up_block(record, profile, profile.chain_id(), speed_up.order, now) {
+        Ok(current) if current == *speed_up => Ok(()),
+        Ok(_) | Err(SpeedUpBlock::NotOpen) => Err(eyre!(SPEED_UP_ORDER_CHANGED)),
+        Err(SpeedUpBlock::Account(refusal)) => Err(refusal.into()),
+        Err(SpeedUpBlock::Expired) => Err(eyre!(
+            "this order has expired; retry once its expiry is final"
+        )),
+        Err(SpeedUpBlock::TwoOrdersFillable) => Err(eyre!(
+            "two orders of this swap can still fill, and a new order can replace only one"
+        )),
+    }
 }
 
 /// The earlier order of this executor that a retry's pre-hook invalidates in the same execution

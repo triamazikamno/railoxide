@@ -58,7 +58,7 @@ use wallet_ops::{
     },
     cow::{
         CowOrderbookClient, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS, GAS_SHARE_TIGHT_BPS,
-        OrderLimitError,
+        OrderLimitError, OrderUid,
     },
     default_public_broadcaster_fee_limit, delivery_shortfall_allowance, prepare_swap_pair,
     settings::{
@@ -66,7 +66,7 @@ use wallet_ops::{
         EffectiveTokenRegistry, SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
         resolve_effective_chain_rpc_route, swap_destination_tokens,
     },
-    submit_swap_pair_setups,
+    submit_swap_pair_setups, swap_speed_up_relaxes,
     vault::{
         BridgeDelivery, BridgePrivateDelivery, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
         ExecutorOperationId, ExecutorRecord, PublicAccountMetadata, PublicAccountSource,
@@ -168,6 +168,13 @@ const SAME_TOKEN_BRIDGE: &str =
     "Same-token bridging isn't supported. Choose another token to receive, or sell something else.";
 const DESTINATION_AUTHORIZATION_MISSING: &str =
     "The approval didn't cover the destination network. Review the swap again. Nothing was sent.";
+/// Under a speed-up's Minimum controls, and why its Review… is off, while the new order
+/// wouldn't ask for less than the open one.
+const SPEED_UP_NOT_LOWER: &str =
+    "This doesn't lower the open order's minimum, so it wouldn't speed the swap up.";
+/// A speed-up review's note on the order it leaves in place.
+const SPEED_UP_STAYS_LIVE: &str =
+    "The open order stays live until the new order invalidates it, or until it fills or expires.";
 
 /// Why Pay from lists a Public account that is shared between Private wallets as unavailable,
 /// and why the Public tab can't bridge from it.
@@ -668,6 +675,14 @@ enum SetupSide {
     Destination,
 }
 
+/// The open order a speed-up form replaces: its ID, and the bounds it was signed with, which
+/// its record never changes.
+#[derive(Clone)]
+struct SpeedUpOrder {
+    uid: OrderUid,
+    bounds: SwapApprovedBounds,
+}
+
 /// The order terms the user approved, for a stealth account that is set up.
 #[derive(Clone)]
 pub(super) struct OrderApproval {
@@ -696,12 +711,20 @@ pub(super) struct OrderApproval {
     /// source account. The order claims both accounts for `swap_use` before it signs. `None`
     /// for any other order, and once the swap's record names its destination account.
     pub(super) pair_destination: Option<DestinationAccount>,
+    /// The open order this approval speeds up, as its form named it. `None` for any other
+    /// order. Signing takes the order from the review's plan, which must name the same one.
+    speed_up: Option<OrderUid>,
 }
 
 impl OrderApproval {
     /// The order's delivery, when it shields on another network.
     pub(super) fn private_delivery(&self) -> Option<BridgeDelivery> {
         self.review.plan().delivery().private_bridge()
+    }
+
+    /// The approval signs a second order beside an open one, by its form or by its plan.
+    pub(super) fn speeds_up(&self) -> bool {
+        self.speed_up.is_some() || self.review.plan().speed_up().is_some()
     }
 }
 
@@ -733,6 +756,8 @@ struct ContinuingDelivery {
     /// The destination network's name.
     network: String,
     surplus: BridgeSurplus,
+    /// The reviewed order speeds up an open one, so two orders can trade.
+    speeds_up: bool,
 }
 
 impl ContinuingDelivery {
@@ -756,19 +781,41 @@ impl ContinuingDelivery {
             BridgeSurplus::KeepInAccount => "stays in the stealth account",
             BridgeSurplus::BridgedByProvider => "is returned separately",
         };
+        let trades = if self.speeds_up {
+            "Whichever order trades"
+        } else {
+            "If this order trades"
+        };
         format!(
-            "If this order trades, that earlier approved deposit may run in its place, and you receive {} there instead of at least {}. Anything left on {source} {rest} and doesn't add to it.",
+            "{trades}, that earlier approved deposit may run in its place, and you receive {} there instead of at least {}. Anything left on {source} {rest} and doesn't add to it.",
             self.lower, self.new
         )
     }
 
-    /// The review's warning.
+    /// The Earlier approval row's hint.
+    const fn hint(&self) -> &'static str {
+        if self.speeds_up {
+            "An earlier order of this swap approved this minimum. Whichever order trades, another order's approved bridge deposit can run in the same settlement. If it is this one, this is what the swap delivers."
+        } else {
+            "An earlier order of this swap approved this minimum, and its bridge deposit can still run if this order trades. Then this is what the swap delivers."
+        }
+    }
+
+    /// The review's warning. With two orders that can trade, it also says that the order that
+    /// trades needn't be the one whose deposit runs.
     fn warning(&self) -> String {
-        format!(
+        let warning = format!(
             "This swap may deliver {} instead of {}.",
             self.lower_there(),
             self.new
-        )
+        );
+        if self.speeds_up {
+            format!(
+                "{warning} Whichever order trades, another order's approved deposit can run in its settlement and decide what is delivered."
+            )
+        } else {
+            warning
+        }
     }
 }
 
@@ -1204,6 +1251,9 @@ pub(super) struct SwapForm {
     error: Option<String>,
     /// The order detail this form continues or retries, which Back returns to.
     back_to_detail: Option<ExecutorOperationId>,
+    /// The form speeds this open order up: its order is planned from that order's record, its
+    /// terms are fixed, and only the Minimum, through the gas share, can change.
+    speed_up: Option<SpeedUpOrder>,
     details_open: bool,
     /// The setup broadcaster popover. Presses elsewhere in the form close it, so a fee token
     /// list opened inside it stays usable.
@@ -1381,6 +1431,17 @@ impl SwapForm {
         }
     }
 
+    /// Whether the order `review` would sign asks for less than the open order a speed-up
+    /// replaces. `None` for a form that speeds nothing up.
+    fn speed_up_relaxes(&self, review: &SwapReview) -> Option<bool> {
+        let open = self.speed_up.as_ref()?;
+        Some(
+            review
+                .buy_amount_for(review.suggested_private_minimum())
+                .is_ok_and(|buy_amount| swap_speed_up_relaxes(&open.bounds, buy_amount)),
+        )
+    }
+
     fn review_problem(&self, review: &Arc<SwapReview>) -> Option<SharedString> {
         match &self.delivery {
             Err(
@@ -1399,6 +1460,9 @@ impl SwapForm {
             ),
             Ok(_) if self.gas_share_fallback(review) => {
                 Some("Gas is too high for this swap right now.".into())
+            }
+            Ok(_) if self.speed_up_relaxes(review) == Some(false) => {
+                Some(SPEED_UP_NOT_LOWER.into())
             }
             Ok(_) if !review.price_verified() && !self.price_acknowledged => {
                 Some("Accept the unverified price before you review the swap.".into())
@@ -1533,6 +1597,11 @@ enum QuoteExecutor {
     Order {
         operation: ExecutorOperationId,
         reuse: bool,
+    },
+    /// The account and the notes come from the record of the open order being sped up.
+    SpeedUp {
+        operation: ExecutorOperationId,
+        order: OrderUid,
     },
 }
 
@@ -1696,10 +1765,14 @@ async fn quote_swap_terms(
 ) -> eyre::Result<QuoteOutcome> {
     let started = Instant::now();
     tracing::debug!(target: "swap_quote", step = "executor", "started");
+    // A speed-up has no executor to preview: its plan names the open order's.
     let executor = match request.executor {
-        QuoteExecutor::Preview => owner.swap_preview_executor()?,
-        QuoteExecutor::Setup(operation) => owner.swap_setup_preview(operation)?,
-        QuoteExecutor::Order { operation, reuse } => owner.swap_order_preview(operation, reuse)?,
+        QuoteExecutor::Preview => Ok(owner.swap_preview_executor()?),
+        QuoteExecutor::Setup(operation) => Ok(owner.swap_setup_preview(operation)?),
+        QuoteExecutor::Order { operation, reuse } => {
+            Ok(owner.swap_order_preview(operation, reuse)?)
+        }
+        QuoteExecutor::SpeedUp { operation, order } => Err((operation, order)),
     };
     tracing::debug!(
         target: "swap_quote",
@@ -1758,8 +1831,14 @@ async fn quote_swap_terms(
     // Note selection can take a moment on fragmented balances.
     let started = Instant::now();
     tracing::debug!(target: "swap_quote", step = "input_planning", "started");
-    let plan = tokio::task::spawn_blocking(move || {
-        planning_owner.plan_swap_amount(&executor, &planning_session, &amount_request)
+    let plan = tokio::task::spawn_blocking(move || match executor {
+        Ok(executor) => {
+            planning_owner.plan_swap_amount(&executor, &planning_session, &amount_request)
+        }
+        // The open order's own notes, tokens, spend and delivery, whatever the request names.
+        Err((operation, order)) => {
+            planning_owner.plan_swap_speed_up(&planning_session, operation, order)
+        }
     })
     .await;
     tracing::debug!(
@@ -2749,6 +2828,73 @@ impl PrivateSwapsView {
         }
     }
 
+    /// Open the swap form on a speed-up of `operation`'s open order: a second order with a
+    /// lower minimum, signed while that order stays live. The order's tokens, spend, delivery,
+    /// price tolerance and validity fill the form and stay fixed, and a fresh quote is planned
+    /// from that order's record. `false` when the order can't be sped up, and nothing opens.
+    pub(super) fn open_speed_up_form(
+        &mut self,
+        operation: ExecutorOperationId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        // Debug UI fixture: a speed-up mode holds its form on a synthesized quote.
+        #[cfg(debug_assertions)]
+        if super::ui_fixture::speed_up_refusal() == Some(Ok(())) {
+            self.open_ui_fixture_retry_review(window, cx);
+            return true;
+        }
+        if super::ui_fixture::holds_swaps() || !self.session_is_current(cx) || self.busy() {
+            return false;
+        }
+        let Some(record) = self.record(operation) else {
+            return false;
+        };
+        // The owner's rule, as it answered for the records now shown. Planning asks it again.
+        if self.speed_up_refusal(record).is_some() {
+            return false;
+        }
+        let Some((swap, open)) = record
+            .swap()
+            .and_then(|swap| Some((swap, swap.orders().last()?)))
+        else {
+            return false;
+        };
+        let tokens = swap.order_terms(open);
+        let (sell, buy) = (tokens.sell_token(), tokens.buy_token());
+        let bounds = open.bounds();
+        let terms = SavedTerms {
+            slippage_bps: Some(bounds.slippage_bps),
+            gas_share_bps: bounds.gas_share_bps,
+            valid_for: bounds
+                .valid_for_secs
+                .map(|secs| Duration::from_secs(secs.into())),
+        };
+        let (amount, delivery) = (bounds.spend_amount(), open.delivery());
+        let speed_up = SpeedUpOrder {
+            uid: open.uid(),
+            bounds: bounds.clone(),
+        };
+        self.open_form(
+            Some(operation),
+            sell,
+            Some(buy),
+            Some(amount),
+            Some(terms),
+            delivery,
+            window,
+            cx,
+        );
+        let Some(form) = self.form.as_mut() else {
+            return false;
+        };
+        form.back_to_detail = Some(operation);
+        form.speed_up = Some(speed_up);
+        // The form opened as its placed swap's, which isn't quoted.
+        self.schedule_quote(window, cx);
+        true
+    }
+
     /// Open the form with its fields filled in, and the order `terms` a reopened swap restores.
     /// A native `buy`, which only a Public address `delivery` receives, fills in as the wrapped
     /// native Buy asset with native output, before a quote is scheduled. A Bridge `delivery`
@@ -2806,9 +2952,10 @@ impl PrivateSwapsView {
         self.stage_public_route_error_for_fixture(window, cx);
     }
 
-    /// Debug UI fixture: in a `retry-review` mode, open the private form of the synthesized
-    /// swap's retry and hold it on the synthesized review. The orderbook client a review is
-    /// approved with takes a route of its own, which is opened first and never asked anything.
+    /// Debug UI fixture: in a `retry-review` or speed-up mode, open the private form of the
+    /// synthesized swap's retry or speed-up and hold it on the synthesized review. The
+    /// orderbook client a review is approved with takes a route of its own, which is opened
+    /// first and never asked anything.
     #[cfg(debug_assertions)]
     pub(super) fn open_ui_fixture_retry_review(&self, window: &Window, cx: &Context<'_, Self>) {
         let profile = self.root.upgrade().and_then(|root| {
@@ -2850,12 +2997,20 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) || self.busy() {
             return;
         }
-        let Some((record, review)) =
+        let Some((record, review, open)) =
             super::ui_fixture::retry_review(profile, orderbook.isolation())
         else {
             tracing::warn!("the debug UI fixture couldn't synthesize its retry");
             return;
         };
+        // A speed-up mode's form speeds up the synthesized swap's open order.
+        let speed_up = record
+            .swap()
+            .and_then(|swap| swap.orders().iter().find(|order| Some(order.uid()) == open))
+            .map(|order| SpeedUpOrder {
+                uid: order.uid(),
+                bounds: order.bounds().clone(),
+            });
         let plan = review.plan();
         let SwapDelivery::Bridge(delivery) = plan.delivery() else {
             return;
@@ -2912,6 +3067,10 @@ impl PrivateSwapsView {
         );
         form.set_orderbook(Some(orderbook), None);
         form.quote = QuoteState::Ready(Arc::new(review));
+        if speed_up.is_some() {
+            form.back_to_detail = Some(operation);
+        }
+        form.speed_up = speed_up;
         // Only the earlier approval is left to accept.
         form.price_acknowledged = true;
         form.high_costs_acknowledged = true;
@@ -3236,6 +3395,7 @@ impl PrivateSwapsView {
             continuing_acknowledged: false,
             error: None,
             back_to_detail: None,
+            speed_up: None,
             details_open: false,
             settings_open: false,
             gas_help_open: false,
@@ -3269,7 +3429,8 @@ impl PrivateSwapsView {
         if form.public.is_some() {
             return FormMode::Order;
         }
-        if form.reuse_account {
+        // A speed-up reviews a second order while its open one is placed.
+        if form.reuse_account || form.speed_up.is_some() {
             return FormMode::Order;
         }
         swap_form_mode(
@@ -4679,7 +4840,7 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        if form.slippage_bps == bps {
+        if form.slippage_bps == bps || form.speed_up.is_some() {
             return;
         }
         form.slippage_bps = bps;
@@ -4936,7 +5097,7 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        if form.valid_for == valid_for || form.network.is_some() {
+        if form.valid_for == valid_for || form.network.is_some() || form.speed_up.is_some() {
             return;
         }
         form.valid_for = valid_for;
@@ -4954,7 +5115,7 @@ impl PrivateSwapsView {
     }
 
     fn use_amount(&mut self, amount: U256, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(form) = self.form.as_ref() else {
+        let Some(form) = self.form.as_ref().filter(|form| form.speed_up.is_none()) else {
             return;
         };
         let value = format_unshield_amount_input(
@@ -5525,7 +5686,7 @@ impl PrivateSwapsView {
         };
         let fees = approval.fees(self.origin_chain_id);
         let summary = self
-            .swap_summary(&review, Some(&fees), None, None, cx)
+            .swap_summary(&review, Some(&fees), None, None, None, cx)
             .requiring_explicit_review();
         self.request_authorization(SwapAction::Setup(Box::new(approval)), summary, window, cx);
     }
@@ -5806,6 +5967,7 @@ impl PrivateSwapsView {
                 reuse_account: true,
                 swap_use,
                 started_at: super::now_unix(),
+                speeds_up: false,
             });
         let tracking = self.tracking.entry(operation).or_default();
         tracking.amount = Some(bounds.spend_amount());
@@ -6361,9 +6523,15 @@ impl PrivateSwapsView {
         // execution preparation refreshes the account before proving and signing.
         let executor = match (self.form_mode(form), form.operation) {
             (FormMode::Setup { resume: true }, Some(operation)) => QuoteExecutor::Setup(operation),
-            (FormMode::Order, Some(operation)) => QuoteExecutor::Order {
-                operation,
-                reuse: form.reuse_account,
+            (FormMode::Order, Some(operation)) => match &form.speed_up {
+                Some(open) => QuoteExecutor::SpeedUp {
+                    operation,
+                    order: open.uid,
+                },
+                None => QuoteExecutor::Order {
+                    operation,
+                    reuse: form.reuse_account,
+                },
             },
             _ => QuoteExecutor::Preview,
         };
@@ -6832,14 +7000,27 @@ impl PrivateSwapsView {
             // The review opens only once `review_problem` has this accepted.
             continuing_minimum: review.continuing_minimum(),
             full_review: true,
-            swap_use: form.reuse_use.filter(|_| form.reuse_account),
+            // A speed-up belongs to its open order's swap use, which its plan names.
+            swap_use: review
+                .plan()
+                .speed_up()
+                .map(|speed_up| speed_up.swap_use)
+                .or_else(|| form.reuse_use.filter(|_| form.reuse_account)),
             // A reused account's order to an existing destination account claims both first.
             pair_destination: form.destination_choice().filter(|_| form.reuse_account),
+            speed_up: form.speed_up.as_ref().map(|open| open.uid),
         };
         // A review that names a change marks the amounts that differ from the saved approval.
         let approved = change.and_then(|_| self.approved_bounds(operation, review));
         let summary = self
-            .swap_summary(&approval.review, None, change, approved, cx)
+            .swap_summary(
+                &approval.review,
+                None,
+                change,
+                approved,
+                form.speed_up.as_ref(),
+                cx,
+            )
             .requiring_explicit_review();
         // The review about to open names the pending change.
         if self
@@ -6908,13 +7089,16 @@ impl PrivateSwapsView {
     /// The single review of a swap. With `setup`, the fees of a new swap's setup, which the
     /// review approves with its order, placed once the setup is confirmed; without, an order
     /// for a stealth account that is set up. With `approved`, the amounts that differ from
-    /// those bounds show their difference.
+    /// those bounds show their difference. With `speed_up`, the open order the reviewed one
+    /// speeds up, the review names both orders' signed minimums and that the open one stays
+    /// live.
     fn swap_summary(
         &self,
         review: &SwapReview,
         setup: Option<&[SetupFee]>,
         change: Option<SwapReviewChange>,
         approved: Option<&SwapApprovedBounds>,
+        speed_up: Option<&SpeedUpOrder>,
         cx: &App,
     ) -> SpendAuthorizationSummary {
         let plan = review.plan();
@@ -7031,20 +7215,39 @@ impl PrivateSwapsView {
         if let Some(delivery) = bridge {
             costs.push(self.bridge_row(delivery, buy, Some(review), surplus.is_some(), cx));
         }
+        // What each order asks for on the swap's own network, where solvers fill it. A Bridge
+        // swap's Receive card has the destination minimum, a term of its own.
+        if let Some(open) = speed_up
+            && let Ok(signed) = review.buy_amount_for(review.suggested_private_minimum())
+        {
+            let amount = |amount: U256| {
+                let amount = self.token_amount(buy, amount, cx);
+                if bridge.is_some() {
+                    format!("{amount} on {chain}")
+                } else {
+                    amount
+                }
+            };
+            rows.push(SpendAuthorizationSummaryRow::new(
+                "Open order's signed minimum",
+                amount(open.bounds.buy_amount),
+            ));
+            rows.push(SpendAuthorizationSummaryRow::new(
+                "New signed minimum",
+                amount(signed),
+            ));
+        }
         if let Some(delivery) = private {
             rows.push(self.shield_failure_row(delivery, buy, cx));
         }
         // An earlier order's lower minimum, on the destination network like the Receive card's.
-        let continuing = self.continuing_delivery(review, cx);
+        let continuing = self.continuing_delivery(review, speed_up.is_some(), cx);
         if let Some(continuing) = &continuing {
             rows.push(
                 SpendAuthorizationSummaryRow::new("Earlier approval", continuing.lower_there())
                     .with_hint(SpendAuthorizationHint::new(
                         "Earlier approval",
-                        [
-                            "An earlier order of this swap approved this minimum, and its bridge deposit can still run if this order trades. Then this is what the swap delivers."
-                                .to_owned(),
-                        ],
+                        [continuing.hint().to_owned()],
                     )),
             );
         }
@@ -7069,8 +7272,10 @@ impl PrivateSwapsView {
             ));
         }
         let mut details = Vec::new();
-        // A Bridge order signs its deposit, which the Deposit row shows.
+        // A Bridge order signs its deposit, which the Deposit row shows, and a speed-up's
+        // signed minimum is a row of its own.
         if bridge.is_none()
+            && speed_up.is_none()
             && let Ok(signed) = review.buy_amount_for(review.suggested_private_minimum())
         {
             let signed = self.token_amount(buy, signed, cx);
@@ -7174,9 +7379,15 @@ impl PrivateSwapsView {
                 "Set up stealth accounts and swap",
                 "Create stealth accounts",
             ),
+            None if speed_up.is_some() => ("Speed up swap", "Speed up"),
             None => ("Private swap", "Swap"),
         };
-        let summary = SpendAuthorizationSummary::new(title, "", rows)
+        let note = if speed_up.is_some() {
+            SPEED_UP_STAYS_LIVE
+        } else {
+            ""
+        };
+        let summary = SpendAuthorizationSummary::new(title, note, rows)
             .with_cards(
                 self.sell_card(sell, plan.amount(), bridge, cx).with_amount_change(
                     approved.map(SwapApprovedBounds::spend_amount),
@@ -7930,6 +8141,7 @@ impl PrivateSwapsView {
                         // The use whose saved approval this step confirms.
                         swap_use: Some(swap_use),
                         pair_destination: None,
+                        speed_up: None,
                     };
                     let summary = match self.place_summary(&approval, cx) {
                         Ok(summary) => summary,
@@ -8089,6 +8301,21 @@ impl PrivateSwapsView {
         if self.busy() || !self.session_is_current(cx) {
             return;
         }
+        // A speed-up is signed only from its own explicit review, and only for the open order
+        // that review named, which the plan binds through signing.
+        let speed_up = approval.review.plan().speed_up();
+        if approval.speeds_up()
+            && (!approval.full_review
+                || speed_up.map(|speed_up| speed_up.order) != approval.speed_up)
+        {
+            self.fail(
+                approval.operation,
+                "This speed-up wasn't reviewed for the swap's open order. Nothing was signed."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let (Some(owner), Some(session)) = (
             self.private_owner().cloned(),
             self.private_session().cloned(),
@@ -8185,6 +8412,7 @@ impl PrivateSwapsView {
             reuse_account: plan.swap_executor().is_reused(),
             swap_use,
             started_at: super::now_unix(),
+            speeds_up: speed_up.is_some(),
         };
         self.tracking.entry(operation).or_default().pending_order = Some(pending);
         self.reapproval = None;
@@ -8232,10 +8460,97 @@ impl PrivateSwapsView {
                 }))
                 .await
             },
-            move |this, outcome, window, cx| this.finish_order(operation, outcome, window, cx),
+            move |this, outcome, window, cx| {
+                if speed_up.is_some() {
+                    this.finish_speed_up(operation, outcome, window, cx);
+                } else {
+                    this.finish_order(operation, outcome, window, cx);
+                }
+            },
             window,
             cx,
         );
+    }
+
+    /// Continue after a speed-up's order job. A placed order shows in the swap's detail, as any
+    /// order does. Changed terms go back to the speed-up's own form with the change named, and
+    /// never to a retry or a new swap: the open order is still live, and only the owner's rule
+    /// says whether it can still be sped up.
+    fn finish_speed_up(
+        &mut self,
+        operation: ExecutorOperationId,
+        outcome: SwapOrderOutcome,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !matches!(outcome, SwapOrderOutcome::Submitted { .. }) {
+            // No order was placed, so the open one is the swap's order again.
+            self.tracking.entry(operation).or_default().pending_order = None;
+        }
+        let change = match outcome {
+            SwapOrderOutcome::Submitted { .. } => {
+                self.finish_order(operation, outcome, window, cx);
+                return;
+            }
+            SwapOrderOutcome::ReviewRequired(change) => change,
+            SwapOrderOutcome::Replan { byte_budget, .. } => {
+                self.tracking.entry(operation).or_default().byte_budget = Some(byte_budget);
+                self.fail(
+                    operation,
+                    "The orderbook rejected the new order's size, so this order can't be sped up."
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        self.track_delivery_shortfall(operation, outcome);
+        let review_again = format!(
+            "Review the speed-up again: {}.",
+            review_change_label(change)
+        );
+        // Another dialog keeps the screen. The change waits for the speed-up to be opened again.
+        if window.has_active_dialog(cx) && !self.swap_dialog_shows(operation, window, cx) {
+            self.reapproval = Some((operation, change));
+            self.fail(operation, review_again);
+            cx.notify();
+            return;
+        }
+        // Nothing was signed. Quote the current terms, then review them again.
+        self.reapproval = Some((operation, change));
+        if !self.open_speed_up_form(operation, window, cx) {
+            self.reapproval = None;
+            self.fail(
+                operation,
+                "This order can no longer be sped up. Nothing was signed.".into(),
+            );
+        }
+        cx.notify();
+    }
+
+    /// A signing quote below the approved destination minimum shows what the preview's
+    /// delivery allowance lacks. Record it before the swap's next review is quoted.
+    fn track_delivery_shortfall(
+        &mut self,
+        operation: ExecutorOperationId,
+        outcome: SwapOrderOutcome,
+    ) {
+        if let SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
+            approved,
+            current,
+        }) = outcome
+        {
+            let shortfall = &mut self
+                .tracking
+                .entry(operation)
+                .or_default()
+                .delivery_shortfall;
+            *shortfall = Some(
+                shortfall
+                    .unwrap_or_default()
+                    .saturating_add(delivery_shortfall_allowance(approved, current)),
+            );
+        }
     }
 
     /// The accounts the swap use `swap_use` of `record` holds, as an approval binds them: each
@@ -8289,24 +8604,7 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         }
-        // A signing quote below the approved destination minimum shows what the preview's
-        // delivery allowance lacks. Record it before the swap's next review is quoted.
-        if let SwapOrderOutcome::ReviewRequired(SwapReviewChange::DestinationMinimum {
-            approved,
-            current,
-        }) = outcome
-        {
-            let shortfall = &mut self
-                .tracking
-                .entry(operation)
-                .or_default()
-                .delivery_shortfall;
-            *shortfall = Some(
-                shortfall
-                    .unwrap_or_default()
-                    .saturating_add(delivery_shortfall_allowance(approved, current)),
-            );
-        }
+        self.track_delivery_shortfall(operation, outcome);
         if window.has_active_dialog(cx)
             && !shown
             && self
@@ -8433,9 +8731,16 @@ impl PrivateSwapsView {
 
     // Rendering
 
-    /// "Retry swap" once an attempt of this swap ended, otherwise "Swap".
+    /// "Speed up swap" for a second order beside an open one, "Retry swap" once an attempt of
+    /// this swap ended, otherwise "Swap".
     pub(super) fn form_title(&self) -> &'static str {
-        if self.form.as_ref().is_some_and(|form| self.is_retry(form)) {
+        if self
+            .form
+            .as_ref()
+            .is_some_and(|form| form.speed_up.is_some())
+        {
+            "Speed up swap"
+        } else if self.form.as_ref().is_some_and(|form| self.is_retry(form)) {
             "Retry swap"
         } else {
             "Swap"
@@ -8865,7 +9170,12 @@ impl PrivateSwapsView {
 
     /// The lower delivery an earlier order of `review`'s swap can still make, beside the
     /// reviewed one. `None` when no earlier approval can deliver less.
-    fn continuing_delivery(&self, review: &SwapReview, cx: &App) -> Option<ContinuingDelivery> {
+    fn continuing_delivery(
+        &self,
+        review: &SwapReview,
+        speeds_up: bool,
+        cx: &App,
+    ) -> Option<ContinuingDelivery> {
         let lower = review.continuing_minimum()?;
         let SwapDelivery::Bridge(delivery) = review.plan().delivery() else {
             return None;
@@ -8882,6 +9192,7 @@ impl PrivateSwapsView {
             ),
             network: network_name(network),
             surplus: delivery.surplus,
+            speeds_up,
         })
     }
 
@@ -9051,6 +9362,8 @@ impl PrivateSwapsView {
         let quoting = matches!(mode, FormMode::Setup { .. } | FormMode::Order);
         let editable = quoting && !self.busy();
         let locked = form.operation.is_some() && !form.reuse_account;
+        // A speed-up keeps its open order's terms. Only its Minimum controls take input.
+        let terms_editable = editable && form.speed_up.is_none();
         let sell_assets = &form.assets.sell_assets;
         let review = match &form.quote {
             QuoteState::Ready(review) if quoting => Some(review),
@@ -9074,7 +9387,7 @@ impl PrivateSwapsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(self.render_sell_panel(form, sell_assets, editable, locked, cx))
+                    .child(self.render_sell_panel(form, sell_assets, terms_editable, locked, cx))
                     .child(
                         div()
                             .relative()
@@ -9084,14 +9397,14 @@ impl PrivateSwapsView {
             )
             .children(self.render_price_acknowledgement(form, cx))
             .children(self.render_continuing_acknowledgement(form, editable, cx))
-            .child(self.render_delivery(form, editable, cx))
-            .child(self.render_account_row(form, mode, editable, cx))
+            .child(self.render_delivery(form, terms_editable, cx))
+            .child(self.render_account_row(form, mode, terms_editable, cx))
             .children(review.map(|review| {
                 self.render_details(
                     form,
                     review,
                     matches!(mode, FormMode::Setup { .. }),
-                    editable,
+                    terms_editable,
                     cx,
                 )
             }))
@@ -10172,8 +10485,74 @@ impl PrivateSwapsView {
             }))
             .children(minimum_field)
             .children(refresh)
+            .children(self.render_speed_up_minimums(form, review, shown, cx))
             .children(warning)
             .children(self.render_source_return(review, cx))
+    }
+
+    /// Under a speed-up's Minimum controls: the open order's signed minimum beside the one the
+    /// shown share signs, and, while that isn't lower, that it wouldn't speed the swap up.
+    /// `None` for any other form, and for a quote that fell back from the form's share.
+    fn render_speed_up_minimums(
+        &self,
+        form: &SwapForm,
+        review: &Arc<SwapReview>,
+        shown: &SwapReview,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let open = form.speed_up.as_ref()?;
+        if form.gas_share_fallback(review) {
+            return None;
+        }
+        let buy = shown.plan().buy_token();
+        let signed = shown
+            .buy_amount_for(shown.suggested_private_minimum())
+            .ok()?;
+        let lower = swap_speed_up_relaxes(&open.bounds, signed);
+        // A Bridge swap's orders buy on the swap's own network, which the amounts name, as its
+        // Buy panel shows the destination minimum.
+        let amount = |amount: U256| {
+            let amount = self.token_amount(buy, amount, cx);
+            if form.network.is_some() {
+                format!("{amount} on {}", self.chain_label())
+            } else {
+                amount
+            }
+        };
+        Some(
+            div()
+                .debug_selector(|| "swap-speed-up-minimums".into())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(detail_row(
+                    "Open order's signed minimum",
+                    app_text(amount(open.bounds.buy_amount)),
+                    false,
+                    None,
+                ))
+                .child(detail_row(
+                    "New signed minimum",
+                    app_text(amount(signed)),
+                    false,
+                    None,
+                ))
+                .when(!lower, |rows| {
+                    rows.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .debug_selector(|| "swap-speed-up-not-lower".into())
+                            .child(
+                                Alert::warning("swap-speed-up-not-lower", SPEED_UP_NOT_LOWER)
+                                    .small()
+                                    .min_w_0(),
+                            ),
+                    )
+                }),
+        )
     }
 
     /// The Minimum field under the gas strip's row, in the token named by `symbol`, with the
@@ -10680,7 +11059,7 @@ impl PrivateSwapsView {
         let QuoteState::Ready(review) = &form.quote else {
             return None;
         };
-        let continuing = self.continuing_delivery(review, cx)?;
+        let continuing = self.continuing_delivery(review, form.speed_up.is_some(), cx)?;
         let warning_color = cx.theme().warning;
         Some(
             div()
@@ -13649,6 +14028,9 @@ const fn review_change_label(change: SwapReviewChange) -> &'static str {
         SwapReviewChange::ApprovalPlan => "the token approval the swap needs changed",
         SwapReviewChange::ContinuingApproval { .. } => {
             "an earlier order of this swap can still deliver less on the destination network"
+        }
+        SwapReviewChange::SpeedUpBuyAmount { .. } => {
+            "this doesn't lower the open order's minimum, so it wouldn't speed the swap up"
         }
     }
 }

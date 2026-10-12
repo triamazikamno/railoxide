@@ -1066,6 +1066,7 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
                         Vec::new(),
                     )),
                     bridge: None,
+                    speed_up: None,
                 },
             )
             .unwrap();
@@ -1909,6 +1910,38 @@ fn placed_swap_with(
     broadcaster_core::contracts::cow::OrderUid,
     wallet_ops::vault::ExecutorNonceObservation,
 ) {
+    let order = PlacedOrder {
+        uid_hash: 0x11,
+        hook_hash: 7,
+        valid_to: 20,
+        speeds_up: None,
+    };
+    placed_order(executors, operation, delivery, order, edit)
+}
+
+/// One order of [`placed_order`]: the byte of its ID's hash, the byte of its pre-hook's hash,
+/// which its post-hook's follows, its expiry, and the open order it speeds up.
+#[derive(Clone, Copy)]
+struct PlacedOrder {
+    uid_hash: u8,
+    hook_hash: u8,
+    valid_to: u32,
+    speeds_up: Option<broadcaster_core::contracts::cow::OrderUid>,
+}
+
+/// [`placed_swap_with`] for the order `placed`. A speed-up is a second order of the account
+/// its open order set up: it shares that order's proof, input and pre-hook nonce, and names
+/// it as the order its pre-hook invalidates.
+fn placed_order(
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    delivery: wallet_ops::vault::SwapDelivery,
+    placed: PlacedOrder,
+    edit: impl FnOnce(&mut wallet_ops::vault::SwapApprovedBounds),
+) -> (
+    broadcaster_core::contracts::cow::OrderUid,
+    wallet_ops::vault::ExecutorNonceObservation,
+) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
     use broadcaster_core::contracts::cow::OrderUid;
@@ -1918,16 +1951,30 @@ fn placed_swap_with(
         IssuedExecutorPayload, NearIntentsOrderTerms, SwapAttempt, SwapDelivery, SwapProof,
         SwapRecipient, SwapTerms,
     };
-    let setup = pending_setup(executors, operation);
-    let setup_hash = setup.issued()[0].hash();
     let observed =
         ExecutorNonceObservation::new(BlockNumHash::new(30, B256::repeat_byte(30)), U256::ONE);
-    executors.record_account_read(operation, observed).unwrap();
+    let setup = if placed.speeds_up.is_some() {
+        executors
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    } else {
+        let setup = pending_setup(executors, operation);
+        executors.record_account_read(operation, observed).unwrap();
+        setup
+    };
+    let setup_hash = setup.issued()[0].hash();
     let input: ExecutorInputIdentity = serde_json::from_value(serde_json::json!({
         "tree": 4, "position": 16198, "commitment": "0x2"
     }))
     .unwrap();
-    let uid = OrderUid::new(B256::repeat_byte(0x11), Address::repeat_byte(3), 20);
+    let uid = OrderUid::new(
+        B256::repeat_byte(placed.uid_hash),
+        Address::repeat_byte(3),
+        placed.valid_to,
+    );
     let hook = |nonce, hash, purpose, inputs| {
         IssuedExecutorPayload::new(
             U256::from(nonce),
@@ -1938,7 +1985,12 @@ fn placed_swap_with(
         )
     };
     let mut bounds = test_approval().bounds;
-    let post_hook = hook(2_u64, 8, ExecutorPayloadPurpose::SwapPostHook, Vec::new());
+    let post_hook = hook(
+        2_u64,
+        placed.hook_hash + 1,
+        ExecutorPayloadPurpose::SwapPostHook,
+        Vec::new(),
+    );
     // A Private delivery shields the output with a post-hook, and an Across one deposits it.
     let (post_hook, bridge) = match delivery {
         SwapDelivery::Reshield => (Some(post_hook), None),
@@ -1998,10 +2050,16 @@ fn placed_swap_with(
                 submission: None,
                 delivery,
                 bounds,
-                invalidates: None,
-                pre_hook: hook(1_u64, 7, ExecutorPayloadPurpose::SwapPreHook, vec![input]),
+                invalidates: placed.speeds_up,
+                pre_hook: hook(
+                    1_u64,
+                    placed.hook_hash,
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    vec![input],
+                ),
                 post_hook,
                 bridge,
+                speed_up: placed.speeds_up,
             },
         )
         .unwrap();
@@ -2042,6 +2100,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
             reuse_account: true,
             swap_use: second,
             started_at: 1,
+            speeds_up: false,
         };
         // The original swap's unshielded funds wait in the account. A draft that sells
         // another token doesn't change what its recovery starts with.
@@ -2277,6 +2336,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                         Vec::new(),
                     )),
                     bridge: None,
+                    speed_up: None,
                 },
             )
             .unwrap();
@@ -2568,7 +2628,12 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
-                swaps.tracking.entry(operation).or_default().order_hint = None;
+                swaps
+                    .tracking
+                    .entry(operation)
+                    .or_default()
+                    .order_hints
+                    .clear();
                 let record = swaps.record(operation).unwrap();
                 assert_eq!(swaps.stage(record), SwapStage::Order(SwapOrderState::Done));
                 assert!(swaps.detail_is_active(operation, window, cx));
@@ -3145,7 +3210,7 @@ fn external_review_names_the_receiver_and_warns_for_own_public_accounts(cx: &mut
             );
             let (summary, unshield) = swaps.read_with(cx, |swaps, cx| {
                 (
-                    swaps.swap_summary(&review, None, None, None, cx),
+                    swaps.swap_summary(&review, None, None, None, None, cx),
                     swaps.token_amount(
                         STUB_USDC,
                         review.plan().amount() - review.sell_amount(),
@@ -4971,7 +5036,7 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
             // The review names both accounts: a new one on Ethereum, and the reused one on
             // Polygon by its number and address, with its own warning and disclosure.
             swaps.read_with(cx, |swaps, cx| {
-                let summary = swaps.swap_summary(&review, None, None, None, cx);
+                let summary = swaps.swap_summary(&review, None, None, None, None, cx);
                 assert_eq!(
                     row(&summary, "Source · Ethereum").as_deref(),
                     Some("New account")
@@ -5136,7 +5201,7 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
             let review = ready_review(swaps, runtime, cx);
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
-                    let summary = swaps.swap_summary(&review, None, None, None, cx);
+                    let summary = swaps.swap_summary(&review, None, None, None, None, cx);
                     assert_eq!(
                         row(&summary, "Source · Ethereum"),
                         Some(format!("{own} · {account}"))
@@ -5321,6 +5386,7 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
                 reuse_account: true,
                 swap_use,
                 started_at: now_unix(),
+                speeds_up: false,
             };
             let destination = ExecutorOperationId::random().unwrap();
             executors
@@ -6561,7 +6627,7 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                         ))
                     );
                 }
-                let summary = swaps.swap_summary(&review, None, None, None, cx);
+                let summary = swaps.swap_summary(&review, None, None, None, None, cx);
                 assert_eq!(
                     received(&summary),
                     exactly(bridge.destination_minimum),
@@ -6658,6 +6724,7 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                         current: bridge.destination_minimum,
                     }),
                     Some(&saved),
+                    None,
                     cx,
                 );
                 let adverse = |delta: Option<(String, bool)>| delta.map(|(_, adverse)| adverse);
@@ -6680,6 +6747,7 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
                     full_review: false,
                     swap_use: None,
                     pair_destination: None,
+                    speed_up: None,
                 };
                 let place = swaps.place_summary(&approval, cx).unwrap();
                 assert_eq!(received(&place), exactly(approved), "the bound minimum");
@@ -6769,7 +6837,7 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                 let amount =
                     |amount| swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx);
                 let earlier = format!("{} on Polygon", amount(lower));
-                let summary = swaps.swap_summary(&review, None, None, None, cx);
+                let summary = swaps.swap_summary(&review, None, None, None, None, cx);
                 assert!(
                     summary
                         .rows_for_test()
@@ -6790,6 +6858,42 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                         .any(|warning| warning.contains(&earlier) && warning.contains(&own)),
                     "{:?}",
                     summary.warnings_for_test()
+                );
+
+                // As the speed-up of an open order, the same review also names both orders'
+                // signed minimums, on the swap's own network, and its warning covers more than
+                // this order trading.
+                let signed = review
+                    .buy_amount_for(review.suggested_private_minimum())
+                    .unwrap();
+                let mut bounds = test_approval().bounds;
+                bounds.buy_amount = signed + U256::ONE;
+                let open = SpeedUpOrder {
+                    uid: OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), 20),
+                    bounds,
+                };
+                let sped_up = swaps.swap_summary(&review, None, None, None, Some(&open), cx);
+                let rows = sped_up.rows_for_test();
+                assert!(rows.contains(&("Earlier approval".to_owned(), earlier.clone())));
+                for minimum in [open.bounds.buy_amount, signed] {
+                    let shown = format!(
+                        "{} on {}",
+                        swaps.token_amount(review.plan().buy_token(), minimum, cx),
+                        swaps.chain_label()
+                    );
+                    assert!(rows.iter().any(|(_, value)| *value == shown), "{rows:?}");
+                }
+                let lower_delivery = |summary: &SpendAuthorizationSummary| {
+                    summary
+                        .warnings_for_test()
+                        .into_iter()
+                        .find(|warning| warning.contains(&earlier) && warning.contains(&own))
+                        .unwrap()
+                };
+                assert_ne!(
+                    lower_delivery(&sped_up),
+                    lower_delivery(&summary),
+                    "two orders that can trade need more than the retry's warning"
                 );
             });
 
@@ -6841,6 +6945,1134 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                     assert!(!form.continuing_acknowledged);
                 });
             });
+        },
+    );
+}
+
+/// Speed up… sits in the order step as the executor owner's rule answers for the swap's own
+/// records: offered for an open order, disabled while a second order can still fill, offered
+/// again once the earlier order's expiry is recorded, and gone once the account's nonce is past
+/// the pre-hook nonce both orders share. Opening it asks for a quote planned from the open
+/// order's record, keeps that order's terms, and shows the form's own state for a failed quote.
+#[gpui::test]
+fn speed_up_follows_the_owners_rule_for_the_swaps_orders(cx: &mut TestAppContext) {
+    use alloy::eips::BlockNumHash;
+    use wallet_ops::vault::{
+        ExecutorNonceObservation, SwapObservation, SwapOrderObservations, SwapSubmissionStatus,
+    };
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        let now = u32::try_from(now_unix()).unwrap();
+        let place = |uid_hash, hook_hash, valid_to, speeds_up, buy_amount: u64| {
+            let (uid, observed) = placed_order(
+                executors,
+                operation,
+                SwapDelivery::Reshield,
+                PlacedOrder {
+                    uid_hash,
+                    hook_hash,
+                    valid_to,
+                    speeds_up,
+                },
+                |bounds| {
+                    bounds.buy_amount = U256::from(buy_amount);
+                    bounds.private_minimum = U256::from(buy_amount - 1);
+                },
+            );
+            executors
+                .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+                .unwrap();
+            (uid, observed)
+        };
+        // The detail as the records now stand: its Speed up button, and the rule's answer.
+        let detail = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let refusal = swaps.read_with(cx, |swaps, _| {
+                swaps.speed_up_refusal(swaps.record(operation).unwrap())
+            });
+            (cx.debug_bounds("swap-progress-speed-up"), refusal)
+        };
+
+        let (first, observed) = place(0x11, 7, now + 600, None, 99);
+        // The quote the form asks for goes nowhere.
+        let unreachable = orderbook_at("http://127.0.0.1:1/mainnet".parse().unwrap(), runtime);
+        let (button, refusal) = detail(cx);
+        assert_eq!(refusal, None, "one open order can be sped up");
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, _| {
+                swaps.tracking.entry(operation).or_default().orderbook = Some(unreachable);
+            });
+        });
+        let button = button.expect("an open order offers Speed up");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let form = swaps.form.as_ref().expect("Speed up opens the swap form");
+                assert_eq!(form.speed_up.as_ref().map(|open| open.uid), Some(first));
+                assert_eq!(swaps.form_mode(form), FormMode::Order);
+                assert!(
+                    matches!(form.quote, QuoteState::Loading),
+                    "a speed-up opens on a fresh quote"
+                );
+                let terms = |swaps: &PrivateSwapsView, cx: &App| {
+                    let form = swaps.form.as_ref().unwrap();
+                    (
+                        form.slippage_bps,
+                        form.valid_for,
+                        form.receive_to,
+                        form.amount_input.read(cx).value().to_string(),
+                    )
+                };
+                let fixed = terms(swaps, cx);
+                swaps.set_slippage(fixed.0 + 50, window, cx);
+                swaps.set_valid_for(fixed.1 + Duration::from_mins(30), window, cx);
+                swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
+                swaps.use_amount(U256::from(7), window, cx);
+                assert_eq!(
+                    terms(swaps, cx),
+                    fixed,
+                    "a speed-up keeps its open order's terms"
+                );
+            });
+        });
+        drive_until(cx, runtime, |cx| {
+            swaps.read_with(cx, |swaps, _| {
+                !matches!(
+                    swaps.form.as_ref().map(|form| &form.quote),
+                    Some(QuoteState::Loading)
+                )
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        swaps.read_with(cx, |swaps, _| {
+            assert!(
+                matches!(swaps.form.as_ref().unwrap().quote, QuoteState::Failed(_)),
+                "this wallet holds none of the order's notes"
+            );
+        });
+        assert!(cx.debug_bounds("swap-price-error").is_some());
+        assert!(cx.debug_bounds("swap-price-retry").is_some());
+
+        // A second order of the same use, at the same pre-hook nonce: two can still fill.
+        let (second, _) = place(0x12, 0x21, now + 900, Some(first), 98);
+        let (button, refusal) = detail(cx);
+        assert_eq!(refusal, Some(SwapSpeedUpRefusal::TwoOrdersFillable));
+        let button = button.expect("Speed up stays in view with its reason");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        swaps.read_with(cx, |swaps, _| {
+            assert!(swaps.form.is_none(), "a disabled Speed up opens nothing");
+        });
+
+        // The earlier order's recorded expiry takes it out of the fillable set.
+        let seen = SwapObservation {
+            block: observed.block(),
+            transaction_hash: None,
+        };
+        executors
+            .record_swap_observations(
+                operation,
+                first,
+                SwapOrderObservations {
+                    expired: Some(seen),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (button, refusal) = detail(cx);
+        assert_eq!(refusal, None, "the remaining open order can be sped up");
+        assert!(button.is_some());
+        swaps.read_with(cx, |swaps, _| {
+            let latest = swaps.record(operation).unwrap().swap().unwrap().orders();
+            assert_eq!(latest.last().map(SwapOrderRecord::uid), Some(second));
+        });
+
+        // The shared nonce is used, though no order's pre-hook is recorded as executed.
+        executors
+            .record_account_read(
+                operation,
+                ExecutorNonceObservation::new(
+                    BlockNumHash::new(31, B256::repeat_byte(31)),
+                    U256::from(2),
+                ),
+            )
+            .unwrap();
+        let (button, refusal) = detail(cx);
+        assert_eq!(refusal, Some(SwapSpeedUpRefusal::Unavailable));
+        assert!(
+            button.is_none(),
+            "an order that can't be sped up offers none"
+        );
+    });
+}
+
+/// Inside the profile's validity window, an earlier order past its own expiry still counts as
+/// fillable, so its local expiry alone doesn't offer Speed up again.
+#[gpui::test]
+fn an_earlier_order_inside_the_validity_window_holds_speed_up_back(cx: &mut TestAppContext) {
+    earlier_order_expiry(cx, false);
+}
+
+/// Past the profile's validity window, the earlier order no longer counts, and the open order
+/// can be sped up.
+#[gpui::test]
+fn an_earlier_order_past_the_validity_window_frees_speed_up(cx: &mut TestAppContext) {
+    earlier_order_expiry(cx, true);
+}
+
+/// An open order that sped up an earlier one whose expiry is a minute inside the profile's
+/// validity window, or with `past_window` a minute beyond it.
+fn earlier_order_expiry(cx: &mut TestAppContext, past_window: bool) {
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let window_secs = swaps.read_with(cx, |swaps, cx| {
+            swaps.swap_profile(cx).unwrap().valid_to_window().as_secs()
+        });
+        let now = now_unix();
+        let earlier = if past_window {
+            now - window_secs - 60
+        } else {
+            now - window_secs + 60
+        };
+        let (first, _) = placed_order(
+            executors,
+            operation,
+            SwapDelivery::Reshield,
+            PlacedOrder {
+                uid_hash: 0x11,
+                hook_hash: 7,
+                valid_to: u32::try_from(earlier).unwrap(),
+                speeds_up: None,
+            },
+            |_| {},
+        );
+        let (second, _) = placed_order(
+            executors,
+            operation,
+            SwapDelivery::Reshield,
+            PlacedOrder {
+                uid_hash: 0x12,
+                hook_hash: 0x21,
+                valid_to: u32::try_from(now + 600).unwrap(),
+                speeds_up: Some(first),
+            },
+            |bounds| {
+                bounds.buy_amount = U256::from(98);
+                bounds.private_minimum = U256::from(97);
+            },
+        );
+        executors
+            .record_swap_submission(
+                operation,
+                second,
+                wallet_ops::vault::SwapSubmissionStatus::Accepted,
+            )
+            .unwrap();
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let refusal = swaps.read_with(cx, |swaps, _| {
+            swaps.speed_up_refusal(swaps.record(operation).unwrap())
+        });
+        assert_eq!(
+            refusal,
+            (!past_window).then_some(SwapSpeedUpRefusal::TwoOrdersFillable)
+        );
+        assert!(
+            cx.debug_bounds("swap-progress-speed-up").is_some(),
+            "offered, or disabled with its reason"
+        );
+    });
+}
+
+/// Speed up… shows, enabled or disabled, only once the latest order has been signed for 30
+/// seconds, and it sits in the order step under the order's ID. An order signed a minute ago
+/// offers it there. A speed-up signed just now leaves the detail without the action, and at 30
+/// seconds the action is back, disabled while both orders can fill.
+#[gpui::test]
+fn speed_up_waits_for_the_latest_order_to_be_open_a_while(cx: &mut TestAppContext) {
+    use wallet_ops::vault::SwapSubmissionStatus;
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let now = u32::try_from(now_unix()).unwrap();
+        // Each order is valid for ten minutes, so it was signed that long before its expiry.
+        let place = |uid_hash, hook_hash, valid_to, speeds_up, buy_amount: u64| {
+            let (uid, _) = placed_order(
+                executors,
+                operation,
+                SwapDelivery::Reshield,
+                PlacedOrder {
+                    uid_hash,
+                    hook_hash,
+                    valid_to,
+                    speeds_up,
+                },
+                |bounds| {
+                    bounds.buy_amount = U256::from(buy_amount);
+                    bounds.private_minimum = U256::from(buy_amount - 1);
+                    bounds.valid_for_secs = Some(600);
+                },
+            );
+            executors
+                .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+                .unwrap();
+            uid
+        };
+        let detail = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.debug_bounds("swap-progress-speed-up")
+        };
+
+        let first = place(0x11, 7, now + 540, None, 99);
+        let button = detail(cx).expect("an order open for a minute offers Speed up");
+        let step = cx
+            .debug_bounds(format!("submission-step-swap-step-{}-1", operation.opaque_id()).leak())
+            .expect("the order step");
+        let order_id = cx.debug_bounds("swap-step-order").unwrap();
+        assert!(
+            step.contains(&button.origin) && step.contains(&button.center()),
+            "Speed up is in the order step, not the footer: {button:?} in {step:?}"
+        );
+        assert!(step.contains(&order_id.origin) && order_id.bottom() <= button.top());
+
+        place(0x12, 0x21, now + 600, Some(first), 98);
+        assert!(
+            detail(cx).is_none(),
+            "a just-placed order shows no Speed up, enabled or disabled"
+        );
+        swaps.read_with(cx, |swaps, _| {
+            let record = swaps.record(operation).unwrap();
+            assert_eq!(
+                swaps.speed_up_refusal(record),
+                Some(SwapSpeedUpRefusal::TwoOrdersFillable)
+            );
+            let latest = record.swap().unwrap().orders().last().unwrap();
+            let open = model::swap_actions(SwapStage::Order(SwapOrderState::Open), false);
+            for (elapsed, shown) in [(29, false), (30, true)] {
+                let shows = model::speed_up_shown(latest, u64::from(now) + elapsed);
+                assert_eq!(shows, shown, "{elapsed} seconds after signing");
+                assert_eq!(
+                    open.with_speed_up(None, shows).speed_up,
+                    shown.then_some(Ok(())),
+                    "an eligible order, {elapsed} seconds after signing"
+                );
+                let held = open
+                    .with_speed_up(Some(SwapSpeedUpRefusal::TwoOrdersFillable), shows)
+                    .speed_up;
+                assert_eq!(
+                    (held.is_some(), matches!(held, Some(Err(_)))),
+                    (shown, shown),
+                    "two fillable orders, {elapsed} seconds after signing"
+                );
+            }
+        });
+    });
+}
+
+/// A speed-up the orderbook rejected doesn't lead the swap while the accepted original can
+/// still fill. The swap stays open and cancellable on the original, both orders stay tracked
+/// with the later expiry, and the rejection leads only once the original is recorded dead.
+#[gpui::test]
+fn a_rejected_speed_up_leaves_the_swap_on_its_open_original(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{
+        SwapObservation, SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
+        SwapSubmissionStatus,
+    };
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let now = u32::try_from(now_unix()).unwrap();
+        let place = |uid_hash, hook_hash, valid_to, speeds_up, minimum: u64| {
+            placed_order(
+                executors,
+                operation,
+                SwapDelivery::Reshield,
+                PlacedOrder {
+                    uid_hash,
+                    hook_hash,
+                    valid_to,
+                    speeds_up,
+                },
+                |bounds| {
+                    bounds.buy_amount = U256::from(minimum + 1);
+                    bounds.private_minimum = U256::from(minimum);
+                },
+            )
+        };
+        let (original, observed) = place(0x11, 7, now + 600, None, 98);
+        executors
+            .record_swap_submission(operation, original, SwapSubmissionStatus::Accepted)
+            .unwrap();
+        let (speed_up, _) = place(0x12, 0x21, now + 900, Some(original), 97);
+        let stage = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, _| {
+                    swaps.reload_records();
+                    swaps.stage(swaps.record(operation).unwrap())
+                })
+            })
+        };
+        // A speed-up whose submission is unconfirmed leads, as the latest order does.
+        assert_eq!(stage(cx), SwapStage::SubmissionPending);
+
+        executors
+            .record_swap_submission(operation, speed_up, SwapSubmissionStatus::Rejected)
+            .unwrap();
+        let open = stage(cx);
+        assert_eq!(open, SwapStage::Order(SwapOrderState::Open));
+        assert_eq!(model::swap_actions(open, false).cancel, Some(Ok(())));
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(
+                    model::tracked_orders(record)
+                        .into_iter()
+                        .map(wallet_ops::vault::SwapOrderRecord::uid)
+                        .collect::<Vec<_>>(),
+                    [original, speed_up]
+                );
+                assert_eq!(
+                    swaps
+                        .next_order_hints(cx)
+                        .map_or_else(Vec::new, |(_, _, requests)| {
+                            requests
+                                .iter()
+                                .map(|request| request.uid)
+                                .collect::<Vec<_>>()
+                        }),
+                    [original, speed_up],
+                    "the rejected order is still asked about"
+                );
+                let latest = record.swap().unwrap().orders().last().unwrap();
+                let attempts = model::SwapAttempts::ending_at(record, latest);
+                assert_eq!(
+                    swaps
+                        .attempt_rows(record, &attempts, cx)
+                        .iter()
+                        .map(|row| (row.label.as_str(), row.order))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Order 1 · Open", original),
+                        ("Order 2 · Rejected", speed_up)
+                    ]
+                );
+                assert_eq!(
+                    swaps.labels(record, cx).expires,
+                    Some(local_time_label(u64::from(now + 900))),
+                    "the rejected order can still fill until its own expiry"
+                );
+            });
+        });
+
+        // With the original dead, no accepted order is left and the rejection leads.
+        executors
+            .record_swap_observations(
+                operation,
+                original,
+                SwapOrderObservations {
+                    pre_hook_dead: Some(SwapPreHookDeath {
+                        cause: SwapPreHookDeathCause::Expired,
+                        observation: SwapObservation {
+                            block: observed.block(),
+                            transaction_hash: None,
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(stage(cx), SwapStage::SubmissionRejected);
+    });
+}
+
+/// The original order trades and is shielded after its speed-up was signed. Routine polling
+/// asks about both orders and reads the block a report locates, and the swap stays one entry
+/// that follows the original order. The speed-up reads as not filled, and no later report on
+/// it moves the original's settlement or the outcome.
+#[gpui::test]
+fn an_original_order_that_trades_after_its_speed_up_decides_the_swap(cx: &mut TestAppContext) {
+    competing_orders_follow_the_one_that_traded(cx, true);
+}
+
+/// The same with the speed-up trading and the original order left unfilled.
+#[gpui::test]
+fn a_speed_up_that_trades_decides_the_swap(cx: &mut TestAppContext) {
+    competing_orders_follow_the_one_that_traded(cx, false);
+}
+
+fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original_wins: bool) {
+    use wallet_ops::vault::{
+        SwapObservation, SwapOrderObservations, SwapSubmissionStatus, SwapTradeAmounts,
+    };
+    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        let now = u32::try_from(now_unix()).unwrap();
+        let place = |uid_hash, hook_hash, valid_to, speeds_up, minimum: u64| {
+            let (uid, observed) = placed_order(
+                executors,
+                operation,
+                SwapDelivery::Reshield,
+                PlacedOrder {
+                    uid_hash,
+                    hook_hash,
+                    valid_to,
+                    speeds_up,
+                },
+                |bounds| {
+                    bounds.buy_amount = U256::from(minimum + 1);
+                    bounds.private_minimum = U256::from(minimum);
+                },
+            );
+            executors
+                .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+                .unwrap();
+            (uid, observed)
+        };
+        let (original, observed) = place(0x11, 7, now + 600, None, 98);
+        let (speed_up, _) = place(0x12, 0x21, now + 900, Some(original), 97);
+        let (winner, loser, minimum) = if original_wins {
+            (original, speed_up, 98_u64)
+        } else {
+            (speed_up, original, 97)
+        };
+        let report = |uid, status, block: Option<u64>| HintResult {
+            operation,
+            uid,
+            client: None,
+            fee: false,
+            report: Some((CowOrderStatusReport { status }, block)),
+            bridges: Vec::new(),
+        };
+        // The settlement each routine page would read, and the orders the orderbook is asked
+        // about.
+        let located = |swaps: &PrivateSwapsView, cx: &App| {
+            swaps
+                .next_observations(cx)
+                .map_or_else(Vec::new, |(_, _, pages)| {
+                    pages
+                        .iter()
+                        .map(|page| (page.settlement, page.range.clone()))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let asked = |swaps: &PrivateSwapsView, cx: &App| {
+            swaps
+                .next_order_hints(cx)
+                .map_or_else(Vec::new, |(_, _, requests)| {
+                    requests
+                        .iter()
+                        .map(|request| (request.uid, request.hint))
+                        .collect::<Vec<_>>()
+                })
+        };
+        // The Orders section's rows, as each order's label and ID.
+        let attempt_rows = |swaps: &PrivateSwapsView, cx: &App| {
+            let record = swaps.record(operation).unwrap();
+            let latest = record.swap().unwrap().orders().last().unwrap();
+            let attempts = model::SwapAttempts::ending_at(record, latest);
+            swaps
+                .attempt_rows(record, &attempts, cx)
+                .into_iter()
+                .map(|row| (row.label, row.order))
+                .collect::<Vec<_>>()
+        };
+        let confirmed = cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
+                else {
+                    panic!("ready fixture")
+                };
+                sync_tip.head_block = Some(400);
+            });
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let confirmed = swaps.confirmed_block(cx).unwrap();
+                let block_only = Some(confirmed..confirmed + 1);
+                // Both orders can fill: one open swap that keeps both IDs, with the lower
+                // minimum and the later expiry.
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(swaps.stage(record), SwapStage::Order(SwapOrderState::Open));
+                assert_eq!(model::record_swaps(record).len(), 1);
+                assert_eq!(swaps.order_rows_for_test(cx).len(), 1);
+                assert_eq!(swaps.shown_swaps().count(), 1);
+                assert_eq!(
+                    attempt_rows(swaps, cx)
+                        .into_iter()
+                        .map(|(_, uid)| uid)
+                        .collect::<Vec<_>>(),
+                    [original, speed_up]
+                );
+                let labels = swaps.labels(record, cx);
+                assert_eq!(
+                    labels.minimum,
+                    Some(swaps.token_amount(Address::repeat_byte(2), U256::from(97), cx))
+                );
+                assert_eq!(labels.expires, Some(local_time_label(u64::from(now + 900))));
+                assert_eq!(
+                    model::swap_valid_to(record),
+                    Some(u64::from(now + 900)),
+                    "the swap can fill until its last order expires"
+                );
+                // Each is asked about, and nothing is read before a report locates a trade.
+                assert_eq!(
+                    asked(swaps, cx),
+                    [(original, true), (speed_up, true)],
+                    "both competing orders are followed"
+                );
+                assert!(located(swaps, cx).is_empty());
+                swaps.apply_order_hints(
+                    vec![
+                        report(winner, CowOrderStatusHint::Fulfilled, Some(confirmed)),
+                        report(loser, CowOrderStatusHint::Open, None),
+                    ],
+                    cx,
+                );
+                assert_eq!(
+                    located(swaps, cx),
+                    [(Some((winner, confirmed)), block_only.clone())],
+                    "the reported trade is read from its block alone"
+                );
+                // A report on the other order is kept beside it, under that order's own ID.
+                swaps.apply_order_hints(
+                    vec![report(
+                        loser,
+                        CowOrderStatusHint::Fulfilled,
+                        Some(confirmed - 1),
+                    )],
+                    cx,
+                );
+                let pages = located(swaps, cx);
+                assert_eq!(pages.len(), 2, "one page for each located order");
+                assert!(pages.contains(&(Some((winner, confirmed)), block_only.clone())));
+                assert!(pages.contains(&(Some((loser, confirmed - 1)), block_only)));
+                confirmed
+            })
+        });
+
+        // The trade is verified on one order. The swap follows it, and the other order is
+        // neither asked about nor read again.
+        let seen = SwapObservation {
+            block: observed.block(),
+            transaction_hash: Some(B256::repeat_byte(40)),
+        };
+        let traded = SwapOrderObservations {
+            pre_hook_executed: Some(seen),
+            traded: Some(seen),
+            trade_amounts: Some(SwapTradeAmounts {
+                sell_amount: U256::from(100),
+                buy_amount: U256::from(99),
+                fee_amount: U256::ZERO,
+                settlement_gas_used: None,
+                settlement_effective_gas_price: None,
+                executed_fee: None,
+                executed_fee_token: None,
+            }),
+            ..Default::default()
+        };
+        executors
+            .record_swap_observations(operation, winner, traded)
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let block_only = Some(confirmed..confirmed + 1);
+                let stage = swaps.stage(swaps.record(operation).unwrap());
+                assert_eq!(stage, SwapStage::Order(SwapOrderState::Traded));
+                assert_eq!(
+                    swaps
+                        .shown_swaps()
+                        .map(|(_, stage)| stage)
+                        .collect::<Vec<_>>(),
+                    [stage],
+                    "the status card shows one swap, at the traded order's stage"
+                );
+                assert_eq!(asked(swaps, cx), [(winner, true)]);
+                assert_eq!(
+                    located(swaps, cx),
+                    [(Some((winner, confirmed)), block_only.clone())]
+                );
+                // Late reports on the order that lost change nothing.
+                for (status, block) in [
+                    (CowOrderStatusHint::Fulfilled, Some(confirmed - 2)),
+                    (CowOrderStatusHint::Expired, None),
+                ] {
+                    swaps.apply_order_hints(vec![report(loser, status, block)], cx);
+                    assert_eq!(
+                        located(swaps, cx),
+                        [(Some((winner, confirmed)), block_only.clone())],
+                        "{status:?}"
+                    );
+                    assert_eq!(swaps.stage(swaps.record(operation).unwrap()), stage);
+                }
+            });
+        });
+
+        // Delivered: the swap is complete under the traded order's terms.
+        executors
+            .record_swap_observations(
+                operation,
+                winner,
+                SwapOrderObservations {
+                    delivered: Some(seen),
+                    shielded: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "observation": seen, "private_amount": "0x62", "fee": "0x1"
+                        }))
+                        .unwrap(),
+                    ),
+                    ..traded
+                },
+            )
+            .unwrap();
+        let done = SwapStage::Order(SwapOrderState::Done);
+        let expected_rows = if original_wins {
+            vec![
+                ("Order 1 · Traded".to_owned(), original),
+                ("Order 2 · Not filled".to_owned(), speed_up),
+            ]
+        } else {
+            vec![
+                ("Order 1 · Not filled".to_owned(), original),
+                ("Order 2 · Traded".to_owned(), speed_up),
+            ]
+        };
+        // What every view shows of the completed swap, also after a restart.
+        let completed = |swaps: &PrivateSwapsView, cx: &App| {
+            let record = swaps.record(operation).unwrap();
+            assert_eq!(swaps.stage(record), done);
+            assert_eq!(model::record_swaps(record).len(), 1);
+            let labels = swaps.labels(record, cx);
+            assert_eq!(labels.order, Some(winner));
+            assert_eq!(
+                labels.minimum,
+                Some(swaps.token_amount(Address::repeat_byte(2), U256::from(minimum), cx))
+            );
+            assert!(labels.received.is_some());
+            assert_eq!(
+                swaps
+                    .order_rows_for_test(cx)
+                    .into_iter()
+                    .map(|(_, status)| status)
+                    .collect::<Vec<_>>(),
+                [model::swap_order_status(done, false, &labels)],
+                "My orders lists the swap once, with the traded order's outcome"
+            );
+            assert_eq!(attempt_rows(swaps, cx), expected_rows);
+            assert!(!swaps.has_shown_swaps(), "a completed swap leaves the card");
+            assert!(asked(swaps, cx).is_empty());
+            assert!(located(swaps, cx).is_empty());
+        };
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                completed(swaps, cx);
+                swaps.apply_order_hints(
+                    vec![report(
+                        loser,
+                        CowOrderStatusHint::Fulfilled,
+                        Some(confirmed - 3),
+                    )],
+                    cx,
+                );
+                completed(swaps, cx);
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("swap-outcome").is_some());
+        for uid in [original, speed_up] {
+            assert!(
+                cx.debug_bounds(format!("swap-attempt-{}", uid.0).leak())
+                    .is_some(),
+                "each order keeps its row and its copy control"
+            );
+        }
+        let restarted = cx.update(|window, cx| {
+            window.close_all_dialogs(cx);
+            root.update(cx, |root, cx| {
+                root.clear_private_swaps(cx);
+                root.ensure_private_swaps(window, cx);
+                root.private_swaps_view().unwrap()
+            })
+        });
+        restarted.read_with(cx, |swaps, cx| completed(swaps, cx));
+    });
+}
+
+/// The speed-up form of an open order, opened from its detail and held on a stub quote of 1
+/// USDC for USDT. That quote stands in for the speed-up's own, which is planned from the
+/// order's notes, and no test wallet holds them. The open order's signed minimum is the
+/// quote's at Balanced, so Balanced doesn't lower it and a larger gas share does. Returns the
+/// open order's ID and the quote.
+fn speed_up_form_on_a_quote(
+    root: &Entity<WalletRoot>,
+    swaps: &Entity<PrivateSwapsView>,
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    stubs: &SwapStubs,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) -> (OrderUid, Arc<SwapReview>) {
+    open_private_form(root, swaps, stubs, runtime, cx);
+    let quoted = ready_review(swaps, runtime, cx);
+    let signed = quoted
+        .buy_amount_for(quoted.suggested_private_minimum())
+        .unwrap();
+    let (uid, _) = placed_order(
+        executors,
+        operation,
+        SwapDelivery::Reshield,
+        PlacedOrder {
+            uid_hash: 0x11,
+            hook_hash: 7,
+            valid_to: u32::try_from(now_unix() + 600).unwrap(),
+            speeds_up: None,
+        },
+        |bounds| {
+            bounds.buy_amount = signed;
+            bounds.private_minimum = quoted.suggested_private_minimum();
+            bounds.gas_share_bps = Some(GAS_SHARE_BALANCED_BPS);
+        },
+    );
+    executors
+        .record_swap_submission(
+            operation,
+            uid,
+            wallet_ops::vault::SwapSubmissionStatus::Accepted,
+        )
+        .unwrap();
+    let orderbook = stub_orderbook(stubs, runtime);
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.reload_records();
+            swaps.show_detail(operation, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let speed_up = cx.debug_bounds("swap-progress-speed-up").unwrap();
+    cx.simulate_click(speed_up.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            let form = swaps.form.as_mut().expect("Speed up opens the swap form");
+            assert_eq!(form.speed_up.as_ref().map(|open| open.uid), Some(uid));
+            // The request for the order's own quote is dropped with its task.
+            form.quote_task = None;
+            form.quote_revision = form.quote_revision.wrapping_add(1);
+            form.orderbook = Some(orderbook);
+            form.quote = QuoteState::Ready(Arc::clone(&quoted));
+            form.price_acknowledged = true;
+            swaps.sync_gas_controls(window, cx);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    (uid, quoted)
+}
+
+/// A speed-up's form changes only the Minimum: a preset, the bar and a typed minimum each move
+/// the gas share, the allowed gas and the minimum together. While the signed minimum isn't
+/// below the open order's, the form says so and can't be reviewed. A lower one opens a review
+/// that names both signed minimums and is always explicit, also for a summary that a
+/// remembered spend authorization could otherwise approve unseen.
+#[gpui::test]
+fn a_speed_up_form_reviews_only_a_lower_signed_minimum(cx: &mut TestAppContext) {
+    use crate::root::spend_authorization::spend_authorization_can_use_cached_password;
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            let (uid, quoted) =
+                speed_up_form_on_a_quote(root, swaps, executors, operation, &stubs, runtime, cx);
+            let open_minimum = quoted
+                .buy_amount_for(quoted.suggested_private_minimum())
+                .unwrap();
+            // The form's quote at its share, whether that lowers the open order's signed
+            // minimum, and what keeps Review… off.
+            let shown = |cx: &mut gpui::VisualTestContext| {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                swaps.read_with(cx, |swaps, _| {
+                    let form = swaps.form.as_ref().unwrap();
+                    let QuoteState::Ready(review) = &form.quote else {
+                        panic!("the speed-up's quote");
+                    };
+                    (
+                        Arc::clone(review),
+                        form.speed_up_relaxes(review),
+                        form.review_problem(review),
+                    )
+                })
+            };
+
+            // Balanced signs the open order's own minimum.
+            let (balanced, lowers, problem) = shown(cx);
+            assert_eq!(lowers, Some(false));
+            assert_eq!(problem, Some(SPEED_UP_NOT_LOWER.into()));
+            assert!(cx.debug_bounds("swap-speed-up-minimums").is_some());
+            assert!(cx.debug_bounds("swap-speed-up-not-lower").is_some());
+
+            // A preset.
+            let loose = cx.debug_bounds("swap-gas-loose").unwrap();
+            cx.simulate_click(loose.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            let (review, lowers, _) = shown(cx);
+            assert_eq!(lowers, Some(true));
+            assert_eq!(review.gas_share_bps(), GAS_SHARE_LOOSE_BPS);
+            assert!(
+                review.gas_allowance() > balanced.gas_allowance()
+                    && review.suggested_private_minimum() < balanced.suggested_private_minimum(),
+                "the allowed gas and the minimum follow the share together"
+            );
+            assert!(cx.debug_bounds("swap-speed-up-minimums").is_some());
+            assert!(cx.debug_bounds("swap-speed-up-not-lower").is_none());
+
+            // The bar.
+            move_gas_slider(swaps, 50., false, cx);
+            let (review, lowers, _) = shown(cx);
+            assert_eq!((review.gas_share_bps(), lowers), (5_000, Some(true)));
+
+            // A typed minimum: above the open order's, then below it.
+            let type_minimum = |share_bps: u16, cx: &mut gpui::VisualTestContext| {
+                let typed = quoted
+                    .with_gas_share(share_bps)
+                    .unwrap()
+                    .suggested_private_minimum();
+                let edit = cx.debug_bounds("swap-gas-edit-minimum").unwrap();
+                cx.simulate_click(edit.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    let input = swaps
+                        .read(cx)
+                        .form
+                        .as_ref()
+                        .unwrap()
+                        .gas_minimum_input
+                        .clone();
+                    assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                    window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+                });
+                cx.simulate_input(&format_unshield_amount_input(typed, Some(6)));
+                cx.run_until_parked();
+            };
+            type_minimum(2_000, cx);
+            let (review, lowers, problem) = shown(cx);
+            assert!(review.gas_allowance() < balanced.gas_allowance());
+            assert_eq!(lowers, Some(false));
+            assert_eq!(problem, Some(SPEED_UP_NOT_LOWER.into()));
+            assert!(cx.debug_bounds("swap-speed-up-not-lower").is_some());
+            type_minimum(3_000, cx);
+            let (review, lowers, _) = shown(cx);
+            assert!(review.gas_allowance() > balanced.gas_allowance());
+            assert_eq!(lowers, Some(true));
+            assert!(cx.debug_bounds("swap-speed-up-not-lower").is_none());
+
+            // With its costs accepted, the lower minimum can be reviewed.
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    cx.notify();
+                });
+            });
+            let (review, _, problem) = shown(cx);
+            assert_eq!(problem, None);
+            let signed = review
+                .buy_amount_for(review.suggested_private_minimum())
+                .unwrap();
+            assert!(signed < open_minimum);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // The review names both orders' signed minimums. An ordinary review of
+                    // the same quote has no row for the open order's.
+                    let buy = review.plan().buy_token();
+                    let open = swaps.form.as_ref().unwrap().speed_up.clone();
+                    let rows = |open: Option<&SpeedUpOrder>| {
+                        swaps
+                            .swap_summary(&review, None, None, None, open, cx)
+                            .rows_for_test()
+                    };
+                    let (sped_up, ordinary) = (rows(open.as_ref()), rows(None));
+                    let amount = |amount| swaps.token_amount(buy, amount, cx);
+                    for minimum in [open_minimum, signed] {
+                        assert!(
+                            sped_up.iter().any(|(_, value)| *value == amount(minimum)),
+                            "{sped_up:?}"
+                        );
+                    }
+                    assert!(
+                        !ordinary
+                            .iter()
+                            .any(|(_, value)| *value == amount(open_minimum)),
+                        "{ordinary:?}"
+                    );
+
+                    swaps.form_primary(window, cx);
+                    let pending = swaps
+                        .pending_authorization
+                        .clone()
+                        .unwrap_or_else(|| panic!("{:?}", swaps.form.as_ref().unwrap().error));
+                    let SwapAction::Order(approval) = &pending.action else {
+                        panic!("the speed-up's review");
+                    };
+                    assert!(Arc::ptr_eq(&approval.review, &review));
+                    assert_eq!(approval.speed_up, Some(uid));
+                    assert!(approval.full_review);
+
+                    // The confirm-only summary is the one a remembered authorization approves
+                    // without a prompt. A speed-up can't be authorized with it.
+                    let confirm_only = swaps.place_summary(approval, cx).unwrap();
+                    assert!(spend_authorization_can_use_cached_password(&confirm_only));
+                    assert!(!spend_authorization_can_use_cached_password(
+                        &authorization_summary(&pending.action, confirm_only.clone())
+                    ));
+                    let ordinary = SwapAction::Order(Box::new(OrderApproval {
+                        speed_up: None,
+                        ..(**approval).clone()
+                    }));
+                    assert!(spend_authorization_can_use_cached_password(
+                        &authorization_summary(&ordinary, confirm_only)
+                    ));
+                });
+            });
+        },
+    );
+}
+
+/// A speed-up is signed only for the review that is still pending in the wallet it was opened
+/// in. Closing the review returns to the speed-up's form, and its late result signs nothing.
+/// Neither does the result of an earlier review once a newer one is pending, nor one that
+/// arrives after the wallet's swaps were cleared. The pending review's own result goes on to
+/// signing, which here refuses the stand-in quote.
+#[gpui::test]
+fn a_late_speed_up_authorization_signs_nothing(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            let (uid, _) =
+                speed_up_form_on_a_quote(root, swaps, executors, operation, &stubs, runtime, cx);
+            // Loose lowers the open order's minimum, so the speed-up can be reviewed.
+            let review = cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.set_gas_preset(GasPreset::Loose, window, cx);
+                    match &swaps.form.as_ref().unwrap().quote {
+                        QuoteState::Ready(review) => Arc::clone(review),
+                        _ => panic!("the quote at Loose"),
+                    }
+                })
+            });
+            // Open the review of the form's quote, which a background pass may have replaced.
+            let request = |cx: &mut gpui::VisualTestContext| {
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        swaps.pending_authorization = None;
+                        let form = swaps.form.as_mut().expect("the speed-up's form");
+                        form.quote_task = None;
+                        form.quote_revision = form.quote_revision.wrapping_add(1);
+                        form.quote = QuoteState::Ready(Arc::clone(&review));
+                        form.price_acknowledged = true;
+                        form.high_costs_acknowledged = true;
+                        swaps.form_primary(window, cx);
+                        let pending = swaps
+                            .pending_authorization
+                            .clone()
+                            .unwrap_or_else(|| panic!("{:?}", swaps.form.as_ref().unwrap().error));
+                        let SwapAction::Order(approval) = &pending.action else {
+                            panic!("the speed-up's review");
+                        };
+                        assert_eq!(approval.speed_up, Some(uid));
+                        pending
+                    })
+                })
+            };
+            // What signing would leave behind: a job, a draft order, or its refusal on the form.
+            let signing = |cx: &mut gpui::VisualTestContext| {
+                swaps.read_with(cx, |swaps, _| {
+                    (
+                        swaps.job.is_some(),
+                        swaps
+                            .tracking
+                            .get(&operation)
+                            .is_some_and(|tracking| tracking.pending_order.is_some()),
+                        swaps.form.as_ref().and_then(|form| form.error.clone()),
+                    )
+                })
+            };
+            // A validation result for `command` reaches the swap view. `true` when it left
+            // anything of signing behind.
+            let arrive = |command: &Arc<SwapAuthorization>, cx: &mut gpui::VisualTestContext| {
+                let before = signing(cx);
+                let authorization = DesktopPrivateSpendAuthorization::VaultPassword(
+                    zeroize::Zeroizing::new("late".to_owned()),
+                );
+                cx.update(|window, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        swaps.continue_authorized(command, authorization, None, window, cx);
+                    });
+                });
+                cx.run_until_parked();
+                signing(cx) != before
+            };
+
+            // Escape closes the review, which cancels it and returns to the form.
+            let closed = request(cx);
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes("escape");
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let swaps = swaps.read(cx);
+                assert!(
+                    swaps.pending_authorization.is_none(),
+                    "closing the review cancels it"
+                );
+                assert!(
+                    swaps.swap_dialog_shows(operation, window, cx),
+                    "focus returns to the speed-up's form"
+                );
+            });
+            assert!(!arrive(&closed, cx), "a closed review signs nothing");
+
+            let _newer = request(cx);
+            assert!(
+                !arrive(&closed, cx),
+                "an earlier review's result can't approve a newer one"
+            );
+
+            let pending = request(cx);
+            assert!(
+                arrive(&pending, cx),
+                "the pending review goes on to signing"
+            );
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps.job.is_none(),
+                    "the stand-in quote is refused unsigned"
+                );
+            });
+
+            // Switching wallets clears the view the review was opened in.
+            let left = request(cx);
+            root.update(cx, crate::root::WalletRoot::clear_private_swaps);
+            assert!(
+                !arrive(&left, cx),
+                "a cleared wallet's review signs nothing"
+            );
         },
     );
 }
@@ -6955,7 +8187,7 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                             Some(&registry),
                         )
                     };
-                    let summary = swaps.swap_summary(&review, Some(&fees), None, None, cx);
+                    let summary = swaps.swap_summary(&review, Some(&fees), None, None, None, cx);
                     let received = swaps.network_token_amount(
                         137,
                         STUB_POLYGON_USDT,
@@ -7075,6 +8307,7 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                         full_review: false,
                         swap_use: None,
                         pair_destination: None,
+                        speed_up: None,
                     };
                     assert_eq!(
                         approval
@@ -7145,8 +8378,9 @@ fn private_bridge_approval_expires_when_the_destination_session_ends(cx: &mut Te
                         full_review: true,
                         swap_use: None,
                         pair_destination: None,
+                        speed_up: None,
                     };
-                    let summary = swaps.swap_summary(&review, None, None, None, cx);
+                    let summary = swaps.swap_summary(&review, None, None, None, None, cx);
                     swaps.request_authorization(
                         SwapAction::Order(Box::new(approval)),
                         summary,
@@ -7214,7 +8448,7 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
             });
             let review = ready_review(swaps, runtime, cx);
             swaps.read_with(cx, |swaps, cx| {
-            let summary = swaps.swap_summary(&review, None, None, None, cx);
+            let summary = swaps.swap_summary(&review, None, None, None, None, cx);
             let pol = swaps.network_token_symbol(137, Address::ZERO, cx);
             let (label, amount, lines) = summary.receive_card_for_test().unwrap();
             assert_eq!(
@@ -7280,6 +8514,7 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
                     full_review: false,
                     swap_use: None,
                     pair_destination: None,
+                    speed_up: None,
                 };
                 let (_, _, lines) = swaps
                     .place_summary(&approval, cx)
@@ -7365,7 +8600,7 @@ fn high_bridge_costs_require_swap_anyway(cx: &mut TestAppContext) {
                         assert!(warning.details.contains("bridge fee"), "{message}");
                         assert!(
                             swaps
-                                .swap_summary(&review, None, None, None, cx)
+                                .swap_summary(&review, None, None, None, None, cx)
                                 .warnings_for_test()
                                 .contains(&message)
                         );
@@ -8214,7 +9449,7 @@ fn private_review_leads_with_the_minimum_and_states_the_gas(cx: &mut TestAppCont
         let first = ready_review(swaps, runtime, cx);
         let review = requote_at_gas(swaps, &stubs, runtime, gas_price_for(&first, 1_000), cx);
         swaps.read_with(cx, |swaps, cx| {
-            let summary = swaps.swap_summary(&review, None, None, None, cx);
+            let summary = swaps.swap_summary(&review, None, None, None, None, cx);
             let minimum = review.suggested_private_minimum();
             let (label, amount, lines) = summary.receive_card_for_test().unwrap();
             assert_eq!(
@@ -8649,6 +9884,7 @@ fn retried_and_traded(
                     Vec::new(),
                 )),
                 bridge: order.bridge().cloned(),
+                speed_up: None,
             },
         )
         .unwrap();
@@ -8853,6 +10089,114 @@ fn a_delivery_under_an_earlier_attempts_terms_keeps_each_attempts_minimum(cx: &m
             .unwrap();
         press_swap_recover(swaps, operation, refunding, cx);
         assert!(cx.debug_bounds("stealth-recovery-form").is_some());
+    });
+}
+
+/// The original order trades while its speed-up can still fill, and the settlement makes the
+/// speed-up's deposit. The swap is one entry that follows the original's trade and that
+/// deposit: its delivery is held to the speed-up's minimum, and each order keeps its own row.
+#[gpui::test]
+fn a_trade_delivered_by_its_speed_ups_deposit_follows_that_deposit(cx: &mut TestAppContext) {
+    use alloy::eips::BlockNumHash;
+    use wallet_ops::vault::{
+        BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome, SwapOrderObservations,
+    };
+
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+            private: None,
+        });
+        let lower = BRIDGE_MINIMUM - U256::from(1_000_000);
+        let (original, observed) = placed_swap(executors, operation, delivery);
+        let (speed_up, _) = placed_order(
+            executors,
+            operation,
+            delivery,
+            PlacedOrder {
+                uid_hash: 0x12,
+                hook_hash: 0x21,
+                valid_to: 20,
+                speeds_up: Some(original),
+            },
+            |bounds| {
+                // A speed-up asks for less of the bought token than its open order.
+                bounds.buy_amount -= U256::from(1);
+                bounds.destination_minimum = Some(lower);
+            },
+        );
+        let handed_off = bridge_observations(
+            observed,
+            Some(U256::from(7)),
+            Some(SwapBridgeOutcome::DeliveredVerified {
+                block: BlockNumHash::new(71_904_233, B256::repeat_byte(60)),
+                transaction_hash: B256::repeat_byte(61),
+                output_amount: lower,
+                shielded: false,
+            }),
+        );
+        executors
+            .record_swap_observations(
+                operation,
+                original,
+                SwapOrderObservations {
+                    pre_hook_executed: handed_off.pre_hook_executed,
+                    traded: handed_off.traded,
+                    trade_amounts: handed_off.trade_amounts,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        executors
+            .record_swap_observations(
+                operation,
+                speed_up,
+                SwapOrderObservations {
+                    pre_hook_executed: None,
+                    traded: None,
+                    trade_amounts: None,
+                    ..handed_off
+                },
+            )
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(
+                    swaps.stage(record),
+                    SwapStage::Order(SwapOrderState::Done),
+                    "the unfilled speed-up doesn't hide the delivery it made"
+                );
+                assert_eq!(model::record_swaps(record).len(), 1);
+                assert_eq!(swaps.order_rows_for_test(cx).len(), 1);
+                let delivered = swaps.network_token_amount(137, STUB_POLYGON_USDC, lower, cx);
+                let labels = swaps.labels(record, cx);
+                assert_eq!(labels.order, Some(original));
+                assert_eq!(labels.received.as_ref(), Some(&delivered));
+                assert_eq!(
+                    labels.bridge.as_ref().unwrap().minimum.as_ref(),
+                    Some(&delivered)
+                );
+                let latest = record.swap().unwrap().orders().last().unwrap();
+                let attempts = model::SwapAttempts::ending_at(record, latest);
+                assert_eq!(
+                    swaps
+                        .attempt_rows(record, &attempts, cx)
+                        .iter()
+                        .map(|row| (row.label.as_str(), row.order))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Order 1 · Traded", original),
+                        ("Order 2 · Bridge deposit", speed_up)
+                    ]
+                );
+            });
+        });
     });
 }
 
@@ -9312,6 +10656,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                             message_hash: Some(B256::repeat_byte(0x57)),
                         })),
                         bounds,
+                        speed_up: None,
                     },
                 )
                 .unwrap();

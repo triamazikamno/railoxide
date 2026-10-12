@@ -63,9 +63,9 @@ pub use swap::{
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
     SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
     SwapPrivateBridgeQuote, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
-    SwapSetupStatus, SwapUseClaim, delivery_shortfall_allowance, is_swap_record,
-    swap_attempt_state, swap_order_state, swap_setup_recorded_executed, swap_setup_status,
-    swap_submission_outcome,
+    SwapSetupStatus, SwapSpeedUpRefusal, SwapUseClaim, delivery_shortfall_allowance,
+    is_swap_record, swap_attempt_state, swap_order_state, swap_setup_recorded_executed,
+    swap_setup_status, swap_speed_up_relaxes, swap_submission_outcome,
 };
 pub use swap::{
     PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
@@ -82,15 +82,15 @@ pub use swap::{
 };
 pub use swap::{PublicSwapOrderState, public_swap_order_state};
 pub use swap::{PublicSwapProgress, PublicSwapTracking};
+#[cfg(test)]
+pub(crate) use swap::{
+    SpeedUpBlock, SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, notes_of_shield,
+    plan_swap_inputs, plan_swap_speed_up_inputs, price_swap_review, reusable_swap_proof,
+    speed_up_block, swap_cancellation_admitted, swap_invalidation, swap_recovery_calls,
+};
 pub use swap::{
     SwapContinuingApproval, SwapContinuingApprovals, SwapQuoteAgeEvidence,
     swap_continuing_approvals,
-};
-#[cfg(test)]
-pub(crate) use swap::{
-    SwapDestinationSigning, SwapOrderSigning, SwapOutputPoiSink, notes_of_shield, plan_swap_inputs,
-    price_swap_review, reusable_swap_proof, swap_cancellation_admitted, swap_invalidation,
-    swap_recovery_calls,
 };
 
 pub struct ExecutorReconciliationReport {
@@ -347,12 +347,14 @@ impl ExecutorOwner {
                     !record.nonce_settled(payload.nonce())
                 } else {
                     // A hook runs inside a settlement, which the swap can observe before
-                    // any account read resolves the hook's nonce.
+                    // any account read resolves the hook's nonce. A verified funding spent
+                    // the notes of every pre-hook that shares it.
                     record.swap().is_some_and(|swap| {
                         swap.orders().iter().any(|order| {
                             order.pre_hook().payload() == payload.hash()
                                 && (order.observations().pre_hook_executed.is_some()
-                                    || order.observations().delivered.is_some())
+                                    || order.observations().delivered.is_some()
+                                    || swap.funding(order).is_some())
                         })
                     })
                 };

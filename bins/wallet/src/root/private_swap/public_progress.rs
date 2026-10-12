@@ -435,7 +435,7 @@ impl PrivateSwapsView {
         }
         let steps = steps.into_iter().enumerate().map(|(ix, step)| {
             let detail = step.detail.clone();
-            progress_group(&step, detail, format!("public-swap-{key}-{ix}"))
+            progress_group(&step, detail, format!("public-swap-{key}-{ix}"), None)
         });
         let observed = swap.observations();
         let source_name = self.public_source_name(source, cx);

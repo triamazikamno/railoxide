@@ -3,8 +3,8 @@ use broadcaster_core::contracts::cow::OrderUid;
 use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorInputIdentity, ExecutorOperationId,
     ExecutorPayloadPurpose, ExecutorRecord, ExecutorStore, ExecutorStoreError, FixedBytes,
-    IssuedExecutorPayload, Serialize, SwapDestinationOutcome, SwapUseId, SwapUseRecord,
-    SwapUseRole, U256,
+    IssuedExecutorPayload, Serialize, SwapAccountRefusal, SwapDestinationOutcome, SwapSpeedUp,
+    SwapUseId, SwapUseRecord, SwapUseRole, U256,
 };
 
 /// Public components of the Railgun address that every post-hook of one swap
@@ -100,6 +100,18 @@ impl SwapProof {
     }
 }
 
+/// Verified execution of a pre-hook proof's private funding effects for one swap use at one
+/// pre-hook nonce. It shows the stealth account was funded with the sell amount, not which of
+/// the attempts signed at that nonce ran its pre-hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapFunding {
+    pub use_id: SwapUseId,
+    pub pre_hook_nonce: U256,
+    /// The digest of the proved transactions, as in [`SwapProof::digest`].
+    pub proof: B256,
+    pub observation: SwapObservation,
+}
+
 /// Swap state in the operation's encrypted executor record. Each attempt writes
 /// one order; the order list keeps later order kinds additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +119,9 @@ pub struct SwapOperationRecord {
     terms: SwapTerms,
     proof: SwapProof,
     orders: Vec<SwapOrderRecord>,
+    /// At most one per swap use and pre-hook nonce.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fundings: Vec<SwapFunding>,
 }
 
 impl SwapOperationRecord {
@@ -133,26 +148,121 @@ impl SwapOperationRecord {
     pub fn orders(&self) -> &[SwapOrderRecord] {
         &self.orders
     }
+    #[must_use]
+    pub fn fundings(&self) -> &[SwapFunding] {
+        &self.fundings
+    }
+    /// The verified funding `order` shares: the one of its swap use at its pre-hook nonce,
+    /// unless its pre-hook is recorded dead. Within one use, attempts at one nonce that are
+    /// not recorded dead share the proof: an ordinary retry at that nonce is admitted only
+    /// after the earlier attempt's pre-hook is recorded dead, and a speed-up must keep the
+    /// proof. An attempt recorded dead by expiry before the funding could not have been the
+    /// one that ran. A funding that another attempt traded away is no longer shared.
+    #[must_use]
+    pub fn funding(&self, order: &SwapOrderRecord) -> Option<SwapObservation> {
+        let use_id = order.use_id?;
+        if order.observations.pre_hook_dead.is_some() || self.traded_sibling(order).is_some() {
+            return None;
+        }
+        self.fundings
+            .iter()
+            .find(|funding| {
+                funding.use_id == use_id && funding.pre_hook_nonce == order.pre_hook.nonce
+            })
+            .map(|funding| funding.observation)
+    }
+    /// Another attempt of `order`'s swap use, signed at the same pre-hook nonce, that traded.
+    /// Attempts of one use at one pre-hook nonce share one funding and one exact sell
+    /// allowance, so once one of them traded no other can.
+    #[must_use]
+    pub fn traded_sibling<'a>(&'a self, order: &'a SwapOrderRecord) -> Option<&'a SwapOrderRecord> {
+        let use_id = order.use_id?;
+        self.orders.iter().find(|other| {
+            other.uid != order.uid
+                && other.use_id == Some(use_id)
+                && other.pre_hook.nonce == order.pre_hook.nonce
+                && other.observations.traded.is_some()
+        })
+    }
     /// A new attempt may start once each earlier attempt has either ended before its pre-hook
     /// ran or traded and completed delivery, for a Bridge order delivery on the destination
     /// chain. Unrecovered executed pre-hooks block it, as do refunding and unresolved bridges.
+    /// An untraded attempt sharing a verified funding blocks it like an executed pre-hook:
+    /// such an attempt is never recorded dead, so it has not ended.
+    /// An untraded attempt whose sibling at the same pre-hook nonce traded can no longer fill
+    /// and admits one, leaving the decision to the traded sibling.
     /// A trade delivered by another attempt of its use completes with that attempt's
     /// destination outcome, and the attempt holding the hand-off waits for the same outcome:
     /// its ended pre-hook does not resolve its bridge.
     #[must_use]
     pub fn admits_attempt(&self) -> bool {
-        self.orders.iter().all(|order| {
-            if order.observations.traded.is_some() {
-                order.has_ended()
-                    || self
-                        .delivery_order(order)
-                        .is_some_and(SwapOrderRecord::destination_delivered)
-            } else if order.observations.bridge_handoff.is_some() {
-                self.trade_order(order).is_some() && order.destination_delivered()
+        self.orders
+            .iter()
+            .all(|order| self.order_admits_attempt(order))
+    }
+
+    fn order_admits_attempt(&self, order: &SwapOrderRecord) -> bool {
+        if order.observations.traded.is_some() {
+            order.has_ended()
+                || self
+                    .delivery_order(order)
+                    .is_some_and(SwapOrderRecord::destination_delivered)
+        } else if order.observations.bridge_handoff.is_some() {
+            self.trade_order(order).is_some() && order.destination_delivered()
+        } else {
+            order.has_ended() || self.traded_sibling(order).is_some()
+        }
+    }
+
+    /// Why a second order can't be signed against the open order `speed_up` names. That order
+    /// must be the latest one, of the same use and pre-hook nonce, with nothing recorded that
+    /// ends it, and it can't deliver privately through a bridge. The use's other attempts at
+    /// that nonce compete with it: they may have ended, but none may have run its pre-hook,
+    /// traded or handed off, and no funding may be recorded at that nonce, whichever of them
+    /// ran. Every other order must admit an attempt as for a retry.
+    pub(super) fn speed_up_refusal(&self, speed_up: &SwapSpeedUp) -> Option<SwapAccountRefusal> {
+        let Some(open) = self.orders.last().filter(|order| {
+            order.uid == speed_up.order.0
+                && order.use_id == Some(speed_up.swap_use)
+                && order.pre_hook.nonce == speed_up.pre_hook_nonce
+        }) else {
+            return Some(SwapAccountRefusal::SpeedUpOrderChanged);
+        };
+        if open.delivery.private_bridge().is_some() {
+            return Some(SwapAccountRefusal::SpeedUpUnsupported);
+        }
+        let competes = |order: &SwapOrderRecord| {
+            order.use_id == open.use_id && order.pre_hook.nonce == open.pre_hook.nonce
+        };
+        if self
+            .orders
+            .iter()
+            .any(|order| competes(order) && order.observations.pre_hook_executed.is_some())
+            || self.fundings.iter().any(|funding| {
+                Some(funding.use_id) == open.use_id && funding.pre_hook_nonce == open.pre_hook.nonce
+            })
+        {
+            return Some(SwapAccountRefusal::SpeedUpNonceUsed);
+        }
+        let admitted = self.orders.iter().all(|order| {
+            let observed = order.observations;
+            if order.uid == open.uid {
+                observed.traded.is_none()
+                    && observed.pre_hook_dead.is_none()
+                    && observed.expired.is_none()
+                    && observed.bridge_handoff.is_none()
+            } else if competes(order) {
+                observed.traded.is_none() && observed.bridge_handoff.is_none()
             } else {
-                order.has_ended()
+                self.order_admits_attempt(order)
             }
-        })
+        });
+        (!admitted).then_some(SwapAccountRefusal::SpeedUpOrderChanged)
+    }
+
+    /// Whether a second order may be signed against the open order `speed_up` names.
+    pub(super) fn admits_speed_up(&self, speed_up: &SwapSpeedUp) -> bool {
+        self.speed_up_refusal(speed_up).is_none()
     }
 
     /// Whether `order` is part of a trade that completed at or below `cutoff`: the trade, its
@@ -1099,6 +1209,8 @@ pub struct SwapAttempt {
     pub post_hook: Option<IssuedExecutorPayload>,
     /// Required for Bridge delivery, with the delivery's provider, and absent otherwise.
     pub bridge: Option<BridgeOrderTerms>,
+    /// The open order this attempt speeds up. `None` for a first order or an ordinary retry.
+    pub speed_up: Option<OrderUid>,
 }
 
 impl ExecutorRecord {
@@ -1524,6 +1636,11 @@ impl ExecutorStore {
     /// earlier attempt ended or completed delivery. The order belongs to the attempt's swap
     /// use, and is refused once another use claims the account. Unless it is a private Bridge
     /// order, it keeps the tokens and delivery of the use's earlier attempts.
+    ///
+    /// A speed-up is the exception to the retry rule: it is admitted while the use's latest
+    /// order is still open, at that order's pre-hook nonce. It must invalidate that order,
+    /// keep the recorded proof, the sell amount, the private spend and the delivery, and ask
+    /// for a lower buy amount. Earlier orders and the use's setup approval stay as they are.
     pub fn record_swap_attempt(
         &self,
         operation: ExecutorOperationId,
@@ -1541,6 +1658,7 @@ impl ExecutorStore {
             pre_hook,
             post_hook,
             bridge,
+            speed_up,
         } = attempt;
         self.update(operation, |record| {
             // An account reserved without swap links takes its first use with its first order.
@@ -1647,12 +1765,39 @@ impl ExecutorStore {
             if !record.swap_use_keeps_terms(use_id, terms.sell_token, terms.buy_token, delivery) {
                 return Err(ExecutorStoreError::SwapUseTermsChanged);
             }
-            if !record
-                .swap
-                .as_ref()
-                .is_none_or(SwapOperationRecord::admits_attempt)
-            {
-                return Err(ExecutorStoreError::SwapAttemptOutstanding);
+            match speed_up {
+                None => {
+                    if !record
+                        .swap
+                        .as_ref()
+                        .is_none_or(SwapOperationRecord::admits_attempt)
+                    {
+                        return Err(ExecutorStoreError::SwapAttemptOutstanding);
+                    }
+                }
+                Some(open) => {
+                    let binding = SwapSpeedUp {
+                        swap_use: use_id,
+                        order: open,
+                        pre_hook_nonce: pre_hook.nonce,
+                    };
+                    // The rule leaves the open order as the latest one. Both orders fund from
+                    // the same proof and sell the same amount, so only one of them can trade.
+                    let admitted = record.swap.as_ref().is_some_and(|swap| {
+                        swap.admits_speed_up(&binding)
+                            && invalidates == Some(open)
+                            && proof == swap.proof
+                            && swap.orders.last().is_some_and(|latest| {
+                                bounds.sell_amount == latest.bounds.sell_amount
+                                    && bounds.spend_amount() == latest.bounds.spend_amount()
+                                    && bounds.buy_amount < latest.bounds.buy_amount
+                                    && delivery == latest.delivery
+                            })
+                    });
+                    if !admitted {
+                        return Err(ExecutorStoreError::SwapSpeedUpRefused);
+                    }
+                }
             }
             // This check shares the record mutation lock with every store handle.
             if self.records()?.iter().any(|other| {
@@ -1725,6 +1870,7 @@ impl ExecutorStore {
                     terms,
                     proof,
                     orders: vec![order],
+                    fundings: Vec::new(),
                 });
             }
             record.issued.push(pre_hook);
@@ -1890,6 +2036,48 @@ impl ExecutorStore {
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
             order.observations = observations;
+            Ok(())
+        })
+    }
+
+    /// Replace the swap's verified fundings, including when a reorg removes one. Each is at or
+    /// below the record's reconciled confirmed block, names the transaction that ran the
+    /// proof, and belongs to a recorded order's swap use and pre-hook nonce, one per pair.
+    pub fn record_swap_fundings(
+        &self,
+        operation: ExecutorOperationId,
+        fundings: Vec<SwapFunding>,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let confirmed = record
+                .nonce_observation
+                .ok_or(ExecutorStoreError::OutstandingNonce)?
+                .block;
+            let same = |one: &SwapFunding, other: &SwapFunding| {
+                one.use_id == other.use_id && one.pre_hook_nonce == other.pre_hook_nonce
+            };
+            if fundings.iter().enumerate().any(|(index, funding)| {
+                funding.observation.block.number > confirmed.number
+                    || funding.observation.transaction_hash.is_none()
+                    || fundings[..index]
+                        .iter()
+                        .any(|earlier| same(earlier, funding))
+            }) {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
+            let swap = record
+                .swap
+                .as_mut()
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if !fundings.iter().all(|funding| {
+                swap.orders.iter().any(|order| {
+                    order.use_id == Some(funding.use_id)
+                        && order.pre_hook.nonce == funding.pre_hook_nonce
+                })
+            }) {
+                return Err(ExecutorStoreError::OperationMismatch);
+            }
+            swap.fundings = fundings;
             Ok(())
         })
     }

@@ -126,6 +126,7 @@ fn swap_hooks_persist_with_their_order_and_a_retry_waits_for_a_dead_pre_hook() {
             Vec::new(),
         )),
         bridge: None,
+        speed_up: None,
     };
 
     // A post-hook is admitted only alongside its pre-hook, at exactly k + 1.
@@ -469,6 +470,7 @@ fn an_order_follows_two_setups_signed_at_one_nonce_once_a_read_shows_it_consumed
                 Vec::new(),
             )),
             bridge: None,
+            speed_up: None,
         }
     };
     // While the setups' nonce is unconsumed, no order is placed beside them.
@@ -1089,6 +1091,7 @@ fn external_swap_attempts_issue_only_their_pre_hook_and_their_trade_admits_the_n
         ),
         post_hook,
         bridge: None,
+        speed_up: None,
     };
 
     // The post-hook's presence must match the delivery kind.
@@ -1341,6 +1344,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
                     )
                 }),
                 bridge,
+                speed_up: None,
             }
         };
     let first = (6, 30, 1, observed);
@@ -1790,6 +1794,7 @@ fn a_split_settlement_keeps_the_trade_and_the_hand_off_on_their_own_attempts() {
             recipient: None,
             message_hash: None,
         })),
+        speed_up: None,
     };
     // Record an attempt, and optionally expire it: `validTo` passed with the nonce unused.
     let record_attempt = |use_id, uid: u8, output_amount: u64, expires: bool| {
@@ -2095,6 +2100,7 @@ fn public_across_attempt(
             Vec::new(),
         )),
         bridge: Some(BridgeOrderTerms::Across(public_across_terms())),
+        speed_up: None,
     }
 }
 
@@ -2831,6 +2837,7 @@ fn private_across_attempt(
             recipient: Some(Address::repeat_byte(12)),
             message_hash: Some(B256::repeat_byte(13)),
         })),
+        speed_up: None,
     }
 }
 
@@ -3461,6 +3468,7 @@ fn settled_source_account(
                     Vec::new(),
                 )),
                 bridge: None,
+                speed_up: None,
             },
         )
         .unwrap();
@@ -3546,6 +3554,7 @@ fn a_later_swap_use_leaves_the_earlier_use_and_its_order_unchanged() {
             Vec::new(),
         )),
         bridge: None,
+        speed_up: None,
     };
     let first = attempt(SwapUseId::first(operation), (5, 6), 30, 1, observed);
     let (first_uid, first_terms) = (first.uid, first.terms);

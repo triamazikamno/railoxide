@@ -282,24 +282,29 @@ pub(super) fn app_step_row(
         .items_start()
         .gap_3()
         .child(
+            // The marker column takes the row's height, so the connector reaches the next
+            // step's marker however tall the body is.
             div()
+                .self_stretch()
                 .flex()
                 .flex_col()
                 .items_center()
-                .child(marker)
+                .child(div().flex_none().child(marker))
                 .children((!is_last).then(|| {
-                    let connector = div()
-                        .w(px(2.0))
+                    let line = div().w(px(2.0)).flex_1().rounded_full().bg(rgb(color));
+                    // The space around the line is part of the connector's height, so a
+                    // short row keeps it clear of both markers.
+                    div()
                         .flex_1()
                         .min_h(connector_min_height)
-                        .my(px(3.0))
-                        .rounded_full()
-                        .bg(rgb(color));
-                    if let Some(opacity) = connector_opacity {
-                        connector.opacity(opacity)
-                    } else {
-                        connector
-                    }
+                        .py(px(3.0))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(match connector_opacity {
+                            Some(opacity) => line.opacity(opacity),
+                            None => line,
+                        })
                 })),
         )
         .child(body)
