@@ -12413,6 +12413,7 @@ fn pay_from_changes_clear_acknowledgements_and_global_imports_cannot_be_chosen(
                     form.price_acknowledged = true;
                     form.high_costs_acknowledged = true;
                     form.destination_route.fee_token = Some(sell);
+                    form.destination_route.fee_token_chosen = true;
                 });
             });
             let polygon = start_polygon_session(root, &stubs, runtime, store, cx);

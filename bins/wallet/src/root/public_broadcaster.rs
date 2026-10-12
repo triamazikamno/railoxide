@@ -435,6 +435,25 @@ pub(super) fn resolve_selected_public_broadcaster_fee_token(
         .map_or(current_fee_token, |option| option.token)
 }
 
+/// The fee token to select before the user chooses one: the eligible option whose spendable
+/// balance is worth the most in USD, or the wrapped native token the wallet holds while none
+/// is priced or no broadcaster makes an offer.
+pub(super) fn highest_value_public_broadcaster_fee_token(
+    options: &[PublicBroadcasterFeeTokenOption],
+    wrapped_native: Option<Address>,
+    mut usd_micro_value: impl FnMut(&PublicBroadcasterFeeTokenOption) -> Option<U256>,
+) -> Option<Address> {
+    options
+        .iter()
+        .filter(|option| option.eligible_broadcaster_count > 0)
+        .filter_map(|option| Some((usd_micro_value(option)?, option.token)))
+        .max_by_key(|(value, _)| *value)
+        .map(|(_, token)| token)
+        .or_else(|| {
+            wrapped_native.filter(|token| options.iter().any(|option| option.token == *token))
+        })
+}
+
 pub(super) fn effective_fee_handling_mode(
     kind: DeliveryFormKind,
     action_token: Address,

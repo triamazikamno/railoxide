@@ -334,6 +334,48 @@ fn fee_token_resolution_prefers_current_then_action_then_first_eligible() {
 }
 
 #[test]
+fn default_fee_token_is_highest_usd_value_then_wrapped_native() {
+    let wrapped = Address::from([0x47; 20]);
+    let small = Address::from([0x48; 20]);
+    let unbroadcast = Address::from([0x49; 20]);
+    let option = |token, count| PublicBroadcasterFeeTokenOption {
+        token,
+        label: String::new(),
+        decimals: None,
+        max_spendable: U256::from(1),
+        eligible_broadcaster_count: count,
+        icon_path: None,
+    };
+    let options = [option(small, 1), option(wrapped, 1), option(unbroadcast, 0)];
+    let priced = |option: &PublicBroadcasterFeeTokenOption| {
+        Some(U256::from(match option.token {
+            token if token == unbroadcast => 9,
+            token if token == wrapped => 5,
+            _ => 1,
+        }))
+    };
+
+    // The largest balance with no broadcaster can't pay a fee.
+    assert_eq!(
+        highest_value_public_broadcaster_fee_token(&options, None, priced),
+        Some(wrapped)
+    );
+    assert_eq!(
+        highest_value_public_broadcaster_fee_token(&options, Some(wrapped), |_| None),
+        Some(wrapped)
+    );
+    // Held wrapped native is the fallback before any broadcaster makes an offer.
+    assert_eq!(
+        highest_value_public_broadcaster_fee_token(&options, Some(unbroadcast), |_| None),
+        Some(unbroadcast)
+    );
+    assert_eq!(
+        highest_value_public_broadcaster_fee_token(&options[..1], Some(wrapped), |_| None),
+        None
+    );
+}
+
+#[test]
 fn fee_token_submit_state_requires_selected_token_broadcaster_count() {
     let selected = Address::from([0x51; 20]);
     let other = Address::from([0x52; 20]);

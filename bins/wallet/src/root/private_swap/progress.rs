@@ -2501,7 +2501,7 @@ impl PrivateSwapsView {
             return;
         };
         let (_, token, candidates) =
-            self.setup_fee_route(self.origin_chain_id, sell, None, false, false, cx);
+            self.setup_fee_route(self.origin_chain_id, Some(sell), None, false, false, cx);
         let candidate = token.and_then(|_| {
             let root = self.root.upgrade()?;
             let root = root.read(cx);

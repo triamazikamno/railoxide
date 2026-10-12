@@ -110,7 +110,8 @@ use crate::root::private_action::{
 use crate::root::public_account::public_account_display_label;
 use crate::root::public_balances::{public_asset_icon_path, public_balance_amount_label};
 use crate::root::public_broadcaster::{
-    PublicBroadcasterFeeTokenOption, public_broadcaster_fee_token_options_from_snapshot,
+    PublicBroadcasterFeeTokenOption, highest_value_public_broadcaster_fee_token,
+    public_broadcaster_fee_token_options_from_snapshot,
     resolve_selected_public_broadcaster_fee_token,
 };
 use crate::root::spend_authorization::{
@@ -852,6 +853,9 @@ enum QuoteState {
 #[derive(Default)]
 struct SetupRoute {
     fee_token: Option<Address>,
+    /// The user picked the fee token. Until then it follows the default, which changes as
+    /// broadcaster offers and prices arrive.
+    fee_token_chosen: bool,
     fee_options: Vec<PublicBroadcasterFeeTokenOption>,
     candidates: Vec<PublicBroadcasterCandidate>,
     selected: Option<String>,
@@ -5279,11 +5283,12 @@ impl PrivateSwapsView {
 
     /// The fee tokens the private balance on `chain_id` can pay a setup broadcaster there with,
     /// the one selected, and its candidates. `preferred` is selected while `current` has no
-    /// eligible broadcaster.
+    /// eligible broadcaster. Without one, the token worth the most in USD is, or the wrapped
+    /// native token while no balance is priced.
     pub(super) fn setup_fee_route(
         &self,
         chain_id: u64,
-        preferred: Address,
+        preferred: Option<Address>,
         current: Option<Address>,
         allow_out_of_range: bool,
         favorites_only: bool,
@@ -5327,7 +5332,25 @@ impl PrivateSwapsView {
                 )
             })
             .unwrap_or_default();
-        let token = (!options.is_empty()).then(|| {
+        let token = options.first().map(|first| {
+            let preferred = preferred
+                .or_else(|| {
+                    highest_value_public_broadcaster_fee_token(
+                        &options,
+                        root.effective_chain_configs
+                            .get(chain_id)
+                            .and_then(|chain| chain.wrapped_native_token),
+                        |option| {
+                            root.public_broadcaster_anchor_cache
+                                .cached_token_usd_micro_value(
+                                    chain_id,
+                                    option.token,
+                                    option.max_spendable,
+                                )
+                        },
+                    )
+                })
+                .unwrap_or(first.token);
             resolve_selected_public_broadcaster_fee_token(
                 current.unwrap_or(preferred),
                 preferred,
@@ -5478,15 +5501,11 @@ impl PrivateSwapsView {
         let form = self.form.as_ref()?;
         let route = form.setup_route(side);
         // Each setup is paid from the private balance on its own network: by default in the
-        // token sold there, and on the destination network in the token delivered.
-        let preferred = match side {
-            SetupSide::Origin => form.sell,
-            SetupSide::Destination => form.buy.unwrap_or_default(),
-        };
+        // token worth the most there.
         let (options, token, candidates) = self.setup_fee_route(
             chain_id,
-            preferred,
-            route.fee_token,
+            None,
+            route.fee_token.filter(|_| route.fee_token_chosen),
             route.allow_out_of_range,
             route.favorites_only,
             cx,
@@ -6301,8 +6320,14 @@ impl PrivateSwapsView {
                 return;
             }
         };
-        let (_, token, candidates) =
-            self.setup_fee_route(chain_id, delivery.destination_token, None, false, false, cx);
+        let (_, token, candidates) = self.setup_fee_route(
+            chain_id,
+            Some(delivery.destination_token),
+            None,
+            false,
+            false,
+            cx,
+        );
         let candidate = token.and_then(|_| {
             let root = self.root.upgrade()?;
             let root = root.read(cx);
@@ -13135,6 +13160,7 @@ fn setup_route_settings(
                 if let Some(form) = view.form.as_mut() {
                     let route = form.setup_route_mut(side);
                     route.fee_token = Some(token);
+                    route.fee_token_chosen = true;
                     route.invalidate_estimate();
                 }
                 view.refresh_setup_route(cx);

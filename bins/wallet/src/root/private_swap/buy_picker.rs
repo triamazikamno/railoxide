@@ -435,7 +435,7 @@ impl PrivateSwapsView {
         let super::ChainUtxoState::Ready { session, .. } = root.chain_states.get(&network)? else {
             return None;
         };
-        let (options, _, _) = self.setup_fee_route(network, Address::ZERO, None, false, false, cx);
+        let (options, _, _) = self.setup_fee_route(network, None, None, false, false, cx);
         let mut balances = Vec::new();
         let mut candidates = Vec::new();
         for option in options {
