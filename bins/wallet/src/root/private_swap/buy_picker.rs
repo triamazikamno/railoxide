@@ -1202,6 +1202,7 @@ impl PrivateSwapsView {
         let network_changed = form.network != network;
         if network_changed {
             form.network = network;
+            form.blocked_shield_delivery_changed();
             // The provider follows the new network's token, unless the user picks one again.
             form.bridge.chosen = None;
         }

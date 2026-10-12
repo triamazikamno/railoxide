@@ -4781,6 +4781,7 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     ));
                     form.price_acknowledged = true;
                     form.high_costs_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     assert_eq!(form.review_problem(&review), None);
                     assert!(!form.destination_route.is_used());
                     let form = swaps.form.as_ref().unwrap();
@@ -4864,6 +4865,10 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                 swaps.update(cx, |swaps, cx| {
                     swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
                     assert_eq!(chosen(swaps), (Some(operation), Some(destination)));
+                    assert!(
+                        !swaps.form.as_ref().unwrap().blocked_shield_acknowledged,
+                        "coming back to a cross-chain Shield asks again"
+                    );
                     swaps.open_buy_picker(window, cx);
                     swaps.show_buy_picker_network(1, window, cx);
                     swaps.pick_buy_token(STUB_USDT, window, cx);
@@ -5067,6 +5072,12 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
                         Some("Confirm Swap anyway to accept the high swap costs.".to_owned())
                     );
                     form.high_costs_acknowledged = true;
+                    // A cross-chain Shield has its own acceptance, which later quotes keep.
+                    assert_eq!(
+                        form.review_problem(&review),
+                        Some(BLOCKED_SHIELD_PROBLEM.into())
+                    );
+                    form.blocked_shield_acknowledged = true;
 
                     // Offers on Polygon come and go while its account is an existing one.
                     let mut offer = crate::root::tests::fee_row(137, STUB_POLYGON_USDT, "churn");
@@ -6054,6 +6065,7 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     form.route.candidates = vec![offer];
                     form.price_acknowledged = true;
                     form.high_costs_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     let (approval, _) = swaps.setup_approval(true, Some(waku)).unwrap();
                     // A reopened setup's review reaches the same guarded persistence boundary
                     // as submission, before any setup payload is prepared or broadcast.
@@ -8149,6 +8161,7 @@ fn private_bridge_review_shows_both_setups_and_the_failure_choice(cx: &mut TestA
                         let form = swaps.form.as_mut().unwrap();
                         form.price_acknowledged = true;
                         form.high_costs_acknowledged = true;
+                        form.blocked_shield_acknowledged = true;
                     });
                 });
                 let bridge = *review.bridge().unwrap();
@@ -8633,6 +8646,7 @@ fn high_bridge_costs_require_swap_anyway(cx: &mut TestAppContext) {
                             Some("Confirm Swap anyway to accept the high swap costs.".to_owned())
                         );
                         form.high_costs_acknowledged = true;
+                        form.blocked_shield_acknowledged = true;
                         assert!(form.review_problem(&review).is_none());
                     });
                 });
@@ -12845,7 +12859,9 @@ fn changed_public_delivery_keeps_the_corrected_review_until_the_draft_changes(
                         .routes
                         .insert((STUB_USDT, 137), vec![route.clone()]);
                     swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                 });
             });
@@ -12947,7 +12963,9 @@ fn changed_public_delivery_keeps_the_corrected_review_until_the_draft_changes(
             );
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                     assert!(swaps.public_authorization.is_some(), "completed approvals must not block the corrected review with an obsolete gas budget");
                 });
@@ -13079,7 +13097,9 @@ fn permit_public_order_needs_no_native_balance_through_a_corrected_delivery(
                         approval.text_for_test(),
                         Some(("signed, not sent", Some("no gas")))
                     );
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                     assert!(
                         swaps.public_authorization.is_some(),
@@ -13151,7 +13171,9 @@ fn permit_public_order_needs_no_native_balance_through_a_corrected_delivery(
                     assert_eq!(shown.bridge().received_minimum(), corrected_minimum);
                     assert!(shown.signs_permit());
                     assert!(form.quote_task.is_none());
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                     assert!(
                         swaps.public_authorization.is_some(),
@@ -13233,7 +13255,9 @@ fn closing_public_preparation_aborts_continuation_and_continue_keeps_the_durable
                         .routes
                         .insert((sell, 137), vec![route]);
                     swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                 });
             });
@@ -13335,7 +13359,9 @@ fn closing_public_preparation_aborts_continuation_and_continue_keeps_the_durable
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
                     swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
-                    swaps.form.as_mut().unwrap().price_acknowledged = true;
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                 });
             });
@@ -13558,6 +13584,7 @@ fn public_amounts_use_selected_balance_metadata_through_review_max_and_restore(
                     let form = swaps.form.as_mut().unwrap();
                     form.price_acknowledged = true;
                     form.high_costs_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
                     swaps.request_public_review(window, cx);
                 });
             });
@@ -13780,7 +13807,9 @@ fn public_form_and_review_follow_the_path_and_name_the_paying_account(cx: &mut T
                                 "a deposit has no order, so no gas share, price or tolerance rows"
                             );
                         }
-                        swaps.form.as_mut().unwrap().price_acknowledged = true;
+                        let form = swaps.form.as_mut().unwrap();
+                        form.price_acknowledged = true;
+                        form.blocked_shield_acknowledged = true;
                         swaps.request_public_review(window, cx);
                         assert!(
                             swaps.public_authorization.is_some(),

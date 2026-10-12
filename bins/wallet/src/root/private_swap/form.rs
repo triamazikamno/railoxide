@@ -160,6 +160,18 @@ const ENTER_RECEIVER: &str = "Enter an address.";
 const INVALID_RECEIVER: &str = "Enter a valid public EVM recipient address";
 const EXTERNAL_DELIVERY_DISCLOSURE: &str = "The order names the receiver, and the settlement pays it in the same transaction that unshields from Railgun, so the receiver and amount are linked to that spend.";
 const NEAR_INTENTS_DISCLAIMER: &str = "A bridge operator holds the funds between the deposit and delivery. Refunds depend on the 1Click service and aren't guaranteed.";
+// A temporary notice for a known Private POI list operator issue. Remove these and the notice's
+// checkbox once the issue is fixed.
+const BLOCKED_SHIELD_HEADLINE: &str = "Cross-chain Shields are often blocked right now.";
+const BLOCKED_SHIELD_DETAILS: &str = "A Private POI list is currently blocking many Shields that arrive from another network. The issue is temporary and is being fixed. A blocked Shield can't be spent privately. You can refund it to the stealth account that made it, which is public and needs gas for the refund.";
+/// What a private payer can do instead, so the notice doesn't read as a risk to every swap.
+const BLOCKED_SHIELD_PRIVATE_ALTERNATIVES: &str =
+    "Same-network swaps and delivery to a Public address aren't affected.";
+/// What a Public payer can do instead: its form only shields on another network.
+const BLOCKED_SHIELD_PUBLIC_ALTERNATIVES: &str = "Shielding on this network isn't affected.";
+const BLOCKED_SHIELD_LABEL: &str = "I accept that this Shield may be blocked";
+const BLOCKED_SHIELD_PROBLEM: &str = "Accept the blocked Shield risk before you review the swap.";
+const BLOCKED_SHIELD_REVIEW_WARNING: &str = "Cross-chain Shields are often blocked right now. A blocked Shield can't be spent privately. You can refund it to the stealth account that made it, which is public and needs gas for the refund.";
 /// The steps of a new swap, as its reviews' stepper names them.
 const SWAP_STEPS: [&str; 2] = ["Set up stealth account", "Place order"];
 /// The steps of a private Bridge swap, which sets up a stealth account on each network.
@@ -1248,6 +1260,9 @@ pub(super) struct SwapForm {
     /// Acceptance of the lower delivery an earlier order of the swap can still make. Applies
     /// only to the current form quote, like `high_costs_acknowledged`.
     continuing_acknowledged: bool,
+    /// Acceptance that a private Bridge delivery's Shield may be blocked. Applies to the
+    /// delivery kind, so a new quote keeps it; leaving a private Bridge delivery clears it.
+    blocked_shield_acknowledged: bool,
     error: Option<String>,
     /// The order detail this form continues or retries, which Back returns to.
     back_to_detail: Option<ExecutorOperationId>,
@@ -1272,6 +1287,20 @@ impl SwapForm {
     /// private Bridge swap with a stealth account on each network.
     const fn private_bridge(&self) -> bool {
         matches!(self.receive_to, ReceiveTo::PrivateBalance) && self.network.is_some()
+    }
+
+    /// The form's delivery makes a cross-chain Shield whose blocked-Shield risk isn't accepted
+    /// yet. A speed-up's open order already carries that delivery.
+    const fn blocked_shield_unaccepted(&self) -> bool {
+        self.private_bridge() && self.speed_up.is_none() && !self.blocked_shield_acknowledged
+    }
+
+    /// Receive to or the network changed: once the delivery is no longer a private Bridge
+    /// delivery, coming back to one asks for the blocked-Shield acceptance again.
+    const fn blocked_shield_delivery_changed(&mut self) {
+        if !self.private_bridge() {
+            self.blocked_shield_acknowledged = false;
+        }
     }
 
     /// The existing account chosen as the private Bridge delivery's destination. A choice made
@@ -1473,6 +1502,7 @@ impl SwapForm {
             Ok(_) if review.continuing_minimum().is_some() && !self.continuing_acknowledged => {
                 Some("Accept the earlier order's delivery before you review the swap.".into())
             }
+            Ok(_) if self.blocked_shield_unaccepted() => Some(BLOCKED_SHIELD_PROBLEM.into()),
             Ok(_) => None,
         }
     }
@@ -3393,6 +3423,7 @@ impl PrivateSwapsView {
             price_acknowledged: false,
             high_costs_acknowledged: false,
             continuing_acknowledged: false,
+            blocked_shield_acknowledged: false,
             error: None,
             back_to_detail: None,
             speed_up: None,
@@ -4398,6 +4429,7 @@ impl PrivateSwapsView {
             return;
         };
         form.receive_to = receive_to;
+        form.blocked_shield_delivery_changed();
         form.native_output = false;
         form.set_receiver_suggestions((false, None));
         if let Some(wrapped) = unwrapped {
@@ -7433,6 +7465,9 @@ impl PrivateSwapsView {
             summary
         };
         let mut warnings = Vec::new();
+        if private.is_some() {
+            warnings.push(Arc::from(BLOCKED_SHIELD_REVIEW_WARNING));
+        }
         if !review.price_verified() {
             warnings.push(Arc::from(UNVERIFIED_PRICE_WARNING));
         }
@@ -9398,6 +9433,18 @@ impl PrivateSwapsView {
             .children(self.render_price_acknowledgement(form, cx))
             .children(self.render_continuing_acknowledgement(form, editable, cx))
             .child(self.render_delivery(form, terms_editable, cx))
+            .children(
+                form.private_bridge()
+                    .then(|| {
+                        Self::render_blocked_shield_acknowledgement(
+                            form,
+                            BLOCKED_SHIELD_PRIVATE_ALTERNATIVES,
+                            editable,
+                            cx,
+                        )
+                    })
+                    .flatten(),
+            )
             .child(self.render_account_row(form, mode, terms_editable, cx))
             .children(review.map(|review| {
                 self.render_details(
@@ -11101,6 +11148,70 @@ impl PrivateSwapsView {
                                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                     if let Some(form) = this.form.as_mut() {
                                         form.continuing_acknowledged = *checked;
+                                        form.error = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// The notice that a private Bridge delivery's Shield may be blocked, with its consent
+    /// checkbox inside the warning frame. It needs no quote, and a speed-up doesn't ask again.
+    /// The caller shows it only on a form that shields on another network, and names the
+    /// `alternatives` that form's payer has.
+    fn render_blocked_shield_acknowledgement(
+        form: &SwapForm,
+        alternatives: &'static str,
+        editable: bool,
+        cx: &Context<'_, Self>,
+    ) -> Option<gpui::Div> {
+        if form.speed_up.is_some() {
+            return None;
+        }
+        let warning_color = cx.theme().warning;
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(warning_color.mix_oklab(gpui::transparent_white(), 0.3))
+                .bg(warning_color.mix_oklab(gpui::transparent_white(), 0.04))
+                .debug_selector(|| "swap-blocked-shield-warning".into())
+                .child(
+                    Alert::warning("swap-blocked-shield-warning", BLOCKED_SHIELD_HEADLINE)
+                        .small()
+                        .min_w_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .p_0()
+                        .border_0()
+                        .bg(gpui::transparent_black()),
+                )
+                .child(
+                    app_muted_text(BLOCKED_SHIELD_DETAILS)
+                        .min_w_0()
+                        .whitespace_normal(),
+                )
+                .child(app_muted_text(alternatives).min_w_0().whitespace_normal())
+                .child(
+                    div()
+                        .debug_selector(|| "swap-blocked-shield-acknowledged".into())
+                        .child(
+                            Checkbox::new("swap-blocked-shield-acknowledged")
+                                .label(BLOCKED_SHIELD_LABEL)
+                                .checked(form.blocked_shield_acknowledged)
+                                .small()
+                                .disabled(!editable)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    if let Some(form) = this.form.as_mut() {
+                                        form.blocked_shield_acknowledged = *checked;
                                         form.error = None;
                                     }
                                     cx.notify();

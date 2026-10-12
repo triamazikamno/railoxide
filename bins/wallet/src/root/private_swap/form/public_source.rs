@@ -1309,6 +1309,9 @@ impl PrivateSwapsView {
         if self.public_high_cost(form, &review, cx).is_some() && !form.high_costs_acknowledged {
             return Err("A large share of this swap may go to costs. Review them and choose Swap anyway to continue.".into());
         }
+        if form.blocked_shield_unaccepted() {
+            return Err(BLOCKED_SHIELD_PROBLEM.into());
+        }
         {
             let root = self.root.upgrade().ok_or("The wallet session ended.")?;
             let root = root.read(cx);
@@ -1915,7 +1918,8 @@ impl PrivateSwapsView {
                 proxy.as_deref(),
             );
         }
-        let mut warnings = Vec::new();
+        // A Public payer's swap always shields on another network.
+        let mut warnings = vec![Arc::from(BLOCKED_SHIELD_REVIEW_WARNING)];
         if !review.price_verified() {
             warnings.push(Arc::from(UNVERIFIED_PRICE_WARNING));
         }
@@ -3447,6 +3451,12 @@ impl PrivateSwapsView {
                 form.network
                     .map(|network| self.render_shield_failure_row(form, network, editable, cx)),
             )
+            .children(Self::render_blocked_shield_acknowledgement(
+                form,
+                BLOCKED_SHIELD_PUBLIC_ALTERNATIVES,
+                !self.busy(),
+                cx,
+            ))
             .child(self.render_account_row(form, FormMode::Order, editable, cx))
             .children(review.map(|review| self.render_public_details(form, review, editable, cx)))
             // The reviewed swap is being claimed. Its detail shows what follows.
@@ -3505,6 +3515,7 @@ impl PrivateSwapsView {
         let ready = review.is_some_and(|review| {
             (review.price_verified() || form.price_acknowledged)
                 && (high_cost.is_none() || form.high_costs_acknowledged)
+                && !form.blocked_shield_unaccepted()
                 // Debug UI fixture: its stand-in setup fee needs no estimate.
                 && (self.destination_setup_chain(form).is_none()
                     || form.destination_route.offered_estimate().is_some()
