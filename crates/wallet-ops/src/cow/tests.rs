@@ -455,6 +455,7 @@ async fn order_hints_read_the_status_trade_block_and_fee_from_the_uid_alone() {
         report,
         CowOrderStatusReport {
             status: CowOrderStatusHint::Fulfilled,
+            executed_buy_amount: Some(U256::from(49_404_100_000_000_000_000_u128)),
         }
     );
     let trades = format!(

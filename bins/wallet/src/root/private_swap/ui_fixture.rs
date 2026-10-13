@@ -1,6 +1,6 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
-//! retry review, speed-up, split outcome and setup progress, at the Stealth accounts inspector
-//! and at the refund dialog of a blocked Shield: it opens them on a scratch wallet without
+//! retry review, speed-up, split outcome, reported fill and setup progress, at the Stealth
+//! accounts inspector and at the refund dialog of a blocked Shield: it opens them on a scratch wallet without
 //! private funds and holds a chosen state on screen. It is compiled only with
 //! `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
@@ -118,11 +118,27 @@
 //!   retry dialog of that account alone. A wallet without private funds has no broadcaster to
 //!   pay there, so the dialog says so and its Continue stays disabled. The footer has no
 //!   Retry setup… or Continue…, and the detail's other actions do nothing.
+//! - `reported:<state>` opens the swap dialog, in place of a Public account's form, on the
+//!   detail of a synthesized swap of 0.05 WETH for USDC on Ethereum whose one order is open on
+//!   its record while the orderbook reports it filled for 101.31 USDC. Nothing of the fill is
+//!   on the record: it is this session's report, counted from a head block of the fixture's
+//!   own, so the count holds still. In every state the reported block was read and holds the
+//!   trade. `fill` is a swap back to the private balance, 3 blocks after the reported
+//!   settlement, whose block shows the shield of 101.06 USDC. `handoff` is that swap delivered
+//!   by Across to a public receiver on Arbitrum One, also 3 blocks after it, whose block shows
+//!   the deposit of 100.46 USDC, with no answer from Across yet. `delivered` is the same 2
+//!   blocks after it, with Across's report of a delivery of 100 USDC. `shielded` and `held`
+//!   are that report for the swap delivered to the private balance on Arbitrum One instead,
+//!   through stealth account #12 there, once the fill block on Arbitrum One was read: it
+//!   shows the shield, which credits 99.75 USDC privately, or the 100 USDC held by that
+//!   account, whose shield didn't run. Copy buttons work, and the detail's other actions do
+//!   nothing.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
 //! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode opens the
-//! route its orderbook client would use, and sends nothing on it.
+//! route its orderbook client would use, and sends nothing on it. A `reported:` mode asks no
+//! orderbook, chain or bridge provider about its swap.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,7 +147,7 @@ use std::time::Duration;
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use gpui::{App, Context, Window};
-use wallet_ops::cow::OrderUid;
+use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderUid};
 use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgePrivateDelivery, BridgeProvider,
@@ -145,15 +161,16 @@ use wallet_ops::vault::{
 };
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
-    OperationNetworkIsolation, PairAnchorRate, PublicBroadcasterResultKind, SwapContinuingApproval,
-    SwapReview, SwapReviewChange, SwapSpeedUpRefusal, TransactionGenerationStage,
+    OperationNetworkIsolation, PairAnchorRate, PublicBroadcasterResultKind, SwapBridgeReport,
+    SwapContinuingApproval, SwapDeliverySeen, SwapHandoffHint, SwapReview, SwapReviewChange,
+    SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage,
 };
 
 use super::dialog::SwapDialogView;
 use super::form::SetupSide;
 use super::model::SwapIdentity;
 use super::setup_progress::SetupProgress;
-use super::{PrivateSwapsView, SwapJob, SwapJobKind, now_unix};
+use super::{PrivateSwapsView, SwapEarlyHint, SwapJob, SwapJobKind, SwapOrderHint, now_unix};
 use crate::root::WalletRoot;
 use crate::root::utxo::BlockedShieldRefundDialogState;
 
@@ -181,6 +198,24 @@ enum Mode {
     Split(Split),
     SpeedUp(SpeedUp),
     Setup(Setup),
+    Reported(Reported),
+}
+
+/// What a `reported:` mode's session holds about the synthesized private swap's open order,
+/// which the orderbook reports filled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reported {
+    /// A swap back to the private balance whose shield was read from the reported block.
+    Fill,
+    /// A Bridge swap whose deposit was read from the reported block, with no provider report.
+    Handoff,
+    /// A Bridge swap whose provider reports the delivery.
+    Delivered,
+    /// A private Bridge swap whose reported delivery's fill block shows the shield.
+    Shielded,
+    /// A private Bridge swap whose reported delivery's fill block shows the proceeds held by
+    /// the destination stealth account.
+    Held,
 }
 
 /// Where a `setup:` mode holds the setup of the synthesized private swap's stealth accounts.
@@ -340,6 +375,16 @@ fn parse(value: &str) -> Option<Mode> {
             _ => return None,
         }));
     }
+    if let Some(state) = value.strip_prefix("reported:") {
+        return Some(Mode::Reported(match state {
+            "fill" => Reported::Fill,
+            "handoff" => Reported::Handoff,
+            "delivered" => Reported::Delivered,
+            "shielded" => Reported::Shielded,
+            "held" => Reported::Held,
+            _ => return None,
+        }));
+    }
     if let Some(state) = value.strip_prefix("fee:") {
         return Some(Mode::Fee(match state {
             "checking" => Fee::Checking,
@@ -437,8 +482,23 @@ pub(super) fn holds_records() -> bool {
 pub(super) fn holds_swaps() -> bool {
     matches!(
         mode(),
-        Some(Mode::RetryReview | Mode::Split(_) | Mode::SpeedUp(_) | Mode::Setup(_))
+        Some(
+            Mode::RetryReview
+                | Mode::Split(_)
+                | Mode::SpeedUp(_)
+                | Mode::Setup(_)
+                | Mode::Reported(_)
+        )
     )
+}
+
+/// The head block a `reported:` mode counts its reported settlement's confirmations from, in
+/// place of the synced head. `None` in every other mode.
+pub(super) fn reported_head() -> Option<u64> {
+    let Mode::Reported(reported) = mode()? else {
+        return None;
+    };
+    Some(REPORTED_TRADE_BLOCK + reported.confirmations())
 }
 
 /// What approving the review of a `retry-review` or speed-up mode ends in, in place of placing
@@ -850,8 +910,8 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     .ok()
 }
 
-/// The network the private swap of a `retry-review`, `split:`, speed-up or `setup:` mode sells
-/// on.
+/// The network the private swap of a `retry-review`, `split:`, speed-up, `setup:` or
+/// `reported:` mode sells on.
 const SWAP_ORIGIN: u64 = 1;
 /// The block the synthesized private swap's observations count from.
 const SWAP_ORIGIN_BLOCK: u64 = 24_612_480;
@@ -878,6 +938,52 @@ const RETRY: (u64, u64) = (100_460_000, 100_000_000);
 const SPED_UP: (u64, u64) = (95_440_000, 95_000_000);
 /// What the trade bought, 101.31 USDC.
 const SWAP_BOUGHT: u64 = 101_312_480;
+/// What a `reported:fill` mode's shield credits privately, 101.06 USDC: the bought amount less
+/// the 0.25% shield fee.
+const REPORTED_SHIELDED: u64 = 101_059_199;
+
+/// The block the orderbook reports a `reported:` mode's trade in.
+const REPORTED_TRADE_BLOCK: u64 = SWAP_ORIGIN_BLOCK + 160;
+
+impl Reported {
+    /// How many blocks the head is past the reported trade block.
+    const fn confirmations(self) -> u64 {
+        match self {
+            Self::Fill | Self::Handoff => 3,
+            Self::Delivered | Self::Shielded | Self::Held => 2,
+        }
+    }
+
+    /// Whether Across reports the swap's delivery.
+    const fn delivered(self) -> bool {
+        matches!(self, Self::Delivered | Self::Shielded | Self::Held)
+    }
+
+    /// Whether the swap delivers to the private balance on Arbitrum One.
+    const fn private(self) -> bool {
+        matches!(self, Self::Shielded | Self::Held)
+    }
+}
+
+/// The record of a `reported:` mode's swap: one open order, signed five minutes ago, with
+/// nothing observed. `Fill` delivers to the private balance on Ethereum, `Shielded` and `Held`
+/// by Across to the private balance on Arbitrum One with a 0.25% shield fee there, and the
+/// other states by Across to the public receiver on Arbitrum One.
+fn staged_reported(reported: Reported) -> Option<ExecutorRecord> {
+    let signed = now_unix().saturating_sub(300);
+    let open = serde_json::to_value(SwapOrderObservations::default()).ok()?;
+    let mut order = staged_order(0, signed, RETRY, 0xa1, &open)?;
+    if reported == Reported::Fill {
+        order["delivery"] = serde_json::to_value(SwapDelivery::Reshield).ok()?;
+        order["bridge"] = serde_json::Value::Null;
+        order["bounds"]["destination_minimum"] = serde_json::Value::Null;
+    }
+    if reported.private() {
+        order["delivery"] = serde_json::to_value(SwapDelivery::Bridge(PRIVATE_DELIVERY)).ok()?;
+        order["bounds"]["destination_shield_fee_bps"] = serde_json::json!(U256::from(25_u8));
+    }
+    staged_swap_record(&[order], 1, signed)
+}
 
 /// Order `attempt` of the synthesized private swap, as its record stores it: signed at `signed`
 /// for 20 minutes, with a deposit that Across has four hours to fill. `hash` tells its ID and
@@ -1216,6 +1322,15 @@ pub(super) fn retry_review(
 /// The destination stealth account of a `setup:` mode's private Bridge swap, on Arbitrum One.
 /// No wallet holds it.
 const SETUP_DESTINATION_ACCOUNT: Address = address!("51fc8a2e6d0b94c37e15a8f26d3c40b97e2ab7a2");
+/// The synthesized swap's delivery by Across to the private balance on Arbitrum One, through
+/// that account.
+const PRIVATE_DELIVERY: BridgeDelivery = BridgeDelivery {
+    receiver: SETUP_DESTINATION_ACCOUNT,
+    private: Some(BridgePrivateDelivery {
+        on_shield_failure: BridgeShieldFailure::RefundOnOrigin,
+    }),
+    ..SWAP_DELIVERY
+};
 
 /// The record of one stealth account of a `setup:` mode's swap, decoded from the JSON a stored
 /// record has, with `links` its own swap fields. A sent setup signed one payload, and a
@@ -1324,13 +1439,7 @@ impl PrivateSwapsView {
             )
         });
         let bridged = matches!(setup, Setup::TwoAccounts | Setup::DestinationFailed);
-        let delivery = bridged.then_some(BridgeDelivery {
-            receiver: SETUP_DESTINATION_ACCOUNT,
-            private: Some(BridgePrivateDelivery {
-                on_shield_failure: BridgeShieldFailure::RefundOnOrigin,
-            }),
-            ..SWAP_DELIVERY
-        });
+        let delivery = bridged.then_some(PRIVATE_DELIVERY);
         let operation = ExecutorOperationId::random().ok();
         let destination_operation = ExecutorOperationId::random().ok();
         let staged = || {
@@ -1461,9 +1570,99 @@ impl PrivateSwapsView {
         self.show_detail(operation, window, cx);
     }
 
-    /// In a `retry-review`, `split:`, speed-up or `setup:` mode, show the synthesized private
-    /// swap in place of the Public account form that was asked for. `true` when such a mode is
-    /// on.
+    /// In a `reported:` mode, show the detail of the synthesized swap with what this session
+    /// would hold of its reported fill: the orderbook's report with the bought amount and the
+    /// trade block, and what that block gave once read: the trade, a private swap's shield,
+    /// and for a Bridge swap the hand-off, with the provider's report. A private Bridge swap
+    /// also has its destination stealth account's record, and its report holds what the fill
+    /// block on the destination network showed.
+    fn open_ui_fixture_reported(
+        &mut self,
+        reported: Reported,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(record) = staged_reported(reported) else {
+            tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
+            return;
+        };
+        let operation = record.operation();
+        let Some(order) = record.swap().and_then(|swap| swap.orders().last()) else {
+            return;
+        };
+        let uid = order.uid();
+        if reported.private() {
+            let swap_use = order
+                .use_id()
+                .unwrap_or_else(|| SwapUseId::first(operation));
+            let destination = ExecutorOperationId::random().ok().and_then(|destination| {
+                staged_setup_account(
+                    destination,
+                    (12, SETUP_DESTINATION_ACCOUNT, Address::repeat_byte(0x5d)),
+                    (true, true),
+                    &serde_json::json!({ "swap_destination": {
+                        "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
+                        "destination_token": PRIVATE_DELIVERY.destination_token,
+                    }}),
+                )
+            });
+            self.destinations.insert(
+                SwapIdentity {
+                    operation,
+                    swap_use,
+                },
+                destination,
+            );
+        }
+        let tracking = self.tracking.entry(operation).or_default();
+        tracking.order_hints.insert(
+            uid,
+            SwapOrderHint {
+                report: CowOrderStatusReport {
+                    status: CowOrderStatusHint::Fulfilled,
+                    executed_buy_amount: Some(U256::from(SWAP_BOUGHT)),
+                },
+                trade_block: Some(REPORTED_TRADE_BLOCK),
+            },
+        );
+        let block = BlockNumHash::new(REPORTED_TRADE_BLOCK, keccak256("settlement"));
+        let bridged = reported != Reported::Fill;
+        let delivered = U256::from(RETRY.1);
+        tracking.early_hints.insert(
+            uid,
+            SwapEarlyHint {
+                trade_block: Some(REPORTED_TRADE_BLOCK),
+                block_read: true,
+                settlement: Some(SwapSettlementHint {
+                    block,
+                    bought: U256::from(SWAP_BOUGHT),
+                    shielded: (!bridged).then_some(U256::from(REPORTED_SHIELDED)),
+                    handoff: bridged.then_some(SwapHandoffHint {
+                        block,
+                        deposit_id: Some(U256::from(3_481_207_u32)),
+                        sent: U256::from(RETRY.0),
+                    }),
+                }),
+                report: reported.delivered().then_some(SwapBridgeReport::Delivered {
+                    amount_out: Some(delivered),
+                    seen: match reported {
+                        Reported::Shielded => {
+                            Some(SwapDeliverySeen::Shielded { amount: delivered })
+                        }
+                        Reported::Held => Some(SwapDeliverySeen::Held { amount: delivered }),
+                        Reported::Fill | Reported::Handoff | Reported::Delivered => None,
+                    },
+                }),
+                reads_fill: reported.private(),
+            },
+        );
+        self.records = vec![record];
+        self.show_detail(operation, window, cx);
+    }
+
+    /// In a `retry-review`, `split:`, speed-up, `setup:` or `reported:` mode, show the
+    /// synthesized private swap in place of the Public account form that was asked for. `true`
+    /// when such a mode is on.
     pub(super) fn open_ui_fixture_swap(
         &mut self,
         window: &mut Window,
@@ -1471,7 +1670,12 @@ impl PrivateSwapsView {
     ) -> bool {
         // The detail's stage, or none for a mode that opens the form.
         let detail = match mode() {
-            Some(Mode::RetryReview | Mode::SpeedUp(SpeedUp::Review) | Mode::Setup(_)) => None,
+            Some(
+                Mode::RetryReview
+                | Mode::SpeedUp(SpeedUp::Review)
+                | Mode::Setup(_)
+                | Mode::Reported(_),
+            ) => None,
             Some(Mode::Split(split)) => Some((Some(split), None)),
             Some(Mode::SpeedUp(speed_up)) => Some((None, Some(speed_up))),
             _ => return false,
@@ -1482,6 +1686,10 @@ impl PrivateSwapsView {
         }
         if let Some(Mode::Setup(setup)) = mode() {
             self.open_ui_fixture_setup(setup, window, cx);
+            return true;
+        }
+        if let Some(Mode::Reported(reported)) = mode() {
+            self.open_ui_fixture_reported(reported, window, cx);
             return true;
         }
         let Some((split, speed_up)) = detail else {

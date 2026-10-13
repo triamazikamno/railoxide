@@ -58,6 +58,7 @@ pub use continuing::{
     SwapContinuingApproval, SwapContinuingApprovals, SwapQuoteAgeEvidence,
     swap_continuing_approvals,
 };
+pub use destination::{SwapBridgeReport, SwapDeliverySeen};
 pub use observation::{SwapOrderState, swap_attempt_state, swap_order_state};
 pub(super) use order::invalidates_order;
 #[cfg(test)]
@@ -94,6 +95,7 @@ pub(super) use recovery::swap_recovery_call_bound;
 #[cfg(test)]
 pub(crate) use recovery::{swap_cancellation_admitted, swap_recovery_calls};
 pub(crate) use settlement::Transfer;
+pub use settlement::{SwapHandoffHint, SwapSettlementHint};
 
 /// Neutral purpose recorded for swap executors; the tokens stay in the setup approval and
 /// the order terms.

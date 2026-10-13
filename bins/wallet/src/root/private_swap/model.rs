@@ -1360,9 +1360,71 @@ pub(in crate::root) struct SwapBridgeLabels {
     pub(in crate::root) private: Option<SwapPrivateBridgeLabels>,
     /// The recorded delivery is the provider's report, which the wallet didn't verify.
     pub(in crate::root) reported: bool,
+    /// The deposit in the reported trade block, while the swap's fill is reported and its
+    /// settlement isn't verified, with "248.82 USDC" of the bought token. `Looking` otherwise.
+    pub(in crate::root) deposit: SwapSeen,
+    /// What the provider reports about the delivery while the swap's fill is reported and its
+    /// settlement isn't verified. `None` without such a report, and once a hand-off is recorded.
+    pub(in crate::root) report: Option<SwapBridgeReported>,
+}
+
+/// A bridge provider's answer about a deposit the wallet hasn't verified. It changes copy only:
+/// the stage, the actions and the outcome follow what observation records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) enum SwapBridgeReported {
+    /// Delivered, with "248.71 USDC" when the provider gives the amount. A private delivery's
+    /// amount is before the destination network's shield fee, and `shield` tells what its fill
+    /// block shows. A public delivery has no shield, and nothing reads the field.
+    Delivered {
+        amount: Option<String>,
+        shield: SwapShieldSeen,
+    },
+    Pending,
+    Refunded,
+    Failed,
+}
+
+/// What the fill block of a reported private delivery shows on the destination network, before
+/// the wallet verified the settlement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) enum SwapShieldSeen {
+    /// The fill block wasn't read yet.
+    Looking,
+    /// The destination stealth account shielded the delivery, with "248.09 USDC", the private
+    /// credit after the shield fee.
+    Detected(String),
+    /// The destination stealth account holds the delivery, "248.71 USDC", and its shield
+    /// didn't run.
+    Held(String),
 }
 
 impl SwapBridgeLabels {
+    /// The shield of a private delivery the provider reports made before the wallet verified
+    /// the settlement. `None` for a public delivery and without such a report.
+    const fn reported_shield(&self) -> Option<&SwapShieldSeen> {
+        match (&self.private, &self.report) {
+            (Some(_), Some(SwapBridgeReported::Delivered { shield, .. })) => Some(shield),
+            _ => None,
+        }
+    }
+
+    /// Whether the swap reads as delivered before the wallet verified the settlement: the
+    /// provider reports the delivery to a public receiver, or the fill block of a private one
+    /// shows its shield.
+    const fn delivery_reported(&self) -> bool {
+        matches!(
+            (self.reported_shield(), &self.report),
+            (Some(SwapShieldSeen::Detected(_)), _)
+                | (None, Some(SwapBridgeReported::Delivered { .. }))
+        )
+    }
+
+    /// Whether the fill block of a reported private delivery shows the proceeds held by the
+    /// destination stealth account.
+    const fn delivery_held(&self) -> bool {
+        matches!(self.reported_shield(), Some(SwapShieldSeen::Held(_)))
+    }
+
     /// Who gets the proceeds on the destination network, as copy names it after "to".
     const fn destination(&self) -> &str {
         if self.private.is_some() {
@@ -1517,26 +1579,99 @@ pub(in crate::root) fn bridge_sent_amount(order: &SwapOrderRecord) -> Option<U25
     }
 }
 
+/// A part of a reported settlement, as the reported trade block shows it before finality depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::root) enum SwapSeen {
+    /// The block isn't known or wasn't read yet.
+    Looking,
+    /// The block holds it, with "49.28 DAI" where it gives an amount.
+    Detected(Option<String>),
+    /// The block was read and doesn't show it.
+    NotFound,
+}
+
 /// The orderbook reports an open order filled before canonical observation records the trade.
 /// It changes copy and hides cancellation; the stage, other actions, reservations and recovery
-/// follow observation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// follow observation. Every step the settlement performs shows as confirming, with the count
+/// and the bought amount on the trade, and each other step tells whether the reported trade
+/// block shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::root) struct SwapFillHint {
     /// Blocks from the reported trade block to the synced head, when both are known.
     pub(in crate::root) confirmations: Option<u64>,
     /// The chain's finality depth, after which observation reads the trade.
     pub(in crate::root) depth: u64,
+    /// "49.40 DAI", the bought amount before any shield fee: the trade's in the reported block
+    /// once that was read, the orderbook's before.
+    pub(in crate::root) bought: Option<String>,
+    /// The reported trade block was read and holds the trade.
+    pub(in crate::root) detected: bool,
+    /// A swap back to the private balance: its shield in the reported trade block, with the
+    /// private credit after the shield fee. `Looking` for any other delivery.
+    pub(in crate::root) shield: SwapSeen,
+    /// The swap's own network, such as "Ethereum", whose blocks the count is of.
+    pub(in crate::root) origin: String,
 }
 
 impl SwapFillHint {
     /// Confirmations first, then the canonical check still needed after the threshold.
-    fn progress(self) -> String {
+    fn progress(&self) -> String {
         match self.confirmations {
             Some(confirmations) if confirmations >= self.depth => "Verifying settlement…".into(),
             Some(confirmations) => format!("Confirming ({confirmations}/{})", self.depth),
             None => "Confirming".into(),
         }
     }
+
+    /// The Traded step's detail: the progress, then the bought amount when there is one, as
+    /// the orderbook's report until the reported block shows the trade. The amount is what the
+    /// order bought, which isn't what the receiver got.
+    fn traded(&self) -> String {
+        let progress = self.progress();
+        match &self.bought {
+            Some(bought) if self.detected => format!("{progress} · {bought} bought"),
+            Some(bought) => format!("{progress} · CoW reports {bought} bought"),
+            None => progress,
+        }
+    }
+
+    /// The private return's detail: whether the reported trade block shows the shield.
+    fn shielded(&self) -> String {
+        match &self.shield {
+            SwapSeen::Looking => "Looking for the shield…".into(),
+            SwapSeen::Detected(Some(amount)) => format!("Shield detected · {amount}"),
+            SwapSeen::Detected(None) => "Shield detected".into(),
+            SwapSeen::NotFound => "No shield detected yet".into(),
+        }
+    }
+}
+
+/// The note under the steps of a swap whose fill is reported and not verified: nothing is left
+/// for the user to do, and the wallet acts on a reported refund or failure, or on a private
+/// delivery its fill block shows held, only once the settlement is verified. `None` without a
+/// reported fill.
+pub(in crate::root) fn reported_fill_note(stage: SwapStage, labels: &SwapLabels) -> Option<String> {
+    if !matches!(
+        stage,
+        SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
+    ) {
+        return None;
+    }
+    let SwapFillHint { depth, origin, .. } = labels.fill_hint.as_ref()?;
+    let problem = labels.bridge.as_ref().is_some_and(|bridge| {
+        bridge.delivery_held()
+            || matches!(
+                bridge.report,
+                Some(SwapBridgeReported::Refunded | SwapBridgeReported::Failed)
+            )
+    });
+    Some(if problem {
+        format!(
+            "The wallet acts on this once the result is confirmed, after {depth} blocks on {origin}."
+        )
+    } else {
+        format!("Nothing more to do. The result is confirmed after {depth} blocks on {origin}.")
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1574,7 +1709,28 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
             if labels.fill_hint.is_some() =>
         {
-            line(format!("Swapping {pair}"), "Traded · confirming".into())
+            line(
+                format!("Swapped {pair}"),
+                match bridge.map(|bridge| (bridge, bridge.reported_shield())) {
+                    Some((bridge, Some(SwapShieldSeen::Detected(_)))) => format!(
+                        "Shielded to {} on {} · confirming",
+                        bridge.destination(),
+                        bridge.network
+                    ),
+                    // The provider delivered to the destination stealth account, whose fill
+                    // block wasn't read yet.
+                    Some((bridge, Some(SwapShieldSeen::Looking))) => {
+                        format!("Delivered on {} · confirming", bridge.network)
+                    }
+                    Some((bridge, None)) if bridge.delivery_reported() => format!(
+                        "Delivered to {} on {} · confirming",
+                        bridge.destination(),
+                        bridge.network
+                    ),
+                    // Held proceeds weren't delivered to the private balance.
+                    _ => "Traded · confirming".into(),
+                },
+            )
         }
         SwapStage::SetupNotSent => line(
             format!("Swap of {pair} isn't set up"),
@@ -1922,10 +2078,12 @@ const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 
 /// The progress steps of decision 8: set up, order open, traded, back in private balance. An
 /// attempt that ended, or stranded funds before a trade, ends the list at the order step. A
-/// fill the orderbook reports shows the trade confirming until observation records it. A Public
-/// address swap has no private-balance step, as [`external_steps`] describes, and a Bridge swap
-/// hands off to its bridge instead, as [`bridge_steps`] describes. Once the swap has an order,
-/// the order step carries its ID.
+/// fill the orderbook reports shows every step its settlement performs as confirming until
+/// observation records it, with one confirmation count, on the trade, and the private return
+/// tells whether the reported trade block shows its shield. A Public address swap has
+/// no private-balance step, as [`external_steps`] describes, and a Bridge swap hands off to its
+/// bridge instead, as [`bridge_steps`] describes. Once the swap has an order, the order step
+/// carries its ID.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     let mut steps = if let Some(bridge) = &labels.bridge {
         let mut steps = bridge_steps(stage, labels, bridge);
@@ -1978,10 +2136,17 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
                     TRADED,
                     labels
                         .fill_hint
-                        .map_or_else(String::new, SwapFillHint::progress),
+                        .as_ref()
+                        .map_or_else(String::new, SwapFillHint::traded),
                     Pending,
                 ),
-                delivered(NotStarted, String::new()),
+                delivered(
+                    Pending,
+                    labels
+                        .fill_hint
+                        .as_ref()
+                        .map_or_else(String::new, SwapFillHint::shielded),
+                ),
             ]
         }
         SwapStage::SetupNotSent => vec![
@@ -2185,9 +2350,10 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
 
 /// A Public address swap's steps. The settlement that trades also pays the receiver, so one
 /// step, delivered to the receiver, replaces Traded and Back in private balance: the least the
-/// receiver gets while the order can fill, then what it got.
+/// receiver gets while the order can fill, then what it got. On a reported fill it confirms with
+/// the trade's count and reported amount.
 fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> Vec<SwapStep> {
-    use PublicActionStepStatus::{Done, NotStarted};
+    use PublicActionStepStatus::{Done, Pending};
     let traded = steps
         .iter()
         .find(|step| step.label == TRADED)
@@ -2200,10 +2366,9 @@ fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> 
                 return step;
             }
             step.label = format!("Delivered to {receiver}");
-            // A reported fill confirms here, since no separate trade step shows it.
-            if let Some((status, detail)) = traded
-                .clone()
-                .filter(|(status, _)| step.status == NotStarted && *status != NotStarted)
+            // A reported fill confirms here, since no separate trade step shows it. Only a
+            // reported fill leaves the trade in progress.
+            if let Some((status, detail)) = traded.clone().filter(|(status, _)| *status == Pending)
             {
                 step.status = status;
                 step.detail = detail;
@@ -2300,11 +2465,17 @@ fn private_setup_step(
 
 /// A Bridge swap's steps: set up, order open, sent to the bridge once the hand-off is proven,
 /// then delivered on the destination network, labelled by the recorded outcome: verified, or
-/// reported by the provider. Refunding and Needs attention replace the delivered step. An Across
-/// post-hook that didn't run replaces both with the bought token held on the swap's network,
-/// once an account read found it there. Until then an Across swap to a public receiver shows
-/// its deposit as unverified. A private Bridge swap's last step is its shield into the private
-/// balance there, and proceeds its destination stealth account holds replace that step.
+/// reported by the provider. A fill the orderbook reports adds the trade, which confirms with
+/// the bridge deposit under the trade's count. The deposit tells whether the reported trade
+/// block shows it, and the last step then shows what the provider reports about the delivery,
+/// marked as reported. A private delivery's reported step waits for its fill block on the
+/// destination network, which shows the shield or the proceeds held by the destination stealth
+/// account. Refunding and Needs attention replace the
+/// delivered step. An Across post-hook that didn't run replaces both with the bought token held
+/// on the swap's network, once an account read found it there. Until then an Across swap to a
+/// public receiver shows its deposit as unverified. A private Bridge swap's last step is its
+/// shield into the private balance there, and proceeds its destination stealth account holds
+/// replace that step.
 fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels) -> Vec<SwapStep> {
     use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
     let step = |label: String, detail: String, status| SwapStep::new(label, detail, status);
@@ -2324,6 +2495,21 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
         )
     };
     let private = bridge.private.as_ref();
+    // Proceeds the destination stealth account holds, `held` of them when the amount is known.
+    let held_detail = |held: Option<&String>| {
+        let token = &bridge.token;
+        let account = private
+            .and_then(|private| private.setups[1].account?.index)
+            .map_or_else(
+                || "the stealth account".to_owned(),
+                |index| format!("stealth account #{index}"),
+            );
+        format!(
+            "{provider} delivered {}, but the shield didn't run. The {token} is in {account} on {}.",
+            held.unwrap_or(token),
+            bridge.network
+        )
+    };
     let delivered = if private.is_some() {
         format!("Private on {}", bridge.network)
     } else {
@@ -2339,8 +2525,100 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
         }
         (None, _) => format!("To {}", bridge.destination()),
     };
+    // What the delivered step shows while the provider has the deposit.
+    let in_transit = format!(
+        "{expected} · {}",
+        match bridge.provider {
+            BridgeProvider::Across => "Across usually fills within a few minutes",
+            BridgeProvider::NearIntents => "NEAR Intents usually delivers within a few minutes",
+        }
+    );
     let mut steps = reshield_steps(stage, labels);
     let outcome = match stage {
+        // The reported settlement trades and hands off at once, so both confirm together. The
+        // provider's report of the delivery is its word until the settlement is verified.
+        SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
+            if labels.fill_hint.is_some() =>
+        {
+            vec![
+                step(
+                    TRADED.into(),
+                    labels
+                        .fill_hint
+                        .as_ref()
+                        .map_or_else(String::new, SwapFillHint::traded),
+                    Pending,
+                ),
+                step(
+                    BRIDGE_DEPOSIT.into(),
+                    match &bridge.deposit {
+                        SwapSeen::Looking => "Looking for the deposit…".into(),
+                        SwapSeen::Detected(Some(sent)) => match bridge.provider {
+                            BridgeProvider::Across => {
+                                format!("Deposit detected · {sent} to Across")
+                            }
+                            BridgeProvider::NearIntents => {
+                                format!("Deposit detected · {sent} to 1Click")
+                            }
+                        },
+                        SwapSeen::Detected(None) => "Deposit detected".into(),
+                        SwapSeen::NotFound => "No deposit detected yet".into(),
+                    },
+                    Pending,
+                ),
+                match &bridge.report {
+                    None => step(delivered, expected, NotStarted),
+                    Some(SwapBridgeReported::Pending) => step(delivered, in_transit, Pending),
+                    Some(SwapBridgeReported::Delivered { amount, shield }) => {
+                        let reported =
+                            format!("Delivered on {} · reported by {provider}", bridge.network);
+                        // A private delivery follows what its fill block shows of the shield.
+                        match (private, shield) {
+                            (None, _) => step(
+                                reported,
+                                amount.as_ref().map_or_else(
+                                    || format!("To {}", bridge.receiver),
+                                    |amount| format!("{amount} to {}", bridge.receiver),
+                                ),
+                                Done,
+                            ),
+                            (Some(_), SwapShieldSeen::Looking) => step(
+                                reported,
+                                amount.as_ref().map_or_else(
+                                    || "Looking for the shield…".into(),
+                                    |amount| {
+                                        format!("{amount} delivered · looking for the shield…")
+                                    },
+                                ),
+                                Pending,
+                            ),
+                            (Some(_), SwapShieldSeen::Detected(credited)) => {
+                                step(delivered, format!("Shield detected · {credited}"), Done)
+                            }
+                            (Some(_), SwapShieldSeen::Held(held)) => step(
+                                format!("Held by stealth account on {}", bridge.network),
+                                held_detail(Some(held)),
+                                Warning,
+                            ),
+                        }
+                    }
+                    Some(SwapBridgeReported::Refunded) => step(
+                        format!("Refund · reported by {provider}"),
+                        format!(
+                            "{provider} reports the deposit refunded or expired. The wallet checks it once the settlement is verified."
+                        ),
+                        Warning,
+                    ),
+                    Some(SwapBridgeReported::Failed) => step(
+                        format!("Problem · reported by {provider}"),
+                        format!(
+                            "{provider} reports the deposit as failed or incomplete. The wallet checks it once the settlement is verified."
+                        ),
+                        Warning,
+                    ),
+                },
+            ]
+        }
         // An Across settlement that deposits shows the deposit with the trade, so a trade
         // without one leaves the hand-off unverified. Only an account read tells where the
         // bought token is.
@@ -2367,22 +2645,9 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
             ),
             step(delivered, expected, NotStarted),
         ],
-        SwapStage::Order(SwapOrderState::Bridging) => vec![
-            handed_off(),
-            step(
-                delivered,
-                format!(
-                    "{expected} · {}",
-                    match bridge.provider {
-                        BridgeProvider::Across => "Across usually fills within a few minutes",
-                        BridgeProvider::NearIntents => {
-                            "NEAR Intents usually delivers within a few minutes"
-                        }
-                    }
-                ),
-                Pending,
-            ),
-        ],
+        SwapStage::Order(SwapOrderState::Bridging) => {
+            vec![handed_off(), step(delivered, in_transit, Pending)]
+        }
         SwapStage::Order(SwapOrderState::Done) => vec![
             handed_off(),
             step(
@@ -2406,22 +2671,7 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
             handed_off(),
             step(
                 format!("Held by stealth account on {}", bridge.network),
-                {
-                    let token = &bridge.token;
-                    let account = private
-                        .and_then(|private| private.setups[1].account?.index)
-                        .map_or_else(
-                            || "the stealth account".to_owned(),
-                            |index| format!("stealth account #{index}"),
-                        );
-                    format!(
-                        "{provider} delivered {}, but the shield didn't run. The {token} is in {account} on {}.",
-                        private
-                            .and_then(|private| private.held.as_ref())
-                            .unwrap_or(token),
-                        bridge.network
-                    )
-                },
+                held_detail(private.and_then(|private| private.held.as_ref())),
                 Warning,
             ),
         ],
@@ -2457,7 +2707,7 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
             format!("{sent} is in the stealth account on {}.", bridge.origin),
             Warning,
         )],
-        // Before the trade, the hand-off waits for it, including a fill the orderbook reports.
+        // Before the trade, the hand-off waits for it.
         _ => {
             let traded = steps
                 .iter()
@@ -2818,7 +3068,16 @@ pub(in crate::root) fn swap_order_status(
         SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
             if labels.fill_hint.is_some() =>
         {
-            "Traded · confirming".into()
+            if labels
+                .bridge
+                .as_ref()
+                .is_some_and(SwapBridgeLabels::delivery_reported)
+            {
+                "Delivered · confirming"
+            } else {
+                "Traded · confirming"
+            }
+            .into()
         }
         SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
             if labels.lapsed =>
@@ -3044,6 +3303,8 @@ pub(super) mod tests {
                 minimum: None,
                 private: None,
                 reported: false,
+                deposit: SwapSeen::Looking,
+                report: None,
             }),
             ..private.clone()
         };
@@ -3480,6 +3741,8 @@ pub(super) mod tests {
                 minimum: Some("248.70 USDC".into()),
                 private: None,
                 reported,
+                deposit: SwapSeen::Looking,
+                report: None,
             }),
             ..labels()
         };
@@ -3658,6 +3921,8 @@ pub(super) mod tests {
                         held: Some("992.74 USDC".into()),
                     }),
                     reported: false,
+                    deposit: SwapSeen::Looking,
+                    report: None,
                 }),
                 ..labels()
             }
@@ -3862,41 +4127,447 @@ pub(super) mod tests {
         }
     }
 
+    /// A fill the orderbook reports 5 blocks after the trade, with the bought amount, whose
+    /// block wasn't read yet.
+    fn fill_hint() -> SwapFillHint {
+        SwapFillHint {
+            confirmations: Some(5),
+            depth: 12,
+            bought: Some("49.40 USDC".into()),
+            detected: false,
+            shield: SwapSeen::Looking,
+            origin: "Ethereum".into(),
+        }
+    }
+
+    /// A swap delivered by `provider` to Treasury on Polygon, with `report` its provider's word
+    /// on the delivery.
+    fn bridged(provider: BridgeProvider, report: Option<SwapBridgeReported>) -> SwapLabels {
+        SwapLabels {
+            bridge: Some(SwapBridgeLabels {
+                provider,
+                network: "Polygon".into(),
+                token: "USDC".into(),
+                origin: "Ethereum".into(),
+                receiver: "Treasury".into(),
+                sent: None,
+                minimum: Some("248.70 USDC".into()),
+                private: None,
+                reported: false,
+                deposit: SwapSeen::Looking,
+                report,
+            }),
+            ..labels()
+        }
+    }
+
     #[test]
     fn a_reported_fill_shows_the_trade_confirming_until_observation_records_it() {
-        use PublicActionStepStatus::{Done, NotStarted, Pending};
+        use PublicActionStepStatus::{Done, Pending};
         // The orderbook reports the fill 5 blocks after the trade, and even past the local
         // expiry, since a fill can land up to validTo.
         let mut hinted = SwapLabels {
-            fill_hint: Some(SwapFillHint {
-                confirmations: Some(5),
-                depth: 12,
-            }),
+            fill_hint: Some(fill_hint()),
             lapsed: true,
             ..labels()
         };
-        for stage in [
+        let stages = [
             SwapStage::Order(SwapOrderState::Open),
             SwapStage::Order(SwapOrderState::PreHookOnly { expired: false }),
-        ] {
-            for (confirmations, detail) in [
-                (5, "Confirming (5/12)"),
-                (12, "Verifying settlement…"),
-                (20, "Verifying settlement…"),
+        ];
+        for stage in stages {
+            for (confirmations, progress) in [
+                (Some(5), "Confirming (5/12)"),
+                (Some(12), "Verifying settlement…"),
+                (Some(20), "Verifying settlement…"),
+                (None, "Confirming"),
             ] {
-                hinted.fill_hint.as_mut().unwrap().confirmations = Some(confirmations);
+                hinted.fill_hint.as_mut().unwrap().confirmations = confirmations;
                 let steps = swap_steps(stage, &hinted);
                 assert_eq!(
                     steps.iter().map(|step| step.status).collect::<Vec<_>>(),
-                    [Done, Done, Pending, NotStarted],
-                    "the reported fill stays pending until canonical verification: {stage:?}"
+                    [Done, Done, Pending, Pending],
+                    "the settlement's steps stay pending until canonical verification: {stage:?}"
                 );
+                // The amount is the order's, so it reads as bought, never as received.
                 assert_eq!(
                     (steps[2].label.as_str(), steps[2].detail.as_str()),
-                    ("Traded", detail)
+                    (
+                        "Traded",
+                        format!("{progress} · CoW reports 49.40 USDC bought").as_str()
+                    )
+                );
+                // The private return confirms with the trade and repeats no count.
+                assert_eq!(
+                    (steps[3].label.as_str(), steps[3].detail.as_str()),
+                    ("Back in private balance", "Looking for the shield…")
                 );
             }
-            assert_eq!(swap_card_line(stage, &hinted).detail, "Traded · confirming");
+            let card = swap_card_line(stage, &hinted);
+            assert_eq!(
+                (card.title.as_str(), card.detail.as_str()),
+                ("Swapped 1.00 WETH for USDC", "Traded · confirming")
+            );
+            assert_eq!(
+                reported_fill_note(stage, &hinted).as_deref(),
+                Some("Nothing more to do. The result is confirmed after 12 blocks on Ethereum.")
+            );
+        }
+        // Once the reported block was read, the trade's amount is the chain's, and the private
+        // return tells whether the block shows the shield. Both stay pending.
+        for (shield, detail) in [
+            (
+                SwapSeen::Detected(Some("49.28 USDC".into())),
+                "Shield detected · 49.28 USDC",
+            ),
+            (SwapSeen::Detected(None), "Shield detected"),
+            (SwapSeen::NotFound, "No shield detected yet"),
+        ] {
+            hinted.fill_hint = Some(SwapFillHint {
+                detected: true,
+                shield,
+                ..fill_hint()
+            });
+            let steps = swap_steps(stages[0], &hinted);
+            assert_eq!(
+                steps[2..]
+                    .iter()
+                    .map(|step| (step.status, step.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    (Pending, "Confirming (5/12) · 49.40 USDC bought"),
+                    (Pending, detail),
+                ]
+            );
+        }
+        // Without an amount the trade shows its count alone.
+        hinted.fill_hint = Some(SwapFillHint {
+            bought: None,
+            ..fill_hint()
+        });
+        assert_eq!(
+            swap_steps(stages[0], &hinted)[2].detail,
+            "Confirming (5/12)"
+        );
+
+        // A Public address swap's one delivery step confirms with the trade's count and amount.
+        let external = SwapLabels {
+            fill_hint: Some(fill_hint()),
+            receiver: Some("Treasury".into()),
+            minimum: Some("48.90 USDC".into()),
+            ..labels()
+        };
+        let steps = swap_steps(stages[0], &external);
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.label.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Stealth account set up", Done),
+                ("Order open", Done),
+                ("Delivered to Treasury", Pending),
+            ]
+        );
+        assert_eq!(
+            steps[2].detail,
+            "Confirming (5/12) · CoW reports 49.40 USDC bought"
+        );
+    }
+
+    #[test]
+    fn a_reported_bridge_fill_confirms_the_deposit_and_shows_the_providers_report() {
+        use PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
+        let open = SwapStage::Order(SwapOrderState::Open);
+        let hinted = |provider, report| SwapLabels {
+            fill_hint: Some(fill_hint()),
+            ..bridged(provider, report)
+        };
+        let delivered = |amount: Option<&str>| SwapBridgeReported::Delivered {
+            amount: amount.map(Into::into),
+            shield: SwapShieldSeen::Looking,
+        };
+        for (provider, name, expected, in_transit) in [
+            (
+                BridgeProvider::Across,
+                "Across",
+                "248.70 USDC to Treasury",
+                "248.70 USDC to Treasury · Across usually fills within a few minutes",
+            ),
+            (
+                BridgeProvider::NearIntents,
+                "NEAR Intents",
+                "At least 248.70 USDC to Treasury",
+                "At least 248.70 USDC to Treasury · NEAR Intents usually delivers within a few minutes",
+            ),
+        ] {
+            for (report, label, status, detail) in [
+                (
+                    None,
+                    "Delivered on Polygon".to_owned(),
+                    NotStarted,
+                    expected,
+                ),
+                (
+                    Some(SwapBridgeReported::Pending),
+                    "Delivered on Polygon".to_owned(),
+                    Pending,
+                    in_transit,
+                ),
+                (
+                    Some(delivered(Some("248.71 USDC"))),
+                    format!("Delivered on Polygon · reported by {name}"),
+                    Done,
+                    "248.71 USDC to Treasury",
+                ),
+                (
+                    Some(delivered(None)),
+                    format!("Delivered on Polygon · reported by {name}"),
+                    Done,
+                    "To Treasury",
+                ),
+                (
+                    Some(SwapBridgeReported::Refunded),
+                    format!("Refund · reported by {name}"),
+                    Warning,
+                    "reports the deposit refunded or expired",
+                ),
+                (
+                    Some(SwapBridgeReported::Failed),
+                    format!("Problem · reported by {name}"),
+                    Warning,
+                    "reports the deposit as failed or incomplete",
+                ),
+            ] {
+                let labels = hinted(provider, report.clone());
+                let steps = swap_steps(open, &labels);
+                // The trade and the deposit confirm together, with the count on the trade.
+                assert_eq!(
+                    steps[1..4]
+                        .iter()
+                        .map(|step| (step.label.as_str(), step.status, step.detail.as_str()))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Order open", Done, ""),
+                        (
+                            "Traded",
+                            Pending,
+                            "Confirming (5/12) · CoW reports 49.40 USDC bought"
+                        ),
+                        ("Bridge deposit", Pending, "Looking for the deposit…"),
+                    ],
+                    "{provider:?} {report:?}"
+                );
+                assert_eq!(steps.len(), 5);
+                assert_eq!(
+                    (steps[4].label.as_str(), steps[4].status),
+                    (label.as_str(), status),
+                    "{provider:?} {report:?}"
+                );
+                assert!(steps[4].detail.contains(detail), "{}", steps[4].detail);
+                // Only a reported delivery reads as delivered, and only a reported refund or
+                // failure changes the note.
+                let made = matches!(report, Some(SwapBridgeReported::Delivered { .. }));
+                let card = swap_card_line(open, &labels);
+                assert_eq!(card.title, "Swapped 1.00 WETH for USDC");
+                assert_eq!(
+                    card.detail,
+                    if made {
+                        "Delivered to Treasury on Polygon · confirming"
+                    } else {
+                        "Traded · confirming"
+                    }
+                );
+                assert_eq!(
+                    swap_order_status(open, false, &labels),
+                    if made {
+                        "Delivered · confirming"
+                    } else {
+                        "Traded · confirming"
+                    }
+                );
+                let problem = matches!(
+                    report,
+                    Some(SwapBridgeReported::Refunded | SwapBridgeReported::Failed)
+                );
+                assert_eq!(
+                    reported_fill_note(open, &labels).as_deref(),
+                    Some(if problem {
+                        "The wallet acts on this once the result is confirmed, after 12 blocks on Ethereum."
+                    } else {
+                        "Nothing more to do. The result is confirmed after 12 blocks on Ethereum."
+                    })
+                );
+            }
+        }
+
+        // Once the reported block was read, the deposit tells whether the block shows it, named
+        // after the provider's own deposit, and stays pending.
+        for (provider, deposit, detail) in [
+            (
+                BridgeProvider::Across,
+                SwapSeen::Detected(Some("49.40 USDC".into())),
+                "Deposit detected · 49.40 USDC to Across",
+            ),
+            (
+                BridgeProvider::NearIntents,
+                SwapSeen::Detected(Some("49.40 USDC".into())),
+                "Deposit detected · 49.40 USDC to 1Click",
+            ),
+            (
+                BridgeProvider::Across,
+                SwapSeen::Detected(None),
+                "Deposit detected",
+            ),
+            (
+                BridgeProvider::Across,
+                SwapSeen::NotFound,
+                "No deposit detected yet",
+            ),
+        ] {
+            let mut labels = hinted(provider, None);
+            labels.bridge.as_mut().unwrap().deposit = deposit;
+            let step = &swap_steps(open, &labels)[3];
+            assert_eq!(
+                (step.label.as_str(), step.status, step.detail.as_str()),
+                ("Bridge deposit", Pending, detail)
+            );
+        }
+
+        // A private delivery's report covers the bridge alone, so its last step follows what
+        // the fill block on Polygon shows. Nothing says the proceeds are in the private balance
+        // before that block shows the shield, and proceeds the stealth account holds read as a
+        // problem.
+        let nothing_to_do =
+            "Nothing more to do. The result is confirmed after 12 blocks on Ethereum.";
+        for (shield, last, card, status, note) in [
+            (
+                SwapShieldSeen::Looking,
+                (
+                    "Delivered on Polygon · reported by Across",
+                    Pending,
+                    "992.74 USDC delivered · looking for the shield…",
+                ),
+                "Delivered on Polygon · confirming",
+                "Traded · confirming",
+                nothing_to_do,
+            ),
+            (
+                SwapShieldSeen::Detected("990.26 USDC".into()),
+                ("Private on Polygon", Done, "Shield detected · 990.26 USDC"),
+                "Shielded to your private balance on Polygon · confirming",
+                "Delivered · confirming",
+                nothing_to_do,
+            ),
+            (
+                SwapShieldSeen::Held("992.74 USDC".into()),
+                (
+                    "Held by stealth account on Polygon",
+                    Warning,
+                    "Across delivered 992.74 USDC, but the shield didn't run. The USDC is in the stealth account on Polygon.",
+                ),
+                "Traded · confirming",
+                "Traded · confirming",
+                "The wallet acts on this once the result is confirmed, after 12 blocks on Ethereum.",
+            ),
+        ] {
+            let mut private = hinted(
+                BridgeProvider::Across,
+                Some(SwapBridgeReported::Delivered {
+                    amount: Some("992.74 USDC".into()),
+                    shield,
+                }),
+            );
+            private.bridge.as_mut().unwrap().private = Some(SwapPrivateBridgeLabels {
+                setups: ["Ethereum", "Polygon"].map(|network| SwapSetupLabels {
+                    network: network.into(),
+                    account: None,
+                    progress: SwapSetupProgress::Done,
+                    reused: false,
+                    detail: None,
+                }),
+                held: None,
+            });
+            let steps = swap_steps(open, &private);
+            let step = steps.last().unwrap();
+            assert_eq!(
+                (step.label.as_str(), step.status, step.detail.as_str()),
+                last
+            );
+            assert_eq!(swap_card_line(open, &private).detail, card);
+            assert_eq!(swap_order_status(open, false, &private), status);
+            assert_eq!(reported_fill_note(open, &private).as_deref(), Some(note));
+        }
+    }
+
+    #[test]
+    fn a_report_that_is_not_borne_out_leaves_the_observed_steps() {
+        use PublicActionStepStatus::{Done, NotStarted, Pending};
+        // Verification found no trade, so the fill hint is gone. Each shape of swap shows its
+        // observed stage again, and a deposit read early or a provider's report left behind
+        // shows nothing by itself.
+        let left = |provider| {
+            let mut labels = bridged(
+                provider,
+                Some(SwapBridgeReported::Delivered {
+                    amount: Some("248.71 USDC".into()),
+                    shield: SwapShieldSeen::Looking,
+                }),
+            );
+            labels.bridge.as_mut().unwrap().deposit = SwapSeen::Detected(Some("49.40 USDC".into()));
+            labels
+        };
+        let open = SwapStage::Order(SwapOrderState::Open);
+        let waiting = [
+            ("Bridge deposit", NotStarted),
+            ("Delivered on Polygon", NotStarted),
+        ];
+        for (labels, last) in [
+            (
+                labels(),
+                vec![
+                    ("Traded", NotStarted),
+                    ("Back in private balance", NotStarted),
+                ],
+            ),
+            (
+                SwapLabels {
+                    receiver: Some("Treasury".into()),
+                    ..labels()
+                },
+                vec![("Delivered to Treasury", NotStarted)],
+            ),
+            (left(BridgeProvider::Across), waiting.to_vec()),
+            (left(BridgeProvider::NearIntents), waiting.to_vec()),
+        ] {
+            let steps = swap_steps(open, &labels);
+            assert_eq!(
+                steps
+                    .iter()
+                    .map(|step| (step.label.as_str(), step.status))
+                    .collect::<Vec<_>>(),
+                [
+                    vec![("Stealth account set up", Done), ("Order open", Pending)],
+                    last
+                ]
+                .concat()
+            );
+            // No step keeps a count, a reported amount, anything detected early or its tie to
+            // a trade.
+            assert!(
+                steps
+                    .iter()
+                    .all(|step| ["Confirm", "report", "detected", "Looking"]
+                        .iter()
+                        .all(|text| !step.detail.contains(text))),
+                "{steps:?}"
+            );
+            let card = swap_card_line(open, &labels);
+            assert_eq!(
+                (card.title.as_str(), card.detail.as_str()),
+                ("Swapping 1.00 WETH for USDC", "Order open · expires 14:32")
+            );
+            assert_eq!(reported_fill_note(open, &labels), None);
         }
     }
 

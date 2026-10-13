@@ -25,9 +25,9 @@ use wallet_ops::{
     settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
     swap_setup_recorded_executed,
     vault::{
-        BridgeDelivery, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadPurpose,
-        ExecutorRecord, SwapApproval, SwapApprovedBounds, SwapBridgeOutcome, SwapDelivery,
-        SwapOrderRecord, SwapUseId, SwapUseRecord,
+        BridgeDelivery, BridgeProvider, ExecutorNonceObservation, ExecutorOperationId,
+        ExecutorPayloadPurpose, ExecutorRecord, SwapApproval, SwapApprovedBounds,
+        SwapBridgeOutcome, SwapDelivery, SwapOrderRecord, SwapUseId, SwapUseRecord,
     },
 };
 
@@ -86,9 +86,10 @@ pub(super) use form::public_source::PublicSwapAuthorization;
 
 use form::{SetupSide, SwapForm};
 use model::{
-    SwapBridgeLabels, SwapFillHint, SwapIdentity, SwapLabels, SwapPrivateBridgeLabels,
-    SwapSetupLabels, SwapSetupProgress, SwapStepAccount, bridge_sent_amount,
-    swap_observation_range, swap_observation_start, swap_private_delivery,
+    SwapBridgeLabels, SwapBridgeReported, SwapFillHint, SwapIdentity, SwapLabels,
+    SwapPrivateBridgeLabels, SwapSeen, SwapSetupLabels, SwapSetupProgress, SwapShieldSeen,
+    SwapStepAccount, bridge_sent_amount, swap_observation_range, swap_observation_start,
+    swap_private_delivery,
 };
 pub(super) use model::{
     SwapStage, swap_account_status, swap_delivery, swap_pair_label, swap_recovery_token,
@@ -313,9 +314,13 @@ struct SwapTracking {
     /// The orderbook's last report on each order asked about, by its UID, so a report on one
     /// competing order never replaces another's. Display and location only; never an outcome.
     order_hints: HashMap<OrderUid, SwapOrderHint>,
+    /// What was learned early about each order whose fill is reported and whose settlement
+    /// isn't recorded, by its UID. Display only; never persisted and never an outcome.
+    early_hints: HashMap<OrderUid, SwapEarlyHint>,
     /// The app-data budget after the orderbook rejected an order's size.
     byte_budget: Option<usize>,
-    /// Routine bridge provider polls of handed-off orders without an outcome, which back off.
+    /// Routine bridge provider polls of handed-off orders without an outcome, which back off,
+    /// and the early requests of orders in `early_hints`.
     bridge_polls: HashMap<OrderUid, BridgePoll>,
     /// Bridge provider clients on the `orderbook` route, kept with it for status checks.
     bridge_clients: Option<wallet_ops::SwapBridgeClients>,
@@ -367,6 +372,18 @@ impl SwapTracking {
         self.setup_progress = None;
         self.destination_setup_progress = None;
     }
+
+    /// Makes the next bridge provider poll of `uid` wait longer, after one without an outcome.
+    fn back_off_bridge_poll(&mut self, uid: OrderUid, now: Instant) {
+        let attempts = self.bridge_polls.get(&uid).map_or(0, |poll| poll.attempts);
+        self.bridge_polls.insert(
+            uid,
+            BridgePoll {
+                attempts: attempts.saturating_add(1),
+                next_at: now + bridge_poll_interval(attempts),
+            },
+        );
+    }
 }
 
 /// The summary `action` is authorized with. A speed-up signs a second order beside a live one,
@@ -412,6 +429,139 @@ struct SwapOrderHint {
     report: CowOrderStatusReport,
     /// The reported trade's block, read once the order is reported filled.
     trade_block: Option<u64>,
+}
+
+/// What this session learned about an order from the block its fill is reported in, before the
+/// settlement reached finality depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwapEarlyHint {
+    /// The reported trade block all of it belongs to.
+    trade_block: Option<u64>,
+    /// Whether that block was read, so it is read once.
+    block_read: bool,
+    /// What that block holds of the order's settlement. `None` when it holds no trade of the
+    /// order or can't be read as a whole block.
+    settlement: Option<wallet_ops::SwapSettlementHint>,
+    /// A Bridge order's provider's last report about the delivery.
+    report: Option<wallet_ops::SwapBridgeReport>,
+    /// Whether the order's fill block is also read on its destination chain: a private Bridge
+    /// delivery to a chain enabled here, as the pass that asks finds it.
+    reads_fill: bool,
+}
+
+impl SwapEarlyHint {
+    /// Whether the reported trade block is known and still to be read.
+    const fn unread(&self) -> bool {
+        self.trade_block.is_some() && !self.block_read
+    }
+
+    /// Whether the provider's report ends the early polling of the reported block: a refund, a
+    /// failure, or a delivery. The delivery of an order whose fill block is also read ends it
+    /// only once that block was read.
+    const fn ends_polling(&self) -> bool {
+        use wallet_ops::SwapBridgeReport::{Delivered, Failed, Pending, Refunded};
+        match self.report {
+            Some(Delivered { seen, .. }) => seen.is_some() || !self.reads_fill,
+            Some(Refunded | Failed) => true,
+            Some(Pending) | None => false,
+        }
+    }
+
+    /// How a part of the reported settlement shows, with `amount` picking it from the read
+    /// block: looked for until the block is read, then detected with its amount, or not found.
+    fn seen(
+        hint: Option<&Self>,
+        amount: impl FnOnce(wallet_ops::SwapSettlementHint) -> Option<String>,
+    ) -> SwapSeen {
+        match hint {
+            Some(hint) if hint.block_read => hint
+                .settlement
+                .and_then(amount)
+                .map_or(SwapSeen::NotFound, |amount| {
+                    SwapSeen::Detected(Some(amount))
+                }),
+            _ => SwapSeen::Looking,
+        }
+    }
+}
+
+/// The delivery of `order` while its reported settlement is read early, and the reported
+/// trade's block: the orderbook reports the order filled, `stage` still shows its swap open,
+/// and no settlement is recorded for it. For a Bridge order that is its hand-off, which
+/// `swap_bridges_to_track` tracks once recorded.
+fn early_order(
+    stage: SwapStage,
+    order: &SwapOrderRecord,
+    hints: &HashMap<OrderUid, SwapOrderHint>,
+) -> Option<(SwapDelivery, Option<u64>)> {
+    if !matches!(
+        stage,
+        SwapStage::Order(SwapOrderState::Open | SwapOrderState::PreHookOnly { expired: false })
+    ) {
+        return None;
+    }
+    let hint = hints
+        .get(&order.uid())
+        .filter(|hint| hint.report.status == CowOrderStatusHint::Fulfilled)?;
+    let delivery = order.delivery();
+    let observed = order.observations();
+    let recorded = match delivery {
+        SwapDelivery::Bridge(_) => observed.bridge_handoff.is_some(),
+        SwapDelivery::Reshield | SwapDelivery::External { .. } => observed.traded.is_some(),
+    };
+    (!recorded).then_some((delivery, hint.trade_block))
+}
+
+/// The early request `order` is due in this pass, with its bridge provider and what is known
+/// for its reported block. Every order reads that block once it is known. A Bridge order is
+/// then asked about until its provider reports an end: NEAR Intents by its deposit address,
+/// Across with the deposit the block's hand-off holds. With `reads_fill`, the order's fill block
+/// is read on its destination chain too, and a reported delivery is asked about until that
+/// block was read. `None` when neither is left to do, and while a request backs off.
+fn early_request(
+    stage: SwapStage,
+    order: &SwapOrderRecord,
+    tracking: &SwapTracking,
+    reads_fill: bool,
+    now: Instant,
+) -> Option<(Option<BridgeProvider>, SwapEarlyHint)> {
+    let (delivery, trade_block) = early_order(stage, order, &tracking.order_hints)?;
+    let uid = order.uid();
+    if tracking
+        .bridge_polls
+        .get(&uid)
+        .is_some_and(|poll| poll.next_at > now)
+    {
+        return None;
+    }
+    let hint = SwapEarlyHint {
+        reads_fill,
+        ..tracking
+            .early_hints
+            .get(&uid)
+            .copied()
+            .filter(|hint| hint.trade_block == trade_block)
+            .unwrap_or(SwapEarlyHint {
+                trade_block,
+                block_read: false,
+                settlement: None,
+                report: None,
+                reads_fill,
+            })
+    };
+    let provider = match delivery {
+        SwapDelivery::Bridge(delivery) => Some(delivery.provider),
+        SwapDelivery::Reshield | SwapDelivery::External { .. } => None,
+    };
+    let asked = !hint.ends_polling()
+        && match provider {
+            Some(BridgeProvider::NearIntents) => true,
+            Some(BridgeProvider::Across) => hint
+                .settlement
+                .is_some_and(|settlement| settlement.handoff.is_some()),
+            None => false,
+        };
+    (hint.unread() || asked).then_some((provider, hint))
 }
 
 pub(super) struct PrivateSwapsView {
@@ -1960,9 +2110,24 @@ impl PrivateSwapsView {
             amount.map(|amount| self.token_amount(buy, amount, cx))
         });
         let valid_to = attempts.map(|attempts| attempts.valid_to());
-        let bridge = evidence.and_then(|order| {
+        let mut bridge = evidence.and_then(|order| {
             self.bridge_labels(record, order.delivery(), buy, Some(order), None, cx)
         });
+        // The deposit read early and a provider's early report show only beside the reported
+        // fill they follow.
+        if fill_hint.is_some()
+            && let Some(bridge) = &mut bridge
+        {
+            bridge.report = self.bridge_report(record, cx);
+            bridge.deposit = SwapEarlyHint::seen(
+                self.reported_order(record).and_then(|(_, _, early)| early),
+                |settlement| {
+                    settlement
+                        .handoff
+                        .map(|handoff| self.token_amount(buy, handoff.sent, cx))
+                },
+            );
+        }
         SwapLabels {
             pair: swap_pair_label(
                 &sell_label,
@@ -2057,6 +2222,49 @@ impl PrivateSwapsView {
                     Some(SwapBridgeOutcome::DeliveredReported { .. })
                 )
             }),
+            deposit: SwapSeen::Looking,
+            report: None,
+        })
+    }
+
+    /// What its bridge provider reported early about the order of `record` whose fill the
+    /// orderbook reports, with a delivered amount in the destination network's token, and for
+    /// a private delivery what its fill block showed: the private credit after the shield fee,
+    /// or what the destination stealth account holds.
+    fn bridge_report(&self, record: &ExecutorRecord, cx: &gpui::App) -> Option<SwapBridgeReported> {
+        use wallet_ops::{SwapBridgeReport, SwapDeliverySeen};
+        let hints = &self.tracking.get(&record.operation())?.early_hints;
+        let (order, delivery, report) =
+            model::tracked_orders(record)
+                .into_iter()
+                .find_map(|order| {
+                    let SwapDelivery::Bridge(delivery) = order.delivery() else {
+                        return None;
+                    };
+                    Some((order, delivery, hints.get(&order.uid())?.report?))
+                })?;
+        let shown = |amount: U256| {
+            self.network_token_amount(
+                delivery.destination_chain,
+                self.delivered_token(delivery, cx),
+                amount,
+                cx,
+            )
+        };
+        Some(match report {
+            SwapBridgeReport::Delivered { amount_out, seen } => SwapBridgeReported::Delivered {
+                amount: amount_out.map(&shown),
+                shield: match seen {
+                    None => SwapShieldSeen::Looking,
+                    Some(SwapDeliverySeen::Shielded { amount }) => SwapShieldSeen::Detected(shown(
+                        model::private_delivery_credit(amount, order.bounds()),
+                    )),
+                    Some(SwapDeliverySeen::Held { amount }) => SwapShieldSeen::Held(shown(amount)),
+                },
+            },
+            SwapBridgeReport::Pending => SwapBridgeReported::Pending,
+            SwapBridgeReport::Refunded => SwapBridgeReported::Refunded,
+            SwapBridgeReport::Failed => SwapBridgeReported::Failed,
         })
     }
 
@@ -2160,8 +2368,33 @@ impl PrivateSwapsView {
         )
     }
 
+    /// The order `record`'s swap still tracks that the orderbook reports filled, with that
+    /// report and what the reported trade block gave early.
+    fn reported_order<'a>(
+        &'a self,
+        record: &'a ExecutorRecord,
+    ) -> Option<(
+        &'a SwapOrderRecord,
+        &'a SwapOrderHint,
+        Option<&'a SwapEarlyHint>,
+    )> {
+        let tracking = self.tracking.get(&record.operation())?;
+        model::tracked_orders(record).into_iter().find_map(|order| {
+            let hint = tracking
+                .order_hints
+                .get(&order.uid())
+                .filter(|hint| hint.report.status == CowOrderStatusHint::Fulfilled)?;
+            let early = tracking
+                .early_hints
+                .get(&order.uid())
+                .filter(|early| early.trade_block == hint.trade_block);
+            Some((order, hint, early))
+        })
+    }
+
     /// The orderbook's report that an order the swap still tracks filled, while canonical
-    /// observation still shows the swap open.
+    /// observation still shows the swap open, with what the reported trade block showed of
+    /// the settlement once it was read.
     fn fill_hint(&self, record: &ExecutorRecord, cx: &gpui::App) -> Option<SwapFillHint> {
         if !matches!(
             self.stage(record),
@@ -2169,11 +2402,9 @@ impl PrivateSwapsView {
         ) {
             return None;
         }
-        let hints = &self.tracking.get(&record.operation())?.order_hints;
-        let hint = model::tracked_orders(record)
-            .into_iter()
-            .filter_map(|order| hints.get(&order.uid()))
-            .find(|hint| hint.report.status == CowOrderStatusHint::Fulfilled)?;
+        let (order, hint, early) = self.reported_order(record)?;
+        let buy = swap_tokens(record).map(|(_, buy)| buy);
+        let settlement = early.and_then(|early| early.settlement);
         let root = self.root.upgrade()?;
         let root = root.read(cx);
         let depth = root
@@ -2185,12 +2416,31 @@ impl PrivateSwapsView {
             .get(&self.origin_chain_id)
             .and_then(super::chain_load::ChainUtxoState::sync_tip)
             .and_then(|tip| tip.head_block);
+        // Debug UI fixture: its reported fill counts from a head of its own.
+        #[cfg(debug_assertions)]
+        let head = ui_fixture::reported_head().or(head);
         Some(SwapFillHint {
             confirmations: hint
                 .trade_block
                 .zip(head)
                 .map(|(block, head)| head.saturating_sub(block)),
             depth,
+            // The amount in the read block comes before the orderbook's.
+            bought: settlement
+                .map(|settlement| settlement.bought)
+                .or(hint.report.executed_buy_amount)
+                .zip(buy)
+                .map(|(amount, buy)| self.token_amount(buy, amount, cx)),
+            detected: settlement.is_some(),
+            shield: match (order.delivery(), buy) {
+                (SwapDelivery::Reshield, Some(buy)) => SwapEarlyHint::seen(early, |settlement| {
+                    settlement
+                        .shielded
+                        .map(|amount| self.token_amount(buy, amount, cx))
+                }),
+                _ => SwapSeen::Looking,
+            },
+            origin: form::network_name(self.origin_chain_id),
         })
     }
 
@@ -2373,6 +2623,13 @@ impl PrivateSwapsView {
     /// Handed-off Bridge orders ask their provider through the same route until an outcome is
     /// recorded, including after a restart, backing off while it reports none. A destination
     /// chain that isn't enabled here isn't tracked.
+    ///
+    /// An order whose fill is reported, and whose settlement isn't recorded yet, gets at most
+    /// one early request with the same back-off, as [`early_request`] describes: its reported
+    /// block is read once, and a Bridge order's provider is asked. A private Bridge order's
+    /// request carries its destination chain, when that is enabled here, so its fill block is
+    /// read there. Its answers are kept for display in this session and nothing of them is
+    /// persisted. A Bridge order is asked about early or as handed off, never both.
     fn next_order_hints(
         &self,
         cx: &gpui::App,
@@ -2396,8 +2653,9 @@ impl PrivateSwapsView {
                 let tracking = self.tracking.get(&record.operation());
                 // Until verification succeeds, keep refreshing the untrusted location,
                 // including after a reorg moves a reported trade to a different block.
+                let stage = self.stage(record);
                 let wanted = matches!(
-                    self.stage(record),
+                    stage,
                     SwapStage::SubmissionPending
                         | SwapStage::SubmissionRejected
                         | SwapStage::Order(
@@ -2410,7 +2668,14 @@ impl PrivateSwapsView {
                     .swap_bridges_to_track()
                     .filter(|order| {
                         tracking
-                            .and_then(|tracking| tracking.bridge_polls.get(&order.uid()))
+                            .and_then(|tracking| {
+                                // A poll that backed off before the hand-off was recorded
+                                // doesn't delay tracking it.
+                                tracking
+                                    .bridge_polls
+                                    .get(&order.uid())
+                                    .filter(|_| !tracking.early_hints.contains_key(&order.uid()))
+                            })
                             .is_none_or(|poll| poll.next_at <= now)
                     })
                     .filter_map(|order| {
@@ -2431,13 +2696,28 @@ impl PrivateSwapsView {
                         let fee = model::needs_executed_fee(order)
                             && tracking
                                 .is_none_or(|tracking| !tracking.fee_asked.contains(&order.uid()));
-                        (wanted || fee || !bridges.is_empty()).then(|| HintRequest {
-                            operation: record.operation(),
-                            uid: order.uid(),
-                            hint: wanted,
-                            fee,
-                            client: tracking.and_then(|tracking| tracking.orderbook.clone()),
-                            bridges: std::mem::take(&mut bridges),
+                        (wanted || fee || !bridges.is_empty()).then(|| {
+                            let destination = match order.delivery() {
+                                SwapDelivery::Bridge(delivery) if delivery.is_private() => chains
+                                    .and_then(|chains| chains.get(delivery.destination_chain))
+                                    .filter(|chain| chain.enabled),
+                                _ => None,
+                            };
+                            let early = tracking.and_then(|tracking| {
+                                early_request(stage, order, tracking, destination.is_some(), now)
+                            });
+                            HintRequest {
+                                operation: record.operation(),
+                                uid: order.uid(),
+                                hint: wanted,
+                                fee,
+                                client: tracking.and_then(|tracking| tracking.orderbook.clone()),
+                                bridges: std::mem::take(&mut bridges),
+                                early,
+                                destination: early
+                                    .and(destination)
+                                    .map(|chain| Box::new(chain.clone())),
+                            }
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2445,6 +2725,26 @@ impl PrivateSwapsView {
             .collect::<Vec<_>>();
         let owner = self.private_owner().filter(|_| !requests.is_empty())?;
         Some((self.runtime.clone(), Arc::clone(owner), requests))
+    }
+
+    /// The orders whose reported settlement is read early, as [`early_order`] admits them.
+    fn early_orders(&self) -> HashSet<OrderUid> {
+        self.records
+            .iter()
+            .flat_map(|record| {
+                let stage = self.stage(record);
+                let hints = self
+                    .tracking
+                    .get(&record.operation())
+                    .map(|tracking| &tracking.order_hints);
+                model::tracked_orders(record)
+                    .into_iter()
+                    .filter(move |order| {
+                        hints.is_some_and(|hints| early_order(stage, order, hints).is_some())
+                    })
+                    .map(SwapOrderRecord::uid)
+            })
+            .collect()
     }
 
     fn apply_order_hints(&mut self, results: Vec<HintResult>, cx: &mut Context<'_, Self>) {
@@ -2467,55 +2767,85 @@ impl PrivateSwapsView {
                     tracking.bridge_polls.remove(&uid);
                     settled.push(result.operation);
                 } else {
-                    let attempts = tracking
-                        .bridge_polls
-                        .get(&uid)
-                        .map_or(0, |poll| poll.attempts);
-                    tracking.bridge_polls.insert(
-                        uid,
-                        BridgePoll {
-                            attempts: attempts.saturating_add(1),
-                            next_at: now + bridge_poll_interval(attempts),
-                        },
-                    );
+                    tracking.back_off_bridge_poll(uid, now);
                 }
             }
-            let Some((report, trade_block)) = result.report else {
-                continue;
-            };
-            // Only the reported order's own entry changes, so a late report on an order that
-            // lost keeps the traded order's location.
-            let known = tracking
+            if let Some((report, trade_block)) = result.report {
+                // Only the reported order's own entry changes, so a late report on an order
+                // that lost keeps the traded order's location.
+                let known = tracking
+                    .order_hints
+                    .get(&result.uid)
+                    .and_then(|hint| hint.trade_block);
+                tracking.order_hints.insert(
+                    result.uid,
+                    SwapOrderHint {
+                        report,
+                        trade_block: if report.status == CowOrderStatusHint::Fulfilled {
+                            trade_block.or(known)
+                        } else {
+                            None
+                        },
+                    },
+                );
+            }
+            // What was learned early belongs to one reported trade block. Another block, or
+            // an order no longer reported filled, drops it, and the new block is read again.
+            let reported = tracking
                 .order_hints
                 .get(&result.uid)
-                .and_then(|hint| hint.trade_block);
-            tracking.order_hints.insert(
-                result.uid,
-                SwapOrderHint {
-                    report,
-                    trade_block: if report.status == CowOrderStatusHint::Fulfilled {
-                        trade_block.or(known)
-                    } else {
-                        None
-                    },
-                },
-            );
+                .filter(|hint| hint.report.status == CowOrderStatusHint::Fulfilled)
+                .map(|hint| hint.trade_block);
+            if tracking
+                .early_hints
+                .get(&result.uid)
+                .is_some_and(|hint| Some(hint.trade_block) != reported)
+            {
+                tracking.early_hints.remove(&result.uid);
+                tracking.bridge_polls.remove(&result.uid);
+            }
+            // An early answer for an older block is dropped. A provider's report of an end
+            // stops the early polling of this block once the block was read, and for a
+            // delivery whose fill block is read too, once that one was; anything else backs
+            // off.
+            if let Some(hint) = result.early
+                && reported == Some(hint.trade_block)
+            {
+                tracking.early_hints.insert(result.uid, hint);
+                if hint.ends_polling() && !hint.unread() {
+                    tracking.bridge_polls.remove(&result.uid);
+                } else {
+                    tracking.back_off_bridge_poll(result.uid, now);
+                }
+            }
         }
         for operation in settled {
             self.reconcile_destination(operation, cx);
         }
-        // Forget orders that are no longer tracked, such as those with a recorded outcome.
+        // Forget orders that are no longer tracked, such as those with a recorded outcome, and
+        // what was learned early about an order once its settlement is recorded or its swap is
+        // no longer shown open. The early requests' poll goes with it, so routine tracking of a
+        // handed-off order starts without the early polling's delay or attempts.
+        let early = self.early_orders();
         let records = &self.records;
         for (operation, tracking) in &mut self.tracking {
             let record = records
                 .iter()
                 .find(|record| record.operation() == *operation);
+            tracking.early_hints.retain(|uid, _| {
+                let keep = early.contains(uid);
+                if !keep {
+                    tracking.bridge_polls.remove(uid);
+                }
+                keep
+            });
             tracking.bridge_polls.retain(|uid, _| {
-                record.is_some_and(|record| {
-                    record
-                        .swap_bridges_to_track()
-                        .any(|order| order.uid() == *uid)
-                })
+                early.contains(uid)
+                    || record.is_some_and(|record| {
+                        record
+                            .swap_bridges_to_track()
+                            .any(|order| order.uid() == *uid)
+                    })
             });
         }
         cx.notify();
@@ -3170,6 +3500,12 @@ struct HintRequest {
     client: Option<CowOrderbookClient>,
     /// Handed-off Bridge orders to poll, with their destination chain.
     bridges: Vec<(OrderUid, EffectiveChainConfig)>,
+    /// Set when `uid` is due an early request: a Bridge order's provider, and what is known
+    /// for its reported trade block.
+    early: Option<(Option<BridgeProvider>, SwapEarlyHint)>,
+    /// The destination chain of a private Bridge order due an early request, when it is
+    /// enabled here, where the order's fill block is read.
+    destination: Option<Box<EffectiveChainConfig>>,
 }
 
 struct HintResult {
@@ -3182,6 +3518,9 @@ struct HintResult {
     bridges: Vec<(OrderUid, bool)>,
     /// The report and trade block, or `None` when the orderbook couldn't be asked.
     report: Option<(CowOrderStatusReport, Option<u64>)>,
+    /// What is known early about `uid` after this pass, for the trade block that was asked
+    /// about. A failed read or request leaves what the request held.
+    early: Option<SwapEarlyHint>,
 }
 
 /// Ask the orderbook about each order through its swap's own route, sending only the order
@@ -3190,6 +3529,11 @@ struct HintResult {
 /// dropped.
 /// Bridge providers are polled on the same route, and the owner persists any outcome. The
 /// caller backs off after a poll without an outcome, including a failed one.
+/// An early request reads the reported trade block's settlement as whole-block data, for an
+/// order that hasn't read it, and asks a Bridge order's provider on the same route until it
+/// reports an end: NEAR Intents always, Across only with a hand-off. With a destination chain,
+/// the owner also reads a reported delivery's fill block there. Nothing of an early request is
+/// persisted.
 async fn fetch_order_hints(
     owner: Arc<ExecutorOwner>,
     requests: Vec<HintRequest>,
@@ -3221,7 +3565,8 @@ async fn fetch_order_hints(
                     .await;
         }
         // Without clients, every poll counts as one without an outcome.
-        let clients = if request.bridges.is_empty() {
+        let early_provider = request.early.and_then(|(provider, _)| provider);
+        let clients = if request.bridges.is_empty() && early_provider.is_none() {
             None
         } else {
             client
@@ -3246,6 +3591,40 @@ async fn fetch_order_hints(
             };
             bridges.push((*uid, outcome));
         }
+        let early = match request.early {
+            Some((provider, mut hint)) => {
+                if !hint.block_read
+                    && let Some(block) = hint.trade_block
+                    && let Ok(settlement) = Box::pin(owner.read_swap_settlement_hint(
+                        request.operation,
+                        request.uid,
+                        block,
+                    ))
+                    .await
+                {
+                    hint.block_read = true;
+                    hint.settlement = settlement;
+                }
+                let handoff = hint.settlement.and_then(|settlement| settlement.handoff);
+                if let Some(provider) = provider
+                    && !hint.ends_polling()
+                    && (provider == BridgeProvider::NearIntents || handoff.is_some())
+                    && let Some(clients) = &clients
+                    && let Ok(report) = Box::pin(owner.swap_bridge_report(
+                        request.operation,
+                        request.uid,
+                        handoff,
+                        clients,
+                        request.destination.as_deref(),
+                    ))
+                    .await
+                {
+                    hint.report = Some(report);
+                }
+                Some(hint)
+            }
+            None => None,
+        };
         results.push(HintResult {
             operation: request.operation,
             uid: request.uid,
@@ -3253,6 +3632,7 @@ async fn fetch_order_hints(
             fee: request.fee,
             bridges,
             report,
+            early,
         });
     }
     results

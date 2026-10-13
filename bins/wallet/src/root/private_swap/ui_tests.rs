@@ -3112,10 +3112,12 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
                     report: Some((
                         CowOrderStatusReport {
                             status: CowOrderStatusHint::Fulfilled,
+                            executed_buy_amount: None,
                         },
                         Some(block),
                     )),
                     bridges: Vec::new(),
+                    early: None,
                 };
                 swaps.apply_order_hints(vec![result(confirmed + 1)], cx);
                 assert!(
@@ -8625,8 +8627,15 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
             uid,
             client: None,
             fee: false,
-            report: Some((CowOrderStatusReport { status }, block)),
+            report: Some((
+                CowOrderStatusReport {
+                    status,
+                    executed_buy_amount: None,
+                },
+                block,
+            )),
             bridges: Vec::new(),
+            early: None,
         };
         // The settlement each routine page would read, and the orders the orderbook is asked
         // about.
@@ -10748,6 +10757,610 @@ fn bridge_observations(
         bridge_outcome: outcome,
         ..Default::default()
     }
+}
+
+/// An open Across order of 99 for [`BRIDGE_MINIMUM`] on Polygon to the address-book entry
+/// "Cold wallet", accepted by the orderbook and valid for ten more minutes, with the synced
+/// head at block 400. Returns its UID and the account's observation.
+fn open_across_order(
+    root: &Entity<WalletRoot>,
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    cx: &mut gpui::VisualTestContext,
+) -> (
+    broadcaster_core::contracts::cow::OrderUid,
+    wallet_ops::vault::ExecutorNonceObservation,
+) {
+    use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapSubmissionStatus};
+
+    let receiver = Address::repeat_byte(0x51);
+    let (uid, observed) = placed_order(
+        executors,
+        operation,
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver,
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+            private: None,
+        }),
+        PlacedOrder {
+            uid_hash: 0x11,
+            hook_hash: 7,
+            valid_to: u32::try_from(now_unix()).unwrap() + 600,
+            speeds_up: None,
+        },
+        |_| {},
+    );
+    executors
+        .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+        .unwrap();
+    cx.update(|_, cx| {
+        root.update(cx, |root, _| {
+            root.public_address_book = vec![cold_wallet_entry(receiver)];
+            let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1) else {
+                panic!("ready fixture")
+            };
+            sync_tip.head_block = Some(400);
+        });
+    });
+    (uid, observed)
+}
+
+/// The orderbook's report that `uid` filled in `block`, with what the same pass learned early
+/// about its settlement and delivery.
+fn reported_fill(
+    operation: ExecutorOperationId,
+    uid: broadcaster_core::contracts::cow::OrderUid,
+    block: u64,
+    early: Option<&SwapEarlyHint>,
+) -> HintResult {
+    HintResult {
+        operation,
+        uid,
+        client: None,
+        fee: false,
+        report: Some((
+            CowOrderStatusReport {
+                status: CowOrderStatusHint::Fulfilled,
+                executed_buy_amount: None,
+            },
+            Some(block),
+        )),
+        bridges: Vec::new(),
+        early: early.copied(),
+    }
+}
+
+/// What a pass holds about an Across order once it read the trade and the deposit in `block`
+/// and its provider answered `report`.
+fn early_hint(block: u64, report: Option<wallet_ops::SwapBridgeReport>) -> SwapEarlyHint {
+    let block_hash = alloy::eips::BlockNumHash::new(block, B256::repeat_byte(98));
+    SwapEarlyHint {
+        trade_block: Some(block),
+        block_read: true,
+        settlement: Some(wallet_ops::SwapSettlementHint {
+            block: block_hash,
+            bought: U256::from(99),
+            shielded: None,
+            handoff: Some(wallet_ops::SwapHandoffHint {
+                block: block_hash,
+                deposit_id: Some(U256::from(7)),
+                sent: U256::from(99),
+            }),
+        }),
+        report,
+        reads_fill: false,
+    }
+}
+
+/// A swap back to the private balance whose fill the orderbook reports has its reported block
+/// read once, before the settlement is final, and shows the trade and the shield that block
+/// holds.
+#[gpui::test]
+fn a_reported_private_fill_reads_its_block_once(cx: &mut TestAppContext) {
+    use wallet_ops::vault::SwapSubmissionStatus;
+
+    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let (uid, _) = placed_order(
+            executors,
+            operation,
+            SwapDelivery::Reshield,
+            PlacedOrder {
+                uid_hash: 0x11,
+                hook_hash: 7,
+                valid_to: u32::try_from(now_unix()).unwrap() + 600,
+                speeds_up: None,
+            },
+            |_| {},
+        );
+        executors
+            .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+            .unwrap();
+        let asked = |swaps: &PrivateSwapsView, cx: &App| {
+            swaps
+                .next_order_hints(cx)
+                .map_or_else(Vec::new, |(_, _, requests)| {
+                    requests
+                        .iter()
+                        .map(|request| request.early)
+                        .collect::<Vec<_>>()
+                })
+        };
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                assert_eq!(asked(swaps, cx), [None]);
+
+                swaps.apply_order_hints(vec![reported_fill(operation, uid, 398, None)], cx);
+                let unread = SwapEarlyHint {
+                    trade_block: Some(398),
+                    block_read: false,
+                    settlement: None,
+                    report: None,
+                    reads_fill: false,
+                };
+                assert_eq!(asked(swaps, cx), [Some((None, unread))]);
+
+                let read = SwapEarlyHint {
+                    block_read: true,
+                    settlement: Some(wallet_ops::SwapSettlementHint {
+                        block: alloy::eips::BlockNumHash::new(398, B256::repeat_byte(98)),
+                        bought: U256::from(99),
+                        shielded: Some(U256::from(98)),
+                        handoff: None,
+                    }),
+                    ..unread
+                };
+                swaps.apply_order_hints(vec![reported_fill(operation, uid, 398, Some(&read))], cx);
+                // The read block needs no further request, whatever a request backs off to.
+                swaps
+                    .tracking
+                    .get_mut(&operation)
+                    .unwrap()
+                    .bridge_polls
+                    .clear();
+                assert_eq!(asked(swaps, cx), [None]);
+
+                let record = swaps.record(operation).unwrap();
+                let (_, buy) = swap_tokens(record).unwrap();
+                let hint = swaps.labels(record, cx).fill_hint.unwrap();
+                assert!(hint.detected);
+                assert_eq!(
+                    hint.bought,
+                    Some(swaps.token_amount(buy, U256::from(99), cx))
+                );
+                assert_eq!(
+                    hint.shield,
+                    model::SwapSeen::Detected(Some(swaps.token_amount(buy, U256::from(98), cx)))
+                );
+            });
+        });
+    });
+}
+
+/// A Bridge order whose fill the orderbook reports is asked about before its settlement is
+/// final: its trade and deposit show as read from the reported block and its delivery as
+/// reported, while the trade still counts confirmations. What was
+/// learned belongs to the reported block, so another block drops it and is read again. Once the
+/// hand-off is recorded, the order is tracked as handed off, once a pass, and nothing learned
+/// early is kept.
+#[gpui::test]
+fn a_reported_bridge_fill_is_asked_about_early_until_its_hand_off_is_recorded(
+    cx: &mut TestAppContext,
+) {
+    use crate::root::public_action::PublicActionStepStatus::{Done, NotStarted, Pending};
+    use wallet_ops::SwapBridgeReport;
+    use wallet_ops::vault::BridgeProvider;
+
+    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        let (uid, observed) = open_across_order(root, executors, operation, cx);
+        // What each request of the next pass asks early, and the handed-off orders it polls.
+        let asked = |swaps: &PrivateSwapsView, cx: &App| {
+            swaps
+                .next_order_hints(cx)
+                .map_or_else(Vec::new, |(_, _, requests)| {
+                    requests
+                        .iter()
+                        .map(|request| {
+                            let polled = request.bridges.iter().map(|(uid, _)| *uid);
+                            (request.early, polled.collect::<Vec<_>>())
+                        })
+                        .collect::<Vec<_>>()
+                })
+        };
+        let unread = |block| {
+            let hint = SwapEarlyHint {
+                trade_block: Some(block),
+                block_read: false,
+                settlement: None,
+                report: None,
+                reads_fill: false,
+            };
+            Some((Some(BridgeProvider::Across), hint))
+        };
+        // The Traded step's detail and the destination step, as the swap's labels give them.
+        let shown = |swaps: &PrivateSwapsView, cx: &App| {
+            let record = swaps.record(operation).unwrap();
+            let stage = swaps.stage(record);
+            assert_eq!(stage, SwapStage::Order(SwapOrderState::Open));
+            let steps = model::swap_steps(stage, &swaps.labels(record, cx));
+            let traded = steps.iter().find(|step| step.label == "Traded").unwrap();
+            let last = steps.last().unwrap();
+            (
+                traded.detail.clone(),
+                last.label.clone(),
+                last.status,
+                last.detail.clone(),
+            )
+        };
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let depth = 400 - swaps.confirmed_block(cx).unwrap();
+                let confirming = |count: u64| format!("Confirming ({count}/{depth})");
+                let expected = format!(
+                    "{} to Cold wallet",
+                    swaps.network_token_amount(137, STUB_POLYGON_USDC, BRIDGE_MINIMUM, cx)
+                );
+                assert_eq!(asked(swaps, cx), [(None, Vec::new())]);
+
+                // The fill is reported two blocks deep, and its block is read at once.
+                swaps.apply_order_hints(vec![reported_fill(operation, uid, 398, None)], cx);
+                assert_eq!(asked(swaps, cx), [(unread(398), Vec::new())]);
+
+                // The relayer filled: the delivery shows as Across's word, and the trade
+                // still counts. A reported end is asked about no more.
+                let delivered = Some(SwapBridgeReport::Delivered {
+                    amount_out: Some(BRIDGE_MINIMUM),
+                    seen: None,
+                });
+                swaps.apply_order_hints(
+                    vec![reported_fill(
+                        operation,
+                        uid,
+                        398,
+                        Some(&early_hint(398, delivered)),
+                    )],
+                    cx,
+                );
+                let record = swaps.record(operation).unwrap();
+                let (_, buy) = swap_tokens(record).unwrap();
+                let sent = swaps.token_amount(buy, U256::from(99), cx);
+                assert_eq!(
+                    shown(swaps, cx),
+                    (
+                        format!("{} · {sent} bought", confirming(2)),
+                        "Delivered on Polygon · reported by Across".to_owned(),
+                        Done,
+                        expected.clone()
+                    )
+                );
+                assert_eq!(
+                    swaps.labels(record, cx).bridge.unwrap().deposit,
+                    model::SwapSeen::Detected(Some(sent))
+                );
+                assert_eq!(asked(swaps, cx), [(None, Vec::new())]);
+
+                // The trade is reported in another block while an answer about the first
+                // one arrives. The delivery waits again, and the new block is read.
+                swaps.apply_order_hints(
+                    vec![reported_fill(
+                        operation,
+                        uid,
+                        397,
+                        Some(&early_hint(398, delivered)),
+                    )],
+                    cx,
+                );
+                assert_eq!(
+                    shown(swaps, cx),
+                    (
+                        confirming(3),
+                        "Delivered on Polygon".to_owned(),
+                        NotStarted,
+                        expected
+                    )
+                );
+                assert_eq!(asked(swaps, cx), [(unread(397), Vec::new())]);
+
+                // Across doesn't know the deposit yet, so the next request backs off.
+                swaps.apply_order_hints(
+                    vec![reported_fill(
+                        operation,
+                        uid,
+                        397,
+                        Some(&early_hint(397, Some(SwapBridgeReport::Pending))),
+                    )],
+                    cx,
+                );
+                let (_, label, status, _) = shown(swaps, cx);
+                assert_eq!((label.as_str(), status), ("Delivered on Polygon", Pending));
+                assert_eq!(asked(swaps, cx), [(None, Vec::new())]);
+            });
+        });
+
+        // Verification records the hand-off. The order is polled as handed off in the next
+        // pass, whatever the early requests backed off to, and never also asked early.
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                bridge_observations(observed, Some(U256::from(7)), None),
+            )
+            .unwrap();
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let mut polygon = built_in_chain(137);
+                polygon.enabled = true;
+                put_chain(root, polygon);
+            });
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(
+                    swaps.stage(record),
+                    SwapStage::Order(SwapOrderState::Bridging)
+                );
+                assert_eq!(swaps.labels(record, cx).bridge.unwrap().report, None);
+                assert_eq!(asked(swaps, cx), [(None, vec![uid])]);
+
+                // Both orders of the next result start here: the hand-off is recorded, and the
+                // early answers and their back-off are still held.
+                let held_hint = swaps.tracking[&operation].early_hints[&uid];
+                let held_poll = swaps.tracking[&operation].bridge_polls[&uid];
+                assert!(held_poll.attempts > 0);
+
+                // An early answer about the reported block arrives late. It is dropped with its
+                // back-off, and the order is polled as handed off at once.
+                swaps.apply_order_hints(
+                    vec![reported_fill(
+                        operation,
+                        uid,
+                        397,
+                        Some(&early_hint(397, Some(SwapBridgeReport::Pending))),
+                    )],
+                    cx,
+                );
+                assert!(swaps.tracking[&operation].early_hints.is_empty());
+                assert_eq!(asked(swaps, cx), [(None, vec![uid])]);
+
+                // The routine poll comes first instead and has no outcome. It doesn't inherit
+                // the early back-off, so the order is polled again at once.
+                let tracking = swaps.tracking.get_mut(&operation).unwrap();
+                tracking.early_hints.insert(uid, held_hint);
+                tracking.bridge_polls.insert(uid, held_poll);
+                let polled = || HintResult {
+                    bridges: vec![(uid, false)],
+                    report: None,
+                    ..reported_fill(operation, uid, 397, None)
+                };
+                swaps.apply_order_hints(vec![polled()], cx);
+                assert!(swaps.tracking[&operation].early_hints.is_empty());
+                assert_eq!(asked(swaps, cx), [(None, vec![uid])]);
+
+                // From then on its polls back off from the base, and the cleanup keeps them.
+                swaps.apply_order_hints(vec![polled()], cx);
+                assert_eq!(swaps.tracking[&operation].bridge_polls[&uid].attempts, 1);
+                assert!(asked(swaps, cx).iter().all(|(_, polled)| polled.is_empty()));
+                swaps.apply_order_hints(Vec::new(), cx);
+                assert_eq!(swaps.tracking[&operation].bridge_polls[&uid].attempts, 1);
+            });
+        });
+    });
+}
+
+/// A private Across order's reported delivery is asked about again, with its destination chain,
+/// until the fill block there was read. The block's shield then ends the early requests and
+/// shows as detected with the private credit.
+#[gpui::test]
+fn a_reported_private_bridge_delivery_is_asked_about_until_its_fill_block_is_read(
+    cx: &mut TestAppContext,
+) {
+    use crate::root::public_action::PublicActionStepStatus::Done;
+    use wallet_ops::vault::SwapSubmissionStatus;
+    use wallet_ops::{SwapBridgeReport, SwapDeliverySeen};
+
+    with_swap_view(cx, |root, swaps, origin, _, _, cx| {
+        // Polygon is enabled, and Ethereum's synced head is at block 400.
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                let mut polygon = built_in_chain(137);
+                polygon.enabled = true;
+                put_chain(root, polygon);
+                let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(&1)
+                else {
+                    panic!("ready fixture")
+                };
+                sync_tip.head_block = Some(400);
+            });
+        });
+        let (db, view, delegate, origin_delegate) = root.read_with(cx, |root, _| {
+            let delegate = |chain_id| {
+                root.effective_chain_configs
+                    .get(chain_id)
+                    .unwrap()
+                    .accepted_executor_profile()
+                    .unwrap()
+                    .delegate()
+            };
+            (
+                root.vault_store.as_ref().unwrap().db(),
+                root.view_session.clone().unwrap(),
+                delegate(137),
+                delegate(1),
+            )
+        });
+        let destination = ExecutorStore::new(db, view, 137).unwrap();
+        let PlacedPrivateBridge { operation, uid, .. } = placed_private_bridge(
+            origin,
+            &destination,
+            origin_delegate,
+            delegate,
+            STUB_POLYGON_USDC,
+        );
+        origin
+            .record_swap_submission(operation, uid, SwapSubmissionStatus::Accepted)
+            .unwrap();
+        // The early request of the next pass, and whether it carries the destination chain.
+        let asked = |swaps: &PrivateSwapsView, cx: &App| {
+            swaps
+                .next_order_hints(cx)
+                .map_or_else(Vec::new, |(_, _, requests)| {
+                    requests
+                        .iter()
+                        .map(|request| {
+                            let (_, hint) = request.early?;
+                            Some((hint, request.destination.is_some()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+        };
+        // What a pass holds once Across reports the delivery and the fill block showed `seen`.
+        let delivered = |seen| SwapEarlyHint {
+            reads_fill: true,
+            ..early_hint(
+                398,
+                Some(SwapBridgeReport::Delivered {
+                    amount_out: Some(BRIDGE_MINIMUM),
+                    seen,
+                }),
+            )
+        };
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                // Across reports the delivery before its fill block could be read. The request
+                // backs off and then comes again.
+                let unread = delivered(None);
+                swaps
+                    .apply_order_hints(vec![reported_fill(operation, uid, 398, Some(&unread))], cx);
+                assert_eq!(asked(swaps, cx), [None]);
+                swaps
+                    .tracking
+                    .get_mut(&operation)
+                    .unwrap()
+                    .bridge_polls
+                    .clear();
+                assert_eq!(asked(swaps, cx), [Some((unread, true))]);
+
+                // The fill block shows the shield, and nothing is asked early any more.
+                let shielded = delivered(Some(SwapDeliverySeen::Shielded {
+                    amount: BRIDGE_MINIMUM,
+                }));
+                swaps.apply_order_hints(
+                    vec![reported_fill(operation, uid, 398, Some(&shielded))],
+                    cx,
+                );
+                assert!(swaps.tracking[&operation].bridge_polls.is_empty());
+                assert_eq!(asked(swaps, cx), [None]);
+
+                let record = swaps.record(operation).unwrap();
+                let steps = model::swap_steps(swaps.stage(record), &swaps.labels(record, cx));
+                let last = steps.last().unwrap();
+                // The fixture's approval binds no shield fee, so all of it is credited.
+                assert_eq!(
+                    (last.label.as_str(), last.status, last.detail.clone()),
+                    (
+                        "Private on Polygon",
+                        Done,
+                        format!(
+                            "Shield detected · {}",
+                            swaps.network_token_amount(137, STUB_POLYGON_USDC, BRIDGE_MINIMUM, cx)
+                        )
+                    )
+                );
+            });
+        });
+    });
+}
+
+/// A provider's report about a reported fill changes the destination step, the card and the
+/// note, and nothing else: the detail keeps the footer of the reported fill alone, without an
+/// outcome and without retry or recovery.
+#[gpui::test]
+fn a_bridge_providers_early_report_changes_the_copy_and_offers_no_action(cx: &mut TestAppContext) {
+    use crate::root::public_action::PublicActionStepStatus::{Done, NotStarted, Pending, Warning};
+    use wallet_ops::SwapBridgeReport;
+
+    const FOOTER: [&str; 6] = [
+        "swap-progress-check",
+        "swap-progress-continue",
+        "swap-progress-retry",
+        "swap-progress-recover",
+        "swap-progress-recover-destination",
+        "swap-progress-remove",
+    ];
+    const NOTHING_TO_DO: &str = "Nothing more to do. The result is confirmed after";
+    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        let (uid, _) = open_across_order(root, executors, operation, cx);
+        // The footer of the reported fill before its provider answered.
+        let mut footer = None;
+        for (report, last, card, note) in [
+            (
+                None,
+                ("Delivered on Polygon", NotStarted),
+                "Traded · confirming",
+                NOTHING_TO_DO,
+            ),
+            (
+                Some(SwapBridgeReport::Pending),
+                ("Delivered on Polygon", Pending),
+                "Traded · confirming",
+                NOTHING_TO_DO,
+            ),
+            (
+                Some(SwapBridgeReport::Delivered {
+                    amount_out: None,
+                    seen: None,
+                }),
+                ("Delivered on Polygon · reported by Across", Done),
+                "Delivered to Cold wallet on Polygon · confirming",
+                NOTHING_TO_DO,
+            ),
+            (
+                Some(SwapBridgeReport::Refunded),
+                ("Refund · reported by Across", Warning),
+                "Traded · confirming",
+                "The wallet acts on this once the result is confirmed, after",
+            ),
+        ] {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.reload_records();
+                    let early = report.map(|report| early_hint(398, Some(report)));
+                    swaps.apply_order_hints(
+                        vec![reported_fill(operation, uid, 398, early.as_ref())],
+                        cx,
+                    );
+                    let record = swaps.record(operation).unwrap();
+                    let stage = swaps.stage(record);
+                    assert_eq!(stage, SwapStage::Order(SwapOrderState::Open));
+                    let labels = swaps.labels(record, cx);
+                    let steps = model::swap_steps(stage, &labels);
+                    let shown = steps.last().unwrap();
+                    assert_eq!((shown.label.as_str(), shown.status), last, "{report:?}");
+                    let line = model::swap_card_line(stage, &labels);
+                    assert_eq!(line.detail, card, "{report:?}");
+                    assert!(!line.attention, "{report:?}");
+                    let shown = model::reported_fill_note(stage, &labels).unwrap();
+                    assert!(shown.starts_with(note), "{shown}");
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            // The outcome and every action wait for what observation records.
+            assert!(cx.debug_bounds("swap-outcome").is_none(), "{report:?}");
+            let offered = FOOTER.map(|action| cx.debug_bounds(action).is_some());
+            assert_eq!(
+                offered[2..5],
+                [false; 3],
+                "a report offers no retry or recovery: {report:?}"
+            );
+            assert_eq!(*footer.get_or_insert(offered), offered, "{report:?}");
+        }
+    });
 }
 
 /// An Across Bridge swap names its destination and provider from the hand-off through each

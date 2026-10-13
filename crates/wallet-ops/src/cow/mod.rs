@@ -207,6 +207,9 @@ pub enum CowOrderStatusHint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CowOrderStatusReport {
     pub status: CowOrderStatusHint,
+    /// The amount of the buy token the orderbook reports as bought so far, in base units.
+    /// `None` when the report has none.
+    pub executed_buy_amount: Option<U256>,
 }
 
 /// The fee the orderbook reports it charged a filled order. It is a hint for display and
@@ -351,6 +354,7 @@ impl CowOrderbookClient {
             .await?;
         Ok(CowOrderStatusReport {
             status: order.status,
+            executed_buy_amount: order.executed_buy_amount,
         })
     }
 
@@ -562,11 +566,13 @@ struct OrderCreationBody<'a> {
     app_data_hash: B256,
 }
 
-/// The field of `Order` the status report reads.
+/// The fields of `Order` the status report reads.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderStatusBody {
     status: CowOrderStatusHint,
+    #[serde(default)]
+    executed_buy_amount: Option<U256>,
 }
 
 /// The fields of `Order` the executed fee reads.

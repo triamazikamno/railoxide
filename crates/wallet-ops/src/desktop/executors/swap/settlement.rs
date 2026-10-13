@@ -4,6 +4,7 @@
 //! delivery, or its Across deposit for Bridge delivery. A public receiver's Across deposit may
 //! match the terms of another attempt of the same swap use, which then holds the hand-off.
 
+use alloy::eips::BlockNumHash;
 use alloy::network::{
     AnyRpcBlock, AnyTransactionReceipt, ReceiptResponse as _, primitives::HeaderResponse as _,
 };
@@ -20,7 +21,7 @@ use tracing::Instrument as _;
 use super::observation::{SwapSettlement, issued, shielded_amount};
 use super::order::cow_buy_token;
 use crate::ExecutorOwner;
-use crate::block_observer::fetch_checked_block_receipts;
+use crate::block_observer::{BlockReceiptsError, fetch_checked_block_receipts};
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
 use crate::settings::EffectiveChainConfig;
@@ -33,6 +34,35 @@ use crate::vault::{
 // The pinned shared ERC20 bindings do not expose the Transfer event.
 alloy::sol! {
     event Transfer(address indexed from, address indexed to, uint256 value);
+}
+
+/// A Bridge order's hand-off as its reported settlement block shows it before finality depth.
+/// A hint for display: it is never persisted and never establishes an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapHandoffHint {
+    /// The block that was read.
+    pub block: BlockNumHash,
+    /// The Across deposit's ID. `None` for a NEAR Intents hand-off.
+    pub deposit_id: Option<U256>,
+    /// What the settlement handed to the bridge, in bought-token base units: the Across
+    /// deposit's input amount (the terms of the attempt the deposit matched), or the whole
+    /// trade's buy amount for NEAR Intents.
+    pub sent: U256,
+}
+
+/// What an order's reported settlement block shows before finality depth. A hint for display:
+/// it is never persisted and never establishes an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapSettlementHint {
+    /// The block that was read.
+    pub block: BlockNumHash,
+    /// The trade's buy amount, in bought-token base units.
+    pub bought: U256,
+    /// A Reshield order's private credit after the shield fee, in bought-token base units, when
+    /// the block shows it. Always `None` for other deliveries.
+    pub shielded: Option<U256>,
+    /// A Bridge order's hand-off, when the block shows it.
+    pub handoff: Option<SwapHandoffHint>,
 }
 
 impl ExecutorOwner {
@@ -104,6 +134,100 @@ impl ExecutorOwner {
         ))
     }
 
+    /// Read what a CoW-reported settlement block shows for the order without waiting for
+    /// finality depth, sending only block identifiers to RPC as the verification does. Nothing
+    /// is recorded. `None` when the block was read whole and holds no trade of the order, when
+    /// the order's delivery is already recorded, or when every endpoint tried answered that
+    /// whole-block receipts are unsupported. Any other failed read is an error, so the caller
+    /// asks again.
+    pub async fn read_swap_settlement_hint(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        number: u64,
+    ) -> Result<Option<SwapSettlementHint>> {
+        let record = self
+            .swap_record(operation)?
+            .ok_or_else(|| eyre!("swap is unavailable"))?;
+        let swap = record.swap().ok_or_else(|| eyre!("swap is unavailable"))?;
+        let order = swap
+            .orders()
+            .iter()
+            .find(|order| order.uid() == uid)
+            .ok_or_else(|| eyre!("swap order is unavailable"))?;
+        if swap.delivery_order(order).is_some() {
+            return Ok(None);
+        }
+        let mut tried = 0_usize;
+        let mut unsupported = 0_usize;
+        for endpoint in self.endpoints.providers().await {
+            tried += 1;
+            let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
+            let result = trace_step(
+                "swap_settlement_hint_receipts",
+                self.while_active(Box::pin(read_block_settlement(
+                    &endpoint.provider,
+                    &self.chain,
+                    &record,
+                    order,
+                    number,
+                ))),
+            )
+            .instrument(span)
+            .await;
+            match result {
+                Ok(settlement) => {
+                    self.endpoints.succeeded(&endpoint);
+                    return Ok(settlement.map(|settlement| {
+                        let handoff = settlement.handoff.map(|handoff| {
+                            // The deposit matched the signed input amount of the attempt it is
+                            // attributed to.
+                            let sent = match swap
+                                .orders()
+                                .iter()
+                                .find(|order| order.uid() == settlement.delivery)
+                                .and_then(SwapOrderRecord::bridge)
+                            {
+                                Some(BridgeOrderTerms::Across(across)) => across.input_amount,
+                                _ => settlement.amounts.buy_amount,
+                            };
+                            SwapHandoffHint {
+                                block: handoff.observation.block,
+                                deposit_id: handoff.deposit_id,
+                                sent,
+                            }
+                        });
+                        SwapSettlementHint {
+                            block: settlement.trade.block,
+                            bought: settlement.amounts.buy_amount,
+                            // An Across order's reshielded surplus is not the order's delivery.
+                            shielded: settlement
+                                .credit
+                                .filter(|_| matches!(order.delivery(), SwapDelivery::Reshield))
+                                .map(|credit| credit.private_amount),
+                            handoff,
+                        }
+                    }));
+                }
+                Err(error) => {
+                    if matches!(
+                        error.downcast_ref::<BlockReceiptsError>(),
+                        Some(BlockReceiptsError::Unsupported)
+                    ) {
+                        unsupported += 1;
+                    }
+                    self.endpoints.failed(&endpoint, &error);
+                }
+            }
+        }
+        if tried > 0 && unsupported == tried {
+            return Ok(None);
+        }
+        Err(eyre!(
+            "The settlement block is unavailable. The swap will be checked again."
+        ))
+    }
+
     /// Read the orderbook's executed fee of an order whose trade is verified, through the
     /// swap's own orderbook route, and persist it with the trade's amounts. The request carries
     /// only the order UID, and the fee is a hint for display, never an outcome. Nothing is
@@ -160,6 +284,7 @@ struct Settlement {
     delivery: OrderUid,
 }
 
+/// [`read_block_settlement`] once block `number` is at finality depth. `None` before that.
 async fn read_settlement(
     provider: &DynProvider,
     chain: &EffectiveChainConfig,
@@ -174,6 +299,22 @@ async fn read_settlement(
     {
         return Ok(None);
     }
+    Box::pin(read_block_settlement(
+        provider, chain, record, order, number,
+    ))
+    .await
+}
+
+/// What block `number` establishes for `order`, from its whole-block receipts and whatever its
+/// depth: `None` when it holds no trade of the order. Only [`read_settlement`]'s result is
+/// evidence.
+async fn read_block_settlement(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    record: &ExecutorRecord,
+    order: &SwapOrderRecord,
+    number: u64,
+) -> Result<Option<Settlement>> {
     let block = trace_step("settlement_block", async {
         EthGetBlock::<AnyRpcBlock>::by_number(number.into(), provider.client()).await
     })
@@ -189,7 +330,15 @@ async fn read_settlement(
         fetch_checked_block_receipts(provider, identity, &hashes),
     )
     .await
-    .map_err(|_| eyre!("whole-block settlement receipts are incomplete or unavailable"))?;
+    .map_err(|error| {
+        // Kept apart from a failed read: an early read of the block gives up on an endpoint
+        // that doesn't serve whole-block receipts.
+        if matches!(error, BlockReceiptsError::Unsupported) {
+            eyre::Report::new(error)
+        } else {
+            eyre!("whole-block settlement receipts are incomplete or unavailable")
+        }
+    })?;
     let settlement = chain
         .swap_profile()
         .ok_or_else(|| eyre!("swaps are unavailable"))?

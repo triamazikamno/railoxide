@@ -41,7 +41,7 @@ use eyre::{Result, eyre};
 use tracing::Instrument as _;
 
 use super::bridge::SwapBridgeClients;
-use super::settlement::Transfer;
+use super::settlement::{SwapHandoffHint, Transfer};
 use crate::ExecutorOwner;
 use crate::block_observer::{BlockReceiptsError, fetch_checked_block_receipts};
 use crate::bridge::{
@@ -54,6 +54,36 @@ use crate::vault::{
     BridgeSurplus, ExecutorOperationId, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
     SwapObservation, SwapUseId, SwapUseRecord, SwapUseRole,
 };
+
+/// What a private delivery's reported fill block shows on the destination chain before
+/// finality depth. A hint for display: never persisted, never an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapDeliverySeen {
+    /// The destination stealth account received `amount` and shielded it. `amount` is before
+    /// Railgun's shield fee, in destination-token base units.
+    Shielded { amount: U256 },
+    /// The account received `amount` and the fill's receipt holds no shield.
+    Held { amount: U256 },
+}
+
+/// What a bridge provider reports about a Bridge order's delivery before the wallet has
+/// recorded the hand-off. A hint for display: never persisted, never an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapBridgeReport {
+    /// Delivered on the destination chain, with the amount in destination-token base units
+    /// when the provider gives one, and for a private Across delivery what the fill block
+    /// shows, once it was read.
+    Delivered {
+        amount_out: Option<U256>,
+        seen: Option<SwapDeliverySeen>,
+    },
+    /// The provider doesn't know the deposit yet, or hasn't finished it.
+    Pending,
+    /// Refunded or expired.
+    Refunded,
+    /// Failed or incomplete.
+    Failed,
+}
 
 impl ExecutorOwner {
     /// One routine poll of a handed-off Bridge order's provider. Returns the order's outcome
@@ -165,6 +195,147 @@ impl ExecutorOwner {
             Box::pin(self.observe_swap_bridge_refund(operation, uid, refund_tx)).await?;
         }
         Ok(current)
+    }
+
+    /// Ask a Bridge order's provider about its delivery without a recorded hand-off. Nothing is
+    /// recorded. Across is asked about the deposit `handoff` names and is pending without one.
+    /// NEAR Intents is asked by the deposit address of the order's terms.
+    ///
+    /// Only a private Across delivery reads the destination chain: with `destination`, that
+    /// chain, the fill block Across names is read whole before finality depth, and
+    /// [`SwapDeliverySeen`] says what it shows. A read that doesn't establish it leaves the
+    /// provider's report as it is.
+    pub async fn swap_bridge_report(
+        &self,
+        operation: ExecutorOperationId,
+        uid: OrderUid,
+        handoff: Option<SwapHandoffHint>,
+        clients: &SwapBridgeClients,
+        destination: Option<&EffectiveChainConfig>,
+    ) -> Result<SwapBridgeReport> {
+        let record = self
+            .swap_record(operation)?
+            .ok_or_else(|| eyre!("swap is unavailable"))?;
+        let order = record
+            .swap()
+            .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
+            .ok_or_else(|| eyre!("swap order is unavailable"))?;
+        let (SwapDelivery::Bridge(delivery), Some(terms)) = (order.delivery(), order.bridge())
+        else {
+            return Err(eyre!("swap order isn't delivered through a bridge"));
+        };
+        let report = match terms {
+            BridgeOrderTerms::Across(across) => {
+                let Some(deposit_id) = handoff.and_then(|handoff| handoff.deposit_id) else {
+                    return Ok(SwapBridgeReport::Pending);
+                };
+                let deposit = self
+                    .while_active(async {
+                        Ok(trace_step(
+                            "swap_bridge_across_deposit",
+                            clients.across.deposit(self.chain.chain_id, deposit_id),
+                        )
+                        .await?)
+                    })
+                    .await?;
+                match deposit.map(|deposit| (deposit.status, deposit)) {
+                    Some((AcrossDepositStatus::Filled, deposit)) => {
+                        let seen = match (destination, deposit.fill_block_number, record.address())
+                        {
+                            (Some(destination), Some(number), Some(depositor))
+                                if delivery.is_private() =>
+                            {
+                                let fill = ExpectedFill {
+                                    origin_chain: self.chain.chain_id,
+                                    deposit_id,
+                                    depositor,
+                                    delivery,
+                                    terms: *across,
+                                };
+                                Box::pin(self.across_delivery_seen(destination, number, &fill))
+                                    .await
+                            }
+                            _ => None,
+                        };
+                        SwapBridgeReport::Delivered {
+                            amount_out: Some(deposit.output_amount),
+                            seen,
+                        }
+                    }
+                    Some((AcrossDepositStatus::Expired | AcrossDepositStatus::Refunded, _)) => {
+                        SwapBridgeReport::Refunded
+                    }
+                    _ => SwapBridgeReport::Pending,
+                }
+            }
+            BridgeOrderTerms::NearIntents(near) => {
+                let outcome = self
+                    .while_active(Box::pin(near_outcome(&clients.near, near.deposit_address)))
+                    .await?;
+                // 1Click's word is never one of the outcomes verified on a chain.
+                match outcome {
+                    Some(SwapBridgeOutcome::DeliveredReported { amount_out, .. }) => {
+                        SwapBridgeReport::Delivered {
+                            amount_out,
+                            seen: None,
+                        }
+                    }
+                    Some(SwapBridgeOutcome::Refunding) => SwapBridgeReport::Refunded,
+                    Some(SwapBridgeOutcome::NeedsAttention) => SwapBridgeReport::Failed,
+                    _ => SwapBridgeReport::Pending,
+                }
+            }
+        };
+        Ok(report)
+    }
+
+    /// What block `number` of `destination` shows for the private delivery `fill` describes,
+    /// whatever the block's depth: what [`Self::across_outcome`] would verify from the same
+    /// receipt. `None` when the read doesn't establish it or `destination` can't be read for
+    /// the delivery. Only block identifiers reach that chain's RPC.
+    async fn across_delivery_seen(
+        &self,
+        destination: &EffectiveChainConfig,
+        number: u64,
+        fill: &ExpectedFill,
+    ) -> Option<SwapDeliverySeen> {
+        resolve_effective_chain_rpc_route(fill.delivery.destination_chain, destination).ok()?;
+        let spoke_pool = destination.bridge_destination()?.spoke_pool();
+        let shield = ExpectedShield {
+            handler: destination.bridge_profile()?.multicall_handler(),
+            railgun: destination.require_railgun().ok()?.deployment.contract,
+        };
+        let endpoints = ObservationEndpoints::new(destination, &self.http);
+        let read = self
+            .while_active(async {
+                Ok(Box::pin(read_fill_from_endpoints(
+                    &endpoints,
+                    destination,
+                    number,
+                    spoke_pool,
+                    fill,
+                    Some(shield),
+                    false,
+                ))
+                .await
+                .ok())
+            })
+            .await
+            .ok()
+            .flatten()?;
+        match read {
+            FillRead::Found(SwapBridgeOutcome::DeliveredVerified {
+                output_amount,
+                shielded: true,
+                ..
+            }) => Some(SwapDeliverySeen::Shielded {
+                amount: output_amount,
+            }),
+            FillRead::Found(SwapBridgeOutcome::HeldOnDestination { amount, .. }) => {
+                Some(SwapDeliverySeen::Held { amount })
+            }
+            _ => None,
+        }
     }
 
     /// One poll of Across about the deposit `tracking` describes. Returns the outcome after
@@ -314,6 +485,7 @@ impl ExecutorOwner {
             spoke_pool,
             &fill,
             shield,
+            true,
         ))
         .await;
         let unsupported = match read {
@@ -682,7 +854,8 @@ async fn near_outcome(
 }
 
 /// [`read_fill`] through the destination chain's endpoints, each tried once, until one reads
-/// the block. An identity check can admit an endpoint after the first ones were tried, so
+/// the block. Without `final_only` it is [`read_block_fill`], which doesn't wait for finality
+/// depth and whose result is not evidence. An identity check can admit an endpoint after the first ones were tried, so
 /// while some weren't tried the later admissions are waited for, [`LATE_ADMISSION_WAIT`] in
 /// all. When none reads the block, `Err` counts the endpoints that answered that whole-block
 /// receipts are unsupported.
@@ -693,6 +866,7 @@ async fn read_fill_from_endpoints(
     spoke_pool: Option<Address>,
     fill: &ExpectedFill,
     shield: Option<ExpectedShield>,
+    final_only: bool,
 ) -> Result<FillRead, usize> {
     let configured = destination.rpc_route.endpoints().len();
     // By pool index, so that each configured endpoint is tried and counted once.
@@ -708,14 +882,21 @@ async fn read_fill_from_endpoints(
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
                 "swap_bridge_fill",
-                Box::pin(read_fill(
-                    &endpoint.provider,
-                    destination.finality_depth,
-                    number,
-                    spoke_pool,
-                    fill,
-                    shield,
-                )),
+                Box::pin(async {
+                    if final_only {
+                        read_fill(
+                            &endpoint.provider,
+                            destination.finality_depth,
+                            number,
+                            spoke_pool,
+                            fill,
+                            shield,
+                        )
+                        .await
+                    } else {
+                        read_block_fill(&endpoint.provider, number, spoke_pool, fill, shield).await
+                    }
+                }),
             )
             .instrument(span)
             .await;
@@ -897,22 +1078,14 @@ impl ExpectedRefund {
 enum FillRead {
     /// A candidate fill's outcome.
     Found(SwapBridgeOutcome),
-    /// The block is final, was read whole and is still canonical, and holds no candidate.
+    /// The block was read whole and is still canonical, and holds no candidate.
     NoCandidate,
     /// Not final yet, left the canonical chain during the read, or a private fill that didn't
     /// reach the destination stealth account.
     Unresolved,
 }
 
-/// Match `fill` in the finalized receipts of block `number`, sending only block identifiers.
-/// Evidence belongs to a receipt, so a receipt is one candidate however many matching events
-/// it holds. One matching event from `spoke_pool`, the destination chain's pinned pool, makes
-/// its receipt a candidate for that event's executed amount, whatever other emitters log
-/// beside it. Without one, a receipt with a matching event from any emitter is a candidate
-/// when it pays the receiver, for the amount paid. See [`ExpectedFill::paid_to_receiver`].
-/// Anyone can emit a matching event, so a receipt with neither is ignored and doesn't make the
-/// block ambiguous. Two candidate receipts do, as do two matching events of the pinned pool in
-/// one receipt. `shield` is given for a private delivery. See [`ExpectedFill::outcome`].
+/// [`read_block_fill`] once block `number` is at finality depth. `Unresolved` before that.
 async fn read_fill(
     provider: &DynProvider,
     finality_depth: u64,
@@ -921,10 +1094,30 @@ async fn read_fill(
     fill: &ExpectedFill,
     shield: Option<ExpectedShield>,
 ) -> Result<FillRead> {
-    let Some((identity, receipts)) = finalized_receipts(provider, finality_depth, number).await?
-    else {
+    if !at_finality_depth(provider, finality_depth, number).await? {
         return Ok(FillRead::Unresolved);
-    };
+    }
+    Box::pin(read_block_fill(provider, number, spoke_pool, fill, shield)).await
+}
+
+/// Match `fill` in the receipts of block `number`, whatever its depth, sending only block
+/// identifiers. Only [`read_fill`]'s result is evidence.
+/// Evidence belongs to a receipt, so a receipt is one candidate however many matching events
+/// it holds. One matching event from `spoke_pool`, the destination chain's pinned pool, makes
+/// its receipt a candidate for that event's executed amount, whatever other emitters log
+/// beside it. Without one, a receipt with a matching event from any emitter is a candidate
+/// when it pays the receiver, for the amount paid. See [`ExpectedFill::paid_to_receiver`].
+/// Anyone can emit a matching event, so a receipt with neither is ignored and doesn't make the
+/// block ambiguous. Two candidate receipts do, as do two matching events of the pinned pool in
+/// one receipt. `shield` is given for a private delivery. See [`ExpectedFill::outcome`].
+async fn read_block_fill(
+    provider: &DynProvider,
+    number: u64,
+    spoke_pool: Option<Address>,
+    fill: &ExpectedFill,
+    shield: Option<ExpectedShield>,
+) -> Result<FillRead> {
+    let (identity, receipts) = block_receipts(provider, number).await?;
     let mut found = None;
     for receipt in receipts {
         let logs = receipt.inner.logs();
@@ -1014,13 +1207,30 @@ pub(super) async fn finalized_receipts(
     finality_depth: u64,
     number: u64,
 ) -> Result<Option<(BlockNumHash, Vec<AnyTransactionReceipt>)>> {
-    let head = trace_step("swap_bridge_block_head", provider.get_block_number()).await?;
-    if head
-        .checked_sub(finality_depth)
-        .is_none_or(|safe| number > safe)
-    {
+    if !at_finality_depth(provider, finality_depth, number).await? {
         return Ok(None);
     }
+    block_receipts(provider, number).await.map(Some)
+}
+
+/// Whether block `number` is at `finality_depth` under the provider's head.
+async fn at_finality_depth(
+    provider: &DynProvider,
+    finality_depth: u64,
+    number: u64,
+) -> Result<bool> {
+    let head = trace_step("swap_bridge_block_head", provider.get_block_number()).await?;
+    Ok(head
+        .checked_sub(finality_depth)
+        .is_some_and(|safe| number <= safe))
+}
+
+/// The successful receipts of block `number`, whatever its depth, read whole by block
+/// identifiers only.
+async fn block_receipts(
+    provider: &DynProvider,
+    number: u64,
+) -> Result<(BlockNumHash, Vec<AnyTransactionReceipt>)> {
     let block = trace_step("swap_bridge_block", async {
         EthGetBlock::<AnyRpcBlock>::by_number(number.into(), provider.client()).await
     })
@@ -1060,7 +1270,7 @@ pub(super) async fn finalized_receipts(
     }) {
         return Err(eyre!("bridge receipt logs have inconsistent inclusion"));
     }
-    Ok(Some((identity, receipts)))
+    Ok((identity, receipts))
 }
 
 /// Whether `identity` is still canonical. A block fetched before a reorg may still be served.

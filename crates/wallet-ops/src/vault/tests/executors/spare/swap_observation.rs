@@ -4308,6 +4308,66 @@ async fn settlement_receipts_hand_off_to_across_only_with_the_signed_deposit() {
     }
 }
 
+#[tokio::test]
+async fn an_unconfirmed_settlement_block_hints_what_it_shows_and_records_nothing() {
+    // 0: an Across order's signed deposit. 1: its trade without a deposit. 2: the signed
+    // deposit, on an endpoint without whole-block receipts. 3: a Reshield order's trade and
+    // shield.
+    for scenario in 0..4 {
+        let fixture = Fixture::start().await;
+        let (delivery, terms) = across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+        let logs = if scenario == 3 {
+            fixture.record_attempt(1, 20);
+            settlement_logs(&fixture, 1, 20)
+        } else {
+            fixture.record_delivery_attempt(
+                1,
+                20,
+                BUY,
+                SwapDelivery::Bridge(delivery),
+                Some(BridgeOrderTerms::Across(terms)),
+            );
+            let deposit = (scenario != 1).then(|| signed_deposit(delivery, &terms));
+            across_settlement_logs(&fixture, &terms, deposit)
+        };
+        // Block 15 is the head, short of the finality depth of 1.
+        let block = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head = 15;
+            chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
+            if scenario == 2 {
+                chain.receipt_error = Some(-32601);
+            }
+            chain.rpc_requests.clear();
+            chain.block(15)
+        };
+        let before = fixture.record();
+        let hint = fixture
+            .owner
+            .read_swap_settlement_hint(fixture.operation, uid(1, 20), 15)
+            .await
+            .unwrap();
+        assert_eq!(
+            hint,
+            (scenario != 2).then_some(crate::SwapSettlementHint {
+                block,
+                bought: U256::from(BUY_AMOUNT),
+                // The Across order's reshielded surplus is not reported as its shield.
+                shielded: (scenario == 3).then_some(U256::from(BUY_AMOUNT - 24)),
+                handoff: (scenario == 0).then_some(crate::SwapHandoffHint {
+                    block,
+                    deposit_id: Some(U256::from(42)),
+                    sent: terms.input_amount,
+                }),
+            }),
+            "scenario {scenario}"
+        );
+        assert_eq!(fixture.record(), before, "scenario {scenario}");
+        assert_block_only_requests(&fixture.chain.lock().unwrap().rpc_requests, block);
+        fixture.finish().await;
+    }
+}
+
 /// Record an Across attempt valid to block `valid_to` and expire it: `validTo` passes at the
 /// confirmed block while the nonce stays unused.
 async fn expired_across_attempt(
@@ -5331,9 +5391,8 @@ async fn a_speed_ups_trade_delivers_under_the_expired_attempts_lower_across_term
     fixture.finish().await;
 }
 
-/// Record a NEAR Intents order to BNB Chain and confirm its settlement in block 15, whose trade
-/// pays `deposit_address`. Returns the trade's observation.
-async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
+/// Record a NEAR Intents order to BNB Chain whose trade pays `deposit_address`.
+fn record_near_order(fixture: &Fixture, deposit_address: Address) {
     fixture.record_delivery_attempt(
         1,
         20,
@@ -5354,6 +5413,12 @@ async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObserv
             signed_quote: "{}".into(),
         })),
     );
+}
+
+/// Record [`record_near_order`]'s order and confirm its settlement in block 15. Returns the
+/// trade's observation.
+async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
+    record_near_order(fixture, deposit_address);
     // The order's UID commits to the deposit address the settlement pays.
     let logs = vec![
         (fixture.settlement, trade_log(uid(1, 20))),
@@ -6498,6 +6563,161 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
             assert_eq!(requests.lock().unwrap().len(), 2);
         }
         stub.abort();
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_providers_report_before_the_recorded_handoff_is_returned_and_records_nothing() {
+    use crate::SwapBridgeReport::{Delivered, Failed, Pending, Refunded};
+    let delivered = |amount: u64| Delivered {
+        amount_out: Some(U256::from(amount)),
+        seen: None,
+    };
+    // Across is asked about the hinted deposit, and not at all without one. NEAR Intents is
+    // asked by the order's deposit address.
+    for (across, status, hinted, expected) in [
+        (true, "filled", true, delivered(REPORTED_AMOUNT)),
+        (true, "pending", true, Pending),
+        (true, "expired", true, Refunded),
+        (true, "filled", false, Pending),
+        (false, "SUCCESS", false, delivered(16)),
+        (false, "PROCESSING", false, Pending),
+        (false, "FAILED", false, Failed),
+    ] {
+        let fixture = Fixture::start().await;
+        let report = if across {
+            let (delivery, terms) =
+                across_order(fixture.config.bridge_profile().unwrap().spoke_pool());
+            fixture.record_delivery_attempt(
+                1,
+                20,
+                BUY,
+                SwapDelivery::Bridge(delivery),
+                Some(BridgeOrderTerms::Across(terms)),
+            );
+            across_report(status, REPORTED_AMOUNT)
+        } else {
+            record_near_order(&fixture, Address::repeat_byte(0x79));
+            format!(r#"{{"status":"{status}","swapDetails":{{"amountOut":"16"}}}}"#)
+        };
+        let handoff = hinted.then_some(crate::SwapHandoffHint {
+            block: BlockNumHash::new(15, B256::repeat_byte(15)),
+            deposit_id: Some(U256::from(42)),
+            sent: U256::from(BUY_AMOUNT - 99),
+        });
+        let (url, requests, stub) =
+            super::swap_order::spawn_bridge_stub(move |_| report.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        let before = fixture.record();
+        assert_eq!(
+            fixture
+                .owner
+                .swap_bridge_report(fixture.operation, uid(1, 20), handoff, &clients, None)
+                .await
+                .unwrap(),
+            expected,
+            "{status}"
+        );
+        assert_eq!(fixture.record(), before, "{status}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            usize::from(!across || hinted),
+            "{status}"
+        );
+        stub.abort();
+        fixture.finish().await;
+    }
+}
+
+// The fill block Across names is read on the destination chain before it is final there, and
+// the report says what the verification would later find in the same receipt.
+#[tokio::test]
+async fn a_private_across_report_says_what_the_unconfirmed_fill_block_shows_and_records_nothing() {
+    use crate::SwapDeliverySeen::{Held, Shielded};
+    // Whether the fill's receipt holds the shield, and whether the endpoint serves whole-block
+    // receipts.
+    for (shield, served) in [(true, true), (false, true), (true, false)] {
+        let fixture = Fixture::start().await;
+        // Block 30 is the head, above finality depth 1.
+        let (destination, config, server) = across_destination(42161).await;
+        let profile = config.bridge_profile().unwrap();
+        let (spoke_pool, handler) = (profile.spoke_pool(), profile.multicall_handler());
+        let railgun = config.require_railgun().unwrap().deployment.contract;
+        let (delivery, terms) = private_across_order(
+            fixture.config.bridge_profile().unwrap().spoke_pool(),
+            handler,
+        );
+        fixture.record_delivery_attempt(
+            1,
+            20,
+            BUY,
+            SwapDelivery::Bridge(delivery),
+            Some(BridgeOrderTerms::Across(terms)),
+        );
+        let received = terms.output_amount + U256::from(7);
+        let transfer = |from: Address, to: Address, value: U256| {
+            (
+                terms.output_token,
+                Transfer { from, to, value }.encode_log_data(),
+            )
+        };
+        let mut logs = vec![
+            (
+                spoke_pool,
+                filled_relay(delivery, &terms, 42).encode_log_data(),
+            ),
+            transfer(handler, delivery.receiver, received),
+        ];
+        if shield {
+            logs.push(transfer(
+                delivery.receiver,
+                railgun,
+                received - U256::from(25),
+            ));
+        }
+        {
+            let mut chain = destination.lock().unwrap();
+            chain.add_addressed_transaction(30, spoke_pool, Bytes::new(), logs);
+            if !served {
+                chain.receipt_error = Some(-32601);
+            }
+        }
+        let report = across_report("filled", REPORTED_AMOUNT);
+        let (url, _, stub) = super::swap_order::spawn_bridge_stub(move |_| report.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        let handoff = Some(crate::SwapHandoffHint {
+            block: BlockNumHash::new(15, B256::repeat_byte(15)),
+            deposit_id: Some(U256::from(42)),
+            sent: U256::from(BUY_AMOUNT - 99),
+        });
+        let before = fixture.record();
+        let seen = match (served, shield) {
+            (false, _) => None,
+            (true, true) => Some(Shielded { amount: received }),
+            (true, false) => Some(Held { amount: received }),
+        };
+        assert_eq!(
+            fixture
+                .owner
+                .swap_bridge_report(
+                    fixture.operation,
+                    uid(1, 20),
+                    handoff,
+                    &clients,
+                    Some(&config)
+                )
+                .await
+                .unwrap(),
+            crate::SwapBridgeReport::Delivered {
+                amount_out: Some(U256::from(REPORTED_AMOUNT)),
+                seen,
+            },
+            "shield {shield}, served {served}"
+        );
+        assert_eq!(fixture.record(), before);
+        stub.abort();
+        server.abort();
         fixture.finish().await;
     }
 }

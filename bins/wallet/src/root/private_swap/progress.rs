@@ -43,9 +43,9 @@ use super::model::{
     SwapActions, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapSetupProgress,
     SwapStage, SwapStep, SwapStepAccount, bridge_sent_amount, card_line, needs_executed_fee,
     prepared_swap_use, private_delivery_credit, provider_name, record_outcome_order, record_swaps,
-    speed_up_shown, swap_actions, swap_order_group, swap_order_stage, swap_order_status,
-    swap_outcome, swap_private_delivery, swap_private_minimum, swap_setup_progress, swap_steps,
-    swap_use_destination, swap_valid_to,
+    reported_fill_note, speed_up_shown, swap_actions, swap_order_group, swap_order_stage,
+    swap_order_status, swap_outcome, swap_private_delivery, swap_private_minimum,
+    swap_setup_progress, swap_steps, swap_use_destination, swap_valid_to,
 };
 use super::setup_progress::{SetupProgress, SetupProgressEnd};
 use super::{
@@ -508,7 +508,10 @@ impl PrivateSwapsView {
                 .into(),
             )
         } else {
-            progress_note(stage).map(Into::into)
+            // A reported fill leaves nothing to do, which the note of its stage doesn't say.
+            reported_fill_note(stage, &labels)
+                .map(Into::into)
+                .or_else(|| progress_note(stage).map(Into::into))
         };
         let latest = pending
             .is_none()

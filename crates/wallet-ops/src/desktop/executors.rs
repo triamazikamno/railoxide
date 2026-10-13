@@ -88,6 +88,7 @@ pub(crate) use swap::{
     plan_swap_inputs, plan_swap_speed_up_inputs, price_swap_review, reusable_swap_proof,
     speed_up_block, swap_cancellation_admitted, swap_invalidation, swap_recovery_calls,
 };
+pub use swap::{SwapBridgeReport, SwapDeliverySeen, SwapHandoffHint, SwapSettlementHint};
 pub use swap::{
     SwapContinuingApproval, SwapContinuingApprovals, SwapQuoteAgeEvidence,
     swap_continuing_approvals,
