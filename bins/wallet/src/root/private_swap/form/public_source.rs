@@ -689,6 +689,7 @@ impl PrivateSwapsView {
             form.price_acknowledged = false;
             form.high_costs_acknowledged = false;
             form.quote = QuoteState::Idle;
+            form.quote_details_open = false;
             form.bridge_quote_error = None;
             public.review = None;
             public.quote_terms = None;
@@ -747,6 +748,7 @@ impl PrivateSwapsView {
         public.review = None;
         let Ok(amount) = amount else {
             form.quote = QuoteState::Idle;
+            form.quote_details_open = false;
             cx.notify();
             return;
         };
@@ -770,6 +772,7 @@ impl PrivateSwapsView {
             shield_failure: failure,
         };
         form.quote = QuoteState::Loading;
+        form.quote_details_open = false;
         let runtime = self.runtime.clone();
         form.quote_task = Some(cx.spawn_in(window, async move |view, cx| {
             cx.background_executor().timer(QUOTE_DEBOUNCE).await;
@@ -825,6 +828,7 @@ impl PrivateSwapsView {
                         public.review = Some(Arc::new(review));
                         public.quote_terms = Some(terms);
                         form.quote = QuoteState::Idle;
+                        form.quote_details_open = false;
                         form.error = None;
                     }
                     Ok(Err(error)) => form.quote = QuoteState::Failed(error),
@@ -3162,6 +3166,7 @@ impl PrivateSwapsView {
             form.quote_revision = form.quote_revision.wrapping_add(1);
             form.quote_task = None;
             form.quote = QuoteState::Idle;
+            form.quote_details_open = false;
             form.bridge_quote_error = None;
             form.price_acknowledged = false;
             form.high_costs_acknowledged = false;
@@ -3477,14 +3482,18 @@ impl PrivateSwapsView {
                     }),
             )
             .children(match &form.quote {
-                QuoteState::Failed(error) => Some(
-                    Alert::error(
+                QuoteState::Failed(error) => {
+                    let failure = public_quote_failure(error, form.network, |token, amount| {
+                        self.token_amount(token, amount, cx)
+                    });
+                    Some(alert_frame(
                         "public-swap-quote-error",
-                        public_quote_error_message(error, form.network),
-                    )
-                    .small()
-                    .min_w_0(),
-                ),
+                        failure.message,
+                        Self::quote_details(form, failure.details, cx),
+                        None,
+                        cx,
+                    ))
+                }
                 _ => None,
             })
             .children(form.error.as_ref().map(|error| {
@@ -4519,26 +4528,38 @@ impl PublicSwapConflict {
 
 /// The route of the form's pair, once its network's routes are read.
 /// A failed quote of a swap paid from a Public account, in the form's words. An amount that
-/// the bridge or the shield's gas on `network` rules out says so and what to do.
-fn public_quote_error_message(error: &eyre::Report, network: Option<u64>) -> String {
+/// the bridge or the shield's gas on `network` rules out says so and what to do, without
+/// details. Any other failure reads as the private form's does, with `cost` formatting its
+/// estimated cost.
+pub(super) fn public_quote_failure(
+    error: &eyre::Report,
+    network: Option<u64>,
+    cost: impl FnOnce(Address, U256) -> String,
+) -> QuoteFailure {
     let there = network.map_or_else(|| "the destination network".to_owned(), network_name);
     if matches!(
         error.downcast_ref::<OrderLimitError>(),
         Some(OrderLimitError::DeliveryAllowanceExceedsOutput { .. })
     ) {
-        return format!(
-            "This amount is too small to bridge to your private balance on {there}. The shield's gas there costs more than the amount. Try a larger amount."
-        );
+        return QuoteFailure {
+            message: format!(
+                "This amount is too small to bridge to your private balance on {there}. The shield's gas there costs more than the amount. Try a larger amount."
+            ),
+            details: None,
+        };
     }
     if matches!(
         error.downcast_ref::<BridgeApiError>(),
         Some(BridgeApiError::AmountTooLow)
     ) {
-        return format!(
-            "This amount is too small for Across to bridge to {there}. Try a larger amount."
-        );
+        return QuoteFailure {
+            message: format!(
+                "This amount is too small for Across to bridge to {there}. Try a larger amount."
+            ),
+            details: None,
+        };
     }
-    format!("{error:#}")
+    map_quote_failure(error, cost)
 }
 
 fn public_route(form: &SwapForm) -> Option<&PublicBridgeDestination> {

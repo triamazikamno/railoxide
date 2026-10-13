@@ -41,9 +41,10 @@ use super::bridge::{
 };
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::order::{
-    SwapGasPricing, SwapOrderOutcome, SwapPrice, anchor_token, approval_cushion,
-    order_limit_or_tight, placeholder_destination_shield_multicall, swap_gas_pricing, swap_order,
-    swap_order_limit, swap_submission_outcome, swap_submission_status, valid_to_after,
+    SwapGasPricing, SwapOrderOutcome, SwapPrice, SwapQuoteAnchor, SwapQuoteDiagnostics,
+    anchor_token, approval_cushion, order_limit_or_tight, placeholder_destination_shield_multicall,
+    swap_gas_pricing, swap_order, swap_order_limit, swap_submission_outcome,
+    swap_submission_status, valid_to_after, wrap_pricing_error,
 };
 use super::public_permit::{PublicSwapApprovalPlan, permit_pre_hook, placeholder_permit_pre_hook};
 use super::public_source::PublicSwapDeliveryQuote;
@@ -1090,6 +1091,11 @@ impl ExecutorOwner {
                         token_registry,
                     )
                 });
+                let diagnostics = SwapQuoteDiagnostics::new(
+                    origin.chain_id,
+                    &quote.quote,
+                    SwapQuoteAnchor::from_cached(&anchor),
+                );
                 let price = match anchor {
                     Ok(Some(rate)) => {
                         check_quote_against_anchor(
@@ -1117,7 +1123,8 @@ impl ExecutorOwner {
                     proxy,
                     hook_gas_limit,
                     valid_for_secs,
-                )?;
+                )
+                .map_err(|error| wrap_pricing_error(error.into(), diagnostics))?;
                 (Some(order), price, plan)
             }
         };

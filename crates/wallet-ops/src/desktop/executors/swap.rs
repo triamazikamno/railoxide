@@ -69,9 +69,9 @@ pub(crate) use order::{
 };
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,
-    SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
-    SwapSpeedUpRefusal, delivery_shortfall_allowance, swap_speed_up_relaxes,
-    swap_submission_outcome,
+    SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapQuoteAnchor, SwapQuoteDiagnostics,
+    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSpeedUpRefusal,
+    delivery_shortfall_allowance, swap_speed_up_relaxes, swap_submission_outcome,
 };
 pub use public_order::{
     PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,

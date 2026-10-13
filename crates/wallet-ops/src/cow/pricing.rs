@@ -274,8 +274,14 @@ pub enum OrderLimitError {
     InvalidPriceTolerance,
     #[error("the gas share must be at most 10000 basis points")]
     InvalidGasShare,
-    #[error("Couldn't calculate network fees from this quote.")]
-    InvalidQuotePrice,
+    #[error("the quote's sell amount is zero")]
+    QuoteSellAmountZero,
+    #[error("the quote's sell token price isn't a decimal number")]
+    QuotePriceNotDecimal,
+    #[error("the quote's sell token price is zero")]
+    QuotePriceZero,
+    #[error("the quote's sell token price is outside the range the gas rate can represent")]
+    QuotePriceOutOfRange,
     #[error("the quote's gas amount can't be used")]
     InvalidQuoteGas,
     #[error(transparent)]
@@ -378,7 +384,7 @@ pub fn price_order_limit(params: &OrderLimitParams<'_>) -> Result<OrderLimit, Or
     }
     let quote = params.quote;
     if quote.sell_amount.is_zero() {
-        return Err(OrderLimitError::InvalidQuotePrice);
+        return Err(OrderLimitError::QuoteSellAmountZero);
     }
     let rate = match params.native_rate {
         NativeBuyRate::Anchor(rate) => rate,
@@ -484,19 +490,34 @@ pub fn order_buy_amount(min_received: U256, shield_fee_bps: U256) -> Result<U256
 
 /// Buy-token base units per whole native token implied by a quote, rounded up:
 /// `1e18 * buyAmount / (sellTokenPrice * sellAmount)`.
+///
+/// The price is cut to its first [`QUOTE_PRICE_SIGNIFICANT_DIGITS`] significant digits. `CoW`
+/// can state it as a float's full decimal expansion, whose later digits describe the float and
+/// not the price. The cut lowers the price, so it can only raise the rate.
 fn quote_native_to_buy_rate(quote: &CowQuoteParameters) -> Result<U256, OrderLimitError> {
-    let (price, exponent) =
-        parse_decimal(&quote.sell_token_price).ok_or(OrderLimitError::InvalidQuotePrice)?;
-    if price.is_zero() || quote.sell_amount.is_zero() {
-        return Err(OrderLimitError::InvalidQuotePrice);
+    let (digits, exponent) =
+        decimal_digits(&quote.sell_token_price).ok_or(OrderLimitError::QuotePriceNotDecimal)?;
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Err(OrderLimitError::QuotePriceZero);
     }
+    if quote.sell_amount.is_zero() {
+        return Err(OrderLimitError::QuoteSellAmountZero);
+    }
+    let kept = &digits[..digits.len().min(QUOTE_PRICE_SIGNIFICANT_DIGITS)];
+    let price =
+        U256::from_str_radix(kept, 10).map_err(|_| OrderLimitError::QuotePriceNotDecimal)?;
+    let exponent = i32::try_from(digits.len() - kept.len())
+        .ok()
+        .and_then(|dropped| exponent.checked_add(dropped))
+        .ok_or(OrderLimitError::QuotePriceOutOfRange)?;
     // 1e18 / (price * 10^exponent) = 10^(18 - exponent) / price.
     let scale = 18_i32
         .checked_sub(exponent)
-        .ok_or(OrderLimitError::InvalidQuotePrice)?;
+        .ok_or(OrderLimitError::QuotePriceOutOfRange)?;
     let power = U256::from(10_u8)
         .checked_pow(U256::from(scale.unsigned_abs()))
-        .ok_or(OrderLimitError::InvalidQuotePrice)?;
+        .ok_or(OrderLimitError::QuotePriceOutOfRange)?;
     let (numerator, denominator) = if scale >= 0 {
         (
             quote.buy_amount.checked_mul(power),
@@ -511,14 +532,24 @@ fn quote_native_to_buy_rate(quote: &CowQuoteParameters) -> Result<U256, OrderLim
         )
     };
     let (Some(numerator), Some(denominator)) = (numerator, denominator) else {
-        return Err(OrderLimitError::InvalidQuotePrice);
+        return Err(OrderLimitError::QuotePriceOutOfRange);
     };
     Ok(numerator.div_ceil(denominator))
 }
 
+/// Significant digits of a quote's `sellTokenPrice` that [`quote_native_to_buy_rate`] keeps.
+const QUOTE_PRICE_SIGNIFICANT_DIGITS: usize = 18;
+
 /// Parses a non-negative decimal such as `412345678.9` or `4.1E-7` into
 /// `(mantissa, exponent)` with value `mantissa * 10^exponent`.
 fn parse_decimal(text: &str) -> Option<(U256, i32)> {
+    let (digits, exponent) = decimal_digits(text)?;
+    Some((U256::from_str_radix(&digits, 10).ok()?, exponent))
+}
+
+/// Splits a non-negative decimal into its digits, of any count, and the exponent that gives
+/// the value `digits * 10^exponent`.
+fn decimal_digits(text: &str) -> Option<(String, i32)> {
     let (number, exponent) = match text.split_once(['e', 'E']) {
         Some((number, exponent)) => (number, exponent.parse::<i32>().ok()?),
         None => (text, 0),
@@ -528,13 +559,13 @@ fn parse_decimal(text: &str) -> Option<(U256, i32)> {
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let mantissa = U256::from_str_radix(&digits, 10).ok()?;
     let exponent = exponent.checked_sub(i32::try_from(fraction.len()).ok()?)?;
-    Some((mantissa, exponent))
+    Some((digits, exponent))
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::U512;
     use railgun_wallet::tx::{ETHEREUM_GAS_MODEL, POLYGON_GAS_MODEL};
 
     use super::*;
@@ -808,12 +839,54 @@ mod tests {
                 "{price}"
             );
         }
-        for price in ["", ".", "-1", "1e", "NaN", "0"] {
+        for (sell_amount, price, error) in [
+            (1, "", OrderLimitError::QuotePriceNotDecimal),
+            (1, ".", OrderLimitError::QuotePriceNotDecimal),
+            (1, "-1", OrderLimitError::QuotePriceNotDecimal),
+            (1, "1e", OrderLimitError::QuotePriceNotDecimal),
+            (1, "NaN", OrderLimitError::QuotePriceNotDecimal),
+            (1, "0", OrderLimitError::QuotePriceZero),
+            (0, "1", OrderLimitError::QuoteSellAmountZero),
+            // 10^(18 + 70) is beyond `U256`.
+            (1, "1e-70", OrderLimitError::QuotePriceOutOfRange),
+        ] {
             assert_eq!(
-                quote_native_to_buy_rate(&quote(1, 1, price)),
-                Err(OrderLimitError::InvalidQuotePrice),
+                quote_native_to_buy_rate(&quote(sell_amount, 1, price)),
+                Err(error),
                 "{price}"
             );
+        }
+    }
+
+    #[test]
+    fn quote_rate_cuts_a_long_price_to_eighteen_significant_digits() {
+        // `ceil(1e18 * buyAmount / (price * sellAmount))` from every digit of a `0.` price.
+        let exact = |quote: &CowQuoteParameters| {
+            let fraction = quote.sell_token_price.split_once('.').unwrap().1;
+            let numerator = U512::from(quote.buy_amount)
+                * U512::from(10_u8).pow(U512::from(18 + fraction.len()));
+            let denominator =
+                U512::from_str_radix(fraction, 10).unwrap() * U512::from(quote.sell_amount);
+            numerator.div_ceil(denominator)
+        };
+        let rate = |price: &str| {
+            let quote = quote(1_000_000_000_000_000_000, 999_000, price);
+            let rate = U512::from(quote_native_to_buy_rate(&quote).unwrap());
+            (rate, exact(&quote))
+        };
+
+        // 17 significant digits are all kept.
+        let (short, exact_short) = rate("0.0013443372127831241");
+        assert_eq!(short, exact_short);
+
+        // A float's full expansion from a BNB Chain quote, and more digits than `U256` holds.
+        let beyond_u256 = format!("0.{}", "123456789".repeat(10));
+        for price in [
+            "0.0013443372127831241559514641181749539100565016269683837890625",
+            beyond_u256.as_str(),
+        ] {
+            let (cut, exact) = rate(price);
+            assert!(exact <= cut && cut <= exact + U512::ONE, "{price}");
         }
     }
 

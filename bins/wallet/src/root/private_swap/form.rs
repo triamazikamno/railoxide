@@ -36,7 +36,7 @@ use gpui_component::{
     spinner::Spinner,
     tooltip::Tooltip,
 };
-use ui::clipboard::clipboard_with_toast;
+use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{
     app_amount_input, app_amount_text, app_button, app_button_base, app_button_label, app_input,
     app_muted_text, app_segment_button, app_strong_text, app_text,
@@ -84,6 +84,7 @@ use self::buy_picker::{
     public_network_availability,
 };
 use self::public_source::{PublicSwapForm, public_strip};
+use self::quote_failure::{QuoteFailure, map_quote_failure};
 use super::dialog::{SwapDialogView, powered_by_cow};
 use super::model::{
     SwapFormMode as FormMode, SwapSetupProgress, SwapStage, SwapStepAccount, format_bps_percent,
@@ -1309,6 +1310,9 @@ pub(super) struct SwapForm {
     settings_open: bool,
     /// The gas strip's "Why pay less than the full gas?" popover. A new quote closes it.
     gas_help_open: bool,
+    /// The Details of a failed quote's alert. Clearing the quote or asking for a new one
+    /// closes them.
+    quote_details_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3024,6 +3028,37 @@ impl PrivateSwapsView {
         self.stage_public_route_error_for_fixture(window, cx);
     }
 
+    /// Debug UI fixture: in a `quote-error` mode, open the private form of a new swap and hold it
+    /// on the synthesized pricing failure. The fixture holds back the form's own quote and
+    /// routes, so nothing replaces the failure.
+    #[cfg(debug_assertions)]
+    pub(super) fn open_ui_fixture_quote_error(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.session_is_current(cx) || self.busy() {
+            return;
+        }
+        let Some((sell, buy, amount, error)) = super::ui_fixture::quote_error() else {
+            return;
+        };
+        self.open_form(
+            None,
+            sell,
+            Some(buy),
+            Some(amount),
+            None,
+            SwapDelivery::Reshield,
+            window,
+            cx,
+        );
+        if let Some(form) = self.form.as_mut() {
+            form.quote = QuoteState::Failed(error);
+        }
+        cx.notify();
+    }
+
     /// Debug UI fixture: in a `retry-review` or speed-up mode, open the private form of the
     /// synthesized swap's retry or speed-up and hold it on the synthesized review. The
     /// orderbook client a review is approved with takes a route of its own, which is opened
@@ -3472,6 +3507,7 @@ impl PrivateSwapsView {
             details_open: false,
             settings_open: false,
             gas_help_open: false,
+            quote_details_open: false,
             _subscriptions: subscriptions,
         };
         if let Some(amount) = amount {
@@ -4095,6 +4131,7 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
+        form.quote_details_open = false;
         if let Some(public) = form.public.as_mut() {
             public.invalidate_quote_route();
             form.quote_revision = form.quote_revision.wrapping_add(1);
@@ -6671,6 +6708,7 @@ impl PrivateSwapsView {
                 form.quote_task = None;
                 form.quote_terms = None;
                 form.gas_help_open = false;
+                form.quote_details_open = false;
             }
             cx.notify();
             return;
@@ -6726,6 +6764,7 @@ impl PrivateSwapsView {
         form.quote_terms = Some(terms);
         form.quote = QuoteState::Loading;
         form.gas_help_open = false;
+        form.quote_details_open = false;
         form.quote_task = Some(cx.spawn_in(window, async move |view, cx| {
             cx.background_executor().timer(QUOTE_DEBOUNCE).await;
             let result = runtime.spawn(quote_swap(owner, session, request)).await;
@@ -8170,7 +8209,9 @@ impl PrivateSwapsView {
             Err(error) => {
                 // The next attempt gets a new isolated route instead of the failed circuit.
                 self.tracking.entry(operation).or_default().orderbook = None;
-                self.fail(operation, format!("{error:#}"));
+                // The quote's values stay in the form's Details, out of the swap's failure text.
+                let message = self.quote_error_message(&error, cx);
+                self.fail(operation, message);
                 return;
             }
         };
@@ -8721,6 +8762,7 @@ impl PrivateSwapsView {
                 self.tracking.entry(operation).or_default().byte_budget = Some(byte_budget);
                 if let Some(form) = self.form.as_mut() {
                     form.quote = QuoteState::Idle;
+                    form.quote_details_open = false;
                     form.error = Some(if attempt_recorded {
                         "The orderbook rejected this order's size. The order stays recorded until it expires. Then retry, and the swap offers the largest amount that fits."
                     } else {
@@ -8871,6 +8913,15 @@ impl PrivateSwapsView {
             && form.gas_help_open != open
         {
             form.gas_help_open = open;
+            cx.notify();
+        }
+    }
+
+    fn set_quote_details_open(&mut self, open: bool, cx: &mut Context<'_, Self>) {
+        if let Some(form) = self.form.as_mut()
+            && form.quote_details_open != open
+        {
+            form.quote_details_open = open;
             cx.notify();
         }
     }
@@ -10135,10 +10186,12 @@ impl PrivateSwapsView {
                 );
             }
             BridgeState::Failed(error) => {
-                return line.child(action_alert(
+                let failure = self.quote_failure(error, cx);
+                return line.child(alert_frame(
                     "swap-price-error",
-                    self.quote_error_message(error, cx),
-                    self.bridge_routes_retry(cx),
+                    failure.message,
+                    Self::quote_details(form, failure.details, cx),
+                    Some(self.bridge_routes_retry(cx)),
                     cx,
                 ));
             }
@@ -10190,12 +10243,16 @@ impl PrivateSwapsView {
                     .min_w_0()
                     .whitespace_normal(),
             ),
-            QuoteState::Failed(error) => line.child(action_alert(
-                "swap-price-error",
-                self.quote_error_message(error, cx),
-                retry(),
-                cx,
-            )),
+            QuoteState::Failed(error) => {
+                let failure = self.quote_failure(error, cx);
+                line.child(alert_frame(
+                    "swap-price-error",
+                    failure.message,
+                    Self::quote_details(form, failure.details, cx),
+                    Some(retry()),
+                    cx,
+                ))
+            }
             QuoteState::PriceBlocked(block) => {
                 let text = match block {
                     PriceBlock::Deviates => {
@@ -10327,18 +10384,26 @@ impl PrivateSwapsView {
         bridge_routes_retry_button(cx.entity(), self.busy())
     }
 
+    /// A failed quote's message and details, with its estimated cost as a token amount.
+    fn quote_failure(&self, error: &eyre::Report, cx: &App) -> QuoteFailure {
+        map_quote_failure(error, |token, amount| self.token_amount(token, amount, cx))
+    }
+
     fn quote_error_message(&self, error: &eyre::Report, cx: &App) -> String {
-        match error.downcast_ref::<OrderLimitError>() {
-            Some(OrderLimitError::HookCostExceedsOutput {
-                buy_token,
-                gas_estimate,
-                ..
-            }) => format!(
-                "Sell amount is too small. Estimated cost: {}",
-                self.token_amount(*buy_token, *gas_estimate, cx)
-            ),
-            _ => bridge_unreachable(error).unwrap_or_else(|| format!("{error:#}")),
-        }
+        self.quote_failure(error, cx).message
+    }
+
+    /// The Details section of a failed quote's alert, for a failure that has `details`.
+    fn quote_details(
+        form: &SwapForm,
+        details: Option<String>,
+        cx: &Context<'_, Self>,
+    ) -> Option<AlertDetails> {
+        details.map(|text| AlertDetails {
+            text,
+            open: form.quote_details_open,
+            view: cx.entity(),
+        })
     }
 
     /// The gas strip across the bottom of the Buy panel: a row with the share presets and the
@@ -14076,6 +14141,27 @@ fn error_alert(selector: &'static str, message: impl Into<SharedString>) -> gpui
 /// A wrapping danger Alert at `selector` with its `action` inside, such as Retry. Alert accepts
 /// text only, so one frame contains its message and the button, as the high-cost warning's does.
 fn action_alert(selector: &'static str, message: String, action: Button, cx: &App) -> gpui::Div {
+    alert_frame(selector, message, None, Some(action), cx)
+}
+
+/// The Details section of an [`alert_frame`]: the technical `text` behind the alert's message,
+/// shown while `open`. Its toggle sets the form's state through `view`.
+struct AlertDetails {
+    text: String,
+    open: bool,
+    view: Entity<PrivateSwapsView>,
+}
+
+/// A wrapping danger Alert at `selector`. Under its message it has the collapsed `details`,
+/// when the failure has any. Its `action` comes last, so it stays in view with the details
+/// open.
+fn alert_frame(
+    selector: &'static str,
+    message: String,
+    details: Option<AlertDetails>,
+    action: Option<Button>,
+    cx: &App,
+) -> gpui::Div {
     let danger = cx.theme().danger;
     div()
         .debug_selector(move || selector.into())
@@ -14099,7 +14185,91 @@ fn action_alert(selector: &'static str, message: String, action: Button, cx: &Ap
                     .bg(gpui::transparent_black()),
             ),
         )
-        .child(div().flex().child(action))
+        .children(details.map(|details| alert_details(selector, details)))
+        .children(action.map(|action| div().flex().child(action)))
+}
+
+/// The "Details" toggle of the alert at `selector` and, while open, the text with its copy
+/// button. The selectors carry the alert's, as a form can show two alerts.
+fn alert_details(selector: &'static str, details: AlertDetails) -> Collapsible {
+    let AlertDetails { text, open, view } = details;
+    let toggle = if open { "Hide details" } else { "Show details" };
+    let copied = SharedString::from(text.clone());
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap_1()
+        .child(
+            app_button_base(SharedString::from(format!("{selector}-details-toggle")))
+                .debug_selector(move || format!("{selector}-details-toggle"))
+                .ghost()
+                .small()
+                .flex_none()
+                .accessibility_label(toggle)
+                .tooltip(toggle)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(app_button_label("Details"))
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .flex_none(),
+                        ),
+                )
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |view, cx| view.set_quote_details_open(!open, cx));
+                }),
+        )
+        .content(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_1()
+                .child(
+                    div()
+                        .debug_selector(move || format!("{selector}-details"))
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        // One element a line keeps the text's line breaks.
+                        .children(text.lines().map(|line| {
+                            app_muted_text(line.to_owned())
+                                .text_xs()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                        })),
+                )
+                .child(
+                    app_button(
+                        SharedString::from(format!("{selector}-details-copy")),
+                        "Copy",
+                    )
+                    .debug_selector(move || format!("{selector}-details-copy"))
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .icon(IconName::Copy)
+                    .on_click(move |_, window, cx| {
+                        copy_to_clipboard_with_toast(copied.clone(), window, cx);
+                    }),
+                ),
+        )
 }
 
 /// One details row. Indented rows are the costs taken from the output; `help` explains the
@@ -14229,6 +14399,9 @@ pub(super) fn broadcaster_result_problem(
 
 #[path = "buy_picker.rs"]
 mod buy_picker;
+
+#[path = "quote_failure.rs"]
+mod quote_failure;
 
 #[cfg(test)]
 #[path = "ui_tests.rs"]

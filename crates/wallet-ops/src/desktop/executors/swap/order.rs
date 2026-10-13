@@ -15,6 +15,7 @@
 //! fee from that value, so the order, its quote, and the pre-hook's approval use what the
 //! executor then holds, the order's sell amount.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -89,7 +90,7 @@ use crate::vault::{
     swap_account_refusal,
 };
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
+    AnchorBlocked, DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
     HardwareExecutorAction, OperationNetworkIsolation, PairAnchorRate, QuoteDeviationError,
     RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache, WalletSession, check_quote_against_anchor,
     railgun_protocol_fee_amount,
@@ -353,6 +354,106 @@ pub enum SwapPrice {
     },
     /// The pair has no usable independent price. Approval requires the user's acknowledgement.
     Unverified,
+}
+
+/// What the cached price anchors gave for a quote's pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapQuoteAnchor {
+    /// Cached rates cover both tokens.
+    Verified,
+    /// A token of the pair has no configured anchor source.
+    NotConfigured,
+    /// A configured source has no cached rate. The text names the token and its read failures.
+    Unavailable(String),
+}
+
+impl SwapQuoteAnchor {
+    /// The outcome of `TokenAnchorRateCache::cached_pair_rate` for the quote's pair.
+    pub(super) fn from_cached(anchor: &Result<Option<PairAnchorRate>, AnchorBlocked>) -> Self {
+        match anchor {
+            Ok(Some(_)) => Self::Verified,
+            Ok(None) => Self::NotConfigured,
+            Err(blocked) => Self::Unavailable(format!(
+                "no cached rate for {} ({:?})",
+                blocked.token, blocked.failures
+            )),
+        }
+    }
+}
+
+impl fmt::Display for SwapQuoteAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verified => f.write_str("verified"),
+            Self::NotConfigured => f.write_str("not configured"),
+            Self::Unavailable(reason) => write!(f, "unavailable, {reason}"),
+        }
+    }
+}
+
+/// The public values of a quote that failed while pricing, attached to the failure as its
+/// `eyre` context. It holds no quote sender or receiver, no endpoint and nothing from the
+/// vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapQuoteDiagnostics {
+    pub chain_id: u64,
+    pub sell_token: Address,
+    pub buy_token: Address,
+    pub sell_amount: U256,
+    pub buy_amount: U256,
+    pub sell_token_price: String,
+    pub gas_amount: String,
+    pub gas_price: String,
+    pub anchor: SwapQuoteAnchor,
+}
+
+impl SwapQuoteDiagnostics {
+    pub(super) fn new(chain_id: u64, quote: &CowQuoteParameters, anchor: SwapQuoteAnchor) -> Self {
+        Self {
+            chain_id,
+            sell_token: quote.sell_token,
+            buy_token: quote.buy_token,
+            sell_amount: quote.sell_amount,
+            buy_amount: quote.buy_amount,
+            sell_token_price: quote.sell_token_price.clone(),
+            gas_amount: quote.gas_amount.clone(),
+            gas_price: quote.gas_price.clone(),
+            anchor,
+        }
+    }
+}
+
+/// One `name: value` line per field, without a trailing newline.
+impl fmt::Display for SwapQuoteDiagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "chain: {}\nsell token: {}\nbuy token: {}\nsell amount: {}\nbuy amount: {}\n\
+             sell token price: {}\ngas amount: {}\ngas price: {}\nprice anchor: {}",
+            self.chain_id,
+            self.sell_token,
+            self.buy_token,
+            self.sell_amount,
+            self.buy_amount,
+            self.sell_token_price,
+            self.gas_amount,
+            self.gas_price,
+            self.anchor,
+        )
+    }
+}
+
+/// Attaches `diagnostics` to a quote's pricing failure. [`OrderLimitError`] stays reachable by
+/// downcast, and any other error is returned as it is.
+pub(super) fn wrap_pricing_error(
+    error: eyre::Report,
+    diagnostics: SwapQuoteDiagnostics,
+) -> eyre::Report {
+    if error.downcast_ref::<OrderLimitError>().is_some() {
+        error.wrap_err(diagnostics)
+    } else {
+        error
+    }
 }
 
 /// Terms the user reviews before approving a private minimum. The review screen shows them
@@ -1882,6 +1983,11 @@ impl ExecutorOwner {
             },
             "finished"
         );
+        let diagnostics = SwapQuoteDiagnostics::new(
+            self.chain.chain_id,
+            &quote.quote,
+            SwapQuoteAnchor::from_cached(&anchor),
+        );
         let price = match anchor {
             Ok(Some(rate)) => {
                 check_quote_against_anchor(
@@ -1909,7 +2015,8 @@ impl ExecutorOwner {
             gas_price_wei,
             hook_data_cost_wei,
             orderbook.isolation(),
-        )?;
+        )
+        .map_err(|error| wrap_pricing_error(error, diagnostics))?;
         if let Some((delivery, route)) = bridge {
             // Bridge orders carry no shield, so the buy amount is the suggested minimum.
             let started = Instant::now();

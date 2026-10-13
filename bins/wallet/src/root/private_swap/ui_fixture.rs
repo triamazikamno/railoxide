@@ -1,6 +1,6 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
-//! retry review, speed-up, split outcome, reported fill and setup progress, at the Stealth
-//! accounts inspector and at the refund dialog of a blocked Shield: it opens them on a scratch wallet without
+//! retry review, failed quote, speed-up, split outcome, reported fill and setup progress, at the
+//! Stealth accounts inspector and at the refund dialog of a blocked Shield: it opens them on a scratch wallet without
 //! private funds and holds a chosen state on screen. It is compiled only with
 //! `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
@@ -58,6 +58,15 @@
 //!   Approving the review takes the vault password and ends in an error on the form. The form
 //!   asks for no quote and no routes, so another gas share leaves Review… waiting for a bridge
 //!   quote until the share is set back.
+//! - `quote-error` opens the private swap form in place of a Public account's, on Ethereum: a
+//!   new swap of 0.05 WETH for USDC whose quote failed while pricing. The failure is
+//!   synthesized, a sell token price outside the range the gas rate can represent, with the
+//!   values of a quote on BNB Chain whose pair has no price anchor. The Buy panel shows the
+//!   failure's message with its collapsed Details, which open on those values and their copy
+//!   button. The form has no synthesized record or review. It asks for no quote and no routes,
+//!   so Retry and changed terms leave the failure on screen, and Retry doesn't collapse the
+//!   Details as it does on a form that quotes. The wallet holds no WETH, so the Sell select
+//!   lists nothing.
 //! - `split:<stage>` opens the swap dialog, in place of a Public account's form, on the detail
 //!   of that swap once its retry traded and the settlement made the expired first order's
 //!   deposit: `bridging` has the hand-off and no outcome, `delivered` a verified delivery of 90
@@ -137,8 +146,8 @@
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
 //! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode opens the
-//! route its orderbook client would use, and sends nothing on it. A `reported:` mode asks no
-//! orderbook, chain or bridge provider about its swap.
+//! route its orderbook client would use, and sends nothing on it. A `quote-error` mode opens no
+//! route. A `reported:` mode asks no orderbook, chain or bridge provider about its swap.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,7 +156,7 @@ use std::time::Duration;
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use gpui::{App, Context, Window};
-use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderUid};
+use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderLimitError, OrderUid};
 use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgePrivateDelivery, BridgeProvider,
@@ -162,8 +171,9 @@ use wallet_ops::vault::{
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
     OperationNetworkIsolation, PairAnchorRate, PublicBroadcasterResultKind, SwapBridgeReport,
-    SwapContinuingApproval, SwapDeliverySeen, SwapHandoffHint, SwapReview, SwapReviewChange,
-    SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage,
+    SwapContinuingApproval, SwapDeliverySeen, SwapHandoffHint, SwapQuoteAnchor,
+    SwapQuoteDiagnostics, SwapReview, SwapReviewChange, SwapSettlementHint, SwapSpeedUpRefusal,
+    TransactionGenerationStage,
 };
 
 use super::dialog::SwapDialogView;
@@ -195,6 +205,7 @@ enum Mode {
     Accounts,
     Refund(Refund),
     RetryReview,
+    QuoteError,
     Split(Split),
     SpeedUp(SpeedUp),
     Setup(Setup),
@@ -334,6 +345,9 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "retry-review" {
         return Some(Mode::RetryReview);
+    }
+    if value == "quote-error" {
+        return Some(Mode::QuoteError);
     }
     if value == "speed-up-review" {
         return Some(Mode::SpeedUp(SpeedUp::Review));
@@ -478,12 +492,14 @@ pub(super) fn holds_records() -> bool {
 
 /// Whether the private swap records are the fixture's own, which nothing reads again, quotes,
 /// tracks or acts on. A `retry-review` or `speed-up-review` mode has none until its form is
-/// opened.
+/// opened, and a `quote-error` mode has none at all: its form holds a failed quote, which no
+/// request replaces.
 pub(super) fn holds_swaps() -> bool {
     matches!(
         mode(),
         Some(
             Mode::RetryReview
+                | Mode::QuoteError
                 | Mode::Split(_)
                 | Mode::SpeedUp(_)
                 | Mode::Setup(_)
@@ -580,6 +596,7 @@ pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
             | Mode::Accounts
             | Mode::Refund(_)
             | Mode::RetryReview
+            | Mode::QuoteError
             | Mode::Split(_)
             | Mode::Setup(_),
             Phase::Approved,
@@ -1253,6 +1270,34 @@ fn staged_swap_record(
     .ok()
 }
 
+/// What a `quote-error` mode's form is opened to sell, to buy and for which amount, and the
+/// failure it holds in place of a quote: a pricing failure with the values of a quote on BNB
+/// Chain, whose pair has no price anchor. `None` in every other mode.
+pub(super) fn quote_error() -> Option<(Address, Address, U256, eyre::Report)> {
+    if !matches!(mode()?, Mode::QuoteError) {
+        return None;
+    }
+    let diagnostics = SwapQuoteDiagnostics {
+        chain_id: 56,
+        // USDC and USDT on BNB Chain, which both have 18 decimals.
+        sell_token: address!("8ac76a51cc950d9822d68b83fe1ad97b32cd580d"),
+        buy_token: address!("55d398326f99059ff775485246999027b3197955"),
+        sell_amount: U256::from(100_000_000_000_000_000_000_u128),
+        buy_amount: U256::from(99_912_504_117_302_255_616_u128),
+        sell_token_price: "0.0013443372127831241559514641181749539100565016269683837890625"
+            .to_owned(),
+        gas_amount: "163218".to_owned(),
+        gas_price: "50000000".to_owned(),
+        anchor: SwapQuoteAnchor::NotConfigured,
+    };
+    Some((
+        WETH,
+        USDC,
+        U256::from(SWAP_SPEND),
+        eyre::Report::from(OrderLimitError::QuotePriceOutOfRange).wrap_err(diagnostics),
+    ))
+}
+
 /// The record and the review a `retry-review` mode holds its form on: the swap's expired first
 /// order, and a quote for its retry that delivers 100 USDC while that order's approval of 90
 /// can still decide the delivery. A `speed-up-review`, `speed-up:open` or
@@ -1660,9 +1705,9 @@ impl PrivateSwapsView {
         self.show_detail(operation, window, cx);
     }
 
-    /// In a `retry-review`, `split:`, speed-up, `setup:` or `reported:` mode, show the
-    /// synthesized private swap in place of the Public account form that was asked for. `true`
-    /// when such a mode is on.
+    /// In a `retry-review`, `quote-error`, `split:`, speed-up, `setup:` or `reported:` mode,
+    /// show the synthesized private swap in place of the Public account form that was asked
+    /// for. `true` when such a mode is on.
     pub(super) fn open_ui_fixture_swap(
         &mut self,
         window: &mut Window,
@@ -1672,6 +1717,7 @@ impl PrivateSwapsView {
         let detail = match mode() {
             Some(
                 Mode::RetryReview
+                | Mode::QuoteError
                 | Mode::SpeedUp(SpeedUp::Review)
                 | Mode::Setup(_)
                 | Mode::Reported(_),
@@ -1690,6 +1736,10 @@ impl PrivateSwapsView {
         }
         if let Some(Mode::Reported(reported)) = mode() {
             self.open_ui_fixture_reported(reported, window, cx);
+            return true;
+        }
+        if matches!(mode(), Some(Mode::QuoteError)) {
+            self.open_ui_fixture_quote_error(window, cx);
             return true;
         }
         let Some((split, speed_up)) = detail else {

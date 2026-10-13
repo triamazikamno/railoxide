@@ -392,6 +392,139 @@ fn swap_quote_error_wraps_within_its_column(cx: &mut TestAppContext) {
     });
 }
 
+/// A pricing failure as the quote paths report it: the cause under the quote's values.
+fn pricing_failure() -> eyre::Report {
+    eyre::Report::from(OrderLimitError::QuotePriceNotDecimal).wrap_err(
+        wallet_ops::SwapQuoteDiagnostics {
+            chain_id: 56,
+            sell_token: Address::repeat_byte(1),
+            buy_token: Address::repeat_byte(2),
+            sell_amount: U256::from(100),
+            buy_amount: U256::from(99),
+            sell_token_price: "abc".to_owned(),
+            gas_amount: "163218".to_owned(),
+            gas_price: "50000000".to_owned(),
+            anchor: wallet_ops::SwapQuoteAnchor::NotConfigured,
+        },
+    )
+}
+
+/// A failed pricing quote offers its Details collapsed. Opened, they hold the quote's values
+/// above Retry, and a retry closes them for the next failure.
+#[gpui::test]
+fn failed_pricing_quote_offers_details_that_a_retry_collapses(cx: &mut TestAppContext) {
+    with_swap_view(cx, |_, swaps, _, _, _, cx| {
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.open_new_form(Address::repeat_byte(1), window, cx);
+                let revision = swaps.form.as_ref().unwrap().quote_revision;
+                swaps.apply_quote(
+                    None,
+                    revision,
+                    Some(QuoteResult {
+                        orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
+                        outcome: Err(pricing_failure()),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        let toggle = cx
+            .debug_bounds("swap-price-error-details-toggle")
+            .expect("a pricing failure offers Details");
+        assert!(
+            cx.debug_bounds("swap-price-error-details").is_none(),
+            "Details start collapsed"
+        );
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let error = cx.debug_bounds("swap-price-error").unwrap();
+        let details = cx.debug_bounds("swap-price-error-details").unwrap();
+        let copy = cx.debug_bounds("swap-price-error-details-copy").unwrap();
+        let retry = cx.debug_bounds("swap-price-retry").unwrap();
+        assert!(
+            details.left() >= error.left() && details.right() <= error.right(),
+            "the details wrap inside the alert: {details:?}, {error:?}"
+        );
+        assert!(
+            copy.top() >= details.bottom() && retry.top() >= copy.bottom(),
+            "Retry stays under the open details: {details:?}, {copy:?}, {retry:?}"
+        );
+        swaps.read_with(cx, |swaps, cx| {
+            let QuoteState::Failed(error) = &swaps.form.as_ref().unwrap().quote else {
+                panic!("the quote stays failed");
+            };
+            let shown = swaps.quote_failure(error, cx).details.unwrap();
+            for field in [
+                "cause: ",
+                "chain: 56",
+                "sell token: ",
+                "buy token: ",
+                "sell amount: 100",
+                "buy amount: 99",
+                "sell token price: abc",
+                "gas amount: 163218",
+                "gas price: 50000000",
+                "price anchor: not configured",
+            ] {
+                assert!(shown.contains(field), "{field}: {shown}");
+            }
+        });
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        assert!(!swaps.read_with(cx, |swaps, _| {
+            swaps.form.as_ref().unwrap().quote_details_open
+        }));
+    });
+}
+
+/// The Public form offers a pricing failure's Details too. An amount too small to bridge keeps
+/// its own message, which has nothing behind it to show.
+#[gpui::test]
+fn public_quote_failure_offers_details_except_for_an_amount_too_small(cx: &mut TestAppContext) {
+    with_swap_view(cx, |root, swaps, _, _, _, cx| {
+        let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+        let too_low = || {
+            eyre::Report::from(BridgeApiError::AmountTooLow).wrap_err("Could not quote the bridge")
+        };
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.open_public_form(source, STUB_USDT, window, cx);
+            });
+        });
+        for (error, details) in [(pricing_failure(), true), (too_low(), false)] {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    let form = swaps.form.as_mut().unwrap();
+                    form.quote_task = None;
+                    form.quote = QuoteState::Failed(error);
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("public-swap-quote-error").is_some());
+            assert_eq!(
+                cx.debug_bounds("public-swap-quote-error-details-toggle")
+                    .is_some(),
+                details
+            );
+        }
+        let failure = public_source::public_quote_failure(&too_low(), Some(137), |_, amount| {
+            amount.to_string()
+        });
+        assert_eq!(
+            failure.message,
+            format!(
+                "This amount is too small for Across to bridge to {}. Try a larger amount.",
+                network_name(137)
+            )
+        );
+    });
+}
+
 #[gpui::test]
 fn quote_retry_discards_the_old_route_and_ignores_its_late_response(cx: &mut TestAppContext) {
     with_swap_view(cx, |_, swaps, _, operation, runtime, cx| {

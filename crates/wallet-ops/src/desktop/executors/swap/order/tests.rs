@@ -1901,3 +1901,85 @@ fn a_public_orders_typed_data_hashes_to_the_digests_its_contracts_verify() {
         )
     );
 }
+
+#[test]
+fn a_pricing_failure_carries_the_quote_values_and_the_anchor_outcome() {
+    let receiver = Address::repeat_byte(0x7e);
+    let quote: CowQuote = serde_json::from_value(serde_json::json!({
+        "quote": {
+            "sellToken": WETH, "buyToken": USDC, "receiver": receiver,
+            "sellAmount": "997500", "buyAmount": "10002",
+            "validTo": 1, "feeAmount": "0", "gasAmount": "123456", "gasPrice": "789",
+            "sellTokenPrice": "NaN", "kind": "sell", "partiallyFillable": false
+        },
+        "expiration": "", "id": 7, "verified": true
+    }))
+    .unwrap();
+    let cache = TokenAnchorRateCache::new();
+    let configured = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let unconfigured = EffectiveTokenRegistry {
+        tokens: std::collections::BTreeMap::new(),
+    };
+    // What both quote paths do with the cached anchor and a quote they can't price.
+    let failure = |tokens: &EffectiveTokenRegistry| {
+        let anchor = cache.cached_pair_rate(1, WETH, USDC, tokens);
+        let diagnostics =
+            SwapQuoteDiagnostics::new(1, &quote.quote, SwapQuoteAnchor::from_cached(&anchor));
+        let error = price_public_order(
+            quote.clone(),
+            &SwapPrice::Unverified,
+            1,
+            U256::ZERO,
+            0,
+            USDC,
+            100,
+            GAS_SHARE_BALANCED_BPS,
+            Address::repeat_byte(0x70),
+            0,
+            1_800,
+        )
+        .unwrap_err();
+        wrap_pricing_error(error.into(), diagnostics)
+    };
+
+    let report = failure(&unconfigured);
+    assert_eq!(
+        report.downcast_ref::<OrderLimitError>(),
+        Some(&OrderLimitError::QuotePriceNotDecimal)
+    );
+    let diagnostics = report.downcast_ref::<SwapQuoteDiagnostics>().unwrap();
+    assert_eq!(diagnostics.anchor, SwapQuoteAnchor::NotConfigured);
+
+    // One line per field, and nothing of the quote's sender or receiver.
+    let text = diagnostics.to_string();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 9);
+    for (line, value) in lines.iter().zip([
+        "1".to_owned(),
+        WETH.to_string(),
+        USDC.to_string(),
+        "997500".to_owned(),
+        "10002".to_owned(),
+        "NaN".to_owned(),
+        "123456".to_owned(),
+        "789".to_owned(),
+        "not configured".to_owned(),
+    ]) {
+        assert!(line.ends_with(&format!(": {value}")), "{line}");
+        assert!(!line.starts_with("from") && !line.starts_with("receiver"));
+    }
+    assert!(!text.contains(&receiver.to_string()));
+
+    // The default registry configures both tokens, and nothing has cached a USDC rate.
+    let report = failure(&configured);
+    assert!(matches!(
+        report
+            .downcast_ref::<SwapQuoteDiagnostics>()
+            .unwrap()
+            .anchor,
+        SwapQuoteAnchor::Unavailable(_)
+    ));
+}
