@@ -921,6 +921,52 @@ impl ExecutorStore {
         })
     }
 
+    /// The records of the accounts the source use `id` claims, on the source chain's store: the
+    /// source account's and, when the use names a destination account, that account's on the
+    /// chain its delivery binds. A destination record that doesn't serve the use is refused.
+    pub(crate) fn swap_use_accounts(
+        &self,
+        source_operation: ExecutorOperationId,
+        id: SwapUseId,
+    ) -> Result<ClaimedSwapPair, ExecutorStoreError> {
+        let _guard = super::EXECUTOR_RECORD_LOCK
+            .lock()
+            .map_err(|_| ExecutorStoreError::Unavailable)?;
+        self.require_wallet()?;
+        let source = self
+            .record(source_operation)?
+            .ok_or(ExecutorStoreError::OperationMismatch)?;
+        let Some(SwapUseRecord {
+            role:
+                SwapUseRole::Source {
+                    destination_operation,
+                    ..
+                },
+            ..
+        }) = source.swap_use(id)
+        else {
+            return Err(ExecutorStoreError::OperationMismatch);
+        };
+        let destination = match *destination_operation {
+            Some(operation) => {
+                let (chain_id, _) = source
+                    .swap_use_destination(id)
+                    .ok_or(ExecutorStoreError::OperationMismatch)?;
+                let record = self
+                    .for_chain(chain_id)
+                    .record(operation)?
+                    .filter(|record| record.serves_swap_use(id, self.chain_id, source_operation))
+                    .ok_or(ExecutorStoreError::OperationMismatch)?;
+                Some(record)
+            }
+            None => None,
+        };
+        Ok(ClaimedSwapPair {
+            source,
+            destination,
+        })
+    }
+
     /// Cancel the swap use `id` before it has an order, on the source chain's store. The use is
     /// stopped on its source account here and on its destination account, and each account is
     /// released as [`SwapUseRelease`] reports, in one write across both chains. A use with an

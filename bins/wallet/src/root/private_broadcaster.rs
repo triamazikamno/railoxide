@@ -52,7 +52,8 @@ mod progress;
 mod types;
 
 pub(super) use progress::{
-    apply_private_broadcaster_progress_stage, ensure_self_broadcast_unshield_progress_stage,
+    apply_private_broadcaster_progress_stage, end_private_broadcaster_progress_steps,
+    ensure_self_broadcast_unshield_progress_stage,
     fail_private_broadcaster_progress_steps_at_stage,
     finish_private_broadcaster_progress_steps_at_stage,
     finish_private_self_broadcast_progress_steps_at_stage,
@@ -60,14 +61,14 @@ pub(super) use progress::{
     private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_footer_action,
     private_broadcaster_progress_is_terminal, private_broadcaster_progress_steps,
     private_broadcaster_stage_detail, private_broadcaster_stage_id,
-    private_progress_stage_disables_stop, private_submission_discard_attempt_available,
-    self_broadcast_progress_steps, self_broadcast_step_retry_kind,
-    sponsored_stop_uses_session_command,
+    private_broadcaster_stage_label, private_progress_stage_disables_stop,
+    private_submission_discard_attempt_available, self_broadcast_progress_steps,
+    self_broadcast_step_retry_kind, sponsored_stop_uses_session_command,
 };
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
-    private_broadcaster_retry_button_id, private_broadcaster_stage_label,
-    private_broadcaster_step_detail, public_broadcaster_waiting_can_stop,
+    private_broadcaster_retry_button_id, private_broadcaster_step_detail,
+    public_broadcaster_waiting_can_stop,
 };
 #[cfg(test)]
 pub(super) use progress::{
@@ -78,11 +79,12 @@ pub(super) use progress::{
 pub(super) use progress::{
     private_broadcaster_closed_active_stage, private_broadcaster_progress_is_successful,
 };
+use types::private_submission_dialog_title_action;
 pub(super) use types::{
     PrivateBroadcasterClosedActiveProgress, PrivateBroadcasterProgressState,
-    PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow, SelfBroadcastGasRetryKind,
+    PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow,
+    SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH, SelfBroadcastGasRetryKind,
 };
-use types::{SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH, private_submission_dialog_title_action};
 
 pub(super) struct SelfBroadcastGasRetryDialogContent {
     root: Entity<WalletRoot>,

@@ -76,6 +76,7 @@ use wallet_ops::{
 };
 
 pub(super) mod public_source;
+mod setup_retry;
 
 use self::buy_picker::{
     BuyNetwork, BuyPicker, NetworkAvailability, NetworkSync, NetworkUnavailable,
@@ -85,10 +86,11 @@ use self::buy_picker::{
 use self::public_source::{PublicSwapForm, public_strip};
 use super::dialog::{SwapDialogView, powered_by_cow};
 use super::model::{
-    SwapFormMode as FormMode, SwapSetupProgress, SwapStage, format_bps_percent,
+    SwapFormMode as FormMode, SwapSetupProgress, SwapStage, SwapStepAccount, format_bps_percent,
     private_delivery_credit, provider_name, quote_anchor_delta_bps, swap_cost_bps, swap_form_mode,
     swap_total_cost,
 };
+use super::setup_progress::SetupProgress;
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
     SwapAction, SwapJobKind, SwapTracking, swap_delivery, swap_private_delivery, swap_sell_amount,
@@ -593,19 +595,47 @@ pub(super) struct DestinationSetup {
     maximum_private_fee: U256,
 }
 
-/// A private Bridge swap's destination setup the user approved to send again by itself, once
-/// the swap's own stealth account is set up.
+/// One stealth account's setup the user approved to send again by itself: the swap's own
+/// account's, or a private Bridge swap's destination account's. The swap's approved terms stay.
 #[derive(Clone)]
-pub(super) struct DestinationRetry {
+pub(super) struct SetupRetry {
     /// The swap, on its own network.
     pub(super) operation: ExecutorOperationId,
+    pub(super) side: SetupSide,
     /// The use whose approval was reviewed, retained through asynchronous preparation.
     swap_use: SwapUseId,
-    pub(super) setup: DestinationSetup,
+    /// The network of the account that is set up again.
+    pub(super) chain_id: u64,
+    /// That account: the swap's own, or its destination account on `chain_id`.
+    pub(super) account: ExecutorOperationId,
+    candidate: PublicBroadcasterCandidate,
+    maximum_private_fee: U256,
     waku: Arc<WakuDeliveryClient>,
+    /// The setup fee limit approved with the swap for this account.
+    approved_fee: Option<U256>,
     /// The swap's approval with this review's fee limit, when it is above the approved one. It
     /// is saved before the setup is sent.
     approval: Option<SwapApproval>,
+}
+
+/// The open retry of one stealth account's setup: the dialog over the swap's detail, and the
+/// setup route its broadcaster controls drive. It is dropped when the dialog closes or the
+/// swap dialog shows something else.
+pub(super) struct SetupRetryForm {
+    /// The swap, on its own network.
+    pub(super) operation: ExecutorOperationId,
+    pub(super) side: SetupSide,
+    /// The network of the account whose setup is sent again.
+    chain_id: u64,
+    /// That account: the swap's own, or its destination account on `chain_id`.
+    account: ExecutorOperationId,
+    /// The account's number and address, as the dialog names it.
+    shown: Option<SwapStepAccount>,
+    route: SetupRoute,
+    /// The retry dialog's own focus, which the broadcaster picker returns to.
+    focus: Option<gpui::WeakFocusHandle>,
+    /// Why the last Continue opened no review.
+    error: Option<String>,
 }
 
 /// One setup fee of a review: at most `maximum` of `token`, paid to `broadcaster` on `chain_id`.
@@ -683,7 +713,7 @@ impl ReviewAccount {
 /// Whose setup a route pays for: the swap's own stealth account, or a private Bridge swap's
 /// destination stealth account on its network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SetupSide {
+pub(super) enum SetupSide {
     Origin,
     Destination,
 }
@@ -1689,6 +1719,14 @@ enum SetupOutcome {
     },
     /// The approved amount no longer fits one order; nothing was paid.
     TooLarge,
+}
+
+/// A setup job's work with its error as a value, so the job's completion can end the setup's
+/// progress with it. `start_job` reports an error of the work itself and skips the completion.
+async fn setup_job_result<T>(
+    work: impl Future<Output = eyre::Result<T>>,
+) -> eyre::Result<eyre::Result<T>> {
+    Ok(work.await)
 }
 
 /// A private Bridge swap's destination stealth account with what reserves it and sends its
@@ -5232,14 +5270,16 @@ impl PrivateSwapsView {
                     .await;
                 let active = view
                     .update_in(cx, |view, window, cx| {
-                        if view.form.is_none() || !view.session_is_current(cx) {
+                        if !view.holds_setup_routes() || !view.session_is_current(cx) {
                             return false;
                         }
                         // Most ticks change nothing; redrawing the form for them costs a frame.
                         if view.update_setup_route(cx) == Some(true) {
                             cx.notify();
                         }
-                        view.refresh_destination_network(window, cx);
+                        if view.form.is_some() {
+                            view.refresh_destination_network(window, cx);
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -5248,8 +5288,127 @@ impl PrivateSwapsView {
                 }
             }
         });
-        if let Some(form) = self.form.as_mut() {
-            form.route.refresh_task = Some(task);
+        // The holder's own route keeps the task, which ends with it.
+        match (self.form.as_mut(), self.setup_retry.as_mut()) {
+            (Some(form), _) => form.route.refresh_task = Some(task),
+            (None, Some(retry)) => retry.route.refresh_task = Some(task),
+            (None, None) => {}
+        }
+    }
+
+    /// Whether something holds setup routes for the broadcaster controls to drive: the open
+    /// form, or the open retry of one account's setup. A retry whose dialog is gone is
+    /// dropped.
+    fn holds_setup_routes(&mut self) -> bool {
+        if self.form.is_some() {
+            return true;
+        }
+        if self
+            .setup_retry
+            .as_ref()
+            .is_some_and(|retry| !retry.is_open())
+        {
+            self.setup_retry = None;
+        }
+        self.setup_retry.is_some()
+    }
+
+    /// `side`'s setup route of the active holder: the open form's, or else the open retry's
+    /// for the side it sends again.
+    fn active_setup_route(&self, side: SetupSide) -> Option<&SetupRoute> {
+        match &self.form {
+            Some(form) => Some(form.setup_route(side)),
+            None => self
+                .setup_retry
+                .as_ref()
+                .filter(|retry| retry.side == side)
+                .map(|retry| &retry.route),
+        }
+    }
+
+    fn active_setup_route_mut(&mut self, side: SetupSide) -> Option<&mut SetupRoute> {
+        match &mut self.form {
+            Some(form) => Some(form.setup_route_mut(side)),
+            None => self
+                .setup_retry
+                .as_mut()
+                .filter(|retry| retry.side == side)
+                .map(|retry| &mut retry.route),
+        }
+    }
+
+    /// The side whose route the broadcaster picker was opened for.
+    fn setup_picker_side(&self) -> Option<SetupSide> {
+        match &self.form {
+            Some(form) => Some(form.broadcaster_side),
+            None => self.setup_retry.as_ref().map(|retry| retry.side),
+        }
+    }
+
+    /// The network of the stealth account `side` sets up for the active holder: as
+    /// [`Self::setup_chain`] tells for the form, or the network of the retry's account.
+    fn active_setup_chain(&self, side: SetupSide) -> Option<u64> {
+        match &self.form {
+            Some(form) => self.setup_chain(form, side),
+            None => self
+                .setup_retry
+                .as_ref()
+                .filter(|retry| retry.side == side)
+                .map(|retry| retry.chain_id),
+        }
+    }
+
+    /// The session and owner that estimate `side`'s setup fee for the active holder, on the
+    /// account's own network, and the reserved account it is estimated for. A new account
+    /// has none yet.
+    fn setup_estimate_account(
+        &self,
+        side: SetupSide,
+        cx: &App,
+    ) -> Option<(
+        Arc<WalletSession>,
+        Arc<ExecutorOwner>,
+        Option<ExecutorOperationId>,
+    )> {
+        // The destination network, for a setup that isn't the swap's own.
+        let (destination, account) = match (&self.form, side) {
+            (Some(form), SetupSide::Origin) => (None, form.operation),
+            (Some(form), SetupSide::Destination) => (
+                Some(self.destination_setup_chain(form)?),
+                self.destination_operation(form),
+            ),
+            (None, _) => {
+                let retry = self
+                    .setup_retry
+                    .as_ref()
+                    .filter(|retry| retry.side == side)?;
+                (
+                    (side == SetupSide::Destination).then_some(retry.chain_id),
+                    Some(retry.account),
+                )
+            }
+        };
+        let (session, owner) = match destination {
+            Some(chain_id) => self.destination_owner(chain_id, cx)?,
+            None => (
+                Arc::clone(self.private_session()?),
+                Arc::clone(self.private_owner()?),
+            ),
+        };
+        Some((session, owner, account))
+    }
+
+    /// Give focus back to the surface the setup route's controls sit on, where the
+    /// broadcaster picker returns it: the form's amount, or the retry's dialog.
+    fn focus_setup_route_holder(&self, window: &mut Window, cx: &mut App) {
+        if self.form.is_some() {
+            self.focus_form_amount(window, cx);
+        } else if let Some(focus) = self
+            .setup_retry
+            .as_ref()
+            .and_then(|retry| retry.focus.as_ref()?.upgrade())
+        {
+            focus.focus(window, cx);
         }
     }
 
@@ -5467,16 +5626,18 @@ impl PrivateSwapsView {
     /// Read the setup routes again: the swap's own network's, and a private Bridge swap's
     /// destination network's, each only while its account needs setup. A side without one
     /// keeps no route, so a broadcaster offer that appears or expires there changes nothing.
-    /// `None` when the form has no setup route to update; otherwise whether anything the form
-    /// or the broadcaster picker shows changed.
+    /// An open retry has the one route of the account it sets up again. `None` when no setup
+    /// route is there to update; otherwise whether anything the form, the retry or the
+    /// broadcaster picker shows changed.
     fn update_setup_route(&mut self, cx: &mut Context<'_, Self>) -> Option<bool> {
-        let form = self.form.as_ref()?;
-        if self.busy() {
+        if (self.form.is_none() && self.setup_retry.is_none()) || self.busy() {
             return None;
         }
         let sides = [SetupSide::Origin, SetupSide::Destination]
-            .map(|side| (side, self.setup_chain(form, side)));
-        if sides.iter().all(|(_, chain_id)| chain_id.is_none()) && !form.chooses_accounts() {
+            .map(|side| (side, self.active_setup_chain(side)));
+        if sides.iter().all(|(_, chain_id)| chain_id.is_none())
+            && !self.form.as_ref().is_some_and(SwapForm::chooses_accounts)
+        {
             return None;
         }
         let mut changed = false;
@@ -5484,22 +5645,23 @@ impl PrivateSwapsView {
             changed |= match chain_id {
                 Some(chain_id) => self.update_route(side, chain_id, cx)?,
                 // An existing account, or another delivery, leaves no account to set up.
-                None => self.form.as_mut()?.setup_route_mut(side).release(),
+                None => self
+                    .active_setup_route_mut(side)
+                    .is_some_and(SetupRoute::release),
             };
         }
         Some(changed)
     }
 
     /// Read `side`'s setup route on `chain_id` again, and estimate its fee when one is due.
-    /// Whether anything the form or the broadcaster picker shows changed.
+    /// Whether anything the route's holder or the broadcaster picker shows changed.
     fn update_route(
         &mut self,
         side: SetupSide,
         chain_id: u64,
         cx: &mut Context<'_, Self>,
     ) -> Option<bool> {
-        let form = self.form.as_ref()?;
-        let route = form.setup_route(side);
+        let route = self.active_setup_route(side)?;
         // Each setup is paid from the private balance on its own network: by default in the
         // token worth the most there.
         let (options, token, candidates) = self.setup_fee_route(
@@ -5510,7 +5672,7 @@ impl PrivateSwapsView {
             route.favorites_only,
             cx,
         );
-        let route = self.form.as_mut()?.setup_route_mut(side);
+        let route = self.active_setup_route_mut(side)?;
         let quote_changed = route.estimate_candidate.as_ref().is_some_and(|quoted| {
             !candidates
                 .iter()
@@ -5546,18 +5708,15 @@ impl PrivateSwapsView {
         Some(quote_changed || token_changed || choice_changed || shown_changed || due)
     }
 
-    /// Estimate `side`'s setup fee with its network's own session and owner, which read the
-    /// private balance the fee is paid from.
-    fn schedule_setup_estimate(&mut self, side: SetupSide, cx: &mut Context<'_, Self>) {
-        let Some(root) = self.root.upgrade() else {
-            return;
-        };
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        let route = form.setup_route(side);
+    /// The broadcaster `route` pays as it stands: the one chosen, or one picked at random among
+    /// its candidates under its fee and trust filters. `None` without an eligible one.
+    fn setup_route_candidate(
+        &self,
+        route: &SetupRoute,
+        cx: &App,
+    ) -> Option<PublicBroadcasterCandidate> {
         if route.candidates.is_empty() {
-            return;
+            return None;
         }
         let selection =
             route
@@ -5568,42 +5727,34 @@ impl PrivateSwapsView {
                         railgun_address: address.clone(),
                     }
                 });
-        let candidate = {
-            let root = root.read(cx);
-            wallet_ops::select_public_broadcaster_with_policy_and_trust(
-                &route.candidates,
-                &selection,
-                root.public_broadcaster_fee_policy(route.allow_out_of_range),
-                &root.public_broadcaster_trust_filter(route.favorites_only),
-            )
-        };
-        let Ok(candidate) = candidate else {
+        let root = self.root.upgrade()?;
+        let root = root.read(cx);
+        wallet_ops::select_public_broadcaster_with_policy_and_trust(
+            &route.candidates,
+            &selection,
+            root.public_broadcaster_fee_policy(route.allow_out_of_range),
+            &root.public_broadcaster_trust_filter(route.favorites_only),
+        )
+        .ok()
+    }
+
+    /// Estimate `side`'s setup fee with its network's own session and owner, which read the
+    /// private balance the fee is paid from.
+    fn schedule_setup_estimate(&mut self, side: SetupSide, cx: &mut Context<'_, Self>) {
+        let Some(candidate) = self
+            .active_setup_route(side)
+            .and_then(|route| self.setup_route_candidate(route, cx))
+        else {
             return;
         };
         // A setup sent again is estimated for its reserved account, from its own fee notes.
-        let (session, owner, operation) = match side {
-            SetupSide::Origin => {
-                let (Some(session), Some(owner)) = (self.private_session(), self.private_owner())
-                else {
-                    return;
-                };
-                (Arc::clone(session), Arc::clone(owner), form.operation)
-            }
-            SetupSide::Destination => {
-                let Some((session, owner)) = self
-                    .destination_setup_chain(form)
-                    .and_then(|chain_id| self.destination_owner(chain_id, cx))
-                else {
-                    return;
-                };
-                (session, owner, self.destination_operation(form))
-            }
-        };
-        let runtime = self.runtime.clone();
-        let Some(form) = self.form.as_mut() else {
+        let Some((session, owner, operation)) = self.setup_estimate_account(side, cx) else {
             return;
         };
-        let route = form.setup_route_mut(side);
+        let runtime = self.runtime.clone();
+        let Some(route) = self.active_setup_route_mut(side) else {
+            return;
+        };
         route.estimate_revision = route.estimate_revision.wrapping_add(1);
         let revision = route.estimate_revision;
         route.estimate_candidate = Some(candidate.clone());
@@ -5621,10 +5772,9 @@ impl PrivateSwapsView {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result.map_err(|error| format!("{error:#}")));
             let _ = view.update(cx, |view, cx| {
-                let Some(form) = view.form.as_mut() else {
+                let Some(route) = view.active_setup_route_mut(side) else {
                     return;
                 };
-                let route = form.setup_route_mut(side);
                 if route.estimate_revision != revision {
                     return;
                 }
@@ -5652,10 +5802,10 @@ impl PrivateSwapsView {
 
     /// The broadcaster picker's view of the setup route it was opened for.
     pub(in crate::root) fn setup_picker_context(&self) -> Option<RecoveryPickerContext> {
-        let form = self.form.as_ref()?;
-        let route = form.setup_route(form.broadcaster_side);
+        let side = self.setup_picker_side()?;
+        let route = self.active_setup_route(side)?;
         Some(RecoveryPickerContext {
-            chain_id: self.setup_chain(form, form.broadcaster_side)?,
+            chain_id: self.active_setup_chain(side)?,
             token: route.fee_token?,
             choice: route.choice(),
             candidates: route.candidates.clone(),
@@ -5678,11 +5828,12 @@ impl PrivateSwapsView {
         if self.busy() {
             return;
         }
-        let Some(form) = self.form.as_mut() else {
+        let Some(route) = self
+            .setup_picker_side()
+            .and_then(|side| self.active_setup_route_mut(side))
+        else {
             return;
         };
-        let side = form.broadcaster_side;
-        let route = form.setup_route_mut(side);
         route.allow_out_of_range = checked;
         route.invalidate_estimate();
         self.refresh_setup_route(cx);
@@ -5698,11 +5849,12 @@ impl PrivateSwapsView {
             return;
         }
         self.refresh_setup_route(cx);
-        let Some(form) = self.form.as_mut() else {
+        let Some(side) = self.setup_picker_side() else {
             return;
         };
-        let side = form.broadcaster_side;
-        let route = form.setup_route_mut(side);
+        let Some(route) = self.active_setup_route_mut(side) else {
+            return;
+        };
         if !route
             .candidates
             .iter()
@@ -5712,9 +5864,8 @@ impl PrivateSwapsView {
         }
         route.selected = Some(address);
         route.invalidate_estimate();
-        let input = form.amount_input.clone();
         self.schedule_setup_estimate(side, cx);
-        input.read(cx).focus_handle(cx).focus(window, cx);
+        self.focus_setup_route_holder(window, cx);
         cx.notify();
     }
 
@@ -5983,16 +6134,21 @@ impl PrivateSwapsView {
                 network_name(destination.plan.identity().0),
             )
         });
-        let (progress, receiver) =
-            tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
-        let mut changes = receiver.clone();
-        let watch = cx.spawn(async move |view, cx| {
-            while changes.changed().await.is_ok() {
-                if view.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        });
+        // A new attempt starts for each side whose setup is sent. A side that sends none keeps
+        // no progress of an earlier one.
+        let sends_destination = destination
+            .as_ref()
+            .is_some_and(|destination| destination.plan.setup().is_some());
+        self.tracking
+            .entry(operation)
+            .or_default()
+            .clear_setup_progress();
+        let progress = approval
+            .origin
+            .is_some()
+            .then(|| self.start_setup_progress(operation, SetupSide::Origin, cx));
+        let destination_progress = sends_destination
+            .then(|| self.start_setup_progress(operation, SetupSide::Destination, cx));
         let bounds = &approval.approval.bounds;
         // An existing account's swap has no order yet for its progress to show, so its draft
         // stands in until the order is placed, and reopens the form with these terms.
@@ -6035,18 +6191,13 @@ impl PrivateSwapsView {
             tracking.setup = None;
             tracking.cursor = None;
         }
-        if destination
-            .as_ref()
-            .is_some_and(|destination| destination.plan.setup().is_some())
-        {
+        if sends_destination {
             tracking.destination_setup = None;
         }
         if draft.is_some() {
             tracking.pending_order = draft;
         }
         tracking.error = None;
-        tracking.setup_stage = Some(receiver);
-        tracking.setup_watch = Some(watch);
         // The order was approved with the setup: place it as soon as every setup the swap
         // needs is confirmed, whichever of its accounts is the new one.
         tracking.auto_place = true;
@@ -6054,7 +6205,7 @@ impl PrivateSwapsView {
         self.start_job(
             operation,
             SwapJobKind::Setup,
-            async move {
+            setup_job_result(async move {
                 let SetupApproval {
                     resume,
                     sell,
@@ -6085,13 +6236,6 @@ impl PrivateSwapsView {
                             &destination.authorization,
                         )
                         .await;
-                        // A preparation interrupted before the destination account was derived
-                        // left the delivery's placeholder receiver in the saved approval.
-                        if let (Ok(account), SwapDelivery::Bridge(delivery)) =
-                            (&prepared_destination, &mut saved.delivery)
-                        {
-                            delivery.receiver = account.executor();
-                        }
                         (prepared, Some(prepared_destination))
                     }
                     // Both accounts are claimed for the swap in one write, each as the new or
@@ -6185,13 +6329,16 @@ impl PrivateSwapsView {
                     return Ok(SetupOutcome::TooLarge);
                 }
                 // A resumed setup's record keeps its earlier approval until the user authorized
-                // this review.
+                // this review. A reserved pair's approval then binds the accounts as they are
+                // derived by now: a preparation interrupted before the destination account was
+                // derived left the delivery's placeholder receiver in the saved approval.
                 if resume {
-                    owner.record_swap_approval(
-                        operation,
-                        swap_use.unwrap_or_else(|| SwapUseId::first(operation)),
-                        saved,
-                    )?;
+                    let swap_use = swap_use.unwrap_or_else(|| SwapUseId::first(operation));
+                    if destination.is_some() {
+                        owner.bind_swap_use_accounts(operation, swap_use, Some(saved))?;
+                    } else {
+                        owner.record_swap_approval(operation, swap_use, saved)?;
+                    }
                 }
                 // Only a new account's setup is sent and paid. An existing account has none.
                 let origin_request = origin.as_ref().map(|origin| SwapSetupRequest {
@@ -6200,7 +6347,7 @@ impl PrivateSwapsView {
                     authorization,
                     waku: Arc::clone(&waku),
                     verify_proof: true,
-                    progress_tx: Some(progress),
+                    progress_tx: progress,
                     response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                     republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
                 });
@@ -6213,7 +6360,7 @@ impl PrivateSwapsView {
                                 authorization: destination.authorization,
                                 waku,
                                 verify_proof: true,
-                                progress_tx: None,
+                                progress_tx: destination_progress,
                                 response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                                 republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
                             });
@@ -6243,16 +6390,42 @@ impl PrivateSwapsView {
                     origin: origin.map(|sent| sent.map(|outcome| outcome.result)),
                     destination: destination.map(|sent| sent.map(|outcome| outcome.result)),
                 })
-            },
+            }),
             move |this, outcome, window, cx| {
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        this.fail_setup_job(operation, &error, cx);
+                        return;
+                    }
+                };
                 let tracking = this.tracking.entry(operation).or_default();
-                tracking.setup_stage = None;
-                tracking.setup_watch = None;
                 match outcome {
                     SetupOutcome::Sent {
                         origin,
                         destination,
                     } => {
+                        // Each side ends with its own answer. A side without one sent nothing.
+                        let ended = [
+                            (
+                                SetupSide::Origin,
+                                origin.as_ref().map(|sent| {
+                                    sent.as_ref().map_err(|error| this.job_error(error, cx))
+                                }),
+                            ),
+                            (
+                                SetupSide::Destination,
+                                destination.as_ref().map(|sent| {
+                                    sent.as_ref().map_err(|error| format!("{error:#}"))
+                                }),
+                            ),
+                        ];
+                        // A result the swap's detail shows on its setup's stages isn't told
+                        // again as the swap's error. Each side's result is judged by itself.
+                        let [origin_shown, destination_shown] = ended.map(|(side, result)| {
+                            this.finish_setup_progress(operation, side, result)
+                                && this.shows_setup_progress(operation, side, cx)
+                        });
                         let failed = origin.as_ref().is_some_and(Result::is_err);
                         let origin = origin.and_then(|sent| match sent {
                             Ok(result) => broadcaster_result_problem(&result, "setup"),
@@ -6262,17 +6435,24 @@ impl PrivateSwapsView {
                             Ok(result) => broadcaster_result_problem(&result, "setup"),
                             Err(error) => Some(format!("{error:#}")),
                         });
-                        let problem = setup_problems(origin, destination, networks.as_ref());
+                        let problem =
+                            setup_problems(origin.clone(), destination.clone(), networks.as_ref());
+                        let unshown = setup_problems(
+                            origin.filter(|_| !origin_shown),
+                            destination.filter(|_| !destination_shown),
+                            networks.as_ref(),
+                        );
                         // A setup that wasn't handed off fails as before, also in the form.
                         match problem {
-                            Some(problem) if failed => this.fail(operation, problem),
-                            problem => {
-                                this.tracking.entry(operation).or_default().error = problem;
+                            Some(problem) if failed => {
+                                this.report_setup_failure(operation, problem, unshown);
                             }
+                            _ => this.tracking.entry(operation).or_default().error = unshown,
                         }
                     }
                     SetupOutcome::TooLarge => {
                         tracking.auto_place = false;
+                        tracking.clear_setup_progress();
                         // The form offers the largest amount that fits, for a new review.
                         if !window.has_active_dialog(cx)
                             || this.detail_is_active(operation, window, cx)
@@ -6291,269 +6471,99 @@ impl PrivateSwapsView {
         self.show_detail(operation, window, cx);
     }
 
-    /// Send only the destination stealth account's setup again for the private Bridge swap
-    /// `operation`, whose own account is set up: estimate its fee afresh through the
-    /// destination network's owner, then open its review.
-    pub(super) fn retry_destination_setup(
+    /// Start a new attempt's progress for `side` of the swap `operation` in place of what an
+    /// earlier attempt left, and return the sender its setup reports its stages through. The
+    /// view redraws on each stage.
+    fn start_setup_progress(
         &mut self,
         operation: ExecutorOperationId,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.busy() {
-            return;
-        }
-        let Some((delivery, destination_operation)) = self.record(operation).and_then(|record| {
-            Some((
-                swap_private_delivery(record)?,
-                record.destination_operation()?,
-            ))
-        }) else {
-            return;
-        };
-        let chain_id = delivery.destination_chain;
-        let (session, owner) = match self.ready_destination(chain_id, cx) {
-            Ok(ready) => ready,
-            Err(error) => {
-                self.fail(operation, error);
-                cx.notify();
-                return;
+        side: SetupSide,
+        cx: &Context<'_, Self>,
+    ) -> tokio::sync::watch::Sender<TransactionGenerationStage> {
+        let (progress, receiver) =
+            tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
+        let mut changes = receiver.clone();
+        let watch = cx.spawn(async move |view, cx| {
+            while changes.changed().await.is_ok() {
+                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
             }
-        };
-        let (_, token, candidates) = self.setup_fee_route(
-            chain_id,
-            Some(delivery.destination_token),
-            None,
-            false,
-            false,
-            cx,
-        );
-        let candidate = token.and_then(|_| {
-            let root = self.root.upgrade()?;
-            let root = root.read(cx);
-            wallet_ops::select_public_broadcaster_with_policy_and_trust(
-                &candidates,
-                &PublicBroadcasterSelection::Random,
-                root.public_broadcaster_fee_policy(false),
-                &root.public_broadcaster_trust_filter(false),
-            )
-            .ok()
         });
-        let Some(candidate) = candidate else {
-            self.fail(
-                operation,
-                format!(
-                    "No compatible broadcaster on {0} accepts a private fee token you hold there. Add private funds on {0}, or try again later.",
-                    network_name(chain_id)
-                ),
-            );
-            cx.notify();
-            return;
-        };
-        self.start_job(
-            operation,
-            SwapJobKind::SetupQuote,
-            async move {
-                Box::pin(owner.estimate_swap_setup_fee(
-                    &session,
-                    Some(destination_operation),
-                    candidate,
-                ))
-                .await
-            },
-            move |this, estimate, window, cx| {
-                this.review_destination_setup(
-                    operation,
-                    chain_id,
-                    destination_operation,
-                    &estimate,
-                    window,
-                    cx,
-                );
-            },
-            window,
-            cx,
-        );
+        let tracking = self.tracking.entry(operation).or_default();
+        *tracking.setup_progress_mut(side) = Some(SetupProgress::running(receiver, Some(watch)));
+        progress
     }
 
-    /// The review of a destination setup sent again by itself, with its fresh fee `estimate`.
-    /// The fee limit approved with the swap binds it: a higher one is named, and approving the
-    /// review saves the swap's approval with the new limit before the setup is sent.
-    fn review_destination_setup(
+    /// End the progress of `side`'s setup with its job's result: a broadcaster's answer, or
+    /// the error it failed with. With no result its setup wasn't sent, and it keeps none.
+    /// `true` when this attempt's stages took the result. A side without stages takes none,
+    /// and neither do stages that had already ended.
+    fn finish_setup_progress(
         &mut self,
         operation: ExecutorOperationId,
-        chain_id: u64,
-        destination_operation: ExecutorOperationId,
-        estimate: &ExecutorRecoveryFeeEstimate,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let Some((swap_use, saved)) = self
-            .record(operation)
-            .filter(|record| record.swap().is_none())
-            .and_then(|record| {
-                let swap_use = super::model::prepared_swap_use(record)?;
-                Some((swap_use.id(), swap_use.approval()?.clone()))
-            })
-        else {
-            return;
+        side: SetupSide,
+        result: Option<Result<&PublicBroadcasterResultKind, String>>,
+    ) -> bool {
+        let Some(tracking) = self.tracking.get_mut(&operation) else {
+            return false;
         };
-        let Some(waku) = self.broadcaster_network(cx) else {
-            self.fail(
-                operation,
-                "Wait for the broadcaster network connection, then try again.".into(),
-            );
-            cx.notify();
-            return;
+        let progress = tracking.setup_progress_mut(side);
+        let Some(result) = result else {
+            *progress = None;
+            return false;
         };
-        let candidate = estimate.broadcaster().clone();
-        let maximum = default_public_broadcaster_fee_limit(estimate.fee_amount());
-        let approved = saved.bounds.destination_setup_fee;
-        let raised = approved.is_none_or(|approved| maximum > approved);
-        let network = network_name(chain_id);
-        let fee = SetupFee {
-            chain_id,
-            token: candidate.token,
-            maximum,
-            broadcaster: broadcaster_candidate_label(&candidate),
-        };
-        let amount = |amount: U256| {
-            let root = self.root.upgrade();
-            format_token_amount_ceiling_for_display(
-                chain_id,
-                candidate.token,
-                amount,
-                root.as_ref()
-                    .map(|root| &root.read(cx).effective_token_registry),
-            )
-        };
-        let mut rows = vec![
-            self.setup_fee_row(std::slice::from_ref(&fee), cx)
-                .with_amount_change(approved, maximum, true, amount),
-        ];
-        if let SwapDelivery::Bridge(delivery) = saved.delivery {
-            rows.push(
-                SpendAuthorizationSummaryRow::new(
-                    "Stealth account",
-                    delivery.receiver.to_checksum(None),
-                )
-                .with_shortened_copyable(),
-            );
+        let recorded = progress
+            .as_mut()
+            .is_some_and(|progress| progress.finish(result));
+        // A setup that failed before its first stage has no stages to keep.
+        if !recorded
+            && progress
+                .as_ref()
+                .is_some_and(|progress| progress.end().is_none())
+        {
+            *progress = None;
         }
-        let warnings = match approved.filter(|_| raised) {
-            Some(approved) => vec![Arc::from(format!(
-                "The setup fee on {network} is above the {} you approved. Approving this review saves the new limit.",
-                amount(approved)
-            ))],
-            None => Vec::new(),
-        };
-        let summary = SpendAuthorizationSummary::new(
-            "Set up stealth account",
-            format!(
-                "The setup on {} is confirmed and isn't paid again. The swap's order is placed once this setup is confirmed too.",
-                self.chain_label()
-            ),
-            rows,
-        )
-        .with_title_network(chain_id)
-        .with_compact_rows()
-        .with_confirm_label("Create stealth account")
-        .with_warnings(warnings)
-        .requiring_explicit_review();
-        let retry = DestinationRetry {
-            operation,
-            swap_use,
-            setup: DestinationSetup {
-                chain_id,
-                operation: destination_operation,
-                candidate,
-                maximum_private_fee: maximum,
-            },
-            waku,
-            approval: raised.then(|| {
-                let mut approval = saved;
-                approval.bounds.destination_setup_fee = Some(maximum);
-                approval
-            }),
-        };
-        self.request_authorization(
-            SwapAction::DestinationSetup(Box::new(retry)),
-            summary,
-            window,
-            cx,
-        );
+        recorded
     }
 
-    /// Hand the approved destination setup to its broadcaster through the destination
-    /// network's session and owner. The swap's own setup stays as it is, and the order follows
-    /// once this one is confirmed.
-    pub(super) fn submit_destination_setup(
+    /// Fail the swap with the error its setup job stopped at, as `start_job` does for a job
+    /// without setup progress, after ending each side's setup that still ran with it. An error
+    /// the swap's detail shows on a setup's stages is told there, and in the swap's open form.
+    fn fail_setup_job(&mut self, operation: ExecutorOperationId, error: &eyre::Report, cx: &App) {
+        let message = self.job_error(error, cx);
+        let mut shown = false;
+        for side in [SetupSide::Origin, SetupSide::Destination] {
+            shown |= self.finish_setup_progress(operation, side, Some(Err(message.clone())))
+                && self.shows_setup_progress(operation, side, cx);
+        }
+        // A job that retired its account ended the swap there, which the swap's stage tells.
+        let retired = self
+            .record(operation)
+            .is_some_and(ExecutorRecord::is_retired);
+        let unshown = (!shown && !retired).then(|| message.clone());
+        self.report_setup_failure(operation, message, unshown);
+    }
+
+    /// Tell a setup's `problem` where the swap shows it. The swap's open form says all of it.
+    /// The swap's error takes `unshown`, the part no setup's stages show in the swap's detail,
+    /// so the detail doesn't tell a stage's problem a second time.
+    fn report_setup_failure(
         &mut self,
-        retry: DestinationRetry,
-        authorization: DesktopPrivateSpendAuthorization,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
+        operation: ExecutorOperationId,
+        problem: String,
+        unshown: Option<String>,
     ) {
-        let operation = retry.operation;
-        let Some(owner) = self.private_owner().cloned() else {
-            return;
-        };
-        let (session, destination_owner) = match self.ready_destination(retry.setup.chain_id, cx) {
-            Ok(ready) => ready,
-            Err(error) => {
-                self.fail(operation, error);
-                cx.notify();
-                return;
-            }
-        };
-        let network = network_name(retry.setup.chain_id);
-        // The new attempt is observed afresh.
-        let tracking = self.tracking.entry(operation).or_default();
-        tracking.destination_setup = None;
-        tracking.error = None;
-        tracking.auto_place = true;
-        self.start_job(
-            operation,
-            SwapJobKind::Setup,
-            async move {
-                // A fee above the approved limit was reviewed, and its approval is saved first.
-                if let Some(approval) = retry.approval {
-                    owner.record_swap_approval(operation, retry.swap_use, approval)?;
-                }
-                let prepared = Box::pin(destination_owner.resume_swap_setup(
-                    retry.setup.operation,
-                    retry.setup.candidate,
-                    &authorization,
-                ))
-                .await?;
-                let outcome = Box::pin(destination_owner.submit_swap_setup(
-                    &prepared,
-                    SwapSetupRequest {
-                        maximum_private_fee: retry.setup.maximum_private_fee,
-                        session,
-                        authorization,
-                        waku: retry.waku,
-                        verify_proof: true,
-                        progress_tx: None,
-                        response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-                        republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
-                    },
-                ))
-                .await?;
-                Ok(outcome.result)
-            },
-            move |this, result, window, cx| {
-                this.tracking.entry(operation).or_default().error =
-                    broadcaster_result_problem(&result, "setup")
-                        .map(|problem| format!("{network}: {problem}"));
-                if !window.has_active_dialog(cx) {
-                    this.show_detail(operation, window, cx);
-                }
-                cx.notify();
-            },
-            window,
-            cx,
-        );
+        if let Some(unshown) = unshown {
+            self.fail(operation, unshown);
+        }
+        if let Some(form) = self
+            .form
+            .as_mut()
+            .filter(|form| form.operation() == Some(operation))
+        {
+            form.set_error(problem);
+        }
     }
 
     // Quote and order
@@ -8920,27 +8930,25 @@ impl PrivateSwapsView {
     }
 
     /// Open the broadcaster picker for `side`'s setup route, on top of the swap dialog. The
-    /// popover draws above dialogs, so it closes first, and focus moves to the amount, where
-    /// the picker returns it.
+    /// form's popover draws above dialogs, so it closes first, and focus moves to the amount,
+    /// where the picker returns it. A retry's picker returns it to the retry's dialog.
     fn choose_specific_setup_broadcaster(
         &mut self,
         side: SetupSide,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, token)) = self.form.as_ref().and_then(|form| {
-            self.setup_chain(form, side)
-                .zip(form.setup_route(side).fee_token)
-        }) else {
+        let Some((chain_id, token)) = self.active_setup_chain(side).zip(
+            self.active_setup_route(side)
+                .and_then(|route| route.fee_token),
+        ) else {
             return;
         };
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        form.broadcaster_side = side;
-        form.settings_open = false;
-        let input = form.amount_input.clone();
-        input.read(cx).focus_handle(cx).focus(window, cx);
+        if let Some(form) = self.form.as_mut() {
+            form.broadcaster_side = side;
+            form.settings_open = false;
+        }
+        self.focus_setup_route_holder(window, cx);
         let target = BroadcasterPickerTarget::Swap(cx.weak_entity());
         let _ = self.root.update(cx, |root, cx| {
             root.open_broadcaster_picker_for_target(
@@ -12301,23 +12309,10 @@ impl PrivateSwapsView {
             .into_iter()
             .filter_map(|side| {
                 let chain_id = self.setup_chain(form, side)?;
-                let route = form.setup_route(side);
                 Some((
                     side,
                     network_name(chain_id),
-                    SetupRouteSettings {
-                        fee_options: route.fee_options.clone(),
-                        fee_token: route.fee_token.unwrap_or_default(),
-                        allow_out_of_range: route.allow_out_of_range,
-                        favorites_only: route.favorites_only,
-                        random_selected: route.selected.is_none(),
-                        specific_label: selected_broadcaster_label(
-                            &route.choice(),
-                            &route.candidates,
-                        ),
-                        candidate_count: route.candidates.len(),
-                        busy,
-                    },
+                    SetupRouteSettings::of(form.setup_route(side), busy),
                 ))
             })
             .collect::<Vec<_>>();
@@ -12845,13 +12840,29 @@ impl PrivateSwapsView {
         let tracking = form
             .operation
             .and_then(|operation| self.tracking.get(&operation));
-        let stage = tracking
-            .and_then(|tracking| tracking.setup_stage.as_ref())
-            .map(|receiver| *receiver.borrow());
+        let stage =
+            tracking.and_then(|tracking| tracking.setup_progress(SetupSide::Origin)?.stage());
         let status = stage.map_or(
             "Waiting for the setup to be confirmed",
             TransactionGenerationStage::label,
         );
+        // A setup's own problem stays with the stage it ended at, and the swap's error holds
+        // what no stage shows.
+        let setup_error = tracking.and_then(|tracking| {
+            let mut problems = tracking
+                .error
+                .clone()
+                .into_iter()
+                .chain(
+                    [SetupSide::Origin, SetupSide::Destination]
+                        .into_iter()
+                        .filter_map(|side| tracking.setup_progress(side)?.problem())
+                        .map(|problem| String::from(&*problem)),
+                )
+                .collect::<Vec<_>>();
+            problems.dedup();
+            (!problems.is_empty()).then(|| problems.join(" "))
+        });
         div()
             .w_full()
             .flex()
@@ -12872,11 +12883,7 @@ impl PrivateSwapsView {
                         }
                     ))),
             )
-            .children(
-                tracking
-                    .and_then(|tracking| tracking.error.clone())
-                    .map(|error| error_alert("swap-setup-error", error)),
-            )
+            .children(setup_error.map(|error| error_alert("swap-setup-error", error)))
             .child(
                 app_muted_text(
                     "Confirmation takes a few minutes. You can close this; the swap stays on the Private tab, and its order is placed once the setup is confirmed.",
@@ -13122,7 +13129,7 @@ fn bridge_unreachable(error: &eyre::Report) -> Option<String> {
     }
 }
 
-/// What the setup broadcaster popover shows, captured when the form renders.
+/// What the setup broadcaster controls show of one route, captured when their holder renders.
 struct SetupRouteSettings {
     fee_options: Vec<PublicBroadcasterFeeTokenOption>,
     fee_token: Address,
@@ -13134,8 +13141,24 @@ struct SetupRouteSettings {
     busy: bool,
 }
 
-/// The shared broadcaster settings with the fee token selector, driving `side`'s setup route.
-/// Specific broadcaster opens the broadcaster picker on top of the swap dialog.
+impl SetupRouteSettings {
+    fn of(route: &SetupRoute, busy: bool) -> Self {
+        Self {
+            fee_options: route.fee_options.clone(),
+            fee_token: route.fee_token.unwrap_or_default(),
+            allow_out_of_range: route.allow_out_of_range,
+            favorites_only: route.favorites_only,
+            random_selected: route.selected.is_none(),
+            specific_label: selected_broadcaster_label(&route.choice(), &route.candidates),
+            candidate_count: route.candidates.len(),
+            busy,
+        }
+    }
+}
+
+/// The shared broadcaster settings with the fee token selector, driving `side`'s setup route
+/// of the open form or retry. Specific broadcaster opens the broadcaster picker on top of the
+/// swap dialog.
 fn setup_route_settings(
     view: Entity<PrivateSwapsView>,
     side: SetupSide,
@@ -13157,8 +13180,7 @@ fn setup_route_settings(
         route.busy,
         move |token, _, cx| {
             fee_view.update(cx, |view, cx| {
-                if let Some(form) = view.form.as_mut() {
-                    let route = form.setup_route_mut(side);
+                if let Some(route) = view.active_setup_route_mut(side) {
                     route.fee_token = Some(token);
                     route.fee_token_chosen = true;
                     route.invalidate_estimate();
@@ -13185,10 +13207,9 @@ fn setup_route_settings(
                     view.choose_specific_setup_broadcaster(side, window, cx);
                     return;
                 }
-                let Some(form) = view.form.as_mut() else {
+                let Some(route) = view.active_setup_route_mut(side) else {
                     return;
                 };
-                let route = form.setup_route_mut(side);
                 match event {
                     Event::Random => route.selected = None,
                     Event::AllowOutOfRange(value) => route.allow_out_of_range = value,

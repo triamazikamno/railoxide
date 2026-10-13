@@ -19,7 +19,7 @@ use wallet_ops::cow::OrderUid;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareExecutorAction,
     PublicBroadcasterCandidate, SwapOrderState, SwapReviewChange, SwapSetupStatus,
-    SwapSpeedUpRefusal, TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    SwapSpeedUpRefusal, WakuDeliveryClient, WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
     is_swap_record,
     settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
@@ -39,6 +39,7 @@ mod form;
 mod model;
 mod progress;
 mod public_progress;
+mod setup_progress;
 #[cfg(debug_assertions)]
 mod ui_fixture;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
@@ -83,7 +84,7 @@ mod ui_fixture {
 pub(super) use form::SHARED_ACCOUNT_REASON;
 pub(super) use form::public_source::PublicSwapAuthorization;
 
-use form::SwapForm;
+use form::{SetupSide, SwapForm};
 use model::{
     SwapBridgeLabels, SwapFillHint, SwapIdentity, SwapLabels, SwapPrivateBridgeLabels,
     SwapSetupLabels, SwapSetupProgress, SwapStepAccount, bridge_sent_amount,
@@ -93,6 +94,7 @@ pub(super) use model::{
     SwapStage, swap_account_status, swap_delivery, swap_pair_label, swap_recovery_token,
     swap_sell_amount, swap_stage, swap_tokens,
 };
+use setup_progress::SetupProgress;
 
 /// Delay between caught-up observation passes, and before retrying failed reads.
 const SWAP_OBSERVATION_INTERVAL: Duration = Duration::from_secs(12);
@@ -103,6 +105,13 @@ const MAX_BRIDGE_POLL_INTERVAL: Duration = Duration::from_mins(5);
 const DRAFT_VALIDITY: Duration = Duration::from_mins(30);
 const SWAP_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 const SWAP_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
+/// Why a setup that private sync shows included isn't sent again.
+const SETUP_ALREADY_INCLUDED: &str =
+    "The setup is already included. Wait for confirmation and verification.";
+
+/// Whether a setup's row offers to send that setup again. `None` shows no action, and an error
+/// shows it disabled with the reason.
+type SetupRetryAvailability = Option<Result<(), gpui::SharedString>>;
 
 pub(super) struct PrivateSwapsPanel {
     origin_chain_id: u64,
@@ -110,8 +119,8 @@ pub(super) struct PrivateSwapsPanel {
     view: Entity<PrivateSwapsView>,
 }
 
-/// A spend the user authorizes for a swap: its setup with the approved order, a private Bridge
-/// swap's destination setup sent again, the order, or an early cancellation.
+/// A spend the user authorizes for a swap: its setup with the approved order, one account's
+/// setup sent again, the order, or an early cancellation.
 pub(super) struct SwapAuthorization {
     session: Arc<WalletSession>,
     destination_session: Option<Arc<WalletSession>>,
@@ -125,8 +134,9 @@ pub(super) struct SwapAuthorization {
 #[derive(Clone)]
 enum SwapAction {
     Setup(Box<form::SetupApproval>),
-    /// Only the destination stealth account's setup of a private Bridge swap, on its network.
-    DestinationSetup(Box<form::DestinationRetry>),
+    /// Only one stealth account's setup, sent again: the swap's own, or a private Bridge
+    /// swap's destination account's on its network.
+    SetupRetry(Box<form::SetupRetry>),
     Order(Box<form::OrderApproval>),
     Cancel(Box<progress::CancelApproval>),
 }
@@ -136,7 +146,7 @@ impl SwapAction {
     fn operation(&self) -> ExecutorOperationId {
         match self {
             Self::Setup(approval) => approval.operation,
-            Self::DestinationSetup(approval) => approval.operation,
+            Self::SetupRetry(approval) => approval.operation,
             Self::Order(approval) => approval.operation,
             Self::Cancel(approval) => approval.operation,
         }
@@ -147,9 +157,7 @@ impl SwapAuthorization {
     pub(super) fn hardware_executor_action(&self) -> HardwareExecutorAction {
         match &self.action {
             SwapAction::Setup(approval) => HardwareExecutorAction::Execute(approval.operation),
-            SwapAction::DestinationSetup(approval) => {
-                HardwareExecutorAction::Execute(approval.setup.operation)
-            }
+            SwapAction::SetupRetry(approval) => HardwareExecutorAction::Execute(approval.account),
             SwapAction::Order(approval) => HardwareExecutorAction::Execute(approval.operation),
             SwapAction::Cancel(approval) => HardwareExecutorAction::Recover(approval.operation),
         }
@@ -160,7 +168,7 @@ impl SwapAuthorization {
     #[cfg(feature = "hardware")]
     pub(super) fn hardware_executor_chain(&self) -> u64 {
         match &self.action {
-            SwapAction::DestinationSetup(approval) => approval.setup.chain_id,
+            SwapAction::SetupRetry(approval) => approval.chain_id,
             _ => self.session.chain_id,
         }
     }
@@ -190,8 +198,8 @@ impl SwapAuthorization {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwapJobKind {
     Setup,
-    /// A private Bridge swap's destination setup is estimated again before its retry is
-    /// reviewed. Nothing is signed.
+    /// One account's setup is estimated again before its retry is reviewed. Nothing is
+    /// signed.
     SetupQuote,
     /// The approved terms are quoted again once the setup is confirmed. Nothing is signed.
     Requote,
@@ -318,9 +326,11 @@ struct SwapTracking {
     /// session's last explicit check of a Bridge swap's refund or undelivered deposit. Recovery
     /// of a refund waits for it, and opens with it.
     stealth_balance: Option<(U256, alloy::eips::BlockNumHash)>,
-    /// Stage of the setup handed to a broadcaster in this session.
-    setup_stage: Option<watch::Receiver<TransactionGenerationStage>>,
-    setup_watch: Option<Task<()>>,
+    /// The stages of the swap's own setup handed to a broadcaster in this session, kept after
+    /// its job ended until a new attempt starts or the swap leaves its setup.
+    setup_progress: Option<SetupProgress>,
+    /// The same for the setup of a private Bridge swap's destination stealth account.
+    destination_setup_progress: Option<SetupProgress>,
     /// The last setup observation of a private Bridge swap's destination stealth account, read
     /// on its own network.
     destination_setup: Option<SwapSetupStatus>,
@@ -336,6 +346,27 @@ struct SwapTracking {
     /// The delivery allowance earlier signing quotes of this swap showed its previews to lack,
     /// added to each later review until an order is submitted.
     delivery_shortfall: Option<U256>,
+}
+
+impl SwapTracking {
+    const fn setup_progress(&self, side: SetupSide) -> Option<&SetupProgress> {
+        match side {
+            SetupSide::Origin => self.setup_progress.as_ref(),
+            SetupSide::Destination => self.destination_setup_progress.as_ref(),
+        }
+    }
+
+    const fn setup_progress_mut(&mut self, side: SetupSide) -> &mut Option<SetupProgress> {
+        match side {
+            SetupSide::Origin => &mut self.setup_progress,
+            SetupSide::Destination => &mut self.destination_setup_progress,
+        }
+    }
+
+    fn clear_setup_progress(&mut self) {
+        self.setup_progress = None;
+        self.destination_setup_progress = None;
+    }
 }
 
 /// The summary `action` is authorized with. A speed-up signs a second order beside a live one,
@@ -445,6 +476,8 @@ pub(super) struct PrivateSwapsView {
     orders_filter: Option<model::SwapOrderGroup>,
     orders_list: Option<Entity<gpui_component::list::ListState<dialog::SwapOrdersDelegate>>>,
     form: Option<SwapForm>,
+    /// The open retry of one account's setup, over the swap's detail.
+    setup_retry: Option<form::SetupRetryForm>,
     cancel: Option<progress::CancelQuote>,
     pending_authorization: Option<Arc<SwapAuthorization>>,
     /// The order's terms changed before signing. Nothing was signed; the swap is quoted again
@@ -560,6 +593,7 @@ impl WalletRoot {
                 view.job_revision = view.job_revision.wrapping_add(1);
                 view.dialog = None;
                 view.form = None;
+                view.setup_retry = None;
                 view.cancel = None;
                 view.pending_authorization = None;
                 view.reapproval = None;
@@ -885,6 +919,7 @@ impl PrivateSwapsView {
             orders_filter: None,
             orders_list: None,
             form: None,
+            setup_retry: None,
             cancel: None,
             pending_authorization: None,
             reapproval: None,
@@ -1156,6 +1191,10 @@ impl PrivateSwapsView {
     /// Read each private Bridge swap's destination stealth account again from the destination
     /// network's executor records. Networks that aren't loaded are left out.
     fn reload_destinations(&mut self, cx: &gpui::App) {
+        // Debug UI fixture: its synthesized destination account isn't read over.
+        if ui_fixture::holds_swaps() {
+            return;
+        }
         let mut loaded = BTreeMap::new();
         let mut destinations = BTreeMap::new();
         let mut attributions = Vec::new();
@@ -1200,6 +1239,10 @@ impl PrivateSwapsView {
     /// set up, whose destination account only that network's session can tell about, then read
     /// the destination accounts again.
     fn refresh_destinations(&mut self, cx: &mut Context<'_, Self>) {
+        // Debug UI fixture: its synthesized swap loads no other network.
+        if ui_fixture::holds_swaps() {
+            return;
+        }
         let chains = self
             .records
             .iter()
@@ -1301,6 +1344,31 @@ impl PrivateSwapsView {
             .get(&swap)?
             .as_ref()
             .filter(|destination| destination.address() == Some(delivery.receiver))
+    }
+
+    /// The destination stealth account record the swap `swap` claims, for its setup's retry.
+    /// A preparation interrupted before the account was derived left `delivery` with its
+    /// placeholder receiver. Until the receiver is bound, the account is the record the swap's
+    /// source use names by its operation, which holds that use for this swap.
+    fn claimed_destination_account(
+        &self,
+        swap: SwapIdentity,
+        delivery: BridgeDelivery,
+    ) -> Option<&ExecutorRecord> {
+        if !delivery.receiver.is_zero() {
+            return self.swap_destination_account(swap, delivery);
+        }
+        self.destinations
+            .get(&swap)?
+            .as_ref()
+            .filter(|destination| {
+                destination
+                    .swap_destination_use(swap.swap_use)
+                    .is_some_and(|served| {
+                        served.origin_chain == self.origin_chain_id
+                            && served.origin_operation == swap.operation
+                    })
+            })
     }
 
     /// Whether this session's setup job covers `operation`. It sends both setups of a private
@@ -1697,7 +1765,121 @@ impl PrivateSwapsView {
             self.stage(record),
             SwapStage::SetupPending | SwapStage::SetupSubmitting
         ) && self.setup_confirmation(record).is_some())
-        .then_some("The setup is already included. Wait for confirmation and verification.")
+        .then_some(SETUP_ALREADY_INCLUDED)
+    }
+
+    /// [`Self::setup_retry_problem`] for the destination stealth account of the private Bridge
+    /// swap `swap`, whose setup is sent and unconfirmed: its record and the private notes of
+    /// its own network's session tell that the setup is included.
+    fn destination_setup_retry_problem(
+        &self,
+        swap: SwapIdentity,
+        delivery: BridgeDelivery,
+        cx: &gpui::App,
+    ) -> Option<&'static str> {
+        let destination = self.claimed_destination_account(swap, delivery)?;
+        let (session, _) = self.destination_owner(delivery.destination_chain, cx)?;
+        let observation = session.observation_rx.borrow();
+        model::swap_setup_confirmation(destination, &observation.snapshot.utxos)
+            .map(|_| SETUP_ALREADY_INCLUDED)
+    }
+
+    /// How far `side`'s setup of the prepared swap `record` shows is, apart from the other
+    /// account's. `None` for an account the swap doesn't set up: one it reuses, or the
+    /// destination of a swap that has none.
+    fn prepared_setup_progress(
+        &self,
+        record: &ExecutorRecord,
+        side: SetupSide,
+    ) -> Option<SwapSetupProgress> {
+        let swap_use = model::prepared_swap_use(record)?;
+        let operation = record.operation();
+        match side {
+            SetupSide::Origin => swap_use.is_fresh().then(|| {
+                account_setup_progress(
+                    record,
+                    self.origin_chain_id,
+                    self.tracking
+                        .get(&operation)
+                        .and_then(|tracking| tracking.setup),
+                    self.submitting_setup(operation),
+                )
+            }),
+            SetupSide::Destination => {
+                let (delivery, _) = model::swap_use_destination(record, swap_use.id())?;
+                sets_up_destination(swap_use).then(|| {
+                    self.swap_destination_setup_progress(
+                        SwapIdentity {
+                            operation,
+                            swap_use: swap_use.id(),
+                        },
+                        delivery,
+                    )
+                })
+            }
+        }
+    }
+
+    /// Whether `side`'s setup of the swap `record` shows can be sent again by itself, which
+    /// keeps the approval saved with the swap: while it isn't sent, is sent and unconfirmed,
+    /// or failed. A setup seen included waits for its confirmation, with the reason. `None`
+    /// while the setup's job runs, once it is confirmed, for a stopped or retired setup, and
+    /// for a swap without a saved approval, which its form reviews instead.
+    ///
+    /// A swap's approval is saved only for an own account that has an address. So while a swap
+    /// that sets its own account up has none for it, the destination setup waits for the swap's
+    /// own, with the reason. Only the missing address holds it back, never how far the swap's
+    /// own setup is.
+    fn setup_retry_availability(
+        &self,
+        record: &ExecutorRecord,
+        side: SetupSide,
+        cx: &gpui::App,
+    ) -> SetupRetryAvailability {
+        if record.is_swap_setup_stopped() {
+            return None;
+        }
+        let swap_use =
+            model::prepared_swap_use(record).filter(|swap_use| swap_use.approval().is_some())?;
+        let progress = self.prepared_setup_progress(record, side)?;
+        let (retired, included) = match side {
+            SetupSide::Origin => (record.is_retired(), self.setup_retry_problem(record)),
+            SetupSide::Destination => {
+                let swap = SwapIdentity {
+                    operation: record.operation(),
+                    swap_use: swap_use.id(),
+                };
+                let (delivery, _) = model::swap_use_destination(record, swap_use.id())?;
+                (
+                    self.claimed_destination_account(swap, delivery)
+                        .is_some_and(ExecutorRecord::is_retired),
+                    self.destination_setup_retry_problem(swap, delivery, cx),
+                )
+            }
+        };
+        if retired {
+            return None;
+        }
+        let underived = swap_use.is_fresh() && record.address().is_none();
+        let waits_for_origin = (side == SetupSide::Destination && underived).then(|| {
+            gpui::SharedString::from(format!(
+                "Set up the account on {} first.",
+                form::network_name(self.origin_chain_id)
+            ))
+        });
+        match progress {
+            SwapSetupProgress::NotSent | SwapSetupProgress::Failed => {
+                Some(waits_for_origin.map_or(Ok(()), Err))
+            }
+            SwapSetupProgress::Pending => Some(
+                waits_for_origin
+                    .or_else(|| included.map(Into::into))
+                    .map_or(Ok(()), Err),
+            ),
+            SwapSetupProgress::NetworkLoading
+            | SwapSetupProgress::Submitting
+            | SwapSetupProgress::Done => None,
+        }
     }
 
     fn setup_confirmation_detail(&self, record: &ExecutorRecord, cx: &gpui::App) -> Option<String> {
@@ -1914,8 +2096,8 @@ impl PrivateSwapsView {
         // What this session knows the swap's own setup waits for.
         let waiting = match origin {
             SwapSetupProgress::Submitting => tracking
-                .and_then(|tracking| tracking.setup_stage.as_ref())
-                .map(|stage| stage.borrow().label().to_owned()),
+                .and_then(|tracking| tracking.setup_progress(SetupSide::Origin)?.stage())
+                .map(|stage| stage.label().to_owned()),
             SwapSetupProgress::Pending => self.setup_confirmation_detail(record, cx),
             _ => None,
         };
@@ -2407,6 +2589,27 @@ impl PrivateSwapsView {
                 tracking.cancelling = false;
             }
         }
+        // A swap that left its setup shows its order, and keeps no setup progress.
+        let past_setup = self
+            .records
+            .iter()
+            .filter(|record| {
+                !matches!(
+                    self.progress_stage(record),
+                    SwapStage::SetupNotSent
+                        | SwapStage::SetupSubmitting
+                        | SwapStage::SetupPending
+                        | SwapStage::SetupFailed
+                        | SwapStage::SetupRetired
+                )
+            })
+            .map(ExecutorRecord::operation)
+            .collect::<Vec<_>>();
+        for operation in past_setup {
+            if let Some(tracking) = self.tracking.get_mut(&operation) {
+                tracking.clear_setup_progress();
+            }
+        }
         self.continue_form_after_observation(window, cx);
         self.continue_approved_swaps(window, cx);
         cx.notify();
@@ -2556,7 +2759,10 @@ impl PrivateSwapsView {
         let destination = self.authorized_destination(&action);
         let destination_chain = match &action {
             SwapAction::Setup(approval) => approval.destination_account().map(|(chain, _)| chain),
-            SwapAction::DestinationSetup(approval) => Some(approval.setup.chain_id),
+            // The swap's own setup is sent again through the swap's own session.
+            SwapAction::SetupRetry(approval) => {
+                (approval.side == SetupSide::Destination).then_some(approval.chain_id)
+            }
             SwapAction::Order(approval) => approval
                 .private_delivery()
                 .map(|delivery| delivery.destination_chain),
@@ -2618,7 +2824,7 @@ impl PrivateSwapsView {
                 Some((delivery.destination_chain, operation))
             }
             // A setup sent again on the destination network is authorized there itself.
-            SwapAction::DestinationSetup(_) | SwapAction::Cancel(_) => None,
+            SwapAction::SetupRetry(_) | SwapAction::Cancel(_) => None,
         }
     }
 
@@ -2684,8 +2890,8 @@ impl PrivateSwapsView {
             SwapAction::Setup(approval) => {
                 self.submit_setup(*approval, authorization, destination, window, cx);
             }
-            SwapAction::DestinationSetup(approval) => {
-                self.submit_destination_setup(*approval, authorization, window, cx);
+            SwapAction::SetupRetry(approval) => {
+                self.submit_setup_retry(*approval, authorization, window, cx);
             }
             SwapAction::Order(approval) => {
                 self.submit_order(*approval, authorization, destination, window, cx);

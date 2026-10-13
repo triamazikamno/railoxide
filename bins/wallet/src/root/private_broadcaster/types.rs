@@ -38,7 +38,7 @@ pub(super) const SELF_BROADCAST_UNSHIELD_PROGRESS_STAGES: [TransactionGeneration
     TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
 ];
 
-pub(super) const SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH: Pixels = px(460.0);
+pub(in crate::root) const SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH: Pixels = px(460.0);
 pub(super) const PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

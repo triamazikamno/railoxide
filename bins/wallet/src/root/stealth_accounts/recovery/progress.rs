@@ -7,8 +7,8 @@ use crate::root::{
     PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH,
     private_broadcaster::{
         PrivateBroadcasterProgressStepState, apply_private_broadcaster_progress_stage,
-        private_broadcaster_progress_steps, private_broadcaster_stage_detail,
-        private_broadcaster_stage_id,
+        end_private_broadcaster_progress_steps, private_broadcaster_progress_steps,
+        private_broadcaster_stage_detail, private_broadcaster_stage_id,
     },
     public_action::PublicActionStepStatus,
     public_broadcaster_cost::render_public_broadcaster_tx_hash_row,
@@ -131,26 +131,7 @@ impl RecoveryProgress {
             }
             return;
         }
-        if status == PublicActionStepStatus::Done {
-            for step in &mut self.steps {
-                step.status = PublicActionStepStatus::Done;
-                step.message = None;
-            }
-        }
-        let active = self
-            .steps
-            .iter()
-            .position(|step| {
-                matches!(
-                    step.status,
-                    PublicActionStepStatus::Pending | PublicActionStepStatus::Error
-                )
-            })
-            .or_else(|| self.steps.len().checked_sub(1));
-        if let Some(step) = active.and_then(|index| self.steps.get_mut(index)) {
-            step.status = status;
-            step.message = Some(message.into());
-        }
+        end_private_broadcaster_progress_steps(&mut self.steps, status, Some(message.into()));
     }
 
     pub(super) fn finish_broadcaster(&mut self, result: PublicBroadcasterResultKind) {

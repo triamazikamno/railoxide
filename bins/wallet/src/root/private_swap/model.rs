@@ -1582,7 +1582,7 @@ pub(in crate::root) fn swap_card_line(stage: SwapStage, labels: &SwapLabels) -> 
         ),
         SwapStage::SetupRetired => line(
             format!("Swap of {pair} needs a new stealth account"),
-            "Start a new swap, or recover any funds in the old account.".into(),
+            "Retry with a new account. The old one stays in Stealth accounts.".into(),
         ),
         SwapStage::SetupSubmitting | SwapStage::SetupPending => line(
             format!("Preparing swap of {pair}"),
@@ -1993,7 +1993,7 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
         SwapStage::SetupRetired => vec![
             setup(
                 Warning,
-                "This stealth account can no longer be used for the swap.",
+                "This stealth account has previous activity, so it can't be used for the swap.",
             ),
             open(NotStarted, "No order was placed".into()),
         ],
@@ -2708,12 +2708,10 @@ pub(in crate::root) const fn swap_actions(stage: SwapStage, past_valid_to: bool)
             dismiss: true,
             ..none
         },
-        SwapStage::SetupRetired => SwapActions {
-            resume: Some(Ok(())),
-            recover: true,
-            ..none
-        },
-        SwapStage::SetupPending => SwapActions {
+        // A setup on its way can be sent again. A retired account never held this swap's funds,
+        // so the swap is retried with a new one, and what the old one holds from before is
+        // recovered in Stealth accounts.
+        SwapStage::SetupRetired | SwapStage::SetupPending => SwapActions {
             resume: Some(Ok(())),
             ..none
         },
@@ -3085,18 +3083,17 @@ pub(super) mod tests {
                 ),
                 "{stage:?}"
             );
-            // Recovery for stranded or refunded funds, or a retired account that may hold funds.
+            // Recovery for stranded or refunded funds. A retired account never held the swap's.
             // A bridge deposit that needs attention isn't in the account to recover.
             assert_eq!(
                 actions.recover,
                 matches!(
                     stage,
-                    SwapStage::SetupRetired
-                        | SwapStage::Order(
-                            SwapOrderState::PreHookOnly { .. }
-                                | SwapOrderState::NotDelivered
-                                | SwapOrderState::Refunding
-                        )
+                    SwapStage::Order(
+                        SwapOrderState::PreHookOnly { .. }
+                            | SwapOrderState::NotDelivered
+                            | SwapOrderState::Refunding
+                    )
                 ),
                 "{stage:?}"
             );

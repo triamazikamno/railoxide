@@ -321,7 +321,6 @@ pub async fn prepare_swap_pair(
                 setup: is_new(account),
             }),
         });
-    let requested_accounts = approval.accounts;
     let claimed = origin.claim_swap_use(
         destination.map(|(owner, _, _)| owner),
         SwapUseClaim {
@@ -348,11 +347,6 @@ pub async fn prepare_swap_pair(
     {
         return Err(eyre!(ACCOUNTS_CHANGED));
     }
-    let approved = claimed
-        .source
-        .swap_use(use_id)
-        .and_then(SwapUseRecord::approval)
-        .and_then(|approval| approval.accounts);
     let prepared_destination = match (destination, destination_candidate) {
         (Some((owner, SwapAccountChoice::New(operation), authorization)), Some(candidate)) => {
             Some(SwapPairSide::Setup(
@@ -376,36 +370,7 @@ pub async fn prepare_swap_pair(
     };
     // The store takes an approval only for a derived account, so the addresses are bound once
     // the swap's own account is derived, before either preparation can issue a payload.
-    let bound_source = (prepared_origin.executor(), prepared_origin.requires_setup());
-    let bound_destination = prepared_destination
-        .as_ref()
-        .map(|side| (side.executor(), side.requires_setup()));
-    if requested_accounts.is_some_and(|approved| !approved.admits(bound_source, bound_destination))
-        || approved.is_some_and(|approved| !approved.admits(bound_source, bound_destination))
-    {
-        return Err(eyre!(ACCOUNTS_CHANGED));
-    }
-    let bind = |(address, setup): (Address, bool)| SwapApprovedAccount {
-        address: Some(address),
-        setup,
-    };
-    approval.accounts = Some(SwapApprovedAccounts {
-        source: bind(bound_source),
-        destination: bound_destination.map(bind),
-    });
-    if let (Some(delivery), Some((receiver, _))) = (delivery, bound_destination) {
-        approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
-            receiver,
-            ..delivery
-        });
-    }
-    // An existing source may have served as a destination before, so its record is not
-    // required to be a swap's own.
-    origin.ensure_active()?;
-    origin
-        .store
-        .record_swap_approval(source.operation(), use_id, approval.clone())?;
-    origin.notify_change();
+    let approval = origin.bind_swap_use_accounts(source.operation(), use_id, Some(approval))?;
     origin.require_live_swap_use(source.operation(), Some(use_id))?;
     if let Some((owner, account, _)) = destination {
         owner.require_live_swap_use(account.operation(), Some(use_id))?;
@@ -825,6 +790,90 @@ impl ExecutorOwner {
             .record_swap_approval(operation, expected_use, approval)?;
         self.notify_change();
         Ok(())
+    }
+
+    /// Complete the approval saved with the swap use `swap_use`, which claims this chain's
+    /// account `operation` as its source, from the stored records, and save it. The approval
+    /// binds the accounts the use claims, each with the address it has by now and whether the
+    /// use sets it up, and a private Bridge delivery's receiver is the destination account once
+    /// that account has an address. The destination account is the one the source use names,
+    /// read on its own chain. `replacement` is saved in place of the stored approval, for terms
+    /// the user authorized since. Every other term stays as it is.
+    ///
+    /// An account or setup need that either approval already binds must be the claimed one.
+    /// Nothing is saved while the source account has no address, which the store requires. A
+    /// destination account that isn't derived yet leaves the receiver as it is, for a later
+    /// call to bind.
+    pub fn bind_swap_use_accounts(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        replacement: Option<SwapApproval>,
+    ) -> Result<SwapApproval> {
+        self.ensure_active()?;
+        let claimed = self.store.swap_use_accounts(operation, swap_use)?;
+        let saved = claimed
+            .source
+            .swap_use(swap_use)
+            .and_then(SwapUseRecord::approval);
+        let mut approval = replacement
+            .or_else(|| saved.cloned())
+            .ok_or_else(|| eyre!("this swap has no saved approval"))?;
+        let source = claimed.source.address().ok_or_else(|| {
+            eyre!("the swap's own stealth account has no address yet; set it up first")
+        })?;
+        let sets_up = |record: &ExecutorRecord| {
+            record
+                .swap_use(swap_use)
+                .is_some_and(SwapUseRecord::is_fresh)
+        };
+        let source_setup = sets_up(&claimed.source);
+        let destination = claimed
+            .destination
+            .as_ref()
+            .map(|record| (record.address(), sets_up(record)));
+        let admits = |approved: SwapApprovedAccounts| {
+            approved.source.admits(source, source_setup)
+                && match (approved.destination, destination) {
+                    (None, None) => true,
+                    (Some(approved), Some((Some(address), setup))) => {
+                        approved.admits(address, setup)
+                    }
+                    // An account without an address takes the one its derivation binds.
+                    (Some(approved), Some((None, setup))) => {
+                        approved.address.is_none() && approved.setup == setup
+                    }
+                    _ => false,
+                }
+        };
+        if [approval.accounts, saved.and_then(|saved| saved.accounts)]
+            .into_iter()
+            .flatten()
+            .any(|approved| !admits(approved))
+        {
+            return Err(eyre!(ACCOUNTS_CHANGED));
+        }
+        approval.accounts = Some(SwapApprovedAccounts {
+            source: SwapApprovedAccount {
+                address: Some(source),
+                setup: source_setup,
+            },
+            destination: destination.map(|(address, setup)| SwapApprovedAccount { address, setup }),
+        });
+        if let (Some(delivery), Some((Some(receiver), _))) =
+            (approval.delivery.private_bridge(), destination)
+        {
+            approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                receiver,
+                ..delivery
+            });
+        }
+        // An existing source may have served as a destination before, so its record is not
+        // required to be a swap's own.
+        self.store
+            .record_swap_approval(operation, swap_use, approval.clone())?;
+        self.notify_change();
+        Ok(approval)
     }
 
     /// Claim the accounts of one swap use together, before any of its preparation: this

@@ -568,6 +568,45 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
     assert_eq!(unrelated_claims(&origin, &destination), [true, true]);
     assert!(record(&origin, operation).issued().is_empty() && reserved.issued().is_empty());
 
+    // The preparation stopped with only the destination account derived, so the saved approval
+    // still holds the placeholder receiver. Nothing is bound or written while the swap's own
+    // account has no address.
+    assert!(record(&origin, operation).address().is_none());
+    assert!(
+        origin
+            .bind_swap_use_accounts(operation, swap_use, None)
+            .is_err()
+    );
+    assert_eq!(pair(&origin, &destination), claimed);
+    // The retry of the swap's own setup derives that account. The approval then binds both
+    // accounts and the delivery's receiver, and takes a fee limit reviewed since. No other term
+    // changes.
+    let resumed = origin
+        .resume_swap_setup(operation, broadcaster(profile.delegate()), &authorization)
+        .await
+        .unwrap();
+    let mut raised = private_bridge_approval();
+    raised.bounds.source_setup_fee = Some(U256::from(3_000));
+    let bound = origin
+        .bind_swap_use_accounts(operation, swap_use, Some(raised.clone()))
+        .unwrap();
+    raised.accounts = Some(SwapApprovedAccounts {
+        source: SwapApprovedAccount {
+            address: Some(resumed.context().executor),
+            setup: true,
+        },
+        destination: Some(SwapApprovedAccount {
+            address: reserved.address(),
+            setup: true,
+        }),
+    });
+    let SwapDelivery::Bridge(delivery) = &mut raised.delivery else {
+        panic!("the approval keeps its Bridge delivery");
+    };
+    delivery.receiver = reserved.address().unwrap();
+    assert_eq!(bound, raised);
+    assert_eq!(record(&origin, operation).swap_approval(), Some(&bound));
+
     // The retry resumes both accounts, and the approval saved with the swap names the
     // destination account.
     let request = preparation(broadcaster(profile.delegate()), private_bridge_approval());

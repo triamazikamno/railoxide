@@ -1,6 +1,7 @@
 //! The swap dialog. One dialog shows the swap form, My orders, or one swap's order detail, and a
 //! back button moves between them. Escape and × close it. The asset and broadcaster pickers,
-//! spend authorization review, stealth-account recovery and confirmations open on top of it.
+//! spend authorization review, a setup's retry, stealth-account recovery and confirmations open
+//! on top of it.
 //!
 //! Background work may change the dialog only while it has focus and shows the swap the work
 //! belongs to, so a quote or order result never replaces or interrupts another dialog.
@@ -40,6 +41,10 @@ use crate::root::{dialog_max_height, secondary_dialog_content_width};
 
 /// One column for the form's panels, narrower than Send and Unshield.
 const SWAP_DIALOG_WIDTH: Pixels = px(520.0);
+/// The width for a detail that shows two setups side by side.
+const SWAP_DIALOG_WIDE_WIDTH: Pixels = px(760.0);
+/// Under this dialog width, two setups sit one above the other.
+const SWAP_DIALOG_STACK_WIDTH: Pixels = px(680.0);
 /// My orders row height in rems: two lines of body text and the row's padding.
 const ORDER_ROW_HEIGHT: f32 = 3.5;
 /// Rows My orders shows before it scrolls.
@@ -268,6 +273,7 @@ impl PrivateSwapsView {
             // A cancelled preparation is reported until the dialog shows something else.
             self.cancelled = None;
         }
+        self.setup_retry = None;
         self.close_setup_settings(cx);
         if let SwapDialogView::Detail(_)
         | SwapDialogView::PastDetail(..)
@@ -286,6 +292,10 @@ impl PrivateSwapsView {
     /// the destination network's session knows. Opening the detail starts loading that network
     /// and reads the account again.
     fn load_detail_destination(&mut self, view: SwapDialogView, cx: &mut Context<'_, Self>) {
+        // Debug UI fixture: its synthesized destination account isn't read over.
+        if super::ui_fixture::holds_swaps() {
+            return;
+        }
         let delivery = match view {
             SwapDialogView::Detail(operation) => self
                 .record(operation)
@@ -312,6 +322,7 @@ impl PrivateSwapsView {
         self.dismiss_public_preparation();
         window.close_all_dialogs(cx);
         self.cancelled = None;
+        self.setup_retry = None;
         match view {
             SwapDialogView::Form => {}
             SwapDialogView::Orders => self.form = None,
@@ -325,13 +336,23 @@ impl PrivateSwapsView {
         }
         let entity = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, window, cx| {
-            let width = (window.viewport_size().width * 0.92).min(SWAP_DIALOG_WIDTH);
-            let content_width = secondary_dialog_content_width(width);
+            let available = window.viewport_size().width * 0.92;
             let close_view = entity.clone();
             let rendered = entity.update(cx, |view, cx| {
-                let (body, footer) = view.render_dialog_body(content_width, cx);
-                (view.render_dialog_title(content_width, cx), body, footer)
+                let width = available.min(if view.shows_two_setups(cx) {
+                    SWAP_DIALOG_WIDE_WIDTH
+                } else {
+                    SWAP_DIALOG_WIDTH
+                });
+                let content_width = secondary_dialog_content_width(width);
+                let (body, footer) =
+                    view.render_dialog_body(content_width, width < SWAP_DIALOG_STACK_WIDTH, cx);
+                let title = view.render_dialog_title(content_width, cx);
+                (width, title, body, footer)
             });
+            let width = rendered
+                .as_ref()
+                .map_or_else(|_| available.min(SWAP_DIALOG_WIDTH), |rendered| rendered.0);
             let dialog = dialog
                 .w(width)
                 .max_h(dialog_max_height(window))
@@ -344,7 +365,7 @@ impl PrivateSwapsView {
                 });
             match rendered {
                 // The footer stays in view while the body scrolls.
-                Ok((title, body, footer)) => dialog
+                Ok((_, title, body, footer)) => dialog
                     .title(title)
                     .child(body)
                     .when_some(footer, gpui_component::dialog::Dialog::footer),
@@ -418,6 +439,7 @@ impl PrivateSwapsView {
         self.dismiss_public_preparation();
         self.dialog = None;
         self.form = None;
+        self.setup_retry = None;
         self.reapproval = None;
         self.cancelled = None;
         cx.notify();
@@ -817,16 +839,20 @@ impl PrivateSwapsView {
             }))
     }
 
-    /// The view's body and, when it has one, its footer for the dialog's footer slot.
+    /// The view's body and, when it has one, its footer for the dialog's footer slot. A dialog
+    /// too narrow for two setups side by side has them stacked.
     fn render_dialog_body(
         &self,
         width: Pixels,
+        stack_setups: bool,
         cx: &mut Context<'_, Self>,
     ) -> (gpui::Div, Option<gpui::Div>) {
         let (body, footer) = match self.dialog.as_ref().map(|dialog| dialog.view) {
             Some(SwapDialogView::Form) => self.render_form(cx),
             Some(SwapDialogView::Orders) => self.render_orders(cx),
-            Some(SwapDialogView::Detail(operation)) => self.render_detail(operation, cx),
+            Some(SwapDialogView::Detail(operation)) => {
+                self.render_detail(operation, stack_setups, cx)
+            }
             Some(SwapDialogView::PublicDetail(swap)) => self.render_public_detail(swap, cx),
             Some(SwapDialogView::PastDetail(swap, first)) => {
                 self.render_past_detail(swap, first, cx)

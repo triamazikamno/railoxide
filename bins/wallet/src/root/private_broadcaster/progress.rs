@@ -316,6 +316,34 @@ pub(in crate::root) fn apply_private_broadcaster_progress_stage(
     }
 }
 
+/// End a stage list with `status`. Success marks every step done. Any other status goes on the
+/// step that was running, with `message`, which success puts on the last step.
+pub(in crate::root) fn end_private_broadcaster_progress_steps(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    status: PublicActionStepStatus,
+    message: Option<Arc<str>>,
+) {
+    if status == PublicActionStepStatus::Done {
+        for step in steps.iter_mut() {
+            step.status = PublicActionStepStatus::Done;
+            step.message = None;
+        }
+    }
+    let active = steps
+        .iter()
+        .position(|step| {
+            matches!(
+                step.status,
+                PublicActionStepStatus::Pending | PublicActionStepStatus::Error
+            )
+        })
+        .or_else(|| steps.len().checked_sub(1));
+    if let Some(step) = active.and_then(|index| steps.get_mut(index)) {
+        step.status = status;
+        step.message = message;
+    }
+}
+
 pub(super) const SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE: &str =
     "Unable to observe transaction inclusion. Check the transaction hash before sending again.";
 
@@ -539,7 +567,7 @@ pub(in crate::root) fn format_public_broadcaster_wait_remaining(duration: Durati
     }
 }
 
-pub(super) const fn private_broadcaster_stage_label(
+pub(in crate::root) const fn private_broadcaster_stage_label(
     stage: TransactionGenerationStage,
     requires_device_approval: bool,
 ) -> &'static str {
