@@ -1364,7 +1364,8 @@ impl ExecutorRecord {
     }
 
     /// Notes still reserved by this operation's swap pre-hooks. A recovery or early
-    /// cancellation competes with the pre-hook for its nonce, so it must not spend them.
+    /// cancellation competes with the pre-hook for its nonce, and a setup sent again runs
+    /// before a pre-hook on its included setup, so neither may spend them.
     #[must_use]
     pub(crate) fn swap_reserved_inputs(&self) -> Vec<ExecutorInputIdentity> {
         self.issued
@@ -1650,10 +1651,38 @@ impl ExecutorStore {
     /// order is still open, at that order's pre-hook nonce. It must invalidate that order,
     /// keep the recorded proof, the sell amount, the private spend and the delivery, and ask
     /// for a lower buy amount. Earlier orders and the use's setup approval stay as they are.
+    ///
+    /// The pre-hook never shares a note with a setup whose nonce is unresolved, which could
+    /// spend it first.
     pub fn record_swap_attempt(
         &self,
         operation: ExecutorOperationId,
         attempt: SwapAttempt,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.record_swap_attempt_at(operation, attempt, None)
+    }
+
+    /// [`Self::record_swap_attempt`] for an order, or its speed-up, on the included setup of
+    /// the account its use reserved fresh: a read at the latest block showed the delegation
+    /// and the account nonce `included_nonce`, while the record leaves the setup's nonce
+    /// unresolved. The setup must sit unresolved at the record's observed nonce `n`, the
+    /// pre-hook holds `n + 1`, which must be `included_nonce`, and a post-hook `n + 2`. Only
+    /// that use's setups may be unresolved below the pre-hook. The hooks still name the
+    /// record's confirmed observation, and nothing from the latest read is recorded.
+    pub fn record_swap_attempt_on_included_setup(
+        &self,
+        operation: ExecutorOperationId,
+        attempt: SwapAttempt,
+        included_nonce: U256,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.record_swap_attempt_at(operation, attempt, Some(included_nonce))
+    }
+
+    fn record_swap_attempt_at(
+        &self,
+        operation: ExecutorOperationId,
+        attempt: SwapAttempt,
+        included_nonce: Option<U256>,
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         let SwapAttempt {
             use_id,
@@ -1683,9 +1712,11 @@ impl ExecutorStore {
             if record.active_swap_use != Some(use_id) {
                 return Err(ExecutorStoreError::SwapUseActive);
             }
-            // The order is an attempt of the account's active use, which the latest use is.
+            // The order is an attempt of the account's active use, which the latest use is. Only
+            // a use that reserved its account fresh has a setup to be included.
             let Some(SwapUseRecord {
                 stopped: false,
+                fresh,
                 role:
                     SwapUseRole::Source {
                         destination_operation,
@@ -1699,6 +1730,9 @@ impl ExecutorStore {
             else {
                 return Err(ExecutorStoreError::OperationMismatch);
             };
+            if included_nonce.is_some() && !*fresh {
+                return Err(ExecutorStoreError::OperationMismatch);
+            }
             let destination_operation = *destination_operation;
             // A private Bridge order pays the destination account this use names, which must
             // serve this use for the delivery's token. Read under the held record lock.
@@ -1818,25 +1852,62 @@ impl ExecutorStore {
             }) {
                 return Err(ExecutorStoreError::InputReserved);
             }
+            // A setup whose nonce is unresolved can still run before the pre-hook and spend
+            // these notes as its fee, whichever attempt of it runs.
+            if record.issued.iter().any(|issued| {
+                issued.purpose == ExecutorPayloadPurpose::Operation
+                    && !record.nonce_resolved(issued.nonce)
+                    && issued
+                        .context
+                        .inputs
+                        .iter()
+                        .any(|input| proof.inputs.contains(input))
+            }) {
+                return Err(ExecutorStoreError::InputReserved);
+            }
             let observed = pre_hook.context.observed;
             let nonce = pre_hook.nonce;
-            // The setup's nonce must be resolved, whichever setup signed at it ran. Every
-            // nonce below the current one is resolved with it, which makes the old
-            // signatures of earlier hooks and shields unusable.
+            // Without included evidence the setup's nonce must be resolved, whichever setup
+            // signed at it ran. Every nonce below the current one is resolved with it, which
+            // makes the old signatures of earlier hooks and shields unusable. On an included
+            // setup the pre-hook takes the nonce after the setup's, and only the setup's
+            // attempts may be unresolved below it.
+            let setup_admitted = match included_nonce {
+                None => {
+                    observed.nonce == nonce
+                        && record.issued.iter().any(|issued| {
+                            issued.hash == terms.setup_payload
+                                && record.nonce_resolved(issued.nonce)
+                        })
+                }
+                Some(included) => {
+                    record.unresolved_swap_setup_nonce(use_id) == Some(observed.nonce)
+                        && observed.nonce.checked_add(U256::ONE) == Some(nonce)
+                        && included == nonce
+                        && record
+                            .issued
+                            .iter()
+                            .find(|issued| issued.hash == terms.setup_payload)
+                            .is_some_and(|setup| setup.nonce == observed.nonce)
+                }
+            };
+            let included_setup_below = |issued: &IssuedExecutorPayload| {
+                included_nonce.is_some()
+                    && issued.purpose == ExecutorPayloadPurpose::Operation
+                    && issued.nonce == observed.nonce
+            };
             if record.nonce_observation != Some(observed)
-                || observed.nonce != nonce
+                || !setup_admitted
                 || pre_hook.context.calldata.is_empty()
                 || post_hook.as_ref().is_some_and(|post_hook| {
                     post_hook.context.observed != observed
                         || nonce.checked_add(U256::ONE) != Some(post_hook.nonce)
                         || post_hook.context.calldata.is_empty()
                 })
-                || !record.issued.iter().any(|issued| {
-                    issued.hash == terms.setup_payload && record.nonce_resolved(issued.nonce)
-                })
                 || record.issued.iter().any(|issued| {
                     issued.nonce < nonce
                         && !record.nonce_resolved(issued.nonce)
+                        && !included_setup_below(issued)
                         && !(issued.purpose == ExecutorPayloadPurpose::SwapPostHook
                             && (record.swap_post_hook_took_nonce(issued.nonce)
                                 || record.swap.as_ref().is_some_and(|swap| {
@@ -1959,6 +2030,19 @@ impl ExecutorStore {
                 .swap_uses
                 .last()
                 .is_some_and(|swap_use| record.has_swap_use_order(swap_use.id));
+            // A setup sent again beside an order placed on it while it was included may raise
+            // its own fee limit. Nothing else the order was approved with changes.
+            let setup_fee_only = has_orders
+                && record.unresolved_swap_setup_nonce(expected_use).is_some()
+                && record
+                    .swap_uses
+                    .last()
+                    .and_then(SwapUseRecord::approval)
+                    .is_some_and(|known| {
+                        let mut unchanged = approval.clone();
+                        unchanged.bounds.source_setup_fee = known.bounds.source_setup_fee;
+                        unchanged == *known
+                    });
             match record.swap_uses.last_mut() {
                 Some(SwapUseRecord {
                     id,
@@ -1969,7 +2053,7 @@ impl ExecutorStore {
                             destination_operation,
                         },
                     ..
-                }) if *id == expected_use && !has_orders => {
+                }) if *id == expected_use && (!has_orders || setup_fee_only) => {
                     // Cancellation resolves the linked destination through this delivery's chain.
                     if destination_operation.is_some()
                         && !matches!(

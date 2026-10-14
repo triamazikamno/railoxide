@@ -7,7 +7,9 @@
 use super::*;
 use crate::root::dialog_max_height;
 use crate::root::private_broadcaster::SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH;
-use crate::root::private_swap::model::{SwapIdentity, prepared_swap_use, swap_use_destination};
+use crate::root::private_swap::model::{
+    SwapIdentity, order_setup_use, prepared_swap_use, swap_use_destination,
+};
 use crate::root::private_swap::progress::{fact_row, stealth_account};
 use crate::root::private_swap::sets_up_destination;
 use crate::root::private_swap::ui_fixture;
@@ -131,15 +133,22 @@ impl PrivateSwapsView {
     }
 
     /// The account `side`'s setup of the swap `operation` is sent again for. `None` unless
-    /// the swap is prepared with a saved approval and has no order.
+    /// the swap is prepared with a saved approval and has no order, or, for the swap's own
+    /// account, its orders were placed on its setup while the record leaves that setup
+    /// unresolved.
     fn setup_retry_account(
         &self,
         operation: ExecutorOperationId,
         side: SetupSide,
     ) -> Option<RetryAccount> {
         let record = self.record(operation)?;
-        let swap_use =
-            prepared_swap_use(record).filter(|swap_use| swap_use.approval().is_some())?;
+        let swap_use = prepared_swap_use(record)
+            .filter(|swap_use| swap_use.approval().is_some())
+            .or_else(|| {
+                (side == SetupSide::Origin)
+                    .then(|| order_setup_use(record))
+                    .flatten()
+            })?;
         let swap_use = swap_use.id();
         match side {
             SetupSide::Origin => Some(RetryAccount {
@@ -939,6 +948,11 @@ impl PrivateSwapsView {
             .record(operation)
             .is_some_and(|record| swap_use_destination(record, retry.swap_use).is_some())
             .then(|| network_name(retry.chain_id));
+        // An order placed on the setup keeps the accounts its saved approval binds, which may be
+        // none. Only a raised setup fee limit changes that approval.
+        let ordered = self
+            .record(operation)
+            .is_some_and(|record| record.has_swap_use_order(retry.swap_use));
         // The new attempt is observed afresh.
         let tracking = self.tracking.entry(operation).or_default();
         match side {
@@ -998,15 +1012,21 @@ impl PrivateSwapsView {
                     // preparation interrupted before their derivation left unbound, and a
                     // replacement left for its new account: the swap's own, and the destination
                     // account as its delivery's receiver. A reviewed fee above the approved limit
-                    // is saved with them, before the setup is sent.
+                    // is saved with them, before the setup is sent. Beside an order, the approval
+                    // keeps its bindings and only the fee limit is saved.
                     match retry.approval {
-                        Some(approval) => accounts.bind_approval(approval)?,
-                        None => owner.bind_swap_use_accounts(
-                            accounts.operation(),
-                            accounts.swap_use(),
-                            None,
-                        )?,
-                    };
+                        Some(approval) => {
+                            accounts.bind_approval(approval)?;
+                        }
+                        None if ordered => {}
+                        None => {
+                            owner.bind_swap_use_accounts(
+                                accounts.operation(),
+                                accounts.swap_use(),
+                                None,
+                            )?;
+                        }
+                    }
                     let request = SwapSetupRequest {
                         maximum_private_fee: retry.maximum_private_fee,
                         session,

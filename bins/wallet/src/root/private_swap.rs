@@ -18,7 +18,8 @@ use tokio::sync::watch;
 use wallet_ops::cow::OrderUid;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareExecutorAction,
-    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SwapOrderState, SwapReviewChange,
+    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SwapOrderState,
+    SwapPlacementReadiness, SwapReviewChange, SwapSetupInclusion, SwapSetupObservation,
     SwapSetupStatus, SwapSpeedUpRefusal, TransactionGenerationStage, WakuDeliveryClient,
     WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
@@ -301,6 +302,10 @@ struct SwapTracking {
     pending_order: Option<PendingSwapOrder>,
     /// The last setup observation, including the delegated executor once confirmed.
     setup: Option<SwapSetupStatus>,
+    /// The last setup observation's read at the latest block, when it showed the swap's own
+    /// setup included while the record leaves that setup unresolved. Never recorded. Each
+    /// setup observation replaces it, and a signing that finds the setup gone drops it.
+    inclusion: Option<SwapSetupInclusion>,
     /// The next block of an order's history to observe. A setup keeps none: each pass reads
     /// its account at the confirmed block.
     cursor: Option<u64>,
@@ -355,6 +360,9 @@ struct SwapTracking {
     /// wallet checks the approved terms again and asks to place the order without waiting
     /// for the user to return. Cleared after the first attempt, so failures don't repeat.
     auto_place: bool,
+    /// The automatic attempt waits for the setup's change: the approved spend doesn't fit the
+    /// spendable notes yet, and the setup can still make it fit. As the owner last answered.
+    waits_for_change: bool,
     /// The delivery allowance earlier signing quotes of this swap showed its previews to lack,
     /// added to each later review until an order is submitted.
     delivery_shortfall: Option<U256>,
@@ -1145,7 +1153,8 @@ impl PrivateSwapsView {
                 records
                     .sort_by_key(|record| std::cmp::Reverse((record.created_at(), record.index())));
                 // Only a setup that private sync newly shows in a transaction recorded for it
-                // wakes the observation loop: it makes the setup's account check due at once.
+                // wakes the observation loop: it makes the setup's account check due at once,
+                // with its read at the latest block, also beside an order placed on it.
                 // Waking on every owner change would spin, since each pass records its own
                 // observations.
                 let inclusions = {
@@ -1156,17 +1165,7 @@ impl PrivateSwapsView {
                     let utxos = observation
                         .as_ref()
                         .map_or(&[][..], |observation| &observation.snapshot.utxos[..]);
-                    records
-                        .iter()
-                        .filter(|record| {
-                            record.swap().is_none()
-                                && matches!(
-                                    model::swap_setup_confirmation(record, utxos),
-                                    Some(model::SwapSetupConfirmation::Included(_))
-                                )
-                        })
-                        .map(ExecutorRecord::operation)
-                        .collect::<BTreeSet<_>>()
+                    synced_setup_inclusions(&records, utxos)
                 };
                 if self
                     .setup_inclusions
@@ -1182,8 +1181,10 @@ impl PrivateSwapsView {
                         Some((record.operation(), owner.attribution(record)?))
                     }),
                 );
-                // The owner's rule is the only one. It reads local records, and an expired
-                // order can't pass it, so only the others are asked about.
+                // The owner's rule is the only one. It reads local records and, for an order
+                // on a setup the record leaves unresolved, this session's last read showing
+                // that setup included. An expired order can't pass it, so only the others are
+                // asked about.
                 let now = now_unix();
                 self.speed_up_refusals = records
                     .iter()
@@ -1192,8 +1193,12 @@ impl PrivateSwapsView {
                         if u64::from(order.valid_to()) <= now {
                             return None;
                         }
+                        let inclusion = self
+                            .tracking
+                            .get(&record.operation())
+                            .and_then(|tracking| tracking.inclusion);
                         let refusal = owner
-                            .swap_speed_up_refusal(record.operation(), order.uid())
+                            .swap_speed_up_refusal(record.operation(), order.uid(), inclusion)
                             .ok()?;
                         Some((record.operation(), (order.uid(), refusal)))
                     })
@@ -1287,6 +1292,27 @@ impl PrivateSwapsView {
             submitting,
             self.attribution(record),
         )
+    }
+
+    /// This session's last read at the latest block that showed `record`'s own setup
+    /// included, while the record still leaves that setup unresolved. It is a hint for
+    /// placing the order: signing reads the account again.
+    pub(super) fn setup_inclusion(&self, record: &ExecutorRecord) -> Option<SwapSetupInclusion> {
+        wallet_ops::own_pending_swap_setup(record)?;
+        self.tracking.get(&record.operation())?.inclusion
+    }
+
+    /// Whether private sync or this session's latest read shows `record`'s own setup, which
+    /// the record leaves unresolved, included.
+    pub(super) fn own_setup_included(&self, record: &ExecutorRecord) -> bool {
+        if wallet_ops::own_pending_swap_setup(record).is_none() {
+            return false;
+        }
+        self.setup_inclusion(record).is_some()
+            || matches!(
+                self.setup_confirmation(record),
+                Some(model::SwapSetupConfirmation::Included(_))
+            )
     }
 
     /// The wallet session and executor owner of `chain_id`, a private Bridge swap's destination
@@ -1721,10 +1747,11 @@ impl PrivateSwapsView {
     }
 
     /// The swap use of `record` whose first order the approval saved with it still binds, once
-    /// every account the swap uses is ready for that order: an account the use set up is
-    /// confirmed, and an account it reuses is set up already. The approved order is then
-    /// placed without another review, whichever of its accounts needed setup. Signing still
-    /// checks each account afresh.
+    /// every account the swap uses is ready for that order: the swap's own account the use set
+    /// up is confirmed, or this session's latest read shows its setup included, a destination
+    /// account the use set up is confirmed, and an account it reuses is set up already. The
+    /// approved order is then placed without another review, whichever of its accounts needed
+    /// setup. Signing still checks each account afresh.
     fn approved_use<'a>(
         &self,
         record: &'a ExecutorRecord,
@@ -1736,7 +1763,7 @@ impl PrivateSwapsView {
         let approval = swap_use.approval()?;
         let operation = record.operation();
         let source_ready = if swap_use.is_fresh() {
-            self.stage(record) == SwapStage::Approved
+            self.stage(record) == SwapStage::Approved || self.setup_inclusion(record).is_some()
         } else {
             account_setup_progress(
                 record,
@@ -1809,6 +1836,28 @@ impl PrivateSwapsView {
                 SwapStage::Recovered
             }
             _ => stage,
+        }
+    }
+
+    /// [`Self::progress_stage`] as the swap's detail shows it. Before its order, a swap whose
+    /// own setup this session's latest read shows included is past that setup, as once the
+    /// setup is confirmed, while its record still leaves the setup unresolved.
+    pub(super) fn detail_stage(&self, record: &ExecutorRecord) -> SwapStage {
+        let stage = self.progress_stage(record);
+        if stage != SwapStage::SetupPending || self.setup_inclusion(record).is_none() {
+            return stage;
+        }
+        let ready = if record.swap_approval().is_some() && record.active_swap_use().is_some() {
+            SwapStage::Approved
+        } else {
+            SwapStage::Ready
+        };
+        match swap_private_delivery(record) {
+            Some(delivery) => model::private_bridge_setup_stage(
+                ready,
+                self.destination_setup_progress(record, delivery),
+            ),
+            None => ready,
         }
     }
 
@@ -1953,6 +2002,11 @@ impl PrivateSwapsView {
     }
 
     fn setup_confirmation(&self, record: &ExecutorRecord) -> Option<model::SwapSetupConfirmation> {
+        // Debug UI fixture: no private note shows the setup it holds included.
+        #[cfg(debug_assertions)]
+        if let Some((block, _)) = ui_fixture::setup_included() {
+            return Some(model::SwapSetupConfirmation::Included(block));
+        }
         model::swap_setup_confirmation(
             record,
             &self
@@ -1964,11 +2018,13 @@ impl PrivateSwapsView {
         )
     }
 
+    /// Why the swap's own setup, before its order, isn't sent again: private sync shows it
+    /// included or resolved, or this session's latest read shows it included.
     fn setup_retry_problem(&self, record: &ExecutorRecord) -> Option<&'static str> {
         (matches!(
             self.stage(record),
             SwapStage::SetupPending | SwapStage::SetupSubmitting
-        ) && self.setup_confirmation(record).is_some())
+        ) && (self.setup_confirmation(record).is_some() || self.setup_inclusion(record).is_some()))
         .then_some(SETUP_ALREADY_INCLUDED)
     }
 
@@ -2034,6 +2090,10 @@ impl PrivateSwapsView {
     /// that sets its own account up has none for it, the destination setup waits for the swap's
     /// own, with the reason. Only the missing address holds it back, never how far the swap's
     /// own setup is.
+    ///
+    /// The swap's own setup that an order was placed on while it was included is sent again
+    /// while the record leaves it unresolved, with the order open or ended. Only private sync
+    /// or this session's latest read showing it included again disables that, with the reason.
     fn setup_retry_availability(
         &self,
         record: &ExecutorRecord,
@@ -2042,6 +2102,16 @@ impl PrivateSwapsView {
     ) -> SetupRetryAvailability {
         if record.is_swap_setup_stopped() {
             return None;
+        }
+        if side == SetupSide::Origin && model::order_setup_use(record).is_some() {
+            if record.is_retired() || self.submitting_setup(record.operation()) {
+                return None;
+            }
+            return Some(if self.own_setup_included(record) {
+                Err(SETUP_ALREADY_INCLUDED.into())
+            } else {
+                Ok(())
+            });
         }
         let swap_use =
             model::prepared_swap_use(record).filter(|swap_use| swap_use.approval().is_some())?;
@@ -2102,6 +2172,14 @@ impl PrivateSwapsView {
             .effective_chain_configs
             .get(self.origin_chain_id)?
             .finality_depth;
+        // Debug UI fixture: its included setup counts from a head of its own, which nothing
+        // finalizes, so the count holds still.
+        #[cfg(debug_assertions)]
+        if let Some((block, head)) = ui_fixture::setup_included() {
+            return model::SwapSetupConfirmation::Included(block).detail(
+                super::utxo::UtxoFinalityContext::new(Some(head), Some(0), Some(depth)),
+            );
+        }
         let tip = *self.private_session()?.sync_tip_rx.borrow();
         self.setup_confirmation(record)?
             .detail(super::utxo::UtxoFinalityContext::new(
@@ -2343,7 +2421,8 @@ impl PrivateSwapsView {
 
     /// The setup of each stealth account of `record`'s private Bridge swap `swap`, the swap's
     /// own network first. `placed` tells that the order these labels describe exists, which
-    /// needs both accounts set up.
+    /// needs both accounts set up. The swap's own setup is finished once this session's latest
+    /// read shows it included, as the detail shows it.
     fn setup_labels(
         &self,
         record: &ExecutorRecord,
@@ -2354,7 +2433,7 @@ impl PrivateSwapsView {
     ) -> [SwapSetupLabels; 2] {
         let operation = record.operation();
         let tracking = self.tracking.get(&operation);
-        let origin = if placed {
+        let origin = if placed || self.setup_inclusion(record).is_some() {
             SwapSetupProgress::Done
         } else {
             account_setup_progress(
@@ -2609,6 +2688,25 @@ impl PrivateSwapsView {
                     .into_iter()
                     .collect()
             })
+            // An order placed on the swap's own included setup leaves that setup unresolved in
+            // the record. Its account is read each pass beside the order's pages, while the
+            // order is open and after it ended: at the confirmed block, which can resolve the
+            // setup, and at the latest block, which shows whether it is still included.
+            .chain(
+                self.records
+                    .iter()
+                    .filter(|record| Some(record.operation()) != busy)
+                    .filter(|record| {
+                        record.swap().is_some()
+                            && wallet_ops::own_pending_swap_setup(record).is_some()
+                    })
+                    .map(|record| ObservationPage {
+                        operation: record.operation(),
+                        settlement: None,
+                        range: None,
+                        destination: None,
+                    }),
+            )
             .chain(
                 self.records
                     .iter()
@@ -2941,8 +3039,8 @@ impl PrivateSwapsView {
                 match result.outcome {
                     Ok(setup) => {
                         tracking.error = None;
-                        if setup.is_some() {
-                            tracking.destination_setup = setup;
+                        if let Some(setup) = setup {
+                            tracking.destination_setup = Some(setup.status);
                         }
                     }
                     Err(error) => tracking.error = Some(format!("{error:#}")),
@@ -2961,14 +3059,27 @@ impl PrivateSwapsView {
                             catchup.push(result.operation);
                         }
                     }
-                    if setup.is_some() {
-                        tracking.setup = setup;
+                    // Each setup observation replaces what the last one read at the latest
+                    // block.
+                    if let Some(setup) = setup {
+                        tracking.setup = Some(setup.status);
+                        tracking.inclusion = setup.inclusion;
                     }
                 }
                 Err(error) => tracking.error = Some(format!("{error:#}")),
             }
         }
         self.reload_records();
+        // A setup the record no longer leaves unresolved needs no read at the latest block.
+        let records = &self.records;
+        for (operation, tracking) in &mut self.tracking {
+            if records.iter().any(|record| {
+                record.operation() == *operation
+                    && wallet_ops::own_pending_swap_setup(record).is_none()
+            }) {
+                tracking.inclusion = None;
+            }
+        }
         self.reload_destinations(cx);
         // A cancellation is settled once canonical observation says which payload won.
         let settled = self
@@ -3009,29 +3120,70 @@ impl PrivateSwapsView {
         catchup
     }
 
-    /// Place the order of a swap approved with its setup in this session once every setup it
-    /// needs is confirmed: its own account's, a private Bridge swap's destination account's,
-    /// or both. After a restart, or once the user declined, its detail offers the step.
-    /// Only this swap's detail may advance while a dialog is open.
+    /// Place the order of a swap approved with its setup in this session once every account it
+    /// uses is ready, as [`Self::approved_use`] tells: its own account's setup is confirmed or
+    /// included, and a private Bridge swap's destination account's is confirmed. After a
+    /// restart, or once the user declined, its detail offers the step. Only this swap's detail
+    /// may advance while a dialog is open.
+    ///
+    /// A swap whose approved spend doesn't fit yet, while its setup's change can still make it
+    /// fit, sends nothing and keeps waiting, as the owner answers from its current notes. The
+    /// next ready swap is placed meanwhile, and each pass asks again.
     fn continue_approved_swaps(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.busy() || self.form.is_some() || !self.session_is_current(cx) {
             return;
         }
-        let next = self
+        let candidates = self
             .records
             .iter()
-            .filter(|record| self.approved_use(record).is_some())
-            .map(ExecutorRecord::operation)
-            .find(|operation| {
+            .filter_map(|record| {
+                let operation = record.operation();
+                let (_, approval) = self.approved_use(record)?;
                 self.tracking
-                    .get(operation)
+                    .get(&operation)
                     .is_some_and(|tracking| tracking.auto_place)
-            });
+                    .then(|| {
+                        let sell = approval
+                            .tokens
+                            .map(|tokens| tokens.sell)
+                            .or_else(|| swap_tokens(record).map(|(sell, _)| sell));
+                        (operation, sell, approval.bounds.spend_amount())
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut next = None;
+        for (operation, sell, spend) in candidates {
+            let waits = self.waits_for_setup_change(operation, sell, spend);
+            self.tracking.entry(operation).or_default().waits_for_change = waits;
+            if !waits && next.is_none() {
+                next = Some(operation);
+            }
+        }
         if let Some(operation) = next
             && (!window.has_active_dialog(cx) || self.detail_is_active(operation, window, cx))
         {
             self.place_approved_order(operation, window, cx);
         }
+    }
+
+    /// Whether the automatic attempt to place the swap `operation`'s approved spend of `sell`
+    /// waits for its setup's change, as the owner answers from one current snapshot of the
+    /// wallet's notes. Without an answer the attempt runs, and reports what it finds.
+    fn waits_for_setup_change(
+        &self,
+        operation: ExecutorOperationId,
+        sell: Option<Address>,
+        spend: U256,
+    ) -> bool {
+        let (Some(owner), Some(session), Some(sell)) =
+            (self.private_owner(), self.private_session(), sell)
+        else {
+            return false;
+        };
+        matches!(
+            owner.swap_placement_readiness(session, operation, sell, spend),
+            Ok(SwapPlacementReadiness::WaitForSetupChange)
+        )
     }
 
     /// Start a signing or submission job for one swap. Only one runs at a time.
@@ -3078,6 +3230,9 @@ impl PrivateSwapsView {
                 this.reload_destinations(cx);
                 match result {
                     Ok(Ok(value)) => apply(this, value, window, cx),
+                    Ok(Err(error))
+                        if kind == SwapJobKind::Order
+                            && this.lost_setup_inclusion(operation, &error) => {}
                     Ok(Err(error)) => {
                         let message = this.job_error(&error, cx);
                         this.fail(operation, message);
@@ -3097,6 +3252,44 @@ impl PrivateSwapsView {
             self.show_detail(operation, window, cx);
         }
         cx.notify();
+    }
+
+    /// After an order job ended with `error`: when signing found the swap's own setup no
+    /// longer included, forget this session's read that showed it, so the swap shows its setup
+    /// as waiting again. A first order then waits to be placed by itself once the setup is
+    /// included again, with no error left to hold it back; nothing was signed. A speed-up's
+    /// failure is still told. Whether the setup was the reason.
+    fn lost_setup_inclusion(
+        &mut self,
+        operation: ExecutorOperationId,
+        error: &eyre::Report,
+    ) -> bool {
+        let unconfirmed = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<wallet_ops::vault::SwapAccountRefusal>(),
+                Some(wallet_ops::vault::SwapAccountRefusal::SetupUnconfirmed)
+            )
+        });
+        // Only an order on the swap's own setup, which the record leaves unresolved, was
+        // signed on its inclusion.
+        let included_path = self
+            .record(operation)
+            .is_some_and(|record| wallet_ops::own_pending_swap_setup(record).is_some());
+        if !unconfirmed || !included_path {
+            return false;
+        }
+        let tracking = self.tracking.entry(operation).or_default();
+        tracking.inclusion = None;
+        if tracking
+            .pending_order
+            .is_some_and(|pending| pending.speeds_up)
+        {
+            return false;
+        }
+        tracking.pending_order = None;
+        tracking.error = None;
+        tracking.auto_place = true;
+        true
     }
 
     fn job_error(&self, error: &eyre::Report, cx: &gpui::App) -> String {
@@ -3539,6 +3732,26 @@ fn account_setup_progress(
     }
 }
 
+/// The accounts among `records` whose pending setup private sync's `utxos` show in a
+/// transaction recorded for it: a swap's setup before its order, or the swap's own setup an
+/// order was placed on while the record leaves that setup unresolved.
+fn synced_setup_inclusions(
+    records: &[ExecutorRecord],
+    utxos: &[wallet_ops::UtxoOutput],
+) -> BTreeSet<ExecutorOperationId> {
+    records
+        .iter()
+        .filter(|record| {
+            (record.swap().is_none() || wallet_ops::own_pending_swap_setup(record).is_some())
+                && matches!(
+                    model::swap_setup_confirmation(record, utxos),
+                    Some(model::SwapSetupConfirmation::Included(_))
+                )
+        })
+        .map(ExecutorRecord::operation)
+        .collect()
+}
+
 /// Whether a setup was signed for the record's account, so its outcome can be read.
 fn has_issued_setup(record: &ExecutorRecord) -> bool {
     record
@@ -3569,7 +3782,8 @@ struct ObservationResult {
     operation: ExecutorOperationId,
     /// The end of the page read. `None` for a setup, which reads no page.
     range_end: Option<u64>,
-    outcome: eyre::Result<Option<SwapSetupStatus>>,
+    /// A setup's observation; `None` for an order's page.
+    outcome: eyre::Result<Option<SwapSetupObservation>>,
     /// A destination account's swap.
     destination: Option<ExecutorOperationId>,
 }

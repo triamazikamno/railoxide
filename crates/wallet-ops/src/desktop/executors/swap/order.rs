@@ -61,8 +61,8 @@ use super::continuing::{SwapContinuingApprovals, is_public_across};
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::simulation::{PreHookSimulation, simulate_pre_hook};
 use super::{
-    DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, SwapShieldNotes, SwapUseClaim,
-    admission, is_live_swap_use, require_swap_account, trace_step,
+    DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, SwapSetupInclusion, SwapShieldNotes,
+    SwapUseClaim, admission, is_live_swap_use, require_swap_account, trace_step,
 };
 use crate::cow::{
     CowApiError, CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters,
@@ -1784,12 +1784,13 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        // Only a plan made for the confirmed delegation has reconciled evidence behind it.
-        let evidence = if executor.delegated().is_some() {
-            SwapAdmissionEvidence::Fresh
-        } else {
-            SwapAdmissionEvidence::Recorded
-        };
+        // Only a plan made for the confirmed or included delegation has reconciled evidence
+        // behind it.
+        let evidence = executor
+            .delegated()
+            .map_or(SwapAdmissionEvidence::Recorded, |delegated| {
+                delegated.evidence()
+            });
         require_swap_account(
             &record,
             self.chain.chain_id,
@@ -1826,12 +1827,15 @@ impl ExecutorOwner {
     /// private spend and delivery, spends exactly the notes of the recorded proof, invalidates
     /// the open order and names it, so review and signing stay bound to it. Like a recorded
     /// preview it can't be signed until execution preparation confirms the account at the open
-    /// order's pre-hook nonce.
+    /// order's pre-hook nonce. While the record leaves the swap's own setup unresolved, the
+    /// speed-up needs `inclusion`, the session's last read at the latest block that showed the
+    /// setup included.
     pub fn plan_swap_speed_up(
         &self,
         session: &WalletSession,
         operation: ExecutorOperationId,
         order: OrderUid,
+        inclusion: Option<SwapSetupInclusion>,
     ) -> Result<SwapAmountPlan> {
         self.require_swap_session(session)?;
         let profile = self.swap_order_profile()?;
@@ -1858,23 +1862,34 @@ impl ExecutorOwner {
             &utxos,
             order,
             SystemTime::now(),
+            inclusion,
         )
     }
 
     /// Why the order `order` of the swap `operation` can't be sped up now, judged from the
     /// record alone and without a network request. `None` is provisional: it offers the
-    /// action, and planning and signing check the order again.
+    /// action, and planning and signing check the order again. While the record leaves the
+    /// swap's own setup unresolved, only `inclusion`, the session's last read at the latest
+    /// block that showed the setup included, offers it.
     pub fn swap_speed_up_refusal(
         &self,
         operation: ExecutorOperationId,
         order: OrderUid,
+        inclusion: Option<SwapSetupInclusion>,
     ) -> Result<Option<SwapSpeedUpRefusal>> {
         let profile = self.swap_order_profile()?;
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         let chain_id = self.chain.chain_id;
-        let admitted = speed_up_block(&record, &profile, chain_id, order, SystemTime::now());
+        let admitted = speed_up_block(
+            &record,
+            &profile,
+            chain_id,
+            order,
+            SystemTime::now(),
+            inclusion,
+        );
         Ok(match admitted {
             Ok(_) => None,
             Err(SpeedUpBlock::TwoOrdersFillable) => Some(SwapSpeedUpRefusal::TwoOrdersFillable),
@@ -2242,7 +2257,7 @@ impl ExecutorOwner {
             self.chain.chain_id,
             SwapAccountRole::Source,
             account_use,
-            SwapAdmissionEvidence::Fresh,
+            delegated.evidence(),
         )?;
         require_swap_use_terms(&record, swap_use, plan)?;
         let utxos = self.swap_inputs(&session, &record)?;
@@ -2432,6 +2447,11 @@ impl ExecutorOwner {
     /// them with the input reservation and the provider's terms, then submit. Nothing signed
     /// leaves the wallet before the write succeeds.
     ///
+    /// On the swap's own included setup `k` is the nonce after the setup's, which the record
+    /// leaves unresolved. The account is read at the latest block again under the lock the
+    /// write holds, and without the setup included there nothing is written or sent: the error
+    /// is [`SwapAccountRefusal::SetupUnconfirmed`].
+    ///
     /// A private Bridge delivery's receiver is the wallet's own destination stealth account.
     /// Before the provider's quote and before this chain's account signs anything, that account
     /// signs its guarded shield for the approved destination minimum, which is persisted in its
@@ -2476,19 +2496,35 @@ impl ExecutorOwner {
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         require_swap_use(&record, swap_use)?;
+        let account_use = order_account_use(plan, swap_use)?;
         require_swap_account(
             &record,
             self.chain.chain_id,
             SwapAccountRole::Source,
-            order_account_use(plan, swap_use)?,
-            SwapAdmissionEvidence::Fresh,
+            account_use,
+            delegated.evidence(),
         )?;
         require_swap_use_terms(&record, swap_use, plan)?;
         // The hooks are issued against the latest reconciled observation, which the write
-        // below requires to be unchanged; the plan's proof shape fixes the nonce.
+        // below requires to be unchanged; the plan's proof shape fixes the nonce. That is the
+        // observed nonce, or on the swap's own included setup, which the record leaves
+        // unresolved at the observed nonce, the next one, which the read at the latest block
+        // showed. The hooks still name the confirmed observation.
         let observed = record
             .nonce_observation()
-            .filter(|observed| observed.nonce() == plan.context.execution_nonce)
+            .ok_or_else(|| eyre!("the swap executor's nonce changed; plan the swap again"))?;
+        let nonce = delegated
+            .inclusion()
+            .map_or_else(
+                || Some(observed.nonce()),
+                |inclusion| {
+                    observed
+                        .nonce()
+                        .checked_add(U256::ONE)
+                        .filter(|next| *next == inclusion.nonce())
+                },
+            )
+            .filter(|nonce| *nonce == plan.context.execution_nonce)
             .ok_or_else(|| eyre!("the swap executor's nonce changed; plan the swap again"))?;
         if record.address() != Some(executor) || record.delegate() != delegated.delegate() {
             return Err(eyre!("the swap executor changed; plan the swap again"));
@@ -2499,8 +2535,14 @@ impl ExecutorOwner {
             Some(speed_up) => {
                 let (open, _) = swap_speed_up_binding(&record, speed_up.order)
                     .ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
-                require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
-                if observed.nonce() != speed_up.pre_hook_nonce {
+                require_speed_up_window(
+                    &record,
+                    &profile,
+                    &speed_up,
+                    SystemTime::now(),
+                    delegated.inclusion(),
+                )?;
+                if nonce != speed_up.pre_hook_nonce {
                     return Err(eyre!(SPEED_UP_NONCE_CHANGED));
                 }
                 let bounds = open.bounds();
@@ -2840,12 +2882,7 @@ impl ExecutorOwner {
         {
             let continuing = trace_step(
                 "order_continuing_approvals",
-                self.swap_continuing_approvals(
-                    operation,
-                    swap_use,
-                    plan.delivery,
-                    Some(observed.nonce()),
-                ),
+                self.swap_continuing_approvals(operation, swap_use, plan.delivery, Some(nonce)),
             )
             .await?;
             if let Some(current) = continuing.lower_minimum(destination_minimum)
@@ -2867,7 +2904,13 @@ impl ExecutorOwner {
         // The open order may have expired while a quote was awaited. A new order can't relax
         // one that solvers no longer fill.
         if let Some(speed_up) = plan.speed_up {
-            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+            require_speed_up_window(
+                &record,
+                &profile,
+                &speed_up,
+                SystemTime::now(),
+                delegated.inclusion(),
+            )?;
         }
         // Resolved before anything is signed.
         let receiver = order_receiver(executor, plan.delivery, bridge_terms.as_ref())?;
@@ -2875,7 +2918,6 @@ impl ExecutorOwner {
         let signing_started = Instant::now();
         tracing::debug!(target: "executor_observation", step = "order_sign", "started");
         let chain_id = self.chain.chain_id;
-        let nonce = observed.nonce();
         let proof_digest = keccak256(transactions.abi_encode());
         let unsigned = TransactionCall {
             to: executor,
@@ -3031,79 +3073,99 @@ impl ExecutorOwner {
         }
         let guard = self.lock_activity().await;
         self.require_record_unchanged(&record)?;
+        // An order on the included setup is admitted on the account read at the latest block
+        // again, under the lock the write holds. When a reorg removed the setup since the
+        // account was refreshed, nothing is written or sent.
+        let inclusion = if delegated.inclusion().is_some() {
+            let inclusion =
+                trace_step("order_included_setup", self.latest_setup_inclusion(&record))
+                    .await?
+                    .filter(|inclusion| inclusion.nonce() == nonce)
+                    .ok_or(SwapAccountRefusal::SetupUnconfirmed)?;
+            require_swap_account(
+                &record,
+                chain_id,
+                SwapAccountRole::Source,
+                account_use,
+                inclusion.evidence(),
+            )?;
+            Some(inclusion)
+        } else {
+            None
+        };
         // The open order may have expired while the lock was awaited. A new order can't relax
         // one that solvers no longer fill.
         if let Some(speed_up) = plan.speed_up {
-            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now(), inclusion)?;
         }
         trace_step("order_persist", async {
-            self.store.record_swap_attempt(
-                operation,
-                SwapAttempt {
-                    use_id: swap_use,
-                    terms: SwapTerms::new(
-                        plan.sell_token,
-                        plan.buy_token,
-                        SwapRecipient::new(
-                            recipient.master_public_key,
-                            recipient.viewing_public_key,
-                        ),
-                        delegated.setup_payload(),
-                    ),
-                    proof: SwapProof::new(proof_digest, input_identities.clone()),
-                    uid,
-                    submission: Some(SwapSubmission::new(signature, review.quote_id)),
-                    delivery: plan.delivery,
-                    bounds: SwapApprovedBounds {
-                        sell_amount: review.sell_amount,
-                        unshield_amount: Some(plan.amount()),
-                        unshield_fee_bps: review.unshield_fee_bps,
-                        buy_amount,
-                        private_minimum,
-                        shield_fee_bps: review.shield_fee_bps,
-                        slippage_bps: review.slippage_bps,
-                        pre_hook_gas_limit: plan.pre_hook_gas_limit(),
-                        post_hook_gas_limit: post_hook
-                            .as_ref()
-                            .map(|(_, _, _, gas_limit)| *gas_limit),
-                        hook_cost: Some(review.gas_estimate()),
-                        anchors,
-                        destination_minimum,
-                        gas_share_bps: Some(review.gas_share_bps),
-                        gas_estimate: Some(review.gas_estimate()),
-                        gas_allowance: Some(gas_allowance),
-                        gas_price_wei: Some(review.gas.gas_price_wei),
-                        valid_for_secs: Some(valid_for_secs),
-                        destination_shield_fee_bps: private_quote
-                            .map(|private| private.destination_shield_fee_bps),
-                        delivery_allowance: private_quote.map(|private| private.delivery_allowance),
-                        // The limits approved with the setup, when this swap's record has them.
-                        destination_setup_fee: private_quote
-                            .and_then(|_| record.swap_approval()?.bounds.destination_setup_fee),
-                        source_setup_fee: private_quote
-                            .and_then(|_| record.swap_approval()?.bounds.source_setup_fee),
-                    },
-                    invalidates: plan.invalidates,
-                    pre_hook: IssuedExecutorPayload::new(
-                        nonce,
-                        delegated.delegate(),
-                        pre_hook_hash,
-                        ExecutorPayloadPurpose::SwapPreHook,
-                        ExecutorPayloadContext::new(pre_hook.clone(), observed, input_identities),
-                    ),
-                    post_hook: post_hook.map(|(post_hook_nonce, hash, calldata, _)| {
-                        IssuedExecutorPayload::new(
-                            post_hook_nonce,
-                            delegated.delegate(),
-                            hash,
-                            ExecutorPayloadPurpose::SwapPostHook,
-                            ExecutorPayloadContext::new(calldata, observed, Vec::new()),
-                        )
-                    }),
-                    bridge: bridge_terms,
-                    speed_up: plan.speed_up.map(|speed_up| speed_up.order),
+            let attempt = SwapAttempt {
+                use_id: swap_use,
+                terms: SwapTerms::new(
+                    plan.sell_token,
+                    plan.buy_token,
+                    SwapRecipient::new(recipient.master_public_key, recipient.viewing_public_key),
+                    delegated.setup_payload(),
+                ),
+                proof: SwapProof::new(proof_digest, input_identities.clone()),
+                uid,
+                submission: Some(SwapSubmission::new(signature, review.quote_id)),
+                delivery: plan.delivery,
+                bounds: SwapApprovedBounds {
+                    sell_amount: review.sell_amount,
+                    unshield_amount: Some(plan.amount()),
+                    unshield_fee_bps: review.unshield_fee_bps,
+                    buy_amount,
+                    private_minimum,
+                    shield_fee_bps: review.shield_fee_bps,
+                    slippage_bps: review.slippage_bps,
+                    pre_hook_gas_limit: plan.pre_hook_gas_limit(),
+                    post_hook_gas_limit: post_hook.as_ref().map(|(_, _, _, gas_limit)| *gas_limit),
+                    hook_cost: Some(review.gas_estimate()),
+                    anchors,
+                    destination_minimum,
+                    gas_share_bps: Some(review.gas_share_bps),
+                    gas_estimate: Some(review.gas_estimate()),
+                    gas_allowance: Some(gas_allowance),
+                    gas_price_wei: Some(review.gas.gas_price_wei),
+                    valid_for_secs: Some(valid_for_secs),
+                    destination_shield_fee_bps: private_quote
+                        .map(|private| private.destination_shield_fee_bps),
+                    delivery_allowance: private_quote.map(|private| private.delivery_allowance),
+                    // The limits approved with the setup, when this swap's record has them.
+                    destination_setup_fee: private_quote
+                        .and_then(|_| record.swap_approval()?.bounds.destination_setup_fee),
+                    source_setup_fee: private_quote
+                        .and_then(|_| record.swap_approval()?.bounds.source_setup_fee),
                 },
-            )
+                invalidates: plan.invalidates,
+                pre_hook: IssuedExecutorPayload::new(
+                    nonce,
+                    delegated.delegate(),
+                    pre_hook_hash,
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    ExecutorPayloadContext::new(pre_hook.clone(), observed, input_identities),
+                ),
+                post_hook: post_hook.map(|(post_hook_nonce, hash, calldata, _)| {
+                    IssuedExecutorPayload::new(
+                        post_hook_nonce,
+                        delegated.delegate(),
+                        hash,
+                        ExecutorPayloadPurpose::SwapPostHook,
+                        ExecutorPayloadContext::new(calldata, observed, Vec::new()),
+                    )
+                }),
+                bridge: bridge_terms,
+                speed_up: plan.speed_up.map(|speed_up| speed_up.order),
+            };
+            match inclusion {
+                Some(inclusion) => self.store.record_swap_attempt_on_included_setup(
+                    operation,
+                    attempt,
+                    inclusion.nonce(),
+                ),
+                None => self.store.record_swap_attempt(operation, attempt),
+            }
         })
         .await?;
         self.notify_change();
@@ -3490,7 +3552,82 @@ impl ExecutorOwner {
     /// POI-spendable notes, without other operations' reservations or notes this swap's
     /// executor already spent.
     fn swap_inputs(&self, session: &WalletSession, record: &ExecutorRecord) -> Result<Vec<Utxo>> {
-        self.inputs_for_record(self.spendable_swap_notes(session)?, record)
+        self.inputs_for_swap_order(self.spendable_swap_notes(session)?, record)
+    }
+
+    /// Notes of `inputs` an order of `record`'s swap may spend: [`Self::inputs_for_record`]
+    /// without a note of a setup whose nonce is unresolved. Any setup attempt at that nonce can
+    /// still run before the pre-hook, as it does below an order on an included setup, and
+    /// spend the note as its fee.
+    pub(crate) fn inputs_for_swap_order(
+        &self,
+        inputs: Vec<Utxo>,
+        record: &ExecutorRecord,
+    ) -> Result<Vec<Utxo>> {
+        let mut inputs = self.inputs_for_record(inputs, record)?;
+        inputs.retain(|input| {
+            !record.issued().iter().any(|payload| {
+                payload.purpose() == ExecutorPayloadPurpose::Operation
+                    && !record.nonce_resolved(payload.nonce())
+                    && payload
+                        .context()
+                        .inputs()
+                        .iter()
+                        .any(|spent| spent.matches(input))
+            })
+        });
+        Ok(inputs)
+    }
+
+    /// Notes a setup of the swap `operation`, or of a new swap, may pay its fee with: as for
+    /// any setup preparation, without the notes the account's open pre-hooks reserve, since a
+    /// setup sent again runs before a pre-hook on its included setup. The fee preview selects
+    /// as signing does.
+    pub(super) fn swap_setup_fee_inputs(
+        &self,
+        session: &WalletSession,
+        operation: Option<ExecutorOperationId>,
+    ) -> Result<Vec<Utxo>> {
+        let notes = self.spendable_swap_notes(session)?;
+        match operation {
+            Some(operation) => {
+                let record = self
+                    .swap_account_record(operation)?
+                    .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+                self.inputs_for_recovery(notes, &record)
+            }
+            None => self.filter_reserved_inputs(notes, None),
+        }
+    }
+
+    /// Whether the automatic attempt to place the approved order of the swap `operation`,
+    /// spending `spend` of `token`, should quote now. One current snapshot of the wallet's
+    /// notes answers both questions. The spend fits when it fits the notes planning would
+    /// select, as [`Self::max_swap_amount`] counts them. When it doesn't, the attempt waits
+    /// while the swap's own setup can still change that: its nonce isn't settled, or a
+    /// `token` note created in a transaction recorded for one of its setups is unspent with a
+    /// POI state that [`crate::UtxoPpoiState::retry_eligible`] accepts. A setup without a
+    /// recorded transaction waits only for settlement. Otherwise the attempt runs and reports
+    /// any shortfall. Planning stays authoritative for every other limit.
+    pub fn swap_placement_readiness(
+        &self,
+        session: &WalletSession,
+        operation: ExecutorOperationId,
+        token: Address,
+        spend: U256,
+    ) -> Result<SwapPlacementReadiness> {
+        self.require_swap_session(session)?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let notes = self.swap_note_snapshot(session)?;
+        let spendable = self.inputs_for_swap_order(notes.spendable, &record)?;
+        Ok(placement_readiness(
+            &record,
+            crate::max_unshield_spendable(&spendable, token) >= spend,
+            &notes.unspent,
+            token,
+        ))
     }
 
     /// Largest batched sell amount currently available to this swap. The same POI,
@@ -3506,7 +3643,7 @@ impl ExecutorOwner {
         Ok(crate::max_unshield_spendable(&inputs, token))
     }
 
-    pub(super) fn spendable_swap_inputs(
+    fn spendable_swap_inputs(
         &self,
         session: &WalletSession,
         operation: Option<ExecutorOperationId>,
@@ -3522,8 +3659,14 @@ impl ExecutorOwner {
         }
     }
 
-    #[cfg_attr(not(feature = "test-support"), allow(clippy::unused_self))]
     fn spendable_swap_notes(&self, session: &WalletSession) -> Result<Vec<Utxo>> {
+        Ok(self.swap_note_snapshot(session)?.spendable)
+    }
+
+    /// The wallet's notes from one current snapshot: the POI-spendable ones planning starts
+    /// from, and every unspent one with its POI state.
+    #[cfg_attr(not(feature = "test-support"), allow(clippy::unused_self))]
+    fn swap_note_snapshot(&self, session: &WalletSession) -> Result<SwapNoteSnapshot> {
         #[cfg(feature = "test-support")]
         {
             let notes = self
@@ -3531,17 +3674,38 @@ impl ExecutorOwner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !notes.is_empty() {
-                return Ok(notes.clone());
+                return Ok(SwapNoteSnapshot {
+                    spendable: notes
+                        .iter()
+                        .filter(|(_, state)| *state == crate::UtxoPpoiState::Valid)
+                        .map(|(note, _)| note.clone())
+                        .collect(),
+                    unspent: notes.clone(),
+                });
             }
         }
         let snapshot = session
             .handle
             .current_snapshot()
             .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
-        Ok(crate::poi_verified_unspent_utxos_from_records(
-            &snapshot.utxos,
-            &snapshot.pending_overlay,
-        ))
+        let lists = crate::default_active_poi_list_keys();
+        Ok(SwapNoteSnapshot {
+            spendable: crate::poi_verified_unspent_utxos_from_records(
+                &snapshot.utxos,
+                &snapshot.pending_overlay,
+            ),
+            unspent: snapshot
+                .utxos
+                .iter()
+                .filter(|entry| !entry.is_spent())
+                .map(|entry| {
+                    (
+                        entry.utxo.clone(),
+                        crate::utxos::utxo_ppoi_state(&entry.utxo.poi, &lists),
+                    )
+                })
+                .collect(),
+        })
     }
 
     /// Plan swaps from one spendable note holding `amount` of `token` instead of the session's
@@ -3549,21 +3713,36 @@ impl ExecutorOwner {
     /// sessions never sync.
     #[cfg(feature = "test-support")]
     pub fn plan_swaps_from_note_for_tests(&self, token: Address, amount: U256) {
-        let note = Utxo::new(
-            railgun_wallet::Note::new_change(U256::ONE, token, amount, [7; 16]),
-            0,
-            0,
-            railgun_wallet::UtxoSource {
-                tx_hash: B256::repeat_byte(6),
-                block_number: 1,
-                block_timestamp: 1,
-            },
-            railgun_wallet::UtxoCommitmentKind::Transact,
-        );
+        self.swap_notes_for_tests(&[(
+            token,
+            amount,
+            B256::repeat_byte(6),
+            crate::UtxoPpoiState::Valid,
+        )]);
+    }
+
+    /// Hold `notes` in place of the session's, each one of `token` holding `amount`, created
+    /// in the transaction `source` and in the POI state given. Only Valid notes are spendable.
+    /// UI tests use it, since their sessions never sync.
+    #[cfg(feature = "test-support")]
+    pub fn swap_notes_for_tests(&self, notes: &[(Address, U256, B256, crate::UtxoPpoiState)]) {
         *self
             .swap_notes_for_tests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![note];
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = test_swap_notes(notes);
+    }
+
+    /// The identity of each of `notes` as [`Self::swap_notes_for_tests`] holds them, which a
+    /// payload that spends one records.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn swap_note_identities_for_tests(
+        notes: &[(Address, U256, B256, crate::UtxoPpoiState)],
+    ) -> Vec<ExecutorInputIdentity> {
+        test_swap_notes(notes)
+            .iter()
+            .map(|(note, _)| ExecutorInputIdentity::from_utxo(note))
+            .collect()
     }
 
     fn require_swap_session(&self, session: &WalletSession) -> Result<()> {
@@ -3584,13 +3763,108 @@ impl ExecutorOwner {
     }
 }
 
+/// UI tests' stand-ins for the wallet's notes: one of `token` holding `amount` for each of
+/// `notes`, created in the transaction `source`, at its own position, in the POI state given.
+#[cfg(feature = "test-support")]
+fn test_swap_notes(
+    notes: &[(Address, U256, B256, crate::UtxoPpoiState)],
+) -> Vec<(Utxo, crate::UtxoPpoiState)> {
+    notes
+        .iter()
+        .zip(0_u64..)
+        .map(|(&(token, amount, source, state), position)| {
+            let note = Utxo::new(
+                railgun_wallet::Note::new_change(U256::ONE, token, amount, [7; 16]),
+                0,
+                position,
+                railgun_wallet::UtxoSource {
+                    tx_hash: source,
+                    block_number: 1,
+                    block_timestamp: 1,
+                },
+                railgun_wallet::UtxoCommitmentKind::Transact,
+            );
+            (note, state)
+        })
+        .collect()
+}
+
+/// The wallet's notes from one current snapshot, for a swap.
+struct SwapNoteSnapshot {
+    /// The POI-spendable notes, before any record's reservations.
+    spendable: Vec<Utxo>,
+    /// Every unspent note, with its POI state.
+    unspent: Vec<(Utxo, crate::UtxoPpoiState)>,
+}
+
+/// Whether the automatic attempt to place a swap's approved order quotes now: see
+/// [`ExecutorOwner::swap_placement_readiness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapPlacementReadiness {
+    /// Quote now. The spend fits, or nothing the swap's setup can still change would make it
+    /// fit, and the attempt reports the shortfall.
+    Place,
+    /// The spend doesn't fit yet, and the swap's own setup's change can still make it fit.
+    WaitForSetupChange,
+}
+
+/// [`ExecutorOwner::swap_placement_readiness`] for `record`, whose approved spend of `token`
+/// `fits` the notes planning would select, with `unspent` the wallet's unspent notes. Only the
+/// setups of the use that reserved the account fresh are waited for: a reused account's
+/// earlier setup has nothing left to return.
+fn placement_readiness(
+    record: &ExecutorRecord,
+    fits: bool,
+    unspent: &[(Utxo, crate::UtxoPpoiState)],
+    token: Address,
+) -> SwapPlacementReadiness {
+    let fresh = match record.active_swap_use() {
+        Some(id) => record.swap_use(id).is_some_and(SwapUseRecord::is_fresh),
+        None => record.swap_uses().is_empty(),
+    };
+    if fits || !fresh {
+        return SwapPlacementReadiness::Place;
+    }
+    let setups = || {
+        record
+            .issued()
+            .iter()
+            .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
+    };
+    let Some(nonce) = setups().map(IssuedExecutorPayload::nonce).max() else {
+        return SwapPlacementReadiness::Place;
+    };
+    if !record.nonce_settled(nonce) {
+        return SwapPlacementReadiness::WaitForSetupChange;
+    }
+    let transactions = setups()
+        .flat_map(|payload| payload.transaction_hashes().iter().copied())
+        .collect::<std::collections::HashSet<_>>();
+    let token = U256::from_be_slice(token.as_slice());
+    let change_pending = unspent.iter().any(|(note, state)| {
+        note.note.token_hash == token
+            && transactions.contains(&note.source.tx_hash)
+            && state.retry_eligible()
+    });
+    if change_pending {
+        SwapPlacementReadiness::WaitForSetupChange
+    } else {
+        SwapPlacementReadiness::Place
+    }
+}
+
 impl ExecutorOwner {
     /// Quote an account whose setup is recorded, without waiting for chain observation.
     /// Reuse permits another token pair; execution preparation checks the account afresh.
+    ///
+    /// Without reuse, `inclusion` is the session's last read at the latest block that showed
+    /// the swap's own setup included. It stands in for the recorded setup while the record
+    /// leaves that setup unresolved at its confirmed nonce, and the hint is then the next nonce.
     pub fn swap_order_preview(
         &self,
         operation: ExecutorOperationId,
         reuse: bool,
+        inclusion: Option<SwapSetupInclusion>,
     ) -> Result<SwapExecutor> {
         let record = self
             .swap_account_record(operation)?
@@ -3602,7 +3876,19 @@ impl ExecutorOwner {
             previewed_swap_use(&record, reuse),
             SwapAdmissionEvidence::Recorded,
         )?;
+        let observed = record
+            .nonce_observation()
+            .map_or(U256::ZERO, ExecutorNonceObservation::nonce);
+        // The order on an included setup takes the nonce after the setup's.
+        let included = inclusion
+            .filter(|inclusion| {
+                !reuse
+                    && super::own_pending_setup(&record) == Some(observed)
+                    && observed.checked_add(U256::ONE) == Some(inclusion.nonce())
+            })
+            .map(|inclusion| inclusion.nonce());
         if !reuse
+            && included.is_none()
             && (!super::is_swap_record(&record)
                 || !record.issued().iter().any(|payload| {
                     payload.purpose() == ExecutorPayloadPurpose::Operation
@@ -3617,9 +3903,7 @@ impl ExecutorOwner {
         recorded_swap_executor(
             &record,
             self.chain.chain_id,
-            record
-                .nonce_observation()
-                .map_or(U256::ZERO, ExecutorNonceObservation::nonce),
+            included.unwrap_or(observed),
             reuse,
         )
     }
@@ -3659,7 +3943,15 @@ impl ExecutorOwner {
             if executor.expected_pre_hook_nonce() != speed_up.pre_hook_nonce {
                 return Err(eyre!(SPEED_UP_NONCE_CHANGED));
             }
-            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now())?;
+            require_speed_up_window(
+                &record,
+                &profile,
+                &speed_up,
+                SystemTime::now(),
+                executor
+                    .delegated()
+                    .and_then(|delegated| delegated.inclusion()),
+            )?;
             if plan.invalidates != Some(speed_up.order) {
                 return Err(eyre!(SPEED_UP_TERMS_CHANGED));
             }
@@ -3686,6 +3978,10 @@ impl ExecutorOwner {
     /// Either way the fresh record is judged under the activity lock, unchanged since it was
     /// read. A destination's receiving-token balance and earlier shields are checked by its
     /// caller. This does not sign, reserve inputs, or restart a stopped setup.
+    ///
+    /// The swap's own source account, while its record leaves the setup its use paid for
+    /// unresolved, is admitted on a read at the latest block that shows the setup included.
+    /// The executor then carries that read and the nonce after the setup's.
     pub async fn reuse_swap_account(
         &self,
         operation: ExecutorOperationId,
@@ -3723,23 +4019,25 @@ impl ExecutorOwner {
         } else {
             trace_step("reuse_account", self.reconcile_account(operation)).await?
         };
-        let super::SwapSetupStatus::Delegated(delegated) =
-            trace_step("reuse_setup", self.check_swap_setup(&report)).await?
-        else {
-            return Err(eyre!(
-                "this account's setup is not confirmed; finish or retry its setup first"
-            ));
+        let delegated = match trace_step("reuse_setup", self.check_swap_setup(&report)).await? {
+            super::SwapSetupStatus::Delegated(delegated) => Some(delegated),
+            // The swap's own setup can be included before the record resolves it.
+            super::SwapSetupStatus::Pending => {
+                trace_step(
+                    "reuse_included_setup",
+                    self.included_swap_setup(report.record(), role, swap_use),
+                )
+                .await?
+            }
+            super::SwapSetupStatus::MissingDelegation => None,
+        };
+        let Some(delegated) = delegated else {
+            return Err(SwapAccountRefusal::SetupUnconfirmed.into());
         };
         let record = report.record();
         let _guard = self.lock_activity().await;
         self.require_record_unchanged(record)?;
-        require_swap_account(
-            record,
-            chain_id,
-            role,
-            swap_use,
-            SwapAdmissionEvidence::Fresh,
-        )?;
+        require_swap_account(record, chain_id, role, swap_use, delegated.evidence())?;
         let mut executor = SwapExecutor::from(delegated);
         executor.reused = true;
         Ok(executor)
@@ -3859,7 +4157,8 @@ fn swap_account_candidate(
 }
 
 /// Hooks are signed only for a plan made for the confirmed delegation, at the nonce that
-/// delegation was observed with. A recorded preview must be refreshed before proving.
+/// delegation was observed with, or for the swap's own included setup, at the nonce after the
+/// setup's. A recorded preview must be refreshed before proving.
 fn require_delegated_plan(plan: &SwapInputPlan) -> Result<DelegatedSwapExecutor> {
     plan.executor.delegated().ok_or_else(|| {
         eyre!("the swap's stealth account isn't confirmed as set up; plan the swap again")
@@ -3975,7 +4274,9 @@ fn swap_speed_up_binding(
 /// The plan [`ExecutorOwner::plan_swap_speed_up`] makes, without its session: a second order
 /// for the open order `order` of `record` at `now`, for the account `executor`, from the
 /// candidate notes `utxos`. Only the notes of the recorded proof are offered to the selection,
-/// and the plan is refused when `utxos` lacks one of them.
+/// and the plan is refused when `utxos` lacks one of them. `inclusion` is as for
+/// [`speed_up_block`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_swap_speed_up_inputs(
     builder: &TransactionBuilder,
     profile: &SwapProfile,
@@ -3984,11 +4285,12 @@ pub(crate) fn plan_swap_speed_up_inputs(
     utxos: &[Utxo],
     order: OrderUid,
     now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
 ) -> Result<SwapAmountPlan> {
     let (open, speed_up) =
         swap_speed_up_binding(record, order).ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
     // The account rule on recorded evidence is part of the window.
-    require_speed_up_window(record, profile, &speed_up, now)?;
+    require_speed_up_window(record, profile, &speed_up, now, inclusion)?;
     let swap = record.swap().ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
     let terms = swap.order_terms(open);
     let request = SwapAmountRequest {
@@ -4054,20 +4356,35 @@ pub(crate) enum SpeedUpBlock {
 /// order can't relax one that solvers no longer fill. And it must be the only order that can
 /// still fill, because a pre-hook invalidates one order: an earlier order counts until
 /// [`fillable_swap_orders`] drops it, which its local expiry alone does not do.
+///
+/// While the record leaves the swap's own setup unresolved, the order was placed on the
+/// included setup, and the account rule judges the speed-up on `inclusion`, the last read at
+/// the latest block that showed that setup included. Without it nothing is admitted.
 pub(crate) fn speed_up_block(
     record: &ExecutorRecord,
     profile: &SwapProfile,
     chain_id: u64,
     order: OrderUid,
     now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
 ) -> Result<SwapSpeedUp, SpeedUpBlock> {
     let (open, speed_up) = swap_speed_up_binding(record, order).ok_or(SpeedUpBlock::NotOpen)?;
+    let evidence = if record
+        .unresolved_swap_setup_nonce(speed_up.swap_use)
+        .is_some()
+    {
+        inclusion
+            .map(SwapSetupInclusion::evidence)
+            .ok_or(SpeedUpBlock::Account(SwapAccountRefusal::SetupUnconfirmed))?
+    } else {
+        SwapAdmissionEvidence::Recorded
+    };
     if let Some(refusal) = swap_account_refusal(
         record,
         chain_id,
         SwapAccountRole::Source,
         SwapAccountUse::SpeedUp(speed_up),
-        SwapAdmissionEvidence::Recorded,
+        evidence,
     ) {
         return Err(SpeedUpBlock::Account(refusal));
     }
@@ -4085,14 +4402,22 @@ pub(crate) fn speed_up_block(
 }
 
 /// Refuse a speed-up bound to `speed_up` unless [`speed_up_block`] admits its order at `now`
-/// with the same binding.
+/// with the same binding, on `inclusion` while the record leaves the setup unresolved.
 fn require_speed_up_window(
     record: &ExecutorRecord,
     profile: &SwapProfile,
     speed_up: &SwapSpeedUp,
     now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
 ) -> Result<()> {
-    match speed_up_block(record, profile, profile.chain_id(), speed_up.order, now) {
+    match speed_up_block(
+        record,
+        profile,
+        profile.chain_id(),
+        speed_up.order,
+        now,
+        inclusion,
+    ) {
         Ok(current) if current == *speed_up => Ok(()),
         Ok(_) | Err(SpeedUpBlock::NotOpen) => Err(eyre!(SPEED_UP_ORDER_CHANGED)),
         Err(SpeedUpBlock::Account(refusal)) => Err(refusal.into()),

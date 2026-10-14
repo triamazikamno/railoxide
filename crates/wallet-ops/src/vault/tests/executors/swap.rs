@@ -495,6 +495,278 @@ fn an_order_follows_two_setups_signed_at_one_nonce_once_a_read_shows_it_consumed
 }
 
 #[test]
+fn an_order_on_an_included_setup_takes_the_next_nonces_and_spends_other_notes() {
+    use SwapAccountRefusal::SetupUnconfirmed;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let delegate = accepted_delegate(1);
+    let note = |position: u64| {
+        ExecutorInputIdentity::from_utxo(&Utxo::new(
+            broadcaster_core::notes::Note::new_change(
+                U256::ONE,
+                Address::ZERO,
+                U256::from(9),
+                [7; 16],
+            ),
+            2,
+            position,
+            UtxoSource {
+                tx_hash: B256::repeat_byte(9),
+                block_number: 1,
+                block_timestamp: 1,
+            },
+            UtxoCommitmentKind::Transact,
+        ))
+    };
+    let included = |nonce: u64| SwapAdmissionEvidence::Included {
+        block: 11,
+        nonce: U256::from(nonce),
+    };
+    // Public address delivery issues only the pre-hook. Each account spends its own notes.
+    for (delivery, executor, first_note) in [
+        (SwapDelivery::Reshield, Address::repeat_byte(2), 10),
+        (
+            SwapDelivery::External {
+                receiver: Address::repeat_byte(70),
+            },
+            Address::repeat_byte(3),
+            20,
+        ),
+    ] {
+        let operation = ExecutorOperationId::random().unwrap();
+        store.reserve(operation, delegate, None, &[]).unwrap();
+        store.bind_address(operation, executor).unwrap();
+        // The confirmed read before the setup stays the record's observation throughout.
+        let observed =
+            ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+        store.record_account_read(operation, observed).unwrap();
+        let (setup_fee, order_note) = (note(first_note), note(first_note + 1));
+        let setup = |hash: u8, inputs: Vec<ExecutorInputIdentity>| {
+            hook(
+                ExecutorPayloadPurpose::Operation,
+                0,
+                hash,
+                delegate,
+                observed,
+                inputs,
+            )
+        };
+        store
+            .record_issued(operation, setup(3, vec![setup_fee.clone()]))
+            .unwrap();
+        let first_use = SwapUseId::first(operation);
+        let uid = OrderUid::new(B256::repeat_byte(30), executor, 1_000);
+        let attempt = |pre_hook_nonce: u64, inputs: Vec<ExecutorInputIdentity>| SwapAttempt {
+            use_id: first_use,
+            terms: SwapTerms::new(
+                Address::repeat_byte(5),
+                Address::repeat_byte(6),
+                SwapRecipient::new(U256::from(7), [8; 32]),
+                B256::repeat_byte(3),
+            ),
+            proof: SwapProof::new(B256::repeat_byte(20), inputs.clone()),
+            uid,
+            submission: None,
+            delivery,
+            bounds: swap_bounds(),
+            invalidates: None,
+            pre_hook: hook(
+                ExecutorPayloadPurpose::SwapPreHook,
+                pre_hook_nonce,
+                31,
+                delegate,
+                observed,
+                inputs,
+            ),
+            post_hook: delivery.has_post_hook().then(|| {
+                hook(
+                    ExecutorPayloadPurpose::SwapPostHook,
+                    pre_hook_nonce + 1,
+                    32,
+                    delegate,
+                    observed,
+                    Vec::new(),
+                )
+            }),
+            bridge: None,
+            speed_up: None,
+        };
+        let refusal = |record: &ExecutorRecord, role, swap_use, evidence| {
+            swap_account_refusal(record, 1, role, swap_use, evidence)
+        };
+
+        // Only a latest read one past the unresolved setup's nonce admits the order, and only
+        // for the account the swap set up as its source.
+        let unplaced = record_of(&store, operation);
+        let claimed = SwapAccountUse::Claimed(first_use);
+        assert_eq!(
+            refusal(&unplaced, SwapAccountRole::Source, claimed, included(1)),
+            None
+        );
+        for evidence in [included(0), SwapAdmissionEvidence::Fresh] {
+            assert_eq!(
+                refusal(&unplaced, SwapAccountRole::Source, claimed, evidence),
+                Some(SetupUnconfirmed)
+            );
+        }
+        let destination = SwapAccountRole::Destination {
+            token: Address::repeat_byte(6),
+        };
+        assert_eq!(
+            refusal(&unplaced, destination, claimed, included(1)),
+            Some(SetupUnconfirmed)
+        );
+        store
+            .record_swap_approval(
+                operation,
+                first_use,
+                SwapApproval {
+                    delivery,
+                    ..approval(5, 6)
+                },
+            )
+            .unwrap();
+
+        // Without included evidence the setup must be resolved first. With it, the pre-hook
+        // takes the nonce after the setup's, which the latest read must show.
+        assert!(matches!(
+            store.record_swap_attempt(operation, attempt(1, vec![order_note.clone()])),
+            Err(ExecutorStoreError::OutstandingNonce)
+        ));
+        for (pre_hook_nonce, read) in [(0, 0), (2, 2), (1, 2)] {
+            assert!(matches!(
+                store.record_swap_attempt_on_included_setup(
+                    operation,
+                    attempt(pre_hook_nonce, vec![order_note.clone()]),
+                    U256::from(read),
+                ),
+                Err(ExecutorStoreError::OutstandingNonce)
+            ));
+        }
+        // The setup could still spend its fee note before the pre-hook runs.
+        assert!(matches!(
+            store.record_swap_attempt_on_included_setup(
+                operation,
+                attempt(1, vec![setup_fee.clone()]),
+                U256::ONE,
+            ),
+            Err(ExecutorStoreError::InputReserved)
+        ));
+        let placed = store
+            .record_swap_attempt_on_included_setup(
+                operation,
+                attempt(1, vec![order_note.clone()]),
+                U256::ONE,
+            )
+            .unwrap();
+        assert_eq!(
+            (placed.nonce_observation(), placed.nonce_watermark()),
+            (Some(observed), unplaced.nonce_watermark())
+        );
+        let hooks = placed
+            .issued()
+            .iter()
+            .filter(|payload| payload.purpose() != ExecutorPayloadPurpose::Operation)
+            .map(|payload| (payload.nonce(), payload.context().observed()))
+            .collect::<Vec<_>>();
+        let mut expected = vec![(U256::ONE, observed)];
+        if delivery.has_post_hook() {
+            expected.push((U256::from(2), observed));
+        }
+        assert_eq!(hooks, expected);
+
+        // A speed-up shares the open pre-hook's nonce, which only the setup's confirmation
+        // would make the observed one.
+        let speed_up = SwapAccountUse::SpeedUp(SwapSpeedUp {
+            swap_use: first_use,
+            order: uid,
+            pre_hook_nonce: U256::ONE,
+        });
+        for evidence in [SwapAdmissionEvidence::Recorded, included(1)] {
+            assert_eq!(
+                refusal(&placed, SwapAccountRole::Source, speed_up, evidence),
+                None
+            );
+        }
+        assert_eq!(
+            refusal(
+                &placed,
+                SwapAccountRole::Source,
+                speed_up,
+                SwapAdmissionEvidence::Fresh
+            ),
+            Some(SetupUnconfirmed)
+        );
+        // An account the swap reused has no setup of its own to be included.
+        let mut reused = serde_json::to_value(&placed).unwrap();
+        reused["swap_uses"][0]["fresh"] = serde_json::json!(false);
+        let reused: ExecutorRecord = serde_json::from_value(reused).unwrap();
+        assert_eq!(
+            refusal(&reused, SwapAccountRole::Source, speed_up, included(1)),
+            Some(SetupUnconfirmed)
+        );
+        store.put_operation_fixture(operation, &reused).unwrap();
+        let mut reused_speed_up = attempt(1, vec![order_note.clone()]);
+        reused_speed_up.speed_up = Some(uid);
+        assert!(matches!(
+            store.record_swap_attempt_on_included_setup(operation, reused_speed_up, U256::ONE),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+        store.put_operation_fixture(operation, &placed).unwrap();
+
+        // The setup sent again may raise its own fee limit beside the order, and nothing else
+        // the order was approved with.
+        let mut raised = placed.swap_approval().unwrap().clone();
+        raised.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+            token: Address::repeat_byte(5),
+            amount: U256::from(99),
+        });
+        let mut changed = raised.clone();
+        changed.price_acknowledged = !changed.price_acknowledged;
+        assert!(matches!(
+            store.record_swap_approval(operation, first_use, changed),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+        store
+            .record_swap_approval(operation, first_use, raised)
+            .unwrap();
+
+        // The setup sent again can't spend the open pre-hook's note, but can reuse its own.
+        assert!(matches!(
+            store.record_issued(operation, setup(4, vec![order_note.clone()])),
+            Err(ExecutorStoreError::InputReserved)
+        ));
+        store
+            .record_issued(operation, setup(5, vec![setup_fee.clone()]))
+            .unwrap();
+
+        // Confirmed reads stay at the setup's nonce until the order expires. The pre-hook
+        // releases its note, and the setup stays pending and can be sent again with it.
+        expire_attempt(&store, operation, uid, observed);
+        let expired = record_of(&store, operation);
+        assert!(expired.swap_reserved_inputs().is_empty());
+        assert_eq!(expired.reserved_inputs(), vec![setup_fee.clone()]);
+        assert_eq!(
+            expired.payload_state(B256::repeat_byte(3)),
+            Some(ExecutorPayloadState::Pending)
+        );
+        store
+            .record_issued(operation, setup(4, vec![order_note.clone()]))
+            .unwrap();
+    }
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn swap_records_written_before_external_delivery_decode_as_reshield() {
     // Match the named MessagePack swap record before External delivery: a required post-hook
     // and post-hook gas limit, and a setup approval without its delivery or token pair.

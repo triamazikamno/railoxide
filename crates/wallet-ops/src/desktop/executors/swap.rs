@@ -17,7 +17,8 @@ use super::{
 };
 use crate::desktop::executor_discovery::{execution_nonce_with_code, matches_executor_delegation};
 use crate::desktop::executor_observation::{
-    ObservationEndpoints, read_executor_account, trace_step,
+    ExecutorAccountRead, ObservationEndpoints, read_executor_account,
+    read_executor_account_at_latest, trace_step,
 };
 use crate::settings::{ExecutorProfile, SwapTokenEligibility};
 use crate::vault::{
@@ -69,8 +70,8 @@ pub(crate) use order::{
 };
 pub use order::{
     SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest, SwapDestinationContext, SwapInputPlan,
-    SwapOrderOutcome, SwapOrderRequest, SwapPrice, SwapQuoteAnchor, SwapQuoteDiagnostics,
-    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSpeedUpRefusal,
+    SwapOrderOutcome, SwapOrderRequest, SwapPlacementReadiness, SwapPrice, SwapQuoteAnchor,
+    SwapQuoteDiagnostics, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSpeedUpRefusal,
     delivery_shortfall_allowance, swap_speed_up_relaxes, swap_submission_outcome,
 };
 pub use public_order::{
@@ -894,6 +895,9 @@ impl<'a> SwapAccountReplacements<'a> {
 
 /// A swap executor that canonically carries the accepted delegation, with an execution
 /// nonce past its setup's. Order preparation for the swap starts here.
+///
+/// On the swap's own included setup the delegation is shown only at the latest block: the
+/// record leaves the setup unresolved at the confirmed nonce, and the order takes the next one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegatedSwapExecutor {
     operation: ExecutorOperationId,
@@ -901,6 +905,7 @@ pub struct DelegatedSwapExecutor {
     delegate: Address,
     setup_payload: B256,
     observed: ExecutorNonceObservation,
+    inclusion: Option<SwapSetupInclusion>,
 }
 
 impl DelegatedSwapExecutor {
@@ -917,16 +922,107 @@ impl DelegatedSwapExecutor {
         self.delegate
     }
     /// The latest issued setup whose nonce is resolved, recorded in the swap's terms with
-    /// its first order. Which setup signed at that nonce ran is not established.
+    /// its first order. Which setup signed at that nonce ran is not established. On an
+    /// included setup, the latest setup issued at the confirmed nonce.
     #[must_use]
     pub const fn setup_payload(&self) -> B256 {
         self.setup_payload
     }
-    /// The confirmed execution nonce observation the delegation was checked at.
+    /// The confirmed execution nonce observation the delegation was checked at, or on an
+    /// included setup the record's observation, which leaves the setup unresolved.
     #[must_use]
     pub const fn observed(&self) -> ExecutorNonceObservation {
         self.observed
     }
+    /// The read at the latest block that showed the swap's own setup included, when the record
+    /// leaves it unresolved.
+    #[must_use]
+    pub const fn inclusion(&self) -> Option<SwapSetupInclusion> {
+        self.inclusion
+    }
+    /// The nonce the order's pre-hook is signed at: the confirmed one, or on an included setup
+    /// the one the latest read showed.
+    #[must_use]
+    pub fn execution_nonce(&self) -> U256 {
+        self.inclusion
+            .map_or_else(|| self.observed.nonce(), |inclusion| inclusion.nonce)
+    }
+    /// What signing admission judges the account from.
+    pub(super) fn evidence(&self) -> SwapAdmissionEvidence {
+        self.inclusion
+            .map_or(SwapAdmissionEvidence::Fresh, SwapSetupInclusion::evidence)
+    }
+}
+
+/// A read of the swap's own account at the latest block that showed the accepted delegation and
+/// the execution nonce past its setup's, while the record leaves that setup unresolved. It is
+/// never recorded and admits only an order of the use that reserved the account fresh, and that
+/// order's speed-ups, at the nonce after the setup's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapSetupInclusion {
+    block: u64,
+    nonce: U256,
+}
+
+impl SwapSetupInclusion {
+    /// The latest block the read named.
+    #[must_use]
+    pub const fn block(&self) -> u64 {
+        self.block
+    }
+    /// The account's execution nonce at that block.
+    #[must_use]
+    pub const fn nonce(&self) -> U256 {
+        self.nonce
+    }
+    pub(super) const fn evidence(self) -> SwapAdmissionEvidence {
+        SwapAdmissionEvidence::Included {
+            block: self.block,
+            nonce: self.nonce,
+        }
+    }
+    /// A read at `block` that showed the setup included at `nonce`. UI tests use it, since
+    /// their sessions read no account.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn for_tests(block: u64, nonce: U256) -> Self {
+        Self { block, nonce }
+    }
+}
+
+/// The nonce of the swap's own setup that `record` leaves unresolved: the confirmed nonce, while
+/// a setup issued at it is unresolved for the use that reserved the account fresh as a source
+/// and isn't stopped. Only such a setup can be included.
+#[must_use]
+pub fn own_pending_setup(record: &ExecutorRecord) -> Option<U256> {
+    if record.is_swap_setup_stopped() {
+        return None;
+    }
+    let swap_use = record.active_swap_use().or_else(|| {
+        record
+            .swap_uses()
+            .is_empty()
+            .then(|| SwapUseId::first(record.operation()))
+    })?;
+    record.unresolved_swap_setup_nonce(swap_use)
+}
+
+/// Whether `read`, made at the latest block, shows `record`'s own pending setup included: the
+/// accepted delegation of `profile` and an execution nonce past the setup's.
+fn setup_inclusion(
+    record: &ExecutorRecord,
+    read: &ExecutorAccountRead,
+    profile: ExecutorProfile,
+) -> Option<SwapSetupInclusion> {
+    let setup = own_pending_setup(record)?;
+    let nonce = read.nonce?.nonce();
+    (record.delegate() == profile.delegate()
+        && matches_executor_delegation(&read.code, profile)
+        && nonce > setup)
+        .then_some(SwapSetupInclusion {
+            block: read.block.number,
+            nonce,
+        })
 }
 
 /// The executor a swap's order is planned and quoted for. Planning and review need only its
@@ -945,6 +1041,7 @@ pub struct SwapExecutor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum SwapExecutorSetup {
     Pending,
     /// Recorded setup is sufficient for a quote, but cannot authorize signing.
@@ -1019,7 +1116,7 @@ impl From<DelegatedSwapExecutor> for SwapExecutor {
             operation: Some(delegated.operation),
             executor: delegated.executor,
             delegate: delegated.delegate,
-            expected_pre_hook_nonce: delegated.observed.nonce(),
+            expected_pre_hook_nonce: delegated.execution_nonce(),
             setup: SwapExecutorSetup::Checked(delegated),
             reused: false,
         }
@@ -1027,6 +1124,7 @@ impl From<DelegatedSwapExecutor> for SwapExecutor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SwapSetupStatus {
     /// No setup's nonce is consumed at the confirmed block yet. A setup that reverted or
     /// whose authorization was skipped leaves its nonce unconsumed and stays here.
@@ -1065,7 +1163,17 @@ pub fn swap_setup_status(
         delegate: record.delegate(),
         setup_payload: setup,
         observed,
+        inclusion: None,
     })
+}
+
+/// One pass of a setup wait: the status the confirmed read gives, and while that leaves the
+/// swap's own setup unresolved, what the read at the latest block beside it showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapSetupObservation {
+    pub status: SwapSetupStatus,
+    /// The setup shown included at the latest block. Never recorded.
+    pub inclusion: Option<SwapSetupInclusion>,
 }
 
 /// The latest issued setup whose nonce is resolved. Several setups signed at one nonce,
@@ -1137,7 +1245,7 @@ impl ExecutorOwner {
             None => None,
         };
         let profile = self.swap_setup_profile(record.as_ref())?;
-        let inputs = self.spendable_swap_inputs(session, operation)?;
+        let inputs = self.swap_setup_fee_inputs(session, operation)?;
         self.estimate_paid_execution_fee(
             PaidExecutionPurpose::SwapSetup,
             profile,
@@ -1169,12 +1277,17 @@ impl ExecutorOwner {
     }
 
     /// Quote a setup retry using its existing account and its own reserved fee notes.
-    /// This is a preview only; signing still requires the confirmed delegation.
+    /// This is a preview only; signing still requires the confirmed delegation. A swap with
+    /// orders retries only the setup its record leaves unresolved, which an order open or
+    /// ended on it doesn't change.
     pub fn swap_setup_preview(&self, operation: ExecutorOperationId) -> Result<SwapExecutor> {
         let record = self
             .swap_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if record.is_retired() || record.is_swap_setup_stopped() || record.swap().is_some() {
+        if record.is_retired()
+            || record.is_swap_setup_stopped()
+            || record.swap().is_some() && own_pending_setup(&record).is_none()
+        {
             return Err(eyre!("this swap cannot retry setup"));
         }
         let Some(executor) = record.address() else {
@@ -1241,6 +1354,10 @@ impl ExecutorOwner {
     /// Nothing is saved while the source account has no address, which the store requires. A
     /// destination account that isn't derived yet leaves the receiver as it is, for a later
     /// call to bind.
+    ///
+    /// Once the use has an order, open or ended, the saved approval's account bindings stay as
+    /// they are, including none, and so does the receiver: a setup sent again beside the order
+    /// only saves the replacement's other terms, which the store limits to the setup fee.
     pub fn bind_swap_use_accounts(
         &self,
         operation: ExecutorOperationId,
@@ -1290,20 +1407,25 @@ impl ExecutorOwner {
         {
             return Err(eyre!(ACCOUNTS_CHANGED));
         }
-        approval.accounts = Some(SwapApprovedAccounts {
-            source: SwapApprovedAccount {
-                address: Some(source),
-                setup: source_setup,
-            },
-            destination: destination.map(|(address, setup)| SwapApprovedAccount { address, setup }),
-        });
-        if let (Some(delivery), Some((Some(receiver), _))) =
-            (approval.delivery.private_bridge(), destination)
-        {
-            approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
-                receiver,
-                ..delivery
+        if claimed.source.has_swap_use_order(swap_use) {
+            approval.accounts = saved.and_then(|saved| saved.accounts);
+        } else {
+            approval.accounts = Some(SwapApprovedAccounts {
+                source: SwapApprovedAccount {
+                    address: Some(source),
+                    setup: source_setup,
+                },
+                destination: destination
+                    .map(|(address, setup)| SwapApprovedAccount { address, setup }),
             });
+            if let (Some(delivery), Some((Some(receiver), _))) =
+                (approval.delivery.private_bridge(), destination)
+            {
+                approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                    receiver,
+                    ..delivery
+                });
+            }
         }
         // An existing source may have served as a destination before, so its record is not
         // required to be a swap's own.
@@ -1674,15 +1796,25 @@ impl ExecutorOwner {
     /// record, so it is applied to the record as it is by then. Another observation
     /// writing during the read leaves the setup pending at worst, and the next pass reads
     /// again.
+    ///
+    /// While the record then leaves the swap's own setup unresolved, as it does for a source
+    /// account its use reserved fresh, also with an order open or ended, the pass reads the
+    /// account once more at the latest block, through the same endpoints and the one that
+    /// served the confirmed read first. That read is returned and never recorded. A failed
+    /// latest read leaves the pass without it. A destination account never gets one.
     pub async fn observe_swap_setup(
         &self,
         operation: ExecutorOperationId,
-    ) -> Result<SwapSetupStatus> {
+    ) -> Result<SwapSetupObservation> {
+        let pending = SwapSetupObservation {
+            status: SwapSetupStatus::Pending,
+            inclusion: None,
+        };
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         let Some(executor) = record.address() else {
-            return Ok(SwapSetupStatus::Pending);
+            return Ok(pending);
         };
         let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
@@ -1702,12 +1834,99 @@ impl ExecutorOwner {
         .await?;
         // Code the execution nonce is not read under shows nothing about the setup's nonce.
         let Some(observed) = read.nonce else {
-            return Ok(SwapSetupStatus::Pending);
+            return Ok(pending);
         };
-        let _guard = self.lock_activity().await;
-        self.ensure_active()?;
-        let record = self.apply_account_read(operation, observed)?;
-        Ok(swap_setup_status(&record, read.block, &read.code, profile))
+        let record = {
+            let _guard = self.lock_activity().await;
+            self.ensure_active()?;
+            self.apply_account_read(operation, observed)?
+        };
+        let status = swap_setup_status(&record, read.block, &read.code, profile);
+        let inclusion = self.latest_setup_inclusion(&record).await.ok().flatten();
+        Ok(SwapSetupObservation { status, inclusion })
+    }
+
+    /// While `record` leaves the swap's own setup unresolved, read its account at the latest
+    /// block and say whether that shows the setup included. Nothing is read otherwise, and
+    /// nothing is recorded.
+    async fn latest_setup_inclusion(
+        &self,
+        record: &ExecutorRecord,
+    ) -> Result<Option<SwapSetupInclusion>> {
+        let Some(executor) = record.address() else {
+            return Ok(None);
+        };
+        if own_pending_setup(record).is_none() {
+            return Ok(None);
+        }
+        let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
+            .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
+        chain.enabled = true;
+        let latest = trace_step(
+            "setup_latest_account",
+            self.while_active(read_executor_account_at_latest(
+                &self.endpoints,
+                &chain,
+                executor,
+            )),
+        )
+        .await?;
+        Ok(setup_inclusion(record, &latest, profile))
+    }
+
+    /// The swap's own setup as an order of the use `swap_use` claims takes it, when the
+    /// reconciled `record` leaves that setup unresolved for a source account the use reserved
+    /// fresh and a read at the latest block now shows it included. The executor keeps the
+    /// record's confirmed observation, and its order takes the nonce the read showed. A
+    /// destination or a reused account never takes this path.
+    async fn included_swap_setup(
+        &self,
+        record: &ExecutorRecord,
+        role: SwapAccountRole,
+        swap_use: SwapAccountUse,
+    ) -> Result<Option<DelegatedSwapExecutor>> {
+        let (
+            SwapAccountRole::Source,
+            SwapAccountUse::Claimed(id)
+            | SwapAccountUse::SpeedUp(crate::vault::SwapSpeedUp { swap_use: id, .. }),
+        ) = (role, swap_use)
+        else {
+            return Ok(None);
+        };
+        let (Some(observed), Some(executor)) = (record.nonce_observation(), record.address())
+        else {
+            return Ok(None);
+        };
+        if record.unresolved_swap_setup_nonce(id) != Some(observed.nonce()) {
+            return Ok(None);
+        }
+        // Setups signed at one nonce are one outcome; the terms name the latest.
+        let Some(setup_payload) = record
+            .issued()
+            .iter()
+            .rev()
+            .find(|payload| {
+                payload.purpose() == ExecutorPayloadPurpose::Operation
+                    && payload.nonce() == observed.nonce()
+            })
+            .map(crate::vault::IssuedExecutorPayload::hash)
+        else {
+            return Ok(None);
+        };
+        let Some(inclusion) = self.latest_setup_inclusion(record).await? else {
+            return Ok(None);
+        };
+        Ok(Some(DelegatedSwapExecutor {
+            operation: record.operation(),
+            executor,
+            delegate: record.delegate(),
+            setup_payload,
+            observed,
+            inclusion: Some(inclusion),
+        }))
     }
 
     /// Confirm this chain's destination stealth account of a private Bridge swap at
@@ -2058,6 +2277,7 @@ impl ExecutorOwner {
                         delegate: record.delegate(),
                         setup_payload: setup,
                         observed,
+                        inclusion: None,
                     }));
                 }
                 Err(error) => self.endpoints.failed(&endpoint, &error),

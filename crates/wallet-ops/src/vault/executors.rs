@@ -1327,12 +1327,16 @@ impl ExecutorStore {
             }) {
                 return Err(ExecutorStoreError::InputReserved);
             }
-            // Recovery, including early cancellation, competes with this swap's own pre-hook.
-            if payload.purpose == ExecutorPayloadPurpose::Recovery
-                && record
-                    .swap_reserved_inputs()
-                    .iter()
-                    .any(|input| payload.context.inputs.contains(input))
+            // Recovery, including early cancellation, competes with this swap's own pre-hook. So
+            // does a setup sent again while an order on its included setup is open: it runs at
+            // the nonce below the pre-hook's and would spend the pre-hook's notes first.
+            if matches!(
+                payload.purpose,
+                ExecutorPayloadPurpose::Recovery | ExecutorPayloadPurpose::Operation
+            ) && record
+                .swap_reserved_inputs()
+                .iter()
+                .any(|input| payload.context.inputs.contains(input))
             {
                 return Err(ExecutorStoreError::InputReserved);
             }
@@ -1589,6 +1593,18 @@ impl ExecutorStore {
             record.apply_synced(resolved, last_scanned);
             Ok(())
         })
+    }
+
+    /// [`Self::record_synced`] of a snapshot scanned to `last_scanned` that shows no payload
+    /// executed: it settles the nonces resolved at a block sync has reached. UI tests use it,
+    /// since their sessions never sync.
+    #[cfg(feature = "test-support")]
+    pub fn record_synced_for_tests(
+        &self,
+        operation: ExecutorOperationId,
+        last_scanned: u64,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.record_synced(operation, None, last_scanned)
     }
 
     /// Persist a confirmed read of the account's execution nonce: the nonce observation

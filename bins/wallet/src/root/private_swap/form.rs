@@ -1712,6 +1712,9 @@ enum QuoteExecutor {
 
 struct QuoteRequest {
     executor: QuoteExecutor,
+    /// This session's last read at the latest block that showed the swap's own setup included,
+    /// for an order or a speed-up on that setup while its record leaves it unresolved.
+    inclusion: Option<wallet_ops::SwapSetupInclusion>,
     sell: Address,
     buy: Address,
     amount: U256,
@@ -1904,7 +1907,7 @@ async fn quote_swap_terms(
         QuoteExecutor::Preview => Ok(owner.swap_preview_executor()?),
         QuoteExecutor::Setup(operation) => Ok(owner.swap_setup_preview(operation)?),
         QuoteExecutor::Order { operation, reuse } => {
-            Ok(owner.swap_order_preview(operation, reuse)?)
+            Ok(owner.swap_order_preview(operation, reuse, request.inclusion)?)
         }
         QuoteExecutor::SpeedUp { operation, order } => Err((operation, order)),
     };
@@ -1962,6 +1965,7 @@ async fn quote_swap_terms(
     };
     let planning_owner = Arc::clone(owner);
     let planning_session = Arc::clone(session);
+    let inclusion = request.inclusion;
     // Note selection can take a moment on fragmented balances.
     let started = Instant::now();
     tracing::debug!(target: "swap_quote", step = "input_planning", "started");
@@ -1971,7 +1975,7 @@ async fn quote_swap_terms(
         }
         // The open order's own notes, tokens, spend and delivery, whatever the request names.
         Err((operation, order)) => {
-            planning_owner.plan_swap_speed_up(&planning_session, operation, order)
+            planning_owner.plan_swap_speed_up(&planning_session, operation, order, inclusion)
         }
     })
     .await;
@@ -6450,7 +6454,7 @@ impl PrivateSwapsView {
                     let executor = match &prepared {
                         SwapPairSide::Setup(prepared) => SwapExecutor::reserved(prepared)?,
                         SwapPairSide::Existing { operation, .. } => {
-                            owner.swap_order_preview(*operation, true)?
+                            owner.swap_order_preview(*operation, true, None)?
                         }
                     };
                     let request = SwapAmountRequest {
@@ -6939,6 +6943,9 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
+        let inclusion = operation
+            .and_then(|operation| self.record(operation))
+            .and_then(|record| self.setup_inclusion(record));
         let tracking = operation.map(|operation| self.tracking.entry(operation).or_default());
         let byte_budget = tracking.as_ref().and_then(|tracking| tracking.byte_budget);
         let tracked_orderbook = tracking.and_then(|tracking| {
@@ -6959,6 +6966,7 @@ impl PrivateSwapsView {
         };
         let request = QuoteRequest {
             executor: terms.executor,
+            inclusion,
             sell: terms.sell,
             buy: terms.buy,
             amount: terms.amount,
@@ -8378,9 +8386,13 @@ impl PrivateSwapsView {
             },
         );
         let valid_for = self.default_valid_for(cx);
+        let inclusion = self
+            .record(operation)
+            .and_then(|record| self.setup_inclusion(record));
         let tracking = self.tracking.entry(operation).or_default();
         let request = QuoteRequest {
             executor: QuoteExecutor::Order { operation, reuse },
+            inclusion,
             sell,
             buy,
             amount: approval.bounds.spend_amount(),

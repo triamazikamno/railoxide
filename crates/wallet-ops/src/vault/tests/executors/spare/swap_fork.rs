@@ -89,6 +89,11 @@ alloy::sol! {
         function transfer(address to, uint256 amount) external returns (bool);
     }
 
+    // Railgun's getter of the nullifiers spent in each tree.
+    interface ForkNullifiers {
+        function nullifiers(uint256 treeNumber, bytes32 nullifier) external view returns (bool);
+    }
+
     // The deployed `SpokePool`s fill with every address as a `bytes32`.
     interface ForkSpokePool {
         struct V3RelayData {
@@ -171,6 +176,17 @@ struct Swap {
     hooks: AppDataHooks,
     /// Length of the signed app data document.
     app_data_len: usize,
+}
+
+/// An order placed on its executor's setup while that setup was included but not final.
+struct IncludedOrder {
+    swap: Swap,
+    /// The setup as issued, which a reorg can drop and anyone can send again.
+    setup: IssuedExecutorTransaction,
+    /// The note the setup pays its fee with.
+    setup_fee: Utxo,
+    /// The fork's state just before the setup was sent.
+    before_setup: U256,
 }
 
 struct Wallet {
@@ -349,6 +365,16 @@ impl Wallet {
     /// Sign, persist, and submit `delegated`'s order to a local orderbook stub.
     async fn swap_from(&self, fork: &ForkChain, delegated: DelegatedSwapExecutor) -> Swap {
         let tree = fork.railgun_tree().await;
+        self.swap_at_root(fork, delegated, tree).await
+    }
+
+    /// [`Self::swap_from`] with its unshield proven against `tree`'s root.
+    async fn swap_at_root(
+        &self,
+        fork: &ForkChain,
+        delegated: DelegatedSwapExecutor,
+        tree: RailgunTree,
+    ) -> Swap {
         let note = self.note(tree, U256::from(SELL_AMOUNT) * U256::from(2));
         let transactions = vec![synthetic_transaction(
             tree,
@@ -489,6 +515,7 @@ impl Wallet {
             .observe_swap_setup(destination_operation)
             .await
             .unwrap()
+            .status
         else {
             panic!("the destination account stays delegated");
         };
@@ -627,7 +654,35 @@ impl Wallet {
         prepared: &PreparedExecutorOperation,
         authorization: &crate::DesktopPrivateSpendAuthorization,
     ) -> DelegatedSwapExecutor {
-        let (operation, executor) = (prepared.operation(), prepared.context().executor);
+        let (issued, _) = self
+            .issue_setup(fork, owner, chain, prepared, authorization)
+            .await;
+        // The wallet's type-4 setup, delivered as a broadcaster would.
+        let receipt = deliver(fork, &issued).await;
+        assert!(receipt.status(), "the setup delegates the executor");
+        fork.mine(chain.finality_depth).await;
+        let SwapSetupStatus::Delegated(delegated) = owner
+            .observe_swap_setup(prepared.operation())
+            .await
+            .unwrap()
+            .status
+        else {
+            panic!("the confirmed setup delegated the executor");
+        };
+        delegated
+    }
+
+    /// Sign `prepared`'s delegation-only setup for `fork`, the fork of `owner`'s `chain`, paying
+    /// its fee with a note of its own. Returns the issued setup and that note.
+    async fn issue_setup(
+        &self,
+        fork: &ForkChain,
+        owner: &ExecutorOwner,
+        chain: &crate::settings::EffectiveChainConfig,
+        prepared: &PreparedExecutorOperation,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
+    ) -> (IssuedExecutorTransaction, Utxo) {
+        let executor = prepared.context().executor;
         let tree = fork
             .railgun_tree_of(chain.require_railgun().unwrap().deployment.contract)
             .await;
@@ -654,30 +709,132 @@ impl Wallet {
             .issue_operation(prepared, &setup, std::slice::from_ref(&fee), authorization)
             .await
             .unwrap();
-        // The wallet's type-4 setup, delivered as a broadcaster would.
-        let receipt = fork
-            .send(
-                issued
-                    .transaction()
-                    .clone()
-                    .from(VERIFICATION_BYPASS)
-                    .gas_limit(3_000_000),
+        (issued, fee)
+    }
+
+    /// Reserve a fresh executor and send its delegation-only setup, then sign, persist, and
+    /// submit its order on the latest read that shows the setup included, before the setup is
+    /// final. The pre-hook signs the nonce after the setup's and the post-hook the one after
+    /// that, while the record keeps the setup unresolved.
+    async fn swap_at_inclusion(&self, fork: &ForkChain) -> IncludedOrder {
+        let authorization = password();
+        let delegate = self.chain.accepted_executor_profile().unwrap().delegate();
+        let operation = ExecutorOperationId::random().unwrap();
+        let prepared = self
+            .owner
+            .prepare_swap_setup(
+                operation,
+                broadcaster(delegate),
+                setup_approval(WETH, self.pair.0, self.pair.1),
+                None,
+                &authorization,
             )
+            .await
+            .unwrap();
+        let (setup, setup_fee) = self
+            .issue_setup(fork, &self.owner, &self.chain, &prepared, &authorization)
             .await;
+        let before_setup = fork.snapshot().await;
+        // The wallet proves against its Merkle forest, which holds leaves up to the safe head
+        // only, so the order's root never includes the setup's block.
+        let confirmed_tree = fork.railgun_tree().await;
+        let receipt = deliver(fork, &setup).await;
         assert!(receipt.status(), "the setup delegates the executor");
-        fork.mine(chain.finality_depth).await;
-        let SwapSetupStatus::Delegated(delegated) =
-            owner.observe_swap_setup(operation).await.unwrap()
-        else {
-            panic!("the confirmed setup delegated the executor");
-        };
-        delegated
+        let included = receipt.block_number.unwrap();
+
+        // The confirmed block doesn't show the setup yet. The latest one does.
+        let observation = self.owner.observe_swap_setup(operation).await.unwrap();
+        assert_eq!(observation.status, SwapSetupStatus::Pending);
+        assert_eq!(
+            observation
+                .inclusion
+                .map(|inclusion| (inclusion.block(), inclusion.nonce())),
+            Some((included, U256::ONE))
+        );
+        let confirmed = fork.block_number().await - self.chain.finality_depth;
+        let delegated = self
+            .owner
+            .reuse_swap_account(
+                operation,
+                confirmed,
+                SwapAccountRole::Source,
+                SwapAccountUse::Claimed(SwapUseId::first(operation)),
+            )
+            .await
+            .unwrap()
+            .delegated()
+            .expect("the included setup admits the order");
+        assert_eq!(
+            (delegated.observed().nonce(), delegated.execution_nonce()),
+            (U256::ZERO, U256::ONE)
+        );
+
+        let swap = self.swap_at_root(fork, delegated, confirmed_tree).await;
+        let record = self.record(operation);
+        assert_eq!(
+            issued_nonces(&record),
+            [
+                (ExecutorPayloadPurpose::Operation, U256::ZERO),
+                (ExecutorPayloadPurpose::SwapPreHook, U256::ONE),
+                (ExecutorPayloadPurpose::SwapPostHook, U256::from(2)),
+            ]
+        );
+        assert_eq!(
+            RelayAdapt7702::executeCall::abi_decode(&swap.hooks.pre[0].call_data)
+                .unwrap()
+                ._nonce,
+            U256::ONE
+        );
+        assert_eq!(
+            record.payload_state(setup.payload_hash()),
+            Some(ExecutorPayloadState::Pending)
+        );
+        IncludedOrder {
+            swap,
+            setup,
+            setup_fee,
+            before_setup,
+        }
+    }
+
+    /// Drop `placed`'s setup in a reorg that replaces every block since it was sent with a
+    /// longer chain without it. The latest read then shows the setup no longer included.
+    async fn drop_setup(&self, fork: &ForkChain, placed: &IncludedOrder) {
+        let head = fork.block_number().await;
+        fork.revert(placed.before_setup).await;
+        fork.mine(head + 1 - fork.block_number().await).await;
+        assert!(fork.code(placed.swap.executor).await.is_empty());
+        let observation = self
+            .owner
+            .observe_swap_setup(placed.swap.operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            (observation.status, observation.inclusion),
+            (SwapSetupStatus::Pending, None)
+        );
+    }
+
+    /// Prepare the setup of `operation`'s swap again, at the account's first nonce.
+    async fn retry_setup(&self, operation: ExecutorOperationId) -> PreparedExecutorOperation {
+        let delegate = self.chain.accepted_executor_profile().unwrap().delegate();
+        let retry = self
+            .owner
+            .resume_swap_setup(operation, broadcaster(delegate), &password())
+            .await
+            .unwrap();
+        assert_eq!(retry.context().execution_nonce, U256::ZERO);
+        retry
     }
 
     /// The executor at its current confirmed nonce, for a retry.
     async fn redelegate(&self, operation: ExecutorOperationId) -> DelegatedSwapExecutor {
-        let SwapSetupStatus::Delegated(delegated) =
-            self.owner.observe_swap_setup(operation).await.unwrap()
+        let SwapSetupStatus::Delegated(delegated) = self
+            .owner
+            .observe_swap_setup(operation)
+            .await
+            .unwrap()
+            .status
         else {
             panic!("the swap executor stays delegated");
         };
@@ -1218,6 +1375,7 @@ impl Wallet {
             notes,
             open.uid,
             std::time::SystemTime::now(),
+            None,
         )
         .unwrap() else {
             panic!("the open order's amount fits one order");
@@ -2774,6 +2932,130 @@ async fn swap_fork_one_cancellation_invalidates_both_overlapping_orders() {
             .await;
         assert!(!receipt.status(), "a cancelled order can't fill");
     }
+    wallet.finish().await;
+}
+
+/// Settle `swap`, an order on an executor whose setup ran, with both hooks, and observe it once
+/// the settlement is final. One confirmed read then resolves every setup attempt and both hooks.
+async fn fill_at_finality(fork: &ForkChain, wallet: &Wallet, swap: &Swap) {
+    let receipt = fork
+        .settle(
+            &swap.order,
+            swap.signature.clone(),
+            &swap.hooks.pre,
+            &swap.hooks.post,
+        )
+        .await;
+    assert!(receipt.status(), "the solver settles with both hooks");
+    assert_eq!(execution_nonce(fork, swap.executor).await, U256::from(3));
+    let settled = receipt.block_number.unwrap();
+    fork.mine(wallet.chain.finality_depth).await;
+    let record = wallet.observe(swap.operation, settled..settled + 1).await;
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
+        SwapOrderState::Done
+    );
+    assert!(record.issued().iter().all(
+        |payload| record.payload_state(payload.hash()) == Some(ExecutorPayloadState::Resolved)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_order_placed_at_setup_inclusion_fills_and_resolves_at_finality() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let placed = Box::pin(wallet.swap_at_inclusion(&fork)).await;
+    fill_at_finality(&fork, &wallet, &placed.swap).await;
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_setup_dropped_by_a_reorg_and_included_again_fills() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let placed = Box::pin(wallet.swap_at_inclusion(&fork)).await;
+    wallet.drop_setup(&fork, &placed).await;
+
+    // The same setup lands again on the new chain.
+    let receipt = deliver(&fork, &placed.setup).await;
+    assert!(receipt.status(), "the setup delegates the executor again");
+    fill_at_finality(&fork, &wallet, &placed.swap).await;
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_setup_retried_while_its_order_is_open_lets_the_order_fill() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let placed = Box::pin(wallet.swap_at_inclusion(&fork)).await;
+    wallet.drop_setup(&fork, &placed).await;
+
+    // The dropped setup never returns. It is sent again at its nonce next to the open order,
+    // paying its fee with a note the order's pre-hook doesn't spend.
+    let retry = wallet.retry_setup(placed.swap.operation).await;
+    let (issued, _) = wallet
+        .issue_setup(&fork, &wallet.owner, &wallet.chain, &retry, &password())
+        .await;
+    let receipt = deliver(&fork, &issued).await;
+    assert!(receipt.status(), "the retried setup delegates the executor");
+    fill_at_finality(&fork, &wallet, &placed.swap).await;
+    wallet.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn swap_fork_order_on_a_setup_dropped_for_good_expires_with_nothing_unshielded() {
+    let fork = ForkChain::start().await;
+    let wallet = Wallet::open(&fork);
+    let placed = Box::pin(wallet.swap_at_inclusion(&fork)).await;
+    let swap = &placed.swap;
+    wallet.drop_setup(&fork, &placed).await;
+
+    fork.increase_time(15 * 60).await;
+    fork.mine(wallet.chain.finality_depth + 1).await;
+    let confirmed = fork.block_number().await - wallet.chain.finality_depth;
+    let record = wallet
+        .observe(swap.operation, confirmed..confirmed + 1)
+        .await;
+    assert_eq!(
+        swap_order_state(record.swap().unwrap(), first_order(&record)),
+        SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
+    );
+
+    // Nothing left the private balance: the order's note is unspent and released, and the
+    // account neither holds nor approved any of the sell token.
+    let spent = fork
+        .call(
+            RAILGUN,
+            ForkNullifiers::nullifiersCall {
+                treeNumber: U256::from(swap.note.tree),
+                nullifier: wallet.nullifier(&swap.note),
+            },
+        )
+        .await;
+    assert!(!spent);
+    assert!(!record.reserved_inputs().contains(&swap.input));
+    assert_eq!(fork.erc20_balance(WETH, swap.executor).await, U256::ZERO);
+    assert_eq!(
+        relayer_allowance(&fork, &wallet, swap.executor).await,
+        U256::ZERO
+    );
+    assert_eq!(order_filled(&fork, &wallet, swap.uid).await, U256::ZERO);
+
+    // The setup stays pending with its fee note reserved, and can be sent again.
+    assert_eq!(
+        record.payload_state(placed.setup.payload_hash()),
+        Some(ExecutorPayloadState::Pending)
+    );
+    assert!(
+        record
+            .reserved_inputs()
+            .contains(&ExecutorInputIdentity::from_utxo(&placed.setup_fee))
+    );
+    wallet.retry_setup(swap.operation).await;
     wallet.finish().await;
 }
 

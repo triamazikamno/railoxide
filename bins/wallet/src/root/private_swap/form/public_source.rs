@@ -4959,7 +4959,12 @@ async fn advance_public_execution(
     if approval.destination.setup {
         // One read of the destination account at its confirmed block. A setup that is still
         // pending is read again on the next pass.
-        match command.owner.observe_swap_setup(command.operation).await? {
+        match command
+            .owner
+            .observe_swap_setup(command.operation)
+            .await?
+            .status
+        {
             SwapSetupStatus::Pending => return Ok(PublicExecutionResult::Waiting(execution)),
             SwapSetupStatus::MissingDelegation => {
                 return Err(eyre::eyre!(

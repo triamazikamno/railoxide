@@ -254,7 +254,8 @@ impl ObservationEndpoints {
     }
 }
 
-/// An account's code and execution nonce at one confirmed canonical block.
+/// An account's code and execution nonce at one canonical block: a confirmed one, or the
+/// latest for [`read_executor_account_at_latest`].
 pub(super) struct ExecutorAccountRead {
     pub(super) block: alloy::eips::BlockNumHash,
     pub(super) code: Bytes,
@@ -289,6 +290,42 @@ pub(super) async fn read_executor_account(
     Err(eyre!("executor account state is unavailable"))
 }
 
+/// Read an account's state by address at the latest block, which a reorg can still remove.
+/// It goes through the same endpoints as [`read_executor_account`], the one that served the
+/// last read first. Nothing may apply it to a record: only a confirmed read resolves a nonce.
+pub(super) async fn read_executor_account_at_latest(
+    endpoints: &ObservationEndpoints,
+    chain: &EffectiveChainConfig,
+    address: Address,
+) -> Result<ExecutorAccountRead> {
+    for provider in endpoints.providers().await {
+        let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = provider.index);
+        let read = trace_step("latest_account_rpc", async {
+            let block = trace_step("latest_account_block", async {
+                provider
+                    .provider
+                    .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+                    .await
+            })
+            .await?
+            .ok_or_else(|| eyre!("latest executor block is unavailable"))?
+            .header
+            .num_hash();
+            read_account_at_block(&provider.provider, chain, address, block).await
+        })
+        .instrument(span)
+        .await;
+        match read {
+            Ok(read) => {
+                endpoints.succeeded(&provider);
+                return Ok(read);
+            }
+            Err(error) => endpoints.failed(&provider, &error),
+        }
+    }
+    Err(eyre!("executor account state is unavailable"))
+}
+
 async fn read_account_at_provider(
     provider: &DynProvider,
     chain: &EffectiveChainConfig,
@@ -296,6 +333,15 @@ async fn read_account_at_provider(
     requested: Option<u64>,
 ) -> Result<ExecutorAccountRead> {
     let block = confirmed_block_at_provider(provider, chain, requested).await?;
+    read_account_at_block(provider, chain, address, block).await
+}
+
+async fn read_account_at_block(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    address: Address,
+    block: alloy::eips::BlockNumHash,
+) -> Result<ExecutorAccountRead> {
     // Both reads name the block by hash, so a reorg after the header read fails
     // them and cannot mix two blocks.
     let block_id = alloy::eips::BlockId::hash_canonical(block.hash);

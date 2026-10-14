@@ -139,6 +139,9 @@ struct RpcState {
     calls: Mutex<std::collections::BTreeMap<Address, Option<U256>>>,
     /// A block number that another block now holds, with a different hash.
     reorged: Mutex<Option<u64>>,
+    /// The code and execution nonce an account reads at the head block only, as while a
+    /// transaction that delegates it is in no confirmed block yet.
+    head_accounts: Mutex<std::collections::BTreeMap<Address, (Bytes, U256)>>,
 }
 
 struct Rpc {
@@ -194,6 +197,23 @@ impl Rpc {
             .lock()
             .unwrap()
             .insert(address, Some(nonce));
+    }
+
+    /// `address` reads as delegated to `delegate` with execution nonce `nonce` at the head
+    /// block, or with `None` as at every other block.
+    fn set_head_account(&self, address: Address, delegated: Option<(Address, U256)>) {
+        use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
+        let mut accounts = self.state.head_accounts.lock().unwrap();
+        if let Some((delegate, nonce)) = delegated {
+            let code = [
+                EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+                delegate.as_slice(),
+            ]
+            .concat();
+            accounts.insert(address, (code.into(), nonce));
+        } else {
+            accounts.remove(&address);
+        }
     }
 
     fn count_for(&self, address: Address) -> usize {
@@ -267,6 +287,12 @@ async fn serve(
     let called = address
         .filter(|_| request["method"] == "eth_call")
         .and_then(|address| state.calls.lock().unwrap().get(&address).copied());
+    let head = state.head.load(Ordering::Relaxed);
+    let at_head = request["params"][1] == json!("latest")
+        || request["params"][1]["blockHash"] == json!(B256::repeat_byte(head as u8));
+    let head_account = address
+        .filter(|_| at_head)
+        .and_then(|address| state.head_accounts.lock().unwrap().get(&address).cloned());
     let result = match request["method"].as_str().unwrap() {
         "eth_chainId" | "eth_gasPrice" => json!("0x1"),
         "eth_blockNumber" => json!(format!("0x{:x}", state.head.load(Ordering::Relaxed))),
@@ -290,12 +316,22 @@ async fn serve(
             state.native_balance.load(Ordering::Relaxed)
         )),
         "eth_getCode" => json!(
-            address
-                .and_then(|address| state.codes.lock().unwrap().get(&address).cloned())
+            head_account
+                .as_ref()
+                .map(|(code, _)| code.clone())
+                .or_else(|| {
+                    address.and_then(|address| state.codes.lock().unwrap().get(&address).cloned())
+                })
                 .unwrap_or_default()
         ),
         "eth_getStorageAt" => json!(B256::from(U256::from(u8::from(used)))),
-        "eth_call" => json!(B256::from(called.flatten().unwrap_or_default())),
+        "eth_call" => json!(B256::from(
+            head_account
+                .as_ref()
+                .map(|(_, nonce)| *nonce)
+                .or_else(|| called.flatten())
+                .unwrap_or_default()
+        )),
         "eth_maxPriorityFeePerGas" => json!("0x0"),
         "eth_feeHistory" => json!({
             "oldestBlock": "0x0", "baseFeePerGas": ["0x1", "0x1"],

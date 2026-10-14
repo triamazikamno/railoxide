@@ -51,6 +51,11 @@ pub enum SwapAdmissionEvidence {
     Recorded,
     /// The record after reconciliation or the settled refresh, with its nonce observation.
     Fresh,
+    /// The record with its nonce observation, as for `Fresh`, and a read of the account at the
+    /// latest block that showed the accepted delegation at `nonce`. It is never recorded. It
+    /// admits only an order and its speed-ups for the claimed fresh source use whose setup at
+    /// the observed nonce is unresolved, with `nonce` the next one.
+    Included { block: u64, nonce: U256 },
 }
 
 /// Why an account can't take a swap use.
@@ -240,14 +245,27 @@ pub fn swap_account_refusal(
             Some(id)
         }
     };
-    if evidence == SwapAdmissionEvidence::Fresh && record.nonce_observation.is_none() {
+    if evidence != SwapAdmissionEvidence::Recorded && record.nonce_observation.is_none() {
         return Some(Refusal::StateUnverified);
     }
     // Recorded evidence is also read while the claiming use still sets up the account it
     // reserved fresh. Fresh evidence comes after that setup.
     let own_setup = evidence == SwapAdmissionEvidence::Recorded
         && claimed.is_some_and(|id| record.swap_use(id).is_none_or(|claimed| claimed.fresh));
-    if !own_setup && !setup_executed(record) {
+    // The setup the order follows, while the record leaves its nonce unresolved.
+    let pending_setup = match role {
+        SwapAccountRole::Source => claimed.and_then(|id| record.unresolved_swap_setup_nonce(id)),
+        SwapAccountRole::Destination { .. } => None,
+    };
+    let next_to_setup =
+        |nonce: U256| pending_setup.and_then(|setup| setup.checked_add(U256::ONE)) == Some(nonce);
+    // Included evidence stands in only for the claimed fresh source use's own setup.
+    let setup_confirmed = match evidence {
+        SwapAdmissionEvidence::Recorded => own_setup || setup_executed(record),
+        SwapAdmissionEvidence::Fresh => setup_executed(record),
+        SwapAdmissionEvidence::Included { nonce, .. } => next_to_setup(nonce),
+    };
+    if !setup_confirmed {
         return Some(Refusal::SetupUnconfirmed);
     }
     match swap_use {
@@ -274,12 +292,22 @@ pub fn swap_account_refusal(
                 return Some(refusal);
             }
             // Another attempt's pre-hook can consume the shared nonce without this order's
-            // own pre-hook being recorded as executed. Fresh evidence always has the
-            // observation here.
-            if record
+            // own pre-hook being recorded as executed. Fresh and included evidence always
+            // have the observation here. An order on an included setup holds the nonce after
+            // the setup's, which the record leaves unresolved.
+            let at_observed = record
                 .nonce_observation
-                .is_some_and(|observed| observed.nonce != speed_up.pre_hook_nonce)
-            {
+                .is_none_or(|observed| observed.nonce == speed_up.pre_hook_nonce);
+            let nonce_current = match evidence {
+                SwapAdmissionEvidence::Fresh => at_observed,
+                SwapAdmissionEvidence::Recorded => {
+                    at_observed || next_to_setup(speed_up.pre_hook_nonce)
+                }
+                SwapAdmissionEvidence::Included { nonce, .. } => {
+                    nonce == speed_up.pre_hook_nonce && next_to_setup(nonce)
+                }
+            };
+            if !nonce_current {
                 return Some(Refusal::SpeedUpNonceUsed);
             }
         }
@@ -308,7 +336,8 @@ pub fn swap_account_refusal(
     if unresolved_delivery.is_some() {
         return unresolved_delivery;
     }
-    if !own_setup && has_executable_work(record, claimed) {
+    let setup_included = matches!(evidence, SwapAdmissionEvidence::Included { .. });
+    if !own_setup && has_executable_work(record, claimed, setup_included) {
         return Some(Refusal::UnfinishedWork);
     }
     None
@@ -348,6 +377,24 @@ pub const fn swap_earlier_shield_refusal(
 }
 
 impl ExecutorRecord {
+    /// The nonce of the confirmed observation, when the use `id` reserved this account fresh
+    /// as a source and a setup issued at that nonce is unresolved. An order of the use on that
+    /// setup, once a read at the latest block shows it included, takes the next nonce. Setups
+    /// belong to the use that reserved the account fresh, so each is an attempt of that use.
+    #[must_use]
+    pub(crate) fn unresolved_swap_setup_nonce(&self, id: SwapUseId) -> Option<U256> {
+        let observed = self.nonce_observation?.nonce;
+        let fresh_source = self.swap_use(id).is_none_or(|swap_use| {
+            swap_use.fresh && matches!(swap_use.role, SwapUseRole::Source { .. })
+        });
+        (fresh_source
+            && !self.nonce_resolved(observed)
+            && self.issued.iter().any(|payload| {
+                payload.purpose == ExecutorPayloadPurpose::Operation && payload.nonce == observed
+            }))
+        .then_some(observed)
+    }
+
     /// The shields this account's destination uses delivered, besides the use `except`. Each
     /// names the notes whose POI verdict a later destination use waits for.
     #[must_use]
@@ -431,8 +478,13 @@ fn setup_executed(record: &ExecutorRecord) -> bool {
 /// Whether a payload the account signed can still execute, besides the shields of the use
 /// `claimed`, which a retry signs again at the same nonce. A destination shield resolves only
 /// once the reconciled nonce passes its own. The order rule judges its own hooks; recovery
-/// payloads must resolve independently of those orders.
-fn has_executable_work(record: &ExecutorRecord, claimed: Option<SwapUseId>) -> bool {
+/// payloads must resolve independently of those orders. With `setup_included`, the claimed
+/// use's unresolved setups are the included setup the order follows.
+fn has_executable_work(
+    record: &ExecutorRecord,
+    claimed: Option<SwapUseId>,
+    setup_included: bool,
+) -> bool {
     // Historical swap orders do not account for a later recovery. These signatures can still
     // spend the account after its orderless claim released.
     let recovery_outstanding = record.issued.iter().any(|payload| {
@@ -458,6 +510,7 @@ fn has_executable_work(record: &ExecutorRecord, claimed: Option<SwapUseId>) -> b
     }
     record.issued.iter().any(|payload| {
         payload.purpose != ExecutorPayloadPurpose::SwapDestinationShield
+            && !(setup_included && payload.purpose == ExecutorPayloadPurpose::Operation)
             && !record.nonce_resolved(payload.nonce)
     })
 }

@@ -115,6 +115,8 @@ pub(super) struct MockChain {
     nullifiers_spent: Option<u64>,
     /// What `depositQuoteTimeBuffer()` returns. `None` reverts the call.
     pub(super) quote_time_buffer: Option<u32>,
+    /// The executor's code at the head block in place of the accepted delegation, when set.
+    head_code: Option<Bytes>,
 }
 
 impl MockChain {
@@ -138,6 +140,7 @@ impl MockChain {
             reorg_on_receipts: false,
             nullifiers_spent: None,
             quote_time_buffer: None,
+            head_code: None,
         }
     }
 
@@ -331,7 +334,11 @@ impl MockChain {
             "eth_chainId" => json!(format!("0x{:x}", self.chain_id)),
             "eth_blockNumber" => json!(format!("0x{:x}", self.head)),
             "eth_getBlockByNumber" => {
-                let number = quantity(&params[0]);
+                let number = if params[0] == "latest" {
+                    self.head
+                } else {
+                    quantity(&params[0])
+                };
                 if number > self.head {
                     Value::Null
                 } else {
@@ -383,12 +390,20 @@ impl MockChain {
                     })
             }
             "eth_getCode" => {
-                let code = [
-                    EIP7702_DELEGATION_DESIGNATOR.as_slice(),
-                    self.delegate.as_slice(),
-                ]
-                .concat();
-                serde_json::to_value(Bytes::from(code)).unwrap()
+                let at_head = self.number_of(&params[1]) == Some(self.head);
+                let code = self
+                    .head_code
+                    .clone()
+                    .filter(|_| at_head)
+                    .unwrap_or_else(|| {
+                        [
+                            EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+                            self.delegate.as_slice(),
+                        ]
+                        .concat()
+                        .into()
+                    });
+                serde_json::to_value(code).unwrap()
             }
             "eth_call" => {
                 let Some(number) = self.number_of(&params[1]) else {
@@ -607,7 +622,24 @@ impl Fixture {
         Self::start_for_purpose("Private swap").await
     }
 
+    /// The swap executor of [`Self::start`] whose setup is in the head block 14, whose nonce
+    /// no block consumes yet: reconciled at confirmed block 13, the setup stays unresolved at
+    /// nonce 0.
+    async fn start_pending() -> Self {
+        Self::start_with("Private swap", 14, false).await
+    }
+
     async fn start_for_purpose(purpose: &str) -> Self {
+        Self::start_with(purpose, 11, true).await
+    }
+
+    /// The setup's transaction is in `setup_block`, which consumes its nonce if `resolves`.
+    async fn start_with(purpose: &str, setup_block: u64, resolves: bool) -> Self {
+        let nonces = if resolves {
+            vec![(setup_block, 1)]
+        } else {
+            Vec::new()
+        };
         let (root, db, vault) = desktop_store_with_vault();
         let view = Arc::new(import_wallet_with_metadata(
             &vault,
@@ -626,7 +658,7 @@ impl Fixture {
         let settlement = config.swap_profile().unwrap().settlement();
         let chain = Arc::new(Mutex::new(MockChain {
             head: 14,
-            nonces: vec![(11, 1)],
+            nonces,
             ..MockChain::new(1, railgun, delegate)
         }));
         let served = chain.clone();
@@ -675,14 +707,20 @@ impl Fixture {
                 ),
             )
             .unwrap();
-        chain
-            .lock()
-            .unwrap()
-            .add_transaction(11, EXECUTOR, setup_call, private_logs(0x11, 0x12));
+        chain.lock().unwrap().add_transaction(
+            setup_block,
+            EXECUTOR,
+            setup_call,
+            private_logs(0x11, 0x12),
+        );
         let reconciled = owner.reconcile_account(operation).await.unwrap();
         assert_eq!(
             reconciled.record().payload_state(setup),
-            Some(ExecutorPayloadState::Resolved)
+            Some(if resolves {
+                ExecutorPayloadState::Resolved
+            } else {
+                ExecutorPayloadState::Pending
+            })
         );
         let input = sell_note(3);
         Self {
@@ -798,11 +836,28 @@ impl Fixture {
         bounds: SwapApprovedBounds,
         bridge: Option<BridgeOrderTerms>,
     ) -> SwapAttempt {
+        self.attempt_after(attempt, valid_to_block, buy, delivery, bounds, bridge, 0)
+    }
+
+    /// [`Self::attempt`] with its hooks signed `offset` nonces past the reconciled one, as an
+    /// order on an included setup takes the nonce after the setup's. The hooks still name the
+    /// record's observation.
+    #[allow(clippy::too_many_arguments)]
+    fn attempt_after(
+        &self,
+        attempt: u8,
+        valid_to_block: u64,
+        buy: Address,
+        delivery: SwapDelivery,
+        bounds: SwapApprovedBounds,
+        bridge: Option<BridgeOrderTerms>,
+        offset: u64,
+    ) -> SwapAttempt {
         let post_hook = delivery.has_post_hook();
         let mut shield = post_hook_shield(attempt);
         shield.preimage.token = TokenData::erc20(buy);
         let observed = self.record().nonce_observation().unwrap();
-        let nonce = observed.nonce().to::<u64>();
+        let nonce = observed.nonce().to::<u64>() + offset;
         let inputs = vec![self.input.clone()];
         SwapAttempt {
             // The use that claims the account, or its first one with its first order.
@@ -971,7 +1026,7 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
     let requests = fixture.chain.lock().unwrap().rpc_methods.len();
     // Even after restart, quoting the recorded setup needs no chain observation.
     let executor = restarted
-        .swap_order_preview(fixture.operation, false)
+        .swap_order_preview(fixture.operation, false, None)
         .unwrap();
     assert_eq!(fixture.chain.lock().unwrap().rpc_methods.len(), requests);
     assert!(!executor.requires_setup(), "do not pay for setup again");
@@ -1165,7 +1220,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
     fixture.chain.lock().unwrap().rpc_methods.clear();
     let preview = fixture
         .owner
-        .swap_order_preview(fixture.operation, true)
+        .swap_order_preview(fixture.operation, true, None)
         .unwrap();
     assert!(preview.is_reused());
     assert!(fixture.chain.lock().unwrap().rpc_methods.is_empty());
@@ -1717,7 +1772,8 @@ async fn a_speed_up_waits_until_its_open_order_is_the_only_one_that_can_fill() {
     let (first, second) = (uid(0, 100), uid(1, 160));
     let (first_ends, second_ends) = (at_block(100), at_block(160));
     assert!(first_ends + profile.valid_to_window() < second_ends);
-    let judged = |order, now| crate::speed_up_block(&fixture.record(), &profile, 1, order, now);
+    let judged =
+        |order, now| crate::speed_up_block(&fixture.record(), &profile, 1, order, now, None);
     let binding = |order| SwapSpeedUp {
         swap_use: SwapUseId::first(fixture.operation),
         order,
@@ -1775,6 +1831,144 @@ async fn a_speed_up_waits_until_its_open_order_is_the_only_one_that_can_fill() {
             .unwrap();
         assert_eq!(judged(second, at_block(20)), Ok(binding(second)));
     }
+    fixture.finish().await;
+}
+
+// A pending setup's pass reads the account at the latest block too, on the same endpoint and
+// about the same account, and returns what it shows. The record keeps the confirmed read.
+#[tokio::test]
+async fn a_pending_setup_pass_reads_the_latest_block_once_and_records_nothing() {
+    let fixture = Fixture::start_pending().await;
+    let other_code = Bytes::from(
+        [
+            EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+            Address::repeat_byte(0xdd).as_slice(),
+        ]
+        .concat(),
+    );
+    let latest_reads = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "eth_getBlockByNumber" && request["params"][0] == "latest"
+            })
+            .count()
+    };
+    // The confirmed block 14 shows the setup's nonce 0 unconsumed. The latest block 15 shows
+    // the delegation and nonce 1, the nonce unconsumed, or another delegation.
+    for (nonce, code, included) in [
+        (1, None, true),
+        (0, None, false),
+        (1, Some(other_code), false),
+    ] {
+        let before = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head = 15;
+            chain.nonces = vec![(15, nonce)];
+            chain.head_code = code;
+            chain.rpc_requests.len()
+        };
+        let observed = fixture
+            .owner
+            .observe_swap_setup(fixture.operation)
+            .await
+            .unwrap();
+        assert_eq!(observed.status, crate::SwapSetupStatus::Pending);
+        assert_eq!(
+            observed
+                .inclusion
+                .map(|inclusion| (inclusion.block(), inclusion.nonce())),
+            included.then_some((15, U256::ONE))
+        );
+        let chain = fixture.chain.lock().unwrap();
+        let pass = &chain.rpc_requests[before..];
+        assert_eq!(latest_reads(pass), 1);
+        assert!(
+            pass.iter()
+                .filter(|request| request["method"] == "eth_getCode")
+                .all(|request| request["params"][0] == json!(EXECUTOR))
+        );
+        let at_confirmed = ExecutorNonceObservation::new(chain.block(14), U256::ZERO);
+        drop(chain);
+        let record = fixture.record();
+        assert_eq!(record.nonce_observation(), Some(at_confirmed));
+        assert_eq!(
+            record.payload_state(fixture.setup),
+            Some(ExecutorPayloadState::Pending)
+        );
+    }
+
+    // A confirmed read resolves the setup, and the pass reads no latest block.
+    let before = {
+        let mut chain = fixture.chain.lock().unwrap();
+        chain.head = 16;
+        chain.nonces = vec![(14, 1)];
+        chain.head_code = None;
+        chain.rpc_requests.len()
+    };
+    let observed = fixture
+        .owner
+        .observe_swap_setup(fixture.operation)
+        .await
+        .unwrap();
+    assert!(matches!(
+        observed.status,
+        crate::SwapSetupStatus::Delegated(_)
+    ));
+    assert_eq!(observed.inclusion, None);
+    assert_eq!(
+        latest_reads(&fixture.chain.lock().unwrap().rpc_requests[before..]),
+        0
+    );
+    fixture.finish().await;
+}
+
+// An order on an included setup names the record's confirmed observation, which stays the floor
+// of its status reads. A pre-hook that ran outside a trade in a block below the latest block
+// read at signing is still found.
+#[tokio::test]
+async fn an_order_on_an_included_setup_is_observed_from_the_confirmed_block() {
+    let fixture = Fixture::start_pending().await;
+    let receiver = Address::repeat_byte(0x77);
+    let delivery = SwapDelivery::External { receiver };
+    let attempt = fixture.attempt_after(
+        0,
+        100,
+        BUY,
+        delivery,
+        SwapApprovedBounds {
+            post_hook_gas_limit: None,
+            ..swap_bounds()
+        },
+        None,
+        1,
+    );
+    // Signed while the latest block 15 showed the setup included.
+    let record = fixture
+        .store
+        .record_swap_attempt_on_included_setup(fixture.operation, attempt, U256::ONE)
+        .unwrap();
+    let floor = record
+        .issued()
+        .iter()
+        .find(|payload| payload.purpose() == ExecutorPayloadPurpose::SwapPreHook)
+        .unwrap()
+        .context()
+        .observed()
+        .block()
+        .number;
+    assert_eq!(floor, 13);
+    // The setup and the pre-hook run in block 14.
+    fund(&fixture, 14);
+    let record = fixture.observe(17, floor).await;
+    assert!(matches!(
+        state(&record, 0),
+        SwapOrderState::PreHookOnly { .. }
+    ));
+    assert_eq!(
+        record.payload_state(fixture.setup),
+        Some(ExecutorPayloadState::Resolved)
+    );
     fixture.finish().await;
 }
 

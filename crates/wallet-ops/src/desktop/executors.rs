@@ -61,12 +61,13 @@ pub use swap::{
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
     SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
-    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPrice,
-    SwapPrivateBridgeQuote, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview, SwapReviewChange,
-    SwapReviewRequest, SwapSetupRequest, SwapSetupStatus, SwapSpeedUpRefusal, SwapUseClaim,
-    delivery_shortfall_allowance, is_swap_record, swap_attempt_state, swap_order_state,
-    swap_setup_recorded_executed, swap_setup_status, swap_speed_up_relaxes,
-    swap_submission_outcome,
+    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPlacementReadiness,
+    SwapPrice, SwapPrivateBridgeQuote, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview,
+    SwapReviewChange, SwapReviewRequest, SwapSetupInclusion, SwapSetupObservation,
+    SwapSetupRequest, SwapSetupStatus, SwapSpeedUpRefusal, SwapUseClaim,
+    delivery_shortfall_allowance, is_swap_record, own_pending_setup as own_pending_swap_setup,
+    swap_attempt_state, swap_order_state, swap_setup_recorded_executed, swap_setup_status,
+    swap_speed_up_relaxes, swap_submission_outcome,
 };
 pub use swap::{
     PreparedSwapPair, SWAP_ACCOUNT_REPLACEMENT_LIMIT, SwapAccountReplacement,
@@ -141,9 +142,10 @@ pub struct ExecutorOwner {
     synced_observation: StdMutex<Option<(WalletHandle, watch::Receiver<WalletSyncTip>)>>,
     unused: StdMutex<spare::UnusedInspections>,
     changes: watch::Sender<u64>,
-    /// Notes that UI tests plan swaps from in place of the session's, which doesn't sync.
+    /// Notes that UI tests plan swaps from in place of the session's, which doesn't sync, each
+    /// with its POI state.
     #[cfg(feature = "test-support")]
-    swap_notes_for_tests: StdMutex<Vec<railgun_wallet::Utxo>>,
+    swap_notes_for_tests: StdMutex<Vec<(railgun_wallet::Utxo, crate::UtxoPpoiState)>>,
 }
 
 struct ExecutorActivityGuard<'a> {
@@ -314,15 +316,13 @@ impl ExecutorOwner {
         prepared: &PreparedExecutorOperation,
     ) -> Result<Vec<railgun_wallet::Utxo>> {
         let record = self.validate_preparation(prepared)?;
-        if prepared.is_recovery() {
-            self.inputs_for_recovery(inputs, &record)
-        } else {
-            self.inputs_for_record(inputs, &record)
-        }
+        self.inputs_for_recovery(inputs, &record)
     }
 
-    /// Fee inputs of a recovery, including a swap's early cancellation. It competes with the
-    /// swap's own pre-hook for its nonce, so it never spends the notes that pre-hook reserves.
+    /// Fee inputs of a recovery, including a swap's early cancellation, or of a swap's setup.
+    /// A recovery competes with the swap's own pre-hook for its nonce, and a setup sent again
+    /// runs before a pre-hook on its included setup, so neither spends the notes the pre-hooks
+    /// reserve. Without them this is [`Self::inputs_for_record`].
     pub(crate) fn inputs_for_recovery(
         &self,
         inputs: Vec<railgun_wallet::Utxo>,

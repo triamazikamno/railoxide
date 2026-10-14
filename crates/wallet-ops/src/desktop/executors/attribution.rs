@@ -897,6 +897,37 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_setup_and_the_hooks_of_an_order_on_it_resolve_nonce_by_nonce() {
+        // A setup at 0 and an order signed on it before it was confirmed, with its pre-hook at
+        // 1 and its post-hook at 2. Confirmed evidence passes any number of them at once.
+        let issued = vec![
+            operation(&note(1), &[]),
+            payload(1, 6, SwapPreHook, &execute(1, Vec::new()), &[&note(2)], &[]),
+            payload(
+                2,
+                7,
+                crate::vault::ExecutorPayloadPurpose::SwapPostHook,
+                &execute(2, Vec::new()),
+                &[],
+                &[],
+            ),
+        ];
+        for consumed in 0..=3 {
+            let expected = [0, 1, 2].map(|nonce| {
+                if nonce < consumed {
+                    Executed
+                } else {
+                    ExecutorPayloadOutcome::Pending
+                }
+            });
+            assert_eq!(
+                outcomes(&record(issued.clone(), consumed), None, &[], &[1, 6, 7]),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn later_recovery_that_invalidates_the_order_keeps_it_from_naming_the_cancellation() {
         let later = vec![payload(
             2,

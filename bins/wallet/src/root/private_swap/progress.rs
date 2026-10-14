@@ -43,8 +43,8 @@ use super::model::{
     SwapActions, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapSetupProgress,
     SwapStage, SwapStep, SwapStepAccount, bridge_sent_amount, card_line, needs_executed_fee,
     prepared_swap_use, private_delivery_credit, provider_name, record_outcome_order, record_swaps,
-    reported_fill_note, speed_up_shown, swap_actions, swap_order_group, swap_order_stage,
-    swap_order_status, swap_outcome, swap_private_delivery, swap_private_minimum,
+    reported_fill_note, setup_unresolved_below, speed_up_shown, swap_actions, swap_order_group,
+    swap_order_stage, swap_order_status, swap_outcome, swap_private_delivery, swap_private_minimum,
     swap_setup_progress, swap_steps, swap_use_destination, swap_valid_to,
 };
 use super::setup_progress::{SetupProgress, SetupProgressEnd};
@@ -70,6 +70,13 @@ use crate::root::submission_progress::{
     render_submission_progress_groups, render_submission_progress_stepper,
 };
 use crate::root::utxo::short_hash;
+
+/// Why Cancel order… waits while a setup below the open order is unconfirmed.
+const CANCEL_WAITS_FOR_SETUP: &str = "The order can be cancelled once the stealth account's setup is confirmed. An order left alone expires at no cost.";
+
+/// Why Swap again waits after an order placed on a setup that isn't confirmed yet.
+const RETRY_WAITS_FOR_SETUP: &str =
+    "You can swap again once the stealth account's setup is confirmed.";
 
 /// A broadcaster's fee for an early cancellation, estimated before the confirmation.
 pub(super) struct CancelQuote {
@@ -286,7 +293,7 @@ impl PrivateSwapsView {
             );
         };
         let pending = self.pending_order(record);
-        let stage = self.progress_stage(record);
+        let stage = self.detail_stage(record);
         let stopped = record.is_swap_setup_stopped();
         let labels = self.labels(record, cx);
         let tracking = self.tracking.get(&operation);
@@ -305,7 +312,11 @@ impl PrivateSwapsView {
         } else {
             swap_actions(stage, past_valid_to)
         };
-        if let Some(problem) = self.setup_retry_problem(record) {
+        // A setup shown included is past its setup, where the step places the order.
+        if let Some(problem) = self
+            .setup_retry_problem(record)
+            .filter(|_| matches!(stage, SwapStage::SetupPending | SwapStage::SetupSubmitting))
+        {
             actions.resume = actions.resume.map(|_| Err(problem));
         }
         // A private Bridge swap whose own account is set up waits for its destination
@@ -341,13 +352,22 @@ impl PrivateSwapsView {
         }
         // Speed up goes with an available Cancel order, as the owner's rule answers for the
         // open order, once that order has been open for a short while.
-        let actions = actions.with_speed_up(
+        let latest_order = record.swap().and_then(|swap| swap.orders().last());
+        let mut actions = actions.with_speed_up(
             self.speed_up_refusal(record),
-            record
-                .swap()
-                .and_then(|swap| swap.orders().last())
-                .is_some_and(|order| speed_up_shown(order, now)),
+            latest_order.is_some_and(|order| speed_up_shown(order, now)),
         );
+        // A cancellation is a recovery, which needs the account's setup confirmed below the
+        // open order. Speed up, decided above, stays as the owner's rule answers.
+        if !cancelling && latest_order.is_some_and(|order| setup_unresolved_below(record, order)) {
+            actions.cancel = actions.cancel.map(|_| Err(CANCEL_WAITS_FOR_SETUP));
+        }
+        // A new order on the account follows the order retry rules once its setup is confirmed.
+        let retry_waits_for_setup =
+            latest_order.is_some_and(|order| setup_unresolved_below(record, order));
+        if retry_waits_for_setup {
+            actions.retry = actions.retry.map(|_| Err(RETRY_WAITS_FOR_SETUP));
+        }
         // A second order with a lower minimum, reviewed in the swap form. The open order
         // stays. The action sits in the order step, under the order's ID.
         let busy = self.busy();
@@ -371,6 +391,11 @@ impl PrivateSwapsView {
                 )
                 .into_any_element()
         });
+        // The automatic attempt to place the approved order waits for the setup's change.
+        let waits_for_change = job.is_none()
+            && pending.is_none()
+            && self.approved_use(record).is_some()
+            && tracking.is_some_and(|tracking| tracking.auto_place && tracking.waits_for_change);
         // A swap that set an account up shows the setup, or the order's steps without it. A
         // setup with no account left to show keeps its step among the swap's, alone.
         let sets_up = self.sets_up_account(record);
@@ -397,6 +422,8 @@ impl PrivateSwapsView {
                     } else if index == 1 && job == Some(SwapJobKind::Requote) {
                         step.status = PublicActionStepStatus::Pending;
                         "Checking the approved terms…".into()
+                    } else if index == 1 && waits_for_change {
+                        "Waiting for the setup's change to become spendable".into()
                     } else {
                         step.detail.clone()
                     };
@@ -475,13 +502,13 @@ impl PrivateSwapsView {
             Some(
                 match (tracking.is_some_and(|tracking| tracking.auto_place), two_setups) {
                     (true, false) => {
-                        "You can close this. Once the setup confirms, the wallet checks the quote again and asks you to place the order."
+                        "You can close this. Once the setup is in a block, the wallet checks the quote again and asks you to place the order."
                     }
                     (true, true) => {
                         "You can close this. Once both setups confirm, the wallet checks the quote again and asks you to place the order."
                     }
                     (false, false) => {
-                        "The order isn't placed yet. Once the setup confirms, place it from here."
+                        "The order isn't placed yet. Once the setup is in a block, place it from here."
                     }
                     (false, true) => {
                         "The order isn't placed yet. Once both setups confirm, place it from here."
@@ -507,6 +534,8 @@ impl PrivateSwapsView {
                 }
                 .into(),
             )
+        } else if retry_waits_for_setup && actions.retry.is_some() {
+            Some(RETRY_WAITS_FOR_SETUP.into())
         } else {
             // A reported fill leaves nothing to do, which the note of its stage doesn't say.
             reported_fill_note(stage, &labels)
@@ -567,7 +596,7 @@ impl PrivateSwapsView {
         // The accounts no setup above names stay among the facts.
         let named = setups.as_ref().is_none_or(|setups| !setups.is_empty());
         let accounts = if steps_shown && sets_up && named {
-            Self::account_facts(record, &labels, stage)
+            self.account_facts(record, &labels, stage, cx)
         } else {
             Vec::new()
         };
@@ -711,7 +740,7 @@ impl PrivateSwapsView {
         }
         self.record(operation)
             .and_then(|record| {
-                let stage = self.progress_stage(record);
+                let stage = self.detail_stage(record);
                 self.setup_columns(record, stage, &self.labels(record, cx), cx)
             })
             .is_some_and(|setups| setups.len() > 1)
@@ -747,7 +776,7 @@ impl PrivateSwapsView {
         }
         self.record(operation)
             .and_then(|record| {
-                let stage = self.progress_stage(record);
+                let stage = self.detail_stage(record);
                 self.setup_columns(record, stage, &self.labels(record, cx), cx)
             })
             .is_some_and(|setups| setups.iter().any(|setup| setup.side == side))
@@ -872,11 +901,15 @@ impl PrivateSwapsView {
     }
 
     /// The stealth accounts of a swap that set one up, as facts: the swap's own, or for a
-    /// private Bridge swap each account that is confirmed or reused, with its network.
+    /// private Bridge swap each account that is confirmed or reused, with its network. While
+    /// the record leaves the swap's own setup unresolved, its fact also tells that setup, as
+    /// [`Self::own_setup_fact`] does.
     fn account_facts(
+        &self,
         record: &ExecutorRecord,
         labels: &SwapLabels,
         stage: SwapStage,
+        cx: &Context<'_, Self>,
     ) -> Vec<gpui::Div> {
         let private = labels
             .bridge
@@ -886,7 +919,7 @@ impl PrivateSwapsView {
             return record
                 .address()
                 .map(|address| {
-                    fact_row(
+                    let fact = fact_row(
                         "Stealth account",
                         stealth_account(
                             "swap-fact-account",
@@ -896,7 +929,8 @@ impl PrivateSwapsView {
                             },
                         ),
                     )
-                    .debug_selector(|| "swap-detail-account".into())
+                    .debug_selector(|| "swap-detail-account".into());
+                    self.with_own_setup_fact(fact, record, cx)
                 })
                 .into_iter()
                 .collect();
@@ -909,26 +943,100 @@ impl PrivateSwapsView {
                     // Held proceeds name the destination account among the bridge's facts.
                     && (*side == SetupSide::Origin || !stage.is_held_on_destination())
             })
-            .filter_map(|(_, account)| {
-                Some(
-                    fact_row(
-                        format!("Stealth account on {}", account.network),
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(stealth_account("swap-fact-account", account.account?))
-                            .child(app_muted_text(if account.reused {
-                                "· reused"
-                            } else {
-                                "· set up"
-                            })),
-                    )
-                    .debug_selector(|| "swap-detail-account".into()),
+            .filter_map(|(side, account)| {
+                let fact = fact_row(
+                    format!("Stealth account on {}", account.network),
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(stealth_account("swap-fact-account", account.account?))
+                        .child(app_muted_text(if account.reused {
+                            "· reused"
+                        } else {
+                            "· set up"
+                        })),
                 )
+                .debug_selector(|| "swap-detail-account".into());
+                Some(match side {
+                    SetupSide::Origin => self.with_own_setup_fact(fact, record, cx),
+                    SetupSide::Destination => fact,
+                })
             })
             .collect()
+    }
+
+    /// `fact`, the swap's own stealth account, with [`Self::own_setup_fact`] under it.
+    fn with_own_setup_fact(
+        &self,
+        fact: gpui::Div,
+        record: &ExecutorRecord,
+        cx: &Context<'_, Self>,
+    ) -> gpui::Div {
+        match self.own_setup_fact(record, cx) {
+            Some(setup) => div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap_1()
+                .child(fact)
+                .child(setup),
+            None => fact,
+        }
+    }
+
+    /// What the swap's own stealth account fact tells of its setup while the record leaves
+    /// that setup unresolved and the detail is past it: the confirmation the setup's own body
+    /// shows while private sync or this session's latest read shows it included, until it is
+    /// confirmed. Once neither shows it under an order, open or ended, that the setup is no
+    /// longer included, with Retry setup…, which sends it again with the same account.
+    fn own_setup_fact(&self, record: &ExecutorRecord, cx: &Context<'_, Self>) -> Option<gpui::Div> {
+        wallet_ops::own_pending_swap_setup(record)?;
+        // Before the order, the setup's own body tells it until the latest read shows it
+        // included.
+        if record.swap().is_none() && self.setup_inclusion(record).is_none() {
+            return None;
+        }
+        if self.own_setup_included(record) {
+            let confirmation = self
+                .setup_confirmation_detail(record, cx)
+                .unwrap_or_else(|| "Confirming…".into());
+            return Some(
+                div()
+                    .debug_selector(|| "swap-detail-account-setup".into())
+                    .child(app_muted_text(confirmation).whitespace_normal()),
+            );
+        }
+        record.swap()?;
+        let operation = record.operation();
+        let busy = self.busy();
+        let retry = self
+            .setup_retry_availability(record, SetupSide::Origin, cx)
+            .map(|availability| {
+                app_button("swap-setup-retry-origin", "Retry setup…")
+                    .debug_selector(|| "swap-setup-retry-origin".into())
+                    .small()
+                    .outline()
+                    .flex_none()
+                    .disabled(busy || availability.is_err())
+                    .when_some(availability.err(), gpui_component::button::Button::tooltip)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_setup_retry(operation, SetupSide::Origin, window, cx);
+                    }))
+            });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap_1()
+                .debug_selector(|| "swap-detail-account-setup".into())
+                .child(app_muted_text("The setup is no longer included.").whitespace_normal())
+                .children(retry),
+        )
     }
 
     /// An earlier swap on a reused stealth account, read only: its steps, facts and outcome from
@@ -2092,6 +2200,7 @@ impl PrivateSwapsView {
         let recover_is_next = stage.needs_recovery();
         let cancel = actions.cancel.map(|availability| {
             app_button("swap-progress-cancel-order", "Cancel order…")
+                .debug_selector(|| "swap-progress-cancel-order".into())
                 .danger()
                 .small()
                 .flex_none()
@@ -2129,9 +2238,10 @@ impl PrivateSwapsView {
             .disabled((busy && !setup_job) || availability.is_err())
             .when_some(availability.err(), gpui_component::button::Button::tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
+                // A setup shown included places its order; only a setup sent again waits.
                 if this
                     .record(operation)
-                    .is_none_or(|record| this.setup_retry_problem(record).is_some())
+                    .is_none_or(|record| !place && this.setup_retry_problem(record).is_some())
                 {
                     return;
                 }

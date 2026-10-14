@@ -1183,6 +1183,33 @@ pub(in crate::root) fn prepared_swap_use(record: &ExecutorRecord) -> Option<&Swa
     .then_some(swap_use)
 }
 
+/// The swap use whose own setup can be sent again beside its orders: the use that reserved the
+/// record's account fresh, with an order, open or ended, placed on that setup while the record
+/// still leaves the setup unresolved. Its saved approval keeps the retry's fee limit.
+pub(in crate::root) fn order_setup_use(record: &ExecutorRecord) -> Option<&SwapUseRecord> {
+    wallet_ops::own_pending_swap_setup(record)?;
+    let swap_use = record.swap_use(record.active_swap_use()?)?;
+    (swap_use.is_fresh()
+        && !swap_use.is_stopped()
+        && record.has_swap_use_order(swap_use.id())
+        && swap_use.approval().is_some())
+    .then_some(swap_use)
+}
+
+/// Whether a setup of `record`'s account below `order`'s pre-hook nonce is unresolved, as the
+/// setup below an order placed on it while included is until it is confirmed.
+pub(in crate::root) fn setup_unresolved_below(
+    record: &ExecutorRecord,
+    order: &SwapOrderRecord,
+) -> bool {
+    let nonce = order.pre_hook().nonce();
+    record.issued().iter().any(|payload| {
+        payload.purpose() == ExecutorPayloadPurpose::Operation
+            && payload.nonce() < nonce
+            && !record.nonce_resolved(payload.nonce())
+    })
+}
+
 /// Stopped preparations have no order UID but retain their account and signed-work history.
 pub(in crate::root) fn cancelled_swap_uses(
     record: &ExecutorRecord,

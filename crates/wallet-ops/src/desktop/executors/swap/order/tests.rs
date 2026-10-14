@@ -80,6 +80,7 @@ fn delegated_executor() -> DelegatedSwapExecutor {
             BlockNumHash::new(12, B256::repeat_byte(12)),
             U256::ONE,
         ),
+        inclusion: None,
     }
 }
 

@@ -1877,7 +1877,7 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
     let pass = async |head: u64| {
         rpc.state.head.store(head, Ordering::Relaxed);
         let before = rpc.state.requests.lock().unwrap().len();
-        let status = owner.observe_swap_setup(operation).await.unwrap();
+        let status = owner.observe_swap_setup(operation).await.unwrap().status;
         let requests = rpc.state.requests.lock().unwrap()[before..].to_vec();
         (status, requests)
     };
@@ -1914,7 +1914,7 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
         owner.set_hidden(operation, true).unwrap();
         rpc.hold.send_replace(None);
     });
-    assert_eq!(status.unwrap(), SwapSetupStatus::Pending);
+    assert_eq!(status.unwrap().status, SwapSetupStatus::Pending);
     owner.set_hidden(operation, false).unwrap();
 
     // The user releases the setup's notes and a transaction that is not recorded for the

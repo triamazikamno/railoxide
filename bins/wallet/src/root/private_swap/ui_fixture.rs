@@ -148,6 +148,23 @@
 //!   retry dialog of that account alone. A wallet without private funds has no broadcaster to
 //!   pay there, so the dialog says so and its Continue stays disabled, except in `retired`.
 //!   The footer has no Retry setup… or Continue…, and the detail's other actions do nothing.
+//! - `setup:included-order-open`, `setup:dropped-order-open` and `setup:dropped-order-expired`
+//!   open the swap dialog, in place of a Public account's form, on the detail of a synthesized
+//!   swap of 0.05 WETH for USDC back to the private balance on Ethereum, whose one order was
+//!   placed while its new stealth account's setup was included and not yet confirmed. The
+//!   setup is at nonce 0, which the confirmed nonce read leaves unresolved, and the order's
+//!   hooks are at nonces 1 and 2. In `included-order-open` the order is open and the setup is
+//!   included 3 blocks below a head of the fixture's own, so the stealth account fact reads
+//!   Confirming (3/12 blocks) and the count holds still. Speed up… is offered, as the latest
+//!   read that admitted the order offers it, and opens the route of the order's orderbook and
+//!   nothing else. In `dropped-order-open` the order is open and nothing shows the setup
+//!   included, so the fact says the setup is no longer included and offers Retry setup…,
+//!   and Speed up… isn't shown. `dropped-order-expired` is that order once it expired with
+//!   its pre-hook never run, so nothing was unshielded, and the fact offers the same Retry
+//!   setup…. Under the open order Cancel order… is disabled with its reason while the setup is
+//!   unconfirmed. Retry setup… opens the retry dialog of the swap's own account, which on a
+//!   wallet without private funds has no broadcaster to pay, as in the other `setup:` states.
+//!   The detail's other actions do nothing.
 //! - `reported:<state>` opens the swap dialog, in place of a Public account's form, on the
 //!   detail of a synthesized swap of 0.05 WETH for USDC on Ethereum whose one order is open on
 //!   its record while the orderbook reports it filled for 101.31 USDC. Nothing of the fill is
@@ -166,11 +183,12 @@
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
-//! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode opens the
-//! route its orderbook client would use, and sends nothing on it. A `quote-error` mode opens no
-//! route. A `reported:` mode asks no orderbook, chain or bridge provider about its swap. The
-//! review of a `setup:fee-token` or `setup:retired` mode holds the broadcaster network's
-//! client, as any setup's review does, and publishes nothing on it.
+//! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode, and the
+//! Speed up… of `setup:included-order-open`, opens the route its orderbook client would use,
+//! and sends nothing on it. A `quote-error` mode opens no route. A `reported:` mode asks no
+//! orderbook, chain or bridge provider about its swap. The review of a `setup:fee-token` or
+//! `setup:retired` mode holds the broadcaster network's client, as any setup's review does,
+//! and publishes nothing on it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -233,7 +251,20 @@ enum Mode {
     Split(Split),
     SpeedUp(SpeedUp),
     Setup(Setup),
+    SetupUnderOrder(SetupUnderOrder),
     Reported(Reported),
+}
+
+/// What a `setup:` mode holds of the swap's own setup below its one order, which was placed
+/// while that setup was included and not yet confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupUnderOrder {
+    /// The order is open and the setup is still included.
+    Included,
+    /// The order is open and nothing shows the setup included any more.
+    Dropped,
+    /// The order expired, its pre-hook never ran, and the setup never returned.
+    Expired,
 }
 
 /// What a `reported:` mode's session holds about the synthesized private swap's open order,
@@ -406,6 +437,15 @@ fn parse(value: &str) -> Option<Mode> {
         }));
     }
     if let Some(state) = value.strip_prefix("setup:") {
+        let under_order = match state {
+            "included-order-open" => Some(SetupUnderOrder::Included),
+            "dropped-order-open" => Some(SetupUnderOrder::Dropped),
+            "dropped-order-expired" => Some(SetupUnderOrder::Expired),
+            _ => None,
+        };
+        if let Some(under_order) = under_order {
+            return Some(Mode::SetupUnderOrder(under_order));
+        }
         return Some(Mode::Setup(match state {
             "running" => Setup::Running,
             "waiting" => Setup::Waiting,
@@ -536,9 +576,18 @@ pub(super) fn holds_swaps() -> bool {
                 | Mode::Split(_)
                 | Mode::SpeedUp(_)
                 | Mode::Setup(_)
+                | Mode::SetupUnderOrder(_)
                 | Mode::Reported(_)
         )
     )
+}
+
+/// The block a `setup:included-order-open` mode holds its swap's own setup included in, as
+/// private sync would show it, and the head that setup's confirmations count from in place of
+/// the synced one, which nothing finalizes. `None` in every other mode.
+pub(super) fn setup_included() -> Option<(u64, u64)> {
+    matches!(mode()?, Mode::SetupUnderOrder(SetupUnderOrder::Included))
+        .then_some((SETUP_INCLUDED_BLOCK, SETUP_INCLUDED_BLOCK + 3))
 }
 
 /// The head block a `reported:` mode counts its reported settlement's confirmations from, in
@@ -561,14 +610,17 @@ pub(super) fn review_refusal() -> Option<&'static str> {
     .then_some("Fixture: this mode stops at the review. Nothing was sent.")
 }
 
-/// What the owner's rule would answer about speeding up a speed-up mode's synthesized swap,
-/// which no owner holds: `Some(Ok(()))` offers the speed-up. `None` in every other mode.
+/// What the owner's rule would answer about speeding up the synthesized swap of a speed-up or
+/// `setup:included-order-open` mode, which no owner holds: `Some(Ok(()))` offers the speed-up.
+/// `None` in every other mode.
 pub(super) fn speed_up_refusal() -> Option<Result<(), SwapSpeedUpRefusal>> {
     match mode()? {
         Mode::SpeedUp(SpeedUp::TwoOrders | SpeedUp::Rejected) => {
             Some(Err(SwapSpeedUpRefusal::TwoOrdersFillable))
         }
-        Mode::SpeedUp(SpeedUp::Review | SpeedUp::Open | SpeedUp::JustPlaced) => Some(Ok(())),
+        // The latest read that admitted the order on its included setup admits its speed-up.
+        Mode::SpeedUp(SpeedUp::Review | SpeedUp::Open | SpeedUp::JustPlaced)
+        | Mode::SetupUnderOrder(SetupUnderOrder::Included) => Some(Ok(())),
         _ => None,
     }
 }
@@ -635,7 +687,8 @@ pub(super) fn step(phase: Phase) -> Option<(Duration, Step)> {
             | Mode::RetryReview
             | Mode::QuoteError
             | Mode::Split(_)
-            | Mode::Setup(_),
+            | Mode::Setup(_)
+            | Mode::SetupUnderOrder(_),
             Phase::Approved,
         ) => (
             Duration::ZERO,
@@ -1277,13 +1330,22 @@ fn staged_swap_record(
     nonce: u8,
     signed: u64,
 ) -> Option<ExecutorRecord> {
+    serde_json::from_value(staged_swap_json(orders, nonce, signed)?).ok()
+}
+
+/// [`staged_swap_record`] as the JSON a stored record has.
+fn staged_swap_json(
+    orders: &[serde_json::Value],
+    nonce: u8,
+    signed: u64,
+) -> Option<serde_json::Value> {
     use ExecutorPayloadPurpose::{Operation, SwapPostHook, SwapPreHook};
     let mut issued = vec![staged_payload(0, 0xa0, Operation, Some(0xc0))];
     for hash in [0xa1, 0xb1].into_iter().take(orders.len()) {
         issued.push(staged_payload(1, hash, SwapPreHook, None));
         issued.push(staged_payload(2, hash + 1, SwapPostHook, None));
     }
-    serde_json::from_value(serde_json::json!({
+    Some(serde_json::json!({
         "version": 1, "derivation": "Railgun7702V1", "origin": "Reserved",
         "operation": ExecutorOperationId::random().ok()?, "index": 4,
         "address": SWAP_ACCOUNT, "delegate": Address::repeat_byte(0x5d), "retired": false,
@@ -1304,7 +1366,55 @@ fn staged_swap_record(
             "orders": orders,
         },
     }))
-    .ok()
+}
+
+/// The block a `setup:included-order-open` mode's private sync would show its swap's own setup
+/// in, just past the confirmed nonce read of its record.
+const SETUP_INCLUDED_BLOCK: u64 = SWAP_ORIGIN_BLOCK + 1_503;
+
+/// The record of a `setup:` mode's swap of 0.05 WETH for USDC back to the private balance,
+/// whose one order was placed on its own setup while that setup was included: the setup at
+/// nonce 0, which the record's confirmed nonce read leaves unresolved, and the order's hooks at
+/// nonces 1 and 2. The order was signed five minutes ago, or with `expired` 25 minutes ago, past
+/// its 20-minute validity, and ended at its expiry with its pre-hook never run.
+fn staged_setup_under_order(expired: bool) -> Option<ExecutorRecord> {
+    let signed = now_unix().saturating_sub(if expired { 1_500 } else { 300 });
+    let observations = if expired {
+        let observation = SwapObservation {
+            block: BlockNumHash::new(SWAP_ORIGIN_BLOCK + 1_600, keccak256("expired")),
+            transaction_hash: None,
+        };
+        SwapOrderObservations {
+            pre_hook_dead: Some(SwapPreHookDeath {
+                cause: SwapPreHookDeathCause::Expired,
+                observation,
+            }),
+            expired: Some(observation),
+            ..Default::default()
+        }
+    } else {
+        SwapOrderObservations::default()
+    };
+    let mut order = staged_order(
+        0,
+        signed,
+        RETRY,
+        0xa1,
+        &serde_json::to_value(observations).ok()?,
+    )?;
+    order["delivery"] = serde_json::to_value(SwapDelivery::Reshield).ok()?;
+    order["bridge"] = serde_json::Value::Null;
+    order["bounds"]["destination_minimum"] = serde_json::Value::Null;
+    let mut record = staged_swap_json(&[order], 0, signed)?;
+    // The account was last read at nonce 0, below the setup's inclusion.
+    record["nonce_observation"] = serde_json::to_value(ExecutorNonceObservation::new(
+        BlockNumHash::new(SWAP_ORIGIN_BLOCK + 1_500, keccak256("observed")),
+        U256::ZERO,
+    ))
+    .ok()?;
+    // The approval saved with the swap, which keeps the fee limit of a setup sent again.
+    record["swap_approval"] = serde_json::to_value(staged_setup_approval(None)?).ok()?;
+    serde_json::from_value(record).ok()
 }
 
 /// What a `quote-error` mode's form is opened to sell, to buy and for which amount, and the
@@ -1902,6 +2012,7 @@ impl PrivateSwapsView {
                 | Mode::QuoteError
                 | Mode::SpeedUp(SpeedUp::Review)
                 | Mode::Setup(_)
+                | Mode::SetupUnderOrder(_)
                 | Mode::Reported(_),
             ) => None,
             Some(Mode::Split(split)) => Some((Some(split), None)),
@@ -1914,6 +2025,17 @@ impl PrivateSwapsView {
         }
         if let Some(Mode::Setup(setup)) = mode() {
             self.open_ui_fixture_setup(setup, window, cx);
+            return true;
+        }
+        if let Some(Mode::SetupUnderOrder(under_order)) = mode() {
+            let Some(record) = staged_setup_under_order(under_order == SetupUnderOrder::Expired)
+            else {
+                tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
+                return true;
+            };
+            let operation = record.operation();
+            self.records = vec![record];
+            self.show_detail(operation, window, cx);
             return true;
         }
         if let Some(Mode::Reported(reported)) = mode() {
