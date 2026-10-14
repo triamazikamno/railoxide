@@ -177,6 +177,25 @@ impl PrivateSwapsView {
         self.dialog.as_ref()?.focus.as_ref()?.upgrade()
     }
 
+    /// Move the focus to the root of the swap dialog or setup retry dialog that holds it. A
+    /// job disables the dialog's controls, and a disabled switch or select stops tracking its
+    /// focus, after which the dialog would read as covered when the job ends.
+    pub(super) fn focus_active_dialog(&self, window: &mut Window, cx: &mut App) {
+        let dialogs = [
+            self.setup_retry
+                .as_ref()
+                .and_then(super::form::SetupRetryForm::focus),
+            self.swap_dialog_focus(),
+        ];
+        if let Some(focus) = dialogs
+            .into_iter()
+            .flatten()
+            .find(|focus| focus.contains_focused(window, cx))
+        {
+            focus.focus(window, cx);
+        }
+    }
+
     /// The swap dialog is open and nothing is in front of it.
     pub(super) fn swap_dialog_active(&self, window: &Window, cx: &App) -> bool {
         self.swap_dialog_focus()
@@ -634,8 +653,8 @@ impl PrivateSwapsView {
     /// When a swap started: for a swap that reused its stealth account, when its use claimed
     /// the account. Otherwise its first order's `validTo` less the validity it was signed
     /// with, or the profile's order window for records without one, or for a swap without
-    /// orders, when its stealth account was reserved. Without either validity, the first
-    /// order's expiry, labeled as such.
+    /// orders, when its use claimed its first stealth account, which a replaced account's
+    /// swap keeps. Without either validity, the first order's expiry, labeled as such.
     pub(super) fn swap_started(
         &self,
         record: &ExecutorRecord,
@@ -643,7 +662,12 @@ impl PrivateSwapsView {
         cx: &App,
     ) -> Option<(&'static str, u64)> {
         let Some(swap) = swap else {
-            return record.created_at().map(|at| ("Started", at));
+            // A swap whose own account was replaced started before its new account was
+            // reserved, when its use first claimed one.
+            return super::model::prepared_swap_use(record)
+                .and_then(wallet_ops::vault::SwapUseRecord::started_at)
+                .or_else(|| record.created_at())
+                .map(|at| ("Started", at));
         };
         if let Some(claimed) = record
             .swap_use(swap.swap_use)

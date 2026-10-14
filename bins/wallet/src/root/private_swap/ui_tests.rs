@@ -630,6 +630,7 @@ fn private_swap_progress_preserves_other_dialogs_and_can_restart_a_retired_setup
         );
         // A preparation may retire an account after detecting prior chain activity. A retry
         // must open a fresh swap review instead of resubmitting that unusable reservation.
+        // This swap has no saved approval for a new account to continue under.
         executors.retire(operation).unwrap();
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -640,7 +641,8 @@ fn private_swap_progress_preserves_other_dialogs_and_can_restart_a_retired_setup
                 assert!(actions.resume.is_some_and(|available| available.is_ok()));
                 // Ended, it leaves the Private tab by itself.
                 assert!(!actions.recover && !actions.dismiss);
-                swaps.open_existing_form(operation, window, cx);
+                swaps.resume_swap(operation, window, cx);
+                assert!(swaps.setup_retry.is_none());
                 assert!(swaps.form.as_ref().unwrap().operation().is_none());
                 assert!(swaps.record(operation).unwrap().is_retired());
             });
@@ -1268,6 +1270,560 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
     });
 }
 
+/// A setup that waits for a broadcaster's answer is offered again once its request was
+/// re-sent five times: Retry setup… sits on its waiting row, and stops that wait as the
+/// timeout would, so the setup ends unanswered and can still be included, before the retry's
+/// dialog opens. The swap still places its order once the setup is confirmed.
+#[gpui::test]
+fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use super::super::setup_progress::{SetupProgress, SetupProgressEnd};
+
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        executors
+            .bind_address(operation, Address::repeat_byte(3))
+            .unwrap();
+        executors
+            .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
+            .unwrap();
+        let waiting_since = Rc::new(Cell::new(None));
+        let waited = |secs| Instant::now().checked_sub(Duration::from_secs(secs));
+        let _stages = cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.job = Some(SwapJob {
+                    operation,
+                    kind: SwapJobKind::Setup,
+                    abort: runtime.spawn(std::future::pending::<()>()).abort_handle(),
+                });
+                swaps.show_detail(operation, window, cx);
+                let (stages, receiver) = tokio::sync::watch::channel(
+                    TransactionGenerationStage::WaitingForBroadcasterResponse,
+                );
+                let tracking = swaps.tracking.entry(operation).or_default();
+                tracking.auto_place = true;
+                *tracking.setup_progress_mut(SetupSide::Origin) = Some(
+                    SetupProgress::running(receiver, None).waiting_since(Rc::clone(&waiting_since)),
+                );
+                stages
+            })
+        });
+
+        // Re-sent twice: the setup still waits, with no retry.
+        waiting_since.set(waited(12));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-setup-retry-origin").is_none());
+
+        // Re-sent five times: its row offers the retry, while its job runs.
+        waiting_since.set(waited(26));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let retry = cx.debug_bounds("swap-setup-retry-origin").unwrap();
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        swaps.read_with(cx, |swaps, _| {
+            assert!(swaps.job.is_none(), "the wait stopped");
+            let tracking = &swaps.tracking[&operation];
+            assert_eq!(
+                tracking
+                    .setup_progress(SetupSide::Origin)
+                    .and_then(SetupProgress::end),
+                Some(SetupProgressEnd::TimedOut)
+            );
+            assert!(tracking.auto_place);
+            assert!(
+                swaps
+                    .setup_retry
+                    .as_ref()
+                    .is_some_and(|retry| retry.operation == operation),
+                "the retry's dialog opened"
+            );
+        });
+    });
+}
+
+/// A setup job that replaces the swap's used account keeps it one swap. The view moves the
+/// swap when the job reports the replacement: its detail stays open on the new account with
+/// the setup's stages, which the running setup keeps reporting into, and the swap keeps its
+/// start time and terms. Nothing the view holds for the swap names the retired account: the
+/// Private tab and My orders list the swap once, under its new account, and the retired
+/// account is left to Stealth accounts as an account that holds no swap.
+#[gpui::test]
+fn a_replaced_account_keeps_the_swap_and_its_open_detail(cx: &mut TestAppContext) {
+    use wallet_ops::vault::SwapUseSide;
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        let swap_use = SwapUseId::first(operation);
+        executors
+            .bind_address(operation, Address::repeat_byte(3))
+            .unwrap();
+        let started = executors
+            .record_swap_approval(operation, swap_use, test_approval())
+            .unwrap()
+            .swap_use(swap_use)
+            .unwrap()
+            .started_at();
+        // This session sends the setup, and the swap's detail shows it.
+        let (stages, (replacements, _following)) = cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.job = Some(SwapJob {
+                    operation,
+                    kind: SwapJobKind::Setup,
+                    abort: runtime.spawn(std::future::pending::<()>()).abort_handle(),
+                });
+                swaps.show_detail(operation, window, cx);
+                (
+                    swaps.start_setup_progress(operation, SetupSide::Origin, cx),
+                    PrivateSwapsView::follow_replacements(cx),
+                )
+            })
+        });
+
+        // The job finds the account used, retires it, replaces it and reports that.
+        let replacement = ExecutorOperationId::random().unwrap();
+        executors.retire(operation).unwrap();
+        executors
+            .replace_swap_use_account(operation, swap_use, SwapUseSide::Source, replacement)
+            .unwrap();
+        replacements
+            .send(ReplacedSwapAccount {
+                from: operation,
+                swap: SwapAccountReplacement {
+                    operation: replacement,
+                    swap_use,
+                    replacement,
+                },
+            })
+            .unwrap();
+        cx.run_until_parked();
+        stages
+            .send(TransactionGenerationStage::PublishingToBroadcaster)
+            .unwrap();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        swaps.read_with(cx, |swaps, _| {
+            assert_eq!(
+                swaps.dialog.as_ref().map(|dialog| dialog.view),
+                Some(SwapDialogView::Detail(replacement))
+            );
+            assert!(
+                swaps
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.operation == replacement)
+            );
+            assert!(!swaps.tracking.contains_key(&operation));
+            assert_eq!(
+                swaps.tracking[&replacement]
+                    .setup_progress(SetupSide::Origin)
+                    .and_then(SetupProgress::stage),
+                Some(TransactionGenerationStage::PublishingToBroadcaster)
+            );
+            // The Private tab lists one swap, with the start time and terms it had.
+            let shown = swaps
+                .shown_swaps()
+                .map(|(record, _)| record.operation())
+                .collect::<Vec<_>>();
+            assert_eq!(shown, [replacement]);
+            let claimed = swaps
+                .record(replacement)
+                .and_then(|record| record.swap_use(swap_use))
+                .unwrap();
+            assert_eq!(claimed.started_at(), started);
+            assert_eq!(claimed.approval(), Some(&test_approval()));
+        });
+        let publishing = format!(
+            "submission-step-swap-setup-{}-origin-publish",
+            replacement.opaque_id()
+        );
+        assert!(
+            cx.debug_bounds(publishing.leak()).is_some(),
+            "the open detail shows the replacement's running setup"
+        );
+        swaps.update(cx, |swaps, _| {
+            if let Some(job) = swaps.job.take() {
+                job.abort.abort();
+            }
+        });
+
+        // My orders lists the swap once, started when it first claimed an account.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.swap_started(swaps.record(replacement).unwrap(), None, cx),
+                    started.map(|at| ("Started", at))
+                );
+                swaps.orders_filter = None;
+                swaps.show_view(SwapDialogView::Orders, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let row = |operation: ExecutorOperationId, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(format!("swap-order-row-{}", operation.opaque_id()).leak())
+                .is_some()
+        };
+        assert!(row(replacement, cx) && !row(operation, cx));
+        // Stealth accounts lists every record, and tags the ones that are a swap's.
+        let records = executors.records().unwrap();
+        let listed = |operation| {
+            records
+                .iter()
+                .find(|record| record.operation() == operation)
+                .map(|record| (record.is_retired(), wallet_ops::is_swap_record(record)))
+        };
+        assert_eq!(listed(operation), Some((true, false)));
+        assert_eq!(listed(replacement), Some((false, true)));
+    });
+}
+
+/// Cancel preparation… is confirmed after the running setup job replaced the swap's used
+/// account, with the job's report of that `followed` by the view or still unread. Either way
+/// the confirmation cancels the swap where it is by then.
+fn cancel_preparation_after_replacement(cx: &mut TestAppContext, followed: bool) {
+    use wallet_ops::vault::SwapUseSide;
+    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        let swap_use = SwapUseId::first(operation);
+        executors
+            .bind_address(operation, Address::repeat_byte(3))
+            .unwrap();
+        executors
+            .record_swap_approval(operation, swap_use, test_approval())
+            .unwrap();
+        // This session sends the setup, and the user asks to cancel while it runs.
+        let job = runtime.spawn(std::future::pending::<()>());
+        let (revision, (replacements, _following)) = cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.job = Some(SwapJob {
+                    operation,
+                    kind: SwapJobKind::Setup,
+                    abort: job.abort_handle(),
+                });
+                swaps.tracking.entry(operation).or_default().auto_place = true;
+                swaps.show_detail(operation, window, cx);
+                (
+                    swaps.job_revision,
+                    PrivateSwapsView::follow_replacements(cx),
+                )
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let cancel = cx.debug_bounds("swap-progress-cancel-preparation").unwrap();
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+
+        // Before the user answers, the job finds the account used and replaces it.
+        let replacement = ExecutorOperationId::random().unwrap();
+        executors.retire(operation).unwrap();
+        executors
+            .replace_swap_use_account(operation, swap_use, SwapUseSide::Source, replacement)
+            .unwrap();
+        executors
+            .bind_address(replacement, Address::repeat_byte(4))
+            .unwrap();
+        if followed {
+            replacements
+                .send(ReplacedSwapAccount {
+                    from: operation,
+                    swap: SwapAccountReplacement {
+                        operation: replacement,
+                        swap_use,
+                        replacement,
+                    },
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        // The job is stopped and its completion no longer applies.
+        assert!(
+            runtime
+                .block_on(job)
+                .is_err_and(|error| error.is_cancelled())
+        );
+        swaps.read_with(cx, |swaps, _| {
+            assert!(swaps.job.is_none() && swaps.job_revision != revision);
+            // Nothing continues the swap, which the view holds under its new account alone.
+            assert!(!swaps.tracking.contains_key(&operation));
+            assert!(!swaps.tracking[&replacement].auto_place);
+            assert_eq!(
+                swaps.dialog.as_ref().map(|dialog| dialog.view),
+                Some(SwapDialogView::Detail(replacement))
+            );
+            let cancelled = swaps
+                .cancelled
+                .as_ref()
+                .expect("the detail reports the cancellation");
+            assert_eq!(cancelled.operation, replacement);
+            let [source] = cancelled.accounts.as_slice() else {
+                panic!("the swap's own account is reported");
+            };
+            assert_eq!(
+                source.account.as_ref().map(|account| account.address),
+                Some(Address::repeat_byte(4))
+            );
+        });
+        // The use is stopped on the replacement, the only account that holds it.
+        let records = executors.records().unwrap();
+        let claimed = |operation| {
+            records
+                .iter()
+                .find(|record| record.operation() == operation)
+                .and_then(|record| record.swap_use(swap_use))
+                .map(wallet_ops::vault::SwapUseRecord::is_stopped)
+        };
+        assert_eq!(
+            (claimed(operation), claimed(replacement)),
+            (None, Some(true))
+        );
+    });
+}
+
+#[gpui::test]
+fn cancelling_preparation_follows_a_replacement_the_view_has_followed(cx: &mut TestAppContext) {
+    cancel_preparation_after_replacement(cx, true);
+}
+
+#[gpui::test]
+fn cancelling_preparation_follows_a_replacement_the_view_has_not_read(cx: &mut TestAppContext) {
+    cancel_preparation_after_replacement(cx, false);
+}
+
+/// The fixture swap stopped at its retired account with an approval saved, and the fee estimate
+/// of a new account's setup with the broadcaster that offers it.
+fn retired_swap_with_estimate(
+    root: &Entity<WalletRoot>,
+    swaps: &Entity<PrivateSwapsView>,
+    executors: &ExecutorStore,
+    operation: ExecutorOperationId,
+    runtime: &tokio::runtime::Runtime,
+    cx: &gpui::VisualTestContext,
+) -> (PublicBroadcasterCandidate, ExecutorRecoveryFeeEstimate) {
+    use wallet_ops::vault::SwapApprovalTokens;
+    executors
+        .bind_address(operation, Address::repeat_byte(3))
+        .unwrap();
+    let mut approval = test_approval();
+    approval.tokens = Some(SwapApprovalTokens {
+        sell: STUB_USDC,
+        buy: STUB_USDT,
+    });
+    executors
+        .record_swap_approval(operation, SwapUseId::first(operation), approval)
+        .unwrap();
+    executors.retire(operation).unwrap();
+    let (session, owner) = swaps.read_with(cx, |swaps, _| {
+        (
+            Arc::clone(swaps.private_session().unwrap()),
+            Arc::clone(swaps.private_owner().unwrap()),
+        )
+    });
+    owner.plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10).pow(U256::from(20)));
+    let offer = setup_offer(root, 1, STUB_USDC, U256::from(10).pow(U256::from(18)), cx);
+    let estimate = runtime
+        .block_on(Box::pin(owner.estimate_swap_setup_fee(
+            &session,
+            None,
+            offer.clone(),
+        )))
+        .unwrap();
+    (offer, estimate)
+}
+
+/// A swap that stopped at a retired account and has a saved approval goes on with a new
+/// account. Retry with new account… opens the retry dialog in place of the swap's form, also
+/// in a wallet restarted there, which holds the swap's records alone and starts the
+/// broadcaster controls from their defaults. The review keeps the saved pair, amount, minimum
+/// and delivery, names a new account, and reserves nothing. Approving it reserves one new
+/// account, which takes the swap use, and leaves the retired one with none.
+#[gpui::test]
+fn retry_with_new_account_keeps_the_saved_terms_and_reserves_one_account(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            let swap_use = SwapUseId::first(operation);
+            let (offer, estimate) =
+                retired_swap_with_estimate(root, swaps, executors, operation, runtime, cx);
+            let waku = idle_waku(root, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // Nothing of this session is held about the swap, as after a restart.
+                    swaps.tracking.remove(&operation);
+                    swaps.reload_records();
+                    swaps.show_detail(operation, window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let resume = cx.debug_bounds("swap-progress-continue").unwrap();
+            cx.simulate_click(resume.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("swap-setup-retry-new-account").is_some());
+            let saved = cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    assert!(swaps.form.is_none(), "the swap isn't reviewed again");
+                    let retry = swaps.setup_retry.as_mut().expect("the retry's dialog");
+                    assert_eq!(
+                        (retry.operation, retry.side),
+                        (operation, SetupSide::Origin)
+                    );
+                    let route = &mut retry.route;
+                    assert!(route.selected.is_none() && !route.fee_token_chosen);
+                    // The route as the dialog's controls leave it once a broadcaster offers.
+                    route.fee_token = Some(STUB_USDC);
+                    route.fee_token_chosen = true;
+                    route.candidates = vec![offer.clone()];
+                    route.selected = Some(offer.railgun_address.clone());
+                    route.estimate = Some(estimate);
+                    swaps.quote_setup_retry(Some(waku), window, cx);
+                    swaps
+                        .record(operation)
+                        .and_then(|record| record.swap_approval())
+                        .unwrap()
+                        .clone()
+                })
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+            });
+            let retry = swaps.read_with(cx, |swaps, cx| {
+                let pending = swaps.pending_authorization.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "{:?}",
+                        swaps
+                            .setup_retry
+                            .as_ref()
+                            .and_then(|retry| retry.error.clone())
+                    )
+                });
+                let SwapAction::SetupRetry(retry) = &pending.action else {
+                    panic!("the retry's review");
+                };
+                assert!(retry.replaces);
+                let mut approval = saved.clone();
+                approval.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                    token: STUB_USDC,
+                    amount: retry.maximum_private_fee,
+                });
+                assert_eq!(
+                    retry.approval.as_ref(),
+                    Some(&approval),
+                    "the pair, amount, minimum and delivery are the saved ones"
+                );
+                let rows = swaps.setup_retry_summary(retry, cx).rows_for_test();
+                assert!(
+                    rows.contains(&("Stealth account".to_owned(), "New account".to_owned())),
+                    "{rows:?}"
+                );
+                (**retry).clone()
+            });
+            assert_eq!(
+                executors.records().unwrap().len(),
+                1,
+                "a review that isn't approved reserves nothing"
+            );
+
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // This password doesn't open the fixture's vault, so the new account can't
+                    // be prepared. wallet-ops covers the setup that follows a preparation.
+                    let authorization = DesktopPrivateSpendAuthorization::VaultPassword(
+                        zeroize::Zeroizing::new("approved".to_owned()),
+                    );
+                    swaps.submit_setup_retry(retry, authorization, window, cx);
+                });
+            });
+            drive_until(cx, runtime, |cx| {
+                swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+            });
+            let records = executors.records().unwrap();
+            let (retired, replacements): (Vec<_>, Vec<_>) = records
+                .iter()
+                .partition(|record| record.operation() == operation);
+            assert!(retired[0].is_retired() && retired[0].swap_uses().is_empty());
+            let [replacement] = replacements.as_slice() else {
+                panic!("one new account is reserved: {}", replacements.len());
+            };
+            let claimed = replacement.swap_use(swap_use).expect("the swap's use");
+            assert_eq!(claimed.approval(), Some(&saved));
+            swaps.read_with(cx, |swaps, _| {
+                let shown = swaps
+                    .shown_swaps()
+                    .map(|(record, _)| record.operation())
+                    .collect::<Vec<_>>();
+                assert_eq!(shown, [replacement.operation()]);
+            });
+        },
+    );
+}
+
+/// A hardware wallet's device approves one account's action. So its retry with a new account
+/// reserves the replacement before any authorization is requested, and the review's hardware
+/// action names the replacement's operation. The swap then sits on the new account, whose
+/// setup an ordinary retry sends, also when the review is cancelled.
+#[gpui::test]
+fn a_hardware_retry_with_new_account_reserves_it_before_its_review(cx: &mut TestAppContext) {
+    use wallet_ops::vault::WalletSource;
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            let swap_use = SwapUseId::first(operation);
+            let (_, estimate) =
+                retired_swap_with_estimate(root, swaps, executors, operation, runtime, cx);
+            let waku = idle_waku(root, cx);
+            root.update(cx, |root, _| {
+                let wallet_id = root
+                    .selected_wallet_id
+                    .clone()
+                    .expect("the fixture's wallet");
+                root.wallet_options = vec![crate::root::vault::WalletOption {
+                    wallet_id,
+                    source: WalletSource::LedgerDerived,
+                }];
+            });
+            let (replacement, command) = swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let replacement = swaps
+                    .reserve_reviewed_replacement(operation, SetupSide::Origin, cx)
+                    .unwrap();
+                assert!(swaps.pending_authorization.is_none());
+                let reserved = swaps.record(replacement).expect("the reserved replacement");
+                assert!(!reserved.is_retired() && reserved.swap_use(swap_use).is_some());
+                assert_ne!(swaps.stage(reserved), SwapStage::SetupRetired);
+                let retry = swaps
+                    .setup_retry_approval(replacement, SetupSide::Origin, &estimate, waku, cx)
+                    .unwrap();
+                assert!(!retry.replaces, "the retry's job replaces nothing more");
+                let command = SwapAuthorization {
+                    session: Arc::clone(swaps.private_session().unwrap()),
+                    destination_session: None,
+                    action: SwapAction::SetupRetry(Box::new(retry)),
+                    destination: None,
+                };
+                (replacement, command)
+            });
+            assert_ne!(replacement, operation);
+            assert!(matches!(
+                command.hardware_executor_action(),
+                HardwareExecutorAction::Execute(named) if named == replacement
+            ));
+            let records = executors.records().unwrap();
+            let retired = records
+                .iter()
+                .find(|record| record.operation() == operation)
+                .unwrap();
+            assert!(retired.is_retired() && retired.swap_uses().is_empty());
+        },
+    );
+}
+
 /// Retry setup… sits on the stage a setup failed at: the response stage after a broadcaster
 /// didn't answer. A setup whose nonce is recorded as consumed waits for its verification, so
 /// its action opens nothing. A swap with no saved approval has no terms for a retry to keep:
@@ -1497,7 +2053,11 @@ fn a_setup_retry_keeps_the_saved_terms_and_saves_a_raised_fee_limit(cx: &mut Tes
                 sell: STUB_USDC,
                 buy: STUB_USDT,
             });
-            saved.bounds.source_setup_fee = Some(U256::ONE);
+            let approved = SwapSetupFeeLimit {
+                token: STUB_USDC,
+                amount: U256::ONE,
+            };
+            saved.bounds.source_setup_fee = Some(approved);
             executors
                 .record_swap_approval(operation, SwapUseId::first(operation), saved)
                 .unwrap();
@@ -1529,8 +2089,11 @@ fn a_setup_retry_keeps_the_saved_terms_and_saves_a_raised_fee_limit(cx: &mut Tes
                     .and_then(|record| record.swap_approval())
                     .unwrap()
                     .clone();
-                assert_eq!(approval.bounds.source_setup_fee, Some(U256::ONE));
-                approval.bounds.source_setup_fee = Some(raised);
+                assert_eq!(approval.bounds.source_setup_fee, Some(approved));
+                approval.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                    token: STUB_USDC,
+                    amount: raised,
+                });
                 assert_eq!(
                     retry.approval.as_ref(),
                     Some(&approval),
@@ -1566,13 +2129,185 @@ fn a_setup_retry_keeps_the_saved_terms_and_saves_a_raised_fee_limit(cx: &mut Tes
                 .find(|record| record.operation() == operation)
                 .and_then(|record| record.swap_approval())
                 .unwrap();
-            assert_eq!(saved.bounds.source_setup_fee, Some(U256::ONE));
+            assert_eq!(saved.bounds.source_setup_fee, Some(approved));
             swaps.read_with(cx, |swaps, _| {
                 let tracking = &swaps.tracking[&operation];
                 // Preparation failed before the setup's first stage, so no stage holds the
                 // failure and the swap's own error tells it.
                 assert!(tracking.setup_progress(SetupSide::Origin).is_none());
                 assert!(tracking.error.is_some());
+            });
+        },
+    );
+}
+
+/// The retry's review tells how its fee limit differs from the one approved with the swap. A
+/// higher limit in the approved token is named with the increase in the token and in USD.
+/// Another fee token is named with both limits, each in its own token, and with the change in
+/// USD alone. Without a price the review names both limits and no change.
+#[gpui::test]
+fn a_setup_retry_review_tells_a_changed_fee_limit_and_fee_token(cx: &mut TestAppContext) {
+    with_swap_view(cx, |root, swaps, _, operation, _, cx| {
+        root.update(cx, |root, _| {
+            root.effective_token_registry = wallet_ops::settings::build_effective_token_registry(
+                &wallet_ops::settings::WalletSettings::default(),
+            )
+            .unwrap();
+        });
+        let waku = idle_waku(root, cx);
+        // The retry pays up to 0.52 USDC.
+        let candidate = setup_offer(root, 1, STUB_USDC, U256::ONE, cx);
+        let shown = |approved: SwapSetupFeeLimit, cx: &mut gpui::VisualTestContext| {
+            let retry = SetupRetry {
+                operation,
+                side: SetupSide::Origin,
+                swap_use: SwapUseId::first(operation),
+                chain_id: 1,
+                account: operation,
+                candidate: candidate.clone(),
+                maximum_private_fee: U256::from(520_000),
+                waku: Arc::clone(&waku),
+                approved_fee: Some(approved),
+                approval: None,
+                replaces: false,
+            };
+            swaps.read_with(cx, |swaps, cx| {
+                let summary = swaps.setup_retry_summary(&retry, cx);
+                (
+                    summary.row_delta_for_test("Pay now"),
+                    summary.warnings_for_test(),
+                )
+            })
+        };
+        let usdc = SwapSetupFeeLimit {
+            token: STUB_USDC,
+            amount: U256::from(400_000),
+        };
+        let weth = SwapSetupFeeLimit {
+            token: STUB_WETH,
+            amount: U256::from(200_000_000_000_000_u64),
+        };
+
+        // No price is cached yet.
+        assert_eq!(
+            shown(weth, cx),
+            (
+                None,
+                vec![
+                    "The fee token changed from WETH to USDC. You approved up to 0.0002 WETH; this setup pays up to 0.52 USDC. Approving this review saves the new limit."
+                        .to_owned()
+                ]
+            )
+        );
+
+        // ETH at $3,000, and USDC at $1.
+        root.read_with(cx, |root, _| {
+            let cache = &root.public_broadcaster_anchor_cache;
+            cache.store_native_usd_rate(1, U256::from(3_000_000_000_u64), 18);
+            cache.store_rate(1, STUB_USDC, U256::from(3_000_000_000_u64));
+            cache.store_rate(1, STUB_WETH, U256::from(10).pow(U256::from(18)));
+        });
+        assert_eq!(
+            shown(usdc, cx),
+            (
+                Some(("+0.12 USDC · +$0.12".to_owned(), true)),
+                vec![
+                    "The setup fee on Ethereum is above the 0.4 USDC you approved. Approving this review saves the new limit."
+                        .to_owned()
+                ]
+            )
+        );
+        assert_eq!(
+            shown(weth, cx),
+            (
+                Some(("−$0.08".to_owned(), false)),
+                vec![
+                    "The fee token changed from WETH to USDC. You approved up to 0.0002 WETH ($0.60); this setup pays up to 0.52 USDC ($0.52). Approving this review saves the new limit."
+                        .to_owned()
+                ]
+            )
+        );
+    });
+}
+
+/// A reviewed setup fee limit is within the approved one only in the approved token. Amounts
+/// in different tokens are never compared, and without an approved limit there is no change.
+#[test]
+fn setup_fee_limit_changes_compare_amounts_only_in_one_token() {
+    let limit = |token: u8, amount: u64| SwapSetupFeeLimit {
+        token: Address::repeat_byte(token),
+        amount: U256::from(amount),
+    };
+    for (approved, reviewed, change) in [
+        (limit(1, 5), limit(1, 5), SetupFeeLimitChange::Within),
+        (limit(1, 5), limit(1, 4), SetupFeeLimitChange::Within),
+        (limit(1, 5), limit(1, 6), SetupFeeLimitChange::Higher),
+        (limit(1, 5), limit(2, 4), SetupFeeLimitChange::AnotherToken),
+    ] {
+        assert_eq!(
+            setup_fee_limit_change(Some(approved), reviewed),
+            Some(change),
+            "{approved:?} {reviewed:?}"
+        );
+    }
+    assert_eq!(setup_fee_limit_change(None, limit(1, 5)), None);
+}
+
+/// A swap that sets up its own stealth account saves that setup's fee token and limit with
+/// its approval, also when it isn't a private Bridge swap. A swap on a reused account sets
+/// none up and saves none.
+#[gpui::test]
+fn a_swap_saves_the_fee_token_and_limit_of_its_own_setup(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            reusable_account(executors, operation);
+            let (session, owner) = swaps.read_with(cx, |swaps, _| {
+                (
+                    Arc::clone(swaps.private_session().unwrap()),
+                    Arc::clone(swaps.private_owner().unwrap()),
+                )
+            });
+            owner.plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10).pow(U256::from(20)));
+            let offer = setup_offer(root, 1, STUB_USDC, U256::from(10).pow(U256::from(18)), cx);
+            let estimate = runtime
+                .block_on(Box::pin(owner.estimate_swap_setup_fee(
+                    &session,
+                    None,
+                    offer.clone(),
+                )))
+                .unwrap();
+            open_private_form(root, swaps, &stubs, runtime, cx);
+            let review = ready_review(swaps, runtime, cx);
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    for reused in [false, true] {
+                        swaps.select_form_account(reused.then_some(operation), window, cx);
+                        // The route holds an estimate, also for an account that needs no setup.
+                        let form = swaps.form.as_mut().unwrap();
+                        form.price_acknowledged = true;
+                        form.route.estimate = Some(estimate.clone());
+                        form.route.candidates = vec![offer.clone()];
+                        let form = swaps.form.as_ref().unwrap();
+                        let parts = swaps.setup_parts(form, &review, false).unwrap();
+                        let bounds = &parts.approval.bounds;
+                        assert_eq!(
+                            (bounds.source_setup_fee, bounds.destination_setup_fee),
+                            (
+                                (!reused).then(|| SwapSetupFeeLimit {
+                                    token: STUB_USDC,
+                                    amount: default_public_broadcaster_fee_limit(
+                                        estimate.fee_amount()
+                                    ),
+                                }),
+                                None,
+                            ),
+                            "reused: {reused}"
+                        );
+                    }
+                });
             });
         },
     );
@@ -1624,6 +2359,11 @@ fn a_setup_retry_reviews_the_broadcaster_and_fee_token_its_dialog_holds(cx: &mut
 
             // The wallet's monitor holds no broadcaster offer.
             assert!(cx.debug_bounds("swap-setup-retry-unavailable").is_some());
+            // A switch the user toggled holds the focus, and stops tracking it while the
+            // estimate disables the dialog's controls.
+            let switch = cx.debug_bounds("out-of-range").unwrap();
+            cx.simulate_click(switch.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
             let proceed = cx.debug_bounds("swap-setup-retry-continue").unwrap();
             cx.simulate_click(proceed.center(), gpui::Modifiers::none());
             cx.update(|window, cx| {
@@ -1652,6 +2392,8 @@ fn a_setup_retry_reviews_the_broadcaster_and_fee_token_its_dialog_holds(cx: &mut
                         Some(SwapJobKind::SetupQuote)
                     );
                 });
+                // A frame while the estimate runs, with the dialog's controls disabled.
+                window.draw(cx).clear(cx);
             });
             drive_until(cx, runtime, |cx| {
                 swaps.read_with(cx, |swaps, _| swaps.job.is_none())
@@ -5888,8 +6630,9 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
                             .collect::<Vec<_>>(),
                             "{combination:?}"
                         );
-                        let limit = |estimate: &ExecutorRecoveryFeeEstimate| {
-                            default_public_broadcaster_fee_limit(estimate.fee_amount())
+                        let limit = |estimate: &ExecutorRecoveryFeeEstimate| SwapSetupFeeLimit {
+                            token: estimate.broadcaster().token,
+                            amount: default_public_broadcaster_fee_limit(estimate.fee_amount()),
                         };
                         let bounds = &parts.approval.bounds;
                         assert_eq!(
@@ -6092,7 +6835,10 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
                 receiver: Address::ZERO,
                 ..delivery
             });
-            approval.bounds.destination_setup_fee = Some(U256::from(50_000));
+            approval.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_POLYGON_USDT,
+                amount: U256::from(50_000),
+            });
             let approved = SwapApprovedAccounts {
                 source: SwapApprovedAccount {
                     address: Some(own),
@@ -6555,7 +7301,8 @@ fn private_bridge_setups_show_side_by_side_until_each_is_confirmed(cx: &mut Test
 
 /// Approving the retry of a private Bridge swap's destination setup starts that account's
 /// stages again. The swap's own setup keeps the stages it ended with and what this session
-/// observed of it.
+/// observed of it. A retry that pays in another fee token than the destination's approved
+/// limit saves its token and limit for that account, and the source's limit stays.
 #[gpui::test]
 fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut TestAppContext) {
     use crate::root::private_swap::setup_progress::{SetupProgress, SetupProgressEnd};
@@ -6593,7 +7340,7 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
             let source = ExecutorOperationId::random().unwrap();
             let destination = ExecutorOperationId::random().unwrap();
             let receiver = Address::repeat_byte(0x61);
-            let approval = SwapApproval {
+            let mut approval = SwapApproval {
                 delivery: SwapDelivery::Bridge(BridgeDelivery {
                     provider: BridgeProvider::Across,
                     destination_chain: 137,
@@ -6610,6 +7357,17 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
                 }),
                 ..test_approval()
             };
+            // Each setup's fee limit as the swap's review approved it. The destination's is in
+            // USDC, with an amount far above the retry's fee in base units of another token.
+            let source_limit = SwapSetupFeeLimit {
+                token: STUB_USDC,
+                amount: U256::from(7),
+            };
+            approval.bounds.source_setup_fee = Some(source_limit);
+            approval.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_POLYGON_USDC,
+                amount: U256::from(u64::MAX),
+            });
             executors
                 .claim_swap_pair(SwapPairClaim {
                     id: SwapUseId::first(source),
@@ -6674,6 +7432,16 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
                         .setup_retry_approval(source, SetupSide::Destination, &estimate, waku, cx)
                         .unwrap();
                     assert_eq!((retry.chain_id, retry.account), (137, destination));
+                    // The estimate is in USDT, which amounts in USDC don't compare with.
+                    let saved = &retry.approval.as_ref().unwrap().bounds;
+                    assert_eq!(
+                        saved.destination_setup_fee,
+                        Some(SwapSetupFeeLimit {
+                            token: STUB_POLYGON_USDT,
+                            amount: retry.maximum_private_fee,
+                        })
+                    );
+                    assert_eq!(saved.source_setup_fee, Some(source_limit));
                     let authorization = DesktopPrivateSpendAuthorization::VaultPassword(
                         zeroize::Zeroizing::new("approved".to_owned()),
                     );
@@ -6766,8 +7534,14 @@ fn an_interrupted_bridge_preparation_is_bound_by_its_setup_retries(cx: &mut Test
                 }),
                 ..test_approval()
             };
-            unbound.bounds.source_setup_fee = Some(U256::ONE);
-            unbound.bounds.destination_setup_fee = Some(U256::ONE);
+            unbound.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_USDC,
+                amount: U256::ONE,
+            });
+            unbound.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_POLYGON_USDT,
+                amount: U256::ONE,
+            });
             let claim = |destination_delegate| {
                 let source = ExecutorOperationId::random().unwrap();
                 let destination = ExecutorOperationId::random().unwrap();
@@ -6817,7 +7591,10 @@ fn an_interrupted_bridge_preparation_is_bound_by_its_setup_retries(cx: &mut Test
             let own = Address::repeat_byte(0x33);
             executors.bind_address(source, own).unwrap();
             let mut raised = unbound.clone();
-            raised.bounds.source_setup_fee = Some(U256::from(2));
+            raised.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_USDC,
+                amount: U256::from(2),
+            });
             let saved = owner
                 .bind_swap_use_accounts(source, swap_use, Some(raised.clone()))
                 .unwrap();
@@ -6942,7 +7719,10 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                 approval.bounds.gas_share_bps = Some(wallet_ops::cow::GAS_SHARE_BALANCED_BPS);
                 approval.bounds.destination_minimum = Some(BRIDGE_MINIMUM);
                 approval.bounds.destination_setup_fee =
-                    new_destination.then_some(U256::from(50_000));
+                    new_destination.then_some(SwapSetupFeeLimit {
+                        token: STUB_POLYGON_USDT,
+                        amount: U256::from(50_000),
+                    });
                 approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
                     provider: BridgeProvider::Across,
                     destination_chain: 137,
@@ -7269,7 +8049,10 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
             let third = SwapUseId::random().unwrap();
             let fresh_source = ExecutorOperationId::random().unwrap();
             let mut approval = prepared(own, false);
-            approval.bounds.source_setup_fee = Some(U256::from(50_000));
+            approval.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                token: STUB_USDC,
+                amount: U256::from(50_000),
+            });
             approval.accounts.as_mut().unwrap().source = SwapApprovedAccount {
                 address: None,
                 setup: true,
@@ -15984,7 +16767,10 @@ fn public_form_and_review_follow_the_path_and_name_the_paying_account(cx: &mut T
                                         address: None,
                                         setup: true,
                                     },
-                                    Some(U256::from(50_000)),
+                                    Some(SwapSetupFeeLimit {
+                                        token: STUB_POLYGON_USDC,
+                                        amount: U256::from(50_000),
+                                    }),
                                     true,
                                 )
                                 .unwrap(),
@@ -16074,7 +16860,10 @@ fn public_order_setup_review_and_signatures(
                     address: None,
                     setup: true,
                 },
-                Some(U256::from(50_000)),
+                Some(SwapSetupFeeLimit {
+                    token: STUB_POLYGON_USDC,
+                    amount: U256::from(50_000),
+                }),
                 true,
             )
             .unwrap();

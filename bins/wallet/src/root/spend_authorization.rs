@@ -1339,17 +1339,58 @@ impl SpendAuthorizationAmountDelta {
         higher_is_worse: bool,
         format_amount: impl FnOnce(U256) -> String,
     ) -> Option<Self> {
-        let previous = previous.filter(|previous| *previous != current)?;
+        let (text, increased) = Self::signed(previous?, current, format_amount)?;
+        Some(Self {
+            text,
+            adverse: increased == higher_is_worse,
+        })
+    }
+
+    /// An amount's change with its change in USD after it, such as "+0.12 USDC · +$0.12".
+    /// `amounts` are the previous and current amounts when both are in one token, and `values`
+    /// their USD values when both have a price. Amounts in different tokens show the USD
+    /// change alone, and amounts without a price the token change alone. `None` when neither
+    /// is known or nothing changed.
+    fn priced(
+        amounts: Option<(U256, U256)>,
+        values: Option<(U256, U256)>,
+        higher_is_worse: bool,
+        format_amount: impl FnOnce(U256) -> String,
+        format_value: impl FnOnce(U256) -> String,
+    ) -> Option<Self> {
+        let amount =
+            amounts.and_then(|(previous, current)| Self::signed(previous, current, format_amount));
+        let value =
+            values.and_then(|(previous, current)| Self::signed(previous, current, format_value));
+        let increased = amount.as_ref().or(value.as_ref())?.1;
+        Some(Self {
+            adverse: increased == higher_is_worse,
+            text: [amount, value]
+                .into_iter()
+                .flatten()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+                .join(" · "),
+        })
+    }
+
+    /// The signed difference of `current` from `previous`, formatted by `format`, and whether
+    /// it is an increase. `None` when the two are equal.
+    fn signed(
+        previous: U256,
+        current: U256,
+        format: impl FnOnce(U256) -> String,
+    ) -> Option<(String, bool)> {
+        if previous == current {
+            return None;
+        }
         let increased = current > previous;
         let (sign, magnitude) = if increased {
             ("+", current - previous)
         } else {
             ("−", previous - current)
         };
-        Some(Self {
-            text: format!("{sign}{}", format_amount(magnitude)),
-            adverse: increased == higher_is_worse,
-        })
+        Some((format!("{sign}{}", format(magnitude)), increased))
     }
 }
 
@@ -1439,6 +1480,27 @@ impl SpendAuthorizationSummaryRow {
             current,
             higher_is_worse,
             format_amount,
+        );
+        self
+    }
+
+    /// [`Self::with_amount_change`] with the change in USD after it, formatted by
+    /// `format_value`. `amounts` are the previous and current amounts when both are in one
+    /// token, and `values` their USD values when both have a price.
+    pub(super) fn with_priced_amount_change(
+        mut self,
+        amounts: Option<(U256, U256)>,
+        values: Option<(U256, U256)>,
+        higher_is_worse: bool,
+        format_amount: impl FnOnce(U256) -> String,
+        format_value: impl FnOnce(U256) -> String,
+    ) -> Self {
+        self.delta = SpendAuthorizationAmountDelta::priced(
+            amounts,
+            values,
+            higher_is_worse,
+            format_amount,
+            format_value,
         );
         self
     }
@@ -5136,6 +5198,45 @@ mod tests {
             );
             assert!(row.delta.is_none());
         }
+    }
+
+    /// A change is told in token units and in USD, in USD alone for amounts in different
+    /// tokens, and in token units alone without a price.
+    #[test]
+    fn priced_amount_deltas_show_the_token_change_the_usd_change_or_both() {
+        let amounts = Some((U256::from(400_000), U256::from(520_000)));
+        let values = Some((U256::from(400_000), U256::from(520_000)));
+        // A cheaper limit in another token.
+        let lower = Some((U256::from(520_000), U256::from(440_000)));
+        for (amounts, values, text, adverse) in [
+            (amounts, values, "+0.12 USDC · +$0.12", true),
+            (None, lower, "−$0.08", false),
+            (amounts, None, "+0.12 USDC", true),
+        ] {
+            let row = SpendAuthorizationSummaryRow::new("", "").with_priced_amount_change(
+                amounts,
+                values,
+                true,
+                |amount| {
+                    format!(
+                        "{} USDC",
+                        crate::root::format_unshield_amount_input(amount, Some(6))
+                    )
+                },
+                railgun_ui::format_usd_micro_value,
+            );
+            let delta = row.delta.expect("a changed amount");
+            assert_eq!((delta.text.as_str(), delta.adverse), (text, adverse));
+        }
+        // No price for limits in different tokens leaves nothing to compare.
+        let row = SpendAuthorizationSummaryRow::new("", "").with_priced_amount_change(
+            None,
+            None,
+            true,
+            |_| unreachable!(),
+            |_| unreachable!(),
+        );
+        assert!(row.delta.is_none());
     }
 
     struct LifetimePickerProbe {

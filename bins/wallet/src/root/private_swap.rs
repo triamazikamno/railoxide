@@ -18,11 +18,15 @@ use tokio::sync::watch;
 use wallet_ops::cow::OrderUid;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareExecutorAction,
-    PublicBroadcasterCandidate, SwapOrderState, SwapReviewChange, SwapSetupStatus,
-    SwapSpeedUpRefusal, WakuDeliveryClient, WalletSession,
+    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SwapOrderState, SwapReviewChange,
+    SwapSetupStatus, SwapSpeedUpRefusal, TransactionGenerationStage, WakuDeliveryClient,
+    WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
     is_swap_record,
-    settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile, SwapTokenEligibility},
+    settings::{
+        EffectiveChainConfig, EffectiveTokenRegistry, ExecutorProfile, SwapProfile,
+        SwapTokenEligibility,
+    },
     swap_setup_recorded_executed,
     vault::{
         BridgeDelivery, BridgeProvider, ExecutorNonceObservation, ExecutorOperationId,
@@ -106,6 +110,9 @@ const MAX_BRIDGE_POLL_INTERVAL: Duration = Duration::from_mins(5);
 const DRAFT_VALIDITY: Duration = Duration::from_mins(30);
 const SWAP_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 const SWAP_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
+/// The re-sends after which a setup still waiting for a broadcaster's answer offers to be sent
+/// again, with another broadcaster.
+const SWAP_SETUP_RETRY_RESENDS: usize = 5;
 /// Why a setup that private sync shows included isn't sent again.
 const SETUP_ALREADY_INCLUDED: &str =
     "The setup is already included. Wait for confirmation and verification.";
@@ -1529,6 +1536,53 @@ impl PrivateSwapsView {
             .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup)
     }
 
+    /// Whether `side`'s setup, sent by the running setup job of the swap `operation`, still
+    /// waits for a broadcaster's answer after the re-sends that offer to send it again. Its job
+    /// sends the swap's setups together and stops as one, so this holds only while no setup of
+    /// that job is still before its broadcaster: each one waits for an answer or has ended.
+    fn setup_wait_outlasted(&self, operation: ExecutorOperationId, side: SetupSide) -> bool {
+        let Some(tracking) = self
+            .tracking
+            .get(&operation)
+            .filter(|_| self.submitting_setup(operation))
+        else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        tracking
+            .setup_progress(side)
+            .is_some_and(|progress| progress.wait_outlasted(now))
+            && [SetupSide::Origin, SetupSide::Destination]
+                .into_iter()
+                .filter_map(|side| tracking.setup_progress(side))
+                .all(|progress| {
+                    progress.end().is_some()
+                        || progress.stage()
+                            == Some(TransactionGenerationStage::WaitingForBroadcasterResponse)
+                })
+    }
+
+    /// Stop waiting for broadcaster answers in the running setup job of the swap `operation`,
+    /// as its timeout would: its requests are no longer re-sent, and each setup that waited
+    /// ends unanswered, which can still be included. The swap still places its order once its
+    /// setups are confirmed.
+    fn stop_setup_wait(&mut self, operation: ExecutorOperationId) {
+        if !self.submitting_setup(operation) {
+            return;
+        }
+        if let Some(job) = self.job.take() {
+            job.abort.abort();
+        }
+        self.job_revision = self.job_revision.wrapping_add(1);
+        for side in [SetupSide::Origin, SetupSide::Destination] {
+            self.finish_setup_progress(
+                operation,
+                side,
+                Some(Ok(&PublicBroadcasterResultKind::TimedOut)),
+            );
+        }
+    }
+
     /// How far the setup of a private Bridge swap's destination stealth account is, before the
     /// swap's first order.
     fn destination_setup_progress(
@@ -2017,10 +2071,19 @@ impl PrivateSwapsView {
                 form::network_name(self.origin_chain_id)
             ))
         });
+        // A setup that waits for a broadcaster's answer for long is offered again, which stops
+        // the wait of its job first.
+        let outlasted = progress == SwapSetupProgress::Submitting
+            && self.setup_wait_outlasted(record.operation(), side);
         match progress {
             SwapSetupProgress::NotSent | SwapSetupProgress::Failed => {
                 Some(waits_for_origin.map_or(Ok(()), Err))
             }
+            SwapSetupProgress::Submitting if outlasted => Some(
+                waits_for_origin
+                    .or_else(|| included.map(Into::into))
+                    .map_or(Ok(()), Err),
+            ),
             SwapSetupProgress::Pending => Some(
                 waits_for_origin
                     .or_else(|| included.map(Into::into))
@@ -2986,6 +3049,7 @@ impl PrivateSwapsView {
             return;
         }
         self.error = None;
+        self.focus_active_dialog(window, cx);
         let tracking = self.tracking.entry(operation).or_default();
         tracking.error = None;
         tracking.status_checked = None;
@@ -3003,7 +3067,8 @@ impl PrivateSwapsView {
                 if this.job_revision != revision || !this.session_is_current(cx) {
                     return;
                 }
-                this.job = None;
+                // A setup job's swap may have moved to an account that replaced a used one.
+                let operation = this.job.take().map_or(operation, |job| job.operation);
                 this.reload_records();
                 if kind == SwapJobKind::Check {
                     // A check may persist an outcome before a later RPC fails. Reconcile
@@ -3035,28 +3100,48 @@ impl PrivateSwapsView {
     }
 
     fn job_error(&self, error: &eyre::Report, cx: &gpui::App) -> String {
-        let Some(exceeded) = error.downcast_ref::<wallet_ops::ExecutorPrivateFeeLimitExceeded>()
-        else {
-            return format!("{error:#}");
-        };
+        self.setup_fee_error(error, self.origin_chain_id, "Continue", cx)
+    }
+
+    /// [`Self::job_error`] for a failed stage of the swap's detail, where Retry setup… opens
+    /// the review of a new fee limit.
+    fn stage_error(&self, error: &eyre::Report, cx: &gpui::App) -> String {
+        self.setup_fee_error(error, self.origin_chain_id, "Retry setup", cx)
+    }
+
+    /// What `error` says of a setup on `chain_id`. A setup fee that needs a new approval names
+    /// what was approved and `control`, which opens the review of the new fee limit.
+    fn setup_fee_error(
+        &self,
+        error: &eyre::Report,
+        chain_id: u64,
+        control: &str,
+        cx: &gpui::App,
+    ) -> String {
         let root = self.root.upgrade();
         let registry = root
             .as_ref()
             .map(|root| &root.read(cx).effective_token_registry);
-        let amount = |value| {
-            super::format_exact_token_amount_for_display(
-                self.origin_chain_id,
-                exceeded.fee_token(),
-                value,
+        if let Some(exceeded) = error.downcast_ref::<wallet_ops::ExecutorPrivateFeeLimitExceeded>()
+        {
+            return setup_fee_increased(
+                chain_id,
                 registry,
-            )
-        };
-        format!(
-            "Setup fee increased. Approved maximum: {}. New estimate: {}, exceeding the maximum by {}. Continue to review the new fee limit.",
-            amount(exceeded.maximum()),
-            amount(exceeded.required()),
-            amount(exceeded.required() - exceeded.maximum()),
-        )
+                exceeded.fee_token(),
+                (exceeded.maximum(), exceeded.required()),
+                control,
+            );
+        }
+        if let Some(changed) = error.downcast_ref::<wallet_ops::ExecutorPrivateFeeTokenChanged>() {
+            return setup_fee_token_changed(
+                chain_id,
+                registry,
+                (changed.approved_token(), changed.approved_amount()),
+                changed.fee_token(),
+                control,
+            );
+        }
+        format!("{error:#}")
     }
 
     fn fail(&mut self, operation: ExecutorOperationId, message: String) {
@@ -3714,10 +3799,79 @@ pub(super) fn now_unix() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// What a setup says whose fee `required` in `token` is above the approved `maximum`. `control`
+/// opens the review of the new fee limit.
+fn setup_fee_increased(
+    chain_id: u64,
+    registry: Option<&EffectiveTokenRegistry>,
+    token: Address,
+    (maximum, required): (U256, U256),
+    control: &str,
+) -> String {
+    let amount =
+        |value| super::format_exact_token_amount_for_display(chain_id, token, value, registry);
+    format!(
+        "Setup fee increased. Approved maximum: {}. New estimate: {}, exceeding the maximum by {}. {control} to review the new fee limit.",
+        amount(maximum),
+        amount(required),
+        amount(required - maximum),
+    )
+}
+
+/// What a setup says that would pay its fee in `token` when the limit was approved as `amount`
+/// of `approved`, another token. The two amounts don't compare. `control` opens the review of
+/// the new fee limit.
+fn setup_fee_token_changed(
+    chain_id: u64,
+    registry: Option<&EffectiveTokenRegistry>,
+    (approved, amount): (Address, U256),
+    token: Address,
+    control: &str,
+) -> String {
+    format!(
+        "Setup fee token changed. Approved: up to {}. This setup pays in {}. {control} to review the new fee limit.",
+        super::format_exact_token_amount_for_display(chain_id, approved, amount, registry),
+        super::token_display_label(chain_id, token, registry),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wallet_ops::settings::build_effective_chain_configs;
+
+    /// A fee in another token names the approved limit in the approved token and the token the
+    /// setup pays in, and both fee messages name the control that reviews the new limit.
+    #[test]
+    fn setup_fee_messages_name_the_approved_token_and_the_reviewing_control() {
+        let (approved, paid) = (Address::repeat_byte(0xaa), Address::repeat_byte(0xbb));
+        // Without a token registry an amount names its token by address.
+        let label = |token| railgun_ui::short_address(&token);
+        for control in ["Continue", "Retry setup"] {
+            assert_eq!(
+                setup_fee_token_changed(1, None, (approved, U256::from(520_000)), paid, control),
+                format!(
+                    "Setup fee token changed. Approved: up to 520000 raw token units ({}). This setup pays in {}. {control} to review the new fee limit.",
+                    label(approved),
+                    label(paid)
+                )
+            );
+            let increased = setup_fee_increased(
+                1,
+                None,
+                approved,
+                (U256::from(520_000), U256::from(600_000)),
+                control,
+            );
+            assert!(
+                increased.ends_with(&format!(
+                    "exceeding the maximum by 80000 raw token units ({}). {control} to review the new fee limit.",
+                    label(approved)
+                )),
+                "{increased}"
+            );
+        }
+    }
 
     #[test]
     fn swap_entry_is_hidden_without_a_profile_and_explains_why_a_token_is_disabled() {

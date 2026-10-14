@@ -1,5 +1,6 @@
 use super::swap_setup::{
     DESTINATION_CHAIN, USDC, WETH, broadcaster, destination_chain_config, password, setup_approval,
+    setup_fee_limit,
 };
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote, GAS_SHARE_BALANCED_BPS, GAS_SHARE_LOOSE_BPS};
@@ -4013,7 +4014,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             }),
         );
         // Only a side that needs setup has a setup fee limit.
-        let setup_fee = |new: bool| new.then_some(U256::from(1_000));
+        let setup_fee = |new: bool| new.then_some(setup_fee_limit(1_000));
         approval.bounds.source_setup_fee = setup_fee(source_new);
         approval.bounds.destination_setup_fee = setup_fee(destination_new);
         approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);

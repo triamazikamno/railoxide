@@ -29,7 +29,7 @@ use crate::poi_contexts::{
     persist_pending_mixed_output_poi_contexts, public_broadcaster_pre_transaction_pois,
 };
 use crate::settings::ExecutorProfile;
-use crate::vault::ExecutorOperationId;
+use crate::vault::{ExecutorOperationId, SwapSetupFeeLimit};
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, PreparedExecutorOperation,
     PublicBroadcasterCandidate, PublicBroadcasterResultKind, TransactionGenerationProgressSender,
@@ -46,6 +46,46 @@ pub struct ExecutorRecoveryFeeEstimate {
 }
 
 impl ExecutorRecoveryFeeEstimate {
+    /// An estimate of `fee_amount` in `token` on `chain_id`, for a broadcaster no network
+    /// offers whose executor is `delegate`. It exists only for the desktop's debug UI fixture,
+    /// which shows a setup's fee review on a wallet without private funds. Its broadcaster's
+    /// keys are placeholders, so nothing can be published to it.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn for_ui_fixture(
+        chain_id: u64,
+        token: Address,
+        delegate: Address,
+        fee_amount: U256,
+    ) -> Self {
+        Self {
+            broadcaster: PublicBroadcasterCandidate {
+                chain_id,
+                railgun_address: "0zkuifixture7f3a".to_owned(),
+                identifier: Some("Fixture".to_owned()),
+                token,
+                fee: U256::ONE,
+                fees_id: "ui-fixture".to_owned(),
+                fee_expiration: std::time::SystemTime::now() + Duration::from_secs(60),
+                reliability: 0.9,
+                available_wallets: 1,
+                version: "8.2.3".to_owned(),
+                relay_adapt: Address::ZERO,
+                relay_adapt_7702: Some(delegate),
+                required_poi_list_keys: Vec::new(),
+                viewing_public_key: [1; 32],
+                address_data: broadcaster_core::crypto::railgun::AddressData {
+                    master_public_key: U256::ONE,
+                    viewing_public_key: [1; 32],
+                },
+                fee_policy_status: crate::BroadcasterFeePolicyStatus::UnknownAnchor,
+            },
+            fee_amount,
+            gas_limit: 0,
+            min_gas_price: 0,
+        }
+    }
+
     #[must_use]
     pub const fn broadcaster(&self) -> &PublicBroadcasterCandidate {
         &self.broadcaster
@@ -122,6 +162,42 @@ impl ExecutorPrivateFeeLimitExceeded {
     #[must_use]
     pub const fn maximum(&self) -> U256 {
         self.maximum
+    }
+
+    #[must_use]
+    pub const fn required(&self) -> U256 {
+        self.required
+    }
+}
+
+/// A private broadcaster fee in another token than the reviewed limit names, which requires a
+/// new spending approval.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{purpose} private fee token differs from the reviewed one; review the new fee token and limit"
+)]
+pub struct ExecutorPrivateFeeTokenChanged {
+    purpose: &'static str,
+    approved_token: Address,
+    approved_amount: U256,
+    fee_token: Address,
+    required: U256,
+}
+
+impl ExecutorPrivateFeeTokenChanged {
+    #[must_use]
+    pub const fn approved_token(&self) -> Address {
+        self.approved_token
+    }
+
+    #[must_use]
+    pub const fn approved_amount(&self) -> U256 {
+        self.approved_amount
+    }
+
+    #[must_use]
+    pub const fn fee_token(&self) -> Address {
+        self.fee_token
     }
 
     #[must_use]
@@ -716,6 +792,27 @@ pub(in crate::desktop::executors) fn require_private_fee_limit(
         return Err(ExecutorPrivateFeeLimitExceeded::new(purpose, fee_token, maximum, fee).into());
     }
     Ok(())
+}
+
+/// Refuse a swap setup's fee in another token than its approved limit names, whatever the
+/// amounts, and otherwise a fee above that limit.
+pub(in crate::desktop::executors) fn require_swap_setup_fee_limit(
+    fee_token: Address,
+    fee: U256,
+    approved: SwapSetupFeeLimit,
+) -> Result<()> {
+    let purpose = PaidExecutionPurpose::SwapSetup;
+    if fee_token != approved.token {
+        return Err(ExecutorPrivateFeeTokenChanged {
+            purpose: purpose.label(),
+            approved_token: approved.token,
+            approved_amount: approved.amount,
+            fee_token,
+            required: fee,
+        }
+        .into());
+    }
+    require_private_fee_limit(fee_token, fee, approved.amount, purpose)
 }
 
 fn private_fee_build_error(error: BuildError, purpose: PaidExecutionPurpose) -> eyre::Report {

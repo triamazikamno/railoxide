@@ -1365,15 +1365,16 @@ impl PrivateSwapsView {
             } else {
                 None
             };
-            let fee = if needs_setup {
-                Some(
-                    form.destination_route
+            let fee = match &candidate {
+                Some(candidate) => Some(SwapSetupFeeLimit {
+                    token: candidate.token,
+                    amount: form
+                        .destination_route
                         .offered_estimate()
                         .map(|estimate| default_public_broadcaster_fee_limit(estimate.fee_amount()))
                         .ok_or("Wait for the destination setup fee.")?,
-                )
-            } else {
-                saved.approval().bounds.destination_setup_fee
+                }),
+                None => saved.approval().bounds.destination_setup_fee,
             };
             let operation = public.operation.expect("held operation");
             (
@@ -1402,7 +1403,13 @@ impl PrivateSwapsView {
         } else {
             let route = &form.destination_route;
             let (candidate, fee) = if let Some(setup) = &fixture_setup {
-                (None, setup.maximum)
+                (
+                    None,
+                    SwapSetupFeeLimit {
+                        token: setup.token,
+                        amount: setup.maximum,
+                    },
+                )
             } else {
                 // The broadcaster the fee was estimated for, which a repeated estimate
                 // under way may differ from.
@@ -1414,6 +1421,10 @@ impl PrivateSwapsView {
                     .offered_estimate()
                     .map(|estimate| default_public_broadcaster_fee_limit(estimate.fee_amount()))
                     .ok_or("Wait for the destination setup fee.")?;
+                let fee = SwapSetupFeeLimit {
+                    token: candidate.token,
+                    amount: fee,
+                };
                 (Some(candidate), fee)
             };
             let operation = public
@@ -1447,10 +1458,10 @@ impl PrivateSwapsView {
         let setup = candidate
             .as_ref()
             .zip(setup_fee)
-            .map(|(candidate, maximum)| SetupFee {
+            .map(|(candidate, limit)| SetupFee {
                 chain_id: network,
                 token: candidate.token,
-                maximum,
+                maximum: limit.amount,
                 broadcaster: broadcaster_candidate_label(candidate),
             })
             .or(fixture_setup);
@@ -4869,6 +4880,7 @@ async fn prepare_public_destination(
                         maximum_private_fee: approval
                             .bounds
                             .destination_setup_fee
+                            .map(|limit| limit.amount)
                             .ok_or_else(|| eyre::eyre!("The review has no setup fee ceiling."))?,
                         session: command.destination_session.clone(),
                         authorization: execution

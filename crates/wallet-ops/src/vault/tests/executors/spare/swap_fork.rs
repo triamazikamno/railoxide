@@ -33,6 +33,7 @@ use super::swap_order::{
 };
 use super::swap_setup::{
     DESTINATION_CHAIN, DESTINATION_TOKEN, USDC, WETH, broadcaster, password, setup_approval,
+    setup_fee_limit,
 };
 use super::*;
 use crate::cow::{CowOrderbookClient, CowQuote};
@@ -417,8 +418,8 @@ impl Wallet {
                 private: Some(BridgePrivateDelivery { on_shield_failure }),
             }),
         );
-        approval.bounds.destination_setup_fee = Some(U256::from(1_000));
-        approval.bounds.source_setup_fee = Some(U256::from(1_000));
+        approval.bounds.destination_setup_fee = Some(setup_fee_limit(1_000));
+        approval.bounds.source_setup_fee = Some(setup_fee_limit(1_000));
         approval.bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
         let operation = ExecutorOperationId::random().unwrap();
         let prepared = prepare_swap_pair(
@@ -4649,7 +4650,7 @@ async fn swap_fork_public_usdt_approval_resets_a_short_allowance_first() {
     bounds.sell_amount = sell_amount;
     bounds.destination_minimum = Some(U256::from(100));
     bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
-    bounds.destination_setup_fee = Some(U256::from(1_000));
+    bounds.destination_setup_fee = Some(setup_fee_limit(1_000));
     owner
         .claim_public_swap(PublicSwapUseClaim {
             id,
@@ -4995,7 +4996,7 @@ fn public_claim(
     bounds.post_hook_gas_limit = terms.hook_gas_limit;
     bounds.destination_minimum = Some(terms.destination_minimum);
     bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
-    bounds.destination_setup_fee = Some(U256::from(1_000));
+    bounds.destination_setup_fee = Some(setup_fee_limit(1_000));
     PublicSwapUseClaim {
         id,
         origin_chain: 1,
@@ -6607,7 +6608,7 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
                 address: None,
                 setup: true,
             },
-            Some(U256::from(1_000)),
+            Some(setup_fee_limit(1_000)),
             true,
         )
         .unwrap();

@@ -37,9 +37,9 @@ pub use output::{
 };
 pub use paid::{
     ExecutorPaidRecoveryOutcome, ExecutorPaidRecoveryRequest, ExecutorPrivateFeeLimitExceeded,
-    ExecutorRecoveryFeeEstimate,
+    ExecutorPrivateFeeTokenChanged, ExecutorRecoveryFeeEstimate,
 };
-pub(super) use paid::{PaidExecutionPurpose, require_private_fee_limit};
+pub(super) use paid::{PaidExecutionPurpose, require_swap_setup_fee_limit};
 
 /// Describe retained recovery calls for history display, without authorizing execution.
 #[must_use]

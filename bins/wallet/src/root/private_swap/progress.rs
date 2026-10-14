@@ -24,7 +24,7 @@ use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorPaidRecoveryRequest,
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
-    SwapOrderState, WakuDeliveryClient,
+    SwapAccountReplacement, SwapOrderState, WakuDeliveryClient,
     cow::OrderUid,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
@@ -36,8 +36,8 @@ use wallet_ops::{
 
 use super::dialog::{SwapDialogView, settled_by_cow};
 use super::form::{
-    SetupSide, broadcaster_result_problem, format_gwei, gas_share_name, network_name,
-    swap_steps as review_steps, swap_steps_hint,
+    ReplacedSwapAccount, SetupSide, broadcaster_result_problem, format_gwei, gas_share_name,
+    network_name, swap_steps as review_steps, swap_steps_hint,
 };
 use super::model::{
     SwapActions, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapSetupProgress,
@@ -115,7 +115,7 @@ pub(super) struct CancelledAccount {
     role: CancelledAccountRole,
     network: String,
     /// `None` for a new account whose address wasn't derived.
-    account: Option<SwapStepAccount>,
+    pub(super) account: Option<SwapStepAccount>,
     /// The swap reserved the account fresh. Otherwise it reused an existing one.
     pub(super) fresh: bool,
     pub(super) release: SwapUseRelease,
@@ -756,7 +756,8 @@ impl PrivateSwapsView {
     /// Each setup's steps, under its network and stealth account when the swap has two
     /// accounts. Two setups sit side by side, or one above the other when `stacked`. A setup
     /// that `retries` offers to send again has Retry setup… on the row it failed or waits at,
-    /// which opens the retry of that account alone.
+    /// which opens the retry of that account alone. A destination account that was retired
+    /// has Retry with new account… there, as the footer has for the swap's own.
     fn render_setups(
         &self,
         operation: ExecutorOperationId,
@@ -772,26 +773,46 @@ impl PrivateSwapsView {
                 SetupSide::Origin => "swap-setup-retry-origin",
                 SetupSide::Destination => "swap-setup-retry-destination",
             };
-            let retry = retry.clone().map(|availability| {
-                div()
-                    .pt(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .child(
-                        app_button(id, "Retry setup…")
-                            .debug_selector(move || id.into())
-                            .small()
-                            .outline()
-                            .flex_none()
-                            .disabled(busy || availability.is_err())
-                            .when_some(availability.err(), gpui_component::button::Button::tooltip)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_setup_retry(operation, side, window, cx);
-                            })),
-                    )
-                    .into_any_element()
-            });
+            let new_account =
+                side == SetupSide::Destination && self.retries_with_new_account(operation, side);
+            // Its own job runs while it waits, and stops for the retry.
+            let outlasted = self.setup_wait_outlasted(operation, side);
+            let retry =
+                retry
+                    .clone()
+                    .or_else(|| new_account.then_some(Ok(())))
+                    .map(|availability| {
+                        div()
+                            .pt(px(4.0))
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .child(
+                                app_button(
+                                    id,
+                                    if new_account {
+                                        "Retry with new account…"
+                                    } else {
+                                        "Retry setup…"
+                                    },
+                                )
+                                .debug_selector(move || id.into())
+                                .small()
+                                .outline()
+                                .flex_none()
+                                .disabled((busy && !outlasted) || availability.is_err())
+                                .when_some(
+                                    availability.err(),
+                                    gpui_component::button::Button::tooltip,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.open_setup_retry(operation, side, window, cx);
+                                    },
+                                )),
+                            )
+                            .into_any_element()
+                    });
             render_submission_progress_stepper(setup_steps(
                 operation,
                 setup,
@@ -2118,7 +2139,7 @@ impl PrivateSwapsView {
                     this.place_approved_order(operation, window, cx);
                 } else {
                     this.stop_setup_job(operation);
-                    this.open_existing_form(operation, window, cx);
+                    this.resume_swap(operation, window, cx);
                 }
             }))
         });
@@ -2451,12 +2472,16 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self
-            .record(operation)
-            .is_none_or(|record| Self::prepared_draft(record).is_none())
-        {
+        let Some(swap_use) = self.record(operation).and_then(Self::prepared_draft) else {
             return;
-        }
+        };
+        // A running setup may move the swap to an account that replaces a used one before the
+        // user answers. The swap's use and the job's revision name them whatever it moves.
+        let setup_job = self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup)
+            .then_some(self.job_revision);
         let view = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
@@ -2471,7 +2496,7 @@ impl PrivateSwapsView {
                 .confirm()
                 .child(app_text("No order will be placed. An existing stealth account is released for other swaps unless it already signed for this one. A setup already sent to a broadcaster may still confirm and charge its fee, and its new account stays in Stealth accounts for recovery.").whitespace_normal())
                 .on_ok(move |_, _, cx| {
-                    view.update(cx, |view, cx| view.cancel_preparation(operation, cx))
+                    view.update(cx, |view, cx| view.cancel_prepared_use(swap_use, setup_job, cx))
                         .unwrap_or(false)
                 })
         });
@@ -2487,20 +2512,49 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        let Some(id) = self
+            .record(operation)
+            .and_then(prepared_swap_use)
+            .map(SwapUseRecord::id)
+        else {
+            return false;
+        };
+        self.cancel_prepared_use(id, None, cx)
+    }
+
+    /// [`Self::cancel_preparation`] for the swap use `id`, with `setup_job`, the revision of
+    /// the setup job that ran for it when the user was asked. That job may have replaced the
+    /// swap's used account since, which moves the use to another operation, and this view may
+    /// not have followed it yet. So the job is stopped under whichever operation it is
+    /// registered, the use is cancelled on the account that holds it by then, and the swap
+    /// moves there before its cancellation is reported.
+    fn cancel_prepared_use(
+        &mut self,
+        id: SwapUseId,
+        setup_job: Option<u64>,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
         if !self.session_is_current(cx) {
             return false;
         }
         let Some(origin) = self.private_owner().cloned() else {
             return false;
         };
-        let Some(record) = self.record(operation) else {
+        let Some((record, swap_use)) = self.records.iter().find_map(|record| {
+            let swap_use = prepared_swap_use(record).filter(|swap_use| swap_use.id() == id)?;
+            Some((record, swap_use))
+        }) else {
             return false;
         };
-        let Some(swap_use) = prepared_swap_use(record) else {
-            return false;
-        };
-        let id = swap_use.id();
-        let title = self.progress_title(operation, cx);
+        // The records as this view read them last, and where it holds the swap: with its
+        // setup job, which a followed replacement moves along with everything else.
+        let known = record.operation();
+        let operation = self
+            .job
+            .as_ref()
+            .filter(|job| job.kind == SwapJobKind::Setup && setup_job == Some(self.job_revision))
+            .map_or(known, |job| job.operation);
+        let title = self.progress_title(known, cx);
         // What the use holds of each account, read before the cancellation changes it.
         let source = (
             CancelledAccountRole::Source,
@@ -2515,7 +2569,7 @@ impl PrivateSwapsView {
             let account = super::destination_account_metadata(
                 self.swap_destination_account(
                     SwapIdentity {
-                        operation,
+                        operation: known,
                         swap_use: id,
                     },
                     delivery,
@@ -2543,14 +2597,43 @@ impl PrivateSwapsView {
             .map(|(_, owner)| owner);
         // A setup still being handed off in this session stops with the preparation.
         self.stop_setup_job(operation);
-        let cancellation = match origin.cancel_swap_use(destination_owner.as_deref(), operation, id)
-        {
-            Ok(cancellation) => cancellation,
-            Err(error) => {
-                self.fail(operation, format!("{error:#}"));
-                cx.notify();
-                return false;
-            }
+        let (cancelled, cancellation) =
+            match origin.cancel_swap_use_by_id(destination_owner.as_deref(), id) {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    self.fail(operation, format!("{error:#}"));
+                    cx.notify();
+                    return false;
+                }
+            };
+        // The use was cancelled on an account that replaced the one this view holds the swap
+        // under. The swap moves there as it does when its setup job reports the replacement.
+        if cancelled != operation {
+            self.follow_replaced_account(
+                ReplacedSwapAccount {
+                    from: operation,
+                    swap: SwapAccountReplacement {
+                        operation: cancelled,
+                        swap_use: id,
+                        replacement: cancelled,
+                    },
+                },
+                cx,
+            );
+        }
+        let operation = cancelled;
+        // The details name the account the use was cancelled on.
+        let source = if operation == known {
+            source
+        } else {
+            let (role, network, _, fresh) = source;
+            let account = self.record(operation).and_then(|record| {
+                Some(SwapStepAccount {
+                    index: Some(record.index()),
+                    address: record.address()?,
+                })
+            });
+            (role, network, account, fresh)
         };
         let account = |(role, network, account, fresh), release| CancelledAccount {
             role,
@@ -3618,16 +3701,23 @@ fn setup_steps(
     let outcome = || (setup.step.status, setup.step.detail.clone());
     let done = || (Done, String::new());
     let (mut steps, confirmation) = if let Some(stages) = stages {
+        let now = std::time::Instant::now();
         let steps = stages
             .steps()
             .into_iter()
             .map(|stage| {
-                let detail = stage.message.as_deref().unwrap_or_else(|| {
-                    private_broadcaster_stage_detail(stage.stage, stage.status, false)
-                });
+                let detail = stage
+                    .message
+                    .as_deref()
+                    .map(str::to_owned)
+                    .or_else(|| stages.wait_detail(&stage, now))
+                    .unwrap_or_else(|| {
+                        private_broadcaster_stage_detail(stage.stage, stage.status, false)
+                            .to_owned()
+                    });
                 step(
                     private_broadcaster_stage_label(stage.stage, false),
-                    (stage.status, detail.to_owned()),
+                    (stage.status, detail),
                     private_broadcaster_stage_id(stage.stage),
                 )
             })
@@ -3855,7 +3945,9 @@ const fn progress_note(stage: SwapStage) -> Option<&'static str> {
         SwapStage::Approved => Some(
             "The stealth account is set up. Placing the order checks the fee, the price and your minimum again. If one changed, you review the swap again.",
         ),
-        SwapStage::SetupRetired => Some("No order was placed."),
+        SwapStage::SetupRetired => {
+            Some("Retry with a new account. The old one stays in Stealth accounts.")
+        }
         SwapStage::SetupNotSent | SwapStage::SetupFailed => Some(
             "Continue to send the setup again with the same stealth account. Nothing was unshielded.",
         ),

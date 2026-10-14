@@ -7,9 +7,9 @@ use super::{
     ExecutorAsset, ExecutorOperationId, ExecutorRecord, ExecutorStore, ExecutorStoreError,
     FixedBytes, RecordKind, SWAP_DESTINATION_PURPOSE_SUMMARY, Serialize, SwapAccountChoice,
     SwapAccountRole, SwapApprovedAccount, SwapApprovedBounds, SwapBridgeHandoff, SwapBridgeOutcome,
-    SwapDestinationOutcome, SwapObservation, SwapSubmission, SwapSubmissionStatus,
-    SwapTradeAmounts, SwapUseId, SwapUseRecord, SwapUseRelease, SwapUseRole, U256, local_timestamp,
-    next_destination_outcome,
+    SwapDestinationOutcome, SwapObservation, SwapSetupFeeLimit, SwapSubmission,
+    SwapSubmissionStatus, SwapTradeAmounts, SwapUseId, SwapUseRecord, SwapUseRelease, SwapUseRole,
+    U256, local_timestamp, next_destination_outcome,
 };
 use crate::vault::PublicAccountScope;
 
@@ -923,7 +923,7 @@ impl ExecutorStore {
     pub(crate) fn public_swap_destination_setup_fee(
         &self,
         operation: ExecutorOperationId,
-    ) -> Result<Option<U256>, ExecutorStoreError> {
+    ) -> Result<Option<SwapSetupFeeLimit>, ExecutorStoreError> {
         let _guard = EXECUTOR_RECORD_LOCK
             .lock()
             .map_err(|_| ExecutorStoreError::Unavailable)?;

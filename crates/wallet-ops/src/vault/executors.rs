@@ -477,7 +477,8 @@ pub struct ExecutorRecord {
     /// Issued payloads the user released from input reservation. Their signatures
     /// remain valid; only the wallet's own spending of their inputs changes.
     released_payloads: Vec<B256>,
-    /// The swaps this account took part in, in the order they started. A use is never removed.
+    /// The swaps this account took part in, in the order they started. A use is removed only
+    /// from a retired account that a replacement took its part from.
     swap_uses: Vec<SwapUseRecord>,
     /// The one swap use that claims this account.
     active_swap_use: Option<SwapUseId>,

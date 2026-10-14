@@ -75,6 +75,21 @@ impl ExecutorDelivery {
     }
 }
 
+/// A newly reserved account that was found used before it issued anything. It is retired.
+#[derive(Debug, thiserror::Error)]
+#[error("reserved executor has prior activity; it remains available for recovery")]
+pub struct ExecutorAccountUsed {
+    operation: ExecutorOperationId,
+}
+
+impl ExecutorAccountUsed {
+    /// The retired account's operation.
+    #[must_use]
+    pub const fn operation(&self) -> ExecutorOperationId {
+        self.operation
+    }
+}
+
 /// Native preparation identity carried through quotes and proof generation.
 /// It contains no signing key and cannot be constructed from browser input.
 pub struct PreparedExecutorOperation {
@@ -521,9 +536,7 @@ impl ExecutorOwner {
                 || observed.nonce() != U256::ZERO)
         {
             self.store.retire(operation)?;
-            return Err(eyre!(
-                "reserved executor has prior activity; it remains available for recovery"
-            ));
+            return Err(ExecutorAccountUsed { operation }.into());
         }
         Ok(PreparedExecutorOperation {
             operation,
@@ -708,9 +721,10 @@ impl ExecutorOwner {
                 || !observed.nonce().is_zero())
         {
             self.store.retire(prepared.operation)?;
-            return Err(eyre!(
-                "reserved executor has prior activity; it remains available for recovery"
-            ));
+            return Err(ExecutorAccountUsed {
+                operation: prepared.operation,
+            }
+            .into());
         }
         if let Some(recovery) = &prepared.recovery {
             super::recovery::recovery_funding_admission(

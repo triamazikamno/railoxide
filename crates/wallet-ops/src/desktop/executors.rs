@@ -69,8 +69,9 @@ pub use swap::{
     swap_submission_outcome,
 };
 pub use swap::{
-    PreparedSwapPair, SwapPairPreparation, SwapPairSetupResults, SwapPairSide, prepare_swap_pair,
-    submit_swap_pair_setups,
+    PreparedSwapPair, SWAP_ACCOUNT_REPLACEMENT_LIMIT, SwapAccountReplacement,
+    SwapAccountReplacements, SwapPairPreparation, SwapPairSetup, SwapPairSetupResults,
+    SwapPairSide, prepare_swap_pair, submit_swap_pair_setups,
 };
 pub use swap::{
     PublicSwapBatchTerms, PublicSwapOrderOutcome, PublicSwapOrderRequest, PublicSwapReview,

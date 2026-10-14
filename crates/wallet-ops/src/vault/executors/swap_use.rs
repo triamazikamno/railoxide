@@ -1,11 +1,12 @@
 use super::{
-    Address, B256, Deserialize, ExecutorAsset, ExecutorDerivationScheme, ExecutorNonceObservation,
-    ExecutorNonceWatermark, ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord,
-    ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck, FixedBytes,
-    IssuedExecutorPayload, LEGACY_VERSION, PublicSwapRecord, SWAP_DESTINATION_PURPOSE_SUMMARY,
-    Serialize, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence, SwapApproval,
-    SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome, SwapDestinationRecord,
-    SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp, swap_account_refusal,
+    Address, B256, BridgeDelivery, Deserialize, ExecutorAsset, ExecutorDerivationScheme,
+    ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId, ExecutorPayloadPurpose,
+    ExecutorRecord, ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck,
+    FixedBytes, IssuedExecutorPayload, LEGACY_VERSION, PublicSwapRecord,
+    SWAP_DESTINATION_PURPOSE_SUMMARY, Serialize, SwapAccountRole, SwapAccountUse,
+    SwapAdmissionEvidence, SwapApproval, SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome,
+    SwapDestinationRecord, SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp,
+    swap_account_refusal,
 };
 
 /// One logical swap: its review, account pair, setup choices and order attempts.
@@ -201,6 +202,24 @@ pub struct SwapUseCancellation {
     pub destination: Option<SwapUseRelease>,
 }
 
+/// Which account of a swap use is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapUseSide {
+    /// The swap's own account, which places its orders.
+    Source,
+    /// A private Bridge swap's destination account.
+    Destination,
+}
+
+/// The records of a swap use after [`ExecutorStore::replace_swap_use_account`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedSwapAccount {
+    /// The swap's own account after the replacement: the new record for a source replacement.
+    pub source: ExecutorRecord,
+    /// The destination account after the replacement, when the use names one.
+    pub destination: Option<ExecutorRecord>,
+}
+
 impl ExecutorRecord {
     /// Every swap use of this account, in the order they started.
     #[must_use]
@@ -392,6 +411,27 @@ impl ExecutorRecord {
             self.active_swap_use = None;
         }
         SwapUseRelease::Released
+    }
+
+    /// The use `id`, when this account can be replaced in it: the use reserved the account
+    /// fresh and still claims it, and the account was retired before it issued anything.
+    fn replaceable_swap_use(&self, id: SwapUseId) -> Option<&SwapUseRecord> {
+        self.swap_use(id).filter(|swap_use| {
+            self.retired
+                && self.issued.is_empty()
+                && self.active_swap_use == Some(id)
+                && swap_use.fresh
+                && !swap_use.stopped
+        })
+    }
+
+    /// Take the use `id` off this retired account, whose part in it a replacement took. The
+    /// account was reserved for that swap alone, so it keeps no purpose and no swap lists it.
+    fn release_replaced_swap_use(&mut self, id: SwapUseId) {
+        self.swap_uses.retain(|swap_use| swap_use.id != id);
+        self.active_swap_use = None;
+        self.purpose_summary = None;
+        self.version = self.format_version();
     }
 
     /// The use an account takes with its reservation, which is what a record from before uses
@@ -980,6 +1020,46 @@ impl ExecutorStore {
             .lock()
             .map_err(|_| ExecutorStoreError::Unavailable)?;
         self.require_wallet()?;
+        self.cancel_swap_use_locked(source_operation, id)
+    }
+
+    /// [`Self::cancel_swap_use`] for the use `id` alone: its source account is the one of this
+    /// wallet and chain that holds the use as its source now, found under the same lock hold
+    /// that cancels it. A setup job that replaced a used account moved the use to another
+    /// operation, which the caller may not have heard of yet. The result names the source
+    /// account the use was cancelled on.
+    pub fn cancel_swap_use_by_id(
+        &self,
+        id: SwapUseId,
+    ) -> Result<(ExecutorOperationId, SwapUseCancellation), ExecutorStoreError> {
+        let _guard = super::EXECUTOR_RECORD_LOCK
+            .lock()
+            .map_err(|_| ExecutorStoreError::Unavailable)?;
+        self.require_wallet()?;
+        let source_operation = self
+            .records()?
+            .into_iter()
+            .find(|record| {
+                matches!(
+                    record.swap_use(id).map(SwapUseRecord::role),
+                    Some(SwapUseRole::Source { .. })
+                )
+            })
+            .map(|record| record.operation)
+            .ok_or(ExecutorStoreError::OperationMismatch)?;
+        Ok((
+            source_operation,
+            self.cancel_swap_use_locked(source_operation, id)?,
+        ))
+    }
+
+    /// The cancellation of [`Self::cancel_swap_use`], while the caller holds
+    /// `EXECUTOR_RECORD_LOCK` and has checked the wallet.
+    fn cancel_swap_use_locked(
+        &self,
+        source_operation: ExecutorOperationId,
+        id: SwapUseId,
+    ) -> Result<SwapUseCancellation, ExecutorStoreError> {
         let mut source = self
             .record(source_operation)?
             .ok_or(ExecutorStoreError::OperationMismatch)?;
@@ -1035,6 +1115,208 @@ impl ExecutorStore {
             source: released,
             destination,
         })
+    }
+
+    /// Replace the retired account on `side` of the swap use `id`, which has no order, with a
+    /// fresh account allocated for `replacement`, on the source chain's store. The new account
+    /// takes the retired one's part in the use, the other account's link follows it, and the
+    /// retired record is released from the use. A replaced source keeps the use's ID, approval
+    /// and start time. A replaced destination clears the approval's destination address and
+    /// the delivery's receiver, for the new account's derivation to bind. Everything is checked
+    /// before anything is written, and the records and allocation rows of both chains commit
+    /// in one write. An account the use reuses, one that isn't retired and one that issued a
+    /// payload are refused.
+    pub fn replace_swap_use_account(
+        &self,
+        source_operation: ExecutorOperationId,
+        id: SwapUseId,
+        side: SwapUseSide,
+        replacement: ExecutorOperationId,
+    ) -> Result<ReplacedSwapAccount, ExecutorStoreError> {
+        let _guard = super::EXECUTOR_RECORD_LOCK
+            .lock()
+            .map_err(|_| ExecutorStoreError::Unavailable)?;
+        self.require_wallet()?;
+        let mut source = self
+            .record(source_operation)?
+            .ok_or(ExecutorStoreError::OperationMismatch)?;
+        let Some(SwapUseRecord {
+            role:
+                SwapUseRole::Source {
+                    approval,
+                    destination_operation,
+                },
+            ..
+        }) = source.swap_use(id)
+        else {
+            return Err(ExecutorStoreError::OperationMismatch);
+        };
+        let mut approval = approval.clone();
+        let destination_operation = *destination_operation;
+        if source.has_swap_use_order(id) {
+            return Err(ExecutorStoreError::OperationMismatch);
+        }
+        // Both accounts are read before either is written.
+        let destination = match destination_operation {
+            Some(operation) => {
+                let (chain_id, _) = source
+                    .swap_use_destination(id)
+                    .ok_or(ExecutorStoreError::OperationMismatch)?;
+                let store = self.for_chain(chain_id);
+                let record = store
+                    .record(operation)?
+                    .filter(|record| record.serves_swap_use(id, self.chain_id, source_operation))
+                    .ok_or(ExecutorStoreError::OperationMismatch)?;
+                Some((store, record))
+            }
+            None => None,
+        };
+        let mut updates = Vec::new();
+        match side {
+            SwapUseSide::Source => {
+                let started_at = source
+                    .replaceable_swap_use(id)
+                    .ok_or(ExecutorStoreError::OperationMismatch)?
+                    .started_at;
+                // A record with a swap of its own would project a use again when re-read.
+                if source.swap.is_some() || self.record(replacement)?.is_some() {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
+                // The new account has another address.
+                if let Some(accounts) = approval
+                    .as_deref_mut()
+                    .and_then(|approval| approval.accounts.as_mut())
+                {
+                    accounts.source.address = None;
+                }
+                let replaced = self.allocate_swap_replacement(
+                    replacement,
+                    (
+                        source.delegate,
+                        source.purpose_summary.as_deref(),
+                        source.assets.as_slice(),
+                    ),
+                    (
+                        id,
+                        SwapUseRole::Source {
+                            approval,
+                            destination_operation,
+                        },
+                    ),
+                    started_at,
+                    &mut updates,
+                )?;
+                let destination = destination
+                    .map(|(store, mut record)| {
+                        if let Some(SwapUseRecord {
+                            role:
+                                SwapUseRole::Destination {
+                                    origin_operation, ..
+                                },
+                            ..
+                        }) = record.swap_use_mut(id)
+                        {
+                            *origin_operation = replacement;
+                        }
+                        updates.push(store.seal(
+                            super::RecordKind::ExecutorOperation,
+                            store.operation_key(record.operation),
+                            &record,
+                        )?);
+                        Ok::<_, ExecutorStoreError>(record)
+                    })
+                    .transpose()?;
+                source.release_replaced_swap_use(id);
+                updates.push(self.seal(
+                    super::RecordKind::ExecutorOperation,
+                    self.operation_key(source_operation),
+                    &source,
+                )?);
+                self.vault.db.put_desktop_wallet_vault_records(&updates)?;
+                Ok(ReplacedSwapAccount {
+                    source: replaced,
+                    destination,
+                })
+            }
+            SwapUseSide::Destination => {
+                let (store, mut retired) =
+                    destination.ok_or(ExecutorStoreError::OperationMismatch)?;
+                let Some(SwapUseRecord {
+                    started_at,
+                    role:
+                        SwapUseRole::Destination {
+                            destination_token, ..
+                        },
+                    ..
+                }) = retired.replaceable_swap_use(id)
+                else {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                };
+                let (started_at, destination_token) = (*started_at, *destination_token);
+                if store.record(replacement)?.is_some() {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
+                let received = [ExecutorAsset::Erc20(destination_token)];
+                let replaced = store.allocate_swap_replacement(
+                    replacement,
+                    (
+                        retired.delegate,
+                        Some(SWAP_DESTINATION_PURPOSE_SUMMARY),
+                        received.as_slice(),
+                    ),
+                    (
+                        id,
+                        SwapUseRole::Destination {
+                            origin_chain: self.chain_id,
+                            origin_operation: source_operation,
+                            destination_token,
+                            shields: Vec::new(),
+                            outcome: None,
+                        },
+                    ),
+                    started_at,
+                    &mut updates,
+                )?;
+                // The approval binds the new account once it is derived.
+                if let Some(approval) = approval.as_deref_mut() {
+                    if let Some(destination) = approval
+                        .accounts
+                        .as_mut()
+                        .and_then(|accounts| accounts.destination.as_mut())
+                    {
+                        destination.address = None;
+                    }
+                    if let Some(delivery) = approval.delivery.private_bridge() {
+                        approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                            receiver: Address::ZERO,
+                            ..delivery
+                        });
+                    }
+                }
+                if let Some(swap_use) = source.swap_use_mut(id) {
+                    swap_use.role = SwapUseRole::Source {
+                        approval,
+                        destination_operation: Some(replacement),
+                    };
+                }
+                updates.push(self.seal(
+                    super::RecordKind::ExecutorOperation,
+                    self.operation_key(source_operation),
+                    &source,
+                )?);
+                retired.release_replaced_swap_use(id);
+                updates.push(store.seal(
+                    super::RecordKind::ExecutorOperation,
+                    store.operation_key(retired.operation),
+                    &retired,
+                )?);
+                self.vault.db.put_desktop_wallet_vault_records(&updates)?;
+                Ok(ReplacedSwapAccount {
+                    source,
+                    destination: Some(replaced),
+                })
+            }
+        }
     }
 
     /// Stop issuance on both accounts of the active use. An orderless source releases each
@@ -1164,6 +1446,35 @@ impl ExecutorStore {
             self.operation_key(operation),
             &record,
         )?);
+        Ok(record)
+    }
+
+    /// Allocate the fresh account that replaces a retired one in the use `id`, as
+    /// `claim_swap_account` allocates one, and append it to `updates` without writing. Its use
+    /// keeps `started_at`, the retired use's start time.
+    fn allocate_swap_replacement(
+        &self,
+        operation: ExecutorOperationId,
+        (delegate, purpose_summary, assets): (Address, Option<&str>, &[ExecutorAsset]),
+        (id, role): (SwapUseId, SwapUseRole),
+        started_at: Option<u64>,
+        updates: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        let mut record = self.allocate_record(
+            operation,
+            delegate,
+            purpose_summary,
+            assets,
+            Some((id, role)),
+            updates,
+        )?;
+        if let Some(swap_use) = record.swap_use_mut(id) {
+            swap_use.started_at = started_at;
+        }
+        // The allocation sealed the record with its own start time.
+        let key = self.operation_key(operation);
+        updates.retain(|(stored, _)| *stored != key);
+        updates.push(self.seal(super::RecordKind::ExecutorOperation, key, &record)?);
         Ok(record)
     }
 

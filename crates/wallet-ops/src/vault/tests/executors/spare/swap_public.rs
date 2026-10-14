@@ -16,7 +16,7 @@ use super::swap_order::{
 };
 use super::swap_setup::{
     DESTINATION_CHAIN, DESTINATION_TOKEN, USDC, WETH, broadcaster, destination_chain_config,
-    password, setup_approval,
+    password, setup_approval, setup_fee_limit,
 };
 use super::*;
 use crate::bridge::AcrossClient;
@@ -84,7 +84,7 @@ fn claim(
     let mut bounds = setup_approval(bridged_token, WETH, SwapDelivery::Reshield).bounds;
     bounds.destination_minimum = Some(U256::from(1_000));
     bounds.destination_shield_fee_bps = Some(crate::RAILGUN_PROTOCOL_FEE_BPS);
-    bounds.destination_setup_fee = Some(U256::from(1_000));
+    bounds.destination_setup_fee = Some(setup_fee_limit(1_000));
     // A Public account's order has a pre-hook only when it carries a permit.
     bounds.pre_hook_gas_limit = 0;
     PublicSwapUseClaim {
@@ -247,6 +247,23 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
     assert_eq!(
         (exceeded.maximum(), exceeded.required()),
         (U256::from(1_000), U256::from(1_001))
+    );
+    // Another fee token is refused even for fewer base units than the limit.
+    let other_token = Address::repeat_byte(0x34);
+    let error = owner
+        .require_swap_destination_setup_fee(operation, other_token, U256::from(999))
+        .unwrap_err();
+    let changed = error
+        .downcast_ref::<crate::ExecutorPrivateFeeTokenChanged>()
+        .unwrap();
+    assert_eq!(
+        (
+            changed.approved_token(),
+            changed.approved_amount(),
+            changed.fee_token(),
+            changed.required(),
+        ),
+        (fee_token, U256::from(1_000), other_token, U256::from(999))
     );
 
     // The setup is handed off and its nonce stays unconsumed.
@@ -420,7 +437,11 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         delivery_review(&owner, &origin_chain, request.source, input_amount, &across).await;
     assert_eq!(review.bridge().destination_minimum, U256::from(1_000));
     request.approval = review
-        .approval(request.approval.destination, Some(U256::from(1_000)), true)
+        .approval(
+            request.approval.destination,
+            Some(setup_fee_limit(1_000)),
+            true,
+        )
         .unwrap();
     owner.claim_public_swap(request).unwrap();
     let executor = owner

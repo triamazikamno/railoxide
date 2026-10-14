@@ -8,7 +8,9 @@
 //! confirm-only step places the order; otherwise the review opens again. Retries and changed
 //! terms use the form without a setup.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -47,11 +49,12 @@ use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, ExecutorRecoveryFeeEstimate,
     OperationNetworkIsolation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, QuoteDeviationError, SwapAccountCandidate, SwapAmountPlan,
-    SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext,
-    SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPairPreparation, SwapPairSide, SwapPrice,
-    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest, TokenAnchorRateCache,
-    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    PublicBroadcasterSelection, QuoteDeviationError, SwapAccountCandidate, SwapAccountReplacement,
+    SwapAccountReplacements, SwapAmountPlan, SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote,
+    SwapBridgeRoute, SwapDestinationContext, SwapExecutor, SwapOrderOutcome, SwapOrderRequest,
+    SwapPairPreparation, SwapPairSide, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
+    SwapSetupRequest, TokenAnchorRateCache, TransactionGenerationStage, WakuDeliveryClient,
+    WalletSession,
     bridge::{
         BridgeApiError, BridgeDestination, PublicBridgePath, across_destination_tokens,
         near_destination_tokens,
@@ -66,12 +69,13 @@ use wallet_ops::{
         EffectiveTokenRegistry, SwapReceiverRejection, SwapTokenEligibility, SwapTokenRole,
         resolve_effective_chain_rpc_route, swap_destination_tokens,
     },
-    submit_swap_pair_setups, swap_speed_up_relaxes,
+    swap_speed_up_relaxes,
     vault::{
         BridgeDelivery, BridgePrivateDelivery, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
         ExecutorOperationId, ExecutorRecord, PublicAccountMetadata, PublicAccountSource,
         SwapAccountChoice, SwapAccountRole, SwapApproval, SwapApprovedAccount,
-        SwapApprovedAccounts, SwapApprovedBounds, SwapDelivery, SwapUseId, SwapUseRecord,
+        SwapApprovedAccounts, SwapApprovedBounds, SwapDelivery, SwapSetupFeeLimit, SwapUseId,
+        SwapUseRecord, SwapUseSide,
     },
 };
 
@@ -484,8 +488,8 @@ pub(super) struct SetupApproval {
     /// The use that reserves the chosen accounts or resumes their saved preparation. `None`
     /// while a new setup uses its source operation's first use.
     swap_use: Option<SwapUseId>,
-    /// Persisted with the setup: the approved amount, minimum, fee and price check. For a
-    /// private Bridge swap it binds the fee limit of each setup the swap needs.
+    /// Persisted with the setup: the approved amount, minimum, fee and price check. It binds
+    /// the fee token and limit of each setup the swap needs.
     approval: SwapApproval,
     orderbook: Option<CowOrderbookClient>,
 }
@@ -612,11 +616,44 @@ pub(super) struct SetupRetry {
     candidate: PublicBroadcasterCandidate,
     maximum_private_fee: U256,
     waku: Arc<WakuDeliveryClient>,
-    /// The setup fee limit approved with the swap for this account.
-    approved_fee: Option<U256>,
-    /// The swap's approval with this review's fee limit, when it is above the approved one. It
-    /// is saved before the setup is sent.
+    /// The setup fee limit approved with the swap for this account, in its fee token.
+    approved_fee: Option<SwapSetupFeeLimit>,
+    /// The swap's approval with this review's fee token and limit, when the limit is above
+    /// the approved one, the token is another one, or none was approved. It is saved before
+    /// the setup is sent.
     approval: Option<SwapApproval>,
+    /// The account is retired, so the retry's job first replaces it with a newly reserved one
+    /// and sets that one up. A hardware wallet's replacement is reserved before its review,
+    /// whose retry then names the new account and replaces nothing.
+    replaces: bool,
+}
+
+/// How a reviewed setup fee limit differs from the one approved with the swap for the same
+/// account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupFeeLimitChange {
+    /// The approved token, and not above the approved limit. The approved limit stays.
+    Within,
+    /// The approved token, above the approved limit.
+    Higher,
+    /// Another fee token, whose amounts don't compare with the approved one's.
+    AnotherToken,
+}
+
+/// How `reviewed` differs from the `approved` limit. `None` without an approved limit, which
+/// has nothing to compare with: the reviewed limit is saved and no change is shown.
+fn setup_fee_limit_change(
+    approved: Option<SwapSetupFeeLimit>,
+    reviewed: SwapSetupFeeLimit,
+) -> Option<SetupFeeLimitChange> {
+    let approved = approved?;
+    Some(if approved.token != reviewed.token {
+        SetupFeeLimitChange::AnotherToken
+    } else if reviewed.amount > approved.amount {
+        SetupFeeLimitChange::Higher
+    } else {
+        SetupFeeLimitChange::Within
+    })
 }
 
 /// The open retry of one stealth account's setup: the dialog over the swap's detail, and the
@@ -1742,20 +1779,41 @@ struct DestinationSubmission {
     authorization: DesktopPrivateSpendAuthorization,
 }
 
-/// One account of a reserved pair, prepared again: a new account for its setup's retry,
-/// and an existing one as it is.
+/// One stealth account a swap's setup job replaced after finding it used: the swap's own
+/// account's operation before, and the swap after.
+#[derive(Clone, Copy)]
+pub(super) struct ReplacedSwapAccount {
+    pub(super) from: ExecutorOperationId,
+    pub(super) swap: SwapAccountReplacement,
+}
+
+/// The view's following of the replacements a setup job reports while it runs.
+struct FollowedReplacements {
+    followed: Rc<Cell<usize>>,
+    _following: Task<()>,
+}
+
+impl FollowedReplacements {
+    /// Stop following, and tell how many of the job's replacements the view followed.
+    fn finish(self) -> usize {
+        self.followed.get()
+    }
+}
+
+/// One account of a reserved pair, prepared again: a new account on `side` for its setup's
+/// retry, replaced when it is found used, and an existing one as it is.
 async fn resume_pair_side(
+    accounts: &mut SwapAccountReplacements<'_>,
+    side: SwapUseSide,
     owner: &ExecutorOwner,
     operation: ExecutorOperationId,
     candidate: Option<&PublicBroadcasterCandidate>,
     authorization: &DesktopPrivateSpendAuthorization,
 ) -> eyre::Result<SwapPairSide> {
     match candidate {
-        Some(candidate) => {
-            Box::pin(owner.resume_swap_setup(operation, candidate.clone(), authorization))
-                .await
-                .map(SwapPairSide::Setup)
-        }
+        Some(candidate) => Box::pin(accounts.resume_setup(side, candidate, authorization))
+            .await
+            .map(SwapPairSide::Setup),
         None => existing_pair_side(owner, operation),
     }
 }
@@ -5421,7 +5479,9 @@ impl PrivateSwapsView {
                     .filter(|retry| retry.side == side)?;
                 (
                     (side == SetupSide::Destination).then_some(retry.chain_id),
-                    Some(retry.account),
+                    // A retired account's replacement isn't reserved yet.
+                    (!self.retries_with_new_account(retry.operation, side))
+                        .then_some(retry.account),
                 )
             }
         };
@@ -6000,19 +6060,22 @@ impl PrivateSwapsView {
         };
         let reused_destination = form.destination_choice();
         let saved = self.reserved_approval(form);
-        // A private Bridge swap's approval binds the fee limit of each setup it needs: this
-        // review's, or for the destination the one saved with a setup that isn't sent again.
-        // An existing account takes no setup, so it binds none.
+        // The approval binds the fee token and limit of each setup the swap needs: this
+        // review's, or for a private Bridge swap's destination the one saved with a setup that
+        // isn't sent again. An existing account takes no setup, so it binds none.
         approval.bounds.destination_setup_fee = match &destination {
-            Some(destination) => Some(destination.maximum_private_fee),
+            Some(destination) => Some(SwapSetupFeeLimit {
+                token: destination.candidate.token,
+                amount: destination.maximum_private_fee,
+            }),
             None => saved
                 .filter(|_| form.private_bridge() && reused_destination.is_none())
                 .and_then(|saved| saved.bounds.destination_setup_fee),
         };
-        approval.bounds.source_setup_fee = origin
-            .as_ref()
-            .filter(|_| form.private_bridge())
-            .map(|origin| origin.maximum_private_fee);
+        approval.bounds.source_setup_fee = origin.as_ref().map(|origin| SwapSetupFeeLimit {
+            token: origin.candidate.token,
+            amount: origin.maximum_private_fee,
+        });
         // The approval names the accounts as they are chosen now and whether each needs
         // setup. Reserving them binds their addresses. A resumed swap keeps the accounts its
         // saved approval binds.
@@ -6171,6 +6234,12 @@ impl PrivateSwapsView {
                 network_name(destination.plan.identity().0),
             )
         });
+        // A destination setup's fee is in a token of its own network.
+        let destination_chain = destination
+            .as_ref()
+            .map_or(self.origin_chain_id, |destination| {
+                destination.plan.identity().0
+            });
         // A new attempt starts for each side whose setup is sent. A side that sends none keeps
         // no progress of an earlier one.
         let sends_destination = destination
@@ -6239,10 +6308,16 @@ impl PrivateSwapsView {
         // needs is confirmed, whichever of its accounts is the new one.
         tracking.auto_place = true;
         let byte_budget = tracking.byte_budget;
+        // A swap whose own account was replaced before keeps the use it started with, which
+        // isn't its new account's first.
+        let reserved_use = self
+            .record(operation)
+            .and_then(ExecutorRecord::active_swap_use);
+        let (replacements, followed) = Self::follow_replacements(cx);
         self.start_job(
             operation,
             SwapJobKind::Setup,
-            setup_job_result(async move {
+            async move {
                 let SetupApproval {
                     resume,
                     sell,
@@ -6253,44 +6328,66 @@ impl PrivateSwapsView {
                     approval: mut saved,
                     ..
                 } = approval;
-                // A destination account that can't be reserved again doesn't hold back the
-                // swap's own setup.
-                let (prepared, prepared_destination) = match &destination {
-                    // The pair is reserved: each account that still needs setup is prepared
-                    // again by itself.
-                    Some(destination) if resume => {
-                        let prepared = resume_pair_side(
-                            &owner,
-                            operation,
-                            origin.as_ref().map(|origin| &origin.candidate),
-                            &authorization,
-                        )
-                        .await?;
-                        let prepared_destination = resume_pair_side(
-                            &destination.owner,
-                            destination.plan.identity().1,
-                            destination.plan.setup().map(|setup| &setup.candidate),
-                            &destination.authorization,
-                        )
-                        .await;
-                        (prepared, Some(prepared_destination))
-                    }
-                    // Both accounts are claimed for the swap in one write, each as the new or
-                    // existing account it was chosen as. The saved approval then binds both
-                    // addresses, with the destination account as its delivery's receiver.
-                    Some(destination) => {
-                        let account = |new: bool, operation| {
-                            if new {
-                                SwapAccountChoice::New(operation)
-                            } else {
-                                SwapAccountChoice::Existing(operation)
-                            }
-                        };
-                        let prepared = Box::pin(prepare_swap_pair(
-                            &owner,
-                            Some(destination.owner.as_ref()),
-                            SwapPairPreparation {
-                                use_id: swap_use.unwrap_or_else(|| SwapUseId::first(operation)),
+                let swap_use = swap_use
+                    .or(reserved_use)
+                    .unwrap_or_else(|| SwapUseId::first(operation));
+                // A newly reserved account that is found used is replaced, and the swap goes
+                // on with the new one. The view is told at once, and again with the result.
+                let mut replaced = Vec::new();
+                let mut accounts = SwapAccountReplacements::new(
+                    owner.as_ref(),
+                    destination.as_ref().map(|destination| {
+                        (destination.owner.as_ref(), destination.plan.identity().1)
+                    }),
+                    operation,
+                    swap_use,
+                    |from, swap| {
+                        let account = ReplacedSwapAccount { from, swap };
+                        replaced.push(account);
+                        let _ = replacements.send(account);
+                    },
+                );
+                let outcome = Box::pin(async {
+                    // A destination account that can't be reserved again doesn't hold back the
+                    // swap's own setup.
+                    let (mut prepared, prepared_destination) = match &destination {
+                        // The pair is reserved: each account that still needs setup is prepared
+                        // again by itself.
+                        Some(destination) if resume => {
+                            let prepared = resume_pair_side(
+                                &mut accounts,
+                                SwapUseSide::Source,
+                                &owner,
+                                operation,
+                                origin.as_ref().map(|origin| &origin.candidate),
+                                &authorization,
+                            )
+                            .await?;
+                            let prepared_destination = resume_pair_side(
+                                &mut accounts,
+                                SwapUseSide::Destination,
+                                &destination.owner,
+                                destination.plan.identity().1,
+                                destination.plan.setup().map(|setup| &setup.candidate),
+                                &destination.authorization,
+                            )
+                            .await;
+                            (prepared, Some(prepared_destination))
+                        }
+                        // Both accounts are claimed for the swap in one write, each as the new
+                        // or existing account it was chosen as. The saved approval then binds
+                        // both addresses, with the destination account as its delivery's
+                        // receiver.
+                        Some(destination) => {
+                            let account = |new: bool, operation| {
+                                if new {
+                                    SwapAccountChoice::New(operation)
+                                } else {
+                                    SwapAccountChoice::Existing(operation)
+                                }
+                            };
+                            let prepared = Box::pin(accounts.prepare_pair(SwapPairPreparation {
+                                use_id: swap_use,
                                 source: account(origin.is_some(), operation),
                                 destination: Some(account(
                                     destination.plan.setup().is_some(),
@@ -6304,131 +6401,141 @@ impl PrivateSwapsView {
                                     .map(|setup| setup.candidate.clone()),
                                 authorization: &authorization,
                                 destination_authorization: Some(&destination.authorization),
-                            },
-                        ))
-                        .await?;
-                        saved = prepared.approval;
-                        (prepared.origin, prepared.destination.map(Ok))
-                    }
-                    None if resume => (
-                        resume_pair_side(
-                            &owner,
-                            operation,
-                            origin.as_ref().map(|origin| &origin.candidate),
-                            &authorization,
-                        )
-                        .await?,
-                        None,
-                    ),
-                    // The new record holds the approval from its first write.
-                    None => {
-                        let origin = origin.as_ref().ok_or_else(|| {
-                            eyre::eyre!("This swap has no setup to send. Review it again.")
-                        })?;
-                        (
-                            SwapPairSide::Setup(
-                                Box::pin(owner.prepare_swap_setup(
-                                    operation,
-                                    origin.candidate.clone(),
-                                    saved.clone(),
-                                    None,
-                                    &authorization,
-                                ))
-                                .await?,
-                            ),
+                            }))
+                            .await?;
+                            saved = prepared.approval;
+                            (prepared.origin, prepared.destination.map(Ok))
+                        }
+                        None if resume => (
+                            resume_pair_side(
+                                &mut accounts,
+                                SwapUseSide::Source,
+                                &owner,
+                                operation,
+                                origin.as_ref().map(|origin| &origin.candidate),
+                                &authorization,
+                            )
+                            .await?,
                             None,
-                        )
+                        ),
+                        // The new record holds the approval from its first write.
+                        None => {
+                            let origin = origin.as_ref().ok_or_else(|| {
+                                eyre::eyre!("This swap has no setup to send. Review it again.")
+                            })?;
+                            let prepared = Box::pin(owner.prepare_swap_setup(
+                                operation,
+                                origin.candidate.clone(),
+                                saved.clone(),
+                                None,
+                                &authorization,
+                            ))
+                            .await;
+                            (
+                                SwapPairSide::Setup(
+                                    Box::pin(accounts.prepare_setup(
+                                        SwapUseSide::Source,
+                                        prepared,
+                                        &origin.candidate,
+                                        &authorization,
+                                    ))
+                                    .await?,
+                                ),
+                                None,
+                            )
+                        }
+                    };
+                    // A new account is planned from its reservation, and an existing one from
+                    // its recorded state, as its quote was.
+                    let executor = match &prepared {
+                        SwapPairSide::Setup(prepared) => SwapExecutor::reserved(prepared)?,
+                        SwapPairSide::Existing { operation, .. } => {
+                            owner.swap_order_preview(*operation, true)?
+                        }
+                    };
+                    let request = SwapAmountRequest {
+                        sell_token: sell,
+                        buy_token: buy,
+                        amount: saved.bounds.spend_amount(),
+                        delivery: saved.delivery,
+                        byte_budget,
+                    };
+                    let planning_owner = Arc::clone(&owner);
+                    let planning_session = Arc::clone(&session);
+                    let plan = tokio::task::spawn_blocking(move || {
+                        planning_owner.plan_swap_amount(&executor, &planning_session, &request)
+                    })
+                    .await
+                    .map_err(|_| eyre::eyre!("Planning the swap stopped unexpectedly."))??;
+                    if matches!(plan, SwapAmountPlan::TooLarge { .. }) {
+                        return Ok(SetupOutcome::TooLarge);
                     }
-                };
-                // A new account is planned from its reservation, and an existing one from its
-                // recorded state, as its quote was.
-                let executor = match &prepared {
-                    SwapPairSide::Setup(prepared) => SwapExecutor::reserved(prepared)?,
-                    SwapPairSide::Existing { operation, .. } => {
-                        owner.swap_order_preview(*operation, true)?
+                    // A resumed setup's record keeps its earlier approval until the user
+                    // authorized this review. A reserved pair's approval then binds the accounts
+                    // as they are derived by now: a preparation interrupted before the
+                    // destination account was derived left the delivery's placeholder receiver
+                    // in the saved approval. It names a replaced account's replacement before
+                    // any setup is sent, also when this job sends no destination setup.
+                    if resume {
+                        accounts.save_resumed_approval(saved)?;
                     }
-                };
-                let request = SwapAmountRequest {
-                    sell_token: sell,
-                    buy_token: buy,
-                    amount: saved.bounds.spend_amount(),
-                    delivery: saved.delivery,
-                    byte_budget,
-                };
-                let planning_owner = Arc::clone(&owner);
-                let planning_session = Arc::clone(&session);
-                let plan = tokio::task::spawn_blocking(move || {
-                    planning_owner.plan_swap_amount(&executor, &planning_session, &request)
+                    // Only a new account's setup is sent and paid. An existing account has none.
+                    // A replacement account's setup is sent with the same request.
+                    let origin_request = origin.as_ref().map(|origin| SwapSetupRequest {
+                        maximum_private_fee: origin.maximum_private_fee,
+                        session: Arc::clone(&session),
+                        authorization: &authorization,
+                        waku: Arc::clone(&waku),
+                        verify_proof: true,
+                        progress_tx: progress,
+                        response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+                        republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                    });
+                    let (origin, destination) = match (&destination, prepared_destination) {
+                        (Some(destination), Some(Ok(mut prepared_destination))) => {
+                            let destination_request =
+                                destination.plan.setup().map(|setup| SwapSetupRequest {
+                                    maximum_private_fee: setup.maximum_private_fee,
+                                    session: Arc::clone(&destination.session),
+                                    authorization: &destination.authorization,
+                                    waku: Arc::clone(&waku),
+                                    verify_proof: true,
+                                    progress_tx: destination_progress,
+                                    response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+                                    republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                                });
+                            Box::pin(accounts.submit_setups(
+                                (&mut prepared, origin_request),
+                                Some((&mut prepared_destination, destination_request)),
+                            ))
+                            .await
+                        }
+                        (_, failed) => {
+                            let (origin, _) = Box::pin(
+                                accounts.submit_setups((&mut prepared, origin_request), None),
+                            )
+                            .await;
+                            (origin, failed.and_then(Result::err).map(Err))
+                        }
+                    };
+                    Ok::<_, eyre::Report>(SetupOutcome::Sent {
+                        origin: origin.map(|sent| sent.map(|outcome| outcome.result)),
+                        destination: destination.map(|sent| sent.map(|outcome| outcome.result)),
+                    })
                 })
-                .await
-                .map_err(|_| eyre::eyre!("Planning the swap stopped unexpectedly."))??;
-                if matches!(plan, SwapAmountPlan::TooLarge { .. }) {
-                    return Ok(SetupOutcome::TooLarge);
+                .await;
+                drop(accounts);
+                Ok((replaced, outcome))
+            },
+            move |this, (replaced, outcome), window, cx| {
+                // The swap is the one its last replacement left. The view follows here what
+                // it didn't while the job ran, also when the job failed after a replacement.
+                let operation = replaced
+                    .last()
+                    .map_or(operation, |account| account.swap.operation);
+                for account in replaced.into_iter().skip(followed.finish()) {
+                    this.follow_replaced_account(account, cx);
                 }
-                // A resumed setup's record keeps its earlier approval until the user authorized
-                // this review. A reserved pair's approval then binds the accounts as they are
-                // derived by now: a preparation interrupted before the destination account was
-                // derived left the delivery's placeholder receiver in the saved approval.
-                if resume {
-                    let swap_use = swap_use.unwrap_or_else(|| SwapUseId::first(operation));
-                    if destination.is_some() {
-                        owner.bind_swap_use_accounts(operation, swap_use, Some(saved))?;
-                    } else {
-                        owner.record_swap_approval(operation, swap_use, saved)?;
-                    }
-                }
-                // Only a new account's setup is sent and paid. An existing account has none.
-                let origin_request = origin.as_ref().map(|origin| SwapSetupRequest {
-                    maximum_private_fee: origin.maximum_private_fee,
-                    session,
-                    authorization,
-                    waku: Arc::clone(&waku),
-                    verify_proof: true,
-                    progress_tx: progress,
-                    response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-                    republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
-                });
-                let (origin, destination) = match (destination, prepared_destination) {
-                    (Some(destination), Some(Ok(prepared_destination))) => {
-                        let destination_request =
-                            destination.plan.setup().map(|setup| SwapSetupRequest {
-                                maximum_private_fee: setup.maximum_private_fee,
-                                session: destination.session,
-                                authorization: destination.authorization,
-                                waku,
-                                verify_proof: true,
-                                progress_tx: destination_progress,
-                                response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-                                republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
-                            });
-                        Box::pin(submit_swap_pair_setups(
-                            (owner.as_ref(), &prepared, origin_request),
-                            Some((
-                                destination.owner.as_ref(),
-                                &prepared_destination,
-                                destination_request,
-                            )),
-                        ))
-                        .await
-                    }
-                    (_, failed) => {
-                        let (origin, _) = Box::pin(submit_swap_pair_setups(
-                            (owner.as_ref(), &prepared, origin_request),
-                            None,
-                        ))
-                        .await;
-                        (
-                            origin,
-                            failed.and_then(Result::err).map(Err),
-                        )
-                    }
-                };
-                Ok(SetupOutcome::Sent {
-                    origin: origin.map(|sent| sent.map(|outcome| outcome.result)),
-                    destination: destination.map(|sent| sent.map(|outcome| outcome.result)),
-                })
-            }),
-            move |this, outcome, window, cx| {
                 let outcome = match outcome {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -6447,13 +6554,20 @@ impl PrivateSwapsView {
                             (
                                 SetupSide::Origin,
                                 origin.as_ref().map(|sent| {
-                                    sent.as_ref().map_err(|error| this.job_error(error, cx))
+                                    sent.as_ref().map_err(|error| this.stage_error(error, cx))
                                 }),
                             ),
                             (
                                 SetupSide::Destination,
                                 destination.as_ref().map(|sent| {
-                                    sent.as_ref().map_err(|error| format!("{error:#}"))
+                                    sent.as_ref().map_err(|error| {
+                                        this.setup_fee_error(
+                                            error,
+                                            destination_chain,
+                                            "Retry setup",
+                                            cx,
+                                        )
+                                    })
                                 }),
                             ),
                         ];
@@ -6470,7 +6584,12 @@ impl PrivateSwapsView {
                         });
                         let destination = destination.and_then(|sent| match sent {
                             Ok(result) => broadcaster_result_problem(&result, "setup"),
-                            Err(error) => Some(format!("{error:#}")),
+                            Err(error) => Some(this.setup_fee_error(
+                                &error,
+                                destination_chain,
+                                "Continue",
+                                cx,
+                            )),
                         });
                         let problem =
                             setup_problems(origin.clone(), destination.clone(), networks.as_ref());
@@ -6508,6 +6627,93 @@ impl PrivateSwapsView {
         self.show_detail(operation, window, cx);
     }
 
+    /// Follow the replacements a setup job reports while it runs: the job sends each one as
+    /// it makes it, and the swap moves at once. The job's completion ends the following and
+    /// follows what was left unread.
+    fn follow_replacements(
+        cx: &Context<'_, Self>,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<ReplacedSwapAccount>,
+        FollowedReplacements,
+    ) {
+        let (reports, mut replacements) = tokio::sync::mpsc::unbounded_channel();
+        let followed = Rc::new(Cell::new(0));
+        let count = Rc::clone(&followed);
+        let following = cx.spawn(async move |view, cx| {
+            while let Some(replaced) = replacements.recv().await {
+                let moved = view.update(cx, |this, cx| {
+                    this.follow_replaced_account(replaced, cx);
+                    count.set(count.get() + 1);
+                });
+                if moved.is_err() {
+                    break;
+                }
+            }
+        });
+        (
+            reports,
+            FollowedReplacements {
+                followed,
+                _following: following,
+            },
+        )
+    }
+
+    /// Move a swap to the stealth account that replaced a used one. The swap's own account's
+    /// operation names it in this view, so when that account was replaced, everything held
+    /// under the retired operation moves to the new one in one update: the tracking with each
+    /// setup's stages, which a running setup keeps reporting into, the destination account
+    /// read for it, the running job, the open detail, and an open form or setup retry of the
+    /// swap. The records are then read again, which also shows a replaced destination
+    /// account. Following a replacement a second time changes nothing.
+    pub(super) fn follow_replaced_account(
+        &mut self,
+        replaced: ReplacedSwapAccount,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let ReplacedSwapAccount { from, swap } = replaced;
+        let to = swap.operation;
+        if from != to {
+            if let Some(tracking) = self.tracking.remove(&from) {
+                self.tracking.insert(to, tracking);
+            }
+            let identity = |operation| super::model::SwapIdentity {
+                operation,
+                swap_use: swap.swap_use,
+            };
+            if let Some(destination) = self.destinations.remove(&identity(from)) {
+                self.destinations.insert(identity(to), destination);
+            }
+            if let Some(job) = self.job.as_mut().filter(|job| job.operation == from) {
+                job.operation = to;
+            }
+            if let Some(dialog) = self
+                .dialog
+                .as_mut()
+                .filter(|dialog| dialog.view == SwapDialogView::Detail(from))
+            {
+                dialog.view = SwapDialogView::Detail(to);
+            }
+            if let Some(form) = self.form.as_mut() {
+                for operation in [&mut form.operation, &mut form.back_to_detail] {
+                    if *operation == Some(from) {
+                        *operation = Some(to);
+                    }
+                }
+            }
+            if let Some(retry) = self.setup_retry.as_mut() {
+                for operation in [&mut retry.operation, &mut retry.account] {
+                    if *operation == from {
+                        *operation = to;
+                    }
+                }
+            }
+        }
+        self.reload_records();
+        self.reload_destinations(cx);
+        cx.notify();
+    }
+
     /// Start a new attempt's progress for `side` of the swap `operation` in place of what an
     /// earlier attempt left, and return the sender its setup reports its stages through. The
     /// view redraws on each stage.
@@ -6520,15 +6726,33 @@ impl PrivateSwapsView {
         let (progress, receiver) =
             tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
         let mut changes = receiver.clone();
+        let waiting_since = Rc::new(Cell::new(None));
+        let waiting = Rc::clone(&waiting_since);
+        // While a broadcaster's answer is awaited, its re-sends and time left are redrawn each
+        // second, as a private action's progress redraws them.
         let watch = cx.spawn(async move |view, cx| {
-            while changes.changed().await.is_ok() {
+            loop {
+                if *changes.borrow_and_update()
+                    == TransactionGenerationStage::WaitingForBroadcasterResponse
+                {
+                    if waiting.get().is_none() {
+                        waiting.set(Some(Instant::now()));
+                    }
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if changes.has_changed().is_err() {
+                        break;
+                    }
+                } else if changes.changed().await.is_err() {
+                    break;
+                }
                 if view.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
             }
         });
         let tracking = self.tracking.entry(operation).or_default();
-        *tracking.setup_progress_mut(side) = Some(SetupProgress::running(receiver, Some(watch)));
+        *tracking.setup_progress_mut(side) =
+            Some(SetupProgress::running(receiver, Some(watch)).waiting_since(waiting_since));
         progress
     }
 
@@ -6536,7 +6760,7 @@ impl PrivateSwapsView {
     /// the error it failed with. With no result its setup wasn't sent, and it keeps none.
     /// `true` when this attempt's stages took the result. A side without stages takes none,
     /// and neither do stages that had already ended.
-    fn finish_setup_progress(
+    pub(super) fn finish_setup_progress(
         &mut self,
         operation: ExecutorOperationId,
         side: SetupSide,
@@ -6569,9 +6793,11 @@ impl PrivateSwapsView {
     /// the swap's detail shows on a setup's stages is told there, and in the swap's open form.
     fn fail_setup_job(&mut self, operation: ExecutorOperationId, error: &eyre::Report, cx: &App) {
         let message = self.job_error(error, cx);
+        // A stage names the control beside it, Retry setup…, where the form names Continue.
+        let stage = self.stage_error(error, cx);
         let mut shown = false;
         for side in [SetupSide::Origin, SetupSide::Destination] {
-            shown |= self.finish_setup_progress(operation, side, Some(Err(message.clone())))
+            shown |= self.finish_setup_progress(operation, side, Some(Err(stage.clone())))
                 && self.shows_setup_progress(operation, side, cx);
         }
         // A job that retired its account ended the swap there, which the swap's stage tells.

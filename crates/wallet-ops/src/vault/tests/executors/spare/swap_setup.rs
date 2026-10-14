@@ -1,8 +1,11 @@
 use super::swap_order::delegate_setup;
 use super::*;
+use crate::vault::SwapUseSide;
 use crate::{
-    BroadcasterFeePolicyStatus, DesktopPrivateSpendAuthorization, ExecutorPrivateFeeLimitExceeded,
-    PublicBroadcasterCandidate, SwapPairPreparation, SwapPairSide, SwapSetupStatus, SwapUseClaim,
+    BroadcasterFeePolicyStatus, DesktopPrivateSpendAuthorization, ExecutorAccountUsed,
+    ExecutorPrivateFeeLimitExceeded, ExecutorPrivateFeeTokenChanged, HardwareExecutorAction,
+    PublicBroadcasterCandidate, SWAP_ACCOUNT_REPLACEMENT_LIMIT, SwapAccountReplacement,
+    SwapAccountReplacements, SwapPairPreparation, SwapPairSide, SwapSetupStatus, SwapUseClaim,
     is_swap_destination_record, prepare_swap_pair, submit_swap_pair_setups_with, swap_setup_status,
 };
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
@@ -40,6 +43,14 @@ pub(super) fn broadcaster(delegate: Address) -> PublicBroadcasterCandidate {
 
 pub(super) fn password() -> DesktopPrivateSpendAuthorization {
     DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()))
+}
+
+/// A setup fee limit of `amount` in the fee token of `broadcaster`.
+pub(super) fn setup_fee_limit(amount: u64) -> SwapSetupFeeLimit {
+    SwapSetupFeeLimit {
+        token: Address::repeat_byte(0x33),
+        amount: U256::from(amount),
+    }
 }
 
 /// Terms approved with a new swap's setup. Only the pair and delivery bind its first order; a
@@ -94,8 +105,8 @@ pub(super) fn private_bridge_approval() -> SwapApproval {
             }),
         }),
     );
-    approval.bounds.destination_setup_fee = Some(U256::from(1_000));
-    approval.bounds.source_setup_fee = Some(U256::from(2_000));
+    approval.bounds.destination_setup_fee = Some(setup_fee_limit(1_000));
+    approval.bounds.source_setup_fee = Some(setup_fee_limit(2_000));
     approval
 }
 
@@ -382,6 +393,396 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A setup job whose newly reserved account was used before goes on with the next one. The
+/// used account is retired and released from the swap, and the swap use moves to the
+/// replacement with its approval, so the setup that is prepared is the replacement's and is
+/// admitted up to the fee limit approved with the swap. Nothing is issued for the used one.
+#[tokio::test]
+async fn a_used_new_account_is_replaced_and_the_swap_sets_up_the_next_one() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let candidate = broadcaster(chain.accepted_executor_profile().unwrap().delegate());
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let mut approval = setup_approval(WETH, USDC, SwapDelivery::Reshield);
+    approval.bounds.source_setup_fee = Some(setup_fee_limit(2_000));
+    // An earlier swap's preparation derives the next account's address, which the chain then
+    // reports as used. The account after it is unused.
+    owner
+        .prepare_swap_setup(
+            ExecutorOperationId::random().unwrap(),
+            candidate.clone(),
+            approval.clone(),
+            None,
+            &password(),
+        )
+        .await
+        .unwrap();
+    let used = store.spare().unwrap().unwrap().address().unwrap();
+    rpc.state.used.lock().unwrap().insert(used);
+
+    let operation = ExecutorOperationId::random().unwrap();
+    let swap_use = SwapUseId::first(operation);
+    let mut replaced = Vec::new();
+    let mut accounts =
+        SwapAccountReplacements::new(&owner, None, operation, swap_use, |from, replacement| {
+            replaced.push((from, replacement));
+        });
+    let prepared = owner
+        .prepare_swap_setup(
+            operation,
+            candidate.clone(),
+            approval.clone(),
+            None,
+            &password(),
+        )
+        .await;
+    let prepared = accounts
+        .prepare_setup(SwapUseSide::Source, prepared, &candidate, &password())
+        .await
+        .unwrap();
+    let replacement = accounts.operation();
+    drop(accounts);
+    assert_ne!(replacement, operation);
+    assert_eq!(
+        replaced,
+        [(
+            operation,
+            SwapAccountReplacement {
+                operation: replacement,
+                swap_use,
+                replacement,
+            }
+        )]
+    );
+    assert_eq!(prepared.operation(), replacement);
+    assert_ne!(prepared.context().executor, used);
+
+    let record = |operation| {
+        owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    };
+    let retired = record(operation);
+    assert_eq!(retired.address(), Some(used));
+    assert!(retired.is_retired() && retired.swap_uses().is_empty() && retired.issued().is_empty());
+    let account = record(replacement);
+    assert_eq!(
+        (account.active_swap_use(), account.is_retired()),
+        (Some(swap_use), false)
+    );
+    assert_eq!(
+        account
+            .swap_use(swap_use)
+            .and_then(|claimed| claimed.approval()),
+        Some(&approval)
+    );
+    // The replacement's setup is paid within the limit approved with the swap, and no more.
+    owner
+        .require_swap_source_setup_fee(replacement, candidate.token, U256::from(2_000))
+        .unwrap();
+    assert!(
+        owner
+            .require_swap_source_setup_fee(replacement, candidate.token, U256::from(2_001))
+            .is_err()
+    );
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A setup job that holds only the swap's own account, because the destination's setup is
+/// already out, still saves an approval that names a replacement. The source of a claimed
+/// private Bridge pair is found used when the job prepares it again, or when it submits its
+/// setup. Either way the saved approval binds the replacement's address before anything is
+/// handed off for it, so the first order's account check admits the pair, and the destination
+/// account's binding, its issued setup and the approved terms stay as they were.
+#[tokio::test]
+async fn a_replaced_source_is_bound_in_the_approval_without_the_destination_owner() {
+    for at_submission in [false, true] {
+        let rpc = Rpc::start().await;
+        let (root, db, vault) = desktop_store_with_vault();
+        let view = Arc::new(import_wallet_with_metadata(
+            &vault,
+            TEST_WALLET_ID,
+            "Wallet",
+        ));
+        let (origin_chain, destination_chain) = (chain(&rpc), destination_chain_config(&rpc).await);
+        let candidate = broadcaster(origin_chain.accepted_executor_profile().unwrap().delegate());
+        let destination_delegate = destination_chain
+            .accepted_executor_profile()
+            .unwrap()
+            .delegate();
+        let mut destination_candidate = broadcaster(destination_delegate);
+        destination_candidate.chain_id = DESTINATION_CHAIN;
+        let owner = |generation, chain| {
+            ExecutorOwner::new(
+                generation,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap()
+        };
+        let (operation, destination_operation) = (
+            ExecutorOperationId::random().unwrap(),
+            ExecutorOperationId::random().unwrap(),
+        );
+        let swap_use = SwapUseId::first(operation);
+        let authorization = password();
+        let destination_authorization = authorization.for_destination().unwrap();
+
+        // An earlier job claimed and derived both accounts, and the destination's setup is out.
+        let (origin, destination) = (owner(0, origin_chain.clone()), owner(0, destination_chain));
+        let prepared = prepare_swap_pair(
+            &origin,
+            Some(&destination),
+            SwapPairPreparation {
+                use_id: swap_use,
+                source: SwapAccountChoice::New(operation),
+                destination: Some(SwapAccountChoice::New(destination_operation)),
+                candidate: Some(candidate.clone()),
+                destination_candidate: Some(destination_candidate),
+                approval: private_bridge_approval(),
+                authorization: &authorization,
+                destination_authorization: Some(&destination_authorization),
+            },
+        )
+        .await
+        .unwrap();
+        let (saved, mut side) = (prepared.approval, prepared.origin);
+        let approved = saved.accounts.unwrap();
+        let used = approved.source.address.unwrap();
+        origin.shutdown().await;
+        destination.shutdown().await;
+        drop((origin, destination));
+        let destination_store =
+            ExecutorStore::new(db.clone(), view.clone(), DESTINATION_CHAIN).unwrap();
+        let signed_at =
+            ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+        destination_store
+            .record_account_read(destination_operation, signed_at)
+            .unwrap();
+        let issued = destination_store
+            .record_issued(
+                destination_operation,
+                IssuedExecutorPayload::new(
+                    U256::ZERO,
+                    destination_delegate,
+                    B256::repeat_byte(3),
+                    ExecutorPayloadPurpose::Operation,
+                    ExecutorPayloadContext::new(
+                        Bytes::from_static(b"setup"),
+                        signed_at,
+                        Vec::new(),
+                    ),
+                ),
+            )
+            .unwrap();
+
+        // The chain then shows the swap's own account as used, and a later session's job holds
+        // no destination owner.
+        rpc.state.used.lock().unwrap().insert(used);
+        let origin = owner(1, origin_chain);
+        let mut accounts =
+            SwapAccountReplacements::new(&origin, None, operation, swap_use, |_, _| {});
+        if at_submission {
+            // A submission retires the used account with the error a preparation gives.
+            let found = origin
+                .resume_swap_setup(operation, candidate.clone(), &authorization)
+                .await
+                .err()
+                .unwrap();
+            let sent = accounts
+                .resubmit_with(
+                    SwapUseSide::Source,
+                    &mut side,
+                    Some(Err(found)),
+                    &authorization,
+                    |_, prepared| async move {
+                        let unsent = eyre::eyre!("no broadcaster took the setup");
+                        (prepared, Err::<(), _>(unsent))
+                    },
+                )
+                .await;
+            assert!(sent.is_some_and(|sent| sent.is_err()));
+        } else {
+            let resumed = accounts
+                .resume_setup(SwapUseSide::Source, &candidate, &authorization)
+                .await
+                .unwrap();
+            side = SwapPairSide::Setup(resumed);
+            accounts.save_resumed_approval(saved.clone()).unwrap();
+        }
+        let replacement = accounts.operation();
+        drop(accounts);
+        assert_ne!(replacement, operation);
+        let SwapPairSide::Setup(setup) = &side else {
+            panic!("the replacement needs setup");
+        };
+        let executor = setup.context().executor;
+        assert_ne!(executor, used);
+
+        let bound = origin
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == replacement)
+            .and_then(|record| record.swap_use(swap_use)?.approval().cloned())
+            .unwrap();
+        let accounts = bound.accounts.unwrap();
+        assert_eq!(accounts.source.address, Some(executor));
+        let after = destination_store
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == destination_operation)
+            .unwrap();
+        assert!(accounts.admits((executor, true), Some((after.address().unwrap(), true))));
+        // Nothing else of the approval changed, and nothing of the destination's setup.
+        assert_eq!(accounts.destination, approved.destination);
+        assert_eq!(
+            SwapApproval {
+                accounts: saved.accounts,
+                ..bound
+            },
+            saved
+        );
+        assert_eq!(after.issued(), issued.issued());
+        origin.shutdown().await;
+        drop(origin);
+        drop(destination_store);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// A setup job replaces at most three used accounts, and none for a hardware authorization,
+/// which the device gave for the first account's action only. Either way the job ends with
+/// the typed error at the account it last retired, which keeps the swap use, and no account
+/// is reserved after it.
+#[tokio::test]
+async fn replacing_used_accounts_stops_at_the_limit_and_for_a_hardware_authorization() {
+    for hardware in [false, true] {
+        let rpc = Rpc::start().await;
+        rpc.state.all_used.store(true, Ordering::Relaxed);
+        let (root, db, vault) = desktop_store_with_vault();
+        let descriptor = test_hardware_descriptor(1);
+        let view = if hardware {
+            super::hardware::hardware_view(&vault, &descriptor)
+        } else {
+            Arc::new(import_wallet_with_metadata(
+                &vault,
+                TEST_WALLET_ID,
+                "Wallet",
+            ))
+        };
+        let chain = chain(&rpc);
+        let candidate = broadcaster(chain.accepted_executor_profile().unwrap().delegate());
+        let owner = Arc::new(
+            ExecutorOwner::new(
+                0,
+                db.clone(),
+                view.clone(),
+                chain,
+                HttpContext::direct_for_tests(),
+            )
+            .unwrap(),
+        );
+        let operation = ExecutorOperationId::random().unwrap();
+        let swap_use = SwapUseId::first(operation);
+        let authorization = if hardware {
+            super::hardware::authorize(
+                &owner,
+                &view,
+                &descriptor,
+                HardwareExecutorAction::Execute(operation),
+            )
+        } else {
+            password()
+        };
+        let mut replacements = 0;
+        let mut accounts =
+            SwapAccountReplacements::new(&owner, None, operation, swap_use, |_, _| {
+                replacements += 1;
+            });
+        let prepared = owner
+            .prepare_swap_setup(
+                operation,
+                candidate.clone(),
+                setup_approval(WETH, USDC, SwapDelivery::Reshield),
+                None,
+                &authorization,
+            )
+            .await;
+        let Err(error) = accounts
+            .prepare_setup(SwapUseSide::Source, prepared, &candidate, &authorization)
+            .await
+        else {
+            panic!("every account is used");
+        };
+        let last = accounts.operation();
+        drop(accounts);
+        assert_eq!(
+            replacements,
+            if hardware {
+                0
+            } else {
+                SWAP_ACCOUNT_REPLACEMENT_LIMIT
+            }
+        );
+        assert_eq!(last == operation, hardware);
+        assert_eq!(
+            error
+                .downcast_ref::<ExecutorAccountUsed>()
+                .map(ExecutorAccountUsed::operation),
+            Some(last)
+        );
+        let records = owner.records().unwrap();
+        assert_eq!(
+            records.len(),
+            replacements + 1,
+            "no account is reserved after the last one is retired"
+        );
+        for record in &records {
+            assert!(record.is_retired());
+            assert_eq!(
+                record.active_swap_use(),
+                (record.operation() == last).then_some(swap_use)
+            );
+        }
+        owner.shutdown().await;
+        drop(owner);
+        drop(view);
+        drop(vault);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_alone() {
     let rpc = Rpc::start().await;
@@ -586,7 +987,7 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
         .await
         .unwrap();
     let mut raised = private_bridge_approval();
-    raised.bounds.source_setup_fee = Some(U256::from(3_000));
+    raised.bounds.source_setup_fee = Some(setup_fee_limit(3_000));
     let bound = origin
         .bind_swap_use_accounts(operation, swap_use, Some(raised.clone()))
         .unwrap();
@@ -698,6 +1099,18 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
     assert_eq!(
         (exceeded.maximum(), exceeded.required()),
         (U256::from(1_000), U256::from(1_001))
+    );
+    // Another fee token is refused even for fewer base units.
+    assert!(
+        destination
+            .require_swap_destination_setup_fee(
+                destination_operation,
+                Address::repeat_byte(0x34),
+                U256::from(999)
+            )
+            .unwrap_err()
+            .downcast_ref::<ExecutorPrivateFeeTokenChanged>()
+            .is_some()
     );
     assert!(
         origin
@@ -923,8 +1336,8 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
         let destination_authorization = authorization.for_destination().unwrap();
         // The approval binds a fee limit only for a chain whose account needs setup.
         let mut approval = private_bridge_approval();
-        approval.bounds.source_setup_fee = source_new.then_some(U256::from(2_000));
-        approval.bounds.destination_setup_fee = destination_new.then_some(U256::from(1_000));
+        approval.bounds.source_setup_fee = source_new.then_some(setup_fee_limit(2_000));
+        approval.bounds.destination_setup_fee = destination_new.then_some(setup_fee_limit(1_000));
         let preparation =
             |source, approval, candidate, destination_candidate| SwapPairPreparation {
                 use_id,
@@ -1105,6 +1518,20 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
                 .unwrap();
             (exceeded.maximum(), exceeded.required())
         };
+        // Another fee token is refused even for fewer base units than the limit.
+        let other_token = Address::repeat_byte(0x34);
+        let changed = |result: eyre::Result<()>| {
+            let error = result.unwrap_err();
+            let changed = error
+                .downcast_ref::<ExecutorPrivateFeeTokenChanged>()
+                .unwrap();
+            (
+                changed.approved_token(),
+                changed.approved_amount(),
+                changed.fee_token(),
+                changed.required(),
+            )
+        };
         if source_new {
             let (operation, token) = (source.operation(), candidate.token);
             origin
@@ -1113,6 +1540,14 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
             assert_eq!(
                 exceeds(origin.require_swap_source_setup_fee(operation, token, U256::from(2_001))),
                 (U256::from(2_000), U256::from(2_001))
+            );
+            assert_eq!(
+                changed(origin.require_swap_source_setup_fee(
+                    operation,
+                    other_token,
+                    U256::from(1_999)
+                )),
+                (token, U256::from(2_000), other_token, U256::from(1_999))
             );
         }
         if destination_new {
@@ -1127,6 +1562,14 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
                     U256::from(1_001)
                 )),
                 (U256::from(1_000), U256::from(1_001))
+            );
+            assert_eq!(
+                changed(destination.require_swap_destination_setup_fee(
+                    operation,
+                    other_token,
+                    U256::from(999)
+                )),
+                (token, U256::from(1_000), other_token, U256::from(999))
             );
         }
 
@@ -1219,7 +1662,7 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
             SwapAccountChoice::New(source.operation())
         };
         let mut rebound = approval;
-        rebound.bounds.source_setup_fee = Some(U256::from(2_000));
+        rebound.bounds.source_setup_fee = Some(setup_fee_limit(2_000));
         let request = preparation(
             flipped,
             rebound,

@@ -65,8 +65,8 @@ use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PublicSwapPr
 use crate::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgePrivateDelivery, BridgeProvider, BridgeShieldFailure,
     BridgeSurplus, ExecutorOperationId, PublicSwapApproval, PublicSwapHookBatch, PublicSwapIntent,
-    PublicSwapOrder, PublicSwapPath, SwapApprovedAccount, SwapApprovedBounds, SwapSubmission,
-    SwapSubmissionStatus, SwapUseId,
+    PublicSwapOrder, PublicSwapPath, SwapApprovedAccount, SwapApprovedBounds, SwapSetupFeeLimit,
+    SwapSubmission, SwapSubmissionStatus, SwapUseId,
 };
 use crate::{ExecutorOwner, TokenAnchorRateCache, check_quote_against_anchor};
 
@@ -424,7 +424,7 @@ impl PublicSwapReview {
     pub fn approval(
         &self,
         destination: SwapApprovedAccount,
-        destination_setup_fee: Option<U256>,
+        destination_setup_fee: Option<SwapSetupFeeLimit>,
         price_acknowledged: bool,
     ) -> Result<PublicSwapApproval> {
         if self.bridge.destination_minimum.is_zero() {

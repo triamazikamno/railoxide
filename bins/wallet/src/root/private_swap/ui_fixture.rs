@@ -110,13 +110,34 @@
 //!   of a synthesized swap that sells 0.05 WETH for USDC and sets up a new stealth account,
 //!   on Ethereum with its private session started. Its review is approved and it has no order
 //!   yet. `running` holds the setup at its proof, with a setup job that never answers.
+//!   `waiting` holds it at the broadcaster's answer, 27 seconds after it was published, where
+//!   the stage tells the re-sends and the time left as of the mode's start; they don't advance.
+//!   Past five re-sends the row offers Retry setup…, which stops the wait and opens the retry
+//!   dialog.
 //!   `failed` is a setup that failed at its fee estimate, before anything was published.
 //!   `broadcaster-error` and `timeout` are a published setup that a broadcaster refused, or
 //!   that no broadcaster answered. `restart` is a setup that was sent and isn't confirmed, as
 //!   a restarted wallet shows it, with no stages. `ready` is the confirmed setup, where the
 //!   detail shows the order's steps and Place order…. `retired` is a setup whose preparation
 //!   found the reserved account used before and retired it: nothing was sent, the detail has
-//!   one step that says so, and the footer offers Retry with new account….
+//!   one step that says so, and the footer offers Retry with new account…. That opens the
+//!   retry dialog for a new account, with a stand-in estimate that no broadcaster gave, so
+//!   its Continue is enabled and opens the review: it names New account for the stealth
+//!   account and limits the fee at 0.0002 WETH, above the 0.00015 WETH the swap approved,
+//!   which its warning says. Approving the review takes the vault password and ends in an
+//!   error on the detail. No account is reserved.
+//!   `replaced` is that swap once it went on with a new account: account #5 holds the swap,
+//!   which started four minutes ago, and its setup is held at its proof, with a setup job
+//!   that never answers. Stealth accounts then shows two synthesized accounts in place of
+//!   the wallet's own: #5 as the swap's, and the retired #4 with no swap. The wallet holds
+//!   neither, so their actions fail.
+//!   `fee-token` is a setup that failed at its fee estimate because the fee token changed: the
+//!   swap approved up to 0.52 USDC, and the setup would pay in WETH. Over the detail it opens
+//!   the review of that setup sent again, with a stand-in estimate that no broadcaster gave
+//!   and limits the fee at 0.0002 WETH, so the review names both limits, the fee token's
+//!   change and, at stand-in prices of $3,000 for ETH and $1 for USDC, the change in USD.
+//!   Those prices replace the session's cached ones on Ethereum until their next refresh.
+//!   Approving the review takes the vault password and ends in an error on the detail.
 //!   `setup:two-accounts` is that swap delivered by Across to the private balance on Arbitrum
 //!   One, with a new stealth account on each network: the setup on Ethereum was submitted
 //!   and waits for its confirmation, and the one on Arbitrum One is at its POI proofs.
@@ -125,8 +146,8 @@
 //!   No private note shows a setup included, so a confirmation never counts blocks. Copy
 //!   buttons work. Retry setup… sits on the row a setup failed or waits at, and opens the
 //!   retry dialog of that account alone. A wallet without private funds has no broadcaster to
-//!   pay there, so the dialog says so and its Continue stays disabled. The footer has no
-//!   Retry setup… or Continue…, and the detail's other actions do nothing.
+//!   pay there, so the dialog says so and its Continue stays disabled, except in `retired`.
+//!   The footer has no Retry setup… or Continue…, and the detail's other actions do nothing.
 //! - `reported:<state>` opens the swap dialog, in place of a Public account's form, on the
 //!   detail of a synthesized swap of 0.05 WETH for USDC on Ethereum whose one order is open on
 //!   its record while the orderbook reports it filled for 101.31 USDC. Nothing of the fill is
@@ -147,7 +168,9 @@
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
 //! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode opens the
 //! route its orderbook client would use, and sends nothing on it. A `quote-error` mode opens no
-//! route. A `reported:` mode asks no orderbook, chain or bridge provider about its swap.
+//! route. A `reported:` mode asks no orderbook, chain or bridge provider about its swap. The
+//! review of a `setup:fee-token` or `setup:retired` mode holds the broadcaster network's
+//! client, as any setup's review does, and publishes nothing on it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,14 +189,15 @@ use wallet_ops::vault::{
     PublicSwapObservations, PublicSwapRecord, SwapApproval, SwapApprovalTokens,
     SwapApprovedAccount, SwapApprovedAccounts, SwapApprovedBounds, SwapBridgeHandoff,
     SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapPreHookDeath,
-    SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapTerms, SwapTradeAmounts, SwapUseId,
+    SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSetupFeeLimit, SwapTerms,
+    SwapTradeAmounts, SwapUseId,
 };
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
-    OperationNetworkIsolation, PairAnchorRate, PublicBroadcasterResultKind, SwapBridgeReport,
-    SwapContinuingApproval, SwapDeliverySeen, SwapHandoffHint, SwapQuoteAnchor,
-    SwapQuoteDiagnostics, SwapReview, SwapReviewChange, SwapSettlementHint, SwapSpeedUpRefusal,
-    TransactionGenerationStage,
+    ExecutorRecoveryFeeEstimate, OperationNetworkIsolation, PairAnchorRate,
+    PublicBroadcasterResultKind, SwapBridgeReport, SwapContinuingApproval, SwapDeliverySeen,
+    SwapHandoffHint, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview, SwapReviewChange,
+    SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage,
 };
 
 use super::dialog::SwapDialogView;
@@ -233,6 +257,8 @@ enum Reported {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Setup {
     Running,
+    /// Published, and waiting for a broadcaster's answer for 27 seconds.
+    Waiting,
     /// The setup failed before it was published.
     Failed,
     BroadcasterError,
@@ -242,6 +268,10 @@ enum Setup {
     Ready,
     /// Preparation found the reserved account used before and retired it. Nothing was sent.
     Retired,
+    /// The swap went on with a new account in place of a retired one, whose setup is running.
+    Replaced,
+    /// The setup failed because its fee token changed, and the review of its retry is open.
+    FeeToken,
     /// A private Bridge swap whose two new accounts are each at another point of their setup.
     TwoAccounts,
     /// A private Bridge swap whose own setup is confirmed and whose destination setup a
@@ -378,12 +408,15 @@ fn parse(value: &str) -> Option<Mode> {
     if let Some(state) = value.strip_prefix("setup:") {
         return Some(Mode::Setup(match state {
             "running" => Setup::Running,
+            "waiting" => Setup::Waiting,
             "failed" => Setup::Failed,
             "broadcaster-error" => Setup::BroadcasterError,
             "timeout" => Setup::Timeout,
             "restart" => Setup::Restart,
             "ready" => Setup::Ready,
             "retired" => Setup::Retired,
+            "replaced" => Setup::Replaced,
+            "fee-token" => Setup::FeeToken,
             "two-accounts" => Setup::TwoAccounts,
             "destination-failed" => Setup::DestinationFailed,
             _ => return None,
@@ -517,11 +550,15 @@ pub(super) fn reported_head() -> Option<u64> {
     Some(REPORTED_TRADE_BLOCK + reported.confirmations())
 }
 
-/// What approving the review of a `retry-review` or speed-up mode ends in, in place of placing
-/// its order. `None` in every other mode.
+/// What approving the review of a `retry-review`, speed-up, `setup:fee-token` or
+/// `setup:retired` mode ends in, in place of placing its order or sending its setup. `None` in
+/// every other mode.
 pub(super) fn review_refusal() -> Option<&'static str> {
-    matches!(mode(), Some(Mode::RetryReview | Mode::SpeedUp(_)))
-        .then_some("Fixture: this mode stops at the review. Nothing was sent.")
+    matches!(
+        mode(),
+        Some(Mode::RetryReview | Mode::SpeedUp(_) | Mode::Setup(Setup::FeeToken | Setup::Retired))
+    )
+    .then_some("Fixture: this mode stops at the review. Nothing was sent.")
 }
 
 /// What the owner's rule would answer about speeding up a speed-up mode's synthesized swap,
@@ -1377,6 +1414,50 @@ const PRIVATE_DELIVERY: BridgeDelivery = BridgeDelivery {
     ..SWAP_DELIVERY
 };
 
+/// The setup fee limit a `setup:fee-token` mode's swap approved, 0.52 USDC, and the fee its
+/// retry is estimated at, 0.00016 WETH, which the review limits at 0.0002 WETH.
+const SETUP_APPROVED_FEE: u64 = 520_000;
+const SETUP_RETRY_FEE: u64 = 160_000_000_000_000;
+/// The setup fee limit a `setup:retired` mode's swap approved, 0.00015 WETH, which the stand-in
+/// estimate of its retry with a new account is above.
+const SETUP_RETIRED_APPROVED_FEE: u64 = 150_000_000_000_000;
+
+/// The two accounts of a `setup:replaced` mode, synthesized once: the swap's new account #5,
+/// reserved a minute ago with the use the swap started with four minutes ago, and the retired
+/// account #4 it replaced, which holds no swap. `None` when they fail to decode.
+fn replaced_accounts() -> Option<&'static (ExecutorRecord, ExecutorRecord)> {
+    static ACCOUNTS: OnceLock<Option<(ExecutorRecord, ExecutorRecord)>> = OnceLock::new();
+    ACCOUNTS
+        .get_or_init(|| {
+            let delegate = Address::repeat_byte(0x5d);
+            let retired = ExecutorOperationId::random().ok()?;
+            // The use keeps the ID it took from the account it started with.
+            let swap_use = SwapUseId::first(retired);
+            let now = now_unix();
+            let swap = staged_setup_account(
+                ExecutorOperationId::random().ok()?,
+                (5, SWAP_ACCOUNT, delegate),
+                (false, false),
+                &serde_json::json!({
+                    "version": 2, "created_at": now.saturating_sub(60),
+                    "purpose_summary": "Private swap", "active_swap_use": swap_use,
+                    "swap_uses": [{
+                        "id": swap_use, "started_at": now.saturating_sub(240), "fresh": true,
+                        "role": { "Source": { "approval": staged_setup_approval(None)? } },
+                    }],
+                }),
+            )?;
+            let retired = staged_setup_account(
+                retired,
+                (4, Address::repeat_byte(0x3a), delegate),
+                (false, false),
+                &serde_json::json!({ "retired": true }),
+            )?;
+            Some((swap, retired))
+        })
+        .as_ref()
+}
+
 /// The record of one stealth account of a `setup:` mode's swap, decoded from the JSON a stored
 /// record has, with `links` its own swap fields. A sent setup signed one payload, and a
 /// confirmed one's nonce was read as consumed.
@@ -1460,6 +1541,31 @@ fn staged_setup_progress(
 }
 
 impl PrivateSwapsView {
+    /// The estimate that stands in for a broadcaster's in the retry dialog of a
+    /// `setup:retired` mode, 0.00016 WETH, so the dialog can open its review on a wallet
+    /// without private funds. `None` in every other mode.
+    pub(super) fn ui_fixture_setup_estimate(
+        &self,
+        cx: &App,
+    ) -> Option<ExecutorRecoveryFeeEstimate> {
+        if !matches!(mode(), Some(Mode::Setup(Setup::Retired))) {
+            return None;
+        }
+        let root = self.root.upgrade()?;
+        let delegate = root
+            .read(cx)
+            .effective_chain_configs
+            .get(SWAP_ORIGIN)?
+            .accepted_executor_profile()?
+            .delegate();
+        Some(ExecutorRecoveryFeeEstimate::for_ui_fixture(
+            SWAP_ORIGIN,
+            WETH,
+            delegate,
+            U256::from(SETUP_RETRY_FEE),
+        ))
+    }
+
     /// In a `setup:` mode, show the detail of the synthesized swap with its setup held at
     /// `setup`: the records of its accounts, and the stages this session would hold of each
     /// setup. A running setup has a job that never answers.
@@ -1491,13 +1597,31 @@ impl PrivateSwapsView {
             let (operation, destination_operation) = (operation?, destination_operation?);
             // Each account's setup: whether it was sent, and whether it is confirmed.
             let (origin, destination) = match setup {
-                Setup::Running | Setup::Failed | Setup::Retired => ((false, false), (false, false)),
+                Setup::Running
+                | Setup::Waiting
+                | Setup::Failed
+                | Setup::Retired
+                | Setup::Replaced
+                | Setup::FeeToken => ((false, false), (false, false)),
                 Setup::BroadcasterError | Setup::Timeout | Setup::Restart | Setup::TwoAccounts => {
                     ((true, false), (false, false))
                 }
                 Setup::Ready => ((true, true), (false, false)),
                 Setup::DestinationFailed => ((true, true), (true, false)),
             };
+            let mut approval = staged_setup_approval(delivery)?;
+            if setup == Setup::FeeToken {
+                approval.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                    token: USDC,
+                    amount: U256::from(SETUP_APPROVED_FEE),
+                });
+            }
+            if setup == Setup::Retired {
+                approval.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+                    token: WETH,
+                    amount: U256::from(SETUP_RETIRED_APPROVED_FEE),
+                });
+            }
             let record = staged_setup_account(
                 operation,
                 (4, SWAP_ACCOUNT, delegate?),
@@ -1505,7 +1629,7 @@ impl PrivateSwapsView {
                 &serde_json::json!({
                     "purpose_summary": "Private swap",
                     "retired": setup == Setup::Retired,
-                    "swap_approval": staged_setup_approval(delivery)?,
+                    "swap_approval": approval,
                     "destination_operation": delivery.map(|_| destination_operation),
                 }),
             )?;
@@ -1523,7 +1647,12 @@ impl PrivateSwapsView {
             };
             Some((record, destination))
         };
-        let Some((record, destination)) = staged() else {
+        // A replaced account's swap is the one Stealth accounts lists in this mode.
+        let staged = match setup {
+            Setup::Replaced => replaced_accounts().map(|(swap, _)| (swap.clone(), None)),
+            _ => staged(),
+        };
+        let Some((record, destination)) = staged else {
             tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
             return;
         };
@@ -1537,8 +1666,20 @@ impl PrivateSwapsView {
         // What the setup job ended with. A failure its stages show isn't the swap's error too.
         let failed = "Fixture: the setup fee is above the limit approved with the swap.";
         let (origin, destination_progress, error) = match setup {
-            Setup::Running => (
+            Setup::Running | Setup::Replaced => (
                 Some(staged_setup_progress(ProvingTransaction, None)),
+                None,
+                None,
+            ),
+            Setup::Waiting => (
+                Some(
+                    staged_setup_progress(WaitingForBroadcasterResponse, None).waiting_since(
+                        std::rc::Rc::new(std::cell::Cell::new(
+                            std::time::Instant::now()
+                                .checked_sub(std::time::Duration::from_secs(27)),
+                        )),
+                    ),
+                ),
                 None,
                 None,
             ),
@@ -1550,6 +1691,26 @@ impl PrivateSwapsView {
                 None,
                 None,
             ),
+            // The stage says what a setup refused for its fee token says there.
+            Setup::FeeToken => {
+                let root = self.root.upgrade();
+                let changed = super::setup_fee_token_changed(
+                    SWAP_ORIGIN,
+                    root.as_ref()
+                        .map(|root| &root.read(cx).effective_token_registry),
+                    (USDC, U256::from(SETUP_APPROVED_FEE)),
+                    WETH,
+                    "Retry setup",
+                );
+                (
+                    Some(staged_setup_progress(
+                        EstimatingBroadcasterFee,
+                        Some(Err(changed)),
+                    )),
+                    None,
+                    None,
+                )
+            }
             Setup::BroadcasterError => (
                 Some(staged_setup_progress(
                     WaitingForBroadcasterResponse,
@@ -1592,7 +1753,10 @@ impl PrivateSwapsView {
         // The review that approved the setup has the wallet place the order after it.
         tracking.auto_place = setup != Setup::Ready;
         // The view tells a running setup by its job, so one that never answers stands in.
-        if matches!(setup, Setup::Running | Setup::TwoAccounts) {
+        if matches!(
+            setup,
+            Setup::Running | Setup::Waiting | Setup::Replaced | Setup::TwoAccounts
+        ) {
             self.job = Some(SwapJob {
                 operation,
                 kind: SwapJobKind::Setup,
@@ -1613,6 +1777,24 @@ impl PrivateSwapsView {
         }
         self.records = vec![record];
         self.show_detail(operation, window, cx);
+        if setup == Setup::FeeToken
+            && let (Some(delegate), Some(root)) = (delegate, self.root.upgrade())
+        {
+            // ETH at $3,000 and USDC at $1: a token's rate is its base units for one ETH.
+            {
+                let cache = &root.read(cx).public_broadcaster_anchor_cache;
+                cache.store_native_usd_rate(SWAP_ORIGIN, U256::from(3_000_000_000_u64), 18);
+                cache.store_rate(SWAP_ORIGIN, USDC, U256::from(3_000_000_000_u64));
+                cache.store_rate(SWAP_ORIGIN, WETH, U256::from(1_000_000_000_000_000_000_u64));
+            }
+            let estimate = ExecutorRecoveryFeeEstimate::for_ui_fixture(
+                SWAP_ORIGIN,
+                WETH,
+                delegate,
+                U256::from(SETUP_RETRY_FEE),
+            );
+            self.open_ui_fixture_setup_retry_review(operation, &estimate, window, cx);
+        }
     }
 
     /// In a `reported:` mode, show the detail of the synthesized swap with what this session
@@ -1766,10 +1948,13 @@ impl PrivateSwapsView {
     }
 }
 
-/// The stealth accounts an `accounts` or `refund:stealth` mode shows in place of the
-/// wallet's own, synthesized once. `None` in every other mode.
+/// The stealth accounts an `accounts`, `refund:stealth` or `setup:replaced` mode shows in
+/// place of the wallet's own, synthesized once. `None` in every other mode.
 pub(in crate::root) fn stealth_accounts() -> Option<Vec<ExecutorRecord>> {
     static ACCOUNTS: OnceLock<Vec<ExecutorRecord>> = OnceLock::new();
+    if matches!(mode(), Some(Mode::Setup(Setup::Replaced))) {
+        return replaced_accounts().map(|(swap, retired)| vec![swap.clone(), retired.clone()]);
+    }
     matches!(mode(), Some(Mode::Accounts | Mode::Refund(Refund::Stealth))).then(|| {
         ACCOUNTS
             .get_or_init(|| {

@@ -65,6 +65,7 @@ pub(super) use progress::{
     private_submission_discard_attempt_available, self_broadcast_progress_steps,
     self_broadcast_step_retry_kind, sponsored_stop_uses_session_command,
 };
+pub(in crate::root) use progress::{broadcaster_resend_count, broadcaster_wait_detail};
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
     private_broadcaster_retry_button_id, private_broadcaster_step_detail,

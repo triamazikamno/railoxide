@@ -4,16 +4,24 @@
 //! The value outlives the job that sent the setup, so the stage it ended at stays known until
 //! a new attempt for that account starts or the swap leaves its setup.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::Task;
 use tokio::sync::watch;
 use wallet_ops::{PublicBroadcasterResultKind, TransactionGenerationStage};
 
 use super::form::broadcaster_result_problem;
+use super::{
+    SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
+    SWAP_SETUP_RETRY_RESENDS,
+};
 use crate::root::private_broadcaster::{
     PrivateBroadcasterProgressStepState, apply_private_broadcaster_progress_stage,
-    end_private_broadcaster_progress_steps, private_broadcaster_progress_steps,
+    broadcaster_resend_count, broadcaster_wait_detail, end_private_broadcaster_progress_steps,
+    private_broadcaster_progress_steps,
 };
 use crate::root::public_action::PublicActionStepStatus;
 
@@ -42,6 +50,8 @@ pub(super) struct SetupProgress {
     end: Option<SetupProgressEnd>,
     /// Redraws the view on each stage. A value built without a view has none.
     watch: Option<Task<()>>,
+    /// When the setup began to wait for a broadcaster's answer, as its watch saw it.
+    waiting_since: Rc<Cell<Option<Instant>>>,
 }
 
 impl SetupProgress {
@@ -55,7 +65,47 @@ impl SetupProgress {
             receiver: Some(receiver),
             end: None,
             watch,
+            waiting_since: Rc::default(),
         }
+    }
+
+    /// The setup with `waiting_since`, which its watch sets once the setup waits for a
+    /// broadcaster's answer.
+    pub(super) fn waiting_since(mut self, waiting_since: Rc<Cell<Option<Instant>>>) -> Self {
+        self.waiting_since = waiting_since;
+        self
+    }
+
+    /// Whether the setup still waits for a broadcaster's answer after the re-sends that offer
+    /// to send it again, `SWAP_SETUP_RETRY_RESENDS`.
+    pub(super) fn wait_outlasted(&self, now: Instant) -> bool {
+        self.stage() == Some(TransactionGenerationStage::WaitingForBroadcasterResponse)
+            && self.waiting_since.get().is_some_and(|since| {
+                broadcaster_resend_count(since, SWAP_BROADCASTER_REPUBLISH_INTERVAL, now)
+                    .is_some_and(|count| count >= SWAP_SETUP_RETRY_RESENDS)
+            })
+    }
+
+    /// What `step` says while the setup waits for a broadcaster's answer: how often the
+    /// request was re-sent and the time left, as a private action's progress says it. `None`
+    /// for any other step, and once the setup's job ended.
+    pub(super) fn wait_detail(
+        &self,
+        step: &PrivateBroadcasterProgressStepState,
+        now: Instant,
+    ) -> Option<String> {
+        if step.stage != TransactionGenerationStage::WaitingForBroadcasterResponse
+            || step.status != PublicActionStepStatus::Pending
+            || self.stage()? != step.stage
+        {
+            return None;
+        }
+        broadcaster_wait_detail(
+            self.waiting_since.get()?,
+            SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+            Some(SWAP_BROADCASTER_RESPONSE_TIMEOUT),
+            now,
+        )
     }
 
     /// The stage a running setup is at. `None` once its job ended.
@@ -171,6 +221,36 @@ mod tests {
         assert!(progress.finish(result));
         assert_eq!(progress.stage(), None);
         progress
+    }
+
+    /// While a broadcaster is awaited, its stage tells the re-sends and the time left, as a
+    /// private action's progress does, with the swap's own interval and timeout.
+    #[test]
+    fn the_response_stage_tells_the_resends_while_waiting() {
+        let (sender, receiver) = watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
+        let now = Instant::now();
+        let waiting_since = Rc::new(Cell::new(None));
+        let progress =
+            SetupProgress::running(receiver, None).waiting_since(Rc::clone(&waiting_since));
+        sender
+            .send(TransactionGenerationStage::WaitingForBroadcasterResponse)
+            .unwrap();
+        waiting_since.set(now.checked_sub(std::time::Duration::from_secs(12)));
+        let details = |progress: &SetupProgress| {
+            progress
+                .steps()
+                .iter()
+                .filter_map(|step| progress.wait_detail(step, now))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            details(&progress),
+            ["Still waiting - re-sent 2x - 1:48 left"]
+        );
+        sender
+            .send(TransactionGenerationStage::PublishingToBroadcaster)
+            .unwrap();
+        assert!(details(&progress).is_empty());
     }
 
     #[test]

@@ -184,6 +184,7 @@ pub fn broadcaster_settings_fields(
             // The pinned Switch stores its tooltip but does not render it.
             div()
                 .id("out-of-range-help")
+                .debug_selector(|| "out-of-range".into())
                 .tooltip(|window, cx| {
                     Tooltip::new("Allow broadcaster fees outside the configured anchor range.")
                         .build(window, cx)

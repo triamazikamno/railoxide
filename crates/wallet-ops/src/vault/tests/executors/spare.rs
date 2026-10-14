@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::{
     Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -126,6 +126,8 @@ fn executor_spare_migrates_and_is_claimed_once_across_store_handles() {
 struct RpcState {
     requests: Mutex<Vec<Value>>,
     used: Mutex<BTreeSet<Address>>,
+    /// Every account counts as used, whatever `used` holds.
+    all_used: AtomicBool,
     head: AtomicU64,
     native_balance: AtomicU64,
     changed: Notify,
@@ -260,7 +262,8 @@ async fn serve(
     {
         let _ = held.wait_for(|held| *held != address).await;
     }
-    let used = address.is_some_and(|address| state.used.lock().unwrap().contains(&address));
+    let used = state.all_used.load(Ordering::Relaxed)
+        || address.is_some_and(|address| state.used.lock().unwrap().contains(&address));
     let called = address
         .filter(|_| request["method"] == "eth_call")
         .and_then(|address| state.calls.lock().unwrap().get(&address).copied());

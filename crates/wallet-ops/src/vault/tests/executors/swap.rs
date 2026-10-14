@@ -2175,7 +2175,7 @@ fn a_retry_keeps_its_swap_uses_tokens_and_delivery() {
         ),
         ..retry()
     };
-    for (case, changed) in [
+    let cases = vec![
         ("another sell token", trading(4, 6)),
         ("another buy token", trading(5, 7)),
         (
@@ -2236,7 +2236,8 @@ fn a_retry_keeps_its_swap_uses_tokens_and_delivery() {
                 ..retry()
             },
         ),
-    ] {
+    ];
+    for (case, changed) in cases {
         assert!(
             matches!(
                 store.record_swap_attempt(operation, changed),
@@ -2698,7 +2699,14 @@ fn swap_records_written_before_private_bridge_delivery_decode_without_it() {
     private.delivery = SwapDelivery::Bridge(private_delivery);
     private.bounds.destination_shield_fee_bps = Some(U256::from(25));
     private.bounds.delivery_allowance = Some(U256::from(120));
-    private.bounds.destination_setup_fee = Some(U256::from(3));
+    private.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+        token: Address::repeat_byte(13),
+        amount: U256::from(3),
+    });
+    private.bounds.source_setup_fee = Some(SwapSetupFeeLimit {
+        token: Address::repeat_byte(14),
+        amount: U256::from(4),
+    });
     assert_eq!(reencode::<SwapApproval>(&private), private);
     let private_terms = AcrossOrderTerms {
         recipient: Some(Address::repeat_byte(12)),
@@ -3108,7 +3116,10 @@ fn destination_shield_payloads_are_outstanding_until_their_nonce_is_consumed() {
             destination_minimum: Some(U256::from(9_900)),
             destination_shield_fee_bps: Some(U256::from(25)),
             delivery_allowance: Some(U256::from(120)),
-            destination_setup_fee: Some(U256::from(3)),
+            destination_setup_fee: Some(SwapSetupFeeLimit {
+                token: Address::repeat_byte(13),
+                amount: U256::from(3),
+            }),
             ..swap_bounds()
         },
         ..private_across_attempt(
@@ -4233,6 +4244,480 @@ fn stopping_an_unsigned_reused_pair_releases_both_accounts_after_reload() {
     assert_eq!(pair.destination.unwrap().active_swap_use(), Some(next));
     drop(reloaded);
     drop(reloaded_destination);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn record_of(store: &ExecutorStore, operation: ExecutorOperationId) -> ExecutorRecord {
+    store
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .unwrap()
+}
+
+/// An approved new account whose derivation bound `address`.
+fn approved_new_account(address: u8) -> SwapApprovedAccount {
+    SwapApprovedAccount {
+        address: Some(Address::repeat_byte(address)),
+        setup: true,
+    }
+}
+
+/// A private Bridge approval to chain 137 that binds new accounts on both chains, the
+/// destination account as the delivery's receiver.
+fn bound_private_bridge_approval(token: Address) -> SwapApproval {
+    let mut approved = approval(5, 6);
+    approved.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+        Address::repeat_byte(9),
+        token,
+        BridgeShieldFailure::RefundOnOrigin,
+    ));
+    approved.accounts = Some(SwapApprovedAccounts {
+        source: approved_new_account(7),
+        destination: Some(approved_new_account(9)),
+    });
+    approved
+}
+
+#[test]
+fn replacing_a_retired_destination_moves_the_swap_use_to_a_new_account() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    let [source, destination, replacement] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let id = SwapUseId::random().unwrap();
+    let approved = bound_private_bridge_approval(token);
+    store
+        .claim_swap_pair(SwapPairClaim {
+            id,
+            source: SwapAccountChoice::New(source),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approved.clone(),
+            destination: Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::New(destination),
+                delegate: destination_delegate,
+                destination_token: token,
+            }),
+        })
+        .unwrap();
+    // The source's setup is out before the destination is found used.
+    set_up(&store, source, delegate, Address::repeat_byte(7));
+    let source_before = record_of(&store, source);
+    destination_store.retire(destination).unwrap();
+    let replaced = store
+        .replace_swap_use_account(source, id, SwapUseSide::Destination, replacement)
+        .unwrap();
+
+    // The new account holds the use, and the two records link each other as a claimed pair's.
+    let account = replaced.destination.clone().unwrap();
+    assert_eq!(account.operation(), replacement);
+    assert_eq!(
+        (
+            account.active_swap_use(),
+            account.is_retired(),
+            account.delegate()
+        ),
+        (Some(id), false, destination_delegate)
+    );
+    assert!(account.swap_use(id).unwrap().is_fresh());
+    assert_eq!(replaced.source.destination_operation(), Some(replacement));
+    assert_eq!(
+        store.swap_use_accounts(source, id).unwrap(),
+        ClaimedSwapPair {
+            source: replaced.source.clone(),
+            destination: replaced.destination,
+        }
+    );
+
+    // The approval waits for the new account's address. Its other terms and the source's
+    // setup stay.
+    let mut expected = approved;
+    expected.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+        Address::ZERO,
+        token,
+        BridgeShieldFailure::RefundOnOrigin,
+    ));
+    expected.accounts = Some(SwapApprovedAccounts {
+        source: approved_new_account(7),
+        destination: Some(SwapApprovedAccount {
+            address: None,
+            setup: true,
+        }),
+    });
+    assert_eq!(
+        replaced.source.swap_use(id).unwrap().approval(),
+        Some(&expected)
+    );
+    assert_eq!(replaced.source.issued(), source_before.issued());
+
+    // The retired account is a plain retired account.
+    let retired = record_of(&destination_store, destination);
+    assert!(retired.is_retired() && retired.swap_uses().is_empty());
+    assert_eq!(retired.active_swap_use(), None);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacing_a_retired_source_keeps_the_swap_use_and_the_destination_setup() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    let [source, destination, replacement] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let id = SwapUseId::random().unwrap();
+    let approved = bound_private_bridge_approval(token);
+    store
+        .claim_swap_pair(SwapPairClaim {
+            id,
+            source: SwapAccountChoice::New(source),
+            delegate,
+            purpose_summary: None,
+            assets: Vec::new(),
+            approval: approved.clone(),
+            destination: Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::New(destination),
+                delegate: destination_delegate,
+                destination_token: token,
+            }),
+        })
+        .unwrap();
+    // The destination's setup is out, with its fee notes, before the source is found used.
+    destination_store
+        .bind_address(destination, Address::repeat_byte(9))
+        .unwrap();
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    destination_store
+        .record_account_read(destination, observed)
+        .unwrap();
+    let before = destination_store
+        .record_issued(
+            destination,
+            hook(
+                ExecutorPayloadPurpose::Operation,
+                0,
+                3,
+                destination_delegate,
+                observed,
+                swap_inputs(),
+            ),
+        )
+        .unwrap();
+    // The retired source as stored, with a start time no later reservation takes.
+    let role = SwapUseRole::Source {
+        approval: Some(Box::new(approved.clone())),
+        destination_operation: Some(destination),
+    };
+    let stored = StoredRecord {
+        retired: true,
+        ..stored_record(source, 1, Some((id, role)))
+    };
+    store.put_operation_fixture(source, &stored).unwrap();
+    let replaced = store
+        .replace_swap_use_account(source, id, SwapUseSide::Source, replacement)
+        .unwrap();
+
+    // The new account holds the same use: its ID, start time, destination link and approval,
+    // which waits for the new account's address.
+    let account = replaced.source.clone();
+    assert_eq!(account.operation(), replacement);
+    assert_eq!(
+        (
+            account.active_swap_use(),
+            account.is_retired(),
+            account.delegate()
+        ),
+        (Some(id), false, stored.delegate)
+    );
+    let moved = account.swap_use(id).unwrap();
+    assert!(moved.is_fresh());
+    assert_eq!(moved.started_at(), stored.swap_uses[0].started_at);
+    assert_eq!(account.destination_operation(), Some(destination));
+    let mut expected = approved;
+    expected.accounts = Some(SwapApprovedAccounts {
+        source: SwapApprovedAccount {
+            address: None,
+            setup: true,
+        },
+        destination: Some(approved_new_account(9)),
+    });
+    assert_eq!(moved.approval(), Some(&expected));
+
+    // The destination's link back moved, and nothing else of it: its setup payload, the notes
+    // that payload reserves and its nonce state are as they were.
+    let after = replaced.destination.clone().unwrap();
+    assert_eq!(
+        after.swap_destination_use(id),
+        Some(SwapDestinationRecord {
+            origin_operation: replacement,
+            ..before.swap_destination_use(id).unwrap()
+        })
+    );
+    assert_eq!(after.issued(), before.issued());
+    assert_eq!(after.reserved_inputs(), swap_inputs());
+    assert_eq!(
+        (
+            after.address(),
+            after.nonce_observation(),
+            after.nonce_watermark(),
+            after.active_swap_use(),
+            after.is_retired(),
+            after.is_swap_setup_stopped(),
+        ),
+        (
+            before.address(),
+            before.nonce_observation(),
+            before.nonce_watermark(),
+            before.active_swap_use(),
+            before.is_retired(),
+            before.is_swap_setup_stopped(),
+        )
+    );
+
+    // After a reload the pair is the new source and the destination, and the retired account
+    // lists no use of the swap.
+    let reloaded = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    assert_eq!(
+        reloaded.swap_use_accounts(replacement, id).unwrap(),
+        ClaimedSwapPair {
+            source: replaced.source,
+            destination: replaced.destination,
+        }
+    );
+    let retired = record_of(&reloaded, source);
+    assert!(retired.is_retired() && retired.swap_uses().is_empty());
+    assert_eq!(
+        (retired.active_swap_use(), retired.destination_operation()),
+        (None, None)
+    );
+    drop(reloaded);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A cancellation finds the use by its ID under the lock a replacement writes under. Whichever
+/// of the two is written first, no account is left preparing the swap.
+#[test]
+fn cancelling_a_swap_use_by_id_and_replacing_its_source_leave_no_live_use_in_either_order() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    // A new pair whose source was found used and retired.
+    let claim = |source, destination| {
+        let id = SwapUseId::random().unwrap();
+        store
+            .claim_swap_pair(SwapPairClaim {
+                id,
+                source: SwapAccountChoice::New(source),
+                delegate,
+                purpose_summary: None,
+                assets: Vec::new(),
+                approval: bound_private_bridge_approval(token),
+                destination: Some(SwapDestinationClaim {
+                    chain_id: 137,
+                    account: SwapAccountChoice::New(destination),
+                    delegate: destination_delegate,
+                    destination_token: token,
+                }),
+            })
+            .unwrap();
+        store.retire(source).unwrap();
+        id
+    };
+    let stopped = |store: &ExecutorStore, operation, id| {
+        record_of(store, operation)
+            .swap_use(id)
+            .is_some_and(SwapUseRecord::is_stopped)
+    };
+
+    // Replaced first: the use is cancelled on the replacement, which the caller didn't name.
+    let [source, destination, replacement] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let id = claim(source, destination);
+    store
+        .replace_swap_use_account(source, id, SwapUseSide::Source, replacement)
+        .unwrap();
+    let (cancelled, _) = store.cancel_swap_use_by_id(id).unwrap();
+    assert_eq!(cancelled, replacement);
+    assert!(stopped(&store, replacement, id) && stopped(&destination_store, destination, id));
+
+    // Cancelled first: the retired account keeps the stopped use, and nothing replaces it.
+    let [source, destination, replacement] =
+        std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let id = claim(source, destination);
+    let (cancelled, _) = store.cancel_swap_use_by_id(id).unwrap();
+    assert_eq!(cancelled, source);
+    assert!(matches!(
+        store.replace_swap_use_account(source, id, SwapUseSide::Source, replacement),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    assert!(stopped(&store, source, id) && stopped(&destination_store, destination, id));
+    assert!(
+        store
+            .records()
+            .unwrap()
+            .iter()
+            .all(|record| record.operation() != replacement)
+    );
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_swap_account_is_replaced_only_while_fresh_retired_and_before_any_order() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    let claim = |source, destination, receiver| {
+        let id = SwapUseId::random().unwrap();
+        let mut approved = approval(5, 6);
+        approved.delivery = SwapDelivery::Bridge(private_bridge_delivery(
+            receiver,
+            token,
+            BridgeShieldFailure::RefundOnOrigin,
+        ));
+        store
+            .claim_swap_pair(SwapPairClaim {
+                id,
+                source,
+                delegate,
+                purpose_summary: None,
+                assets: Vec::new(),
+                approval: approved,
+                destination: Some(SwapDestinationClaim {
+                    chain_id: 137,
+                    account: destination,
+                    delegate: destination_delegate,
+                    destination_token: token,
+                }),
+            })
+            .unwrap();
+        id
+    };
+    // A refusal writes nothing on either chain.
+    let refused = |source, id, side| {
+        let records = || {
+            (
+                store.records().unwrap(),
+                destination_store.records().unwrap(),
+            )
+        };
+        let before = records();
+        assert!(matches!(
+            store.replace_swap_use_account(
+                source,
+                id,
+                side,
+                ExecutorOperationId::random().unwrap()
+            ),
+            Err(ExecutorStoreError::OperationMismatch)
+        ));
+        assert_eq!(records(), before);
+    };
+
+    // Neither account of a new pair is retired.
+    let [source, destination] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let id = claim(
+        SwapAccountChoice::New(source),
+        SwapAccountChoice::New(destination),
+        Address::ZERO,
+    );
+    refused(source, id, SwapUseSide::Source);
+    refused(source, id, SwapUseSide::Destination);
+
+    // Accounts the swap reuses are never replaced, retired or not.
+    let [source, destination] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    store.reserve(source, delegate, None, &[]).unwrap();
+    destination_store
+        .reserve(destination, destination_delegate, None, &[])
+        .unwrap();
+    set_up(&store, source, delegate, Address::repeat_byte(7));
+    set_up(
+        &destination_store,
+        destination,
+        destination_delegate,
+        Address::repeat_byte(9),
+    );
+    let id = claim(
+        SwapAccountChoice::Existing(source),
+        SwapAccountChoice::Existing(destination),
+        Address::repeat_byte(9),
+    );
+    store.retire(source).unwrap();
+    destination_store.retire(destination).unwrap();
+    refused(source, id, SwapUseSide::Source);
+    refused(source, id, SwapUseSide::Destination);
+
+    // A use with an order keeps its accounts, also a new destination that issued nothing.
+    let [source, destination] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let (executor, receiver) = (Address::repeat_byte(8), Address::repeat_byte(18));
+    store.reserve(source, delegate, None, &[]).unwrap();
+    let observed = set_up(&store, source, delegate, executor);
+    let id = claim(
+        SwapAccountChoice::Existing(source),
+        SwapAccountChoice::New(destination),
+        receiver,
+    );
+    destination_store
+        .bind_address(destination, receiver)
+        .unwrap();
+    let mut order = private_across_attempt(source, executor, delegate, observed, receiver, token);
+    order.use_id = id;
+    store.record_swap_attempt(source, order).unwrap();
+    destination_store.retire(destination).unwrap();
+    refused(source, id, SwapUseSide::Destination);
     drop(store);
     drop(destination_store);
     drop(view);
@@ -5681,7 +6166,10 @@ fn public_swap_claims_take_a_destination_account_and_cancel_before_signing() {
     // A full review before hand-off discards stale signed delivery terms.
     let mut replacement = recorded.approval().clone();
     replacement.bounds.destination_minimum = Some(bridge.output_amount);
-    replacement.bounds.destination_setup_fee = Some(U256::from(100));
+    replacement.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+        token: Address::repeat_byte(0x33),
+        amount: U256::from(100),
+    });
     let reapproved = store
         .reapprove_public_swap(new, first, replacement.clone())
         .unwrap();
@@ -6007,7 +6495,10 @@ fn a_public_account_has_one_open_swap_per_bought_and_sold_token_on_a_chain() {
         },
     );
     replacement.bounds.destination_minimum = Some(U256::from(9_900));
-    replacement.bounds.destination_setup_fee = Some(U256::from(100));
+    replacement.bounds.destination_setup_fee = Some(SwapSetupFeeLimit {
+        token: Address::repeat_byte(0x33),
+        amount: U256::from(100),
+    });
     assert!(matches!(
         store.reapprove_public_swap(operation, open_id, replacement),
         Err(ExecutorStoreError::OperationMismatch)

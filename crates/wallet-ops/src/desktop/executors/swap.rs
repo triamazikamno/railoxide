@@ -9,8 +9,8 @@ use eyre::{Result, eyre};
 use railgun_wallet::tx::RailgunGasModel;
 use tracing::Instrument as _;
 
-use super::execution::OperationReservation;
-use super::recovery::{PaidExecutionPurpose, recovery_gas_limits, require_private_fee_limit};
+use super::execution::{ExecutorAccountUsed, OperationReservation};
+use super::recovery::{PaidExecutionPurpose, recovery_gas_limits, require_swap_setup_fee_limit};
 use super::{
     ExecutorDelivery, ExecutorOwner, ExecutorPaidRecoveryOutcome, ExecutorReconciliationReport,
     ExecutorRecoveryFeeEstimate, PreparedExecutorOperation,
@@ -25,7 +25,7 @@ use crate::vault::{
     ExecutorPayloadPurpose, ExecutorRecord, SwapAccountChoice, SwapAccountRole, SwapAccountUse,
     SwapAdmissionEvidence, SwapApproval, SwapApprovalTokens, SwapApprovedAccount,
     SwapApprovedAccounts, SwapDelivery, SwapDestinationClaim, SwapPairClaim, SwapUseCancellation,
-    SwapUseId, SwapUseRecord, SwapUseRole, swap_account_refusal,
+    SwapUseId, SwapUseRecord, SwapUseRole, SwapUseSide, swap_account_refusal,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction,
@@ -156,6 +156,7 @@ fn require_swap_account(
 
 /// Delivery of an approved setup. The fee ceiling is the reviewed maximum.
 /// Borrow the authorization when the same swap needs it again for destination shielding.
+#[derive(Clone)]
 pub struct SwapSetupRequest<A = DesktopPrivateSpendAuthorization> {
     pub maximum_private_fee: U256,
     pub session: Arc<WalletSession>,
@@ -176,6 +177,17 @@ pub struct SwapUseClaim {
     pub approval: SwapApproval,
     /// The destination stealth account, exactly for a private Bridge delivery.
     pub destination: Option<SwapAccountChoice>,
+}
+
+/// A swap use after one of its accounts was replaced: see
+/// [`ExecutorOwner::replace_swap_account`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapAccountReplacement {
+    /// The swap's own account's operation after the replacement.
+    pub operation: ExecutorOperationId,
+    pub swap_use: SwapUseId,
+    /// The newly reserved account's operation on its side's chain.
+    pub replacement: ExecutorOperationId,
 }
 
 /// The accounts one swap use prepares, and what each side needs: see [`prepare_swap_pair`].
@@ -455,6 +467,429 @@ where
             None => None,
         }
     })
+}
+
+/// How many newly reserved stealth accounts one setup job replaces by itself after finding them
+/// used. Another used account in a row suggests an account index far behind the chain, where
+/// asking the user is better than spending reservations unseen.
+pub const SWAP_ACCOUNT_REPLACEMENT_LIMIT: usize = 3;
+
+/// One account of a prepared pair with its setup's delivery, for
+/// [`SwapAccountReplacements::submit_setups`]. The authorization is borrowed, so a replacement
+/// account's setup is sent with the same one.
+pub type SwapPairSetup<'a> = (
+    &'a mut SwapPairSide,
+    Option<SwapSetupRequest<&'a DesktopPrivateSpendAuthorization>>,
+);
+
+/// Whether `authorization` covers any stealth account of its wallet. A hardware approval is
+/// bound to the reviewed account's action, so it doesn't cover a replacement account.
+const fn authorizes_replacement(authorization: &DesktopPrivateSpendAuthorization) -> bool {
+    matches!(
+        authorization,
+        DesktopPrivateSpendAuthorization::VaultPassword(_)
+            | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { .. }
+    )
+}
+
+/// One setup job's swap, followed through the replacement of newly reserved accounts that are
+/// found used. A preparation or a submission that fails with [`ExecutorAccountUsed`] for the
+/// account it works on retired that account. The job then replaces it with
+/// [`ExecutorOwner::replace_swap_account`] and goes on with the new account on that side
+/// alone, under the terms, broadcaster, fee limit and authorization it already holds.
+///
+/// It replaces at most [`SWAP_ACCOUNT_REPLACEMENT_LIMIT`] accounts, counted over both sides,
+/// and none for an authorization bound to the retired account's action. Where it replaces
+/// nothing, the error is returned as it came and the retired account keeps the swap use.
+pub struct SwapAccountReplacements<'a> {
+    origin: &'a ExecutorOwner,
+    /// A private Bridge swap's destination chain's owner and the swap's account there.
+    destination: Option<(&'a ExecutorOwner, ExecutorOperationId)>,
+    operation: ExecutorOperationId,
+    swap_use: SwapUseId,
+    remaining: usize,
+    replaced_source: bool,
+    replaced_destination: bool,
+    replaced: Box<dyn FnMut(ExecutorOperationId, SwapAccountReplacement) + Send + 'a>,
+}
+
+impl<'a> SwapAccountReplacements<'a> {
+    /// Follow the swap use `swap_use` of the account `operation` on `origin`'s chain, with
+    /// `destination`, a private Bridge swap's destination chain's owner and account there.
+    /// `replaced` is told each replacement as it is made: the swap's own account's operation
+    /// before it, and the swap after it.
+    #[must_use]
+    pub fn new(
+        origin: &'a ExecutorOwner,
+        destination: Option<(&'a ExecutorOwner, ExecutorOperationId)>,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        replaced: impl FnMut(ExecutorOperationId, SwapAccountReplacement) + Send + 'a,
+    ) -> Self {
+        Self {
+            origin,
+            destination,
+            operation,
+            swap_use,
+            remaining: SWAP_ACCOUNT_REPLACEMENT_LIMIT,
+            replaced_source: false,
+            replaced_destination: false,
+            replaced: Box::new(replaced),
+        }
+    }
+
+    /// The swap's own account's operation, after the replacements made so far.
+    #[must_use]
+    pub const fn operation(&self) -> ExecutorOperationId {
+        self.operation
+    }
+
+    /// The swap use, which every replacement keeps.
+    #[must_use]
+    pub const fn swap_use(&self) -> SwapUseId {
+        self.swap_use
+    }
+
+    /// The destination account's operation, after the replacements made so far.
+    #[must_use]
+    pub fn destination_operation(&self) -> Option<ExecutorOperationId> {
+        self.destination.map(|(_, operation)| operation)
+    }
+
+    /// Save `approval`, terms the user authorized for the reserved swap in this job, with the
+    /// accounts the swap has by now: [`ExecutorOwner::bind_swap_use_accounts`] for the swap
+    /// this follows. The approval was reviewed before the job replaced anything, so what it
+    /// binds of a replaced account is dropped first, as the replacement dropped it from the
+    /// saved approval: the account's address and, for the destination, the delivery's receiver.
+    pub fn bind_approval(&self, mut approval: SwapApproval) -> Result<SwapApproval> {
+        if let Some(accounts) = approval.accounts.as_mut() {
+            if self.replaced_source {
+                accounts.source.address = None;
+            }
+            if let Some(destination) = accounts
+                .destination
+                .as_mut()
+                .filter(|_| self.replaced_destination)
+            {
+                destination.address = None;
+            }
+        }
+        if let Some(delivery) = approval
+            .delivery
+            .private_bridge()
+            .filter(|_| self.replaced_destination)
+        {
+            approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
+                receiver: Address::ZERO,
+                ..delivery
+            });
+        }
+        self.origin
+            .bind_swap_use_accounts(self.operation, self.swap_use, Some(approval))
+    }
+
+    /// Save `approval` for a setup resumed in this job. One that binds its accounts is saved
+    /// with [`Self::bind_approval`], whether or not this job holds the destination account, so
+    /// it names the swap's accounts as they are after a replacement. One that binds none is
+    /// saved as it is, which also gives a record without a use its first one.
+    pub fn save_resumed_approval(&self, approval: SwapApproval) -> Result<()> {
+        if approval.accounts.is_some() {
+            self.bind_approval(approval)?;
+        } else {
+            self.origin
+                .record_swap_approval(self.operation, self.swap_use, approval)?;
+        }
+        Ok(())
+    }
+
+    fn account(&self, side: SwapUseSide) -> Option<ExecutorOperationId> {
+        match side {
+            SwapUseSide::Source => Some(self.operation),
+            SwapUseSide::Destination => self.destination_operation(),
+        }
+    }
+
+    fn owner(&self, side: SwapUseSide) -> Result<&'a ExecutorOwner> {
+        match side {
+            SwapUseSide::Source => Ok(self.origin),
+            SwapUseSide::Destination => self
+                .destination
+                .map(|(owner, _)| owner)
+                .ok_or_else(|| eyre!("this swap has no destination stealth account")),
+        }
+    }
+
+    /// Replace the account on `side` after `error`, when that is [`ExecutorAccountUsed`] for
+    /// it, a replacement is left and `authorization` covers another account. Otherwise
+    /// `error` is returned unchanged, also when the replacement itself is refused.
+    fn replace(
+        &mut self,
+        side: SwapUseSide,
+        authorization: &DesktopPrivateSpendAuthorization,
+        error: eyre::Report,
+    ) -> Result<SwapAccountReplacement> {
+        let used = error
+            .downcast_ref::<ExecutorAccountUsed>()
+            .map(ExecutorAccountUsed::operation);
+        if used.is_none()
+            || used != self.account(side)
+            || self.remaining == 0
+            || !authorizes_replacement(authorization)
+        {
+            return Err(error);
+        }
+        let replaced = match self.origin.replace_swap_account(
+            self.destination.map(|(owner, _)| owner),
+            self.operation,
+            self.swap_use,
+            side,
+        ) {
+            Ok(replaced) => replaced,
+            Err(refusal) => {
+                tracing::warn!(error = %refusal, "a used stealth account was not replaced");
+                return Err(error);
+            }
+        };
+        self.remaining -= 1;
+        let previous = std::mem::replace(&mut self.operation, replaced.operation);
+        match side {
+            SwapUseSide::Source => self.replaced_source = true,
+            SwapUseSide::Destination => {
+                self.replaced_destination = true;
+                if let Some((_, operation)) = self.destination.as_mut() {
+                    *operation = replaced.replacement;
+                }
+            }
+        }
+        (self.replaced)(previous, replaced);
+        Ok(replaced)
+    }
+
+    /// The preparation of `side`'s new account, after `prepared`, its first attempt. An
+    /// account found used is replaced and the replacement prepared with `candidate`, until one
+    /// is unused or nothing more is replaced.
+    pub async fn prepare_setup(
+        &mut self,
+        side: SwapUseSide,
+        mut prepared: Result<PreparedExecutorOperation>,
+        candidate: &PublicBroadcasterCandidate,
+        authorization: &DesktopPrivateSpendAuthorization,
+    ) -> Result<PreparedExecutorOperation> {
+        loop {
+            let error = match prepared {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) => error,
+            };
+            // Every pass replaces one account or ends.
+            let replaced = self.replace(side, authorization, error)?;
+            prepared = Box::pin(self.owner(side)?.resume_swap_setup(
+                replaced.replacement,
+                candidate.clone(),
+                authorization,
+            ))
+            .await;
+        }
+    }
+
+    /// Prepare `side`'s reserved account again with [`ExecutorOwner::resume_swap_setup`],
+    /// replacing it as [`Self::prepare_setup`] does.
+    pub async fn resume_setup(
+        &mut self,
+        side: SwapUseSide,
+        candidate: &PublicBroadcasterCandidate,
+        authorization: &DesktopPrivateSpendAuthorization,
+    ) -> Result<PreparedExecutorOperation> {
+        let operation = self
+            .account(side)
+            .ok_or_else(|| eyre!("this swap has no destination stealth account"))?;
+        let prepared = Box::pin(self.owner(side)?.resume_swap_setup(
+            operation,
+            candidate.clone(),
+            authorization,
+        ))
+        .await;
+        Box::pin(self.prepare_setup(side, prepared, candidate, authorization)).await
+    }
+
+    /// [`prepare_swap_pair`] for the swap this follows, which `request` names. A new account
+    /// found used is replaced and the pair prepared again with the replacement, which resumes
+    /// the same claim. The approval is bound once both accounts are derived, so it names the
+    /// accounts the pair ends with.
+    pub async fn prepare_pair(
+        &mut self,
+        request: SwapPairPreparation<'_>,
+    ) -> Result<PreparedSwapPair> {
+        let SwapPairPreparation {
+            use_id,
+            mut source,
+            mut destination,
+            approval,
+            candidate,
+            destination_candidate,
+            authorization,
+            destination_authorization,
+        } = request;
+        loop {
+            let prepared = Box::pin(prepare_swap_pair(
+                self.origin,
+                self.destination.map(|(owner, _)| owner),
+                SwapPairPreparation {
+                    use_id,
+                    source,
+                    destination,
+                    approval: approval.clone(),
+                    candidate: candidate.clone(),
+                    destination_candidate: destination_candidate.clone(),
+                    authorization,
+                    destination_authorization,
+                },
+            ))
+            .await;
+            let error = match prepared {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) => error,
+            };
+            let used = error
+                .downcast_ref::<ExecutorAccountUsed>()
+                .map(ExecutorAccountUsed::operation);
+            // Every pass replaces one account or ends.
+            if used.is_some() && used == self.destination_operation() {
+                let Some(authorization) = destination_authorization else {
+                    return Err(error);
+                };
+                let replaced = self.replace(SwapUseSide::Destination, authorization, error)?;
+                destination = Some(SwapAccountChoice::New(replaced.replacement));
+            } else {
+                let replaced = self.replace(SwapUseSide::Source, authorization, error)?;
+                source = SwapAccountChoice::New(replaced.replacement);
+            }
+        }
+    }
+
+    /// [`submit_swap_pair_setups`] for the swap this follows. A setup whose account is found
+    /// used before its first payload is then followed on its side alone: the account is
+    /// replaced and prepared, a private Bridge swap's saved approval is bound to the accounts
+    /// as they are by then, and the replacement's setup is submitted with the same request.
+    /// The other side's setup, sent or failed, is neither stopped nor sent again. Each side
+    /// ends holding the account it was last prepared with.
+    pub async fn submit_setups(
+        &mut self,
+        origin: SwapPairSetup<'_>,
+        destination: Option<SwapPairSetup<'_>>,
+    ) -> SwapPairSetupResults {
+        let (origin, origin_request) = origin;
+        let (sent_origin, sent_destination) = {
+            let destination = destination
+                .as_ref()
+                .zip(self.destination)
+                .map(|((side, request), (owner, _))| (owner, &**side, request.clone()));
+            submit_swap_pair_setups_with(
+                (self.origin, &*origin, origin_request.clone()),
+                destination,
+                |owner, prepared, request| Box::pin(owner.submit_swap_setup(prepared, request)),
+            )
+            .await
+        };
+        let sent_origin =
+            Box::pin(self.resubmit(SwapUseSide::Source, origin, sent_origin, origin_request)).await;
+        let sent_destination = match destination {
+            Some((side, request)) => {
+                Box::pin(self.resubmit(SwapUseSide::Destination, side, sent_destination, request))
+                    .await
+            }
+            None => sent_destination,
+        };
+        (sent_origin, sent_destination)
+    }
+
+    /// The result of `side`'s setup after `sent`, its first submission: while a submission
+    /// fails because its account was found used, the account is replaced and prepared, and
+    /// the replacement's setup submitted. A saved approval that binds its accounts is bound
+    /// first, so it names the replacement, and a replaced destination is its delivery's
+    /// receiver, before anything is signed for the new account.
+    async fn resubmit(
+        &mut self,
+        side: SwapUseSide,
+        account: &mut SwapPairSide,
+        sent: Option<Result<ExecutorPaidRecoveryOutcome>>,
+        request: Option<SwapSetupRequest<&DesktopPrivateSpendAuthorization>>,
+    ) -> Option<Result<ExecutorPaidRecoveryOutcome>> {
+        let Some(request) = request else {
+            return sent;
+        };
+        let authorization = request.authorization;
+        let submit = |owner: &'a ExecutorOwner, prepared: PreparedExecutorOperation| {
+            let request = request.clone();
+            async move {
+                let sent = Box::pin(owner.submit_swap_setup(&prepared, request)).await;
+                (prepared, sent)
+            }
+        };
+        Box::pin(self.resubmit_with(side, account, sent, authorization, submit)).await
+    }
+
+    /// [`Self::resubmit`] over `submit`, which hands a replacement's prepared setup off and
+    /// returns it with the result.
+    pub(crate) async fn resubmit_with<T, F, S>(
+        &mut self,
+        side: SwapUseSide,
+        account: &mut SwapPairSide,
+        mut sent: Option<Result<T>>,
+        authorization: &DesktopPrivateSpendAuthorization,
+        submit: F,
+    ) -> Option<Result<T>>
+    where
+        F: Fn(&'a ExecutorOwner, PreparedExecutorOperation) -> S,
+        S: Future<Output = (PreparedExecutorOperation, Result<T>)>,
+    {
+        loop {
+            let error = match sent {
+                Some(Err(error)) => error,
+                sent => return sent,
+            };
+            let SwapPairSide::Setup(used) = &*account else {
+                return Some(Err(error));
+            };
+            let ExecutorDelivery::PublicBroadcaster(candidate) = used.delivery() else {
+                return Some(Err(error));
+            };
+            let candidate = PublicBroadcasterCandidate::clone(candidate);
+            // Every pass replaces one account or ends.
+            let (replaced, owner) = match self
+                .replace(side, authorization, error)
+                .and_then(|replaced| Ok((replaced, self.owner(side)?)))
+            {
+                Ok(replaced) => replaced,
+                Err(error) => return Some(Err(error)),
+            };
+            let (origin, operation, swap_use) = (self.origin, self.operation, self.swap_use);
+            let submitted = async {
+                let prepared = Box::pin(owner.resume_swap_setup(
+                    replaced.replacement,
+                    candidate,
+                    authorization,
+                ))
+                .await?;
+                // The stored approval says whether the swap binds its accounts. This job may
+                // hold no destination owner for a swap that does.
+                let binds = origin
+                    .swap_account_record(operation)?
+                    .is_some_and(|record| {
+                        record
+                            .swap_use(swap_use)
+                            .and_then(SwapUseRecord::approval)
+                            .is_some_and(|approval| approval.accounts.is_some())
+                    });
+                if binds {
+                    origin.bind_swap_use_accounts(operation, swap_use, None)?;
+                }
+                let (prepared, sent) = Box::pin(submit(owner, prepared)).await;
+                *account = SwapPairSide::Setup(prepared);
+                sent
+            };
+            sent = Some(Box::pin(submitted).await);
+        }
+    }
 }
 
 /// A swap executor that canonically carries the accepted delegation, with an execution
@@ -984,6 +1419,69 @@ impl ExecutorOwner {
         Ok(cancellation)
     }
 
+    /// [`Self::cancel_swap_use`] for the use `id` alone, on whichever of this chain's accounts
+    /// holds it as its source now, found in the same store write that cancels it. A setup job
+    /// may have replaced the swap's used account since the caller read it. The result names
+    /// the swap's own account the use was cancelled on.
+    pub fn cancel_swap_use_by_id(
+        &self,
+        destination: Option<&Self>,
+        id: SwapUseId,
+    ) -> Result<(ExecutorOperationId, SwapUseCancellation)> {
+        self.ensure_active()?;
+        if let Some(destination) = destination {
+            destination.ensure_active()?;
+            if !self.view.is_same_wallet_session(&destination.view) {
+                return Err(eyre!(
+                    "the destination network belongs to another wallet session"
+                ));
+            }
+        }
+        let cancelled = self.store.cancel_swap_use_by_id(id)?;
+        self.notify_change();
+        if let Some(destination) = destination {
+            destination.notify_change();
+        }
+        Ok(cancelled)
+    }
+
+    /// Replace the retired stealth account on `side` of the swap use `swap_use`, which has no
+    /// order yet, with a newly reserved one, through this source chain's owner. `operation` is
+    /// the swap's own account. The new account takes the retired one's part in the use and the
+    /// retired one stays a plain retired account. It reads no chain state and derives no key.
+    pub fn replace_swap_account(
+        &self,
+        destination: Option<&Self>,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        side: SwapUseSide,
+    ) -> Result<SwapAccountReplacement> {
+        self.ensure_active()?;
+        if let Some(destination) = destination {
+            destination.ensure_active()?;
+            if !self.view.is_same_wallet_session(&destination.view) {
+                return Err(eyre!(
+                    "the destination network belongs to another wallet session"
+                ));
+            }
+        }
+        let replacement = ExecutorOperationId::random()?;
+        self.store
+            .replace_swap_use_account(operation, swap_use, side, replacement)?;
+        self.notify_change();
+        if let Some(destination) = destination {
+            destination.notify_change();
+        }
+        Ok(SwapAccountReplacement {
+            operation: match side {
+                SwapUseSide::Source => replacement,
+                SwapUseSide::Destination => operation,
+            },
+            swap_use,
+            replacement,
+        })
+    }
+
     /// Remove a setup from active swaps, preserving the account for observation and recovery.
     /// Stopping a swap also stops its destination stealth account on that chain's next load;
     /// call this on the destination chain's owner to stop that account at once.
@@ -1376,8 +1874,8 @@ impl ExecutorOwner {
     }
 
     /// Refuse a destination setup's private fee ceiling above the destination setup fee approved
-    /// with its swap. A swap paid from a Public account saves it with the use that claims this
-    /// account, and any other in the swap's record on its own chain.
+    /// with its swap, or in another fee token. A swap paid from a Public account saves it with
+    /// the use that claims this account, and any other in the swap's record on its own chain.
     pub(crate) fn require_swap_destination_setup_fee(
         &self,
         operation: ExecutorOperationId,
@@ -1394,16 +1892,12 @@ impl ExecutorOwner {
         }
         let approved = approved
             .ok_or_else(|| eyre!("this destination stealth account has no approved setup fee"))?;
-        require_private_fee_limit(
-            fee_token,
-            maximum_private_fee,
-            approved,
-            PaidExecutionPurpose::SwapSetup,
-        )
+        require_swap_setup_fee_limit(fee_token, maximum_private_fee, approved)
     }
 
     /// Refuse a swap's own setup's private fee ceiling above the source setup fee approved with
-    /// the swap. An approval from before that fee was bound has none and refuses nothing.
+    /// the swap, or in another fee token. Only an account the swap use reuses has no limit, and
+    /// nothing is refused for it.
     pub(crate) fn require_swap_source_setup_fee(
         &self,
         operation: ExecutorOperationId,
@@ -1414,12 +1908,7 @@ impl ExecutorOwner {
             .swap_account_record(operation)?
             .and_then(|record| record.swap_approval()?.bounds.source_setup_fee);
         if let Some(approved) = approved {
-            require_private_fee_limit(
-                fee_token,
-                maximum_private_fee,
-                approved,
-                PaidExecutionPurpose::SwapSetup,
-            )?;
+            require_swap_setup_fee_limit(fee_token, maximum_private_fee, approved)?;
         }
         Ok(())
     }

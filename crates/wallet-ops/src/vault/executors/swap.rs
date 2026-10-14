@@ -575,6 +575,15 @@ pub struct SwapAnchorObservation {
     pub updated_at: Option<u64>,
 }
 
+/// The approved maximum private fee of one stealth account's setup, with the fee token it is
+/// counted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapSetupFeeLimit {
+    pub token: Address,
+    /// In `token` base units.
+    pub amount: U256,
+}
+
 /// Values the user approved for one order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapApprovedBounds {
@@ -641,14 +650,14 @@ pub struct SwapApprovedBounds {
     /// in destination-token base units. `None` for other deliveries.
     #[serde(default)]
     pub delivery_allowance: Option<U256>,
-    /// The approved maximum private setup fee on the destination chain, in its fee token.
-    /// `None` for other deliveries.
+    /// The approved maximum private setup fee on the destination chain, with its fee token.
+    /// `None` when the destination account needs no setup, and for other deliveries.
     #[serde(default)]
-    pub destination_setup_fee: Option<U256>,
-    /// The approved maximum private setup fee on the swap's own chain, in its fee token. `None`
-    /// when the source account needs no setup, and in records from before it was bound.
+    pub destination_setup_fee: Option<SwapSetupFeeLimit>,
+    /// The approved maximum private setup fee on the swap's own chain, with its fee token.
+    /// `None` when the source account needs no setup because the swap use reuses its account.
     #[serde(default)]
-    pub source_setup_fee: Option<U256>,
+    pub source_setup_fee: Option<SwapSetupFeeLimit>,
 }
 
 impl SwapApprovedBounds {
