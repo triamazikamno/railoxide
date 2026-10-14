@@ -211,12 +211,17 @@ pub fn swap_account_refusal(
         SwapAccountRole::Source => record.retired && record.swap.is_none(),
         SwapAccountRole::Destination { .. } => record.retired,
     };
-    if retired || record.swap_setup_stopped {
+    // A new source use can take the account of a cancelled fresh source preparation. Its
+    // setup and every payload it signed must still resolve, which the rules below judge.
+    let cancelled_source = role == SwapAccountRole::Source
+        && swap_use == SwapAccountUse::New
+        && cancelled_fresh_source(record);
+    if retired || record.swap_setup_stopped && !cancelled_source {
         return Some(Refusal::RecoveryOnly);
     }
     let claimed = match swap_use {
         SwapAccountUse::New => {
-            if !active_use_finished(record) {
+            if !cancelled_source && !active_use_finished(record) {
                 return Some(Refusal::ClaimedByAnotherSwap);
             }
             None
@@ -439,6 +444,17 @@ fn active_use_finished(record: &ExecutorRecord) -> bool {
                 SwapUseRole::Destination { shields, .. }
                 | SwapUseRole::PublicSourceDestination { shields, .. } => !shields.is_empty(),
             })
+    })
+}
+
+/// Whether the use that claims the account reserved it fresh as a source and was stopped
+/// before any order. Its claim and the account's stopped setup then hold only that use back.
+fn cancelled_fresh_source(record: &ExecutorRecord) -> bool {
+    record.active_use().is_some_and(|swap_use| {
+        swap_use.fresh
+            && swap_use.stopped
+            && matches!(swap_use.role, SwapUseRole::Source { .. })
+            && !record.has_swap_use_order(swap_use.id)
     })
 }
 

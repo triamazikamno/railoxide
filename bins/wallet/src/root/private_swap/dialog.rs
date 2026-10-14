@@ -513,9 +513,7 @@ impl PrivateSwapsView {
                 || self.pending_order(record).is_some()
                 || super::model::cancelled_swap_uses(record).next().is_some()
         }) {
-            let mut has_cancelled = false;
             for claimed in super::model::cancelled_swap_uses(record) {
-                has_cancelled = true;
                 let swap = SwapIdentity {
                     operation: record.operation(),
                     swap_use: claimed.id(),
@@ -564,11 +562,7 @@ impl PrivateSwapsView {
                     started: self.swap_started(record, Some(swap), cx),
                 });
             }
-            if has_cancelled
-                && orders.is_empty()
-                && pending.is_none()
-                && super::model::prepared_swap_use(record).is_none()
-            {
+            if pending.is_none() && super::model::holds_only_cancelled_preparations(record) {
                 continue;
             }
             let stage = self.progress_stage(record);

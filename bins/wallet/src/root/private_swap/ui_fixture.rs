@@ -1,8 +1,9 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
-//! retry review, failed quote, speed-up, split outcome, reported fill and setup progress, at the
-//! Stealth accounts inspector and at the refund dialog of a blocked Shield: it opens them on a scratch wallet without
-//! private funds and holds a chosen state on screen. It is compiled only with
-//! `debug_assertions`, and does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
+//! retry review, failed quote, speed-up, split outcome, reported fill, setup progress and
+//! cancelled preparation, at the Stealth accounts inspector and at the refund dialog of a
+//! blocked Shield: it opens them on a scratch wallet without private funds and holds a chosen
+//! state on screen. It is compiled only with `debug_assertions`, and does nothing unless
+//! `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
@@ -180,15 +181,32 @@
 //!   shows the shield, which credits 99.75 USDC privately, or the 100 USDC held by that
 //!   account, whose shield didn't run. Copy buttons work, and the detail's other actions do
 //!   nothing.
+//! - `cancelled:<state>` opens the private form of a new swap that sells WETH for USDC, in place
+//!   of a Public account's, on Ethereum with its private session started. It holds two
+//!   synthesized stealth accounts: #5 on Ethereum and #12 on Arbitrum One, which a private
+//!   Bridge swap of 0.05 WETH for USDC to the private balance on Arbitrum One reserved fresh 15
+//!   minutes ago. Both setups are confirmed, and that swap was cancelled before its order with
+//!   no signed work left, which stopped its use of each account and retired #12. In
+//!   `confirmed` nothing claimed #5 since, so the Source picker lists it under New account,
+//!   which stays the default. Choosing #5 shows its reuse warning in place of a setup fee. In
+//!   `reused` a later swap of 0.02 WETH for USDC back to the private balance claimed #5 two
+//!   minutes ago and has no order yet, so the picker lists New account alone. The form asks
+//!   for no quote, so it can't be reviewed, and a change of account estimates no setup fee.
+//!   My orders, opened from the form, lists the cancelled swap under Ended, and in `reused`
+//!   the later swap too. The cancelled swap's entry opens its detail, which says that #5 can
+//!   be chosen for another swap in `confirmed`, that it can't be until no other swap holds it
+//!   in `reused`, and that #12 isn't used for another swap. On the later swap's detail,
+//!   Cancel preparation… ends in an error, as the wallet's store holds no such swap, and the
+//!   other actions do nothing.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
 //! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode, and the
 //! Speed up… of `setup:included-order-open`, opens the route its orderbook client would use,
-//! and sends nothing on it. A `quote-error` mode opens no route. A `reported:` mode asks no
-//! orderbook, chain or bridge provider about its swap. The review of a `setup:fee-token` or
-//! `setup:retired` mode holds the broadcaster network's client, as any setup's review does,
-//! and publishes nothing on it.
+//! and sends nothing on it. A `quote-error` or `cancelled:` mode opens no route. A `reported:`
+//! mode asks no orderbook, chain or bridge provider about its swap. The review of a
+//! `setup:fee-token` or `setup:retired` mode holds the broadcaster network's client, as any
+//! setup's review does, and publishes nothing on it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -253,6 +271,17 @@ enum Mode {
     Setup(Setup),
     SetupUnderOrder(SetupUnderOrder),
     Reported(Reported),
+    Cancelled(Cancelled),
+}
+
+/// What a `cancelled:` mode holds of stealth account #5 once the fresh source preparation that
+/// reserved it was cancelled with its setup confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cancelled {
+    /// Nothing claimed the account since, so a new swap can choose it.
+    Confirmed,
+    /// A later swap claimed the account and has no order yet.
+    Reused,
 }
 
 /// What a `setup:` mode holds of the swap's own setup below its one order, which was placed
@@ -472,6 +501,13 @@ fn parse(value: &str) -> Option<Mode> {
             _ => return None,
         }));
     }
+    if let Some(state) = value.strip_prefix("cancelled:") {
+        return Some(Mode::Cancelled(match state {
+            "confirmed" => Cancelled::Confirmed,
+            "reused" => Cancelled::Reused,
+            _ => return None,
+        }));
+    }
     if let Some(state) = value.strip_prefix("fee:") {
         return Some(Mode::Fee(match state {
             "checking" => Fee::Checking,
@@ -578,6 +614,7 @@ pub(super) fn holds_swaps() -> bool {
                 | Mode::Setup(_)
                 | Mode::SetupUnderOrder(_)
                 | Mode::Reported(_)
+                | Mode::Cancelled(_)
         )
     )
 }
@@ -1017,8 +1054,8 @@ fn staged_record(stage: Detail, identity: SwapIdentity, swap: &Staged) -> Option
     .ok()
 }
 
-/// The network the private swap of a `retry-review`, `split:`, speed-up, `setup:` or
-/// `reported:` mode sells on.
+/// The network the private swap of a `retry-review`, `split:`, speed-up, `setup:`,
+/// `reported:` or `cancelled:` mode sells on.
 const SWAP_ORIGIN: u64 = 1;
 /// The block the synthesized private swap's observations count from.
 const SWAP_ORIGIN_BLOCK: u64 = 24_612_480;
@@ -1634,6 +1671,84 @@ fn staged_setup_approval(delivery: Option<BridgeDelivery>) -> Option<SwapApprova
     })
 }
 
+/// The records of a `cancelled:` mode, each decoded from the JSON a stored record has: account
+/// #5 on Ethereum, for the accepted `delegate`, and destination account #12 on Arbitrum One.
+/// Fifteen minutes ago a private Bridge swap of 0.05 WETH for USDC reserved both fresh. Both
+/// setups, at nonce 0, are confirmed, and the swap was cancelled before its order, which
+/// stopped its use of each account and retired #12. With `Reused`, a later swap of 0.02 WETH
+/// for USDC back to the private balance claimed #5 two minutes ago and has no order yet.
+/// Between the two records is the cancelled swap's identity, under which the view finds #12.
+fn staged_cancelled(
+    cancelled: Cancelled,
+    delegate: Address,
+) -> Option<(ExecutorRecord, SwapIdentity, ExecutorRecord)> {
+    let now = now_unix();
+    let started = now.saturating_sub(900);
+    let operation = ExecutorOperationId::random().ok()?;
+    let destination_operation = ExecutorOperationId::random().ok()?;
+    let swap = SwapIdentity {
+        operation,
+        swap_use: SwapUseId::first(operation),
+    };
+    let mut uses = vec![serde_json::json!({
+        "id": swap.swap_use, "started_at": started, "fresh": true, "stopped": true,
+        "stopped_before_order": true,
+        "role": { "Source": {
+            "approval": staged_setup_approval(Some(PRIVATE_DELIVERY))?,
+            "destination_operation": destination_operation,
+        }},
+    })];
+    let mut active = swap.swap_use;
+    if cancelled == Cancelled::Reused {
+        // 0.02 WETH, less Railgun's unshield fee, for 40.18 USDC, on the account as it is.
+        let mut approval = staged_setup_approval(None)?;
+        approval.bounds.unshield_amount = Some(U256::from(20_000_000_000_000_000_u64));
+        approval.bounds.sell_amount = U256::from(19_950_000_000_000_000_u64);
+        approval.bounds.buy_amount = U256::from(40_184_000_u32);
+        approval.bounds.private_minimum = U256::from(40_184_000_u32);
+        approval.accounts = Some(SwapApprovedAccounts {
+            source: SwapApprovedAccount {
+                address: Some(SWAP_ACCOUNT),
+                setup: false,
+            },
+            destination: None,
+        });
+        active = SwapUseId::random().ok()?;
+        uses.push(serde_json::json!({
+            "id": active, "started_at": now.saturating_sub(120), "fresh": false,
+            "role": { "Source": { "approval": approval } },
+        }));
+    }
+    let source = staged_setup_account(
+        operation,
+        (5, SWAP_ACCOUNT, delegate),
+        (true, true),
+        &serde_json::json!({
+            "version": 2, "created_at": started, "purpose_summary": "Private swap",
+            "swap_setup_stopped": cancelled == Cancelled::Confirmed,
+            "active_swap_use": active, "swap_uses": uses,
+        }),
+    )?;
+    let destination = staged_setup_account(
+        destination_operation,
+        (12, SETUP_DESTINATION_ACCOUNT, Address::repeat_byte(0x5d)),
+        (true, true),
+        &serde_json::json!({
+            "version": 2, "created_at": started, "retired": true, "swap_setup_stopped": true,
+            "active_swap_use": swap.swap_use,
+            "swap_uses": [{
+                "id": swap.swap_use, "started_at": started, "fresh": true, "stopped": true,
+                "stopped_before_order": true,
+                "role": { "Destination": {
+                    "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
+                    "destination_token": PRIVATE_DELIVERY.destination_token,
+                }},
+            }],
+        }),
+    )?;
+    Some((source, swap, destination))
+}
+
 /// This session's stages of a setup whose job is at `stage`, or ended there with `result`.
 fn staged_setup_progress(
     stage: TransactionGenerationStage,
@@ -1997,9 +2112,40 @@ impl PrivateSwapsView {
         self.show_detail(operation, window, cx);
     }
 
-    /// In a `retry-review`, `quote-error`, `split:`, speed-up, `setup:` or `reported:` mode,
-    /// show the synthesized private swap in place of the Public account form that was asked
-    /// for. `true` when such a mode is on.
+    /// In a `cancelled:` mode, stage account #5 and the destination account of its cancelled
+    /// swap, then open the private form of a new swap that sells WETH. Its Source picker lists
+    /// #5 when local admission offers it.
+    fn open_ui_fixture_cancelled(
+        &mut self,
+        cancelled: Cancelled,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // Local admission offers a source only for the network's accepted delegate.
+        let delegate = self.root.upgrade().and_then(|root| {
+            let chains = &root.read(cx).effective_chain_configs;
+            Some(
+                chains
+                    .get(SWAP_ORIGIN)?
+                    .accepted_executor_profile()?
+                    .delegate(),
+            )
+        });
+        let Some((record, swap, destination)) =
+            delegate.and_then(|delegate| staged_cancelled(cancelled, delegate))
+        else {
+            tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
+            return;
+        };
+        self.destinations.insert(swap, Some(destination));
+        // The form lists its Source accounts from the records as it opens.
+        self.records = vec![record];
+        self.open_ui_fixture_new_swap(WETH, USDC, window, cx);
+    }
+
+    /// In a `retry-review`, `quote-error`, `split:`, speed-up, `setup:`, `reported:` or
+    /// `cancelled:` mode, show the synthesized private swap in place of the Public account form
+    /// that was asked for. `true` when such a mode is on.
     pub(super) fn open_ui_fixture_swap(
         &mut self,
         window: &mut Window,
@@ -2013,7 +2159,8 @@ impl PrivateSwapsView {
                 | Mode::SpeedUp(SpeedUp::Review)
                 | Mode::Setup(_)
                 | Mode::SetupUnderOrder(_)
-                | Mode::Reported(_),
+                | Mode::Reported(_)
+                | Mode::Cancelled(_),
             ) => None,
             Some(Mode::Split(split)) => Some((Some(split), None)),
             Some(Mode::SpeedUp(speed_up)) => Some((None, Some(speed_up))),
@@ -2040,6 +2187,10 @@ impl PrivateSwapsView {
         }
         if let Some(Mode::Reported(reported)) = mode() {
             self.open_ui_fixture_reported(reported, window, cx);
+            return true;
+        }
+        if let Some(Mode::Cancelled(cancelled)) = mode() {
+            self.open_ui_fixture_cancelled(cancelled, window, cx);
             return true;
         }
         if matches!(mode(), Some(Mode::QuoteError)) {

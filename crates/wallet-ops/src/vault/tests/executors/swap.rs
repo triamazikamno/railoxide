@@ -4419,6 +4419,139 @@ fn cancelling_a_swap_use_releases_a_reused_source_and_keeps_an_issued_destinatio
 }
 
 #[test]
+fn a_new_swap_takes_a_cancelled_sources_confirmed_account_and_the_cancelled_use_stays_stopped() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let destination_store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let (delegate, destination_delegate) = (accepted_delegate(1), accepted_delegate(137));
+    let token = Address::repeat_byte(10);
+    let [source, unconfirmed] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+
+    // The swap's setup is handed off with its fee notes, then the user cancels it.
+    store
+        .reserve_with_swap_approval(
+            source,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    let first = SwapUseId::first(source);
+    store.bind_address(source, Address::repeat_byte(2)).unwrap();
+    let before_setup =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    store.record_account_read(source, before_setup).unwrap();
+    let setup = |nonce, hash, observed, inputs| {
+        hook(
+            ExecutorPayloadPurpose::Operation,
+            nonce,
+            hash,
+            delegate,
+            observed,
+            inputs,
+        )
+    };
+    store
+        .record_issued(source, setup(0, 3, before_setup, swap_inputs()))
+        .unwrap();
+    assert_eq!(
+        store.cancel_swap_use(source, first).unwrap().source,
+        SwapUseRelease::IssuedWorkRemains
+    );
+    let claim = |id, destination| SwapPairClaim {
+        id,
+        source: SwapAccountChoice::Existing(source),
+        delegate,
+        purpose_summary: None,
+        assets: Vec::new(),
+        approval: approval(7, 8),
+        destination,
+    };
+
+    // A confirmed read resolves the setup. Private sync hasn't passed it, so its notes stay
+    // reserved.
+    let observed =
+        ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE);
+    store.record_account_read(source, observed).unwrap();
+    let cancelled = record_of(&store, source);
+    assert_eq!(cancelled.reserved_inputs(), swap_inputs());
+
+    // A destination that can't take the use refuses the whole claim.
+    destination_store
+        .reserve(unconfirmed, destination_delegate, Some("Private swap"), &[])
+        .unwrap();
+    destination_store
+        .bind_address(unconfirmed, Address::repeat_byte(9))
+        .unwrap();
+    let id = SwapUseId::random().unwrap();
+    assert!(matches!(
+        store.claim_swap_pair(claim(
+            id,
+            Some(SwapDestinationClaim {
+                chain_id: 137,
+                account: SwapAccountChoice::Existing(unconfirmed),
+                delegate: destination_delegate,
+                destination_token: token,
+            })
+        )),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    assert_eq!(record_of(&store, source), cancelled);
+
+    // The new swap claims the account alone, and no other swap can take it.
+    let claimed = store.claim_swap_pair(claim(id, None)).unwrap().source;
+    assert!(matches!(
+        store.claim_swap_pair(claim(SwapUseId::random().unwrap(), None)),
+        Err(ExecutorStoreError::SwapUseActive)
+    ));
+    // Cancelling the old use again changes nothing.
+    store.cancel_swap_use(source, first).unwrap();
+
+    // After a restart the old use is still stopped with its terms, the new one holds the
+    // account, and the setup keeps its payload and notes.
+    let reopened = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let record = record_of(&reopened, source);
+    assert_eq!(record, claimed);
+    assert_eq!(
+        (record.active_swap_use(), record.is_swap_setup_stopped()),
+        (Some(id), false)
+    );
+    let [old, new] = record.swap_uses() else {
+        panic!("one use per swap");
+    };
+    assert!(old.is_fresh() && old.is_stopped());
+    assert_eq!(old.approval(), Some(&approval(5, 6)));
+    assert!(!new.is_fresh() && !new.is_stopped());
+    assert_eq!(record.issued(), cancelled.issued());
+    assert_eq!(record.reserved_inputs(), swap_inputs());
+
+    // Late work of the old use can't continue on the account.
+    assert!(matches!(
+        reopened.record_swap_approval(source, first, approval(5, 6)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    assert!(matches!(
+        reopened.record_issued(source, setup(1, 4, observed, Vec::new())),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    assert_eq!(record_of(&reopened, source), claimed);
+    drop(reopened);
+    drop(store);
+    drop(destination_store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stopping_an_unsigned_reused_pair_releases_both_accounts_after_reload() {
     let (root, db, vault) = desktop_store_with_vault();
     let view = Arc::new(import_wallet_with_metadata(

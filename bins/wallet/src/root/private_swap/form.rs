@@ -73,9 +73,9 @@ use wallet_ops::{
     vault::{
         BridgeDelivery, BridgePrivateDelivery, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
         ExecutorOperationId, ExecutorRecord, PublicAccountMetadata, PublicAccountSource,
-        SwapAccountChoice, SwapAccountRole, SwapApproval, SwapApprovedAccount,
-        SwapApprovedAccounts, SwapApprovedBounds, SwapDelivery, SwapSetupFeeLimit, SwapUseId,
-        SwapUseRecord, SwapUseSide,
+        SwapAccountChoice, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence, SwapApproval,
+        SwapApprovedAccount, SwapApprovedAccounts, SwapApprovedBounds, SwapDelivery,
+        SwapSetupFeeLimit, SwapUseId, SwapUseRecord, SwapUseSide, swap_account_refusal,
     },
 };
 
@@ -2276,47 +2276,39 @@ impl PrivateSwapsView {
         ]
     }
 
-    /// The Pay from row, and under it why the payer is fixed while a stealth account is chosen.
+    /// The Pay from row, with a tooltip explaining why a chosen stealth account fixes the payer.
     fn render_pay_from(form: &SwapForm, editable: bool) -> gpui::Div {
         // A chosen stealth account spends the private balance, so the payer can't change.
         let hint = (editable && form.public.is_none() && form.operation.is_some()).then(|| {
-            app_muted_text(if form.account_select.is_some() {
+            if form.account_select.is_some() {
                 "To pay from another account, set Stealth account to New account."
             } else {
                 "This swap keeps its stealth account, so its payer can't be changed."
-            })
-            .debug_selector(|| "swap-pay-from-hint".into())
-            .text_xs()
-            .whitespace_normal()
+            }
         });
         let editable = editable && form.can_change_source();
         div()
             .w_full()
             .min_w_0()
             .flex()
-            .flex_col()
-            .gap_1()
+            .items_center()
+            .gap_2()
+            .child(app_muted_text("Pay from").flex_none())
             .child(
                 div()
-                    .w_full()
+                    .id("swap-pay-from")
+                    .flex_1()
                     .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(app_muted_text("Pay from").flex_none())
+                    .debug_selector(|| "swap-pay-from".into())
+                    .when_some(hint, |this, hint| {
+                        this.tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                    })
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .debug_selector(|| "swap-pay-from".into())
-                            .child(
-                                Select::new(&form.pay_from_select)
-                                    .w_full()
-                                    .disabled(!editable),
-                            ),
+                        Select::new(&form.pay_from_select)
+                            .w_full()
+                            .disabled(!editable),
                     ),
             )
-            .children(hint)
     }
 
     fn refresh_source_select(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -2600,21 +2592,49 @@ impl PrivateSwapsView {
         chosen: Option<&ExecutorRecord>,
         cx: &App,
     ) -> Vec<SwapAccountSelectItem> {
-        let mut accounts = self
-            .private_owner()
-            .and_then(|owner| owner.swap_account_candidates().ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|candidate| {
-                (
-                    candidate.operation(),
-                    candidate.index(),
-                    candidate.address(),
-                    candidate.is_hidden(),
-                    candidate.last_pair(),
-                )
-            })
-            .collect::<Vec<_>>();
+        // Debug UI fixture: its synthesized records stand in for the store's, under the same
+        // local admission the store's candidates pass.
+        let mut accounts = if super::ui_fixture::holds_swaps() {
+            self.records
+                .iter()
+                .filter(|record| {
+                    swap_account_refusal(
+                        record,
+                        self.origin_chain_id,
+                        SwapAccountRole::Source,
+                        SwapAccountUse::New,
+                        SwapAdmissionEvidence::Recorded,
+                    )
+                    .is_none()
+                })
+                .filter_map(|record| {
+                    Some((
+                        record.operation(),
+                        record.index(),
+                        record.address()?,
+                        record.is_hidden(),
+                        record
+                            .swap()
+                            .map(|swap| (swap.terms().sell_token(), swap.terms().buy_token())),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.private_owner()
+                .and_then(|owner| owner.swap_account_candidates().ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.operation(),
+                        candidate.index(),
+                        candidate.address(),
+                        candidate.is_hidden(),
+                        candidate.last_pair(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         if let Some(record) = chosen
             && let Some(address) = record.address()
             && !accounts
@@ -2736,7 +2756,10 @@ impl PrivateSwapsView {
         self.refresh_form_assets(cx);
         // A receiver can't be the swap's own stealth account.
         self.refresh_form_delivery(cx);
-        self.refresh_setup_route(cx);
+        // Debug UI fixture: its form sets nothing up, so no setup fee is estimated for it.
+        if !super::ui_fixture::holds_swaps() {
+            self.refresh_setup_route(cx);
+        }
         self.schedule_quote(window, cx);
         cx.notify();
     }
@@ -3119,6 +3142,29 @@ impl PrivateSwapsView {
             form.quote = QuoteState::Failed(error);
         }
         cx.notify();
+    }
+
+    /// Debug UI fixture: in a `cancelled:` mode, open the private form of a new swap of `sell`
+    /// for `buy` over the synthesized records the mode staged. The fixture holds back the
+    /// form's own quote and routes, so the form has no quote.
+    #[cfg(debug_assertions)]
+    pub(super) fn open_ui_fixture_new_swap(
+        &mut self,
+        sell: Address,
+        buy: Address,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.open_form(
+            None,
+            sell,
+            Some(buy),
+            None,
+            None,
+            SwapDelivery::Reshield,
+            window,
+            cx,
+        );
     }
 
     /// Debug UI fixture: in a `retry-review` or speed-up mode, open the private form of the

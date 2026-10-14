@@ -1722,8 +1722,11 @@ fn stale_setup_read_is_dropped_and_a_failed_read_records_its_error(cx: &mut Test
 #[gpui::test]
 fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut TestAppContext) {
     use alloy::eips::{BlockNumHash, eip7702::constants::EIP7702_DELEGATION_DESIGNATOR};
-    use alloy::primitives::B256;
-    use wallet_ops::vault::ExecutorNonceObservation;
+    use alloy::primitives::{B256, Bytes};
+    use wallet_ops::vault::{
+        ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload, SwapAccountChoice, SwapPairClaim,
+    };
     with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let issued = pending_setup(executors, operation);
         executors
@@ -1885,6 +1888,91 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
                 swaps.continue_approved_swaps(window, cx);
                 assert!(swaps.pending_authorization.is_none());
                 assert!(swaps.job.is_none());
+            });
+        });
+
+        // Nothing of the cancelled swap is unresolved.
+        let first = SwapUseId::first(operation);
+        let identity = model::SwapIdentity {
+            operation,
+            swap_use: first,
+        };
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                assert!(!swaps.cancelled_use(identity, cx).unwrap().needs_attention());
+            });
+        });
+        // A new swap takes the account and is shown while it is prepared.
+        let second = SwapUseId::random().unwrap();
+        let mut later = test_approval();
+        later.bounds.sell_amount = U256::from(200);
+        executors
+            .claim_swap_pair(SwapPairClaim {
+                id: second,
+                source: SwapAccountChoice::Existing(operation),
+                delegate: record.delegate(),
+                purpose_summary: None,
+                assets: Vec::new(),
+                approval: later,
+                destination: None,
+            })
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                assert!(swaps.has_shown_swaps());
+                assert_eq!(swaps.open_order_count(cx), 1);
+            });
+        });
+        // Cancelled before its order too, the account holds only cancelled preparations: no
+        // card stays on the Private tab, also after reopening the view, and My orders lists
+        // both cancellations. The account isn't retired here, so its stage alone would still
+        // show it.
+        executors.cancel_swap_use(operation, second).unwrap();
+        let only_cancelled = |swaps: &PrivateSwapsView, cx: &gpui::App| {
+            assert!(!swaps.record(operation).unwrap().is_retired());
+            assert!(!swaps.has_shown_swaps());
+            assert_eq!(swaps.open_order_count(cx), 0);
+            assert_eq!(swaps.order_rows_for_test(cx).len(), 2);
+        };
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                only_cancelled(swaps, cx);
+            });
+        });
+        let swaps = cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.clear_private_swaps(cx);
+                root.ensure_private_swaps(window, cx);
+                root.private_swaps_view().unwrap()
+            })
+        });
+        cx.update(|_, cx| swaps.update(cx, |swaps, cx| only_cancelled(swaps, cx)));
+        // The account then signs a recovery that is still unresolved. That later work is not
+        // the first cancelled swap's attention.
+        executors
+            .record_issued(
+                operation,
+                IssuedExecutorPayload::new(
+                    U256::ONE,
+                    record.delegate(),
+                    B256::repeat_byte(5),
+                    ExecutorPayloadPurpose::Recovery,
+                    ExecutorPayloadContext::new(
+                        Bytes::from_static(b"recovery"),
+                        ExecutorNonceObservation::new(confirmed, U256::ONE),
+                        Vec::new(),
+                    ),
+                ),
+            )
+            .unwrap();
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                assert!(record.has_unresolved_issued_work());
+                assert!(!swaps.cancelled_use(identity, cx).unwrap().needs_attention());
             });
         });
     });
@@ -8685,7 +8773,9 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                             && cancelled.accounts.iter().all(|account| {
                                 !account.fresh
                                     && account.release == SwapUseRelease::Released
-                                    && account.outcome().starts_with("Released.")
+                                    && account
+                                        .outcome(swaps.offers_cancelled_source(operation))
+                                        .starts_with("Released.")
                             })
                     );
                     assert!(
@@ -8763,7 +8853,7 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                 assert!(
                     destination.fresh
                         && destination.release == SwapUseRelease::IssuedWorkRemains
-                        && destination.outcome().starts_with("Unresolved."),
+                        && destination.outcome(false).starts_with("Unresolved."),
                     "the sent setup is still unresolved"
                 );
             });

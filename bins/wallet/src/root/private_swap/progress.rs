@@ -28,9 +28,10 @@ use wallet_ops::{
     cow::OrderUid,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
-        ExecutorPayloadState, ExecutorRecord, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
+        ExecutorPayloadState, ExecutorRecord, SwapAccountRole, SwapAccountUse,
+        SwapAdmissionEvidence, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
         SwapPreHookDeathCause, SwapSubmissionStatus, SwapUseId, SwapUseRecord, SwapUseRelease,
-        SwapUseRole,
+        SwapUseRole, swap_account_refusal,
     },
 };
 
@@ -132,18 +133,30 @@ pub(super) struct CancelledAccount {
 
 impl CancelledAccount {
     /// What the cancellation left of the account. An existing account is released or kept
-    /// reserved, and never retired. A fresh one isn't used again and stays in Stealth
-    /// accounts, with its guards while a setup it sent can still confirm.
-    pub(super) const fn outcome(&self) -> &'static str {
+    /// reserved, and never retired. A fresh one stays in Stealth accounts, with its guards
+    /// while a setup it sent can still confirm. A fresh destination isn't used again.
+    /// `source_available` tells whether the Source picker offers the source account now,
+    /// which a clean cancellation alone doesn't promise.
+    pub(super) const fn outcome(&self, source_available: bool) -> &'static str {
         if self.unknown {
             return "Load this network to check its signed work. Cancellation preserves any outstanding nonce and fee-note guards.";
         }
+        let source = matches!(self.role, CancelledAccountRole::Source);
         match (self.fresh, self.release) {
-            (false, SwapUseRelease::Released) => {
+            (false, SwapUseRelease::Released) if !source || source_available => {
                 "Released. You can choose this account for another swap."
+            }
+            (false, SwapUseRelease::Released) => {
+                "Released from this swap. It can't be chosen for another swap right now."
             }
             (false, SwapUseRelease::IssuedWorkRemains) => {
                 "Still reserved. A shield it signed for this swap can still run, so its nonce guard stays until that is resolved."
+            }
+            (true, SwapUseRelease::Released) if source && source_available => {
+                "Preparation stopped with no unresolved signed work. You can choose this account for another swap."
+            }
+            (true, SwapUseRelease::Released) if source => {
+                "Preparation stopped with no unresolved signed work. This new account stays in Stealth accounts. It can be chosen for another swap once its setup is confirmed and no other swap holds it."
             }
             (true, SwapUseRelease::Released) => {
                 "Preparation stopped with no unresolved signed work. This new account stays in Stealth accounts and isn't used for another swap."
@@ -263,7 +276,8 @@ impl PrivateSwapsView {
         cx: &Context<'_, Self>,
     ) -> (gpui::Div, Option<gpui::Div>) {
         if let Some(cancelled) = self.cancelled_preparation(operation) {
-            return render_cancelled_preparation(cancelled, cx);
+            let available = self.offers_cancelled_source(operation);
+            return render_cancelled_preparation(cancelled, available, cx);
         }
         let Some(record) = self.record(operation) else {
             // An approved setup reserves the stealth account first.
@@ -2488,7 +2502,16 @@ impl PrivateSwapsView {
                        address: Option<alloy::primitives::Address>| {
             let unresolved = record.is_some_and(|record| {
                 if fresh {
-                    return record.has_unresolved_issued_work();
+                    // A later use took this source only once the work this preparation
+                    // signed had resolved. What the account signs since is that use's.
+                    let later_use = matches!(role, CancelledAccountRole::Source)
+                        && record
+                            .swap_uses()
+                            .iter()
+                            .skip_while(|later| later.id() != swap.swap_use)
+                            .nth(1)
+                            .is_some();
+                    return !later_use && record.has_unresolved_issued_work();
                 }
                 let Some(SwapUseRole::Destination { shields, .. }) =
                     record.swap_use(swap.swap_use).map(SwapUseRecord::role)
@@ -2572,8 +2595,26 @@ impl PrivateSwapsView {
     ) -> (gpui::Div, Option<gpui::Div>) {
         self.cancelled_use(swap, cx).map_or_else(
             || (app_muted_text("Swap preparation unavailable."), None),
-            |cancelled| render_cancelled_preparation(&cancelled, cx),
+            |cancelled| {
+                let available = self.offers_cancelled_source(swap.operation);
+                render_cancelled_preparation(&cancelled, available, cx)
+            },
         )
+    }
+
+    /// Whether the Source picker offers `operation`'s account to a new swap now, by the same
+    /// local admission and without a network request.
+    pub(super) fn offers_cancelled_source(&self, operation: ExecutorOperationId) -> bool {
+        self.record(operation).is_some_and(|record| {
+            swap_account_refusal(
+                record,
+                self.origin_chain_id,
+                SwapAccountRole::Source,
+                SwapAccountUse::New,
+                SwapAdmissionEvidence::Recorded,
+            )
+            .is_none()
+        })
     }
 
     fn confirm_cancel_preparation(
@@ -3715,6 +3756,7 @@ pub(super) fn stealth_account(id: &'static str, account: SwapStepAccount) -> gpu
 /// only closes.
 fn render_cancelled_preparation(
     cancelled: &CancelledPreparation,
+    source_available: bool,
     cx: &Context<'_, PrivateSwapsView>,
 ) -> (gpui::Div, Option<gpui::Div>) {
     let accounts = cancelled.accounts.iter().map(|account| {
@@ -3744,7 +3786,7 @@ fn render_cancelled_preparation(
                             .map(|shown| stealth_account("swap-cancelled-account", shown)),
                     ),
             )
-            .child(app_muted_text(account.outcome()).whitespace_normal())
+            .child(app_muted_text(account.outcome(source_available)).whitespace_normal())
     });
     let body = div()
         .flex()

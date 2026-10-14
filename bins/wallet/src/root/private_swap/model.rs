@@ -1221,6 +1221,15 @@ pub(in crate::root) fn cancelled_swap_uses(
     })
 }
 
+/// Whether `record` holds only cancelled preparations: no order of any of its swaps, no
+/// prepared swap, and at least one cancelled preparation. This only decides what is shown;
+/// it neither means the work they signed is resolved nor that the account can be reused.
+pub(in crate::root) fn holds_only_cancelled_preparations(record: &ExecutorRecord) -> bool {
+    record.swap().is_none_or(|swap| swap.orders().is_empty())
+        && prepared_swap_use(record).is_none()
+        && cancelled_swap_uses(record).next().is_some()
+}
+
 /// A recovery returned funds at or after `block`: a batch, paid by a broadcaster or by the
 /// account, that is the action attributed at its nonce with its shield received since then.
 /// Without `attribution` no batch counts.

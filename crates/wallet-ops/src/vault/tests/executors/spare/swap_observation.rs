@@ -2050,6 +2050,111 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
     fixture.finish().await;
 }
 
+// A source preparation cancelled after its setup was sent keeps its account until a confirmed
+// read resolves the setup and every payload the account signed. Only then is the account
+// offered to a new swap as a source, and fresh checks still read its delegation.
+#[tokio::test]
+async fn a_cancelled_source_is_offered_again_once_its_setup_and_work_resolve() {
+    let fixture = Fixture::start_pending().await;
+    let first = SwapUseId::first(fixture.operation);
+    fixture
+        .owner
+        .record_swap_approval(
+            fixture.operation,
+            first,
+            SwapApproval {
+                bounds: swap_bounds(),
+                price_verified: Some(false),
+                price_acknowledged: true,
+                delivery: SwapDelivery::Reshield,
+                tokens: None,
+                accounts: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .cancel_swap_use(fixture.operation, first)
+            .unwrap()
+            .source,
+        crate::vault::SwapUseRelease::IssuedWorkRemains
+    );
+    let refusal = |role| {
+        fixture
+            .owner
+            .swap_account_refusal(fixture.operation, role)
+            .unwrap()
+    };
+    // The setup is only in the head block, above the confirmed one.
+    assert_eq!(
+        refusal(SwapAccountRole::Source),
+        Some(SwapAccountRefusal::SetupUnconfirmed)
+    );
+    assert!(listed(&fixture.owner, fixture.operation).is_none());
+
+    {
+        let mut chain = fixture.chain.lock().unwrap();
+        chain.head = 16;
+        chain.nonces = vec![(14, 1)];
+    }
+    fixture
+        .owner
+        .reconcile_account(fixture.operation)
+        .await
+        .unwrap();
+    assert_eq!(refusal(SwapAccountRole::Source), None);
+    assert!(listed(&fixture.owner, fixture.operation).is_some());
+    // The cancelled use itself never continues, and the account takes no destination use.
+    assert_eq!(
+        swap_account_refusal(
+            &fixture.record(),
+            1,
+            SwapAccountRole::Source,
+            SwapAccountUse::Claimed(first),
+            SwapAdmissionEvidence::Recorded,
+        ),
+        Some(SwapAccountRefusal::RecoveryOnly)
+    );
+    assert_eq!(
+        refusal(SwapAccountRole::Destination { token: BUY }),
+        Some(SwapAccountRefusal::RecoveryOnly)
+    );
+
+    // Fresh checks refuse another delegation at the confirmed block and sign nothing.
+    let issued = fixture.record().issued().to_vec();
+    fixture.chain.lock().unwrap().delegate = Address::repeat_byte(0xdd);
+    assert_eq!(
+        reuse_refusal(&fixture.owner, fixture.operation, 15).await,
+        SwapAccountRefusal::SetupUnconfirmed
+    );
+    fixture.chain.lock().unwrap().delegate = fixture.delegate;
+    let reused = fixture
+        .owner
+        .reuse_swap_account(
+            fixture.operation,
+            15,
+            SwapAccountRole::Source,
+            SwapAccountUse::New,
+        )
+        .await
+        .unwrap();
+    assert!(reused.is_reused());
+    assert_eq!(fixture.record().issued(), issued.as_slice());
+
+    // A recovery signed after the cancellation retires the account for good.
+    record_cancellation(&fixture, Vec::new(), &sell_note(5));
+    assert_eq!(
+        refusal(SwapAccountRole::Source),
+        Some(SwapAccountRefusal::RecoveryOnly)
+    );
+    assert_eq!(
+        reuse_refusal(&fixture.owner, fixture.operation, 15).await,
+        SwapAccountRefusal::RecoveryOnly
+    );
+    fixture.finish().await;
+}
+
 #[tokio::test]
 async fn swap_delivery_tolerates_dust_retains_shield_evidence_and_reopens_on_reorg() {
     let fixture = Fixture::start().await;

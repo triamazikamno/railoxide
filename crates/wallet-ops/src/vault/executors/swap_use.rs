@@ -187,7 +187,8 @@ pub struct ClaimedSwapPair {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapUseRelease {
     /// Nothing the account issued is unresolved. An existing account is free for another use;
-    /// a fresh one stays stopped and is never allocated again.
+    /// a fresh one stays stopped and is never allocated again. Once its setup is confirmed, a
+    /// fresh source can still be chosen for a new swap.
     Released,
     /// A payload the account issued can still execute. Its nonce and input guards stay, and
     /// the account stays unavailable until canonical reconciliation resolves it.
@@ -449,7 +450,9 @@ impl ExecutorRecord {
     }
 
     /// A use an existing account takes after its reservation. The account keeps its setup, so
-    /// the use is not fresh. The caller checks `admits_swap_use` first.
+    /// the use is not fresh. The caller checks `admits_swap_use` first, which admits a stopped
+    /// setup only for a new source use on a cancelled fresh source. That use takes the
+    /// account, and its stopped setup stays with the cancelled use.
     fn begin_later_swap_use(&mut self, id: SwapUseId, role: SwapUseRole) {
         if let SwapUseRole::Destination {
             destination_token, ..
@@ -472,6 +475,7 @@ impl ExecutorRecord {
             stopped_before_order: false,
         });
         self.active_swap_use = Some(id);
+        self.swap_setup_stopped = false;
     }
 
     /// The stored format follows the content: a record without use metadata keeps the shape

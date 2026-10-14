@@ -1430,7 +1430,12 @@ impl PrivateSwapsView {
             .records
             .iter()
             .filter(|record| {
-                record.swap().is_none() && !record.is_retired() && !record.is_swap_setup_stopped()
+                let cancelled = model::holds_only_cancelled_preparations(record)
+                    && self.pending_order(record).is_none();
+                record.swap().is_none()
+                    && !record.is_retired()
+                    && !record.is_swap_setup_stopped()
+                    && !cancelled
             })
             .filter_map(swap_private_delivery)
             .map(|delivery| delivery.destination_chain)
@@ -2593,13 +2598,16 @@ impl PrivateSwapsView {
             .filter(|record| is_swap_record(record) || self.pending_order(record).is_some())
             .filter_map(|record| {
                 let stage = self.progress_stage(record);
+                // A reused account whose later swap was cancelled too holds only cancelled
+                // preparations, which My orders lists.
                 (!record.is_swap_setup_stopped()
                     && (self.pending_order(record).is_some()
-                        || stage.is_shown_on_private_tab(
-                            record.is_hidden(),
-                            model::swap_valid_to(record)
-                                .is_some_and(|valid_to| valid_to < now_unix()),
-                        )))
+                        || !model::holds_only_cancelled_preparations(record)
+                            && stage.is_shown_on_private_tab(
+                                record.is_hidden(),
+                                model::swap_valid_to(record)
+                                    .is_some_and(|valid_to| valid_to < now_unix()),
+                            )))
                 .then_some((record, stage))
             })
     }
@@ -2740,6 +2748,7 @@ impl PrivateSwapsView {
                 let (delivery, _) = model::swap_use_destination(record, pending.swap_use)?;
                 (delivery, self.swap_destination_account(swap, delivery)?)
             }
+            None if model::holds_only_cancelled_preparations(record) => return None,
             _ if record.swap().is_some() || record.is_retired() => return None,
             _ => {
                 let delivery = swap_private_delivery(record)?;

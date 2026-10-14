@@ -473,6 +473,9 @@ pub struct ExecutorRecord {
     settled_nonce: Option<U256>,
     public_account_uuid: Option<String>,
     swap: Option<SwapOperationRecord>,
+    /// The active use's setup was stopped, so the account issues no further swap work. The
+    /// stopped use keeps its own flag; a later use admitted onto a cancelled fresh source
+    /// clears this one in the write that claims the account.
     swap_setup_stopped: bool,
     /// Issued payloads the user released from input reservation. Their signatures
     /// remain valid; only the wallet's own spending of their inputs changes.
