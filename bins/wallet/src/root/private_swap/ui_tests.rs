@@ -17015,6 +17015,146 @@ fn closing_public_preparation_aborts_continuation_and_continue_keeps_the_durable
     );
 }
 
+/// A live sync batch on the destination network keeps its session. A Public swap's
+/// preparation that finishes while Polygon syncs goes on to the swap's detail.
+#[gpui::test]
+fn public_preparation_finishing_while_the_destination_syncs_shows_the_swap(
+    cx: &mut TestAppContext,
+) {
+    let stubs = SwapStubs::start();
+    stubs.enable_public_reviews();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, _, _, runtime, store, cx| {
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    enable_stub_chain(root, &stubs, 1);
+                    enable_stub_chain(root, &stubs, 137);
+                    root.effective_token_registry =
+                        wallet_ops::settings::build_effective_token_registry(
+                            &wallet_ops::settings::WalletSettings::default(),
+                        )
+                        .unwrap();
+                    configure_public_review_assets(root);
+                });
+            });
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (destination_store, destination_operation) = reusable_polygon_account(root, cx);
+            let destination_record = destination_store
+                .records()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation() == destination_operation)
+                .unwrap();
+            let source = root.read_with(cx, |root, _| root.public_accounts[1].clone());
+            let sell = STUB_USDC;
+            let (review, across, orderbook, route) = public_review_fixture(
+                root,
+                &polygon,
+                &stubs,
+                runtime,
+                sell,
+                U256::from(7_000_000),
+                false,
+                cx,
+            );
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_public_form(source, sell, window, cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.network = Some(137);
+                    form.buy = Some(STUB_POLYGON_USDC);
+                    form.amount_input
+                        .update(cx, |input, cx| input.set_value("7", window, cx));
+                    form.destination_account = Some(DestinationAccount {
+                        chain_id: 137,
+                        operation: destination_operation,
+                        index: destination_record.index(),
+                        address: destination_record.address().unwrap(),
+                    });
+                    form.public
+                        .as_mut()
+                        .unwrap()
+                        .routes
+                        .insert((sell, 137), vec![route]);
+                    swaps.install_public_review_for_tests(review, across, Some(orderbook), cx);
+                    let form = swaps.form.as_mut().unwrap();
+                    form.price_acknowledged = true;
+                    form.blocked_shield_acknowledged = true;
+                    swaps.request_public_review(window, cx);
+                });
+            });
+            let command =
+                swaps.read_with(cx, |swaps, _| swaps.public_authorization.clone().unwrap());
+            cx.update(WindowExt::close_dialog);
+            let (release, gate) = tokio::sync::oneshot::channel();
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let identity = cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps
+                        .hold_public_preparation_for_tests(
+                            command,
+                            gate,
+                            completed.clone(),
+                            window,
+                            cx,
+                        )
+                        .unwrap()
+                })
+            });
+            cx.run_until_parked();
+            runtime.block_on(tokio::task::yield_now());
+
+            // Polygon starts its next sync batch with the session the swap was reviewed with.
+            cx.update(|_, cx| {
+                root.update(cx, |root, _| {
+                    let Some(ChainUtxoState::Ready {
+                        snapshot,
+                        session,
+                        observer_token,
+                        sync_tip,
+                        poi_refreshing,
+                        ppoi_workflow_status,
+                    }) = root.chain_states.remove(&137)
+                    else {
+                        panic!("ready fixture");
+                    };
+                    root.chain_states.insert(
+                        137,
+                        ChainUtxoState::Syncing {
+                            snapshot,
+                            progress: crate::root::chain_load::ChainSyncProgress::default(),
+                            session,
+                            observer_token,
+                            sync_tip,
+                            poi_refreshing,
+                            ppoi_workflow_status,
+                        },
+                    );
+                });
+            });
+
+            // The preparation finishes mid-batch. Its result isn't dropped as stale.
+            let _ = release.send(());
+            runtime.block_on(tokio::task::yield_now());
+            cx.run_until_parked();
+            assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            swaps.read_with(cx, |swaps, _| {
+                assert!(
+                    swaps
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.view == SwapDialogView::PublicDetail(identity)),
+                    "the finished preparation shows its swap"
+                );
+                assert!(swaps.form.is_none() && swaps.public_job.is_none());
+            });
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
 #[gpui::test]
 fn public_amounts_use_selected_balance_metadata_through_review_max_and_restore(
     cx: &mut TestAppContext,

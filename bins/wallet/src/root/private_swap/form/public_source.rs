@@ -348,7 +348,7 @@ impl PublicSwapAuthorization {
                 .iter()
                 .any(|account| account == &self.source)
             && matches!(root.chain_states.get(&self.destination_session.chain_id),
-                Some(ChainUtxoState::Ready { session, .. })
+                Some(ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. })
                 if Arc::ptr_eq(session, &self.destination_session))
             && root
                 .effective_chain_configs
