@@ -14034,12 +14034,18 @@ fn checking_an_across_refund_asks_across_before_the_balance(cx: &mut TestAppCont
 fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use alloy::primitives::{B256, Bytes};
+    use alloy::sol_types::SolCall;
+    use broadcaster_core::contracts::railgun::{
+        Call, CommitmentPreimage, RelayAdapt7702, ShieldCiphertext, ShieldRequest, TokenData,
+        shieldCall,
+    };
     use wallet_ops::ExecutorAsset;
     use wallet_ops::vault::{
         AcrossOrderTerms, BridgeOrderTerms, ExecutorInputIdentity, ExecutorNonceObservation,
-        ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload, SwapAccountChoice,
-        SwapAttempt, SwapBridgeOutcome, SwapDestinationClaim, SwapDestinationOutcome,
-        SwapPairClaim, SwapProof, SwapTerms, SwapUseId,
+        ExecutorNonceWatermark, ExecutorPayloadContext, ExecutorPayloadPurpose,
+        IssuedExecutorPayload, SwapAccountChoice, SwapAttempt, SwapBridgeOutcome,
+        SwapDestinationClaim, SwapDestinationOutcome, SwapPairClaim, SwapProof, SwapTerms,
+        SwapUseId,
     };
 
     let stubs = SwapStubs::start();
@@ -14363,6 +14369,106 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                     ),
                     (true, true, true)
                 );
+            }
+            // The held USDC counts as recovered only once a recovery of USDC is attributed
+            // after the hold and this order's own check reads none left. A recovery of the
+            // reused account's earlier USDT, or a check made for the earlier order, says
+            // nothing about it.
+            let recovered = |token: Address| {
+                let record = destination.records().unwrap().remove(0);
+                let request = ShieldRequest {
+                    preimage: CommitmentPreimage {
+                        npk: B256::repeat_byte(0x7a),
+                        token: TokenData::erc20(token),
+                        value: alloy::primitives::Uint::from(10_u64),
+                    },
+                    ciphertext: ShieldCiphertext {
+                        encryptedBundle: [B256::ZERO; 3],
+                        shieldKey: B256::ZERO,
+                    },
+                };
+                let before = ExecutorNonceObservation::new(
+                    BlockNumHash::new(41, B256::ZERO),
+                    U256::from(10),
+                );
+                let calldata = RelayAdapt7702::multicallCall {
+                    _requireSuccess: true,
+                    _calls: vec![Call {
+                        to: record.address().unwrap(),
+                        data: shieldCall {
+                            _shieldRequests: vec![request.clone()],
+                        }
+                        .abi_encode()
+                        .into(),
+                        value: U256::ZERO,
+                    }],
+                    _nonce: U256::from(10),
+                    _signature: Bytes::new(),
+                }
+                .abi_encode();
+                let payload = IssuedExecutorPayload::new(
+                    U256::from(10),
+                    record.delegate(),
+                    B256::repeat_byte(0x7a),
+                    ExecutorPayloadPurpose::Recovery,
+                    ExecutorPayloadContext::new(calldata.into(), before, Vec::new()),
+                );
+                let mut saved = serde_json::to_value(&record).unwrap();
+                saved["issued"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::to_value(payload).unwrap());
+                saved["nonce_watermark"] =
+                    serde_json::to_value(ExecutorNonceWatermark::new(U256::from(11), 43)).unwrap();
+                (
+                    serde_json::from_value::<ExecutorRecord>(saved).unwrap(),
+                    wallet_ops::ExecutorAttribution::with_shields_for_tests(
+                        Address::ZERO,
+                        &[(request, 42)],
+                    ),
+                )
+            };
+            let read = |order, amount: u64| {
+                Some((order, U256::from(amount), BlockNumHash::new(43, B256::ZERO)))
+            };
+            for (token, balance, complete) in [
+                (STUB_POLYGON_USDT, read(uid, 0), false),
+                (STUB_POLYGON_USDC, read(uid, 5), false),
+                (STUB_POLYGON_USDC, None, false),
+                (STUB_POLYGON_USDC, read(earlier_uid, 0), false),
+                (STUB_POLYGON_USDC, read(uid, 0), true),
+            ] {
+                let (account, attribution) = recovered(token);
+                cx.update(|_, cx| {
+                    swaps.update(cx, |swaps, cx| {
+                        swaps.reload_records();
+                        swaps.reload_destinations(cx);
+                        let shown = swaps.shown_swap(swaps.record(operation).unwrap()).unwrap();
+                        swaps.destinations.insert(shown, Some(account));
+                        swaps
+                            .attributions
+                            .insert(destination_operation, attribution);
+                        swaps
+                            .tracking
+                            .entry(operation)
+                            .or_default()
+                            .destination_balance = balance;
+                        let stage = swaps.progress_stage(swaps.record(operation).unwrap());
+                        assert_eq!(
+                            stage,
+                            if complete {
+                                SwapStage::Recovered
+                            } else {
+                                SwapStage::Order(SwapOrderState::HeldOnDestination)
+                            },
+                            "{token} {balance:?}"
+                        );
+                        assert_eq!(
+                            model::swap_actions(stage, false).recover_on_destination,
+                            !complete
+                        );
+                    });
+                });
             }
             // Reload without an originating swap view supplying its receiving token. Direct
             // account balance checks and recovery discover their assets from this record.

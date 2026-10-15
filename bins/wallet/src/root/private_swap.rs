@@ -351,9 +351,11 @@ struct SwapTracking {
     /// The last setup observation of a private Bridge swap's destination stealth account, read
     /// on its own network.
     destination_setup: Option<SwapSetupStatus>,
-    /// The delivered token in the destination stealth account, and the block it was read at,
-    /// from this session's last explicit check of held proceeds. Recovery there opens with it.
-    destination_balance: Option<(U256, alloy::eips::BlockNumHash)>,
+    /// The delivered token in the destination stealth account, and the confirmed block it was
+    /// read at, from this session's last explicit check of held proceeds, with the order
+    /// checked. Only [`PrivateSwapsView::destination_balance`] reads it. Recovery there opens
+    /// with it.
+    destination_balance: Option<(OrderUid, U256, alloy::eips::BlockNumHash)>,
     /// An early cancellation was handed to a broadcaster; the observation decides the winner.
     cancelling: bool,
     /// The user approved this swap's setup in this session: once the setup is confirmed, the
@@ -1701,8 +1703,35 @@ impl PrivateSwapsView {
             });
         held.zip(self.destination_account(record, delivery))
             .is_some_and(|(block, destination)| {
-                model::held_proceeds_recovered(destination, block, self.attribution(destination))
+                model::held_proceeds_recovered(
+                    destination,
+                    delivery.destination_token,
+                    block,
+                    self.attribution(destination),
+                    self.destination_balance(record),
+                )
             })
+    }
+
+    /// This session's last explicit check of a private Bridge swap's held proceeds, while it
+    /// was made for the order the swap last placed, that order's proceeds are held, and it was
+    /// read no earlier than their fill. The tracking outlives the order, and blocks of
+    /// different destination networks don't compare, so a check of another order never counts.
+    fn destination_balance(
+        &self,
+        record: &ExecutorRecord,
+    ) -> Option<(U256, alloy::eips::BlockNumHash)> {
+        let order = record.swap()?.orders().last()?;
+        let Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) =
+            order.observations().bridge_outcome
+        else {
+            return None;
+        };
+        let (uid, balance, read_at) = self
+            .tracking
+            .get(&record.operation())?
+            .destination_balance?;
+        (uid == order.uid() && read_at.number >= block.number).then_some((balance, read_at))
     }
 
     /// A new submission must not borrow the previous order's outcome. Once its own swap use

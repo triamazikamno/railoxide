@@ -1486,14 +1486,9 @@ impl PrivateSwapsView {
                         )),
                     ));
                 }
-                rows.extend(
-                    self.tracking
-                        .get(&record.operation())
-                        .and_then(|tracking| tracking.destination_balance)
-                        .map(|(balance, _)| {
-                            fact_row("In stealth account", app_text(destination_amount(balance)))
-                        }),
-                );
+                rows.extend(self.destination_balance(record).map(|(balance, _)| {
+                    fact_row("In stealth account", app_text(destination_amount(balance)))
+                }));
                 note = Some(format!(
                     "Recover on {network}… shields it to your private balance on {network} for the shield fee and a broadcaster fee, paid from your private balance there."
                 ));
@@ -3367,10 +3362,7 @@ impl PrivateSwapsView {
             return;
         };
         let destination = destination.operation();
-        let checked = self
-            .tracking
-            .get(&operation)
-            .and_then(|tracking| tracking.destination_balance);
+        let checked = self.destination_balance(record);
         let root = self.root.clone();
         window.defer(cx, move |window, cx| {
             let _ = root.update(cx, |root, cx| {
@@ -3417,24 +3409,23 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
+        // The order checked, so a later order's held proceeds never take this balance.
+        let order = self
+            .record(operation)
+            .and_then(|record| record.swap()?.orders().last())
+            .map(SwapOrderRecord::uid);
         let asset = ExecutorAsset::Erc20(delivery.destination_token);
         self.start_job(
             operation,
             SwapJobKind::Check,
             async move {
                 owner.reconcile_swap_destinations()?;
-                let inspection = owner.inspect_record(destination, &[asset]).await?;
-                Ok(inspection
-                    .balances()
-                    .get(&asset)
-                    .copied()
-                    .flatten()
-                    .map(|balance| (balance, inspection.block())))
+                owner.read_record_balance(destination, asset).await
             },
-            move |this, balance, _, _| {
+            move |this, (balance, read_at), _, _| {
                 let tracking = this.tracking.entry(operation).or_default();
-                if balance.is_some() {
-                    tracking.destination_balance = balance;
+                if let Some(order) = order {
+                    tracking.destination_balance = Some((order, balance, read_at));
                 }
                 tracking.error = None;
             },

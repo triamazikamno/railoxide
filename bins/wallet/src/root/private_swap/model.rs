@@ -567,27 +567,19 @@ pub(super) fn public_swap_stage(
             }
             Some(SwapBridgeOutcome::Refunding) => PublicSwapStage::Refunding,
             Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) => {
-                let recovered_at = attribution.and_then(|attribution| {
-                    let SwapUseRole::PublicSourceDestination {
+                let recovered = match claimed.role() {
+                    SwapUseRole::PublicSourceDestination {
                         destination_token, ..
-                    } = claimed.role()
-                    else {
-                        return None;
-                    };
-                    wallet_ops::executor_recovered_token_since(
+                    } => held_recovered(
                         record,
                         *destination_token,
                         block.number,
-                        &attribution.evidence(),
-                    )
-                });
-                if recovered_at.is_some_and(|recovered_at| {
-                    destination_balance.is_some_and(|(amount, read_at)| {
-                        amount.is_zero()
-                            && read_at.number >= block.number
-                            && read_at.number >= recovered_at
-                    })
-                }) {
+                        attribution,
+                        destination_balance,
+                    ),
+                    _ => false,
+                };
+                if recovered {
                     PublicSwapStage::Recovered
                 } else {
                     PublicSwapStage::HeldOnDestination
@@ -1240,6 +1232,32 @@ fn recovered_since(
     })
 }
 
+/// Proceeds of `token` held since `held_block` are recovered: a recovery of that token is
+/// confirmed since then, and `balance` reads none of it at a confirmed block no earlier than
+/// the hold and that recovery. Without `attribution` or `balance` they stay held.
+fn held_recovered(
+    record: &ExecutorRecord,
+    token: Address,
+    held_block: u64,
+    attribution: Option<&ExecutorAttribution>,
+    balance: Option<(U256, alloy::eips::BlockNumHash)>,
+) -> bool {
+    attribution
+        .and_then(|attribution| {
+            wallet_ops::executor_recovered_token_since(
+                record,
+                token,
+                held_block,
+                &attribution.evidence(),
+            )
+        })
+        .is_some_and(|recovered_at| {
+            balance.is_some_and(|(amount, read_at)| {
+                amount.is_zero() && read_at.number >= held_block && read_at.number >= recovered_at
+            })
+        })
+}
+
 /// The setup stage from the recorded state of each signed setup alone. A setup whose nonce
 /// is not consumed stays pending and can be retried, whatever became of a transaction that
 /// carried it. While this session observes the setup, a consumed nonce stays pending until
@@ -1582,14 +1600,16 @@ pub(in crate::root) fn private_delivery_credit(amount: U256, bounds: &SwapApprov
     amount.saturating_sub(fee)
 }
 
-/// Whether a recovery on the destination network returned what its stealth account held since
-/// the fill in `held_block`.
+/// Whether a recovery on the destination network returned the delivered `token` its stealth
+/// account held since the fill in `held_block`, as an explicit check's `balance` confirms.
 pub(in crate::root) fn held_proceeds_recovered(
     destination: &ExecutorRecord,
+    token: Address,
     held_block: u64,
     attribution: Option<&ExecutorAttribution>,
+    balance: Option<(U256, alloy::eips::BlockNumHash)>,
 ) -> bool {
-    recovered_since(destination, held_block, attribution)
+    held_recovered(destination, token, held_block, attribution, balance)
 }
 
 pub(in crate::root) const fn provider_name(provider: BridgeProvider) -> &'static str {

@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use alloy::eips::BlockNumHash;
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use eyre::{Result, eyre};
 use sync_service::WalletHandle;
 use tokio::sync::{Mutex, MutexGuard, watch};
 
-use super::executor_observation::{ExecutorAccountRead, read_executor_account, trace_step};
+use super::executor_observation::{
+    ExecutorAccountRead, read_executor_account, read_executor_asset_balance, trace_step,
+};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     DesktopVaultStore, DesktopViewSession, ExecutorNonceObservation, ExecutorOperationId,
@@ -671,6 +673,34 @@ impl ExecutorOwner {
             &self.http,
             address,
             assets,
+        ))
+        .await
+    }
+
+    /// One asset balance of a stored account at the confirmed canonical block, and that block.
+    /// A balance that can't be read is an error, never zero.
+    pub async fn read_record_balance(
+        &self,
+        operation: ExecutorOperationId,
+        asset: ExecutorAsset,
+    ) -> Result<(U256, BlockNumHash)> {
+        self.ensure_active()?;
+        let _guard = self.lock_activity().await;
+        self.ensure_active()?;
+        let record = self
+            .store
+            .records()?
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .ok_or_else(|| eyre!("executor record is unavailable"))?;
+        let address = record.address().ok_or_else(|| {
+            eyre!("executor address is unavailable; authorize its derivation first")
+        })?;
+        self.while_active(read_executor_asset_balance(
+            &self.endpoints,
+            &self.chain,
+            address,
+            asset,
         ))
         .await
     }
