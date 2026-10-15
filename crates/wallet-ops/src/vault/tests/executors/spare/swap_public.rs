@@ -2919,6 +2919,107 @@ async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
     }
 }
 
+// The deposit's receipt was seen, but a reorganization within the finality depth orphaned its
+// block, and another transaction of the Public account took its nonce there. Its provisional
+// inclusion stays recorded and doesn't hold the deposit live: the final block holds the other
+// transaction instead, so the deposit is ruled out, and the swap deposits again under the next
+// nonce with its destination shield kept.
+#[tokio::test]
+async fn a_deposit_whose_provisional_block_was_orphaned_for_its_nonce_is_ruled_out() {
+    let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
+    let shield_state = payment.saved().record.payload_state(payment.shield);
+    let PublicSwapTransactionOutcome::Included {
+        block_number,
+        transaction_hash: hash,
+    } = payment.deposit(&owner).await.unwrap()
+    else {
+        panic!("the deposit is included");
+    };
+    let provisional = payment.saved().swap.transactions()[0].inclusion.unwrap();
+    assert!(!provisional.finalized);
+
+    let mut other = alloy::rpc::types::TransactionRequest::default().to(Address::repeat_byte(0x99));
+    other.chain_id = Some(DESTINATION_CHAIN);
+    other.from = Some(payment.source);
+    other.nonce = Some(0);
+    other.gas = Some(21_000);
+    other.max_fee_per_gas = Some(100);
+    other.max_priority_fee_per_gas = Some(1);
+    let other = payment
+        .signer
+        .sign_transaction_request(other, "another transaction")
+        .await
+        .unwrap();
+    let other = TxEnvelope::decode_2718(&mut other.as_slice()).unwrap();
+    {
+        let mut origin = payment.chain.lock().unwrap();
+        origin.chain.reorg(block_number);
+        origin
+            .chain
+            .include(block_number, other, payment.source, true, Vec::new());
+        // The other transaction's block is final.
+        origin.chain.head = block_number + 1;
+        // Only observation's requests are checked below. The deposit's own step sent its hash.
+        origin.requests.clear();
+    }
+
+    // Verifying the orphaned block takes one inspection, and the scan from the boundary then
+    // reads three blocks up to it, all in one poll.
+    assert_eq!(
+        owner
+            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .await
+            .unwrap(),
+        None
+    );
+    let evidence = SwapObservation {
+        block: payment.chain.lock().unwrap().chain.block(block_number),
+        transaction_hash: None,
+    };
+    let observed = payment.saved();
+    let [ruled] = observed.swap.transactions() else {
+        panic!("only the deposit is recorded");
+    };
+    assert_eq!(
+        (ruled.hash, ruled.inclusion, ruled.ruled_out),
+        (hash, Some(provisional), Some(evidence))
+    );
+    for request in &payment.chain.lock().unwrap().requests {
+        assert!(
+            !request["params"]
+                .to_string()
+                .contains(&alloy::hex::encode(hash))
+        );
+    }
+
+    owner.shutdown().await;
+    drop(owner);
+    let restarted = ExecutorOwner::new(
+        1,
+        payment.db.clone(),
+        payment.view.clone(),
+        payment.destination.clone(),
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let PublicSwapTransactionOutcome::Included {
+        transaction_hash: second,
+        ..
+    } = payment.deposit(&restarted).await.unwrap()
+    else {
+        panic!("the second deposit is included");
+    };
+    let after = payment.saved();
+    let [ruled, live] = after.swap.transactions() else {
+        panic!("both deposits are recorded");
+    };
+    assert_eq!((ruled.hash, live.hash), (hash, second));
+    assert_eq!(live.transaction.nonce, Some(1));
+    assert_eq!(after.shields, [payment.shield]);
+    assert_eq!(after.record.payload_state(payment.shield), shield_state);
+    payment.finish(restarted).await;
+}
+
 // The Public account signs its proxy's hook batch, then the order that carries it. Both are in
 // the record before the orderbook request, which names the account as owner and the proxy as
 // receiver. The batch's signature recovers the account over the digest cow-shed verifies, and

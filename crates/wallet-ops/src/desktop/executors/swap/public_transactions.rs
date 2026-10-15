@@ -5,11 +5,11 @@
 //! chain through that chain's configuration. Each transaction is in the record before it is
 //! broadcast, and its inclusion comes from the step that sent it. A deposit is recorded with
 //! its signed bytes too. One that no RPC accepted is left to tracking without a receipt.
-//! The hand-off is read from finalized whole-block receipts. A deposit without an inclusion is
-//! found by a bounded scan of finalized blocks, matching recorded hashes locally without
-//! transaction-hash RPC queries. Tracking resends its recorded bytes unchanged until it is
-//! found, or ruled out once the scan passed every block it could be in and the Public
-//! account's nonce passed its own.
+//! The hand-off is read from finalized whole-block receipts. A deposit without a finalized
+//! inclusion is found by a bounded scan of finalized blocks, matching recorded hashes locally
+//! without transaction-hash RPC queries. It is ruled out once the scan passed every block it
+//! could be in and the Public account's nonce passed its own. Until then tracking resends the
+//! recorded bytes of one without any inclusion unchanged.
 //!
 //! An order's Public account sends two more: the withdrawal of proceeds its cow-shed proxy
 //! holds, and the order's early invalidation. Neither touches the order's own hook batch.
@@ -652,9 +652,9 @@ impl ExecutorOwner {
     /// A deposit with a recorded inclusion is read in that block once it is final. Otherwise
     /// at most eight finalized blocks are inspected per poll from the durable hand-off
     /// boundary, matching the hash locally and saving progress for restart. A deposit those
-    /// blocks don't hold is ruled out once the Public account's nonce at the last of them,
-    /// still canonical, passed its own. A stopped swap's deposit is read too, and a ruled-out
-    /// deposit isn't.
+    /// blocks don't hold, with no inclusion or one its final block no longer holds, is ruled
+    /// out once the Public account's nonce at the last of them, still canonical, passed its
+    /// own. A stopped swap's deposit is read too, and a ruled-out deposit isn't.
     pub async fn observe_public_swap_handoff(
         &self,
         operation: ExecutorOperationId,
@@ -1462,11 +1462,14 @@ struct DepositUpdate {
 /// Resume each handed-off deposit independently. Inspect at most eight finalized blocks per
 /// poll, matching transaction hashes locally before fetching checked whole-block receipts.
 ///
-/// A deposit without an inclusion is ruled out when this poll's scan reached a block
-/// without finding it, every block from its boundary up to that one having been inspected,
-/// and the Public account's nonce at that block, read by its hash as canonical, passed the
+/// A deposit without an inclusion, or whose provisional inclusion this poll found missing
+/// from its now final block, is ruled out when this poll's scan reached a block without
+/// finding it, every block from its boundary up to that one having been inspected, and the
+/// Public account's nonce at that block, read by its hash as canonical, passed the
 /// deposit's own while the block stayed canonical. Another transaction then used the
-/// deposit's nonce, so it can never be included. A read that fails rules nothing out.
+/// deposit's nonce, so it can never be included. A provisional inclusion not yet final isn't
+/// checked, so a deposit awaiting finality costs no nonce reads. A read that fails rules
+/// nothing out.
 async fn read_public_swap_handoff(
     provider: &DynProvider,
     finality_depth: u64,
@@ -1491,7 +1494,8 @@ async fn read_public_swap_handoff(
         }
         // A saved first receipt is a location hint, never proof of failure. Verify the
         // canonical block at its number before falling back to the persisted scan boundary.
-        if let Some(inclusion) = deposit.inclusion
+        // A provisional one that block no longer holds was orphaned by a reorganization.
+        let orphaned = if let Some(inclusion) = deposit.inclusion
             && inclusion.observation.block.number <= finalized_head
             && remaining > 0
         {
@@ -1516,7 +1520,10 @@ async fn read_public_swap_handoff(
                 }
                 continue;
             }
-        }
+            !inclusion.finalized
+        } else {
+            false
+        };
         let Some(mut number) = deposit.deposit_scan_from_block else {
             continue;
         };
@@ -1547,7 +1554,7 @@ async fn read_public_swap_handoff(
             };
             number = next;
         }
-        if deposit.inclusion.is_none()
+        if (deposit.inclusion.is_none() || orphaned)
             && update.inclusion.is_none()
             && let (Some(block), Some(nonce)) = (scanned, deposit.transaction.nonce)
             && deposit_nonce_used(provider, expected.source, block, nonce).await
