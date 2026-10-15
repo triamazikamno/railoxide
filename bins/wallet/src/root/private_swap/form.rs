@@ -2738,8 +2738,9 @@ impl PrivateSwapsView {
             form.renew_reuse_use();
             form.error = None;
             // Each account quotes on its own orderbook route, which keeps the accounts
-            // unlinked there.
+            // unlinked there. The old account's route lookups are dropped too.
             form.set_orderbook(None, None);
+            form.bridge.routes_tasks.clear();
             form.route.invalidate_estimate();
             form.destination_route.invalidate_estimate();
         }
@@ -2760,6 +2761,7 @@ impl PrivateSwapsView {
         if !super::ui_fixture::holds_swaps() {
             self.refresh_setup_route(cx);
         }
+        self.load_bridge_routes(window, cx);
         self.schedule_quote(window, cx);
         cx.notify();
     }
