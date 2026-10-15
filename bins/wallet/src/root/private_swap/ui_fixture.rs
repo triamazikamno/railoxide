@@ -2112,6 +2112,7 @@ impl PrivateSwapsView {
                         Reported::Held => Some(SwapDeliverySeen::Held { amount: delivered }),
                         Reported::Fill | Reported::Handoff | Reported::Delivered => None,
                     },
+                    transaction: Some(keccak256("fill")),
                 }),
                 reads_fill: reported.private(),
             },

@@ -72,10 +72,12 @@ pub enum SwapDeliverySeen {
 pub enum SwapBridgeReport {
     /// Delivered on the destination chain, with the amount in destination-token base units
     /// when the provider gives one, and for a private Across delivery what the fill block
-    /// shows, once it was read.
+    /// shows, once it was read. `transaction` is the provider's destination transaction, when
+    /// it gives one.
     Delivered {
         amount_out: Option<U256>,
         seen: Option<SwapDeliverySeen>,
+        transaction: Option<B256>,
     },
     /// The provider doesn't know the deposit yet, or hasn't finished it.
     Pending,
@@ -260,6 +262,7 @@ impl ExecutorOwner {
                         SwapBridgeReport::Delivered {
                             amount_out: Some(deposit.output_amount),
                             seen,
+                            transaction: deposit.fill_tx,
                         }
                     }
                     Some((AcrossDepositStatus::Expired | AcrossDepositStatus::Refunded, _)) => {
@@ -274,12 +277,14 @@ impl ExecutorOwner {
                     .await?;
                 // 1Click's word is never one of the outcomes verified on a chain.
                 match outcome {
-                    Some(SwapBridgeOutcome::DeliveredReported { amount_out, .. }) => {
-                        SwapBridgeReport::Delivered {
-                            amount_out,
-                            seen: None,
-                        }
-                    }
+                    Some(SwapBridgeOutcome::DeliveredReported {
+                        amount_out,
+                        transaction_hash,
+                    }) => SwapBridgeReport::Delivered {
+                        amount_out,
+                        seen: None,
+                        transaction: transaction_hash,
+                    },
                     Some(SwapBridgeOutcome::Refunding) => SwapBridgeReport::Refunded,
                     Some(SwapBridgeOutcome::NeedsAttention) => SwapBridgeReport::Failed,
                     _ => SwapBridgeReport::Pending,

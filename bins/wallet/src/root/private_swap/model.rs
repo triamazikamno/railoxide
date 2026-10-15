@@ -731,6 +731,17 @@ pub(super) fn public_swap_steps(
     let block = |observation: Option<SwapObservation>| {
         observation.map(|observation| observation.block.number)
     };
+    let hash = |observation: Option<SwapObservation>| {
+        observation.and_then(|observation| observation.transaction_hash)
+    };
+    // The swap's latest transaction of `kind`, which a step waits on until it is observed.
+    let latest = |kind: Kind| {
+        swap.transactions()
+            .iter()
+            .rev()
+            .find(|tx| tx.kind == kind)
+            .map(|tx| tx.hash)
+    };
     let setup_status = match stage {
         PublicSwapStage::Preparing(SwapStage::SetupFailed) => Error,
         PublicSwapStage::Preparing(SwapStage::SetupNotSent) => NotStarted,
@@ -779,7 +790,8 @@ pub(super) fn public_swap_steps(
                 detail,
                 status,
             )
-            .in_block(block(tx.inclusion.map(|inclusion| inclusion.observation))),
+            .in_block(block(tx.inclusion.map(|inclusion| inclusion.observation)))
+            .with_transaction(Some(tx.hash)),
         );
     }
     // A permit is the approval as a signature the order carries, so it has no transaction.
@@ -824,7 +836,8 @@ pub(super) fn public_swap_steps(
         steps.push(
             SwapStep::new(title, detail, status)
                 .in_block(block(observed.traded))
-                .with_order(swap.order().map(wallet_ops::vault::PublicSwapOrder::uid)),
+                .with_order(swap.order().map(wallet_ops::vault::PublicSwapOrder::uid))
+                .with_transaction(hash(observed.traded)),
         );
     }
     let proxy = matches!(
@@ -835,6 +848,7 @@ pub(super) fn public_swap_steps(
             | PublicSwapStage::SwappedNotBridged
     );
     if proxy {
+        let withdrawal = hash(observed.withdrawn).or_else(|| latest(Kind::Withdrawal));
         let step = match stage {
             // The settlement that paid the proxy is the block the proceeds are held since.
             PublicSwapStage::HeldByProxy => SwapStep::new(
@@ -852,19 +866,22 @@ pub(super) fn public_swap_steps(
                 format!("Withdrawing to {}", labels.source),
                 "Waiting for confirmation…",
                 Pending,
-            ),
+            )
+            .with_transaction(withdrawal),
             PublicSwapStage::WithdrawnPendingCheck => SwapStep::new(
                 format!("Withdrawn to {}", labels.source),
                 "The wallet checks for a bridge deposit once the bridge instructions for your CoW proxy expire…",
                 Pending,
             )
-            .in_block(block(observed.withdrawn)),
+            .in_block(block(observed.withdrawn))
+            .with_transaction(withdrawal),
             _ => SwapStep::new(
                 format!("Withdrawn to {}", labels.source),
                 "Swapped without bridging",
                 Done,
             )
-            .in_block(block(observed.withdrawn)),
+            .in_block(block(observed.withdrawn))
+            .with_transaction(withdrawal),
         };
         steps.push(step);
         return steps;
@@ -894,9 +911,37 @@ pub(super) fn public_swap_steps(
         )
         .in_block(block(
             observed.bridge_handoff.map(|handoff| handoff.observation),
-        )),
+        ))
+        .with_transaction(
+            // A deposit the settlement made shows its transaction on the order step.
+            hash(observed.bridge_handoff.map(|handoff| handoff.observation))
+                .filter(|deposit| hash(observed.traded) != Some(*deposit))
+                .or_else(|| {
+                    matches!(
+                        stage,
+                        PublicSwapStage::Depositing | PublicSwapStage::DepositFailed
+                    )
+                    .then(|| latest(Kind::Deposit))
+                    .flatten()
+                }),
+        ),
     );
     let private = format!("Private on {}", labels.destination);
+    // The fill on the destination network, when the recorded outcome has one.
+    let filled = match observed.bridge_outcome {
+        Some(
+            SwapBridgeOutcome::DeliveredVerified {
+                transaction_hash, ..
+            }
+            | SwapBridgeOutcome::HeldOnDestination {
+                transaction_hash, ..
+            },
+        ) => Some(transaction_hash),
+        Some(SwapBridgeOutcome::DeliveredReported {
+            transaction_hash, ..
+        }) => transaction_hash,
+        _ => None,
+    };
     let step = match stage {
         PublicSwapStage::DeliveredVerified => SwapStep::new(
             format!("{private} · verified"),
@@ -908,12 +953,14 @@ pub(super) fn public_swap_steps(
         .in_block(match observed.bridge_outcome {
             Some(SwapBridgeOutcome::DeliveredVerified { block, .. }) => Some(block.number),
             _ => None,
-        }),
+        })
+        .with_transaction(filled),
         PublicSwapStage::DeliveredReported => SwapStep::new(
             format!("Delivered on {} · reported", labels.destination),
             "Across reports delivery. The wallet could not verify the shield in finalized receipts.",
             Warning,
-        ),
+        )
+        .with_transaction(filled),
         PublicSwapStage::Refunding => SwapStep::new(
             format!("Refunding to {}", labels.source),
             format!(
@@ -930,6 +977,7 @@ pub(super) fn public_swap_steps(
         PublicSwapStage::Refunded => {
             SwapStep::new(format!("Refunded to {}", labels.source), "", Done)
                 .in_block(block(observed.bridge_refund))
+                .with_transaction(hash(observed.bridge_refund))
         }
         PublicSwapStage::HeldOnDestination => SwapStep::new(
             format!("Held on {}", labels.destination),
@@ -942,7 +990,8 @@ pub(super) fn public_swap_steps(
         .in_block(match observed.bridge_outcome {
             Some(SwapBridgeOutcome::HeldOnDestination { block, .. }) => Some(block.number),
             _ => None,
-        }),
+        })
+        .with_transaction(filled),
         PublicSwapStage::Recovered => {
             SwapStep::new("Recovered", "Destination funds were recovered.", Done)
         }
@@ -1387,6 +1436,8 @@ pub(in crate::root) struct SwapLabels {
     /// A swap back to the private balance: the transaction of its post-hook shield, once
     /// observation verified the delivery. `None` for any other delivery.
     pub(in crate::root) shield_transaction: Option<B256>,
+    /// The settlement transaction of the traded order, once observation recorded the trade.
+    pub(in crate::root) settlement_transaction: Option<B256>,
     /// A Bridge swap's destination. `None` for delivery on the swap's own network.
     pub(in crate::root) bridge: Option<SwapBridgeLabels>,
 }
@@ -1414,6 +1465,12 @@ pub(in crate::root) struct SwapBridgeLabels {
     pub(in crate::root) private: Option<SwapPrivateBridgeLabels>,
     /// The recorded delivery is the provider's report, which the wallet didn't verify.
     pub(in crate::root) reported: bool,
+    /// The transaction of the recorded delivery on the destination network, when it is known.
+    pub(in crate::root) delivered_transaction: Option<B256>,
+    /// The hand-off's transaction on the swap's network, once observation recorded it.
+    pub(in crate::root) handoff_transaction: Option<B256>,
+    /// The transaction of Across's refund on the swap's network, once a refund is verified.
+    pub(in crate::root) refund_transaction: Option<B256>,
     /// The deposit in the reported trade block, while the swap's fill is reported and its
     /// settlement isn't verified, with "248.82 USDC" of the bought token. `Looking` otherwise.
     pub(in crate::root) deposit: SwapSeen,
@@ -1428,10 +1485,12 @@ pub(in crate::root) struct SwapBridgeLabels {
 pub(in crate::root) enum SwapBridgeReported {
     /// Delivered, with "248.71 USDC" when the provider gives the amount. A private delivery's
     /// amount is before the destination network's shield fee, and `shield` tells what its fill
-    /// block shows. A public delivery has no shield, and nothing reads the field.
+    /// block shows. A public delivery has no shield, and nothing reads the field. `transaction`
+    /// is the provider's transaction on the destination network, when it gives one.
     Delivered {
         amount: Option<String>,
         shield: SwapShieldSeen,
+        transaction: Option<B256>,
     },
     Pending,
     Refunded,
@@ -2082,8 +2141,10 @@ pub(in crate::root) struct SwapStep {
     pub(in crate::root) account: Option<SwapStepAccount>,
     /// The `CoW` order ID of the order step, once the swap has an order.
     pub(in crate::root) order: Option<OrderUid>,
-    /// The shield transaction of a swap back to the private balance, on its private-balance
-    /// step, once the reported trade block or verified delivery shows it.
+    /// The transaction that completed the step, or a Public-paid swap's own transaction the
+    /// step waits on, once the wallet knows its hash: such as the settlement, a Bridge swap's
+    /// hand-off or its fill on the destination network, or the shield of a swap back to the
+    /// private balance, once the reported trade block or verified delivery shows it.
     pub(in crate::root) transaction: Option<B256>,
     /// The block the step completed in, shown at its trailing edge. Only a Public-paid swap's
     /// steps carry one.
@@ -2349,10 +2410,12 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
                 Warning,
             ),
         ],
+        // The traded step shows the settlement where no later step does. A finished return's
+        // shield transaction is that settlement.
         SwapStage::Order(SwapOrderState::Traded) => vec![
             setup(Done, ""),
             open(Done, String::new()),
-            traded(Done),
+            traded(Done).with_transaction(labels.settlement_transaction),
             delivered(
                 Pending,
                 "Private return unverified. Check status for retry or recovery.".into(),
@@ -2367,7 +2430,7 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
         SwapStage::Order(SwapOrderState::NotDelivered) => vec![
             setup(Done, ""),
             open(Done, String::new()),
-            traded(Done),
+            traded(Done).with_transaction(labels.settlement_transaction),
             step(
                 "Not delivered",
                 format!(
@@ -2457,6 +2520,10 @@ fn external_steps(steps: Vec<SwapStep>, receiver: &str, labels: &SwapLabels) -> 
             {
                 step.status = status;
                 step.detail = detail;
+            }
+            // The settlement that traded also delivered.
+            if step.status == Done {
+                step.transaction = labels.settlement_transaction;
             }
             step.detail = match (&labels.received, &labels.minimum) {
                 (Some(received), _) if step.status == Done => {
@@ -2578,6 +2645,7 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                 }),
             Done,
         )
+        .with_transaction(bridge.handoff_transaction)
     };
     let private = bridge.private.as_ref();
     // Proceeds the destination stealth account holds, `held` of them when the amount is known.
@@ -2654,11 +2722,15 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                 match &bridge.report {
                     None => step(delivered, expected, NotStarted),
                     Some(SwapBridgeReported::Pending) => step(delivered, in_transit, Pending),
-                    Some(SwapBridgeReported::Delivered { amount, shield }) => {
+                    Some(SwapBridgeReported::Delivered {
+                        amount,
+                        shield,
+                        transaction,
+                    }) => {
                         let reported =
                             format!("Delivered on {} · reported by {provider}", bridge.network);
                         // A private delivery follows what its fill block shows of the shield.
-                        match (private, shield) {
+                        let delivery = match (private, shield) {
                             (None, _) => step(
                                 reported,
                                 amount.as_ref().map_or_else(
@@ -2685,7 +2757,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                                 held_detail(Some(held)),
                                 Warning,
                             ),
-                        }
+                        };
+                        delivery.with_transaction(*transaction)
                     }
                     Some(SwapBridgeReported::Refunded) => step(
                         format!("Refund · reported by {provider}"),
@@ -2750,7 +2823,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                     (None, None) => format!("To {}", bridge.receiver),
                 },
                 Done,
-            ),
+            )
+            .with_transaction(bridge.delivered_transaction),
         ],
         SwapStage::Order(SwapOrderState::HeldOnDestination) => vec![
             handed_off(),
@@ -2758,7 +2832,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                 format!("Held by stealth account on {}", bridge.network),
                 held_detail(private.and_then(|private| private.held.as_ref())),
                 Warning,
-            ),
+            )
+            .with_transaction(bridge.delivered_transaction),
         ],
         SwapStage::Order(SwapOrderState::Refunding) => vec![
             handed_off(),
@@ -2775,7 +2850,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                     ),
                 },
                 Warning,
-            ),
+            )
+            .with_transaction(bridge.refund_transaction),
         ],
         SwapStage::Order(SwapOrderState::NeedsAttention) => vec![
             handed_off(),
@@ -3324,6 +3400,7 @@ pub(super) mod tests {
             uncovered_gas: None,
             order: None,
             shield_transaction: None,
+            settlement_transaction: None,
             bridge: None,
         }
     }
@@ -3389,6 +3466,9 @@ pub(super) mod tests {
                 minimum: None,
                 private: None,
                 reported: false,
+                delivered_transaction: None,
+                handoff_transaction: None,
+                refund_transaction: None,
                 deposit: SwapSeen::Looking,
                 report: None,
             }),
@@ -3817,6 +3897,22 @@ pub(super) mod tests {
             done.last().map(|step| step.transaction),
             Some(shield_transaction)
         );
+        // A Public address swap's settlement delivers, so its delivery step shows it.
+        let settlement_transaction = Some(B256::repeat_byte(0x5f));
+        let external = swap_steps(
+            SwapStage::Order(SwapOrderState::Done),
+            &SwapLabels {
+                receiver: Some("Treasury".into()),
+                settlement_transaction,
+                ..labels()
+            },
+        );
+        assert_eq!(
+            external
+                .last()
+                .map(|step| (step.label.as_str(), step.transaction)),
+            Some(("Delivered to Treasury", settlement_transaction))
+        );
         let undelivered = swap_steps(SwapStage::Order(SwapOrderState::NotDelivered), &labels());
         assert_ne!(
             undelivered.last().map(|step| step.status),
@@ -3839,6 +3935,9 @@ pub(super) mod tests {
                 minimum: Some("248.70 USDC".into()),
                 private: None,
                 reported,
+                delivered_transaction: None,
+                handoff_transaction: None,
+                refund_transaction: None,
                 deposit: SwapSeen::Looking,
                 report: None,
             }),
@@ -3961,6 +4060,18 @@ pub(super) mod tests {
                 .detail
                 .starts_with("At least 248.70 USDC to Treasury")
         );
+        // The deposit step shows the recorded hand-off's transaction.
+        let handoff = Some(B256::repeat_byte(0xd0));
+        let mut recorded = across.clone();
+        recorded.bridge.as_mut().unwrap().handoff_transaction = handoff;
+        for state in [SwapOrderState::Bridging, SwapOrderState::Done] {
+            let steps = swap_steps(order(state), &recorded);
+            assert_eq!(
+                (steps[2].label.as_str(), steps[2].transaction),
+                (BRIDGE_DEPOSIT, handoff),
+                "{state:?}"
+            );
+        }
         assert_eq!(
             swap_card_line(order(SwapOrderState::Done), &across).detail,
             "Delivered 248.71 USDC to Treasury on Polygon via Across"
@@ -4019,6 +4130,9 @@ pub(super) mod tests {
                         held: Some("992.74 USDC".into()),
                     }),
                     reported: false,
+                    delivered_transaction: None,
+                    handoff_transaction: None,
+                    refund_transaction: None,
                     deposit: SwapSeen::Looking,
                     report: None,
                 }),
@@ -4253,6 +4367,9 @@ pub(super) mod tests {
                 minimum: Some("248.70 USDC".into()),
                 private: None,
                 reported: false,
+                delivered_transaction: None,
+                handoff_transaction: None,
+                refund_transaction: None,
                 deposit: SwapSeen::Looking,
                 report,
             }),
@@ -4392,9 +4509,11 @@ pub(super) mod tests {
             fill_hint: Some(fill_hint()),
             ..bridged(provider, report)
         };
+        let fill = Some(B256::repeat_byte(0xf1));
         let delivered = |amount: Option<&str>| SwapBridgeReported::Delivered {
             amount: amount.map(Into::into),
             shield: SwapShieldSeen::Looking,
+            transaction: fill,
         };
         for (provider, name, expected, in_transit) in [
             (
@@ -4477,6 +4596,12 @@ pub(super) mod tests {
                 // Only a reported delivery reads as delivered, and only a reported refund or
                 // failure changes the note.
                 let made = matches!(report, Some(SwapBridgeReported::Delivered { .. }));
+                // A reported delivery's step carries the provider's fill transaction.
+                assert_eq!(
+                    steps[4].transaction,
+                    if made { fill } else { None },
+                    "{provider:?} {report:?}"
+                );
                 let card = swap_card_line(open, &labels);
                 assert_eq!(card.title, "Swapped 1.00 WETH for USDC");
                 assert_eq!(
@@ -4585,6 +4710,7 @@ pub(super) mod tests {
                 Some(SwapBridgeReported::Delivered {
                     amount: Some("992.74 USDC".into()),
                     shield,
+                    transaction: fill,
                 }),
             );
             private.bridge.as_mut().unwrap().private = Some(SwapPrivateBridgeLabels {
@@ -4603,10 +4729,21 @@ pub(super) mod tests {
                 (step.label.as_str(), step.status, step.detail.as_str()),
                 last
             );
+            assert_eq!(step.transaction, fill);
             assert_eq!(swap_card_line(open, &private).detail, card);
             assert_eq!(swap_order_status(open, false, &private), status);
             assert_eq!(reported_fill_note(open, &private).as_deref(), Some(note));
         }
+
+        // Once observation records the delivery, its step carries the recorded fill.
+        let mut recorded = bridged(BridgeProvider::Across, None);
+        recorded.bridge.as_mut().unwrap().delivered_transaction = fill;
+        let steps = swap_steps(SwapStage::Order(SwapOrderState::Done), &recorded);
+        let step = steps.last().unwrap();
+        assert_eq!(
+            (step.label.as_str(), step.transaction),
+            ("Delivered on Polygon · verified", fill)
+        );
     }
 
     #[test]
@@ -4621,6 +4758,7 @@ pub(super) mod tests {
                 Some(SwapBridgeReported::Delivered {
                     amount: Some("248.71 USDC".into()),
                     shield: SwapShieldSeen::Looking,
+                    transaction: None,
                 }),
             );
             labels.bridge.as_mut().unwrap().deposit = SwapSeen::Detected(Some("49.40 USDC".into()));
@@ -5372,6 +5510,17 @@ pub(super) mod tests {
                 steps,
                 "{stage:?}"
             );
+            // The approval shows its own transaction, and the deposit step the observed
+            // hand-off's.
+            if stage == PublicSwapStage::Bridging {
+                assert_eq!(
+                    shown
+                        .iter()
+                        .map(|step| step.transaction)
+                        .collect::<Vec<_>>(),
+                    [None, Some(B256::repeat_byte(30)), Some(B256::ZERO), None]
+                );
+            }
             // The order step, and no other, carries the order ID.
             assert_eq!(
                 shown

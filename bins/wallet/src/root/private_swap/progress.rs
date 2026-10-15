@@ -1374,10 +1374,7 @@ impl PrivateSwapsView {
                             rows.push(fact_row("Settled by", settled_by_cow()));
                         }
                     }
-                    Some(SwapBridgeOutcome::DeliveredReported {
-                        amount_out,
-                        transaction_hash,
-                    }) => {
+                    Some(SwapBridgeOutcome::DeliveredReported { amount_out, .. }) => {
                         rows.extend(amount_out.map(|amount| {
                             fact_row(
                                 "Reported amount",
@@ -1387,18 +1384,6 @@ impl PrivateSwapsView {
                                         format!("(minimum {})", destination_amount(minimum))
                                     }),
                                 ),
-                            )
-                        }));
-                        // A copy button only, with no explorer link.
-                        rows.extend(transaction_hash.map(|hash| {
-                            let hash = hash.to_string();
-                            let copy_id =
-                                SharedString::from(format!("swap-destination-{hash}-copy"));
-                            hash_row(
-                                format!("{network} transaction"),
-                                hash,
-                                copy_id,
-                                "Copy transaction hash",
                             )
                         }));
                         rows.push(provider_row);

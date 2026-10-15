@@ -2002,6 +2002,7 @@ impl PrivateSwapsView {
                 uncovered_gas: None,
                 order: None,
                 shield_transaction: None,
+                settlement_transaction: None,
                 bridge: None,
             };
         };
@@ -2330,6 +2331,9 @@ impl PrivateSwapsView {
                 .filter(|order| matches!(order.delivery(), SwapDelivery::Reshield))
                 .and_then(|order| order.observations().delivered)
                 .and_then(|delivered| delivered.transaction_hash),
+            settlement_transaction: attempts
+                .and_then(|attempts| attempts.traded)
+                .and_then(|traded| traded.observations().traded?.transaction_hash),
             bridge,
         }
     }
@@ -2403,6 +2407,31 @@ impl PrivateSwapsView {
                     Some(SwapBridgeOutcome::DeliveredReported { .. })
                 )
             }),
+            delivered_transaction: order.and_then(|order| {
+                match order.observations().bridge_outcome {
+                    Some(
+                        SwapBridgeOutcome::DeliveredVerified {
+                            transaction_hash, ..
+                        }
+                        | SwapBridgeOutcome::HeldOnDestination {
+                            transaction_hash, ..
+                        },
+                    ) => Some(transaction_hash),
+                    Some(SwapBridgeOutcome::DeliveredReported {
+                        transaction_hash, ..
+                    }) => transaction_hash,
+                    _ => None,
+                }
+            }),
+            handoff_transaction: order.and_then(|order| {
+                order
+                    .observations()
+                    .bridge_handoff?
+                    .observation
+                    .transaction_hash
+            }),
+            refund_transaction: order
+                .and_then(|order| order.observations().bridge_refund?.transaction_hash),
             deposit: SwapSeen::Looking,
             report: None,
         })
@@ -2433,7 +2462,11 @@ impl PrivateSwapsView {
             )
         };
         Some(match report {
-            SwapBridgeReport::Delivered { amount_out, seen } => SwapBridgeReported::Delivered {
+            SwapBridgeReport::Delivered {
+                amount_out,
+                seen,
+                transaction,
+            } => SwapBridgeReported::Delivered {
                 amount: amount_out.map(&shown),
                 shield: match seen {
                     None => SwapShieldSeen::Looking,
@@ -2442,6 +2475,7 @@ impl PrivateSwapsView {
                     )),
                     Some(SwapDeliverySeen::Held { amount }) => SwapShieldSeen::Held(shown(amount)),
                 },
+                transaction,
             },
             SwapBridgeReport::Pending => SwapBridgeReported::Pending,
             SwapBridgeReport::Refunded => SwapBridgeReported::Refunded,

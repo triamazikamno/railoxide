@@ -6888,18 +6888,24 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
 #[tokio::test]
 async fn a_providers_report_before_the_recorded_handoff_is_returned_and_records_nothing() {
     use crate::SwapBridgeReport::{Delivered, Failed, Pending, Refunded};
-    let delivered = |amount: u64| Delivered {
+    let delivered = |amount: u64, transaction: Option<B256>| Delivered {
         amount_out: Some(U256::from(amount)),
         seen: None,
+        transaction,
     };
     // Across is asked about the hinted deposit, and not at all without one. NEAR Intents is
     // asked by the order's deposit address.
     for (across, status, hinted, expected) in [
-        (true, "filled", true, delivered(REPORTED_AMOUNT)),
+        (
+            true,
+            "filled",
+            true,
+            delivered(REPORTED_AMOUNT, Some(REPORTED_FILL)),
+        ),
         (true, "pending", true, Pending),
         (true, "expired", true, Refunded),
         (true, "filled", false, Pending),
-        (false, "SUCCESS", false, delivered(16)),
+        (false, "SUCCESS", false, delivered(16, None)),
         (false, "PROCESSING", false, Pending),
         (false, "FAILED", false, Failed),
     ] {
@@ -7030,6 +7036,7 @@ async fn a_private_across_report_says_what_the_unconfirmed_fill_block_shows_and_
             crate::SwapBridgeReport::Delivered {
                 amount_out: Some(U256::from(REPORTED_AMOUNT)),
                 seen,
+                transaction: Some(REPORTED_FILL),
             },
             "shield {shield}, served {served}"
         );

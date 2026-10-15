@@ -12745,6 +12745,7 @@ fn a_reported_bridge_fill_is_asked_about_early_until_its_hand_off_is_recorded(
                 let delivered = Some(SwapBridgeReport::Delivered {
                     amount_out: Some(BRIDGE_MINIMUM),
                     seen: None,
+                    transaction: None,
                 });
                 swaps.apply_order_hints(
                     vec![reported_fill(
@@ -12955,6 +12956,7 @@ fn a_reported_private_bridge_delivery_is_asked_about_until_its_fill_block_is_rea
                 Some(SwapBridgeReport::Delivered {
                     amount_out: Some(BRIDGE_MINIMUM),
                     seen,
+                    transaction: None,
                 }),
             )
         };
@@ -13044,6 +13046,7 @@ fn a_bridge_providers_early_report_changes_the_copy_and_offers_no_action(cx: &mu
                 Some(SwapBridgeReport::Delivered {
                     amount_out: None,
                     seen: None,
+                    transaction: None,
                 }),
                 ("Delivered on Polygon · reported by Across", Done),
                 "Delivered to Cold wallet on Polygon · confirming",
